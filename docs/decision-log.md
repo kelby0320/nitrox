@@ -16701,3 +16701,56 @@ manager's at 512, sessions at `MAX_WAIT_HANDLES - 3`. The bound was the *API*: o
 connection, enforced by `libsurface` owning the transport. Removing that accident is what turned
 an emergent limit into one that has to be written down. Sequential churn is unaffected —
 `ui-testclient` opens 128 windows in a row and destroys each before the next.
+
+## 2026-08-20 — `nxterm`'s menu is a window (M6 C3, part 3 of 3), and no button was clickable
+
+The menu was a `Stack` layer over the whole terminal window — hoisted there because a layer
+inside the 24-pixel bar would have been clipped to 24 pixels. That worked only because the menu
+happened to fit inside the terminal. It is a `popup` now: parented to the terminal, positioned by
+`nxterm` at the anchor its own layout gives, and clipped by the **screen** rather than by its
+parent, which is what `display-substrate.md` §4a means by "a menu clipped to its window is not a
+menu".
+
+The window is created when the menu opens and destroyed when it closes, because `popup` is a
+transient role — a hidden one would still be a window in the stack, still taking focus. Its size
+is **measured**, not guessed: a popup window needs its extent before it exists, and a hardcoded
+size would stop matching the menu the first time an item was added. `Fill` measures as zero, so
+the backing layer does not inflate it.
+
+**Choosing an item now dismisses the menu**, which is both what every menu does and what hands
+the keyboard back: an open popup is topmost and focusable, so a menu that stayed up would take
+the next keystroke instead of the shell.
+
+## The bug this found, which made the feature moot
+
+**No button in this toolkit was clickable, anywhere.** `libui`'s `hit_test` returns the *deepest*
+widget under the cursor and the dispatch looked for a handler on exactly that widget. But
+`widget::button` is a `Stack` carrying `on_press`, with a `fill` and a `text` label inside it — so
+clicking a button hit the **label**, which handles nothing, and the click produced no message.
+
+Nothing caught it. The routing tests attach handlers directly to leaves (`custom(…).on_pointer(…)`),
+which is the one shape that works, and every gate that clicked anything clicked a `custom` node.
+The menu was the first real button ever clicked in this system, and it was clicked by a gate on
+its first attempt.
+
+Dispatch now walks up from the hit to the nearest ancestor carrying the handler — press, pointer
+and focus alike, since `button` marks the outer `Stack` focusable too. Reproduced first as a pure
+host test with no compositor and no popup involved, which is where the fix is pinned.
+
+**The reusable lesson is about the tests, not the toolkit**: a widget library tested only through
+leaves cannot see a bug that lives in the relationship between a widget and its parts, and a gate
+that only ever clicks the one primitive shaped like a leaf will not either.
+
+## What the gate proves
+
+`check-terminal` presses F1 — a key, because `nxterm` is created before `ui-testclient`'s windows
+and the bar button that opens the menu is underneath them — then reads the popup's id and
+geometry off the serial log, clicks its first item, and asserts the message. The published line
+was `138 at 0,24 62x52`: directly below the 24-pixel bar and extending to y=76, which is the
+escape-the-parent property with a real application behind it.
+
+The ordering is load-bearing and stated in the gate: the menu is opened **after** everything typed
+at the shell has been asserted, because an open popup takes the keyboard.
+
+**Milestone 6 is complete** — every checkbox, including D1, which was satisfied incrementally as
+each op landed rather than by a documentation pass at the end.

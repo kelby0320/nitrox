@@ -304,14 +304,35 @@ impl Router {
 
         if let Some(id) = target
             && let Some(path) = path_to_id(tree.root(), id)
-            && let Some(e) = element_at(element, &path)
         {
+            // **The handler may be on an ancestor of what was hit, so look up the path.**
+            // `hit_test` returns the *deepest* widget under the cursor, and a widget that draws
+            // itself out of smaller pieces puts its handler on the outside: `widget::button` is
+            // a `Stack` carrying `on_press`, with a `fill` and a `text` inside it. Clicking the
+            // label therefore hit the label, which handles nothing — so **no button in this
+            // toolkit was clickable**, anywhere, until this walked up to find the handler.
+            //
+            // Nothing caught it because the routing tests attach handlers to leaves and the
+            // gates only ever clicked `custom` nodes, which are leaves. Found by `nxterm`'s
+            // menu becoming a real popup and the gate clicking an item (M6 C3).
+            let nearest = |has: &dyn Fn(&Element<Msg>) -> bool| -> Option<(usize, &Element<Msg>)> {
+                (0..=path.len()).rev().find_map(|n| {
+                    let e = element_at(element, &path[..n])?;
+                    has(e).then_some((n, e))
+                })
+            };
+
             if !window_crossing
+                && let Some((n, e)) = nearest(&|e: &Element<Msg>| e.on_pointer.is_some())
                 && let Some(f) = e.on_pointer
-                && let Some(l) = layout_at(layout, &path)
+                && let Some(l) = layout_at(layout, &path[..n])
             {
                 out.push(f(localise(event, l.rect)));
             }
+            let e = match element_at(element, &path) {
+                Some(e) => e,
+                None => return (out, target),
+            };
             // A **click** is a release inside the widget that took the press. Releasing
             // outside is a cancel, which is why this is not simply "on release".
             //
@@ -325,13 +346,29 @@ impl Router {
             // inside a `padding` silently lost its clicks (PR #184 review, finding 1).
             if released
                 && self.capture_button == Some(event.button)
-                && let Some(msg) = e.on_press.clone()
-                && let Some(l) = layout_at(layout, &path)
+                && let Some((n, pe)) = nearest(&|e: &Element<Msg>| e.on_press.is_some())
+                && let Some(msg) = pe.on_press.clone()
+                && let Some(l) = layout_at(layout, &path[..n])
                 && l.rect.contains(event.x, event.y)
             {
                 out.push(msg);
             }
-            // Click to focus, but only where focus can land.
+            // Click to focus, but only where focus can land — **on the widget actually hit,
+            // not on an ancestor**.
+            //
+            // The walk-up above is right for `on_press` and `on_pointer`, where a composite
+            // widget's handler lives on its outside and the click landed on one of its parts.
+            // It is wrong here, and the difference is that focus is a *claim on the keyboard*
+            // rather than a response to this event: `widget::button` marks its outer `Stack`
+            // focusable but gives it no `on_key`, so walking up moved focus from the terminal
+            // grid to a widget that claims keys and handles none — and nothing puts it back.
+            // Clicking the menu bar killed typing until you clicked the grid again
+            // (PR #223 review, finding 1).
+            //
+            // Leaving it on the hit node means clicking a `button` moves focus nowhere at all,
+            // because the label under the cursor is not focusable. That is the behaviour that
+            // shipped before this, and making a button take focus needs it to *do* something
+            // with the keyboard first.
             if pressed && e.focusable {
                 self.focus = Some(id);
             }
@@ -370,9 +407,19 @@ impl Router {
         out: &mut Vec<Msg>,
     ) {
         let Some(path) = path_to_id(tree.root(), id) else { return };
-        let Some(e) = element_at(element, &path) else { return };
+        // **The same walk-up the press and motion paths do.** A composite widget's handler is
+        // on its outside, so requiring it on the exact node hit would give it motion — which
+        // walks up — and never a crossing, which did not. A `button` driving its hover state
+        // from `on_pointer` would latch hovered on entry and never hear that the cursor left
+        // (PR #223 review, finding 5).
+        let Some((n, e)) = (0..=path.len())
+            .rev()
+            .find_map(|n| element_at(element, &path[..n]).filter(|e| e.on_pointer.is_some()).map(|e| (n, e)))
+        else {
+            return;
+        };
         let Some(f) = e.on_pointer else { return };
-        let Some(l) = layout_at(layout, &path) else { return };
+        let Some(l) = layout_at(layout, &path[..n]) else { return };
         // The state that was true when the cursor crossed, from the event that moved it —
         // a crossing has no buttons or modifiers of its own, and inventing zeroes would tell
         // a widget the button it is about to be dragged with is not held.
@@ -454,6 +501,7 @@ fn path_to_id(root: Option<&Widget>, id: u64) -> Option<Path> {
     walk(root, id, &mut path).then_some(path)
 }
 
+/// The id of the widget at `path`, for the ancestor a handler was actually found on.
 /// The element at `path`, walking [`Element::children`] order.
 fn element_at<'a, Msg>(e: &'a Element<Msg>, path: &[usize]) -> Option<&'a Element<Msg>> {
     let mut cur = e;
@@ -545,6 +593,84 @@ mod tests {
     /// record belongs to this window before it gets here.
     fn key(code: u16) -> KeyEvent {
         KeyEvent::new(1, code, 1, 0)
+    }
+
+    /// Clicking a composite widget does **not** steal the keyboard from whatever had it.
+    ///
+    /// The press and pointer handlers of a composite widget live on its outside, so dispatch
+    /// walks up to find them. Focus must not: `widget::button` marks its outer `Stack`
+    /// focusable and gives it no `on_key`, so walking up moved focus onto a widget that claims
+    /// keys and handles none — clicking a menu bar killed typing until the user clicked the
+    /// text back (PR #223 review, finding 1).
+    ///
+    /// There was no click-to-focus test here at all, which is why the walk-up looked harmless.
+    #[test]
+    fn clicking_a_button_does_not_take_the_keyboard_from_the_focused_widget() {
+        use crate::widget::{Palette, WidgetState, button};
+
+        let p = Palette::default();
+        // A focusable widget that handles keys — the terminal grid's shape — beside a button.
+        let e: Element<Msg> = column(vec![
+            button("Menu", Msg::Pressed(1), WidgetState::default(), &p),
+            custom(7, Size::new(0, 0)).on_key(|k| Some(Msg::Key(k))).focusable(),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+
+        let grid = t.root().unwrap().children[1].id;
+        r.focus(&t, &e, grid);
+        assert_eq!(r.key(&t, &e, key(30)), Some(Msg::Key(key(30))), "the grid has the keyboard");
+
+        // Click the button. Its message is produced — and the keyboard stays where it was.
+        let btn = l.children[0].rect;
+        let (at_x, at_y) = (btn.origin.x + btn.size.w as i32 / 2, btn.origin.y + btn.size.h as i32 / 2);
+        let (_, _) = r.pointer(&t, &e, &l, press(at_x, at_y));
+        let (msgs, _) = r.pointer(&t, &e, &l, release(at_x, at_y));
+        assert_eq!(msgs, vec![Msg::Pressed(1)], "the button still fires");
+        assert_eq!(
+            r.key(&t, &e, key(31)),
+            Some(Msg::Key(key(31))),
+            "and the grid still has the keyboard"
+        );
+    }
+
+    /// A press inside a `button` in a padded column inside a stack produces its message.
+    ///
+    /// The exact shape `nxterm`'s menu takes — a backing `fill` under a padded column of
+    /// buttons — checked because a popup made of it was hit-testing to the column rather than
+    /// to the button under the cursor.
+    #[test]
+    fn a_press_on_a_button_in_a_padded_column_produces_its_message() {
+        use crate::element::padding;
+        use crate::widget::{Palette, WidgetState, button};
+        use crate::element::Insets;
+
+        let p = Palette::default();
+        let e: Element<Msg> = stack(vec![
+            crate::element::fill(p.face),
+            padding(
+                Insets::all(2),
+                column(vec![
+                    button("Clear", Msg::Pressed(1), WidgetState::default(), &p),
+                    button("Reset", Msg::Pressed(2), WidgetState::default(), &p),
+                ]),
+            ),
+        ]);
+        // A window the size the menu measures to, as the popup is created at.
+        let size = crate::layout::measure(&e, crate::layout::Constraints::loose(SCREEN.size), &CELL);
+        let bounds = Rect::new(0, 0, size.w, size.h);
+        let l = layout(&e, bounds, &CELL);
+        let mut t = Tree::new();
+        t.update(&e, &l).expect("a clean frame");
+
+        let mut r = Router::new();
+        // The upper quarter: inside the first button, clear of the boundary.
+        let at = (bounds.size.w as i32 / 2, bounds.size.h as i32 / 4);
+        // A click is a press *and* a release inside the widget the press captured.
+        let (_, hit) = r.pointer(&t, &e, &l, press(at.0, at.1));
+        assert!(hit.is_some(), "something was hit at {at:?} in {bounds:?}");
+        let (msgs, _) = r.pointer(&t, &e, &l, release(at.0, at.1));
+        assert_eq!(msgs, vec![Msg::Pressed(1)], "the first item's message, at {at:?}");
     }
 
     #[test]

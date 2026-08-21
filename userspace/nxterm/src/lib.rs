@@ -31,7 +31,7 @@ use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use librsproto::surface::{KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent};
-use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, stack};
+use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, stack};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
 /// The `custom` node the grid is drawn into.
@@ -339,16 +339,24 @@ impl App {
             custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
         );
 
-        // **The popup is a layer over the whole window, not a child of the bar.** A `Stack`
-        // layer inside a 24-pixel bar would be clipped to 24 pixels; the menu has to escape its
-        // parent, and the window is the first ancestor big enough to hold it.
-        let Some(anchor) = self.menu_anchor.filter(|_| self.menu_open) else {
-            return body;
-        };
-        stack(vec![
-            body,
-            offset(anchor.origin.x, anchor.bottom() as i32, self.menu(&ui)),
-        ])
+        // **The menu is not in this tree.** It used to be a `Stack` layer over the whole
+        // window — a layer inside the 24-pixel bar would have been clipped to 24 pixels, so it
+        // was hoisted to the first ancestor big enough to hold it. Since M6 C3 it is a *window*:
+        // a `popup`, parented to this one and clipped only by the screen, which is what a menu
+        // has always needed and what `libui`'s `offset` cannot give it. See [`menu_view`].
+        //
+        // [`menu_view`]: Self::menu_view
+        body
+    }
+
+    /// The menu popup's own element tree — the root of a second window, not a layer in this one.
+    ///
+    /// Separate from [`view`](Self::view) because it is painted into a different surface with
+    /// its own diff state. It carries no `Fill` sizing of its own beyond the backing, so
+    /// `libui::layout::measure` under loose constraints gives the size the popup window should
+    /// be created at.
+    pub fn menu_view(&self) -> Element<Msg> {
+        self.menu(&UiPalette::default())
     }
 
     /// The popup's contents.
@@ -525,48 +533,62 @@ mod tests {
             assert!(!a.menu_open, "{msg:?} left the menu open");
         }
     }
-
+    /// The menu is **never** in the window's tree, open or closed.
+    ///
+    /// It was a `Stack` layer over the whole window until M6 C3 — hoisted there because a layer
+    /// inside the 24-pixel bar would have been clipped to 24 pixels. It is a `popup` *window*
+    /// now, parented to this one and clipped only by the screen, so the window's tree is the
+    /// body and nothing else.
     #[test]
-    fn the_popup_appears_only_when_the_menu_is_open_and_anchored() {
-        let a0 = app();
-        // Closed: the tree is the body, a `Dock`.
-        assert!(matches!(a0.view().node, libui::element::Node::Dock { .. }));
-
-        let mut a = app();
-        a.menu_open = true;
-        a.menu_anchor = Some(Rect::new(4, 0, 60, BAR_H));
-        assert!(matches!(a.view().node, libui::element::Node::Stack(_)), "no popup layer");
-
-        // Open but never laid out: no anchor, so no popup rather than one at the origin.
-        let mut a = app();
-        a.menu_open = true;
-        a.menu_anchor = None;
-        assert!(matches!(a.view().node, libui::element::Node::Dock { .. }));
+    fn the_menu_is_not_a_layer_in_the_windows_tree() {
+        for (open, anchor) in [
+            (false, None),
+            (true, Some(Rect::new(4, 0, 60, BAR_H))),
+            (true, None),
+        ] {
+            let mut a = app();
+            a.menu_open = open;
+            a.menu_anchor = anchor;
+            assert!(
+                matches!(a.view().node, libui::element::Node::Dock { .. }),
+                "open={open}: the window's tree is the body"
+            );
+        }
     }
 
+    /// The anchor sits directly under the menu item, and is what the popup is placed at.
+    ///
+    /// `locate` finds the item; the anchor it yields becomes the popup window's offset from its
+    /// parent's origin (`CreateWindowRequest::at`). The value is the same one the old in-window
+    /// `offset` consumed — what changed is who reads it.
     #[test]
-    fn the_popup_lands_under_the_menu_item() {
-        // `locate` finds the item, `offset` puts the menu beneath it — the two toolkit
-        // additions of B1a, doing their job through the real view.
+    fn the_anchor_is_under_the_menu_item_and_escapes_the_bar() {
         let mut a = app();
         let cell = FixedCell { w: 8, h: 16 };
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
 
-        let closed = a.view();
-        let l = layout(&closed, bounds, &cell);
-        let item = locate(&closed, &l, MENU_ITEM_KEY).expect("the menu item is keyed");
+        let view = a.view();
+        let l = layout(&view, bounds, &cell);
+        let item = locate(&view, &l, MENU_ITEM_KEY).expect("the menu item is keyed");
         a.menu_anchor = Some(item);
         a.menu_open = true;
 
-        let open = a.view();
-        let l = layout(&open, bounds, &cell);
-        let popup = l.children[1].rect;
-        assert_eq!(popup.origin.x, item.origin.x, "the popup is not aligned with its item");
-        assert_eq!(popup.origin.y, item.bottom() as i32, "the popup is not below its item");
-        assert!(popup.size.h > 0 && popup.size.w > 0);
-        // And it escapes the bar it hangs from, which is the whole reason it is a window-level
-        // layer rather than a child of the menu bar.
-        assert!(popup.bottom() > BAR_H as i64, "the popup was clipped to the bar");
+        // The popup hangs from the item's left edge, immediately below it.
+        assert!(item.bottom() <= BAR_H as i64, "the item is inside the bar");
+
+        // And the menu it will hold has a real size to be created at — measured, not guessed,
+        // because a popup window needs its extent before it exists.
+        let menu = a.menu_view();
+        let size = libui::layout::measure(
+            &menu,
+            libui::layout::Constraints::loose(bounds.size),
+            &cell,
+        );
+        assert!(size.w > 0 && size.h > 0, "the menu measures to something");
+        assert!(
+            item.bottom() + size.h as i64 > BAR_H as i64,
+            "and it extends past the bar it hangs from — which only a window can do"
+        );
     }
 
     #[test]

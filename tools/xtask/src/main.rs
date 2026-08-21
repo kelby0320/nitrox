@@ -1190,6 +1190,56 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
+/// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxterm`'s menu-popup line.
+///
+/// Hand-parsed for the same reason the QMP reply is: xtask carries no regex dependency, and the
+/// shape here is fixed by the one line that emits it.
+fn parse_popup_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
+    let mut it = rest.split_whitespace();
+    let id = it.next()?.parse().ok()?;
+    if it.next()? != "at" {
+        return None;
+    }
+    let (x, y) = it.next()?.split_once(',')?;
+    let (w, h) = it.next()?.split_once('x')?;
+    Some((id, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
+}
+
+/// Pin the pointer to the bottom-right corner, then walk it to `(x, y)`.
+///
+/// **Relative injection, so the pointer must be somewhere known first.** A PS/2 packet carries a
+/// 9-bit signed delta, so one huge motion is a different movement rather than a big one — the
+/// steps are bounded, and the corner is reached by over-driving into the clamp.
+fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
+    for _ in 0..20 {
+        qmp.send_motion(100, 100)?; // pin to (1279, 799)
+    }
+    let (mut dx, mut dy) = (x - 1279, y - 799);
+    while dx != 0 || dy != 0 {
+        let sx = dx.clamp(-100, 100);
+        let sy = dy.clamp(-100, 100);
+        qmp.send_motion(sx, sy)?;
+        dx -= sx;
+        dy -= sy;
+    }
+    Ok(())
+}
+
+///
+/// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →
+/// `tty-server` → `nxsh` → back out → the terminal's grid. Every piece of it has its own test;
+/// none of those can tell you the pieces are joined.
+///
+/// **Asserted on the grid's contents, not on pixels.** What a shell prints is not fixed by this
+/// milestone, so comparing pixels would pin it — and the display gate already compares a
+/// *fixed* terminal render, which is the part that must not drift. Under `test-harness`,
+/// `nxterm` reports each completed grid line on the debug console; that is what this reads.
+///
+/// **It clicks before it types**, which is not ceremony. `nxterm` is created first so it sits at
+/// the bottom of the stack (windows stack at the origin in creation order and it is the
+/// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
+/// it, which is both how a user would do it and the only mechanism available: there is no op to
+/// raise a window, and there will not be until Milestone 6.
 /// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
 ///
 /// **Status 2026-08-13 (superseding an earlier status the same day): the flake was real, and it
@@ -1216,22 +1266,6 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 /// recurrence reports coordinates rather than a bare timeout. That failure is still
 /// unexplained. The deferral entry that used to hold this record has moved to the resolved
 /// table; the live record is now `docs/decision-log.md`, 2026-08-18.
-
-///
-/// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →
-/// `tty-server` → `nxsh` → back out → the terminal's grid. Every piece of it has its own test;
-/// none of those can tell you the pieces are joined.
-///
-/// **Asserted on the grid's contents, not on pixels.** What a shell prints is not fixed by this
-/// milestone, so comparing pixels would pin it — and the display gate already compares a
-/// *fixed* terminal render, which is the part that must not drift. Under `test-harness`,
-/// `nxterm` reports each completed grid line on the debug console; that is what this reads.
-///
-/// **It clicks before it types**, which is not ceremony. `nxterm` is created first so it sits at
-/// the bottom of the stack (windows stack at the origin in creation order and it is the
-/// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
-/// it, which is both how a user would do it and the only mechanism available: there is no op to
-/// raise a window, and there will not be until Milestone 6.
 fn cmd_check_terminal(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
@@ -1331,6 +1365,7 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // may already have had focus and no event is sent for that.
     session.expect("nxterm: clicked")?;
 
+
     // **One character at a time, each waited for.** Two reasons, and the second is the one
     // that cost an afternoon.
     //
@@ -1366,8 +1401,51 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // `desktop-shell` constructs a namespace per application.
     session.expect("nxterm: grid> ")?;
 
+    // **The menu is a window now (M6 C3).** It was a `Stack` layer over the terminal, which
+    // worked only because it happened to fit inside it; as a `popup` it is parented to the
+    // terminal, placed by `nxterm` at the anchor its own layout gives, and clipped by the
+    // screen rather than by its parent.
+    //
+    // **F1, not a click on the bar.** `nxterm` is created before `ui-testclient`'s windows, so
+    // the bar button that normally opens the menu is underneath them and cannot be clicked. A
+    // key can be injected, and doing it *here* — after everything typed at the shell has been
+    // asserted — matters: an open menu is a topmost popup and takes the keyboard, so opening it
+    // earlier would swallow the typing this gate exists to check.
+    qmp.send_key("f1", true)?;
+    qmp.send_key("f1", false)?;
+    session.expect("nxterm: menu popup ")?;
+    // `<id> at <x>,<y> <w>x<h>`, in screen coordinates — the compositor resolved the offset
+    // against the terminal's origin, so this is where a click has to be aimed.
+    let line = session.rest_of_line()?;
+    let Some((_, px, py, pw, ph)) = parse_popup_line(&line) else {
+        let _ = session.child.kill();
+        return Err(format!("could not read the popup's geometry from {line:?}").into());
+    };
+    println!("  ok: the menu is a window: {line}");
+    if pw == 0 || ph == 0 {
+        let _ = session.child.kill();
+        return Err(format!("the menu popup has no extent: {line:?}").into());
+    }
+
+    // **Click the menu.** This is the whole of C3 in one step: the record names the popup,
+    // `libsurface` routes it to the popup's own tree rather than the terminal's, and the item
+    // it lands on produces a message. Before part 1 the record could not say which window it
+    // was for; before part 2 the client could not hold both windows at once.
+    //
+    // The upper quarter, so it lands on the first item rather than near the boundary between
+    // the two. The press position is asserted before the effect, for the reason the click above
+    // states: it separates "the pointer was not there" from "the pointer was there and nothing
+    // happened".
+    let (cx, cy) = (px + pw as i32 / 2, py + ph as i32 / 4);
+    move_pointer_to(&mut qmp, cx, cy)?;
+    qmp.send_button("left", true)?;
+    qmp.send_button("left", false)?;
+    session.expect(&format!("compositor: press at x={cx} y={cy}"))?;
+    session.expect("nxterm: menu chose Clear")?;
+
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
+
     println!(
         "\nxtask: terminal gate PASSED — a keystroke reached the shell and its answer \
          reached the grid ✓"
@@ -2286,6 +2364,34 @@ impl Session {
         Ok(Session { child, out, cursor: 0, gate, sent_since_match: Vec::new() })
     }
 
+    /// The rest of the line the last [`expect`](Self::expect) matched on.
+    ///
+    /// For the few assertions that need a *value* the guest computed rather than a string it
+    /// was always going to print — a window's id and geometry, say, which the host cannot know
+    /// and must not guess. Read after `expect` has moved the cursor past the pattern.
+    fn rest_of_line(&self) -> R<String> {
+        // **Wait for the newline.** `expect` returns the instant the *prefix* appears, and the
+        // guest's line reaches the host serial in whatever chunks `read` happens to return — so
+        // taking what is there can take half a line. Reading `"… popup 138 at 0,"` and failing
+        // to parse it would be a rare, confusing gate failure with nothing wrong in the guest
+        // (PR #223 review, finding 6).
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let tail = &g[self.cursor..];
+                if let Some(end) = tail.find('\n') {
+                    return Ok(tail[..end].trim().to_string());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("the guest never finished the line after the matched prefix".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Wait for `pat` in output not yet consumed. The guest paces the test.
     fn expect(&mut self, pat: &str) -> R<()> {
         // **An `expect` the guest's echo can satisfy is not an assertion.** The terminal
@@ -2372,7 +2478,6 @@ impl Session {
         }
     }
 
-    /// Type a line, Enter included.
     /// Send bytes with **no trailing newline** — for keys that are not a line.
     ///
     /// `Ctrl-C` is the case that needs it: appending `\n` would submit the line as well as
@@ -2386,6 +2491,7 @@ impl Session {
         Ok(())
     }
 
+    /// Type a line, Enter included.
     fn send(&mut self, line: &str) -> R<()> {
         use std::io::Write as _;
         self.sent_since_match.push(line.to_string());

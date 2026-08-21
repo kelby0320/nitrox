@@ -1381,7 +1381,7 @@ item. Two facts found while detailing changed the shape of the work:
       client. Nor does M6 expose the screen size so a client can flip a menu upward — that is a
       contract the shell (M7) may want to own, and nothing in M6 places a window near an edge.
 
-- [ ] **C3 — `nxterm`'s menu becomes a real popup**, which is the first honest consumer and the
+- [x] **C3 — `nxterm`'s menu becomes a real popup** ✅ 2026-08-20., which is the first honest consumer and the
       thing that proves C1/C2 rather than asserting them. This is also the moment `libui`'s
       in-window popup stops being the only option, so the toolkit's `offset` gets a doc note
       saying which to reach for.
@@ -1408,8 +1408,18 @@ item. Two facts found while detailing changed the shape of the work:
          *own* connection owns. `Session` owns the transport and lends windows through
          `WindowRef`. The compositor gained `MAX_WINDOWS_PER_CONNECTION` at the same time,
          because the old API had been the only bound.
-      3. The conversion itself — a second surface for the menu, its own buffers and render pass,
-         and a loop that routes by window id.
+      3. ✅ *The conversion itself* (2026-08-20) — a second surface for the menu, its own
+         buffers, render pass and diff state, and a loop that routes by window id. `libui`'s
+         `offset` gets no doc note after all: the menu no longer uses it, and the note belongs
+         with whatever still does.
+
+      **And it found a bug that made the whole feature moot.** `libui`'s hit-testing returns the
+      *deepest* widget under the cursor and dispatch looked for a handler on exactly that — but
+      `widget::button` puts its handler on the outer `Stack` and draws a `text` label inside it,
+      so clicking a button hit the label, which handles nothing. **No button in this toolkit was
+      clickable, anywhere.** Nothing caught it because the routing tests attach handlers to
+      leaves and every gate that clicked, clicked a `custom` node, which is a leaf. Dispatch
+      walks up to the nearest ancestor with a handler now.
 
       **Focus comes back for free, and gets a test anyway.** `Role::Popup` takes focus, so the
       menu window takes the keyboard from the grid; on close `focus_candidate` is the topmost
@@ -1418,7 +1428,7 @@ item. Two facts found while detailing changed the shape of the work:
 
 ### Part D — the contract
 
-- [ ] **D1 — `rsproto-surface-ops.md` grows M6's ops.** A resolve path (`manage`), B2's five
+- [x] **D1 — `rsproto-surface-ops.md` grows M6's ops.** ✅ 2026-08-20 — done incrementally as each op landed, and verified against this list: the manager channel section (all six ops), the manager events section, the `manage` resolve path, `Surface::Configure`, and `SetTitle` under "Reserved". Nothing was left for a doc pass at the end, which is what this checkbox existed to prevent. A resolve path (`manage`), B2's five
       manager ops, B3's five manager events, `Surface::Configure` and `Surface::SetTitle`. The spec is the
       canonical contract — its "How a client obtains a connection" section documents
       `/dev/draw/new` as *the* way, and "Which requests reply, and why a client must drain" is

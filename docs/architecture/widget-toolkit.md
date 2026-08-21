@@ -1,6 +1,7 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11), and this document describes what exists.** Milestone 4 built
+**Status: built (2026-08-11, last checked 2026-08-20), and this document describes what
+exists.** Milestone 4 built
 all of it: the retained tree and the declarative `view` (`userspace/libui/src/element.rs`),
 measure/arrange layout (`layout.rs`), the keyed diff that damage falls out of (`diff.rs`),
 per-buffer damage accumulation (`damage.rs`), event routing with implicit capture
@@ -14,8 +15,11 @@ and compares against the guest's screen pixel for pixel.
 runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
 assembles it by hand and is the first application to do so), **theming** (§11), and the
 **text area** (§8, absent on purpose — the terminal's grid is a `custom` widget, so nothing yet
-needs one). The menu's **popup half** left this list in M5 Part B: `offset` + `locate` place it,
-and `nxterm` uses both.
+needs one). The menu's **popup half** left this list in M5 Part B and left the toolkit
+entirely in M6 C3: a menu is a `popup` *window* now, parented to its application's window,
+positioned by the client at the anchor `locate` gives and clipped by the **screen**. `nxterm`
+still uses `locate`; it no longer uses `offset`, which has no consumer outside this crate's own
+tests. A layer can only be clipped to its parent, which is not what a menu needs.
 
 Everything else below describes running code. Three sections carry a **banner** marking them as
 the design argument for something now built, rather than a description of a gap — §9.1 the
@@ -314,6 +318,19 @@ sixty times a second.
 Hit-test the arranged tree **topmost-first** — the reverse of paint order, so an overlay
 menu takes the click that visually landed on it.
 
+**The handler may be on an ancestor of what was hit, and dispatch walks up to find it.** A
+composite widget is built from parts — `button` is a `Stack` carrying `on_press`, with a `fill`
+and a `text` inside it — so the deepest widget under the cursor is one of the *parts*, which
+handles nothing. `on_press` and `on_pointer` are therefore looked for on the hit node and then on
+each ancestor in turn, and the first that has one receives the event **in that widget's
+coordinates**. This is the same rule §7.2 states for keys, arriving late: until M6 C3 no button
+in this toolkit was clickable, because every click landed on a label.
+
+**Focus does not walk up.** It is a claim on the keyboard rather than a response to this event,
+and an ancestor that is `focusable` without an `on_key` — which `button` is — would take the
+keyboard from whatever had it and handle nothing. Clicking a menu bar killed typing until this
+was made an exception.
+
 **A press captures.** Every pointer event up to the release of the last button goes to the
 widget the press landed on, even after the cursor leaves it. This is the same rule the
 compositor applies between windows, one layer down, and it exists for the same reason: a
@@ -383,7 +400,7 @@ public addition rather than a redesign:
 
 | Added | Why the terminal needed it |
 |---|---|
-| `offset` + `layout::locate` | Placing the menu's popup under the item that opened it (§5) |
+| `layout::locate` | Finding where the menu item was laid out, which is the anchor the popup *window* is created at (§5). `offset` was added here for the same job and is no longer used for it — a menu is a window as of M6 C3, and a `stack` layer cannot leave its parent |
 | `ScrollState::offset_at` | `thumb()`'s inverse. M4 could say where a thumb goes for an offset but not what *grabbing* it means, so a scrollbar was a picture of a scrollbar |
 | `diff::Tree::find_by_key` | `locate`'s companion — "which widget is it", where `locate` answers "where was it laid out". A window has to name the widget that starts with the keyboard, and tree order would give it to the menu button |
 

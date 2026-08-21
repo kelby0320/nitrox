@@ -21,18 +21,21 @@ mod backend;
 
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
-use libdraw::geom::Rect;
+use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
-use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, exit, kprint, syscall4};
+use libkern::{
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, exit, kprint, syscall2, syscall4,
+};
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 use libui::diff::Tree;
 use libui::damage::union_opt;
-use libui::layout::{Layout, layout, locate};
+use libui::layout::{Constraints, Layout, layout, locate, measure};
 use libui::paint::FontMetrics;
 use libui::paint::{Theme, paint};
 use libui::route::Router;
+use alloc::boxed::Box;
 use nxterm::{App, GRID_KEY, GRID_KIND, MENU_ITEM_KEY, Msg, rows_in};
 
 /// `alloc` backing — the element tree, the grid and the render all allocate.
@@ -82,6 +85,162 @@ fn fail(msg: &[u8]) -> ! {
     // `Unsupported` and falls through.
     unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
     exit(1);
+}
+
+/// The menu's window, alive only while the menu is open.
+///
+/// **A `popup`, not a layer.** `libui`'s `offset` clips at its parent's edge, which is right one
+/// level down and wrong for a menu — "a menu clipped to its window is not a menu"
+/// (`display-substrate.md` §4a). Until M6 C3 the menu was a `Stack` layer hoisted to the whole
+/// window, which worked only because it happened to fit inside the terminal. As a `popup` window
+/// it is parented to the terminal, positioned by *this* client at the anchor the layout gives,
+/// and clipped only by the screen.
+struct Popup {
+    id: u32,
+    /// Pixels for each buffer, mapped on this side and kept for the popup's life.
+    maps: [*mut u8; BUFFERS],
+    /// Bytes per buffer, for the unmap on close.
+    len: usize,
+    /// Composed here and copied into whichever buffer is free — the same reason the terminal
+    /// window does it: the toolkit's damage describes the last frame, not the free buffer's.
+    scratch: MemFramebuffer,
+    /// Diff state, separate from the terminal's because this is a different tree.
+    tree: Tree,
+    /// Routing state, likewise: focus within the menu is not focus within the terminal.
+    router: Router,
+    size: Size,
+}
+
+impl Popup {
+    /// Create the menu's window at `anchor`, sized to what the menu measures.
+    ///
+    /// **Measured rather than guessed.** A popup window needs its extent before it exists, and
+    /// a hardcoded size would silently stop matching the menu the first time an item is added.
+    /// `Fill` measures as zero, so the backing layer does not inflate this.
+    fn open(
+        session: &mut Session<Box<ChannelTransport>>,
+        parent: u32,
+        anchor: Rect,
+        app: &App,
+        font: &Font,
+    ) -> Option<Self> {
+        let menu = app.menu_view();
+        let m = FontMetrics::new(font, FONT_PX);
+        let size = measure(&menu, Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &m);
+        if size.w == 0 || size.h == 0 {
+            return None;
+        }
+        // Directly under the item it drops from, in the parent's coordinates — which is what
+        // the offset in `CreateWindow` means.
+        let id = session
+            .create(
+                &CreateWindowRequest::at(
+                    size.w,
+                    size.h,
+                    Role::Popup { parent },
+                    anchor.origin.x,
+                    anchor.bottom() as i32,
+                ),
+                BUFFERS,
+            )
+            .ok()?;
+
+        // **Everything after this destroys the window on the way out.** An abandoned popup is
+        // worse than no popup: `Session::create` waited for its first `Configure`, so it is
+        // *configured*, and a configured `popup` is focusable — it becomes the compositor's
+        // topmost focus candidate and stays there. Having committed nothing it is never drawn,
+        // so the result is an invisible window silently eating every keystroke, and the caller
+        // treats the failure as recoverable and carries on (PR #223 review, finding 4).
+        let pitch = size.w as usize * 4;
+        let len = pitch * size.h as usize;
+        let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];
+        let built = (|| {
+            let geometry = Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888)?;
+            for (i, slot) in maps.iter_mut().enumerate() {
+                let (handle, addr) = shared_buffer(len)?;
+                *slot = addr;
+                session.window(id)?.attach(i as u32, size.w, size.h, pitch as u32, handle).ok()?;
+            }
+            Some(geometry)
+        })();
+        let Some(geometry) = built else {
+            if let Some(w) = session.window(id) {
+                let _ = w.destroy();
+            }
+            for addr in maps {
+                if !addr.is_null() {
+                    // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+                    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
+                }
+            }
+            return None;
+        };
+        Some(Self {
+            id,
+            maps,
+            len,
+            scratch: MemFramebuffer::new(geometry),
+            tree: Tree::new(),
+            router: Router::new(),
+            size,
+        })
+    }
+
+    /// Paint the menu and put it on screen **when something changed**, and say whether all is
+    /// well.
+    ///
+    /// **Gated on the diff, like the terminal window is.** Committing every frame instead is
+    /// not merely wasteful: with two buffers the third commit blocks in `acquire` until the
+    /// compositor releases one, and that block is inside the render half of the loop — so the
+    /// tty is never pumped and the shell's output never arrives. The terminal appeared to hang
+    /// with its menu open.
+    ///
+    /// The region is the whole window when it does repaint: it is tiny, and tracking damage
+    /// within it would be more state than it saves.
+    fn present(
+        &mut self,
+        session: &mut Session<Box<ChannelTransport>>,
+        app: &App,
+        font: &Font,
+        theme: &Theme,
+    ) -> bool {
+        let menu = app.menu_view();
+        let bounds = Rect::new(0, 0, self.size.w, self.size.h);
+        let l = layout(&menu, bounds, &FontMetrics::new(font, FONT_PX));
+        match self.tree.update(&menu, &l) {
+            Ok(None) => return true, // nothing changed; the frame on screen is still right
+            Ok(Some(_)) => {}
+            Err(_) => return false,
+        }
+        paint(&mut self.scratch, font, theme, &menu, &l, bounds, &mut |_, _, _, _| {});
+        let Some(mut w) = session.window(self.id) else { return false };
+        let Ok(b) = w.acquire() else { return false };
+        // SAFETY: `maps[b]` maps `len` writable bytes and `scratch` holds exactly `len`; the two
+        // are distinct allocations.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.scratch.bytes().as_ptr(), self.maps[b as usize], self.len)
+        };
+        session
+            .window(self.id)
+            .is_some_and(|mut w| w.commit(b, (0, 0, self.size.w, self.size.h)).is_ok())
+    }
+
+    /// Destroy the window and give the client's half of the pixels back.
+    ///
+    /// The compositor drops its mapping when the window goes; this is the mapping on *this*
+    /// side, which nothing else would ever release — a menu opened and closed a hundred times
+    /// would otherwise grow this process by a hundred buffers.
+    fn close(self, session: &mut Session<Box<ChannelTransport>>) {
+        if let Some(w) = session.window(self.id) {
+            let _ = w.destroy();
+        }
+        for addr in self.maps {
+            if !addr.is_null() {
+                // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+                unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, self.len as u64) };
+            }
+        }
+    }
 }
 
 /// Paint `damage` of `app` into `fb`.
@@ -225,6 +384,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
+    // The menu's window while it is open, and nothing at all while it is not — a popup is
+    // transient by role, so closing the menu destroys it rather than hiding it.
+    let mut popup: Option<Popup> = None;
+    // Set once, by the harness click below, to open the menu — see there.
+    #[cfg(feature = "test-harness")]
+    let mut opened_for_harness = false;
 
     // **The tty, and the shell on the other end of it.** Part C's whole point: the terminal is
     // obtained like any program's, this process becomes its backend, and the terminal itself is
@@ -256,6 +421,52 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // The anchor for the next frame's popup. Read every frame rather than only when the
         // menu opens: the item's position is a fact about the layout, not about the menu.
         app.menu_anchor = locate(&ui, &l, MENU_ITEM_KEY);
+
+        // ---- the menu's window ----
+        //
+        // **Opened and destroyed with the menu**, because `popup` is a transient role: the
+        // compositor takes it with its parent, it takes keyboard focus while it is up, and a
+        // hidden one would still be a window in the stack. The anchor has to exist first —
+        // before the first layout there is nowhere to put it, which is why this reads the
+        // anchor computed just above rather than the one from when the menu was toggled.
+        match (app.menu_open, popup.is_some(), app.menu_anchor) {
+            (true, false, Some(anchor)) => {
+                popup = Popup::open(&mut win, window_id, anchor, &app, &font);
+                // **Where it is and how big**, because the gate has no other way to see a
+                // second window: it reads the serial log, and this is the only thing that
+                // says the menu became a window rather than a layer. The origin is in screen
+                // coordinates, which is what a click has to be aimed at.
+                #[cfg(feature = "test-harness")]
+                if let Some(p) = popup.as_ref() {
+                    let o = win
+                        .window(p.id)
+                        .and_then(|w| w.configured())
+                        .map_or((0, 0), |c| (c.x, c.y));
+                    libkern::debug::Line::new()
+                        .s(b"nxterm: menu popup ").u(p.id as u64)
+                        .s(b" at ").i(o.0 as i64).s(b",").i(o.1 as i64)
+                        .s(b" ").u(p.size.w as u64).s(b"x").u(p.size.h as u64)
+                        .end();
+                }
+                if popup.is_none() {
+                    // Not fatal: the terminal is still usable without its menu, and saying so
+                    // beats a window that silently never appears.
+                    kprint(b"nxterm: could not open the menu popup\n");
+                    app.menu_open = false;
+                }
+            }
+            (false, true, _) => {
+                if let Some(p) = popup.take() {
+                    p.close(&mut win);
+                }
+            }
+            _ => {}
+        }
+        if let Some(p) = popup.as_mut()
+            && !p.present(&mut win, &app, &font, &theme)
+        {
+            kprint(b"nxterm: the menu popup could not be drawn\n");
+        }
 
         let ui_damage = match tree.update(&ui, &l) {
             Ok(d) => d,
@@ -355,14 +566,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // shell's output only after the next keystroke — a prompt one keypress late. So the
         // window's handle and the backend's go into one `sys_wait`, and the events are drained
         // non-blockingly afterwards. A terminal with no backend keeps the simple path.
-        let mut events: alloc::vec::Vec<WindowEvent> = alloc::vec::Vec::new();
+        let mut events: alloc::vec::Vec<(u32, WindowEvent)> = alloc::vec::Vec::new();
         match backend.as_ref().map(|b| b.channel).filter(|_| win.wait_handle() != 0) {
             Some(bch) => {
                 loop {
                     match win.poll_event() {
-                        // The id is discarded: one window today, and `Session`
-                        // has already filtered out anything that is not for it.
-                        Ok(Some((_, e))) => events.push(e),
+                        // **The id is kept.** With the menu open this session holds two
+                        // windows, and a click on the menu is not a click on the terminal.
+                        Ok(Some(ev)) => events.push(ev),
                         Ok(None) => break,
                         Err(_) => {
                             kprint(b"nxterm: the compositor went away\n");
@@ -376,7 +587,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 }
             }
             None => match win.wait_event() {
-                Ok((_, e)) => events.push(e),
+                Ok(ev) => events.push(ev),
                 Err(_) => {
                     kprint(b"nxterm: the compositor went away\n");
                     exit(0);
@@ -384,7 +595,45 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             },
         }
 
-        for event in events {
+        for (from, event) in events {
+        // **The menu's window routes through the menu's tree.** Same `App`, so an item's `Msg`
+        // updates the same state; different tree, layout and router, because they describe a
+        // different window. A record for a window that is not one of these two is not possible
+        // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
+        // dropped rather than routed into the terminal.
+        if popup.as_ref().is_some_and(|p| p.id == from) {
+            let menu = app.menu_view();
+            let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
+            let ml = layout(&menu, bounds, &FontMetrics::new(&font, FONT_PX));
+            let msgs: alloc::vec::Vec<Msg> = match event {
+                WindowEvent::Key(k) => popup
+                    .as_mut()
+                    .and_then(|p| p.router.key(&p.tree, &menu, k))
+                    .into_iter()
+                    .collect(),
+                WindowEvent::Pointer(pt) => popup
+                    .as_mut()
+                    .map(|p| p.router.pointer(&p.tree, &menu, &ml, pt).0)
+                    .unwrap_or_default(),
+                _ => alloc::vec::Vec::new(),
+            };
+            for msg in msgs {
+                // **The routing proof.** A record arrived naming the popup's window, was routed
+                // through the popup's own tree, and produced a message — three things that were
+                // each impossible before C3's parts 1 and 2.
+                #[cfg(feature = "test-harness")]
+                match msg {
+                    Msg::Clear => kprint(b"nxterm: menu chose Clear\n"),
+                    Msg::Reset => kprint(b"nxterm: menu chose Reset\n"),
+                    _ => {}
+                }
+                app.update(msg);
+            }
+            continue;
+        }
+        if from != window_id {
+            continue;
+        }
         match event {
             // **Everything goes through the router**, including the keys that end up as text:
             // the grid is a focusable widget with an `on_key`, so "typed a character" and
@@ -392,6 +641,17 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // it. Whether a key types at all — a repeat does, a release does not — is
             // `App::key`'s, because it is a fact about terminals and not about routing.
             WindowEvent::Key(k) => {
+                // **F1 opens the menu, under the harness only.** The gate cannot click the bar
+                // button that normally opens it: `nxterm` is created before `ui-testclient`'s
+                // windows, so its top-left is underneath them. A key it can inject, and doing
+                // it on the gate's schedule matters — an open menu is topmost and takes the
+                // keyboard, so opening it earlier would swallow everything typed at the shell.
+                #[cfg(feature = "test-harness")]
+                if k.keycode == 59 && k.pressed != 0 && !opened_for_harness {
+                    opened_for_harness = true;
+                    app.update(Msg::ToggleMenu);
+                    continue;
+                }
                 if let Some(msg) = router.key(&tree, &ui, k) {
                     app.update(msg);
                 }

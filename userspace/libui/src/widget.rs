@@ -224,9 +224,11 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, palette: &Pal
 
 /// A horizontal bar of buttons — a menu bar, or a toolbar.
 ///
-/// The popup half of a menu is not here: an open menu is a `stack` layer the application adds
-/// over its content, which needs the popup positioned under its item and is Milestone 5's
-/// first real requirement for it. This is the part the terminal's chrome needs.
+/// The popup half of a menu is not here, and is not a widget at all: an open menu is a `popup`
+/// **window**, parented to the application's window and clipped by the screen. It was a `stack`
+/// layer over the application's content until M6 C3, which works only for a menu that fits
+/// inside the window it drops from. This is the part the terminal's chrome needs; the anchor it
+/// is dropped from comes from [`layout::locate`](crate::layout::locate).
 pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, palette: &Palette) -> Element<Msg> {
     sized(
         Size::new(0, height),
