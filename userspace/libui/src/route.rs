@@ -304,14 +304,35 @@ impl Router {
 
         if let Some(id) = target
             && let Some(path) = path_to_id(tree.root(), id)
-            && let Some(e) = element_at(element, &path)
         {
+            // **The handler may be on an ancestor of what was hit, so look up the path.**
+            // `hit_test` returns the *deepest* widget under the cursor, and a widget that draws
+            // itself out of smaller pieces puts its handler on the outside: `widget::button` is
+            // a `Stack` carrying `on_press`, with a `fill` and a `text` inside it. Clicking the
+            // label therefore hit the label, which handles nothing — so **no button in this
+            // toolkit was clickable**, anywhere, until this walked up to find the handler.
+            //
+            // Nothing caught it because the routing tests attach handlers to leaves and the
+            // gates only ever clicked `custom` nodes, which are leaves. Found by `nxterm`'s
+            // menu becoming a real popup and the gate clicking an item (M6 C3).
+            let nearest = |has: &dyn Fn(&Element<Msg>) -> bool| -> Option<(usize, &Element<Msg>)> {
+                (0..=path.len()).rev().find_map(|n| {
+                    let e = element_at(element, &path[..n])?;
+                    has(e).then_some((n, e))
+                })
+            };
+
             if !window_crossing
+                && let Some((n, e)) = nearest(&|e: &Element<Msg>| e.on_pointer.is_some())
                 && let Some(f) = e.on_pointer
-                && let Some(l) = layout_at(layout, &path)
+                && let Some(l) = layout_at(layout, &path[..n])
             {
                 out.push(f(localise(event, l.rect)));
             }
+            let e = match element_at(element, &path) {
+                Some(e) => e,
+                None => return (out, target),
+            };
             // A **click** is a release inside the widget that took the press. Releasing
             // outside is a cancel, which is why this is not simply "on release".
             //
@@ -325,16 +346,22 @@ impl Router {
             // inside a `padding` silently lost its clicks (PR #184 review, finding 1).
             if released
                 && self.capture_button == Some(event.button)
-                && let Some(msg) = e.on_press.clone()
-                && let Some(l) = layout_at(layout, &path)
+                && let Some((n, pe)) = nearest(&|e: &Element<Msg>| e.on_press.is_some())
+                && let Some(msg) = pe.on_press.clone()
+                && let Some(l) = layout_at(layout, &path[..n])
                 && l.rect.contains(event.x, event.y)
             {
                 out.push(msg);
             }
-            // Click to focus, but only where focus can land.
-            if pressed && e.focusable {
-                self.focus = Some(id);
+            // Click to focus, but only where focus can land — which is also an ancestor's
+            // property: `button` marks the `Stack` focusable, not the label inside it.
+            if pressed
+                && let Some((n, _)) = nearest(&|e: &Element<Msg>| e.focusable)
+                && let Some(fid) = id_at_path(tree.root(), &path[..n])
+            {
+                self.focus = Some(fid);
             }
+            let _ = e;
         }
 
         if released && event.buttons == 0 {
@@ -455,6 +482,15 @@ fn path_to_id(root: Option<&Widget>, id: u64) -> Option<Path> {
 }
 
 /// The element at `path`, walking [`Element::children`] order.
+/// The id of the widget at `path`, for the ancestor a handler was actually found on.
+fn id_at_path(root: Option<&Widget>, path: &[usize]) -> Option<u64> {
+    let mut w = root?;
+    for &i in path {
+        w = w.children.get(i)?;
+    }
+    Some(w.id)
+}
+
 fn element_at<'a, Msg>(e: &'a Element<Msg>, path: &[usize]) -> Option<&'a Element<Msg>> {
     let mut cur = e;
     for &i in path {
@@ -545,6 +581,45 @@ mod tests {
     /// record belongs to this window before it gets here.
     fn key(code: u16) -> KeyEvent {
         KeyEvent::new(1, code, 1, 0)
+    }
+
+    /// A press inside a `button` in a padded column inside a stack produces its message.
+    ///
+    /// The exact shape `nxterm`'s menu takes — a backing `fill` under a padded column of
+    /// buttons — checked because a popup made of it was hit-testing to the column rather than
+    /// to the button under the cursor.
+    #[test]
+    fn a_press_on_a_button_in_a_padded_column_produces_its_message() {
+        use crate::element::padding;
+        use crate::widget::{Palette, WidgetState, button};
+        use crate::element::Insets;
+
+        let p = Palette::default();
+        let e: Element<Msg> = stack(vec![
+            crate::element::fill(p.face),
+            padding(
+                Insets::all(2),
+                column(vec![
+                    button("Clear", Msg::Pressed(1), WidgetState::default(), &p),
+                    button("Reset", Msg::Pressed(2), WidgetState::default(), &p),
+                ]),
+            ),
+        ]);
+        // A window the size the menu measures to, as the popup is created at.
+        let size = crate::layout::measure(&e, crate::layout::Constraints::loose(SCREEN.size), &CELL);
+        let bounds = Rect::new(0, 0, size.w, size.h);
+        let l = layout(&e, bounds, &CELL);
+        let mut t = Tree::new();
+        t.update(&e, &l).expect("a clean frame");
+
+        let mut r = Router::new();
+        // The upper quarter: inside the first button, clear of the boundary.
+        let at = (bounds.size.w as i32 / 2, bounds.size.h as i32 / 4);
+        // A click is a press *and* a release inside the widget the press captured.
+        let (_, hit) = r.pointer(&t, &e, &l, press(at.0, at.1));
+        assert!(hit.is_some(), "something was hit at {at:?} in {bounds:?}");
+        let (msgs, _) = r.pointer(&t, &e, &l, release(at.0, at.1));
+        assert_eq!(msgs, vec![Msg::Pressed(1)], "the first item's message, at {at:?}");
     }
 
     #[test]
