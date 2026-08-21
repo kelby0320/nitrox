@@ -145,15 +145,36 @@ impl Popup {
             )
             .ok()?;
 
+        // **Everything after this destroys the window on the way out.** An abandoned popup is
+        // worse than no popup: `Session::create` waited for its first `Configure`, so it is
+        // *configured*, and a configured `popup` is focusable — it becomes the compositor's
+        // topmost focus candidate and stays there. Having committed nothing it is never drawn,
+        // so the result is an invisible window silently eating every keystroke, and the caller
+        // treats the failure as recoverable and carries on (PR #223 review, finding 4).
         let pitch = size.w as usize * 4;
         let len = pitch * size.h as usize;
-        let geometry = Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888)?;
         let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];
-        for (i, slot) in maps.iter_mut().enumerate() {
-            let (handle, addr) = shared_buffer(len)?;
-            *slot = addr;
-            session.window(id)?.attach(i as u32, size.w, size.h, pitch as u32, handle).ok()?;
-        }
+        let built = (|| {
+            let geometry = Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888)?;
+            for (i, slot) in maps.iter_mut().enumerate() {
+                let (handle, addr) = shared_buffer(len)?;
+                *slot = addr;
+                session.window(id)?.attach(i as u32, size.w, size.h, pitch as u32, handle).ok()?;
+            }
+            Some(geometry)
+        })();
+        let Some(geometry) = built else {
+            if let Some(w) = session.window(id) {
+                let _ = w.destroy();
+            }
+            for addr in maps {
+                if !addr.is_null() {
+                    // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+                    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
+                }
+            }
+            return None;
+        };
         Some(Self {
             id,
             maps,

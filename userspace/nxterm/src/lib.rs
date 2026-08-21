@@ -231,15 +231,6 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::ToggleMenu => self.menu_open = !self.menu_open,
-            // **Choosing an item dismisses the menu**, which is what every menu does and what
-            // makes the popup transient: it is destroyed, and the keyboard goes back to the
-            // grid — a menu that stayed up would keep focus and the next keystroke would go
-            // to it rather than to the shell.
-            Msg::Clear | Msg::Reset if self.menu_open => {
-                self.menu_open = false;
-                let m = if matches!(msg, Msg::Clear) { Msg::Clear } else { Msg::Reset };
-                self.update(m);
-            }
             Msg::Clear => {
                 // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
                 // one implementation of it rather than a menu-shaped second one.

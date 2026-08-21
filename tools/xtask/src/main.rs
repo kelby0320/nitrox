@@ -1190,33 +1190,6 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
-/// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
-///
-/// **Status 2026-08-13 (superseding an earlier status the same day): the flake was real, and it
-/// was not in the harness.** This gate spent two milestones failing, and the standing diagnosis
-/// here blamed "driving a GUI from QMP" and suspected an `input-server` bug where a consumer
-/// disconnecting cost the others their stream. **Both were wrong**, and the second sent at least
-/// one investigation after a bug that does not exist.
-///
-/// The cause was a kernel deadlock: the boot self-test's verdict syscall parked a CPU that the
-/// scheduler still counted online, so the next TLB shootdown — any large `free` in any process —
-/// waited forever for an acknowledgement it could never get. `nxterm` froze mid-repaint while
-/// freeing a glyph outline, which is why it looked like a terminal that stops on a particular
-/// keystroke. Fixed 2026-08-13; see the decision log.
-///
-/// One piece of the old diagnosis survives and is still load-bearing below: **a keystroke is not
-/// cheap.** The terminal repaints, waits for a free buffer and copies a window of pixels before
-/// it looks at input again, so keys injected as fast as QMP sends them outrun it. Pacing on the
-/// echo is the fix, and it is what the typing loop does.
-///
-/// **Wired into CI** since 2026-08-18 (`.github/workflows/ci.yml`, the QEMU integration job,
-/// unconditional), on 64 consecutive passes. The bar was never the count: the audit logged one
-/// unreproduced failure at the click step, and what made promotion defensible is that this gate
-/// now asserts *where* the press landed before asserting that `nxterm` received it, so a
-/// recurrence reports coordinates rather than a bare timeout. That failure is still
-/// unexplained. The deferral entry that used to hold this record has moved to the resolved
-/// table; the live record is now `docs/decision-log.md`, 2026-08-18.
-
 /// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxterm`'s menu-popup line.
 ///
 /// Hand-parsed for the same reason the QMP reply is: xtask carries no regex dependency, and the
@@ -1267,6 +1240,32 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
 /// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
 /// it, which is both how a user would do it and the only mechanism available: there is no op to
 /// raise a window, and there will not be until Milestone 6.
+/// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
+///
+/// **Status 2026-08-13 (superseding an earlier status the same day): the flake was real, and it
+/// was not in the harness.** This gate spent two milestones failing, and the standing diagnosis
+/// here blamed "driving a GUI from QMP" and suspected an `input-server` bug where a consumer
+/// disconnecting cost the others their stream. **Both were wrong**, and the second sent at least
+/// one investigation after a bug that does not exist.
+///
+/// The cause was a kernel deadlock: the boot self-test's verdict syscall parked a CPU that the
+/// scheduler still counted online, so the next TLB shootdown — any large `free` in any process —
+/// waited forever for an acknowledgement it could never get. `nxterm` froze mid-repaint while
+/// freeing a glyph outline, which is why it looked like a terminal that stops on a particular
+/// keystroke. Fixed 2026-08-13; see the decision log.
+///
+/// One piece of the old diagnosis survives and is still load-bearing below: **a keystroke is not
+/// cheap.** The terminal repaints, waits for a free buffer and copies a window of pixels before
+/// it looks at input again, so keys injected as fast as QMP sends them outrun it. Pacing on the
+/// echo is the fix, and it is what the typing loop does.
+///
+/// **Wired into CI** since 2026-08-18 (`.github/workflows/ci.yml`, the QEMU integration job,
+/// unconditional), on 64 consecutive passes. The bar was never the count: the audit logged one
+/// unreproduced failure at the click step, and what made promotion defensible is that this gate
+/// now asserts *where* the press landed before asserting that `nxterm` received it, so a
+/// recurrence reports coordinates rather than a bare timeout. That failure is still
+/// unexplained. The deferral entry that used to hold this record has moved to the resolved
+/// table; the live record is now `docs/decision-log.md`, 2026-08-18.
 fn cmd_check_terminal(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
@@ -2365,19 +2364,35 @@ impl Session {
         Ok(Session { child, out, cursor: 0, gate, sent_since_match: Vec::new() })
     }
 
-    /// Wait for `pat` in output not yet consumed. The guest paces the test.
     /// The rest of the line the last [`expect`](Self::expect) matched on.
     ///
     /// For the few assertions that need a *value* the guest computed rather than a string it
     /// was always going to print — a window's id and geometry, say, which the host cannot know
     /// and must not guess. Read after `expect` has moved the cursor past the pattern.
     fn rest_of_line(&self) -> R<String> {
-        let g = self.out.lock().map_err(|_| "transcript lock")?;
-        let tail = &g[self.cursor..];
-        let end = tail.find('\n').unwrap_or(tail.len());
-        Ok(tail[..end].trim().to_string())
+        // **Wait for the newline.** `expect` returns the instant the *prefix* appears, and the
+        // guest's line reaches the host serial in whatever chunks `read` happens to return — so
+        // taking what is there can take half a line. Reading `"… popup 138 at 0,"` and failing
+        // to parse it would be a rare, confusing gate failure with nothing wrong in the guest
+        // (PR #223 review, finding 6).
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let tail = &g[self.cursor..];
+                if let Some(end) = tail.find('\n') {
+                    return Ok(tail[..end].trim().to_string());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("the guest never finished the line after the matched prefix".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
+    /// Wait for `pat` in output not yet consumed. The guest paces the test.
     fn expect(&mut self, pat: &str) -> R<()> {
         // **An `expect` the guest's echo can satisfy is not an assertion.** The terminal
         // echoes what the harness types and `expect` takes the first match, which is always
@@ -2463,7 +2478,6 @@ impl Session {
         }
     }
 
-    /// Type a line, Enter included.
     /// Send bytes with **no trailing newline** — for keys that are not a line.
     ///
     /// `Ctrl-C` is the case that needs it: appending `\n` would submit the line as well as
@@ -2477,6 +2491,7 @@ impl Session {
         Ok(())
     }
 
+    /// Type a line, Enter included.
     fn send(&mut self, line: &str) -> R<()> {
         use std::io::Write as _;
         self.sent_since_match.push(line.to_string());
