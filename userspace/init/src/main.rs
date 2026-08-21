@@ -1816,16 +1816,26 @@ fn run_ui_testclient(root_ns: u64) {
 /// reschedule IPI; see the 2026-07-20 decision log). The prior demo→login *sequencing* was
 /// a workaround for that hang and is no longer needed. (This is a concurrency *smoke test*,
 /// not a deterministic catch of that specific timing bug, which only reproduced under
-/// sustained multi-second load.) session-mgr fires the `test-harness` verdict once login is
-/// proven; a crashed demo `parent` fails the run first (in `reap_loop`).
+/// sustained multi-second load.)
+///
+/// **This function's ordering is the argument that the boot verdict is airtight**, so it is
+/// worth stating rather than leaving implicit. The demo chain runs **synchronously** and a
+/// non-zero exit fails the run here; only then is the login chain handed off, and only then
+/// does `service-mgr` start `boot-probe`, which runs the SMP and floating-point gates and
+/// fires the single `SYS_TEST_EXIT(PASS)`. So everything the run adjudicates has already
+/// happened when those gates run. That placement is why `fp_gate` was moved out of the demo
+/// `parent` in the first place — it completed in 2 of 15 KVM runs there, because whoever owns
+/// the verdict races the demo chain — and it survived the verdict moving out of `session-mgr`
+/// (retrofit Part B) only because of the sequencing below.
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
         // Serial adjudication (decision log 2026-07-24): run the integration test harness
         // **first**, synchronously — a non-zero exit fails the run, and a hang fails it via
-        // the runner's wall-clock timeout (init never reaches the verdict) — **then** hand
-        // off to the login chain, which fires the PASS verdict once login is proven. (The
-        // earlier harness/login concurrency is retired with the parent/child demos.)
+        // the runner's wall-clock timeout (nothing ever reaches the verdict) — **then** hand
+        // off to the login chain. `service-mgr` starts `boot-probe` from that chain, and the
+        // probe fires the PASS verdict after its gates. (The earlier harness/login
+        // concurrency is retired with the parent/child demos.)
         if !run_test_harness(notif, root_ns) {
             kprint(b"init: integration test harness FAILED\n");
             #[cfg(feature = "test-harness")]
@@ -1836,9 +1846,11 @@ fn supervise(notif: u64, root_ns: u64) -> ! {
         kprint(b"init: harness passed; handing off to login chain\n");
         let smgr_h = spawn_service_mgr(root_ns);
         if smgr_h >= 0 {
-            // service-mgr runs independently and fires the verdict once login is proven
-            // (or drops to the `login:` prompt in an interactive selftest). SAFETY:
-            // closing init's reference; service-mgr runs on.
+            // service-mgr runs independently: it brings up the login chain — which reaches a
+            // `login:` prompt nobody answers under `test-qemu`, and a real one under
+            // `test-interactive` — and starts the declared services, `boot-probe` among them
+            // in a test image. The verdict comes from there. SAFETY: closing init's
+            // reference; service-mgr runs on.
             unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
         }
         reap_loop(notif, root_ns, 0);
