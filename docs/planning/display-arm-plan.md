@@ -1397,12 +1397,19 @@ item. Two facts found while detailing changed the shape of the work:
       compositor would be shaping the terminal around its gate. C2's host tests and a
       `ui-testclient` case carry the geometry; `nxterm` carries the plumbing.
 
-      **Blocked on a `libsurface` change C1 discovered.** `Window` owns its `Transport`, so a
-      client can hold exactly one window per connection — while a popup may only name a parent
-      its *own* connection owns. `nxterm` therefore cannot have its terminal window and its menu
-      at the same time until `libsurface` grows a session type that owns the transport and mints
-      windows from it. The protocol has no such limit; the API does. `TODO(libsurface-multi-window)`,
-      and it is the first thing C3 has to build.
+      **Three pieces, two of them prerequisites, both now done.**
+
+      1. ✅ *Input records name their window* (2026-08-20). `KeyEvent` and `PointerEvent` carried
+         no window id, so a client with a menu open could not tell a click on the menu from one
+         on the window beneath. Closed the deferral filed at the PR #184 re-review, whose stated
+         trigger was "the first client with two windows".
+      2. ✅ *`libsurface` grew a session type* (2026-08-20). `Window` owned its `Transport`, so a
+         client held one usable window per connection while a popup may only name a parent its
+         *own* connection owns. `Session` owns the transport and lends windows through
+         `WindowRef`. The compositor gained `MAX_WINDOWS_PER_CONNECTION` at the same time,
+         because the old API had been the only bound.
+      3. The conversion itself — a second surface for the menu, its own buffers and render pass,
+         and a loop that routes by window id.
 
       **Focus comes back for free, and gets a test anyway.** `Role::Popup` takes focus, so the
       menu window takes the keyboard from the grid; on close `focus_candidate` is the topmost

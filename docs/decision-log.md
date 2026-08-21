@@ -16659,3 +16659,45 @@ will break none.
 
 Measured blast radius: 7 crates touched, and the producers already had the window id in scope at
 both sites — the compositor knew which window it had routed to and simply was not recording it.
+
+## 2026-08-20 — `libsurface` holds a session, not a window (M6 C3, part 2 of 3)
+
+`Window<T>` owned its `Transport`. Holding a window therefore meant holding the only handle to
+the channel, so a client could drive exactly one — while the *protocol* never had that limit:
+`Connection::owned` is a list, and a popup may only name a parent **its own connection owns**.
+The API made the one thing a menu requires impossible.
+
+`Session<T>` owns the transport and the per-window state; `Session::window(id)` lends one through
+a `WindowRef` for the length of a call. One window is borrowed at a time, which is all anyone
+needs — operations are sequential, and handing out several live handles would mean several paths
+to one transport.
+
+**`Window` was replaced rather than kept beside it.** Two implementations of the buffer and event
+logic is how the two drift apart, which this project keeps finding. Three clients migrated —
+`nxterm`, `ui-testclient`, `input-testclient`; the compositor only ever mentioned `libsurface` in
+comments.
+
+**Two things fall out that `Window` structurally could not do**, and both are tested:
+
+- `Session::next_event()` returns `(window, event)`, so a client dispatches by id. That is what
+  part 3's menu loop needs and what part 1's window ids made possible.
+- Records for window A that arrive while `create` is waiting out window B's handshake are routed
+  to A rather than dropped. `Window::new` had nowhere to file them, so opening a menu would have
+  cost whatever was typed at the window underneath.
+
+**Destroy is transitive on this side too.** `WindowRef::destroy` drops the descendants the
+compositor drops — a popup with its parent, a submenu with that popup — because a client holding
+buffers and queued events for windows that no longer exist can never be told they went.
+
+**Loss below the layer is told to every window.** `Transport::took_loss` reports a message the
+transport dropped without decoding, so it is not attributable to one window. Every window is
+marked, which is the safe direction: a client that discards accumulated state it did not have to
+is correct, one that keeps state it should have discarded is not.
+
+**The compositor gained `MAX_WINDOWS_PER_CONNECTION` (64) in the same change**, and that is the
+more interesting half. Nothing bounded windows per connection — `conn.owned` and the stack are
+plain `Vec`s — while everything else in the compositor is bounded: the outbox at 32, the
+manager's at 512, sessions at `MAX_WAIT_HANDLES - 3`. The bound was the *API*: one window per
+connection, enforced by `libsurface` owning the transport. Removing that accident is what turned
+an emergent limit into one that has to be written down. Sequential churn is unaffected —
+`ui-testclient` opens 128 windows in a row and destroys each before the next.

@@ -155,7 +155,23 @@ pub enum StackError {
     BadGeometry,
     /// A buffer id already attached to this window.
     DuplicateBuffer,
+    /// This connection already holds [`MAX_WINDOWS_PER_CONNECTION`] windows.
+    TooManyWindows,
 }
+
+/// How many windows one connection may hold at once.
+///
+/// **Bounded because everything else here is** — the outbox at 32, the manager's at 512,
+/// sessions at `MAX_WAIT_HANDLES - 3`. Until M6 C3 the *API* was the bound: `libsurface`'s
+/// `Window` owned its transport, so a well-behaved client held one window per connection and
+/// nothing needed a number. A session type removes that accident, so the limit becomes a real
+/// one rather than an emergent one.
+///
+/// 64 is far above any honest use — a window, its menu, that menu's submenus and a dialog or
+/// two — and far below what would let one client exhaust the compositor's memory. Sequential
+/// churn is unaffected: `ui-testclient` opens 128 windows in a row and destroys each before the
+/// next, so it never holds more than one.
+pub const MAX_WINDOWS_PER_CONNECTION: usize = 64;
 
 /// The pointer sprite: a plain arrow, `CURSOR_W × CURSOR_H`.
 ///

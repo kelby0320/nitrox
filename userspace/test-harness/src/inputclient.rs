@@ -36,8 +36,8 @@ use libkern::{
     RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
     syscall2, syscall4, syscall5,
 };
-use librsproto::surface::{KeyEvent, PointerEvent, Role};
-use libsurface::{Window, WindowEvent, ipc::ChannelTransport};
+use librsproto::surface::{CreateWindowRequest, KeyEvent, PointerEvent, Role};
+use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libui::diff::Tree;
 use libui::element::{Element, custom};
 use libui::layout::{FixedCell, layout};
@@ -314,14 +314,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             exit(1);
         }
     };
-    let Ok(mut win) = Window::new(
-        alloc::boxed::Box::new(transport),
-        WIN_W,
-        WIN_H,
-        Role::Normal,
-        2,
-    ) else {
-        kprint(b"input-testclient: Window::new FAILED\n");
+    // One session, one window: this client never opens a menu. `Session` is what `libsurface`
+    // hands out since M6 C3 — a window no longer owns its connection.
+    let mut win = Session::new(alloc::boxed::Box::new(transport));
+    let Ok(window_id) = win.create(&CreateWindowRequest::new(WIN_W, WIN_H, Role::Normal), 2) else {
+        kprint(b"input-testclient: Session::create FAILED\n");
         exit(1);
     };
 
@@ -356,7 +353,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // The second synchronisation point. The window has to exist before the harness injects
     // at it, for the same reason `listening` exists: a keystroke routed before there is a
     // focusable window is one the compositor correctly drops.
-    Line::new().s(b"input-testclient: window ready id=").u(win.id() as u64).end();
+    Line::new().s(b"input-testclient: window ready id=").u(window_id as u64).end();
 
     // **A button *press* is the sentinel**, for the same reason `DONE_CODE` is one for the
     // raw stream: it is the last thing the harness injects. Accepting any button record
@@ -375,8 +372,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     let (mut saw_key, mut saw_press) = (false, false);
     while !(saw_key && saw_press) {
+        // The window id is discarded: this client has exactly one window, so every record is
+        // for it — `Session` filters anything else out before it gets here.
         let ev = match wait_event_before(&mut win, deadline_ns(IDLE_LIMIT_NS)) {
-            Some(Ok(e)) => e,
+            Some(Ok((_, e))) => e,
             Some(Err(_)) => {
                 kprint(b"input-testclient: window stream FAILED\n");
                 exit(1);
@@ -504,7 +503,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     let mut saw_late_key = false;
     while !saw_late_key {
-        let ev = match win.wait_event() {
+        let ev = match win.wait_event().map(|(_, e)| e) {
             Ok(e) => e,
             Err(_) => {
                 kprint(b"input-testclient: window stream FAILED\n");
@@ -549,13 +548,13 @@ fn deadline_ns(ns: u64) -> u64 {
 
 /// Wait for a window event until `deadline`, or `None` if it passes first.
 ///
-/// `Window::wait_event` blocks forever, which is right for a real client and wrong for a test
+/// `Session::wait_event` blocks forever, which is right for a real client and wrong for a test
 /// one that may never be driven. Built from the pieces `libsurface` grew in M5 Part C for
 /// `nxterm`: the waitable handle, and a non-blocking drain.
 fn wait_event_before(
-    win: &mut Window<alloc::boxed::Box<ChannelTransport>>,
+    win: &mut Session<alloc::boxed::Box<ChannelTransport>>,
     deadline: u64,
-) -> Option<Result<WindowEvent, libsurface::UiError>> {
+) -> Option<Result<(u32, WindowEvent), libsurface::UiError>> {
     loop {
         match win.poll_event() {
             Ok(Some(e)) => return Some(Ok(e)),
