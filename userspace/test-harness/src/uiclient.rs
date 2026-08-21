@@ -715,9 +715,14 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
 
     kprint(b"ui-testclient: the first configure carried the manager's placement\n");
 
-    // Held open for the same reason the B3 probe's session is: closing it makes the compositor
-    // tear the session down and repaint the whole screen.
-    core::mem::forget(t);
+    // **Closed, not leaked.** These probes used to `core::mem::forget` their transport, because
+    // closing a session makes the compositor tear it down and repaint the whole screen, which
+    // raced `check-display`'s capture. That race is gone — the gate now captures only once two
+    // consecutive screendumps match (B4) — and leaking was never free: an unread session's
+    // outbox never empties, so the compositor stays `parked` and wakes every
+    // `RETRY_INTERVAL_NS` to retry sends that can never land, for the rest of the boot. That is
+    // steady pressure on exactly the path `input-testclient`'s stall phase measures.
+    drop(t);
 }
 
 /// **A popup is placed by its creator, relative to its parent** — M6 C1, on the wire.
@@ -877,8 +882,8 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     // answers only on failure. Passing a real buffer parks this thread waiting for a reply that
     // is never coming, which is a hang rather than an error.
     let _ = t.request(librsproto::surface::OP_DESTROY_WINDOW, &body[..4], None, &mut []);
-    // The session stays open for the run: closing it makes the compositor repaint everything.
-    core::mem::forget(t);
+    // Closed rather than leaked, for the reasons given in `verify_initial_configure`.
+    drop(t);
 }
 
 /// `CreateWindow` through the raw transport, returning the new id. `fail`s if it did not.
