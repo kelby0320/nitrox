@@ -880,9 +880,9 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     kprint(b"ui-testclient: a popup was placed by its creator, without the manager\n");
 
     // 5. **And a `dialog` is the other way round on both counts.** It names a parent, but the
-    //    parent carries its desktop membership, its lifetime and its canvas exclusion — not its
-    //    position — so a manager places it and it is held like a `normal`. The offset below is
-    //    deliberately large and deliberately ignored.
+    //    parent carries its desktop membership and its lifetime — not its position — so a
+    //    manager places it and it is held like a `normal`. The offset below is deliberately
+    //    large and deliberately ignored.
     //
     //    Neither half of that is reachable from a host test: `placed_by_creator` lives in the
     //    `#![no_main]` bin, which `cargo test -p compositor --lib` does not build. Without this

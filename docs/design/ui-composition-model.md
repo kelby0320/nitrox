@@ -7,9 +7,10 @@ old §5 "Tier 2" and §7 "Templates". See "Changes in revision 3" below; the rea
 reading before proposing anything shaped like it.
 
 **Not built.** This describes a subsystem with no code behind it; the build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
-when ports and desktops land (Milestone 8; window management alone is Milestone 6, and the
-desktop shell that owns ports is Milestone 7 — the arm was re-scoped 2026-08-12).
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/` when
+**desktops** land (Milestone 8), carrying a Status line that says §5a's ports are still unbuilt
+and unscheduled — the plan holds that graduation as a checkbox. Window management alone was
+Milestone 6 and is done; the desktop shell that spawns applications is Milestone 7.
 
 This document revises the "User Interface and Shell" section of `os-design-v5.1.md`. That
 section was written early, before kernel/system design matured, and its central mechanism —
@@ -58,6 +59,9 @@ paths under a window (§5a), which a *command line* can address as readily as an
 structural drag-and-drop (§5), which is a self-contained improvement on MIME-table dispatch.
 
 ### Changes in v2 (2026-08-04)
+
+Kept as history; the section numbers below are v2's own, and revision 3 renumbered §7 and
+dropped §8.
 
 The mechanism beneath this document is now specified separately:
 **`display-substrate.md`** — framebuffer ownership, the surface protocol, input,
@@ -272,7 +276,11 @@ Three things follow from ports being paths:
 
 **An application cannot compose other applications.** This is a requirement rather than an
 accident, and it is structural: no application holds a handle to another's namespace, so it has
-nothing to bind into. It survives the cut unchanged, and constrains whatever §5a becomes.
+nothing to reach into. The desktop shell is the sole exception, and it is one by construction —
+it holds a full-rights handle to every application's namespace because it *created* that
+namespace at spawn (§6). An application cannot construct a namespace, so it can never acquire
+what the shell has. Both halves survive the cut untouched — neither was ever about wiring; both
+are about who builds a namespace — and together they constrain whatever this section becomes.
 
 **The shape of this is not settled.** What is above was drawn for a mechanism that no longer
 exists, and the CLI case has different pressures — naming, whether a port is a stream or a single
@@ -289,20 +297,19 @@ why desktops belong in this document at all.
 
 Desktops are served by the **desktop shell**, a separate process from the compositor: the
 compositor owns pixels, surfaces, windows, focus and input routing; the desktop shell owns
-desktops and spawning applications. Keeping the compositor small
-matters because it is what everything visible depends on.
+desktops and spawning applications. Keeping the compositor small matters because it is what
+everything visible depends on.
 
 **Dynamic by default, nameable afterwards.** Desktops are created and destroyed on demand — the
 GNOME shape — and *naming* one is something a user does later, not a precondition. A scratch
-desktop never gets a name or a file; a purposeful one does. That gets KDE's
-built-for-a-purpose feel without KDE's fixed slots, and it means **the desktop is fully usable
-with none of §7's machinery**: make a desktop, start what you like, place it how you like, wire
-it or don't.
+desktop never gets a name; a purposeful one does. That gets KDE's built-for-a-purpose feel
+without KDE's fixed slots, and it means **there is nothing to set up first**: make a desktop,
+start what you like, place it how you like, name it if it turns out to matter.
 
 Two properties keep it a workspace rather than a cage:
 
-- **A desktop works with an empty graph.** Opening two terminals must not require naming or
-  saving anything.
+- **A desktop needs no setting up.** Opening two terminals must not require naming or saving
+  anything.
 - **Windows move between desktops** — one attribute change (§2a), since membership lives only
   in the compositor.
 

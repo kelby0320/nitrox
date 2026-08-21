@@ -54,7 +54,7 @@ The shell is **one process owning several windows**, not separate taskbar, launc
 clients.
 
 They share state intensely — the window list, the desktop list and focus all come from the
-compositor, and one subscriber is simpler than three with identical authority. composability
+compositor, and one subscriber is simpler than three with identical authority. The composability
 argument in the composition model was about *users wiring applications* — and that wiring was cut
 in its revision 3; what remains is a drag that dispatches one message. Either way the shell's own
 chrome is not something anyone composes.
@@ -70,8 +70,8 @@ the same thing, because they are the same intent.
 **Its entries are `/bin` programs**, and this falls out of decisions already made rather than
 being designed here: they are ordinary files in the namespace, so type-to-filter runs over them
 with no special mechanism. (An earlier version also listed `~/Desktop/*.nxg` templates; templates
-were cut in composition revision 3.) "Open the code-editor
-desktop" is a launcher entry, not a feature.
+were cut in composition revision 3.) "Open the code-editor desktop" is a launcher entry, not a
+feature.
 
 The Super key means the shell receives a keystroke **regardless of focus** — see §8's global
 hotkey requirement, which is a capability rather than an ambient grab.

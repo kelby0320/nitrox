@@ -56,7 +56,8 @@ items are unblocked by this one, and they are listed under "What this unblocks" 
    pixels are the one place where "we'll add tests once it works" would actually happen, and
    the design doc's §8 exists to prevent it.
 2. **The compositor stays small.** Pixels, surfaces, windows, input routing, focus. Anything
-   else — desktops and spawning applications — belongs to the desktop shell. It is the process everything visible depends on.
+   else — desktops and spawning applications — belongs to the desktop shell. It is the process
+   everything visible depends on.
 3. **Serial keeps working throughout.** `test-qemu`, `test-interactive`, `eshell`'s recovery
    path and headless CI all depend on the serial console. The GUI is a *second* backend behind
    the tty server's existing `backend_write` seam, never a replacement. The precedent is
@@ -1553,7 +1554,7 @@ desktop shell. [`graphical-session.md`](../design/graphical-session.md) now spec
 
 - [ ] **`desktop-shell`, minimally**: the top bar, the applications modal, window placement
       policy driving M6's ops, and — the load-bearing part — **constructing a namespace per
-      application it spawns**. `ui-composition-model.md` §5a requires this; §5's guarantee that
+      application it spawns**. `ui-composition-model.md` §5a requires this: its guarantee that
       "an application cannot compose other applications" rests on the shell being the process
       that built them.
 

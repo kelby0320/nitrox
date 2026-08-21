@@ -47,8 +47,9 @@ Worth stating, because three of these are load-bearing for decisions below:
 **Compositor** — the framebuffer, surfaces, windows, input routing, focus. Serves `/dev/draw`.
 
 **Desktop shell** — desktops and spawning applications. Serves `/dev/desktop`, and is the only
-holder of application namespace handles (composition §5a). It also held the wiring graph and
-templates until those were cut on 2026-08-21.
+process holding a full-rights handle to an application's namespace, because it is the one that
+*created* it (composition §5a). It also held the wiring graph and templates until those were cut
+on 2026-08-21.
 
 **Rejected: one process.** Stacked up, the single-process version would own surfaces, windows,
 ports, desktops and application spawning. That is too much for the one process that must never
@@ -124,8 +125,8 @@ each changes what the compositor does:
 - **`dialog`** — parented, on its parent's desktop, and **listed**. Its parent carries its
   desktop membership and its lifetime, not its position: a manager places a dialog as it places
   any other listed window. (An earlier revision also distinguished it as "not offered as a
-  wirable node on the composition canvas"; the canvas was cut in
-  `ui-composition-model.md` revision 3, and the rest of the definition stands without it.)
+  wirable node on the composition canvas"; the canvas was cut in `ui-composition-model.md`
+  revision 3, and the rest of the definition stands without it.)
 - **`normal`** — everything else.
 
 **A panel reserves space.** A maximised window must not cover the bars, which X calls struts.

@@ -265,10 +265,9 @@ Request, 24 bytes:
 menu item its popup drops from was drawn, so a manager does not place popups — and they are
 exempt from the initial-configure hold below, because there is nobody to wait for.
 
-**A `dialog` is not.** It names a parent, but the parent carries its desktop membership, its
-lifetime — not its position. In placement terms a
-dialog is an ordinary listed window: it lands at the compositor's default origin, a manager
-places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
+**A `dialog` is not.** It names a parent, but the parent carries its desktop membership and its
+lifetime — not its position. In placement terms a dialog is an ordinary listed window: it lands
+at the compositor's default origin, a manager places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
 
 A manager needs nothing **from the client** to place one: `WindowCreated` carries the parent id
 and the requested size, and the manager already tracks where the parent is from the geometry

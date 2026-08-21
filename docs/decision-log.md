@@ -16802,6 +16802,19 @@ editor built as applications, which is what the cut argues for, plus the one sur
 canvas**" — and the 2026-08-20 entry "A `dialog` is placed by the manager, not by its creator"
 leaned on that canvas exclusion as one of three legs. The canvas is now cut. **The conclusion is
 unaffected** — the parent still carries desktop membership and lifetime and still does not carry
-position — but a leg of the argument is gone, and the definition has been reworded in the spec,
-`librsproto`, and `display-substrate.md` so that nothing defines a shipped role in terms of a
-feature that will not exist. The earlier entry stands as written: it was true on its date.
+position — but a leg of the argument is gone, and the definition has been reworded everywhere it
+is stated — the spec, `librsproto`, the compositor, the UI test client and `display-substrate.md`
+— so that nothing defines a shipped role in terms of a feature that will not exist. The earlier
+entry stands as written: it was true on its date.
+
+**A second thing it reached backwards into: `desktop-shell`'s `BIND_NAMESPACE` grant.**
+`graphical-session.md` argued the grant by "that guarantee is what makes the shell the only
+process that can wire a graph". The grant is still right, but for the reason underneath that one
+rather than for it: the shell **constructs** each application's namespace at spawn, which is what
+requires `BIND_NAMESPACE`, and constructing them is also what makes "an application cannot compose
+other applications" structural — an application cannot construct a namespace, so it can never hold
+a handle to a peer's. The wiring was a consequence of that authority, never its source. Both the
+argument in `graphical-session.md` and the statement of the authority in `ui-composition-model.md`
+§5a — which the cut removed along with the wiring paragraph it sat in, leaving three documents
+citing §5a for a claim it no longer made — are restored on the spawn-time reasoning
+(PR #224 review, findings 1 and 2).

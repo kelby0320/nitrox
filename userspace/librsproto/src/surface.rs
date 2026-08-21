@@ -300,9 +300,9 @@ pub struct CreateWindowRequest {
     /// the only party that knows where the item it drops from was drawn. A `dialog` is an
     /// ordinary listed window that happens to name a parent — the parent carries its desktop
     /// membership and its lifetime, not its position (`display-substrate.md` §4a,
-    /// `ui-composition-model.md` §6) — so a manager places it, and
-    /// a manager needs nothing from the client to do so: `MgrWindowCreated` already carries the
-    /// parent id and the requested size, which is what centring on a parent takes.
+    /// `ui-composition-model.md` §6) — so a manager places it, and a manager needs nothing from
+    /// the client to do so: `MgrWindowCreated` already carries the parent id and the requested
+    /// size, which is what centring on a parent takes.
     ///
     /// **Carried here rather than sent afterwards** so that a popup's position is atomic with
     /// its existence. A separate op between `CreateWindow` and the first `Commit` would put a
@@ -1178,12 +1178,12 @@ mod tests {
 
     /// **Only a `popup` carries an offset.** Every other role, `dialog` included, sends zero.
     ///
-    /// A `dialog` names a parent, but the parent carries its desktop membership, its lifetime
-    /// and its lifetime — not its position. It is an ordinary
-    /// listed window and a manager places it, so a client-supplied offset would be redundant
-    /// with what `MgrWindowCreated` already tells the manager, and would compete with the
-    /// placement the manager chose. Nothing asserted this either way before, so the encoder
-    /// could have started carrying it and no test would have noticed.
+    /// A `dialog` names a parent, but the parent carries its desktop membership and its
+    /// lifetime — not its position. It is an ordinary listed window and a manager places it, so
+    /// a client-supplied offset would be redundant with what `MgrWindowCreated` already tells
+    /// the manager, and would compete with the placement the manager chose. Nothing asserted
+    /// this either way before, so the encoder could have started carrying it and no test would
+    /// have noticed.
     #[test]
     fn only_a_popup_carries_an_offset_on_the_wire() {
         for role in [

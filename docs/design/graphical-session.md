@@ -120,13 +120,14 @@ Every arrow attenuates. The new rows extend the existing concentration rather th
 ([`why-supervisor-registration.md`](../rationale/why-supervisor-registration.md)).
 
 **`desktop-shell` holding `BIND_NAMESPACE` is the one genuinely new grant, and it is load-bearing
-rather than convenient.** `ui-composition-model.md` §5a already states it: the shell "holds a
-full-rights handle to every application's namespace because it *created* those namespaces at
-spawn", and §5 gives the property that buys — *"An application cannot compose other applications
-… structural rather than policy: no application holds a handle to another's namespace."* An
-application cannot construct namespaces, so it cannot reach into a peer's. That guarantee is what
-makes the shell the only process that can wire a graph, and it requires the shell to be the one
-that built them.
+rather than convenient.** `ui-composition-model.md` §5a states both halves: the shell "holds a
+full-rights handle to every application's namespace because it *created* that namespace at
+spawn", and from that — *"An application cannot compose other applications … it is structural:
+no application holds a handle to another's namespace."* An application cannot construct a
+namespace, so it can never reach into a peer's. That isolation is what the grant buys, and it is
+why the shell has to be the process that *built* the namespaces rather than one handed them: a
+shell given namespaces someone else constructed would need no `BIND_NAMESPACE` — and could not
+make the guarantee either, because whoever did construct them would still hold their handles.
 
 **It does not make the shell a fourth supervisor tier by accident.** It is the graphical session's
 leader — the counterpart of `nxsh`, which likewise spawns things, but with the addition that a GUI

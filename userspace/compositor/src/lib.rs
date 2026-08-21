@@ -438,10 +438,9 @@ impl WindowStack {
         // placement policy — see `TODO(popup-follows-parent)`.
         //
         // **A `dialog` is not placed this way, though it also names a parent.** Its parent
-        // carries desktop membership and lifetime — not its position
-        // (`display-substrate.md` §4a, `ui-composition-model.md` §6). In placement terms it is
-        // an ordinary listed window, so it lands at the origin and a
-        // manager places it, exactly like a `normal`.
+        // carries desktop membership and lifetime — not its position (`display-substrate.md`
+        // §4a, `ui-composition-model.md` §6). In placement terms it is an ordinary listed
+        // window, so it lands at the origin and a manager places it, exactly like a `normal`.
         let origin = match req.role {
             Role::Popup { parent } => {
                 // The parent is known to exist: checked directly above, and nothing between
@@ -1841,9 +1840,8 @@ mod tests {
     /// Only a `popup` is offset from its parent. A `dialog` lands where a `normal` does.
     ///
     /// The two parented roles share a wire shape and were treated as one placement rule, which
-    /// they are not: a `dialog`'s parent carries its desktop membership, its lifetime and its
-    /// lifetime — not its position. In placement terms it is an
-    /// ordinary listed window and a manager places it.
+    /// they are not: a `dialog`'s parent carries its desktop membership and its lifetime — not
+    /// its position. In placement terms it is an ordinary listed window and a manager places it.
     #[test]
     fn only_a_popup_is_offset_from_its_parent() {
         let mut s = WindowStack::new();

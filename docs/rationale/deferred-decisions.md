@@ -280,8 +280,8 @@ scheduling rather than a trigger.
 
 ### Graphics
 
-**The shape of a window's ports — `TODO(port-shape-rework)`.** A port is a path under the window that owns it (`ui-composition-model.md` §5a), and that much is
-settled. Nothing else about it is: naming, whether a port carries a stream or a single message,
+**The shape of a window's ports — `TODO(port-shape-rework)`.** A port is a path under the window
+that owns it (`ui-composition-model.md` §5a), and that much is settled. Nothing else about it is: naming, whether a port carries a stream or a single message,
 what a resolve does when nothing is listening, and whether the compositor is the right server for
 a path an application defines.
 
