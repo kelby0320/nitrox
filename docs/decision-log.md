@@ -17002,3 +17002,56 @@ The general rule, now in `conventions/qemu-integration-tests.md`: add a transcri
 the behaviour is observable on the console **and** a wrong version of it would reach the same
 verdict. Where a defect would change the exit code, the exit code is the better assertion, since a
 transcript match is coupled to log wording.
+
+## 2026-08-21 — A control channel signals its own close, not a child's exit
+
+PR #226 review, finding 1, and the correction is worth its own entry because the mechanism it
+qualifies was recorded earlier the same day as "exact".
+
+`service-mgr` learns which child died from **which control endpoint closed**, since a pid on
+`KIND_CHILD_EXITED` cannot be matched to a process handle. What that actually observes is the
+endpoint closing. It equals "the child exited" **only because nothing else closes it** — and
+`boot-probe`, the program added to demonstrate the mechanism, closed it as its second
+instruction. Its stated reason was reasonable: a probe with no lifecycle protocol to serve has
+no use for a lifecycle channel.
+
+Consequence, demonstrated by widening the window between the close and the exit: `service-mgr`
+printed `'boot-probe' exited code=unknown` *before* the probe's own next line, released its
+handles, and took the "no code queued ⇒ treat as failure" branch. With `policy = "always"` it
+then started **a second copy of a live service** — the exact failure the probe exists to prove
+is gone, reached by a different route. `policy = "never"` was the only thing masking it.
+
+**So the property is a contract, not a guarantee**: a declared service must hold its control
+endpoint until it exits, and there is no way for the manager to verify it. Written into
+`service-toml-schema.md` beside the `control` handle, and the three places that called the
+discriminator "exact" now say what it is exact *given*. `boot-probe` holds the handle and lets
+process teardown close it.
+
+**The gate could not tell the two apart, and now can.** `check_service_attribution` required
+`'boot-probe' exited`; the premature-death run produced exactly that string and PASSED. It now
+requires `'boot-probe' exited code=0`, which pins the *notification* as well as the close —
+`code=unknown` is precisely what an early close looks like. Negative-controlled both ways: with
+the early close reintroduced the gate fails, without it the transcript reads `up` →
+`exiting 0` → `'boot-probe' exited code=0` in that order.
+
+**Also from the same review**, three corrections to claims rather than to code:
+
+- **"A repeated key keeps the first value" was true of `executable` only.** Every `[restart]`
+  key was last-wins, so appending `policy = "always"` after `policy = "never"` changed the
+  policy — as did appending a whole second `[service.<name>.restart]` table, since a repeated
+  header re-enters the section. The schema stated the general form as a guarantee. Made true
+  rather than narrowed, because "cannot be steered by appending to it" is the half worth having;
+  tracked with explicit flags rather than "differs from the default", so a key set *to* its
+  default still consumes its slot.
+- **The exit-code queue accepted children `service-mgr` does not supervise.** `auth-service` and
+  `session-mgr` are spawned by its own `bring_up_login_chain` and reach the same notification
+  channel; their codes would have been consumed by the next supervised death. The queue is now
+  per-wake — correct because a child's exit enqueues its notification and destroys its endpoint
+  under one `SCHED` hold — and leftovers are reported rather than carried.
+- **`slot_of` was built, indexed, and never read**, with a comment explaining a mapping nothing
+  used. No warning, because writing an element counts as a use.
+
+**And one thing measured on the way**: `boot-probe` exits microseconds after it starts, and
+`session-mgr` writes the verdict about 0.1 s later. Twenty million spin iterations in the probe
+were enough for the boot to finish first. Part B's "the verdict must be last" box is not
+theoretical — the probe will take that long once it carries real checks.

@@ -2681,10 +2681,19 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
 /// (`TODO(child-exit-attribution)`). See `docs/planning/test-path-retrofit.md`.
 fn check_service_attribution(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
-    // The probe ran, and its exit was attributed to **it**.
-    if !text.contains("service-mgr: 'boot-probe' exited") {
-        return Err("service-mgr never attributed boot-probe's exit \
-             (expected \"service-mgr: 'boot-probe' exited\" in the transcript)"
+    // The probe ran, and its exit was attributed to **it**, **with its code**.
+    //
+    // `code=0` rather than a bare `exited`, and the difference is not cosmetic: a
+    // `service-mgr` that reads a *closed control channel* as an exit reports the death
+    // before the child has run, takes the "no code queued => failure" branch, and prints
+    // `'boot-probe' exited code=unknown`. The looser pattern passed that run
+    // (PR #226 review, findings 1 and 3). Pinning the code is what distinguishes "the
+    // child exited and we paired its status" from "its handle went away".
+    if !text.contains("service-mgr: 'boot-probe' exited code=0") {
+        return Err("service-mgr did not attribute boot-probe's exit with its status \
+             (expected \"service-mgr: 'boot-probe' exited code=0\" in the transcript; \
+             \"code=unknown\" means the death was detected without a matching notification, \
+             which is what an early control-handle close looks like)"
             .into());
     }
     // And nothing else was blamed for it. `heartbeat` is `policy = always`, so a

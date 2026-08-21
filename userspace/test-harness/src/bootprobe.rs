@@ -26,25 +26,29 @@
 #![no_std]
 #![no_main]
 
-use libkern::{SYS_HANDLE_CLOSE, exit, kprint, syscall1};
+use libkern::{exit, kprint};
 
 /// Bootstrap registers, as `service-mgr`'s `SPAWN_SERVICE` fills them: `rdi` = this
 /// process's notification channel, `rsi` = the inherited LOOKUP-only root namespace,
 /// `rdx` = the control-channel endpoint (`RECV | WAIT`), `rcx` = `arg0` (unused).
 ///
-/// The control channel is closed rather than served. A declared service is entitled to a
-/// lifecycle channel, and `service-mgr` sends `CTRL_OP_SHUTDOWN` on it to the **first**
-/// declared service after a demo interval — but this probe's whole shape is "run, report,
-/// exit", so there is nothing for a shutdown request to interrupt. Closing it here is also
-/// what makes the exit observable: `service-mgr` learns a child is gone from that channel's
-/// peer closing, which is what happens when this process exits either way.
+/// **The control endpoint is held until exit, and closing it early is a bug.** An earlier
+/// version of this file closed it as its second instruction, reasoning that a probe with no
+/// lifecycle protocol to serve has no use for it. It does have one use, and it is not the
+/// probe's: `service-mgr` reads *this handle's* closure as "the child is gone"
+/// (`supervise`), because a pid on `KIND_CHILD_EXITED` cannot be matched to a process
+/// handle. Closing it early therefore reports a death that has not happened — observed as
+/// `'boot-probe' exited code=unknown` printed before this function's own next line, and
+/// under `policy = "always"` as a *second copy of a live service*, which is the exact
+/// failure this program was added to prove is gone (PR #226 review, finding 1).
+///
+/// So: hold it, and let process teardown close it. That is what makes "peer closed" mean
+/// "child exited", and it is a contract on every declared service rather than a quirk of
+/// this one — see `docs/spec/service-toml-schema.md`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"boot-probe: up\n");
-    if control != 0 {
-        // SAFETY: closing our own control-channel endpoint, handed over at spawn.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, control) };
-    }
+    let _ = control;
     // Part A carries no checks yet, and says so rather than printing a verdict it did not
     // earn. `session-mgr` still writes the boot verdict until Part B moves it here.
     kprint(b"boot-probe: no checks yet (retrofit Part A) -- exiting 0\n");

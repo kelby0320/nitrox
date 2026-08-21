@@ -433,9 +433,16 @@ with the pid-blind rule in place, a `test-qemu` run prints `'heartbeat' exited c
 survivor's peer pointer and signals it (`sched::ipc_endpoint_closing` → `signal_ipc_endpoint`,
 the same wake path `sys_wait` uses), so the control handles sit in the wait set and a
 `sys_channel_recv` on the one that woke answers `PeerClosed` (`-13`) rather than `WouldBlock`
-(`-11`). A handle cannot be recycled under its holder the way a pid can, so this is exact where
-pid matching would not have been — and it needed **no kernel change**: `KIND_PEER_CLOSED` is
-still unemitted, and the mechanism turned out not to need it.
+(`-11`). A handle cannot be recycled under its holder the way a pid can, so *which* endpoint
+closed is never ambiguous — and it needed **no kernel change**: `KIND_PEER_CLOSED` is still
+unemitted, and the mechanism turned out not to need it.
+
+**It is exact given a contract the manager cannot verify**: a declared service must hold its
+control endpoint until it exits. What the manager observes is the endpoint closing; that is the
+child exiting only because nothing else closes it. A service that closes it early is reported
+dead while it runs, and under `policy = "always"` gets a second live copy — found that way in
+`boot-probe`, which closed the handle as its second instruction (PR #226 review, finding 1). The
+contract is now stated in `docs/spec/service-toml-schema.md` under the `control` handle.
 
 **What is still deferred is the exit *code*.** It arrives on `KIND_CHILD_EXITED` beside a pid the
 parent cannot match, so `service-mgr` pairs codes with dead services in arrival order. With one

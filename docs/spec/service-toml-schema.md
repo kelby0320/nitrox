@@ -18,7 +18,9 @@ Building enumeration to serve the schema was rejected against changing the schem
 
 The file contains one `[service.<name>]` table per service, in any order. The service name comes from the table header.
 
-**Malformed input, since one bad table must not cost the file.** A `[service.<name>]` with no `executable` is skipped and does not consume the next declaration. A repeated key inside a table keeps the **first** value, so a declarations file cannot be steered by appending to it. A service name that appears again after another service's table closed it is dropped rather than started twice. A `[service.<other>.restart]` table belongs to `<other>` and never leaks into the declaration being parsed.
+**Malformed input, since one bad table must not cost the file.** A `[service.<name>]` with no `executable` is skipped and does not consume the next declaration. A service name that appears again after another service's table closed it is dropped rather than started twice. A `[service.<other>.restart]` table belongs to `<other>` and never leaks into the declaration being parsed.
+
+**A repeated key keeps the first value** — `executable` and every `[restart]` key — so a declarations file cannot be steered by appending to it. That includes appending a whole second `[service.<name>.restart]` table, which re-enters the section rather than starting a new one. (Until 2026-08-21 this held for `executable` only, and the schema said otherwise; the restart keys were last-wins.)
 
 **This is also how a test image differs from a release image.** The retrofit's rule is that a service under test is the service that ships (`docs/planning/test-path-retrofit.md`): the same `service-mgr` binary reads a file that, in a selftest image, carries one extra `[service.boot-probe]` table. Code identical, data different.
 
@@ -158,7 +160,11 @@ log subsystem / `principal`.
 kind = "ipc-channel"
 ```
 
-An IPC channel pair created at spawn time. The service receives one end (granted with `SEND | RECV | TRANSFER`); the service manager retains the other end. Used for lifecycle management (shutdown requests, health checks, configuration reloads).
+An IPC channel pair created at spawn time. The service receives one end; the service manager retains the other. Used for lifecycle management (shutdown requests, health checks, configuration reloads).
+
+**A service must hold its control endpoint until it exits.** This is a contract, not advice, and it is load-bearing for something a service cannot see: the service manager reads *that endpoint closing* as "this child is gone", because `KIND_CHILD_EXITED` names a child by pid and nothing maps a process handle back to a pid (`TODO(child-exit-attribution)`). A service that closes the handle early — a reasonable-looking thing to do if it serves no lifecycle protocol — is reported dead while it runs, and under `policy = "always"` gets a **second live copy** of itself. Found exactly that way in `boot-probe`, whose whole job was to demonstrate the opposite.
+
+If a service has no use for the channel, the correct handling is to ignore it and let process teardown close it. There is no way for the manager to distinguish an early close from an exit.
 
 ### Handle ergonomics
 

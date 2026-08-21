@@ -256,7 +256,7 @@ be scoped to what is buildable:
 | Schema assumes | Reality today | Implication for slice 1 |
 |---|---|---|
 | `executable = "/store/…"` path spawns | Spawn is a **kernel-embedded `ImageId` enum** (no ELF-from-namespace loader) | Slice-1 services are embedded images selected by `ImageId`; the `executable` field maps to a known image, not an arbitrary path. Full path-based spawn is a later slice (needs a userspace ELF loader). |
-| Declarations in `/store/…-system-services/` projected to `/etc/services/` | No content store, no profile server | Slice-1 declarations come from the **initramfs** (e.g. `/etc/services/*.toml`), like `init.toml`. |
+| Declarations in `/store/…-system-services/` projected to `/etc/services/` | No content store, no profile server | Declarations come from the **initramfs**, like `init.toml`. **One file** — `/initramfs/etc/services.toml` — not a directory: nothing can enumerate one (schema changed 2026-08-21). |
 | `log` handles → a logging service | No logging service | Slice-1 `stdout`/`stderr`/`log` route to `sys_kprint` / the kernel log; the logging service is a later backlog item. |
 | Typed `environment` / `argv` envmap | Spawn passes a single `arg0` + moved handles | Defer typed envmap/argv delivery; slice-1 services take handles only. |
 | `stdin`=`/dev/null`, stream stdio | No `/dev/null`, no stream stdio yet | Defer auto-stdio; slice-1 grants only explicitly-declared handles + the auto namespace/notification/control. |
@@ -294,9 +294,12 @@ Settled in review (2026-07-15):
 
 1. **Slice-A demo service**: a purpose-built trivial **heartbeat** service — a clean,
    controllable restart/backoff demonstration (not a reused image).
-2. **Declaration source**: the **initramfs** (`/etc/services/*.toml`, mirroring
-   `init.toml`) — it exercises the real parse path and sidesteps the profile-server
-   bootstrap ordering.
+2. **Declaration source**: the **initramfs** — `/initramfs/etc/services.toml`, mirroring
+   `init.toml` — which exercises the real parse path and sidesteps the profile-server
+   bootstrap ordering. **One file holding every service**, revised 2026-08-21 from
+   `/etc/services/*.toml`: a directory of declarations needs enumeration, and neither the
+   initramfs (a CPIO archive the kernel looks up by name) nor `profile-server` (which
+   projects packages' `bin/` only) can do it. See `docs/spec/service-toml-schema.md`.
 3. **fs-server ownership**: **stays in init for slice A** (critical path — init must
    reach a mounted root to find service-mgr's declarations); service-mgr owns only
    *additional* services in A. Whether service-mgr re-adopts the root fs-server is a

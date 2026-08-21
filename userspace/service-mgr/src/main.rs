@@ -3,13 +3,18 @@
 //! Spawned by init once critical-path boot is stable, it starts, supervises, and
 //! restarts the system's services. See `docs/architecture/service-manager.md`.
 //!
-//! **Slice A (this file):** the supervision spine — parse a declaration from the
-//! initramfs (`service_toml`, Part C), start the service, and on its exit apply the
-//! restart policy + backoff (Part D). **Part E** adds a per-service **control
-//! channel**: service-mgr keeps one end, moves the other to the service at spawn, and
-//! can send lifecycle commands — here, a graceful `CTRL_OP_SHUTDOWN`. A supervisor-
-//! requested shutdown is distinguished from an unexpected exit, so it is *not*
-//! restarted even under `policy = always`.
+//! **The supervision spine:** parse the declarations from the initramfs
+//! (`service_toml`), start **every** service in the file, and on a child's exit apply
+//! *that child's* restart policy + backoff. Each service gets a **control channel**:
+//! service-mgr keeps one end, moves the other to the service at spawn, and can send
+//! lifecycle commands — here, a graceful `CTRL_OP_SHUTDOWN`. A supervisor-requested
+//! shutdown is distinguished from an unexpected exit, so it is *not* restarted even
+//! under `policy = always`.
+//!
+//! That control channel is also how a child's exit is **attributed**: `KIND_CHILD_EXITED`
+//! names a child by pid and nothing maps a process handle to a pid, so the discriminator
+//! is which endpoint closed rather than which pid died. See [`supervise`], and
+//! `TODO(child-exit-attribution)` for what that still leaves open.
 //!
 //! `#![no_std]` + `#![no_main]`. Slice A uses `libkern` (raw syscalls) + `libheap`
 //! (the `#[global_allocator]`); the design's `librsproto`/`libos` surface arrives with
@@ -755,16 +760,31 @@ struct Supervised {
 /// `sys_wait` uses. So the control handles go in the wait set, `sys_wait` returns the
 /// handle that signalled, and a `sys_channel_recv` on it answers `PeerClosed` (`-13`)
 /// rather than `WouldBlock` (`-11`). A handle cannot be recycled under its holder the way
-/// a pid can, so this is exact where pid matching would not have been.
+/// a pid can, so *which* endpoint closed is never ambiguous.
+///
+/// **Exact given one thing, which is a contract on the service rather than a property of
+/// this code:** a declared service must hold its control endpoint until it exits. What
+/// this observes is the endpoint closing; that is the child exiting only because nothing
+/// else closes it. A service that closes it early is reported dead while it runs, and
+/// under `policy = "always"` gets a *second live copy* — found exactly that way, in
+/// `boot-probe` itself (PR #226 review, finding 1). The contract is written down in
+/// `docs/spec/service-toml-schema.md`; there is no way to verify it from here.
 ///
 /// **The exit *code* is still unattributed**, and that is the deliberate residual. It
-/// arrives on `KIND_CHILD_EXITED` beside a pid this process cannot match, so the code is
-/// taken from the queue in arrival order and paired with whichever service was found dead.
-/// With one exit per wake — every case the system produces today — that pairing is right.
-/// With two in the same wake the codes can swap, which matters only to `on-failure`;
-/// `never` and `always` do not read the code at all. A service found dead with no code
-/// queued is treated as a **failure**, because a crash that outruns its notification is
-/// the case worth restarting.
+/// arrives on `KIND_CHILD_EXITED` beside a pid this process cannot match, so codes are
+/// collected **per wake** and paired with whichever service that wake found dead. A wake
+/// is the right scope because a child's exit enqueues its notification and destroys its
+/// endpoint under the same `SCHED` hold, so both reach one `sys_wait`. Codes left over at
+/// the end of a wake are **discarded, and counted**: they belong to a child that is not
+/// supervised here — `bring_up_login_chain` spawns `auth-service` and `session-mgr`, and
+/// every child's exit reaches its parent's notification channel whether the parent
+/// supervises it or not. Carrying them forward would mispair them with the next supervised
+/// death (PR #226 review, finding 4).
+///
+/// Within one wake, two deaths can still swap their codes, which matters only to
+/// `on-failure`; `never` and `always` do not read the code. A service found dead with no
+/// code is treated as a **failure**, because a crash that outruns its notification is the
+/// case worth restarting.
 ///
 /// **The demo shutdown applies to the first declared service only.** It exercises the
 /// control path end to end after `DEMO_RUN_NS`; a real shutdown trigger is still deferred.
@@ -824,21 +844,22 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
     // Demo: schedule the graceful-shutdown request for the first declared service.
     let shutdown_at = now_ns().saturating_add(DEMO_RUN_NS);
 
-    // Exit codes drained from the notification queue, awaiting a service to pair with.
-    let mut codes: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-
     loop {
         // Build the wait set: the notification channel, then each running service's
-        // control channel. `slot_of[i]` maps a wait slot back to a service index.
+        // control channel.
+        //
+        // **Which slot signalled is not read**, and does not need to be: step 2 below polls
+        // every running service's channel, and `IpcChannel::already_signaled` is level- not
+        // edge-triggered, so a close that happened between the poll and the next `sys_wait`
+        // is still there to find. An earlier version kept a `slot_of` map from wait slot to
+        // service index and never indexed it (PR #226 review, finding 7).
         let mut count = 1usize;
-        let mut slot_of = [usize::MAX; 1 + MAX_SERVICES];
         // SAFETY: WAIT_HANDLES is a valid writable array of `1 + MAX_SERVICES`.
         unsafe { WAIT_HANDLES[0] = notif };
-        for (i, s) in svcs.iter().enumerate() {
+        for s in svcs.iter() {
             if s.running && s.ctrl != 0 && count < 1 + MAX_SERVICES {
                 // SAFETY: `count` is bounded by the array length by the condition above.
                 unsafe { WAIT_HANDLES[count] = s.ctrl };
-                slot_of[count] = i;
                 count += 1;
             }
         }
@@ -877,7 +898,10 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
         }
 
         // 1. Drain every queued notification, collecting exit codes. Which child each
-        //    belongs to is unknowable here — see this function's doc comment.
+        //    belongs to is unknowable here — see this function's doc comment. The vector is
+        //    **per wake**: a code with no death to pair with by the end of this iteration
+        //    belongs to a child service-mgr does not supervise.
+        let mut codes: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
         loop {
             // SAFETY: NOTIF is a valid 64-byte writable out-param.
             let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
@@ -996,6 +1020,17 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
                 svcs[i].running = true;
                 svcs[i].attempts += 1;
             }
+        }
+
+        // Anything left belongs to a child this supervisor does not hold — `auth-service`
+        // and `session-mgr` are spawned by `bring_up_login_chain` and reach this same
+        // notification channel. Reported rather than dropped silently: on a release boot
+        // either of those exiting is a system fault, and this is the only place that sees it.
+        for code in codes {
+            Line::new()
+                .s(b"service-mgr: an unsupervised child exited code=")
+                .i(code as i64)
+                .end();
         }
     }
 }

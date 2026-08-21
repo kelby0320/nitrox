@@ -113,9 +113,10 @@ server's) — but a `kprint` behind a cfg does not make the shipping path a diff
    *behave* differently, and it may not have a function that exists only in one build.
 2. **Adjudication is a program, not a phase of a supervisor.** Whatever runs last writes the
    verdict; nothing else needs to know a verdict exists.
-3. **The test image differs from the release image by data, not code.** `service-mgr` already
-   parses `[service.<name>]` declarations from `/initramfs/etc/services/`; the test image ships
-   one more file. `init` and `service-mgr` compile identically in both.
+3. **The test image differs from the release image by data, not code.** `service-mgr` parses
+   `[service.<name>]` declarations from `/initramfs/etc/services.toml`; the test image ships
+   that file with **one more table** in it. `init` and `service-mgr` compile identically in
+   both, and their ELFs are byte-identical.
 4. **`SYS_TEST_EXIT` stays.** The kernel having a test-only syscall is not what this plan is
    about — a kernel facility is not a service code path — and `isa-debug-exit` distinguishes
    "the guest decided it failed" from "a log line happened to match". The expect-only
@@ -188,6 +189,13 @@ selftest images. The probes move there; they do not need a new crate.
 - [ ] **Ordering.** The verdict must be last. `[service.<name>].after` is already in the schema
       and unparsed; either it lands here or the probe waits on what it needs. Deferred to
       Part B, which is when anything depends on the order.
+
+      **Measured while probing Part A, and it is closer than it looks.** `boot-probe` exits
+      microseconds after it starts, and `session-mgr` writes the verdict roughly 0.1 s later.
+      A spin loop of 20 million iterations inserted into the probe was enough for the boot to
+      finish first — so the probe never reached its exit, and the gate correctly reported no
+      attribution. Once Part B moves real checks in, the probe *will* take that long. Whatever
+      carries the verdict has to be ordered against the probe rather than racing it.
 
 ## Part B — `session-mgr` ships one login
 
