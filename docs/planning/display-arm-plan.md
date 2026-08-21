@@ -39,7 +39,7 @@ the source of truth for *the order*.
 - **Mechanism:** [`docs/design/display-substrate.md`](../design/display-substrate.md)
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
 - **Semantics:** [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
-  — windows, ports, desktops, templates.
+  — windows, ports, desktops.
 - **The shell itself:** [`docs/design/desktop-shell.md`](../design/desktop-shell.md)
   — bars, applications modal, overview, and the operations it demands of the compositor.
 - **Who logs you in:** [`docs/design/graphical-session.md`](../design/graphical-session.md)
@@ -56,8 +56,8 @@ items are unblocked by this one, and they are listed under "What this unblocks" 
    pixels are the one place where "we'll add tests once it works" would actually happen, and
    the design doc's §8 exists to prevent it.
 2. **The compositor stays small.** Pixels, surfaces, windows, input routing, focus. Anything
-   else — desktops, the wiring graph, templates, spawning applications — belongs to the desktop
-   shell. It is the process everything visible depends on.
+   else — desktops and spawning applications — belongs to the desktop shell. It is the process
+   everything visible depends on.
 3. **Serial keeps working throughout.** `test-qemu`, `test-interactive`, `eshell`'s recovery
    path and headless CI all depend on the serial console. The GUI is a *second* backend behind
    the tty server's existing `backend_write` seam, never a replacement. The precedent is
@@ -1554,7 +1554,7 @@ desktop shell. [`graphical-session.md`](../design/graphical-session.md) now spec
 
 - [ ] **`desktop-shell`, minimally**: the top bar, the applications modal, window placement
       policy driving M6's ops, and — the load-bearing part — **constructing a namespace per
-      application it spawns**. `ui-composition-model.md` §5a requires this; §5's guarantee that
+      application it spawns**. `ui-composition-model.md` §5a requires this: its guarantee that
       "an application cannot compose other applications" rests on the shell being the process
       that built them.
 
@@ -1568,25 +1568,40 @@ desktop shell. [`graphical-session.md`](../design/graphical-session.md) now spec
       Serial must stay available while a graphical session runs — it is the recovery path — but
       whether that is two sessions or one session with two views is undecided.
 
-## Milestone 8 — desktops, ports, templates
+## Milestone 8 — desktops and the overview
 
 Sketched. The remainder of the old Milestone 6, now resting on a shell that exists.
 
+**Rescoped 2026-08-21**, when durable window-to-window wiring was cut
+([`ui-composition-model.md`](../design/ui-composition-model.md) revision 3). Ports-as-wiring, the
+default-handler fallback and templates went with it; desktops never depended on any of them.
+
 - [ ] **Graduate `ui-composition-model.md`** to `docs/architecture/` — this milestone builds the
-      ports and desktops it specifies.
+      desktops it specifies. Ports are the part that will still be unbuilt, so the graduation has
+      to say so rather than move the whole document.
 
 Multiple desktops and **the overview** — thumbnail capture, the frozen image grid, the desktop
-sidebar (desktop shell §6). Ports under windows, with `list` answering discovery. Desktop
-membership as a filtered view of the compositor's window set; moving windows between desktops.
-Wiring by `sys_ns_bind` into an application's namespace, and the default-handler fallback.
-Templates: instantiate, extract, `open ./code.nxg | desktop`, `save`.
+sidebar (desktop shell §6). Desktop membership as a filtered view of the compositor's window set;
+moving windows between desktops.
 
-## Milestone 9 — the composed desktop
+**No longer here:** ports with `list` discovery as a *wiring* surface, wiring by `sys_ns_bind`
+into an application's namespace, the default-handler fallback, and templates
+(`instantiate`/`extract`/`save`, `open ./code.nxg | desktop`). Ports themselves survive as paths
+and are unscheduled — see `TODO(port-shape-rework)`.
 
-Sketched. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via
-`QueryCaps`, Tier 2 durable wiring); and the question the composition doc leaves open — what
-happens to a wired graph when an application crashes, and whether the desktop shell respawns
-and rewires it.
+## Milestone 9 — applications, and drag-and-drop between them
+
+Sketched. A file browser and a text editor, as ordinary applications rather than as parts to be
+wired together, and the one composition mechanism that survived: **structural drag-and-drop** —
+`QueryCaps` against visible windows on a drag, valid targets highlighting, one message on drop.
+
+The applications come first in the ordering because the mechanism needs two honest consumers, and
+because they are the two the cut argues for building properly: revision 3's conclusion was that a
+workflow wanting tools tightly integrated is asking for an *application*.
+
+**No longer here:** the patch canvas, Tier 2 durable wiring, and "what happens to a wired graph
+when an application crashes" — that question was among the better arguments *for* the graph and
+went with it.
 
 - [ ] **Graduate `display-substrate.md`** to `docs/architecture/` — by the end of this milestone
       the substrate is fully built.
