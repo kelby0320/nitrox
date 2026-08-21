@@ -1,6 +1,10 @@
-# Nitrox: UI Composition Model — Design Notes (Revision 2)
+# Nitrox: UI Composition Model — Design Notes (Revision 3)
 
 ## Status
+
+**Revision 3 (2026-08-21) cuts durable window-to-window wiring**, with no replacement — the
+old §5 "Tier 2" and §7 "Templates". See "Changes in revision 3" below; the reasoning is worth
+reading before proposing anything shaped like it.
 
 **Not built.** This describes a subsystem with no code behind it; the build order is
 [`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
@@ -16,6 +20,42 @@ objects (widgets, windows) fit into the model, and what "pipes between windows" 
 
 Shell semantics beyond this — grammar, scripting language, error propagation, the
 builtin/external boundary — are still open and are the next topic of discussion.
+
+### Changes in revision 3 (2026-08-21)
+
+**Durable, per-instance window wiring is cut, and nothing replaces it.** Gone: Tier 2 standing
+connections, the patch-canvas view and its "show connections" overlay, the desktop shell's
+`sys_ns_bind` wiring, the default-handler fallback that existed to make an unwired port
+harmless, and templates as serialised wiring graphs (§7 entire).
+
+**Why.** The whole of Tier 2 was justified by one example — composing a file browser, editor and
+terminal into an IDE — and that example did not survive examination:
+
+- **It did not generalise.** Every other candidate that came up (email → calendar, log viewer →
+  editor, media player → file browser) wants *ephemeral dispatch*, not a standing connection. You
+  do not want every log-viewer click bound to one editor window forever. A dev session is
+  unusually long-lived, which is what made the IDE case look natural — and close to the only case
+  where durable per-instance wiring is the right shape at all.
+- **It did not beat the boring answer.** Any widget toolkit gives you a file tree, tabs and panels
+  inside a single application for free. If the pitch is "compose an IDE from independent programs
+  rather than building one", the composition machinery has to be worth more than the thing it
+  replaces, and it is not.
+- **It could not absorb the hard case.** LSP is bidirectional, stateful and high-frequency —
+  diagnostics streaming, completion mid-keystroke. Expressing it as ports would mean building
+  LSP-specific logic on top of the port abstraction, at which point the generic layer underneath
+  earns nothing. A design that needs an escape hatch for its most demanding real integration was
+  drawn in the wrong place.
+
+**The lesson, which outlives this document.** Durable, tightly-integrated tool composition is
+better served by *building the application* than by general OS-level wiring. Treat "durable
+cross-app wiring as an OS primitive" as a pattern to be **skeptical of by default** — not a
+prohibition, but a prior to check future proposals against, given it failed to generalise past a
+single example here.
+
+**What survives is justified without any composition story**: windows as resource servers (§2),
+which buys capability-gated window creation and scriptable window management on its own; ports as
+paths under a window (§5a), which a *command line* can address as readily as another window; and
+structural drag-and-drop (§5), which is a self-contained improvement on MIME-table dispatch.
 
 ### Changes in v2 (2026-08-04)
 
@@ -172,7 +212,7 @@ up a fake prompt because it was never given anywhere to put one. (This supersede
 of a dedicated `display` IPC channel — not needed; the namespace grant does the same job with one
 less concept.)
 
-## 4. Two kinds of composition, one substrate
+## 4. Two kinds of composition
 
 "Pipes between windows" stayed vague for a reason: it was being asked to do two different jobs.
 
@@ -182,67 +222,64 @@ less concept.)
 | Example | `cmd1 \| cmd2` | Click a file in a browser → "open this" to an editor |
 | Closest existing pattern | Unix pipe | Qt signal/slot, "open with" handler |
 
-Both are instances of the same underlying thing: nodes with typed ports, wired together. The
-port-based visual shell already planned for CLI dataflow doesn't need a sibling system for
-windows — it needs its scope extended to include long-running window-nodes alongside ephemeral
-pipeline-stage-nodes. One graph. Two front-ends onto it (text shell, visual canvas), plus a third
-informal one (drag-and-drop, below).
+Revision 2 read these as one graph with two front-ends, a text shell and a visual canvas. The
+canvas is cut and the graph with it, and the distinction is more useful without that framing:
+they are two *shapes of traffic* over the same substrate — a port that is a path (§5a).
 
-## 5. Window-to-window composition — two tiers
+**The shell is a client of both.** A pipeline stage streaming into a window's input port and a
+drag dropping one message on it differ in cadence, not in kind: each resolves a path and gets a
+handle. That is why ports survive the cut and the graph does not — the substrate is a namespace,
+which the system already has, rather than a wiring model, which it would have had to build.
 
-**Tier 1 — zero-setup, ephemeral.** Dragging a file from a browser triggers a live capability
+## 5. Window-to-window composition
+
+**One mechanism, deliberately small.** Dragging a file from a browser triggers a live capability
 query against visible windows (`QueryCaps`, already defined in `librsproto`'s Meta category) —
-"who has an input port shaped like `FileRef`." Valid targets highlight; drop sends one message. No
-pre-wiring, nothing persisted. This should feel like ordinary OS drag-and-drop, just driven by
-structural type match instead of a hardcoded MIME table. This is the case the dev-environment
-example is actually describing day-to-day.
+"who has an input port shaped like `FileRef`." Valid targets highlight; dropping sends one
+message, once. Nothing is pre-wired, nothing is persisted, no standing connection is created.
 
-**Tier 2 — durable, inspectable.** "Clicking in the browser always routes to this specific editor
-instance, for the rest of this session." A standing port connection between two specific
-instances. Surfaced via the visual shell/patch-canvas view — deliberately *not* baked into default
-window chrome (connector nubs on every window border all the time is noise for something set up
-rarely). Exposed instead through an explicit overlay: window context menu → "show connections," or
-similar. Same underlying graph the visual shell already renders — one data model, two views.
+This should feel like ordinary desktop drag-and-drop, just driven by **structural type match**
+instead of a hardcoded MIME table — and that is the whole of its claim. It is an improvement on
+how drag-and-drop works elsewhere, not the foundation of a composition system.
 
-**Binding granularity: per-instance**, not per-type. ("Route to *this* editor window," not
-"anything that can open text files.")
+**There is no second tier.** Revision 3 cut durable per-instance wiring, the patch canvas and
+templates; see the Status section for why, and for the prior it leaves behind. A workflow that
+wants tools durably integrated is asking for an application, and should be given one.
 
 ### 5a. Ports live under the window
 
 A port is a path under the window that owns it — `/dev/draw/3/ports/in/open-file` — served by
-the compositor. Three things follow:
+the compositor.
 
-- **Discovery is `list`.** The canvas draws connectable nubs by listing a window's ports, and
-  `QueryCaps` is answered from the same place rather than through a side channel.
-- **The server is not in the data path.** Resolving a path returns a *handle*; after that the
-  two programs talk directly. The compositor brokers the introduction and steps out — the same
-  shape the shell uses when it wires two pipeline stages together.
+**Kept, but on a different justification than it was written for.** Revision 2 justified ports as
+the thing durable wiring bound into; that is gone. What keeps them is a use case the wiring story
+was obscuring rather than serving: **a command line can address a GUI program's port**. Sending a
+file to a running editor, or reading a selection out of a browser, is exactly the everything-is-a-
+resource claim this system is built on, and it wants a *path* — there is nothing for `QueryCaps`
+alone to hand a shell. That the compositor's drag-and-drop uses the same ports is then a
+consequence rather than the reason.
+
+Three things follow from ports being paths:
+
+- **Discovery is `list`.** A window's ports are enumerable, and `QueryCaps` is answered from the
+  same place rather than through a side channel.
+- **The server is not in the data path.** Resolving a path returns a *handle*; after that the two
+  ends talk directly. The compositor brokers the introduction and steps out — the same shape the
+  shell uses when it wires two pipeline stages together, and what makes a CLI-to-GUI stream
+  possible without the compositor relaying it.
 - **Per-instance granularity falls out**, because ports hang off the window rather than the
-  process. An app with two editor windows has two input ports without anything special.
+  process. An application with two editor windows has two input ports without anything special.
 
-**The two kinds of composition materialise differently, and should.** §4 calls them one thing
-because they are one graph, but their cost profiles differ:
+**An application cannot compose other applications.** This is a requirement rather than an
+accident, and it is structural: no application holds a handle to another's namespace, so it has
+nothing to bind into. It survives the cut unchanged, and constrains whatever §5a becomes.
 
-| | Resolution | Why |
-|---|---|---|
-| **Discrete** (click → "open this") | resolve at send time | User-initiated and rare; always sees current wiring, so a connection made a second ago is live |
-| **Streaming** (a pipe between windows) | wire once into a direct channel | Per-message resolution would be absurd for a stream, and the wirer must not become a relay |
-
-**Wiring is `sys_ns_bind`; unwiring is `sys_ns_unbind`.** The desktop shell holds a full-rights
-handle to every application's namespace because it *created* those namespaces at spawn (§6),
-so installing a connection is one bind into an already-running program. No new mechanism.
-
-**An application cannot compose other applications** — the maintainer's requirement, and it is
-structural rather than policy: no application holds a handle to another's namespace, so it has
-nothing to bind into. Only the desktop shell does.
-
-**Absence is the fallback.** An unwired output port simply does not resolve, and the program
-falls back to the desktop's default handler (§5). That is the same shape as "absence is the
-sandbox" everywhere else in this system: nothing is denied, it is merely not there.
-
-**No connection present:** falls back to ordinary desktop default-handler behavior (spawn
-whatever's registered as default for the type). Tier 2 wiring is additive, never required to make
-the system usable.
+**The shape of this is not settled.** What is above was drawn for a mechanism that no longer
+exists, and the CLI case has different pressures — naming, whether a port is a stream or a single
+message, what happens when nothing is listening, and whether the compositor is the right server
+for a path an application defines. Reworking it is a discussion in its own right and has not
+happened; nothing here should be read as decided beyond "ports are paths, and the shell is a
+first-class client of them" (`TODO(port-shape-rework)`).
 
 ## 6. Desktops
 
@@ -252,7 +289,7 @@ why desktops belong in this document at all.
 
 Desktops are served by the **desktop shell**, a separate process from the compositor: the
 compositor owns pixels, surfaces, windows, focus and input routing; the desktop shell owns
-desktops, the graph, wiring, templates, and spawning applications. Keeping the compositor small
+desktops and spawning applications. Keeping the compositor small
 matters because it is what everything visible depends on.
 
 **Dynamic by default, nameable afterwards.** Desktops are created and destroyed on demand — the
@@ -269,95 +306,35 @@ Two properties keep it a workspace rather than a cage:
 - **Windows move between desktops** — one attribute change (§2a), since membership lives only
   in the compositor.
 
-Three cases are named but not settled: a window on **no** desktop (just created, or mid-move);
-**sticky** windows on all desktops, which every DE has and which breaks a plain 1:1; and
-**dialogs**, which are genuinely *on* a desktop and should be listed, but which the canvas
-should not offer as wirable nodes — a filter by `role`, not a different tree.
+Two cases are named but not settled: a window on **no** desktop (just created, or mid-move), and
+**sticky** windows on all desktops, which every DE has and which breaks a plain 1:1.
 
-## 7. Templates
+A third — **dialogs** — is settled by revision 3. It was "genuinely *on* a desktop and should be
+listed, but the canvas should not offer it as a wirable node", which was a filter by `role`
+against a canvas that no longer exists. What remains is the half that was always the substance: a
+dialog is on its parent's desktop and is listed. Being listed is now the whole of what
+distinguishes it, and it is placed like any other listed window.
 
-A saved development environment — terminal + file browser + editor, wired and placed — is a
-**template**: a description of which applications to spawn, where their windows go, and how
-their ports are wired.
-
-**A template is a file; a desktop is a namespace.** They share a shape, which makes translation
-cheap, but they are not the same thing:
-
-| | Template | Live desktop |
-|---|---|---|
-| Where | `/home/Desktop/code.nxg`, ordinary data | `/dev/desktop/1/`, exists while running |
-| Nodes | program + args + geometry | window ids |
-| Status | a recipe | what is actually true right now |
-
-Instantiating reads the file, spawns, places and wires. Extracting walks the live desktop and
-produces a value — **translating window ids into node descriptions**, which is the point where
-"a template is not a snapshot" stops being a principle and becomes a specific transformation.
-
-**Both directions are existing shell verbs**, because a live graph is a readable resource and a
-template is ordinary data:
-
-```
-open ./code.nxg | desktop                              # instantiate
-open /dev/desktop/current/graph | save ~/Desktop/code.nxg   # capture what I have now
-```
-
-v1 said "no new save format required". With windows and ports as paths and the graph as TSM1,
-that is now literally true — and the first version of this needs **no GUI at all**: a meta-app
-can be built and saved from the shell before a canvas exists to draw one.
-
-Four rules that keep templates honest:
-
-- **No live link between a template and its instances.** Extraction produces a new value;
-  writing it back over the original is a deliberate act, like save-versus-save-as. A live link
-  would mean moving one window silently rewrote the arrangement — the failure mode every
-  workspace manager that tried it has had.
-- **A template may be instantiated more than once.** Two code desktops for two projects. The
-  live desktop's identity is its own (§2b); the template's origin is at most a note in `info`.
-- **Most desktops have no template**, and nothing about a desktop's behaviour depends on
-  whether it had one.
-- **Templates are per-user and profile-relative.** They name programs (`/bin/edit`), so they
-  resolve against whoever opens them. Living in `/home/Desktop` makes that a non-issue by
-  construction — a template in your home is yours. A template naming a program you do not have
-  should fail loudly at instantiation rather than quietly producing a smaller desktop.
-
-**Templates should take parameters.** One template per project is the wrong answer; a
-code-editor desktop wants the terminal in *this* project's directory and the editor on *this*
-project's tree. `open ./code.nxg | desktop ~/src/nitrox` reads correctly and has an obvious
-spelling available, since the shell already has named arguments for `def` calls (shell design
-§5b). Flagged rather than specified.
-
-## 8. Open questions carried forward
-
-**Largely resolved in v2: does "windows as namespace-resident resources" overload namespace
-semantics?** The worry was churn — windows come and go by the second, and namespace binding is a
-supervisor operation. §2a answers it: windows are **paths a server answers for**, not bindings
-anyone maintains, so opening a window calls no `sys_ns_bind` and involves no supervisor. It is
-the mechanism `/home` already uses. What remains open is narrower and worth watching: whether
-serving ports through the compositor makes it a **discovery bottleneck** on a canvas with many
-windows.
-
-**The shell questions v1 carried are now answered** by the shell subproject (Milestone 4;
-design `docs/spec/shell-language.md`):
-
-| v1 question | Where it landed |
-|---|---|
-| Error propagation: convention or explicit `try`/`catch`? | Explicit. Failures raise and propagate; `try`/`catch` is an expression, `fail` raises, errors carry a `kind` (§2) |
-| Redirection/`save` for structured data | `save`/`open` replace redirection entirely; format from the extension (§4) |
-| Builtin vs external boundary | Four categories, resolved by what a thing structurally *can* be (§3) |
-| Env vars as non-ambient, namespace-scoped | A TSM1 `Record` on the setup message — not ambient, not inherited (Milestone 3.5) |
-| Grammar/syntax | Settled (§8/§9), built, and revised once in light of use |
+## 7. Open questions carried forward
 
 Still open, from this document:
 
-- **Where port names come from** (§5a) — an application manifest at spawn, or `QueryCaps` asked
-  of the live window? Discovery wants the second; wiring a program that has not started yet
-  wants the first.
-- **A namespace name for the default handler** (§5). "Falls back to ordinary desktop
-  default-handler behaviour" is a path the program resolves, so the desktop shell wants a
-  binding of its own in every application's namespace.
-- **Sticky windows, windows on no desktop, and dialog filtering** (§6).
-- **Template parameters** (§7) — the idea is accepted, the spelling is not.
-- **What happens to a wired graph when an application crashes.** Does the desktop shell respawn
-  and rewire it? The template makes that mechanically possible, and it may be one of the better
-  arguments for the whole idea — a meta-app that repairs itself is something a pile of manually
-  arranged windows cannot do.
+- **The shape of ports** (§5a) — `TODO(port-shape-rework)`. Kept for the command-line case, but
+  designed for a mechanism that no longer exists. Naming, stream-versus-message, what happens when
+  nothing is listening, and which server owns the path are all unsettled. This is the live
+  question in this document.
+- **Sticky windows and windows on no desktop** (§6). The *dialog filtering* half of this question
+  is gone with the canvas — a `dialog` is now distinguished by being listed and parented, not by
+  what a canvas declines to offer.
+
+Answered or made moot by revision 3:
+
+- ~~Where port names come from~~ — **`QueryCaps`, asked of the live window.** The alternative, an
+  application manifest read at spawn, existed to wire a program that had not started yet. Nothing
+  pre-wires anything now, so the question resolves itself.
+- ~~A namespace name for the default handler~~ — moot. The default handler was the fallback for an
+  unwired port.
+- ~~Template parameters~~ — moot with templates.
+- ~~What happens to a wired graph when an application crashes~~ — moot. It was among the better
+  arguments *for* Tier 2, and it went with it.
+

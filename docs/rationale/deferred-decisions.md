@@ -280,6 +280,24 @@ scheduling rather than a trigger.
 
 ### Graphics
 
+**The shape of a window's ports — `TODO(port-shape-rework)`.** A port is a path under the window that owns it (`ui-composition-model.md` §5a), and that much is
+settled. Nothing else about it is: naming, whether a port carries a stream or a single message,
+what a resolve does when nothing is listening, and whether the compositor is the right server for
+a path an application defines.
+
+**Filed because its justification changed underneath it.** §5a was written to describe what
+durable window-to-window wiring bound into, and revision 3 cut that wiring. What keeps ports is a
+different case the wiring story had been obscuring: **the command line addressing a GUI program** —
+sending a file to a running editor, reading a selection out of a browser. That is the
+everything-is-a-resource claim applied to windows, and it wants a path, since there is nothing for
+`QueryCaps` alone to hand a shell. The pressures are not the same ones §5a was drawn against, so
+the design is carried forward as an open question rather than as a decision.
+
+The marker sits on the compositor's forwarded-resolve arm, which is where such a path would be
+served and where `/dev/draw/<N>/ports/…` is currently declined. Trigger: the first client that
+wants to address a window from outside it — most likely a coreutil, which is also the case that
+would settle the stream-versus-message question fastest.
+
 **GPU driver and compositor.** Architecture is sketched (GPU driver as Tier 2 LKM, compositor as userspace server, client-side rendering, Wayland-influenced protocol). Specific compositor protocol, 3D acceleration scope, window management model — all deferred. Trigger: when the project wants a GUI. Pre-compositor mode (`/dev/framebuffer` as a kernel resource server) is sufficient for early userspace, debug UI, and kernel panic screens.
 
 **Specific compositor/client protocol.** Deferred along with the compositor itself. Likely Wayland-derived but using the resource-server protocol as the wire format. Decision when compositor work begins.

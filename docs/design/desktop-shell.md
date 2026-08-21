@@ -13,8 +13,8 @@ shelved (§9).
 Three documents divide this space:
 
 - **`display-substrate.md`** — mechanism. Framebuffer, surfaces, input, the test gate.
-- **`ui-composition-model.md`** — semantics. What a window *is*, ports, desktops,
-  templates.
+- **`ui-composition-model.md`** — semantics. What a window *is*, ports, desktops. (Templates
+  and durable wiring were cut in its revision 3, 2026-08-21.)
 - **This document** — the shell built on both, and the demands it places back on the compositor
   (§8). It is also what settled the widget toolkit's central question (§5).
 
@@ -66,9 +66,10 @@ compositor. That is the cheap option kept open rather than exercised.
 **One modal, two triggers**: the applications button in the top bar, and the Super key. They open
 the same thing, because they are the same intent.
 
-**Its entries are `/bin` programs and `~/Desktop/*.nxg` templates**, and this falls out of
-decisions already made rather than being designed here: both are ordinary files in the
-namespace, so type-to-filter runs over both with no special mechanism. "Open the code-editor
+**Its entries are `/bin` programs**, and this falls out of decisions already made rather than
+being designed here: they are ordinary files in the namespace, so type-to-filter runs over them
+with no special mechanism. (An earlier version also listed `~/Desktop/*.nxg` templates; templates
+were cut in composition revision 3.) "Open the code-editor
 desktop" is a launcher entry, not a feature.
 
 The Super key means the shell receives a keystroke **regardless of focus** — see §8's global
@@ -174,12 +175,13 @@ a role into a shipped protocol is the kind of change that touches every client.
 
 - **Desktop lifecycle — shelved, not decided.** GNOME 3 auto-removes a workspace when it empties;
   an explicit "new empty desktop" button implies desktops live until closed. The two fight, and
-  the maintainer has deliberately deferred choosing. Note that saved desktops (composition v2 §7)
-  pull toward explicit lifecycle: a template-instantiated desktop vanishing because you closed its
-  last window would be surprising.
+  the maintainer has deliberately deferred choosing. The argument that used to settle it — saved
+  desktops pulling toward explicit lifecycle, since a template-instantiated desktop vanishing
+  would surprise — went with templates in composition revision 3, so the question is now open on
+  its own terms.
 - **The system tray is v2.** It is an *inter-process protocol* — applications register icons and
   receive click callbacks — and that is real scope, not a widget.
-- **Does the launcher search beyond programs and templates?** Files and open windows are the
-  obvious extensions, and each adds an indexing problem.
+- **Does the launcher search beyond programs?** Files and open windows are the obvious
+  extensions, and each adds an indexing problem.
 - **Live thumbnails** as an optimisation. Trigger: the frozen ones being visibly wrong in use.
 - **Indicator or switcher** (§7) — decidable empirically after living with the bar.

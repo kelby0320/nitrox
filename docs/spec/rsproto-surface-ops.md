@@ -11,7 +11,10 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 `PointerEvent` are defined, and
 three paths resolve: `/dev/draw/new` for a session, `/dev/draw/<N>/info` for a window's
 metadata, and `/dev/draw/manage` for the **manager channel** (M6 Part B, 2026-08-19). A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
-capture, window movement and port wiring are later milestones and will extend this category.
+capture and window movement are later milestones and will extend this category. Ports are
+**unscheduled**: durable window-to-window wiring was cut on 2026-08-21, and what keeps ports —
+a command line addressing a running window — wants a shape that has not been designed yet
+(`TODO(port-shape-rework)`).
 
 **`KeyEvent` and `PointerEvent` are sent** as of M3 Part C3 (2026-08-10). The compositor
 consumes `/dev/input/new`, interprets the stream with `libinput`, and routes it:
@@ -209,7 +212,7 @@ A window carries a **role**, fixed at creation. Each changes what the compositor
 | `normal` | `0` | An ordinary application window. |
 | `panel` | `1` | A bar. Docks to a screen edge, visible on every desktop, and **never takes keyboard focus** — clicking the clock must not steal input from the terminal. Reserves space (below). |
 | `popup` | `2` | A menu or modal. Transient, parented, and may extend beyond its parent's bounds; a menu clipped to its window is not a menu. |
-| `dialog` | `3` | Parented, on its parent's desktop, listed but **not** offered as a wirable node on the composition canvas. |
+| `dialog` | `3` | Parented, on its parent's desktop, and **listed**. The parent carries desktop membership and lifetime, not position — a manager places a dialog as it places any other listed window. |
 
 **Role is immutable.** A change would force the compositor to redo struts, focus policy
 and stacking mid-flight. A client that wants a different role creates a different window —
@@ -263,7 +266,7 @@ menu item its popup drops from was drawn, so a manager does not place popups —
 exempt from the initial-configure hold below, because there is nobody to wait for.
 
 **A `dialog` is not.** It names a parent, but the parent carries its desktop membership, its
-lifetime and its exclusion from the composition canvas — not its position. In placement terms a
+lifetime — not its position. In placement terms a
 dialog is an ordinary listed window: it lands at the compositor's default origin, a manager
 places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
 

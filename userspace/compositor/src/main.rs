@@ -1915,8 +1915,8 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
         }
 
         // A forwarded resolve: `new` mints a session, `manage` mints the manager channel
-        // (one holder), `<N>/info` answers with window metadata. A bare `<N>` and
-        // `<N>/ports/...` are later milestones.
+        // (one holder), `<N>/info` answers with window metadata. A bare `<N>` is a later
+        // milestone; `<N>/ports/...` is unscheduled — see `TODO(port-shape-rework)`.
         // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
         let rr = unsafe {
             syscall4(

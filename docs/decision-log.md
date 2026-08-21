@@ -16754,3 +16754,54 @@ at the shell has been asserted, because an open popup takes the keyboard.
 
 **Milestone 6 is complete** — every checkbox, including D1, which was satisfied incrementally as
 each op landed rather than by a documentation pass at the end.
+
+## 2026-08-21 — Durable window-to-window wiring is cut, with no replacement
+
+`ui-composition-model.md` revision 3 removes Tier 2 — standing per-instance connections between
+windows, the patch-canvas view and its "show connections" overlay, the desktop shell's
+`sys_ns_bind` wiring, the default-handler fallback that made an unwired port harmless, and
+templates as serialised wiring graphs. Nothing replaces it. **Maintainer's decision**, after
+examining the idea on its merits rather than on its appeal.
+
+**The case against it, which is the part worth keeping.** Tier 2 was justified almost entirely by
+one example — composing a file browser, editor and terminal into an IDE — and that example did not
+survive scrutiny on three counts:
+
+- *It did not generalise.* Other candidates (email → calendar, log viewer → editor, media player →
+  file browser) all want ephemeral dispatch rather than a standing connection; you do not want
+  every log-viewer click bound to one editor forever. A dev session is unusually long-lived, which
+  is what made the IDE case look natural — and close to the only case where durable per-instance
+  wiring is the right shape at all.
+- *It did not beat the boring answer.* A widget toolkit gives you a file tree, tabs and panels
+  inside one application for free. Composition machinery has to be worth more than the thing it
+  replaces.
+- *It could not absorb the hard case.* LSP is bidirectional, stateful and high-frequency. As ports
+  it would need LSP-specific logic layered on top, at which point the generic layer earns nothing.
+  A design needing an escape hatch for its most demanding real integration was drawn in the wrong
+  place.
+
+**The generalisable lesson, recorded as a prior rather than a rule:** durable, tightly-integrated
+tool composition is better served by *building the application* than by OS-level wiring. Treat
+"durable cross-app wiring as an OS primitive" as a pattern to be skeptical of by default, given it
+failed to generalise past a single example here.
+
+**Ports survive, on a different justification than they were written for.** Revision 2 justified
+ports as what wiring bound into. What keeps them is a case the wiring story had been obscuring:
+**a command line addressing a GUI program** — sending a file to a running editor, reading a
+selection out of a browser. That is everything-as-a-resource applied to windows, and it wants a
+*path*, since there is nothing for `QueryCaps` alone to hand a shell. Their shape is now an open
+question rather than a settled design — `TODO(port-shape-rework)` — because the pressures of the
+CLI case are not the ones §5a was drawn against.
+
+**Milestones rescoped.** M8 becomes "desktops and the overview" (desktops never depended on
+wiring); M9 becomes "applications, and drag-and-drop between them" — a file browser and a text
+editor built as applications, which is what the cut argues for, plus the one surviving mechanism.
+
+**One thing it reached backwards into, which is worth naming.** `Role::Dialog` was defined as
+"parented, on its parent's desktop, listed but **not offered as a wirable node on the composition
+canvas**" — and the 2026-08-20 entry "A `dialog` is placed by the manager, not by its creator"
+leaned on that canvas exclusion as one of three legs. The canvas is now cut. **The conclusion is
+unaffected** — the parent still carries desktop membership and lifetime and still does not carry
+position — but a leg of the argument is gone, and the definition has been reworded in the spec,
+`librsproto`, and `display-substrate.md` so that nothing defines a shipped role in terms of a
+feature that will not exist. The earlier entry stands as written: it was true on its date.

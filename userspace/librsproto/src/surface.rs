@@ -41,8 +41,13 @@ pub const ROLE_PANEL: u16 = 1;
 /// `popup` — a menu or modal. Transient, parented, and may extend beyond its parent's
 /// bounds (a menu clipped to its window is not a menu).
 pub const ROLE_POPUP: u16 = 2;
-/// `dialog` — parented, on its parent's desktop, listed but not offered as a wirable node
-/// on the composition canvas.
+/// `dialog` — parented, on its parent's desktop, and **listed**.
+///
+/// The parent carries this window's desktop membership and its lifetime — destroy is
+/// transitive — but **not its position**: a manager places a dialog as it places any other
+/// listed window, and it is held for one like any other. Only a `popup` is placed by its
+/// creator. (An earlier definition also said "not offered as a wirable node on the composition
+/// canvas"; that canvas was cut, and the rest stands without it.)
 pub const ROLE_DIALOG: u16 = 3;
 
 /// Wire tag for the top edge.

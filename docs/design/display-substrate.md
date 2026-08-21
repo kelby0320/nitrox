@@ -50,7 +50,7 @@ Worth stating, because three of these are load-bearing for decisions below:
 `/dev/desktop`, and is the only holder of application namespace handles (v2 §4).
 
 **Rejected: one process.** Stacked up, the single-process version would own surfaces, windows,
-ports, wiring, desktops and saved graphs. That is too much for the one process that must never
+ports, desktops and application spawning. That is too much for the one process that must never
 wedge — the compositor is what everything on screen depends on, and it should be small enough
 to reason about and restartable last.
 
@@ -120,8 +120,11 @@ each changes what the compositor does:
   the terminal.
 - **`popup`** — a menu or a modal. Transient, parented to another window, and may extend beyond
   its parent's bounds. Menus force this: a menu clipped to its window is not a menu.
-- **`dialog`** — parented, on its parent's desktop, listed but **not offered as a wirable node**
-  on the composition canvas (v2 §6).
+- **`dialog`** — parented, on its parent's desktop, and **listed**. Its parent carries its
+  desktop membership and its lifetime, not its position: a manager places a dialog as it places
+  any other listed window. (An earlier revision also distinguished it as "not offered as a
+  wirable node on the composition canvas"; the canvas was cut in
+  `ui-composition-model.md` revision 3, and the rest of the definition stands without it.)
 - **`normal`** — everything else.
 
 **A panel reserves space.** A maximised window must not cover the bars, which X calls struts.
