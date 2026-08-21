@@ -319,13 +319,24 @@ fn load_declaration(root_ns: u64) -> Option<ServiceDecl> {
             return None;
         }
     };
-    let decl = match service_toml::parse(&text) {
-        Some(d) => d,
-        None => {
-            kprint(b"service-mgr: declaration parse error\n");
-            return None;
-        }
-    };
+    let mut decls = service_toml::parse_all(&text);
+    if decls.is_empty() {
+        kprint(b"service-mgr: declaration parse error\n");
+        return None;
+    }
+    // **Only the first is started.** `parse_all` returns every service in the file, but
+    // this supervisor can hold exactly one child: `supervise` attributes a `ChildExited`
+    // to its service without matching the pid, because nothing maps a process handle to a
+    // pid — see `TODO(child-exit-attribution)`. Starting a second child here would make
+    // whichever exits first look like this one exiting.
+    if decls.len() > 1 {
+        Line::new()
+            .s(b"service-mgr: ")
+            .u(decls.len() as u64 - 1)
+            .s(b" further service(s) declared and NOT started (one child at a time)")
+            .end();
+    }
+    let decl = decls.remove(0);
     Line::new()
         .s(b"service-mgr: parsed service '")
         .s(decl.name.as_bytes())

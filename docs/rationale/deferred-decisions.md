@@ -405,6 +405,38 @@ namespace binds the subtree and reaches both. It cannot express "the subtree min
 which is why an application that ever needs `/dev/draw/<id>/info` for ids it does not know in
 advance re-opens this.
 
+**A supervisor cannot tell its children's exits apart — `TODO(child-exit-attribution)`.**
+`KIND_CHILD_EXITED` carries the child's **pid** (body bytes 0–3), and nothing in the system maps
+a process **handle** back to a pid: `sys_process_spawn` returns a handle, `sys_handle_stat`'s
+`HandleInfo` carries rights / object type / generation / size and no pid, there is no pid syscall,
+and `/proc` exposes exactly `self/status` (the caller's *own* pid) and `sched/stats` — there is no
+per-pid tree. `KIND_PEER_CLOSED` is declared in both ABIs but **never emitted**, so a control
+channel's death is not a notification either.
+
+So a supervisor with two children learns *that* one exited and never *which*. Both supervisors
+already assume their way past it: `init`'s `reap_loop` attributes the first `ChildExited` to its
+primary child while `parent_h != 0`, without comparing the pid — and init has six or more children
+(fs-server, profile-server, compositor, input-server, tty-server, service-mgr, plus the selftest
+demos) — and `service-mgr`'s `supervise` does the same for its single service. Neither has been
+bitten because in both cases only one child is *expected* to exit, which makes this a latent bug
+rather than a live one.
+
+**It bites the moment a supervisor has a second child that exits**, which is exactly what a
+declared `boot-probe` is ([`test-path-retrofit.md`](../planning/test-path-retrofit.md) Part A):
+the probe exiting would be read as the supervised service exiting, closing its handle and firing
+its restart policy, after which the real exit is ignored. Found on contact 2026-08-21, which is
+why `service-mgr` starts only the first declaration in a multi-service file and says so.
+
+Three shapes, none chosen. **Report the pid at spawn** — the kernel writes it back into a
+`SpawnArgs` field, or a new syscall reads it from a process handle; smallest and most direct, but
+`SpawnArgs`/`HandleInfo` cross the ABI and `HandleInfo`'s size has already caused one memory bug.
+**Emit `KIND_PEER_CLOSED`** for real, so a supervisor watching a per-child control channel learns
+which one died from *which handle* signalled — no pid involved, and a handle cannot be recycled
+under you the way a pid can. **Match on the process handle**, by having the notification carry the
+handle the parent holds rather than (or beside) the pid.
+
+Trigger: `test-path-retrofit.md` Part A, which needs `service-mgr` to hold two children.
+
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
 server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and
