@@ -49,8 +49,8 @@ a particular keystroke. See the decision log, 2026-08-13.
 
 | Situation | Verdict | Fired by |
 |---|---|---|
-| The substrate gates pass | PASS (`0x10` → exit **33**) | **`boot-probe`**, after `sched_gate` + `fp_gate` |
-| A substrate gate fails | FAIL (`0x11` → exit **35**) | `boot-probe`, same call |
+| Every substrate check passes | PASS (`0x10` → exit **33**) | **`boot-probe`**: `sched_gate`, `fp_gate`, and the four filesystem checks + `subtree_bind_test` |
+| Any one of them fails | FAIL (`0x11` → exit **35**) | `boot-probe`, same call |
 | A demo child crashes | FAIL | `init`, on the non-zero reap code |
 | Spawn / critical-path boot failure | FAIL | `init` (`supervise` spawn-fail; `emergency`) |
 | Kernel `panic!` | FAIL | the kernel panic handler (`main.rs`) |

@@ -888,6 +888,62 @@ mod tests {
         }
     }
 
+    /// **One registration can be bound at two paths, and the two coexist** — one unscoped,
+    /// one subtree-scoped, each resolving with its own suffix and base.
+    ///
+    /// That is the shape `init` and `session-mgr` rely on: the fs endpoint is bound at `/`,
+    /// and `session-mgr` binds *the same* endpoint again at `/home` with a base. Nothing else
+    /// here covers it — [`bind_rejects_invalid_and_duplicate`] rejects a repeated *path*, not
+    /// a repeated target.
+    ///
+    /// **What this test does NOT establish, despite an earlier name that said it did.** It was
+    /// called `one_registration_bound_twice_is_shared_not_duplicated`, and its headline
+    /// assertion — that both bindings resolve to the same registration pointer — **cannot
+    /// fail**: the test hands the same `ObjectRef` to both binds, `bind_userspace_server`
+    /// stores it verbatim, and `resolve` clones it back out. There is no code path in
+    /// `Namespace` that could substitute a different registration, so the assertion is a
+    /// property of the test's own setup (PR #228 review, finding 4). It is kept below because
+    /// it states the intent cheaply, not because it is a check.
+    ///
+    /// **Sharing is the caller's property**, enforced by `init` and `session-mgr` passing the
+    /// same endpoint rather than minting a second, and pinned end to end by `boot-probe`'s
+    /// `subtree_bind_test` — which compares a file read through both names — and by
+    /// `test-interactive` steps 5a–5c, where a session writes through the scoped binding.
+    #[test]
+    fn one_registration_can_be_bound_at_two_paths() {
+        let n = ns();
+        let reg = us_reg_target();
+        let same = reg.clone();
+        let addr = reg.as_ptr() as usize;
+        n.bind_userspace_server(b"/", reg, Rights::LOOKUP, SubtreeBase::empty()).unwrap();
+        let base = SubtreeBase::from_path(b"/system").unwrap();
+        n.bind_userspace_server(b"/subtreetest", same, Rights::LOOKUP, base).unwrap();
+
+        // The root mount forwards the whole path and carries no base.
+        let (direct, _, dsuf) = n.resolve(b"/system/current-generation").unwrap();
+        assert_eq!(dsuf, b"system/current-generation");
+        // The scoped binding forwards only the tail, and hands back the base to prepend —
+        // so the syscall layer joins them to the *same* server-relative path as above.
+        let (scoped, _, ssuf) = n.resolve(b"/subtreetest/current-generation").unwrap();
+        assert_eq!(ssuf, b"current-generation");
+
+        match (direct, scoped) {
+            (
+                ResolvedTarget::UserspaceServer(a, abase),
+                ResolvedTarget::UserspaceServer(b, bbase),
+            ) => {
+                // True by construction (see the doc comment) — stated, not checked.
+                assert_eq!(a.as_ptr() as usize, addr);
+                assert_eq!(b.as_ptr() as usize, addr);
+                // These two *are* checks: each binding carries its own base, and the second
+                // bind did not overwrite or inherit the first's.
+                assert!(abase.is_empty(), "the unscoped binding must carry no base");
+                assert_eq!(bbase.as_path(), b"/system");
+            }
+            _ => panic!("expected userspace-server targets"),
+        }
+    }
+
     #[test]
     fn bind_userspace_server_hands_back_target_on_error() {
         let n = ns();

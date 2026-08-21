@@ -112,6 +112,30 @@ impl<T> SpinLock<T> {
     fn release(&self) {
         self.locked.store(false, Ordering::Release);
     }
+
+    /// Borrow the protected value **without locking**, given exclusive access.
+    ///
+    /// `&mut self` proves no other reference to this lock exists, so there is nothing to
+    /// exclude — the atomic and the rank check would both be theatre. Note this takes no
+    /// part in [`lock`](Self::lock)'s preemption discipline above: there is no critical
+    /// section to keep a holder running through.
+    ///
+    /// **It exists because taking the lock is not always harmless.** The rank check is a
+    /// real constraint, and a `Drop` impl that locks itself and then releases the objects it
+    /// owns acquires a *second* lock of the same rank from inside the first — a genuine
+    /// ordering violation that panics the kernel, and one `AddressSpace::drop` had until
+    /// 2026-08-21. Reaching the value directly is both faster and correct.
+    ///
+    /// **Appended below `lock` rather than inserted above it**, which is not style: the first
+    /// version of this method went in above `lock` and silently absorbed `lock`'s entire doc
+    /// comment — the F12 holder-liveness rationale — leaving `lock` undocumented and this
+    /// method described as a preemption-disabled critical section (PR #228 review, finding 3).
+    /// That failure mode has a history in this repo.
+    pub fn get_mut(&mut self) -> &mut T {
+        // SAFETY: `&mut self` is exclusive access to the whole lock, so no guard can exist
+        // and no other CPU can hold a reference to the contents.
+        unsafe { &mut *self.data.get() }
+    }
 }
 
 /// RAII guard returned by [`SpinLock::lock`]. While alive, the guard

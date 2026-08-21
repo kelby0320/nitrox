@@ -17154,3 +17154,53 @@ be *scheduled* to print its line before `boot-probe` fires PASS and stops the ma
 was measured rather than assumed — six lines and one ELF materialisation — and the function says
 what to check first if it ever goes red on a healthy boot, plus the weaker causal alternative
 (`service-mgr: login chain up`) and what that alternative gives up.
+
+## 2026-08-21 — A lock-order violation in `AddressSpace::drop`, found by moving tests out of PID 1
+
+Test-path retrofit Part C, first half. The five filesystem tests left `init` — 376 lines, into
+`boot-probe` — and the move surfaced a kernel bug that had been reachable since file mappings
+existed.
+
+**The bug.** `AddressSpace::drop` locked its own `inner` (`LockRank::KernelObject`) and released
+its VMAs inside that guard. A VMA owns an `ObjectRef` to whatever backs it, so the last reference
+to a `FileObject` drops there — taking the *file's* lock, same rank. The rank checker is exactly
+right to panic: `lock-order violation: acquiring KernelObject … while holding KernelObject`.
+
+**Why it took this change to find it.** It needs a process that **exits** while holding the last
+reference to a file-backed mapping. `init` ran these tests and never exits. `boot-probe` maps
+`/system/large.bin`, closes its handle — leaving the mapping as the only reference — and exits.
+First boot, kernel panic.
+
+And it appeared in **`check-terminal`, not `test-qemu`**, which is Part B's property paying off a
+second time: the probe writes the verdict, so under `test-qemu` the machine stops before the
+probe can exit. A gate that boots the same image *without* `isa-debug-exit` sees the guest keep
+running past the verdict, and that is where the fault lives.
+
+**The fix is `SpinLock::get_mut`, and it is not a workaround.** `Drop` has `&mut self`, which is
+exclusive access to the whole lock — there is nothing to exclude, and both the atomic and the
+rank check are theatre. Reaching the value directly is correct *and* removes the false ordering.
+The method is new and documented with this case as its reason.
+
+**No host test in this kernel can catch a lock-order violation, and that is worth knowing.** The
+rank tracker is `#[cfg(not(all(debug_assertions, not(test))))]` — inert under `cfg(test)`,
+because it needs per-CPU state the host harness has no equivalent for. The test added beside the
+fix pins the half that *is* testable (an address space that last-holds a file mapping releases it
+on drop) and says plainly that reverting the fix leaves it passing. A test whose negative control
+does not fire is decoration; better to label it than to imply cover that is not there.
+
+**The filesystem tests now gate the run, which they never did.** Every failure path in `init` was
+a bare `return` after a `FAIL` print — nineteen of them — so a broken filesystem printed
+`init: create MISMATCH` and the boot passed. That is decoration wearing the word "test", and
+exactly the class this plan exists for. Each returns `bool` now, joined with `&` rather than `&&`
+so one failure does not hide the others.
+
+**The `/subtreetest` binding is the one cfg C1 could not remove, and it stays for a reason worth
+stating.** It cannot move: `[handles].namespace` is unparsed, and a declared service is spawned
+with `namespace: 0` — an inherited LOOKUP-only root — so "the test image differs by data" has no
+way to express a namespace bind. Removing it anyway broke the demo harness's case 8, which needs a
+binding that is *also* an openable directory to prove `move` refuses to recurse through a mount.
+Closing this needs a mechanism, not an edit.
+
+`init` still carries **20** `selftest` cfgs otherwise — the demo chain, the four graphical spawns,
+and the `cfg(not(selftest))` supervision of `service-mgr`. Those are ordinary code that becomes
+service declarations in C2, and they are the larger half of Part C.

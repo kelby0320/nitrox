@@ -731,8 +731,21 @@ impl Drop for AddressSpace {
     /// Tear down every VMA (uninstall PTEs, free leaf frames), drop
     /// the (now-empty) tree, then free the top-level PML4 frame.
     /// Intermediate page-table frames leak per the deferred decision.
+    ///
+    /// **`get_mut`, not `lock`, and that is a bug fix rather than an optimisation.** A VMA
+    /// owns an `ObjectRef` to whatever backs it, and the last reference to a `FileObject`
+    /// drops when the VMA does — taking the *file's* lock. That lock and this one are both
+    /// `LockRank::KernelObject`, so releasing a VMA while holding this guard is a same-rank
+    /// acquisition: `lock-order violation: acquiring KernelObject … while holding
+    /// KernelObject`, and the kernel panics.
+    ///
+    /// It stayed hidden because it needs a process to **exit** holding the last reference to
+    /// a file-backed mapping. `init` ran the filesystem tests and never exits; moving them to
+    /// `boot-probe`, which maps `/system/large.bin`, closes its handle and then exits, hit it
+    /// on the first boot (retrofit Part C). `&mut self` in `Drop` means there is nothing to
+    /// exclude, so not locking is also simply correct.
     fn drop(&mut self) {
-        let mut guard = self.inner.lock();
+        let guard = self.inner.get_mut();
 
         // Drain the tree leftmost-first: peek via iter (an immutable
         // borrow that ends before the mutating remove), then remove.
@@ -1164,6 +1177,47 @@ mod tests {
         unsafe {
             ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject)
         }
+    }
+
+    /// **Dropping an address space must release its file-backed VMAs without a lock-order
+    /// violation**, which it did not until 2026-08-21.
+    ///
+    /// A VMA owns an `ObjectRef` to what backs it. Here the mapping holds the *last*
+    /// reference to the `FileObject`, so dropping the address space drops the file — taking
+    /// the file's `LockRank::KernelObject` lock. `Drop` used to hold its own lock of the same
+    /// rank across that release, and the rank checker panics on it: "acquiring KernelObject …
+    /// while holding KernelObject".
+    ///
+    /// It needed a **process that exits** holding the last reference to a file mapping to
+    /// show up: `init` ran the filesystem tests and never exits. Moving them to `boot-probe`
+    /// (retrofit Part C) panicked the kernel on the first boot, in `check-terminal` — not
+    /// `test-qemu`, where the probe's verdict stops the machine before it can exit.
+    ///
+    /// **This test does not catch the ordering bug, and saying so is the point.** The rank
+    /// tracker is `#[cfg(not(all(debug_assertions, not(test))))]` — *inert under `cfg(test)`*,
+    /// because it needs per-CPU state the host harness has no equivalent for. Reverting `drop`
+    /// to `self.inner.lock()` leaves this test passing. **No host test in this kernel can
+    /// catch a lock-order violation**; the reproduction is a QEMU boot, and for this one it is
+    /// `cargo xtask check-terminal`.
+    ///
+    /// What it does pin is the half that is testable and that a future refactor could break
+    /// on its own: an address space that is the last holder of a file mapping **releases the
+    /// file when it drops**, rather than leaking it.
+    #[test]
+    fn dropping_an_address_space_releases_a_file_mapping_it_last_holds() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        test_probe::reset();
+        let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
+        asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj)
+            .expect("map_file must succeed");
+        // The VMA is now the only reference: `obj` was moved into it above.
+        assert_eq!(test_probe::file_object_destroys(), 0, "the mapping holds the file alive");
+        drop(asp);
+        // Dropping the address space dropped the file — from inside `Drop`, which is the
+        // whole point. Under `lock()` the run never reaches this line: the rank checker
+        // panics as the VMA is released.
+        assert_eq!(test_probe::file_object_destroys(), 1, "dropping the AS released the file");
     }
 
     #[test]
