@@ -16627,3 +16627,35 @@ Found by a question about whether a popup should follow its parent through an in
 which turned into: *do these two roles even want the same thing?* They do not, and the same
 conversation showed the `popup-follows-parent` deferral had been justified with an argument that
 does not hold — see that entry, rewritten the same day.
+
+## 2026-08-20 — Input records name their window (M6 C3, part 1 of 3)
+
+`KeyEvent` and `PointerEvent` now carry a `window` at offset 0, as `Release`, `FocusEvent` and
+`Configure` already did. `KeyEvent` is 12 bytes, `PointerEvent` 24. This closes a deferral filed
+at the PR #184 re-review on 2026-08-11, whose stated trigger was *"the first client with two
+windows — Part C's menus are the obvious candidate, since a popup is a second window on the
+parent's session."* That is exactly where it arrived, nine days later.
+
+**Why it cannot be worked around.** `libsurface::Window::apply_event` filtered `Release`,
+`FocusEvent` and `Configure` by window and enqueued key and pointer records unconditionally,
+which is correct only while a client has one window per connection. A menu makes that false: a
+click on the popup would also be handed to the window underneath, and both would act on it.
+
+Keys alone could have been attributed from `FocusEvent`, which does carry a window. **Pointer
+records could not** — they go to the window *under the cursor* or to the grab holder, and there
+is nothing to infer that from. A menu you cannot click is not a menu, so the widening was the
+only way through.
+
+**The window id left the envelope.** `Outbound::Key` and `Outbound::Pointer` used to carry a
+`window` beside the record; now the record carries it alone and `Outbound::window()` reads it
+from there. Keeping both would have been two fields that must always agree, in a codebase that
+has already been bitten by exactly that (PR #217: a geometry event and `/dev/draw/<id>/info`
+disagreeing about one window). The other variants keep their field because their records are
+built at send time from it, so there is no second copy.
+
+**Both records gained constructors** — `KeyEvent::new`, `PointerEvent::new` — for the reason
+`CreateWindowRequest` did in C1: widening broke every literal in the tree, and the next field
+will break none.
+
+Measured blast radius: 7 crates touched, and the producers already had the window id in scope at
+both sites — the compositor knew which window it had routed to and simply was not recording it.

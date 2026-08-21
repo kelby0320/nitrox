@@ -35,18 +35,20 @@ use librsproto::surface::{KeyEvent, POINTER_MOTION, PointerEvent};
 /// One message addressed to one window.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outbound {
-    /// A `Surface::KeyEvent` for `window`.
+    /// A `Surface::KeyEvent`, addressed by the window **inside** the record.
+    ///
+    /// **No envelope copy of the window id.** These two records name their own window as of
+    /// M6 C3, and the addressing the outbox does must not be able to disagree with what the
+    /// client reads: an envelope that said one window while the record said another would
+    /// deliver to one client a record claiming to be for a different window. The other
+    /// variants keep theirs because their records are built at send time from those fields.
     Key {
-        /// Which window it is addressed to.
-        window: u32,
-        /// The record to send.
+        /// The record to send; `event.window` is who it goes to.
         event: KeyEvent,
     },
-    /// A `Surface::PointerEvent` for `window`.
+    /// A `Surface::PointerEvent`, addressed by the window inside the record — see [`Key`](Self::Key).
     Pointer {
-        /// Which window it is addressed to.
-        window: u32,
-        /// The record to send.
+        /// The record to send; `event.window` is who it goes to.
         event: PointerEvent,
     },
     /// A `Surface::Release` — a buffer has left the screen.
@@ -86,11 +88,14 @@ pub enum Outbound {
 
 impl Outbound {
     /// The window this message is addressed to.
+    ///
+    /// **One place the addressing is decided**, which is what lets `Key` and `Pointer` carry
+    /// the id only in their record: there is no second copy for it to disagree with.
     pub fn window(&self) -> u32 {
         match self {
-            Outbound::Key { window, .. }
-            | Outbound::Pointer { window, .. }
-            | Outbound::Release { window, .. }
+            Outbound::Key { event } => event.window,
+            Outbound::Pointer { event } => event.window,
+            Outbound::Release { window, .. }
             | Outbound::Focus { window, .. }
             | Outbound::Configure { window, .. } => *window,
         }
@@ -187,16 +192,12 @@ mod tests {
 
     fn motion(window: u32, x: i32) -> Outbound {
         Outbound::Pointer {
-            window,
-            event: PointerEvent { kind: POINTER_MOTION, x, ..Default::default() },
+            event: PointerEvent { window, kind: POINTER_MOTION, x, ..Default::default() },
         }
     }
 
     fn key(window: u32, keycode: u16) -> Outbound {
-        Outbound::Key {
-            window,
-            event: KeyEvent { keycode, pressed: 1, modifiers: 0, _pad: 0 },
-        }
+        Outbound::Key { event: KeyEvent::new(window, keycode, 1, 0) }
     }
 
     fn drain(o: &mut Outbox) -> Vec<Outbound> {
@@ -253,12 +254,10 @@ mod tests {
             o.push(key(1, k));
         }
         o.push(Outbound::Pointer {
-            window: 1,
-            event: PointerEvent { kind: POINTER_ENTER, ..Default::default() },
+            event: PointerEvent { window: 1, kind: POINTER_ENTER, ..Default::default() },
         });
         o.push(Outbound::Pointer {
-            window: 1,
-            event: PointerEvent { kind: POINTER_BUTTON, ..Default::default() },
+            event: PointerEvent { window: 1, kind: POINTER_BUTTON, ..Default::default() },
         });
         assert_eq!(o.len(), 7);
     }

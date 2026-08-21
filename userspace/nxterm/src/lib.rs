@@ -741,8 +741,11 @@ mod tests {
     }
 
     /// A key event as the compositor sends it.
+    ///
+    /// The window id is arbitrary: by the time a record reaches the application, `libsurface`
+    /// has already established that it belongs to this window.
     fn key_ev(code: u16, pressed: u16) -> KeyEvent {
-        KeyEvent { keycode: code, pressed, modifiers: 0, _pad: 0 }
+        KeyEvent::new(1, code, pressed, 0)
     }
 
     /// The tree, layout and router of a live window, with the grid focused as `main` does it.

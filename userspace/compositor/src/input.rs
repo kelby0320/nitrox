@@ -140,13 +140,7 @@ impl InputRouter {
                     return false;
                 };
                 out.push(Outbound::Key {
-                    window,
-                    event: KeyEvent {
-                        keycode,
-                        pressed: u16::from(pressed),
-                        modifiers,
-                        _pad: 0,
-                    },
+                    event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers),
                 });
                 false
             }
@@ -279,20 +273,20 @@ impl InputRouter {
             return;
         };
         let origin = w.bounds().origin;
-        let event = PointerEvent {
+        let event = PointerEvent::new(
+            window,
             kind,
             button,
-            buttons: self.buttons,
+            self.buttons,
             flags,
-            modifiers: self.modifiers,
-            _pad: 0,
+            self.modifiers,
             // Signed and unclamped: under a grab the cursor is routinely outside the
             // window, and reporting a clamped edge position would make a drag look like it
             // stopped at the border.
-            x: self.pointer.x.saturating_sub(origin.x),
-            y: self.pointer.y.saturating_sub(origin.y),
-        };
-        out.push(Outbound::Pointer { window, event });
+            self.pointer.x.saturating_sub(origin.x),
+            self.pointer.y.saturating_sub(origin.y),
+        );
+        out.push(Outbound::Pointer { event });
     }
 }
 
@@ -443,7 +437,7 @@ mod tests {
 
         let out = go(&mut r, &mut s, button(true));
         assert!(
-            out.iter().any(|o| matches!(o, Outbound::Pointer { window, .. } if *window == panel)),
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == panel)),
             "the panel got the click"
         );
         go(&mut r, &mut s, button(false));
@@ -497,7 +491,7 @@ mod tests {
         let kinds: Vec<_> = out
             .iter()
             .map(|o| match o {
-                Outbound::Pointer { window, event } => (*window, event.kind),
+                Outbound::Pointer { event } => (event.window, event.kind),
                 other => unreachable!("the router emits no {other:?} here"),
             })
             .collect();
@@ -581,7 +575,7 @@ mod tests {
         let kinds: Vec<_> = out
             .iter()
             .map(|o| match o {
-                Outbound::Pointer { window, event } => (*window, event.kind),
+                Outbound::Pointer { event } => (event.window, event.kind),
                 other => unreachable!("the router emits no {other:?} here"),
             })
             .collect();
@@ -596,12 +590,12 @@ mod tests {
         warp(&mut r, &mut s, 250, 130);
 
         let out = go(&mut r, &mut s, motion(5, 5));
-        let Outbound::Pointer { window, event } =
+        let Outbound::Pointer { event } =
             out.iter().find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION)).copied().expect("a motion")
         else {
             unreachable!()
         };
-        assert_eq!(window, w);
+        assert_eq!(event.window, w, "the record names the window it was routed to");
         assert_eq!((event.x, event.y), (55, 35), "screen (255,135) minus origin (200,100)");
     }
 
@@ -676,10 +670,10 @@ mod tests {
         let crossings: Vec<_> = out
             .iter()
             .filter_map(|o| match o {
-                Outbound::Pointer { window, event }
+                Outbound::Pointer { event }
                     if event.kind == POINTER_LEAVE || event.kind == POINTER_ENTER =>
                 {
-                    Some((*window, event.kind))
+                    Some((event.window, event.kind))
                 }
                 _ => None,
             })

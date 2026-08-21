@@ -37,6 +37,18 @@ on:
       - 'userspace/test-harness/**'
       - 'userspace/init/src/main.rs'
       - 'userspace/libkern/src/abi.rs'
+      # **The Surface-layer records this gate asserts on, and both ends of them.** The device
+      # nodes above are only half the path: `check-input` matches on `win key code=…` and
+      # `win ptr kind=…`, which are `KeyEvent`/`PointerEvent` — defined in `librsproto`,
+      # produced by the compositor's router, and delivered by `libsurface`. Widening those two
+      # records to carry a window id (M6 C3) changed all three and scheduled this workflow
+      # only because it also touched `test-harness/`; a change confined to the definition or
+      # the producer would not have run the one gate that presses a key (PR #221 review,
+      # finding 5). Coverage held by luck: `check-terminal` is unconditional in `ci.yml` and
+      # drives the same path.
+      - 'userspace/librsproto/src/surface.rs'
+      - 'userspace/libsurface/**'
+      - 'userspace/compositor/**'
       - 'tools/xtask/src/main.rs'
       - '.github/workflows/input.yml'
   pull_request:

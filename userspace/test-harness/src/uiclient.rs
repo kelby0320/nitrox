@@ -44,10 +44,14 @@
 //! `/system/fonts/DejaVuSansMono.ttf` through `fs-server-ext4` and rasterises with it, and
 //! `check-display` compares the result against the same render performed on the host.
 //!
-//! **Two connections, not two windows on one.** The compositor's `KeyEvent`/`PointerEvent`
-//! records carry no window id (a gap recorded in `docs/spec/rsproto-surface-ops.md`), so a
-//! single session with two windows could not tell which of them a keystroke was for. A
-//! session each keeps that question from arising, and costs one channel.
+//! **Two connections, not two windows on one.** Not for the reason this comment used to give:
+//! `KeyEvent` and `PointerEvent` carry a window id as of M6 C3, so input *can* be attributed
+//! now. What remains is `libsurface` — a [`Window`] owns its [`ChannelTransport`], so a client
+//! holds one usable window per session — `TODO(libsurface-multi-window)`, which C3's second
+//! part removes. A session each keeps the question from arising, and costs one channel.
+//!
+//! `verify_popup_placement` is the exception and drives its two windows through the raw
+//! transport, because a popup may only name a parent its **own** connection owns.
 //!
 //! **The UI window is created first**, so the reference scene — created second — stacks above
 //! it. That ordering is load-bearing for the gate: it compares the scene's 64×32 at the

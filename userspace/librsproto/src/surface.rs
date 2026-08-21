@@ -625,6 +625,15 @@ pub const KEY_REPEAT: u16 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct KeyEvent {
+    /// Which window this is about.
+    ///
+    /// **A session can hold several windows** — a popup is created on its parent's connection —
+    /// so without this a client with a menu open cannot tell a keystroke meant for the menu
+    /// from one meant for the window under it. `Release`, `FocusEvent` and `Configure` all
+    /// carry one and `libsurface` filters on it; these two were shipped before the gap was
+    /// found, so closing it is a wire break rather than two spare bytes (M6 C3; filed at the
+    /// PR #184 re-review, whose stated trigger was "the first client with two windows").
+    pub window: u32,
     /// The keycode (an `EV_KEY` code from the device layer, unchanged).
     pub keycode: u16,
     /// [`KEY_UP`], [`KEY_DOWN`] or [`KEY_REPEAT`].
@@ -641,7 +650,7 @@ pub struct KeyEvent {
     pub _pad: u16,
 }
 
-const _: () = assert!(core::mem::size_of::<KeyEvent>() == 8);
+const _: () = assert!(core::mem::size_of::<KeyEvent>() == 12);
 
 /// Modifier bits.
 ///
@@ -683,6 +692,12 @@ pub const POINTER_PRESSED: u16 = 1 << 0;
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PointerEvent {
+    /// Which window this is about — see [`KeyEvent::window`].
+    ///
+    /// Pointer records need it more than keys do, not less: a key goes to the focused window,
+    /// which a client can track from `FocusEvent`, but a pointer record goes to the window
+    /// *under the cursor* or to the grab holder. There is nothing to infer it from.
+    pub window: u32,
     /// `POINTER_MOTION`, `POINTER_BUTTON`, `POINTER_ENTER` or `POINTER_LEAVE`.
     pub kind: u16,
     /// The button for `POINTER_BUTTON` (a `BTN_*` code), otherwise zero.
@@ -710,7 +725,7 @@ pub struct PointerEvent {
     pub y: i32,
 }
 
-const _: () = assert!(core::mem::size_of::<PointerEvent>() == 20);
+const _: () = assert!(core::mem::size_of::<PointerEvent>() == 24);
 
 /// This window gained or lost the keyboard.
 ///
@@ -1062,63 +1077,92 @@ impl FocusEvent {
 }
 
 impl KeyEvent {
-    /// Serialise into exactly 8 little-endian bytes.
-    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < 8 {
-            return None;
-        }
-        out[0..2].copy_from_slice(&self.keycode.to_le_bytes());
-        out[2..4].copy_from_slice(&self.pressed.to_le_bytes());
-        out[4..6].copy_from_slice(&self.modifiers.to_le_bytes());
-        out[6..8].copy_from_slice(&0u16.to_le_bytes());
-        Some(8)
+    /// A key record for `window`.
+    ///
+    /// **A constructor, so the next field costs no call sites.** Widening this record for the
+    /// window id broke every literal in the tree; the one after it will not.
+    pub const fn new(window: u32, keycode: u16, pressed: u16, modifiers: u16) -> Self {
+        Self { window, keycode, pressed, modifiers, _pad: 0 }
     }
 
-    /// Parse from exactly 8 little-endian bytes.
+    /// Serialise into exactly 12 little-endian bytes.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 12 {
+            return None;
+        }
+        out[0..4].copy_from_slice(&self.window.to_le_bytes());
+        out[4..6].copy_from_slice(&self.keycode.to_le_bytes());
+        out[6..8].copy_from_slice(&self.pressed.to_le_bytes());
+        out[8..10].copy_from_slice(&self.modifiers.to_le_bytes());
+        out[10..12].copy_from_slice(&0u16.to_le_bytes());
+        Some(12)
+    }
+
+    /// Parse from exactly 12 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
+        if b.len() < 12 {
             return None;
         }
         Some(Self {
-            keycode: u16::from_le_bytes([b[0], b[1]]),
-            pressed: u16::from_le_bytes([b[2], b[3]]),
-            modifiers: u16::from_le_bytes([b[4], b[5]]),
+            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            keycode: u16::from_le_bytes([b[4], b[5]]),
+            pressed: u16::from_le_bytes([b[6], b[7]]),
+            modifiers: u16::from_le_bytes([b[8], b[9]]),
             _pad: 0,
         })
     }
 }
 
 impl PointerEvent {
-    /// Serialise into exactly 20 little-endian bytes.
-    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < 20 {
-            return None;
-        }
-        out[0..2].copy_from_slice(&self.kind.to_le_bytes());
-        out[2..4].copy_from_slice(&self.button.to_le_bytes());
-        out[4..6].copy_from_slice(&self.buttons.to_le_bytes());
-        out[6..8].copy_from_slice(&self.flags.to_le_bytes());
-        out[8..10].copy_from_slice(&self.modifiers.to_le_bytes());
-        out[10..12].copy_from_slice(&0u16.to_le_bytes());
-        out[12..16].copy_from_slice(&self.x.to_le_bytes());
-        out[16..20].copy_from_slice(&self.y.to_le_bytes());
-        Some(20)
+    /// A pointer record for `window` at window-local `(x, y)`.
+    ///
+    /// A constructor for the same reason [`KeyEvent::new`] is one.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        window: u32,
+        kind: u16,
+        button: u16,
+        buttons: u16,
+        flags: u16,
+        modifiers: u16,
+        x: i32,
+        y: i32,
+    ) -> Self {
+        Self { window, kind, button, buttons, flags, modifiers, _pad: 0, x, y }
     }
 
-    /// Parse from exactly 20 little-endian bytes.
+    /// Serialise into exactly 24 little-endian bytes.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 24 {
+            return None;
+        }
+        out[0..4].copy_from_slice(&self.window.to_le_bytes());
+        out[4..6].copy_from_slice(&self.kind.to_le_bytes());
+        out[6..8].copy_from_slice(&self.button.to_le_bytes());
+        out[8..10].copy_from_slice(&self.buttons.to_le_bytes());
+        out[10..12].copy_from_slice(&self.flags.to_le_bytes());
+        out[12..14].copy_from_slice(&self.modifiers.to_le_bytes());
+        out[14..16].copy_from_slice(&0u16.to_le_bytes());
+        out[16..20].copy_from_slice(&self.x.to_le_bytes());
+        out[20..24].copy_from_slice(&self.y.to_le_bytes());
+        Some(24)
+    }
+
+    /// Parse from exactly 24 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 20 {
+        if b.len() < 24 {
             return None;
         }
         Some(Self {
-            kind: u16::from_le_bytes([b[0], b[1]]),
-            button: u16::from_le_bytes([b[2], b[3]]),
-            buttons: u16::from_le_bytes([b[4], b[5]]),
-            flags: u16::from_le_bytes([b[6], b[7]]),
-            modifiers: u16::from_le_bytes([b[8], b[9]]),
+            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            kind: u16::from_le_bytes([b[4], b[5]]),
+            button: u16::from_le_bytes([b[6], b[7]]),
+            buttons: u16::from_le_bytes([b[8], b[9]]),
+            flags: u16::from_le_bytes([b[10], b[11]]),
+            modifiers: u16::from_le_bytes([b[12], b[13]]),
             _pad: 0,
-            x: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-            y: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+            x: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+            y: i32::from_le_bytes([b[20], b[21], b[22], b[23]]),
         })
     }
 }
@@ -1388,40 +1432,46 @@ mod tests {
 
     #[test]
     fn a_key_event_sits_at_the_offsets_the_spec_publishes() {
-        let e = KeyEvent { keycode: 0x1112, pressed: 1, modifiers: 0x3132, _pad: 0 };
-        let mut b = [0u8; 8];
+        let e = KeyEvent::new(0x4142_4344, 0x1112, 1, 0x3132);
+        let mut b = [0u8; 12];
         e.write(&mut b).unwrap();
-        assert_eq!(&b[0..2], &0x1112u16.to_le_bytes(), "keycode @0");
-        assert_eq!(&b[2..4], &1u16.to_le_bytes(), "pressed @2");
-        assert_eq!(&b[4..6], &0x3132u16.to_le_bytes(), "modifiers @4");
+        assert_eq!(&b[0..4], &0x4142_4344u32.to_le_bytes(), "window @0");
+        assert_eq!(&b[4..6], &0x1112u16.to_le_bytes(), "keycode @4");
+        assert_eq!(&b[6..8], &1u16.to_le_bytes(), "pressed @6");
+        assert_eq!(&b[8..10], &0x3132u16.to_le_bytes(), "modifiers @8");
+        assert_eq!(&b[10..12], &0u16.to_le_bytes(), "reserved @10, zero");
         assert_eq!(KeyEvent::read(&b), Some(e));
+        // A short body is refused rather than read from whatever follows it.
+        assert!(KeyEvent::read(&b[..11]).is_none(), "11 bytes is not a key record");
     }
 
     #[test]
     fn a_pointer_event_sits_at_the_offsets_the_spec_publishes() {
         // Signed coordinates: a pointer can be dragged past a window's left or top edge,
         // and a client that read them unsigned would see it teleport.
-        let e = PointerEvent {
-            kind: POINTER_BUTTON,
-            button: 0x1112,
-            buttons: 0x2122,
-            flags: POINTER_PRESSED,
-            modifiers: MOD_SHIFT | MOD_CTRL,
-            _pad: 0,
-            x: -3,
-            y: -4,
-        };
-        let mut b = [0u8; 20];
+        let e = PointerEvent::new(
+            0x4142_4344,
+            POINTER_BUTTON,
+            0x1112,
+            0x2122,
+            POINTER_PRESSED,
+            MOD_SHIFT | MOD_CTRL,
+            -3,
+            -4,
+        );
+        let mut b = [0u8; 24];
         e.write(&mut b).unwrap();
-        assert_eq!(&b[0..2], &POINTER_BUTTON.to_le_bytes(), "kind @0");
-        assert_eq!(&b[2..4], &0x1112u16.to_le_bytes(), "button @2");
-        assert_eq!(&b[4..6], &0x2122u16.to_le_bytes(), "buttons @4");
-        assert_eq!(&b[6..8], &POINTER_PRESSED.to_le_bytes(), "flags @6");
-        assert_eq!(&b[8..10], &(MOD_SHIFT | MOD_CTRL).to_le_bytes(), "modifiers @8");
-        assert_eq!(&b[10..12], &0u16.to_le_bytes(), "reserved @10, zero");
-        assert_eq!(&b[12..16], &(-3i32).to_le_bytes(), "x @12, signed");
-        assert_eq!(&b[16..20], &(-4i32).to_le_bytes(), "y @16, signed");
+        assert_eq!(&b[0..4], &0x4142_4344u32.to_le_bytes(), "window @0");
+        assert_eq!(&b[4..6], &POINTER_BUTTON.to_le_bytes(), "kind @4");
+        assert_eq!(&b[6..8], &0x1112u16.to_le_bytes(), "button @6");
+        assert_eq!(&b[8..10], &0x2122u16.to_le_bytes(), "buttons @8");
+        assert_eq!(&b[10..12], &POINTER_PRESSED.to_le_bytes(), "flags @10");
+        assert_eq!(&b[12..14], &(MOD_SHIFT | MOD_CTRL).to_le_bytes(), "modifiers @12");
+        assert_eq!(&b[14..16], &0u16.to_le_bytes(), "reserved @14, zero");
+        assert_eq!(&b[16..20], &(-3i32).to_le_bytes(), "x @16, signed");
+        assert_eq!(&b[20..24], &(-4i32).to_le_bytes(), "y @20, signed");
         assert_eq!(PointerEvent::read(&b), Some(e));
+        assert!(PointerEvent::read(&b[..23]).is_none(), "23 bytes is not a pointer record");
     }
 
     #[test]
