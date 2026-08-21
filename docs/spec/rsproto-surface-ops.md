@@ -409,9 +409,12 @@ wrong — a tracking obligation, not a layout one.
 **`window` is carried because one session can hold several.** A popup is created on its
 parent's connection and takes focus from it, so both halves of that change arrive on the one
 channel; without an id a client cannot attribute them, and per-window focus state is exactly
-what a toolkit keeps. `KeyEvent` and `PointerEvent` have the same shortcoming and do **not**
-carry one — a gap recorded in `../rationale/deferred-decisions.md` rather than fixed here,
-because widening a shipped record is a wire break where this one was a day old.
+what a toolkit keeps.
+
+`KeyEvent` and `PointerEvent` carry one for the same reason, as of M6 C3. They did not when this
+record was written — they were already shipped, so closing the gap was a wire break rather than
+two spare bytes — and it was closed when the first client with two windows arrived, which is
+what the deferral filed against it predicted.
 
 **A toolkit needs this and cannot derive it.** A caret blinks only when *both* the widget has
 focus within its window and the window has the keyboard; those are two facts from two sources,

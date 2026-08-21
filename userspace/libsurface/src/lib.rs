@@ -726,7 +726,6 @@ mod tests {
             self.events.insert(0, (OP_KEY_EVENT, b[..n].to_vec()));
         }
 
-        /// Queue a pointer event as the compositor would send it.
         /// Queue a key addressed to `window` — for the multi-window filter test.
         fn queue_key_for(&mut self, window: u32, keycode: u16, pressed: bool, modifiers: u16) {
             let e = KeyEvent::new(window, keycode, u16::from(pressed), modifiers);
@@ -743,6 +742,7 @@ mod tests {
             self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
         }
 
+        /// Queue a pointer event as the compositor would send it.
         fn queue_pointer(&mut self, kind: u16, x: i32, y: i32) {
             let e = PointerEvent { window: self.next_window, kind, x, y, ..Default::default() };
             let mut b = [0u8; core::mem::size_of::<PointerEvent>()];

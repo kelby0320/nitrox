@@ -741,8 +741,9 @@ mod tests {
     }
 
     /// A key event as the compositor sends it.
-    /// A key record for these tests. The window id is arbitrary: by the time a record reaches
-    /// the application, `libsurface` has already established it belongs to this window.
+    ///
+    /// The window id is arbitrary: by the time a record reaches the application, `libsurface`
+    /// has already established that it belongs to this window.
     fn key_ev(code: u16, pressed: u16) -> KeyEvent {
         KeyEvent::new(1, code, pressed, 0)
     }
