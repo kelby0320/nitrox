@@ -77,10 +77,12 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     `libterm`'s parser, grid, render and encoder, plus the blend that unblocked antialiasing)
     and Part B (`nxterm` itself: window, chrome, scrollback, key repeat, and the display gate's
     third region) both landed 2026-08-12, and Part C — the tty server's second backend, with
-    `nxterm` hosting a real `nxsh` — on 2026-08-13, closing M5. **M6, window management, is
-    planned in detail** (2026-08-13); **Part A landed 2026-08-13** — placement, restacking, move
-    damage and the initial-configure handshake — with B (the manager seam), C (popups) and D (the
-    spec) to come).
+    `nxterm` hosting a real `nxsh` — on 2026-08-13, closing M5. **M6 — window management — ✅
+    complete (2026-08-20)**: Part A (placement, restacking, move damage and the initial-configure
+    handshake), Part B (the manager seam and four of its five events), Part C (popups positioned
+    by their creator and clipped to the screen) and Part D (the spec). **M7 — the graphical
+    session — was planned in detail 2026-08-21** and carries a prerequisite outside the display
+    arm: [test-path-retrofit.md](test-path-retrofit.md), which lands first.)
     **Re-scoped 2026-08-12** after a gap surfaced while planning Part C: nothing said who logs a
     *graphical* user in or spawns the desktop shell. That column is specified now in
     [docs/design/graphical-session.md](../design/graphical-session.md), and the milestones above

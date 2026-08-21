@@ -1,6 +1,8 @@
 # Sessions and authentication
 
-**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20). The full
+**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
+2026-08-21, when the `/svc/auth` claim under "Credential validation" was found to describe a
+binding that has never existed and was corrected). The full
 path — login → authenticate → per-user namespace → sandboxed user shell → home write —
 runs end to end. Living document; describes the architecture, with the build sequence
 in the [implementation plan](../planning/implementation-plan.md). What remains is
@@ -47,7 +49,7 @@ sees a plaintext password except to forward it once to the oracle.
 ```
 kernel ─spawns→ init (full SysCaps)
   init ─spawns, delegates BIND_NAMESPACE→ service-mgr
-    service-mgr ─spawns→ auth-service        (no caps; endpoint bound at /svc/auth)
+    service-mgr ─spawns→ auth-service        (no caps; a client channel, handed on — see below)
     service-mgr ─spawns, re-delegates BIND_NAMESPACE→ session-mgr
        │   (+ a channel to auth, + the fs-server & console endpoints to compose sessions)
        │
@@ -74,8 +76,20 @@ constructs it and hands down an attenuated view.
 
 auth-service is an ordinary userspace resource server that answers one question. It
 holds a read handle to the user DB and nothing else — no namespace-construction
-authority, no device access. session-mgr reaches it over an rsproto channel (its
-endpoint is bound at `/svc/auth`).
+authority, no device access. session-mgr reaches it over an rsproto channel.
+
+**That channel is handed over, not resolved from a namespace.** This paragraph read
+"its endpoint is bound at `/svc/auth`" until 2026-08-21, and nothing in the tree has
+ever bound anything under `/svc`: `auth-service` creates **one** channel pair at
+startup and transfers the client end in its `Meta::Ready`, and `service-mgr` couriers
+that end to `session-mgr` over its control channel, positionally, alongside the fs,
+profile and tty endpoints. One server, one client, by construction.
+
+The distinction is not pedantic — it is the difference between a second supervisor
+being able to reach the oracle and not. Milestone 7's `desktop-session-mgr` needs a
+channel of its own, which this shape cannot give it; see
+[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 7 Part C, which
+either makes `/svc/auth` real or settles on minting a second endpoint.
 
 The exchange is the `Auth` category of the resource-server protocol —
 `Authenticate { username, password } → { AUTHENTICATED, principal, home } | DENIED` —

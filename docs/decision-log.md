@@ -16818,3 +16818,117 @@ argument in `graphical-session.md` and the statement of the authority in `ui-com
 §5a — which the cut removed along with the wiring paragraph it sat in, leaving three documents
 citing §5a for a claim it no longer made — are restored on the spawn-time reasoning
 (PR #224 review, findings 1 and 2).
+
+## 2026-08-21 — Milestone 7 planned in detail; two independent sessions; a test-path retrofit first
+
+Milestone 7 (the graphical session) got the details pass every large milestone gets. Three
+decisions and two corrections came out of it.
+
+**The sketch described about half the milestone.** The 45 lines it replaces named the shared
+session core, `desktop-session-mgr`, `desktop-shell` and a launchable `nxterm`. It did not name
+the two widgets none of those can be built without, the window titles a window list needs, or the
+mechanism that closes `TODO(manage-ungated)` — and two of its statements about the existing
+system were false. Recorded here rather than smoothed over, because the sketch read as complete:
+a plan that names four things and needs seven is more dangerous than one that admits it is a
+sketch.
+
+**Decision 1 — serial and graphical sessions are concurrent, as two independent sessions.**
+`session-and-auth.md` deferred "one console, one session at a time"; two supervisors able to
+authenticate independently fires it. `session-mgr` and `desktop-session-mgr` each authenticate
+and run a session, unaware of each other. **Maintainer's decision.**
+
+The argument that carried it: serial staying available while a graphical session runs is the
+display arm's governing decision 3, and with two independent sessions that holds *by
+construction* — there is nothing to arbitrate, so there is nothing that can arbitrate wrongly.
+It is also what Linux does; `getty` and `gdm` do not coordinate. The alternative, one session
+with two views, is closer to the letter of the deferral but requires the session registry
+`graphical-session.md` §1 explicitly defers, so it would have made the graphical session wait on
+a `logind`-shaped component to exist. Costs accepted and written down: the same principal may
+hold two sessions with two namespaces, and nothing arbitrates. Nothing built for two forecloses
+one later.
+
+**Decision 2 — the widgets are a prerequisite part, not incidental work.** `libui` has no text
+field and no list view; `desktop-shell.md` §5 names both, and says the model-backed list is the
+answer to the toolkit's *central* question — an explicit toolkit plus one list widget rather than
+a diffing engine. So building it is how that question gets settled, and doing it in passing while
+also writing a session supervisor would settle it by accident against a single caller. M7 Part A
+builds both against two callers each, and gates them, before anything new spawns.
+
+**Decision 3 — the test-path retrofit lands before M7, as its own plan
+(`planning/test-path-retrofit.md`). Maintainer's decision**, from: *"I want to move away from
+having custom test paths in services like init or session-mgr. Ideally all software under test
+should work basically the way it does on release builds."*
+
+The measurement behind it — counting, for each cfg site, the **set** of line numbers it governs,
+so nesting cannot double-count: `init` 672 lines / 32 %, `session-mgr` 388 / 33 %, `nxterm`
+74 / 10 %. Only three crates are affected at all, which is what makes this contained rather than
+systemic.
+
+**The percentages are not the finding; the direction is.** 147 of `session-mgr`'s lines are the
+*shipping* login compiled out under `test-harness` — the interactive `login()` and the whole
+`tty_*` layer — so `test-qemu` adjudicates a build in which the login code it claims to prove does
+not exist. And 15 of `init`'s are `cfg(not(selftest))` on PID 1's supervision of `service-mgr`:
+under `selftest` init closes service-mgr's handle immediately and reaps the demo `parent` as its
+primary child instead, so **service-mgr is not supervised and the restart-on-death path is a
+different branch**. That one was missed by the first draft of this entry, which said `init`'s
+shipping-omitted count was zero, and by the review that agreed with it.
+
+**The diagnosis is not "cfgs accumulated".** The probes are in `session-mgr` *because the verdict
+is in `session-mgr`*, and the verdict is there because it is the last thing to run — `sched_gate`
+says so in its own comment. That has already produced a visible duplicate: `session-mgr`'s
+`sched_gate` and `test-harness`'s `sched_stats_demo` read the same `/proc/sched/stats` for the
+same purpose in two processes. Move the verdict to a program whose job is adjudication and the
+probes follow it out.
+
+**The answer already existed and was never finished.** `cargo xtask test-interactive` boots the
+**release image** and drives a real login over serial — 71 expectations, in CI — and its own doc
+comment makes this argument verbatim, including *"Every interactive bug this project has had
+lived exactly there."* What did not happen is the second half: the substitutions it made
+redundant were never deleted, and the pattern never reached the display arm. Root `CLAUDE.md`'s
+build-command list did not even mention `test-interactive` or `check-input`, which is the
+likeliest reason it did not spread; both are listed now.
+
+**Ordering, and why it is not the other way round.** M7 Part B factors `session-mgr`'s
+"authenticate → construct → spawn → reap" into a crate both supervisors link. Factoring a
+`login()` that has two compilations would carry the fork into the shared crate and then edit it
+again during the retrofit. Doing the retrofit first also makes "no substitution cfg in the new
+code" a rule M7 can simply follow rather than a debt it adds to.
+
+**Correction 1 — `/svc/auth` has never existed.** `session-and-auth.md` is an `architecture/`
+doc — a claim about current behaviour — and said auth-service's "endpoint is bound at
+`/svc/auth`". Nothing in the tree binds anything under `/svc`: `auth-service` creates one channel
+pair at startup, transfers the client end in `Meta::Ready`, and `service-mgr` couriers it to
+`session-mgr`. `graphical-session.md` repeated the claim in its authority chain. Both corrected.
+`check-docs` could not have caught it — it validates `userspace/…` paths, not namespace paths.
+
+**Correction 2 — `auth-service` cannot serve a second client, and "auth-service is untouched" was
+doing work it could not support.** The *protocol* is untouched, and that remains good evidence
+the split was drawn in the right place. The *plumbing* is a single-client server: one channel
+pair, one serve end, no second endpoint for `desktop-session-mgr` to hold, and no `/svc/auth` to
+resolve one from. M7 Part C either makes `/svc/auth` real or mints a second endpoint.
+
+**A requirement inherited without checking — where the check vindicated the deferral and caught
+this entry's own first draft.** `TODO(manage-ungated)` says M7 closes the manager-channel hole
+"by binding", and it does. A namespace binding is per-path with an optional subtree base, so an
+application's namespace binds `/dev/draw/new` **on its own** with base `/new`: the exact resolve
+matches and forwards the suffix `new`, and `/dev/draw/manage` is not a component-boundary prefix
+match against that binding, so nothing answers it. The shell binds the subtree and gets both. No
+protocol change; `session-mgr` already binds `/home` this way.
+
+This entry first specified a **second forwarding endpoint** for management, couriered to
+`desktop-session-mgr`, reasoning that the compositor classifies by suffix with no caller identity
+and therefore binding could not distinguish. Both premises are true and **the conclusion does not
+follow**: what a namespace can *reach* is decided by what it binds, not by how the server on the
+far side dispatches. Recorded because the error was a protocol change bought on a non-sequitur,
+and because the three current-behaviour docs that already said "by binding" were right while the
+new plan was the outlier (PR #225 review, finding 1).
+
+The caveat that decides how long the cheap answer lasts is in Part E: a narrow bind cannot express
+"the subtree minus `manage`", so the first application needing `/dev/draw/<id>/info` for unknown
+ids is the trigger for the second endpoint. What stays open regardless: anything spawned with
+`namespace: 0` inherits root, so the selftest path remains ungated.
+
+**Also closed by this pass:** `graphical-session.md` §6.4 ("which process places windows before
+`desktop-shell` exists?") was answered by Milestone 6 and had not been marked so — the compositor
+has a default origin, a manager seam, and skips the initial-configure hold when no manager is
+attached, which is exactly what lets the greeter draw before a shell exists.
