@@ -457,13 +457,13 @@ fn log_route(rec: &Outbound) {
     }
     let mut l = Line::new();
     match rec {
-        Outbound::Key { window, event } => {
-            l.s(b"compositor: key win=").u(*window as u64);
+        Outbound::Key { event } => {
+            l.s(b"compositor: key win=").u(event.window as u64);
             l.s(b" code=").u(event.keycode as u64);
             l.s(b" down=").u(event.pressed as u64);
         }
-        Outbound::Pointer { window, event } => {
-            l.s(b"compositor: ptr win=").u(*window as u64);
+        Outbound::Pointer { event } => {
+            l.s(b"compositor: ptr win=").u(event.window as u64);
             l.s(b" kind=").u(event.kind as u64);
             l.s(b" x=").i(event.x as i64).s(b" y=").i(event.y as i64);
         }
@@ -531,13 +531,12 @@ fn fire_repeat(srv: &mut Server) {
         return;
     };
     let rec = Outbound::Key {
-        window: r.window,
-        event: KeyEvent {
-            keycode: r.keycode,
-            pressed: librsproto::surface::KEY_REPEAT,
-            modifiers: r.modifiers,
-            _pad: 0,
-        },
+        event: KeyEvent::new(
+            r.window,
+            r.keycode,
+            librsproto::surface::KEY_REPEAT,
+            r.modifiers,
+        ),
     };
     log_route(&rec);
     enqueue(srv, slot, rec);

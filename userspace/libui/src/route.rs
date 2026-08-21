@@ -540,8 +540,11 @@ mod tests {
         PointerEvent { kind: POINTER_MOTION, buttons: 1, x, y, ..Default::default() }
     }
 
+    /// A key record for these tests. The window id is arbitrary: routing to a *widget* happens
+    /// inside one window, so the toolkit never reads it — `libsurface` has already decided the
+    /// record belongs to this window before it gets here.
     fn key(code: u16) -> KeyEvent {
-        KeyEvent { keycode: code, pressed: 1, modifiers: 0, _pad: 0 }
+        KeyEvent::new(1, code, 1, 0)
     }
 
     #[test]

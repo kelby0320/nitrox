@@ -440,13 +440,22 @@ impl<T: Transport> Window<T> {
                     b.busy = false;
                 }
             }
+            // **Filtered by window, like every other record here.** These two carried no window
+            // id until M6 C3, so this was an unconditional enqueue — correct only because a
+            // client had exactly one window per connection. A popup is a second window on its
+            // parent's session, so without the filter a click on a menu would also be handed to
+            // the window underneath it, and both would act on it.
             OP_KEY_EVENT => {
-                if let Some(e) = KeyEvent::read(body) {
+                if let Some(e) = KeyEvent::read(body)
+                    && e.window == self.id
+                {
                     self.enqueue(WindowEvent::Key(e));
                 }
             }
             OP_POINTER_EVENT => {
-                if let Some(e) = PointerEvent::read(body) {
+                if let Some(e) = PointerEvent::read(body)
+                    && e.window == self.id
+                {
                     self.enqueue(WindowEvent::Pointer(e));
                 }
             }
@@ -711,16 +720,32 @@ mod tests {
     impl MockTransport {
         /// Queue a key event as the compositor would send it.
         fn queue_key(&mut self, keycode: u16, pressed: bool, modifiers: u16) {
-            let e = KeyEvent { keycode, pressed: u16::from(pressed), modifiers, _pad: 0 };
-            let mut b = [0u8; 8];
+            let e = KeyEvent::new(self.next_window, keycode, u16::from(pressed), modifiers);
+            let mut b = [0u8; core::mem::size_of::<KeyEvent>()];
             let n = e.write(&mut b).unwrap();
             self.events.insert(0, (OP_KEY_EVENT, b[..n].to_vec()));
         }
 
         /// Queue a pointer event as the compositor would send it.
+        /// Queue a key addressed to `window` — for the multi-window filter test.
+        fn queue_key_for(&mut self, window: u32, keycode: u16, pressed: bool, modifiers: u16) {
+            let e = KeyEvent::new(window, keycode, u16::from(pressed), modifiers);
+            let mut b = [0u8; core::mem::size_of::<KeyEvent>()];
+            let n = e.write(&mut b).unwrap();
+            self.events.insert(0, (OP_KEY_EVENT, b[..n].to_vec()));
+        }
+
+        /// Queue a pointer record addressed to `window`.
+        fn queue_pointer_for(&mut self, window: u32, kind: u16, x: i32, y: i32) {
+            let e = PointerEvent { window, kind, x, y, ..Default::default() };
+            let mut b = [0u8; core::mem::size_of::<PointerEvent>()];
+            let n = e.write(&mut b).unwrap();
+            self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
+        }
+
         fn queue_pointer(&mut self, kind: u16, x: i32, y: i32) {
-            let e = PointerEvent { kind, x, y, ..Default::default() };
-            let mut b = [0u8; 20];
+            let e = PointerEvent { window: self.next_window, kind, x, y, ..Default::default() };
+            let mut b = [0u8; core::mem::size_of::<PointerEvent>()];
             let n = e.write(&mut b).unwrap();
             self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
         }
@@ -1042,6 +1067,34 @@ mod tests {
         assert_eq!(w.next_event(), None);
     }
 
+    /// Input for **another** window on the same connection is not delivered to this one.
+    ///
+    /// This is the whole reason `KeyEvent` and `PointerEvent` gained a window id (M6 C3). A
+    /// session can hold several windows — a popup is created on its parent's connection — and
+    /// until now these two records carried nothing to tell them apart, so every window on a
+    /// connection received every keystroke and every click that arrived on it. With one window
+    /// per connection that was invisible; with a menu open it means a click on the menu is also
+    /// handed to the window underneath, and both act on it.
+    #[test]
+    fn input_for_another_window_on_the_same_session_is_not_delivered_here() {
+        let mut w = window(2);
+        let mine = w.id();
+        let other = mine + 1;
+
+        // Two records for a sibling window, then one for this one.
+        w.transport.queue_key_for(other, 30, true, 0);
+        w.transport.queue_pointer_for(other, POINTER_MOTION, 1, 2);
+        w.transport.queue_key_for(mine, 31, true, 0);
+
+        assert_eq!(w.pump().expect("pump"), 3, "all three were read off the wire");
+        assert_eq!(
+            w.next_event(),
+            Some(WindowEvent::Key(KeyEvent::new(mine, 31, 1, 0))),
+            "only the record naming this window is queued"
+        );
+        assert_eq!(w.next_event(), None, "and the sibling's two were dropped, not queued");
+    }
+
     #[test]
     fn key_and_pointer_events_reach_the_queue_intact() {
         let mut w = window(2);
@@ -1051,18 +1104,14 @@ mod tests {
 
         assert_eq!(
             w.next_event(),
-            Some(WindowEvent::Key(KeyEvent {
-                keycode: 30,
-                pressed: 1,
-                modifiers: MOD_SHIFT,
-                _pad: 0
-            }))
+            Some(WindowEvent::Key(KeyEvent::new(w.id(), 30, 1, MOD_SHIFT)))
         );
         // Signed coordinates survive the round trip — an unsigned read here is the
         // "pointer teleports on a leftward drag" bug, one layer further out.
         assert_eq!(
             w.next_event(),
             Some(WindowEvent::Pointer(PointerEvent {
+                window: w.id(),
                 kind: POINTER_MOTION,
                 x: -7,
                 y: 12,
@@ -1093,7 +1142,7 @@ mod tests {
         assert_eq!(w.acquire().expect("released"), b);
         assert_eq!(
             w.next_event(),
-            Some(WindowEvent::Key(KeyEvent { keycode: 31, pressed: 1, modifiers: 0, _pad: 0 })),
+            Some(WindowEvent::Key(KeyEvent::new(w.id(), 31, 1, 0))),
             "the keystroke that arrived while blocked survived"
         );
     }
@@ -1111,9 +1160,10 @@ mod tests {
         // instead would have `pump` consume it before `wait_event` ever blocks — which is
         // how a first version of this test passed against a `wait_event` that discarded
         // releases outright.
+        let wid = w.id();
         w.transport.deferred.push({
-            let e = KeyEvent { keycode: 1, pressed: 1, modifiers: 0, _pad: 0 };
-            let mut bb = [0u8; 8];
+            let e = KeyEvent::new(wid, 1, 1, 0);
+            let mut bb = [0u8; core::mem::size_of::<KeyEvent>()];
             let n = e.write(&mut bb).unwrap();
             (OP_KEY_EVENT, bb[..n].to_vec())
         });
