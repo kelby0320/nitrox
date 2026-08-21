@@ -1,6 +1,8 @@
 # Nitrox Test-Path Retrofit — Subproject Plan
 
-**Status:** 📋 planned 2026-08-21, not started. Sits between Milestone 6 and Milestone 7 of
+**Status:** 🚧 in progress. Planned 2026-08-21; **Part A landed the same day** —
+`parse_all`, the schema change under it, `boot-probe` started from a declaration, and
+`service-mgr` holding more than one service. Parts B, C and D are not started. Sits between Milestone 6 and Milestone 7 of
 the [display arm](display-arm-plan.md), and is a **prerequisite for M7** — not because M7
 needs it to function, but because M7 adds three processes to the set that would otherwise
 grow test paths of their own.
@@ -111,9 +113,10 @@ server's) — but a `kprint` behind a cfg does not make the shipping path a diff
    *behave* differently, and it may not have a function that exists only in one build.
 2. **Adjudication is a program, not a phase of a supervisor.** Whatever runs last writes the
    verdict; nothing else needs to know a verdict exists.
-3. **The test image differs from the release image by data, not code.** `service-mgr` already
-   parses `[service.<name>]` declarations from `/initramfs/etc/services/`; the test image ships
-   one more file. `init` and `service-mgr` compile identically in both.
+3. **The test image differs from the release image by data, not code.** `service-mgr` parses
+   `[service.<name>]` declarations from `/initramfs/etc/services.toml`; the test image ships
+   that file with **one more table** in it. `init` and `service-mgr` compile identically in
+   both, and their ELFs are byte-identical.
 4. **`SYS_TEST_EXIT` stays.** The kernel having a test-only syscall is not what this plan is
    about — a kernel facility is not a service code path — and `isa-debug-exit` distinguishes
    "the guest decided it failed" from "a log line happened to match". The expect-only
@@ -128,29 +131,71 @@ server's) — but a `kprint` behind a cfg does not make the shipping path a diff
 `test-stage`, `display-selftest`, `ui-testclient`, `input-testclient`) and is embedded only in
 selftest images. The probes move there; they do not need a new crate.
 
-- [ ] **`service_toml` learns `syscaps` and `[handles]`.** The parser's own header says these
-      are "parsed as those features are consumed by later parts" — this is that part. A probe
-      that reads `/proc/sched/stats` and writes the verdict needs stated authority, and stating
-      it in the declaration is what keeps the difference between the images in *data*.
-      Useful beyond testing: no service can currently declare what it needs.
+- [x] ~~**`service_toml` learns `syscaps` and `[handles]`.**~~ ✅ **Dropped 2026-08-21 — not
+      needed, and the reason it was listed was wrong.** This box said "a probe that reads
+      `/proc/sched/stats` and writes the verdict needs stated authority". It needs none:
+      `SYS_TEST_EXIT` is gated by the kernel's own `test-harness` feature and no syscap, and
+      `SPAWN_SERVICE` already passes `namespace: 0, syscaps: 0` — an inherited LOOKUP-only root
+      namespace, which is exactly what every existing test program gets. Parsing `syscaps` and
+      `[handles]` is still worth doing when a service needs them; nothing here does.
 
-- [ ] **`boot-probe`**, a sixth bin: the in-guest checks with no user-facing surface, in one
-      place with one exit path. It takes the SMP and floating-point probes from `session-mgr`
+- [x] **`service_toml` parses every service in a file** ✅ — `parse_all`, with the schema
+      change that made it necessary. The original plan had the probe found by a **directory
+      scan**, which the schema describes and nothing can do: the initramfs is a CPIO archive
+      the kernel looks up by name, `sys_ns_enumerate` lists namespace bindings and says so, and
+      `profile-server` projects only packages' `bin/`. One file with many `[service.<name>]`
+      tables replaces it (`docs/spec/service-toml-schema.md`, changed 2026-08-21).
+
+- [x] **`boot-probe` exists and is started** ✅ — a sixth bin in `test-harness`, present only
+      in selftest images. It carries no checks yet and says so; Parts B and C move them in.
+      What it proves now is the *plumbing*: a program the test image runs and the release image
+      does not, started from data.
+
+- [ ] **Move the checks in.** The SMP and floating-point probes from `session-mgr`
       (`sched_gate`, `cpus_with_switches`, `parse_field`, `fp_gate`, `fp_cpuid`,
-      `fp_avx2_usable`, `fp_sum_squares_avx2` — 178 lines) and the five filesystem tests from
-      `init` (330 lines in the test functions; 346 with their two helpers and their call sites),
-      and it writes the boot verdict.
+      `fp_avx2_usable`, `fp_sum_squares_avx2` — 178 lines, Part B) and the five filesystem
+      tests from `init` (330 lines in the test functions; 346 with their two helpers and their
+      call sites, Part C), and with them the boot verdict.
 
       **The duplicate resolves here**: `sched_stats_demo` and `sched_gate` become one check.
 
-- [ ] **A service declaration starts it**, shipped in the test image's initramfs and nowhere
-      else. `run_test_harness`, `run_display_selftest`, `run_ui_testclient` and
-      `run_input_testclient` become declarations too, which is what removes their `#[cfg]`
-      blocks from `init` rather than relocating them.
+- [x] **A service declaration starts it** ✅ — `[service.boot-probe]` is appended to
+      `/initramfs/etc/services.toml` when `mode.features().is_some()`, so `init` and
+      `service-mgr` are byte-identical in both images and one of them reads a file with an
+      extra table. Governing decision 3, concretely.
+
+- [ ] **`init`'s four `run_*` spawns become declarations too** — `run_test_harness`,
+      `run_display_selftest`, `run_ui_testclient`, `run_input_testclient`. Deferred to Part C,
+      which opens `init` anyway; the mechanism they need now exists.
+
+- [x] **`service-mgr` holds more than one service** ✅ — and this was the part nobody planned
+      for. **No supervisor in this system could tell its children's exits apart**:
+      `KIND_CHILD_EXITED` carries a pid, and nothing maps a process handle to a pid. Starting
+      the probe alongside `heartbeat` made the probe's exit read as `heartbeat`'s, restarting a
+      service that never stopped — demonstrated, not theorised.
+
+      The fix needed **no kernel change**, which the option chosen for it assumed it would:
+      each child's control channel is destroyed when it exits, the kernel already signals the
+      survivor on the same path `sys_wait` uses, and a non-blocking `sys_channel_recv` answers
+      `PeerClosed` (`-13`) rather than `WouldBlock` (`-11`). `KIND_PEER_CLOSED` remains
+      unemitted and unneeded. See `TODO(child-exit-attribution)` for what is still open — the
+      exit *code* is still unattributed.
+
+- [x] **`test-qemu` asserts the attribution** ✅ — because the verdict cannot see it. With the
+      pid-blind rule in place the guest restarts a live service and **still exits PASS**; the
+      transcript is what distinguishes them, so `check_service_attribution` requires
+      `'boot-probe' exited` and forbids `restarting 'heartbeat'`. Negative-controlled both ways.
 
 - [ ] **Ordering.** The verdict must be last. `[service.<name>].after` is already in the schema
-      and unparsed; either it lands here or the probe waits on what it needs. Decide in the
-      part, do not assume.
+      and unparsed; either it lands here or the probe waits on what it needs. Deferred to
+      Part B, which is when anything depends on the order.
+
+      **Measured while probing Part A, and it is closer than it looks.** `boot-probe` exits
+      microseconds after it starts, and `session-mgr` writes the verdict roughly 0.1 s later.
+      A spin loop of 20 million iterations inserted into the probe was enough for the boot to
+      finish first — so the probe never reached its exit, and the gate correctly reported no
+      attribution. Once Part B moves real checks in, the probe *will* take that long. Whatever
+      carries the verdict has to be ordered against the probe rather than racing it.
 
 ## Part B — `session-mgr` ships one login
 

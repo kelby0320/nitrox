@@ -6,13 +6,27 @@ This document specifies the schema of service declaration files read by the serv
 
 ## Location and discovery
 
-Service declarations live in the system profile (typically `/store/<hash>-system-services/services/*.toml` projected into `/etc/services/*.toml` via the system profile namespace).
+Service declarations live in **one file**, read by the service manager at startup. Today that is `/initramfs/etc/services.toml`; it will move into the system profile when profile projection can carry something other than a package's `bin/`.
 
-The service manager scans this directory at startup, parses each file, and builds a dependency graph. Each file declares one service. The filename is informational; the service name comes from the `[service.<name>]` table inside.
+**One file holding many services — changed 2026-08-21.** This section previously read: declarations live at `/store/<hash>-system-services/services/*.toml`, projected into `/etc/services/*.toml`, and "the service manager scans this directory at startup". Nothing in Nitrox can enumerate a directory of `.toml` files, so that scan was never implementable:
+
+- The initramfs is a CPIO archive the kernel looks up **by name** (`kernel/src/initramfs.rs`, `lookup`); there is no iteration and no listing op.
+- `sys_ns_enumerate` lists a namespace's **bindings** — mount points and kernel resources — and says in its own documentation that it is "not a filesystem `readdir`".
+- `profile-server` does serve `File::ReadDir`, but projects only each package's `bin/`.
+
+Building enumeration to serve the schema was rejected against changing the schema, which is pre-stabilization. See the decision log, 2026-08-21.
+
+The file contains one `[service.<name>]` table per service, in any order. The service name comes from the table header.
+
+**Malformed input, since one bad table must not cost the file.** A `[service.<name>]` with no `executable` is skipped and does not consume the next declaration. A service name that appears again after another service's table closed it is dropped rather than started twice. A `[service.<other>.restart]` table belongs to `<other>` and never leaks into the declaration being parsed.
+
+**A repeated key keeps the first value** — `executable` and every `[restart]` key — so a declarations file cannot be steered by appending to it. That includes appending a whole second `[service.<name>.restart]` table, which re-enters the section rather than starting a new one. (Until 2026-08-21 this held for `executable` only, and the schema said otherwise; the restart keys were last-wins.)
+
+**This is also how a test image differs from a release image.** The retrofit's rule is that a service under test is the service that ships (`docs/planning/test-path-retrofit.md`): the same `service-mgr` binary reads a file that, in a selftest image, carries one extra `[service.boot-probe]` table. Code identical, data different.
 
 ## File structure
 
-Each file contains one `[service.<name>]` top-level table, with sub-tables for handle grants, restart policy, and other concerns:
+Each `[service.<name>]` top-level table has sub-tables for handle grants, restart policy, and other concerns:
 
 ```toml
 [service.network-manager]
@@ -146,7 +160,11 @@ log subsystem / `principal`.
 kind = "ipc-channel"
 ```
 
-An IPC channel pair created at spawn time. The service receives one end (granted with `SEND | RECV | TRANSFER`); the service manager retains the other end. Used for lifecycle management (shutdown requests, health checks, configuration reloads).
+An IPC channel pair created at spawn time. The service receives one end; the service manager retains the other. Used for lifecycle management (shutdown requests, health checks, configuration reloads).
+
+**A service must hold its control endpoint until it exits.** This is a contract, not advice, and it is load-bearing for something a service cannot see: the service manager reads *that endpoint closing* as "this child is gone", because `KIND_CHILD_EXITED` names a child by pid and nothing maps a process handle back to a pid (`TODO(child-exit-attribution)`). A service that closes the handle early — a reasonable-looking thing to do if it serves no lifecycle protocol — is reported dead while it runs, and under `policy = "always"` gets a **second live copy** of itself. Found exactly that way in `boot-probe`, whose whole job was to demonstrate the opposite.
+
+If a service has no use for the channel, the correct handling is to ignore it and let process teardown close it. There is no way for the manager to distinguish an early close from an exit.
 
 ### Handle ergonomics
 
@@ -296,7 +314,7 @@ Device manager has `LOAD_MODULE` because that's its job. It binds into `/dev` to
 
 The service manager validates declarations at parse time:
 
-- Required fields present
+- Required fields present (a table with no `executable` is skipped, not fatal to the file)
 - `syscaps` are a subset of those the service manager itself holds
 - Dependency graph (`after`, `before`, `wants`) has no cycles
 - Restart policy values are recognized

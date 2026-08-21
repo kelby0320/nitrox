@@ -1914,6 +1914,14 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     .end();
                 // Release init's reference to the primary child on its exit. Reparented
                 // orphans have no handle here — the kernel tears them down; init observes.
+                //
+                // **This does not compare `cpid`, and init has more than one child.**
+                // `KIND_CHILD_EXITED` names a child by pid, and nothing maps a process
+                // handle to a pid — so whichever child exits first is taken for the primary.
+                // Latent rather than live, because the primary is the only child expected to
+                // exit; `service-mgr` hit the live version of this the moment it held two
+                // services. See `TODO(child-exit-attribution)`, whose trigger is the retrofit
+                // Part C that opens this file anyway.
                 if parent_h != 0 {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };

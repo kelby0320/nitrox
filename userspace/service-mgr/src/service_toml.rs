@@ -1,15 +1,23 @@
 //! A focused parser for service declarations (`docs/spec/service-toml-schema.md`).
 //!
-//! Slice A parses the subset the demo needs: the `[service.<name>]` header, the
-//! `executable` key, and the nested `[service.<name>.restart]` table (`policy`,
-//! `max_attempts`, `backoff`, `backoff_initial`, `backoff_max`). It is line-oriented
-//! and section-tracking (unlike init's `toml_lite`, which does not do two-level
-//! nesting) and reads a **single** service per file. The rest of the schema — arrays
-//! (`after`/`syscaps`), the `[handles]` table, multiple services — is parsed as those
-//! features are consumed by later parts/slices. Unknown keys and sections are ignored
-//! (forward-compat, per the schema).
+//! Parses the subset the system uses: the `[service.<name>]` header, the `executable`
+//! key, and the nested `[service.<name>.restart]` table (`policy`, `max_attempts`,
+//! `backoff`, `backoff_initial`, `backoff_max`) — for **every** service in the file, in
+//! file order. It is line-oriented and section-tracking, unlike init's `toml_lite`, which
+//! does not do two-level nesting.
+//!
+//! Still unparsed, and parsed when something consumes them: the arrays (`after`,
+//! `before`, `wants`, `syscaps`), the `[handles]` table, `[environment]` and `[argv]`.
+//! Unknown keys and sections are ignored (forward-compat, per the schema).
+//!
+//! **Malformed input resolves toward the safe answer**, since one bad table must not cost
+//! the file: a declaration with no `executable` is skipped without swallowing the next, a
+//! repeated key keeps the **first** value so a file cannot be steered by appending to it,
+//! a name that returns after another service closed it is dropped rather than started
+//! twice, and a `[restart]` table never leaks across a service boundary.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Restart policy from a declaration's `[restart].policy`. See the schema.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -73,6 +81,26 @@ pub struct ServiceDecl {
     pub restart: RestartConfig,
 }
 
+/// Which `[restart]` keys this declaration has already set.
+///
+/// **First value wins, for every key**, which is what makes the schema's "a declarations
+/// file cannot be steered by appending to it" true rather than true-of-`executable`-only.
+/// An earlier version tracked it for `executable` and left the restart keys last-wins, so
+/// appending `policy = "always"` after `policy = "never"` changed the policy — and
+/// appending a whole second `[service.<name>.restart]` table did too, since a repeated
+/// header re-enters the section (PR #226 review, finding 2).
+///
+/// Flags rather than "differs from the default", because a key deliberately set *to* the
+/// default would otherwise stay overwritable.
+#[derive(Default)]
+struct RestartSeen {
+    policy: bool,
+    max_attempts: bool,
+    backoff: bool,
+    initial: bool,
+    max: bool,
+}
+
 /// Which section of the declaration the parser is currently inside.
 enum Section {
     /// Before any recognized header, or inside an unrecognized section.
@@ -127,13 +155,43 @@ fn parse_duration_ns(v: &str) -> Option<u64> {
     Some(n.saturating_mul(mult))
 }
 
-/// Parse the first service declaration in `text`. Returns `None` if no
-/// `[service.<name>]` header with an `executable` is found.
-pub fn parse(text: &str) -> Option<ServiceDecl> {
+/// Parse **every** service declaration in `text`, in file order.
+///
+/// A declaration is emitted only if its `[service.<name>]` table carried an
+/// `executable`; one without is skipped, because a service with nothing to run is a
+/// misconfiguration the schema says to skip rather than a reason to drop the file.
+///
+/// **A repeated name is skipped, not re-emitted.** TOML forbids redefining a table, so a
+/// second `[service.foo]` is already malformed — and the failure it would otherwise cause
+/// here is starting the same service twice, which is worse than ignoring the duplicate.
+///
+/// One file holding many services is a **2026-08-21 change** to
+/// `docs/spec/service-toml-schema.md`, which previously said each file declares one
+/// service and the manager scans the directory. Nothing can enumerate a directory of
+/// `.toml` files: the initramfs is a CPIO archive the kernel looks up by name with no
+/// iteration, `sys_ns_enumerate` lists namespace bindings rather than directory entries
+/// (it says so in its own doc), and `profile-server` projects only packages' `bin/`.
+/// See the decision log.
+pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
+    let mut out: Vec<ServiceDecl> = Vec::new();
     let mut name: Option<String> = None;
     let mut executable: Option<String> = None;
     let mut restart = RestartConfig::default();
+    let mut seen = RestartSeen::default();
     let mut section = Section::None;
+
+    // Emit whatever has been accumulated, if it is complete and not a duplicate. The
+    // caller resets `restart` afterwards where another declaration can follow; at EOF
+    // there is nothing left to leak into.
+    macro_rules! flush {
+        () => {
+            if let (Some(n), Some(e)) = (name.take(), executable.take())
+                && !out.iter().any(|d: &ServiceDecl| d.name == n)
+            {
+                out.push(ServiceDecl { name: n, executable: e, restart });
+            }
+        };
+    }
 
     for raw in text.lines() {
         let line = strip(raw);
@@ -150,16 +208,17 @@ pub fn parse(text: &str) -> Option<ServiceDecl> {
                 }
             };
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                // `[service.<name>]`
-                (Some("service"), Some(svc), None, None) => match &name {
-                    None => {
+                // `[service.<name>]` — starts a declaration, and closes the previous one.
+                (Some("service"), Some(svc), None, None) => {
+                    if name.as_deref() != Some(svc) {
+                        flush!();
+                        // Nothing from the closed declaration may reach the next one.
+                        restart = RestartConfig::default();
+                        seen = RestartSeen::default();
                         name = Some(String::from(svc));
-                        section = Section::Root;
                     }
-                    // A second, different service — slice A parses only the first.
-                    Some(existing) if existing != svc => break,
-                    Some(_) => section = Section::Root,
-                },
+                    section = Section::Root;
+                }
                 // `[service.<name>.restart]` for the service we're parsing.
                 (Some("service"), Some(svc), Some("restart"), None)
                     if name.as_deref() == Some(svc) =>
@@ -178,11 +237,17 @@ pub fn parse(text: &str) -> Option<ServiceDecl> {
             None => continue,
         };
         match section {
-            Section::Root if key == "executable" => {
+            // **First value wins.** A key repeated inside one table is malformed TOML, and
+            // of the two ways to be wrong, taking the first is the one that cannot be
+            // steered by appending to a file. Also what makes a re-entered
+            // `[service.<name>]` header harmless rather than a silent override.
+            Section::Root if key == "executable" && executable.is_none() => {
                 executable = unquote(value).map(String::from)
             }
+            // Every arm is guarded on **not yet seen** — see [`RestartSeen`].
             Section::Restart => match key {
-                "policy" => {
+                "policy" if !seen.policy => {
+                    seen.policy = true;
                     restart.policy = match unquote(value) {
                         Some("never") => RestartPolicy::Never,
                         Some("on-failure") => RestartPolicy::OnFailure,
@@ -191,12 +256,14 @@ pub fn parse(text: &str) -> Option<ServiceDecl> {
                         _ => RestartPolicy::Never,
                     };
                 }
-                "max_attempts" => {
+                "max_attempts" if !seen.max_attempts => {
                     if let Ok(n) = value.parse::<u32>() {
+                        seen.max_attempts = true;
                         restart.max_attempts = n;
                     }
                 }
-                "backoff" => {
+                "backoff" if !seen.backoff => {
+                    seen.backoff = true;
                     restart.backoff = match unquote(value) {
                         Some("none") => Backoff::None,
                         Some("linear") => Backoff::Linear,
@@ -204,13 +271,15 @@ pub fn parse(text: &str) -> Option<ServiceDecl> {
                         _ => restart.backoff,
                     };
                 }
-                "backoff_initial" => {
+                "backoff_initial" if !seen.initial => {
                     if let Some(ns) = unquote(value).and_then(parse_duration_ns) {
+                        seen.initial = true;
                         restart.initial_ns = ns;
                     }
                 }
-                "backoff_max" => {
+                "backoff_max" if !seen.max => {
                     if let Some(ns) = unquote(value).and_then(parse_duration_ns) {
+                        seen.max = true;
                         restart.max_ns = ns;
                     }
                 }
@@ -220,11 +289,8 @@ pub fn parse(text: &str) -> Option<ServiceDecl> {
         }
     }
 
-    Some(ServiceDecl {
-        name: name?,
-        executable: executable?,
-        restart,
-    })
+    flush!();
+    out
 }
 
 #[cfg(test)]
@@ -245,9 +311,16 @@ backoff = \"exponential\"\n\
 backoff_initial = \"200ms\"\n\
 backoff_max = \"2s\"\n";
 
+    /// Parse `text` and require exactly one declaration.
+    fn one(text: &str) -> ServiceDecl {
+        let mut v = parse_all(text);
+        assert_eq!(v.len(), 1, "expected exactly one declaration, got {}", v.len());
+        v.remove(0)
+    }
+
     #[test]
     fn parses_the_slice_a_declaration() {
-        let d = parse(DECL).expect("declaration parses");
+        let d = one(DECL);
         assert_eq!(d.name, "heartbeat");
         assert_eq!(d.executable, "/sbin/heartbeat");
         assert_eq!(d.restart.policy, RestartPolicy::Always);
@@ -258,13 +331,13 @@ backoff_max = \"2s\"\n";
     }
 
     #[test]
-    fn missing_executable_is_none() {
-        assert!(parse("[service.x]\n").is_none());
+    fn missing_executable_is_skipped() {
+        assert!(parse_all("[service.x]\n").is_empty());
     }
 
     #[test]
     fn restart_defaults_when_absent() {
-        let d = parse("[service.s]\nexecutable=\"/e\"\n").unwrap();
+        let d = one("[service.s]\nexecutable=\"/e\"\n");
         assert_eq!(d.restart, RestartConfig::default());
         assert_eq!(d.restart.policy, RestartPolicy::Never);
         assert_eq!(d.restart.max_attempts, 0);
@@ -274,7 +347,7 @@ backoff_max = \"2s\"\n";
     fn policy_and_backoff_variants() {
         let mk = |extra: &str| {
             let t = std::format!("[service.s]\nexecutable=\"/e\"\n[service.s.restart]\n{extra}");
-            parse(&t).unwrap().restart
+            one(&t).restart
         };
         assert_eq!(mk("policy=\"on-failure\"\n").policy, RestartPolicy::OnFailure);
         assert_eq!(mk("backoff=\"linear\"\n").backoff, Backoff::Linear);
@@ -290,9 +363,189 @@ backoff_max = \"2s\"\n";
         assert_eq!(parse_duration_ns("10h"), None);
     }
 
+    /// The whole point of the 2026-08-21 schema change: one file, every service in it.
+    ///
+    /// This replaces `only_first_service_is_parsed`, which asserted the old behaviour —
+    /// so it is also the negative control for the change. Deleting the `flush!()` on a
+    /// new `[service.<name>]` header makes this fail and nothing else.
     #[test]
-    fn only_first_service_is_parsed() {
-        let t = "[service.a]\nexecutable=\"/a\"\n[service.b]\nexecutable=\"/b\"\n";
-        assert_eq!(parse(t).unwrap().name, "a");
+    fn every_service_in_the_file_is_parsed_in_order() {
+        let v = parse_all("[service.a]\nexecutable=\"/a\"\n[service.b]\nexecutable=\"/b\"\n");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "a");
+        assert_eq!(v[0].executable, "/a");
+        assert_eq!(v[1].name, "b");
+        assert_eq!(v[1].executable, "/b");
+    }
+
+    /// **Text a correct writer would never produce.** A service with no `executable`
+    /// must be skipped *without* taking the next one with it — the failure mode of a
+    /// flush that emits on header rather than on completeness is that `b`'s executable
+    /// lands on `a`, and both a length check and a name check would pass.
+    #[test]
+    fn a_service_with_no_executable_does_not_swallow_the_next() {
+        let v = parse_all("[service.a]\ndescription=\"no exe\"\n[service.b]\nexecutable=\"/b\"\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "b");
+        assert_eq!(v[0].executable, "/b");
+    }
+
+    /// A restart table must not leak across the service boundary. `a` declares one and
+    /// `b` does not, so `b` gets the defaults.
+    #[test]
+    fn a_restart_table_does_not_leak_to_the_next_service() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\npolicy=\"always\"\nmax_attempts=9\n\
+             [service.b]\nexecutable=\"/b\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].restart.policy, RestartPolicy::Always);
+        assert_eq!(v[0].restart.max_attempts, 9);
+        assert_eq!(v[1].restart, RestartConfig::default());
+    }
+
+    /// A `[service.<other>.restart]` table is not this service's, even mid-file.
+    #[test]
+    fn a_restart_table_naming_another_service_is_ignored() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/a\"\n[service.b.restart]\npolicy=\"always\"\n",
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "a");
+        assert_eq!(v[0].restart.policy, RestartPolicy::Never);
+    }
+
+    /// A repeated table is malformed TOML; emitting it twice would start one service
+    /// twice, which is the worse of the two failures. **Immediately** repeated, the
+    /// header re-enters the table in progress and the first `executable` stands.
+    #[test]
+    fn an_immediately_repeated_service_header_keeps_the_first_executable() {
+        let v = parse_all("[service.a]\nexecutable=\"/first\"\n[service.a]\nexecutable=\"/second\"\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].executable, "/first");
+    }
+
+    /// The case the `out.iter().any(...)` guard in `flush!` is actually for: a name that
+    /// returns **after** another service closed it, so the first copy has already been
+    /// emitted. Without the guard this yields two services both called `a`, and
+    /// `start_declared_services` would spawn the executable twice.
+    #[test]
+    fn a_service_name_returning_later_in_the_file_is_dropped() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/first\"\n[service.b]\nexecutable=\"/b\"\n\
+             [service.a]\nexecutable=\"/second\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "a");
+        assert_eq!(v[0].executable, "/first");
+        assert_eq!(v[1].name, "b");
+    }
+
+    /// A repeated `executable` key inside one table takes the first, for the same reason.
+    #[test]
+    fn a_repeated_executable_key_keeps_the_first() {
+        let d = one("[service.a]\nexecutable=\"/first\"\nexecutable=\"/second\"\n");
+        assert_eq!(d.executable, "/first");
+    }
+
+    /// **Every** `[restart]` key is first-wins, not just `executable`. The schema promises a
+    /// declarations file cannot be steered by appending to it, and until 2026-08-21 that was
+    /// only true of `executable` — appending `policy = "always"` after `policy = "never"`
+    /// silently changed the policy (PR #226 review, finding 2).
+    #[test]
+    fn a_repeated_restart_key_keeps_the_first() {
+        let d = one(
+            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+             policy=\"never\"\nmax_attempts=1\nbackoff=\"none\"\n\
+             backoff_initial=\"1ms\"\nbackoff_max=\"2ms\"\n\
+             policy=\"always\"\nmax_attempts=99\nbackoff=\"linear\"\n\
+             backoff_initial=\"9s\"\nbackoff_max=\"9min\"\n",
+        );
+        assert_eq!(d.restart.policy, RestartPolicy::Never);
+        assert_eq!(d.restart.max_attempts, 1);
+        assert_eq!(d.restart.backoff, Backoff::None);
+        assert_eq!(d.restart.initial_ns, 1_000_000);
+        assert_eq!(d.restart.max_ns, 2_000_000);
+    }
+
+    /// The same, by **appending a whole second table** — the shape an attacker has, since a
+    /// repeated `[service.<name>.restart]` header re-enters the section rather than starting
+    /// anything new.
+    #[test]
+    fn an_appended_restart_table_cannot_change_a_policy() {
+        let d = one(
+            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\npolicy=\"never\"\n\
+             [service.a.restart]\npolicy=\"always\"\n",
+        );
+        assert_eq!(d.restart.policy, RestartPolicy::Never);
+    }
+
+    /// A key set **to its own default** is still consumed: `policy = "never"` is the default,
+    /// and a later `policy = "always"` must not win because "it was never really set". This
+    /// is why [`RestartSeen`] is flags rather than a comparison against the default.
+    #[test]
+    fn a_key_set_to_its_default_still_consumes_the_slot() {
+        let d = one(
+            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+             policy=\"never\"\npolicy=\"always\"\n",
+        );
+        assert_eq!(d.restart.policy, RestartPolicy::Never);
+        // And `backoff`, whose default is `Exponential`, behaves the same way.
+        let e = one(
+            "[service.b]\nexecutable=\"/b\"\n[service.b.restart]\n\
+             backoff=\"exponential\"\nbackoff=\"none\"\n",
+        );
+        assert_eq!(e.restart.backoff, Backoff::Exponential);
+    }
+
+    /// The first-wins flags are **per declaration**, not per file. Two services each with a
+    /// `[restart]` table must each get their own values; without the `seen` reset beside the
+    /// `restart` reset, the *second* service's keys are all silently ignored and it inherits
+    /// the defaults. The neighbouring leak test cannot catch this — its second service
+    /// declares no restart table, so the defaults are the right answer there either way.
+    #[test]
+    fn the_first_wins_flags_reset_between_services() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+             policy=\"never\"\nmax_attempts=1\nbackoff=\"none\"\n\
+             [service.b]\nexecutable=\"/b\"\n[service.b.restart]\n\
+             policy=\"always\"\nmax_attempts=5\nbackoff=\"linear\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].restart.policy, RestartPolicy::Never);
+        assert_eq!(v[0].restart.max_attempts, 1);
+        assert_eq!(v[0].restart.backoff, Backoff::None);
+        assert_eq!(v[1].restart.policy, RestartPolicy::Always);
+        assert_eq!(v[1].restart.max_attempts, 5);
+        assert_eq!(v[1].restart.backoff, Backoff::Linear);
+    }
+
+    /// A malformed value does **not** consume the slot: `max_attempts = "oops"` is not a
+    /// value, so a later well-formed one is still taken. Otherwise a typo would pin a key to
+    /// its default and nothing would say so.
+    #[test]
+    fn a_malformed_value_does_not_consume_the_slot() {
+        let d = one(
+            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+             max_attempts=\"oops\"\nmax_attempts=7\n",
+        );
+        assert_eq!(d.restart.max_attempts, 7);
+    }
+
+    /// An unrecognized section between two services resets the parser's section without
+    /// discarding the declaration in progress.
+    #[test]
+    fn an_unknown_section_between_services_is_ignored() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/a\"\n[totally.unknown]\nkey=1\n[service.b]\nexecutable=\"/b\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].name, "b");
+    }
+
+    #[test]
+    fn an_empty_file_yields_nothing() {
+        assert!(parse_all("").is_empty());
+        assert!(parse_all("# just a comment\n").is_empty());
     }
 }

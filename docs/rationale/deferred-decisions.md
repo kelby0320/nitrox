@@ -405,6 +405,64 @@ namespace binds the subtree and reaches both. It cannot express "the subtree min
 which is why an application that ever needs `/dev/draw/<id>/info` for ids it does not know in
 advance re-opens this.
 
+**A supervisor cannot tell its children's exits apart — `TODO(child-exit-attribution)`.**
+`KIND_CHILD_EXITED` carries the child's **pid** (body bytes 0–3), and nothing in the system maps
+a process **handle** back to a pid: `sys_process_spawn` returns a handle, `sys_handle_stat`'s
+`HandleInfo` carries rights / object type / generation / size and no pid, there is no pid syscall,
+and `/proc` exposes exactly `self/status` (the caller's *own* pid) and `sched/stats` — there is no
+per-pid tree. `KIND_PEER_CLOSED` is declared in both ABIs but **never emitted**, so a control
+channel's death is not a notification either.
+
+So a supervisor with two children learns *that* one exited and never *which*. Both supervisors
+already assume their way past it: `init`'s `reap_loop` attributes the first `ChildExited` to its
+primary child while `parent_h != 0`, without comparing the pid — and init has six or more children
+(fs-server, profile-server, compositor, input-server, tty-server, service-mgr, plus the selftest
+demos) — and `service-mgr`'s `supervise` does the same for its single service. Neither has been
+bitten because in both cases only one child is *expected* to exit, which makes this a latent bug
+rather than a live one.
+
+**It bit the moment a supervisor gained a second child that exits**, which is exactly what a
+declared `boot-probe` is ([`test-path-retrofit.md`](../planning/test-path-retrofit.md) Part A):
+the probe exiting was read as the supervised service exiting, closing its handle and firing its
+restart policy while the service was still alive. Found on contact 2026-08-21, and demonstrated —
+with the pid-blind rule in place, a `test-qemu` run prints `'heartbeat' exited code=0` and
+`restarting 'heartbeat' (attempt 1 of 3)` for a service that never stopped.
+
+**`service-mgr` no longer depends on this, and does not use the pid.** It watches each child's
+**control channel** instead: the child's end is destroyed when it exits, the kernel nulls the
+survivor's peer pointer and signals it (`sched::ipc_endpoint_closing` → `signal_ipc_endpoint`,
+the same wake path `sys_wait` uses), so the control handles sit in the wait set and a
+`sys_channel_recv` on the one that woke answers `PeerClosed` (`-13`) rather than `WouldBlock`
+(`-11`). A handle cannot be recycled under its holder the way a pid can, so *which* endpoint
+closed is never ambiguous — and it needed **no kernel change**: `KIND_PEER_CLOSED` is still
+unemitted, and the mechanism turned out not to need it.
+
+**It is exact given a contract the manager cannot verify**: a declared service must hold its
+control endpoint until it exits. What the manager observes is the endpoint closing; that is the
+child exiting only because nothing else closes it. A service that closes it early is reported
+dead while it runs, and under `policy = "always"` gets a second live copy — found that way in
+`boot-probe`, which closed the handle as its second instruction (PR #226 review, finding 1). The
+contract is now stated in `docs/spec/service-toml-schema.md` under the `control` handle.
+
+**What is still deferred is the exit *code*.** It arrives on `KIND_CHILD_EXITED` beside a pid the
+parent cannot match, so `service-mgr` pairs codes with dead services in arrival order. With one
+exit per wake — every case the system produces today — that is right; with two in the same wake
+the codes can swap, which matters only to `on-failure` (`never` and `always` do not read the
+code). A service found dead with no code queued is treated as a failure, since a crash that
+outruns its notification is the case worth restarting.
+
+**`init` is untouched and still has the original bug**: `reap_loop` attributes the first
+`ChildExited` to its primary child without comparing the pid. Its children do not all have control
+channels, so the fix above does not carry over. Trigger: `test-path-retrofit.md` Part C, which
+opens `init` anyway.
+
+The candidate fixes for the code, none chosen: **report the pid at spawn** (the kernel writes it
+back into a `SpawnArgs` field, or a new syscall reads it from a process handle) — smallest, but
+`SpawnArgs`/`HandleInfo` cross the ABI and `HandleInfo`'s size has already caused one memory bug;
+**emit `KIND_PEER_CLOSED`** with the exit status folded in; or **carry the parent's handle** on
+`KIND_CHILD_EXITED` beside the pid, which answers the question directly and keeps the code on the
+same record.
+
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
 server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and

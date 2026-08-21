@@ -3,13 +3,18 @@
 //! Spawned by init once critical-path boot is stable, it starts, supervises, and
 //! restarts the system's services. See `docs/architecture/service-manager.md`.
 //!
-//! **Slice A (this file):** the supervision spine — parse a declaration from the
-//! initramfs (`service_toml`, Part C), start the service, and on its exit apply the
-//! restart policy + backoff (Part D). **Part E** adds a per-service **control
-//! channel**: service-mgr keeps one end, moves the other to the service at spawn, and
-//! can send lifecycle commands — here, a graceful `CTRL_OP_SHUTDOWN`. A supervisor-
-//! requested shutdown is distinguished from an unexpected exit, so it is *not*
-//! restarted even under `policy = always`.
+//! **The supervision spine:** parse the declarations from the initramfs
+//! (`service_toml`), start **every** service in the file, and on a child's exit apply
+//! *that child's* restart policy + backoff. Each service gets a **control channel**:
+//! service-mgr keeps one end, moves the other to the service at spawn, and can send
+//! lifecycle commands — here, a graceful `CTRL_OP_SHUTDOWN`. A supervisor-requested
+//! shutdown is distinguished from an unexpected exit, so it is *not* restarted even
+//! under `policy = always`.
+//!
+//! That control channel is also how a child's exit is **attributed**: `KIND_CHILD_EXITED`
+//! names a child by pid and nothing maps a process handle to a pid, so the discriminator
+//! is which endpoint closed rather than which pid died. See [`supervise`], and
+//! `TODO(child-exit-attribution)` for what that still leaves open.
 //!
 //! `#![no_std]` + `#![no_main]`. Slice A uses `libkern` (raw syscalls) + `libheap`
 //! (the `#[global_allocator]`); the design's `librsproto`/`libos` surface arrives with
@@ -37,8 +42,19 @@ const PAGE: u64 = 4096;
 /// shutdown over its control channel (exercises the control path end to end).
 const DEMO_RUN_NS: u64 = 1_100_000_000; // ~1.1s (a few heartbeat beats)
 
-static mut WAIT_HANDLES: [u64; 1] = [0];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// How many declared services this supervisor holds at once.
+///
+/// Bounded by the wait set: `sys_wait` takes at most `MAX_WAIT_HANDLES` handles, and this
+/// supervisor spends one on its notification channel and one per running service's control
+/// channel. Four is well inside that and well past what the system declares.
+const MAX_SERVICES: usize = 4;
+
+/// `notif`, plus one control-channel handle per running service — the wait set
+/// [`supervise`] builds. Other callers use the first slot with a count of one.
+static mut WAIT_HANDLES: [u64; 1 + MAX_SERVICES] = [0; 1 + MAX_SERVICES];
+/// One 24-byte `IoResult` per waited handle.
+static mut WAIT_RESULTS: [u8; 24 * (1 + MAX_SERVICES)] = [0; 24 * (1 + MAX_SERVICES)];
+const _: () = assert!(1 + MAX_SERVICES <= libkern::abi::MAX_WAIT_HANDLES);
 static mut NOTIF: Notification = Notification::zeroed();
 static mut CLOCK_BUF: u64 = 0;
 static mut CTRL_OUT0: u64 = 0;
@@ -309,35 +325,55 @@ fn read_file(ns: u64, path: &[u8]) -> Option<String> {
     text
 }
 
-/// Read + parse the slice-A service declaration. `None` (with a logged reason) if
-/// absent or malformed. The executable is resolved to a `MemoryObject` at spawn time.
-fn load_declaration(root_ns: u64) -> Option<ServiceDecl> {
-    let text = match read_file(root_ns, b"/initramfs/etc/services/heartbeat.toml") {
+/// Read + parse the service declarations. Empty (with a logged reason) if the file is
+/// absent or holds nothing well-formed. Each `executable` is resolved to a `MemoryObject`
+/// at spawn time.
+///
+/// **One file, every service in it.** The schema said each file declares one service and
+/// the manager scans the directory; nothing can enumerate a directory of `.toml` files
+/// (the initramfs is a CPIO archive the kernel looks up by name, `sys_ns_enumerate` lists
+/// namespace bindings rather than directory entries, and `profile-server` projects only
+/// packages' `bin/`), so the schema changed on 2026-08-21 instead. See the decision log.
+///
+/// This is what lets a **test image differ from a release image by data**: the same
+/// `service-mgr` binary reads a file with one more table in it.
+fn load_declarations(root_ns: u64) -> alloc::vec::Vec<ServiceDecl> {
+    let text = match read_file(root_ns, b"/initramfs/etc/services.toml") {
         Some(t) => t,
         None => {
             kprint(b"service-mgr: no service declarations found\n");
-            return None;
+            return alloc::vec::Vec::new();
         }
     };
-    let decl = match service_toml::parse(&text) {
-        Some(d) => d,
-        None => {
-            kprint(b"service-mgr: declaration parse error\n");
-            return None;
-        }
-    };
-    Line::new()
-        .s(b"service-mgr: parsed service '")
-        .s(decl.name.as_bytes())
-        .s(b"' (executable=")
-        .s(decl.executable.as_bytes())
-        .s(b", restart=")
-        .s(restart_name(decl.restart.policy))
-        .s(b", max_attempts=")
-        .u(decl.restart.max_attempts as u64)
-        .s(b")")
-        .end();
-    Some(decl)
+    let mut decls = service_toml::parse_all(&text);
+    if decls.is_empty() {
+        kprint(b"service-mgr: declaration parse error\n");
+        return decls;
+    }
+    // More than the wait set can hold: keep the first `MAX_SERVICES` and **say** which
+    // were dropped. A silent truncation would read as "everything declared is running".
+    while decls.len() > MAX_SERVICES {
+        let dropped = decls.pop().expect("len > MAX_SERVICES");
+        Line::new()
+            .s(b"service-mgr: '")
+            .s(dropped.name.as_bytes())
+            .s(b"' NOT started -- more than MAX_SERVICES declared")
+            .end();
+    }
+    for decl in &decls {
+        Line::new()
+            .s(b"service-mgr: parsed service '")
+            .s(decl.name.as_bytes())
+            .s(b"' (executable=")
+            .s(decl.executable.as_bytes())
+            .s(b", restart=")
+            .s(restart_name(decl.restart.policy))
+            .s(b", max_attempts=")
+            .u(decl.restart.max_attempts as u64)
+            .s(b")")
+            .end();
+    }
+    decls
 }
 
 /// Spawn the service `decl` names (image already resolved), with a fresh control
@@ -686,24 +722,73 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
     };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
     bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint, tty_endpoint);
-    match load_declaration(root_ns) {
-        Some(decl) => {
-            let (h, ctrl) = spawn_service(root_ns, &decl);
-            supervise(notif, root_ns, decl, h, ctrl);
-        }
-        None => {
-            kprint(b"service-mgr: no services to start; idling\n");
-            idle(notif);
-        }
-    }
+    supervise(notif, root_ns, load_declarations(root_ns));
 }
 
-/// Supervise the single slice-A service: on its exit, apply the restart policy +
-/// backoff (Part D), bounded by `max_attempts`. **Part E:** after `DEMO_RUN_NS`,
-/// request a graceful shutdown over the control channel; a requested shutdown is not
-/// restarted, even under `policy = always`. (A later slice generalises this to a table
-/// of services and a real shutdown trigger.)
-fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mut ctrl: u64) -> ! {
+/// One supervised service: its declaration, its child, and the state the restart
+/// policy needs across exits.
+struct Supervised {
+    decl: ServiceDecl,
+    /// The child's process handle, or `0` when it is not running.
+    proc_h: i64,
+    /// service-mgr's end of the child's control channel, or `0` when it is not running
+    /// (or the channel could not be created). **This is the exit discriminator** — see
+    /// [`supervise`].
+    ctrl: u64,
+    /// Restarts applied so far, against `decl.restart.max_attempts`.
+    attempts: u32,
+    running: bool,
+    /// A supervisor-requested shutdown is intentional and is never restarted, whatever
+    /// the policy says.
+    requested_shutdown: bool,
+}
+
+/// Supervise every declared service: on a child's exit, apply *that child's* restart
+/// policy + backoff, bounded by its `max_attempts`.
+///
+/// **How this knows which child exited, which is the whole design.** `KIND_CHILD_EXITED`
+/// names the child by **pid**, and nothing in this system maps a process handle to a pid —
+/// `sys_process_spawn` returns a handle, `HandleInfo` carries no pid, there is no pid
+/// syscall, and `/proc` has no per-pid tree (`TODO(child-exit-attribution)`). A supervisor
+/// with two children would learn *that* one exited and never *which*, which is why this
+/// function held exactly one service until 2026-08-21.
+///
+/// The discriminator is the **control channel**, not the notification. Each service has
+/// its own, service-mgr holds the other end, and when the child dies its end is destroyed:
+/// the kernel nulls the survivor's peer pointer and *signals* it
+/// (`sched::ipc_endpoint_closing` → `signal_ipc_endpoint`), which is the same wake path
+/// `sys_wait` uses. So the control handles go in the wait set, `sys_wait` returns the
+/// handle that signalled, and a `sys_channel_recv` on it answers `PeerClosed` (`-13`)
+/// rather than `WouldBlock` (`-11`). A handle cannot be recycled under its holder the way
+/// a pid can, so *which* endpoint closed is never ambiguous.
+///
+/// **Exact given one thing, which is a contract on the service rather than a property of
+/// this code:** a declared service must hold its control endpoint until it exits. What
+/// this observes is the endpoint closing; that is the child exiting only because nothing
+/// else closes it. A service that closes it early is reported dead while it runs, and
+/// under `policy = "always"` gets a *second live copy* — found exactly that way, in
+/// `boot-probe` itself (PR #226 review, finding 1). The contract is written down in
+/// `docs/spec/service-toml-schema.md`; there is no way to verify it from here.
+///
+/// **The exit *code* is still unattributed**, and that is the deliberate residual. It
+/// arrives on `KIND_CHILD_EXITED` beside a pid this process cannot match, so codes are
+/// collected **per wake** and paired with whichever service that wake found dead. A wake
+/// is the right scope because a child's exit enqueues its notification and destroys its
+/// endpoint under the same `SCHED` hold, so both reach one `sys_wait`. Codes left over at
+/// the end of a wake are **discarded, and counted**: they belong to a child that is not
+/// supervised here — `bring_up_login_chain` spawns `auth-service` and `session-mgr`, and
+/// every child's exit reaches its parent's notification channel whether the parent
+/// supervises it or not. Carrying them forward would mispair them with the next supervised
+/// death (PR #226 review, finding 4).
+///
+/// Within one wake, two deaths can still swap their codes, which matters only to
+/// `on-failure`; `never` and `always` do not read the code. A service found dead with no
+/// code is treated as a **failure**, because a crash that outruns its notification is the
+/// case worth restarting.
+///
+/// **The demo shutdown applies to the first declared service only.** It exercises the
+/// control path end to end after `DEMO_RUN_NS`; a real shutdown trigger is still deferred.
+fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> ! {
     // A reusable one-shot timer for backoff sleeps.
     let timer_h = {
         // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
@@ -715,46 +800,108 @@ fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mu
             t as u64
         }
     };
-    let mut attempts: u32 = 0;
-    let mut running = service_h > 0;
-    let mut requested_shutdown = false;
-    // Demo: schedule the graceful-shutdown request.
+
+    // Start every declaration, in file order.
+    let mut svcs: alloc::vec::Vec<Supervised> = alloc::vec::Vec::new();
+    for decl in decls {
+        let (proc_h, ctrl) = spawn_service(root_ns, &decl);
+        // A service that could not be spawned is recorded as not running rather than
+        // dropped: its declaration still describes what should exist, and the log line
+        // `spawn_service` emitted is the record of why it does not.
+        svcs.push(Supervised {
+            decl,
+            proc_h,
+            ctrl,
+            attempts: 0,
+            running: proc_h > 0,
+            requested_shutdown: false,
+        });
+    }
+    if svcs.is_empty() {
+        kprint(b"service-mgr: no services to start; idling\n");
+        idle(notif);
+    }
+    // A service with no control channel cannot be attributed on exit — say so once, here,
+    // rather than letting it look supervised. `spawn_service` already logged the failure.
+    for s in &svcs {
+        if s.running && s.ctrl == 0 {
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(s.decl.name.as_bytes())
+                .s(b"' has no control channel -- its exit cannot be attributed")
+                .end();
+        }
+    }
+    {
+        let mut l = Line::new();
+        l.s(b"service-mgr: supervising ").u(svcs.len() as u64).s(b" service(s):");
+        for s in &svcs {
+            l.s(b" '").s(s.decl.name.as_bytes()).s(b"'");
+        }
+        l.end();
+    }
+
+    // Demo: schedule the graceful-shutdown request for the first declared service.
     let shutdown_at = now_ns().saturating_add(DEMO_RUN_NS);
-    Line::new().s(b"service-mgr: supervising '").s(decl.name.as_bytes()).s(b"'").end();
 
     loop {
-        // Wait on the notification channel; while the service runs and no shutdown has
-        // been requested, wake at `shutdown_at` to send it.
-        let deadline = if running && !requested_shutdown {
-            shutdown_at
-        } else {
-            u64::MAX
+        // Build the wait set: the notification channel, then each running service's
+        // control channel.
+        //
+        // **Which slot signalled is not read**, and does not need to be: step 2 below polls
+        // every running service's channel, and `IpcChannel::already_signaled` is level- not
+        // edge-triggered, so a close that happened between the poll and the next `sys_wait`
+        // is still there to find. An earlier version kept a `slot_of` map from wait slot to
+        // service index and never indexed it (PR #226 review, finding 7).
+        let mut count = 1usize;
+        // SAFETY: WAIT_HANDLES is a valid writable array of `1 + MAX_SERVICES`.
+        unsafe { WAIT_HANDLES[0] = notif };
+        for s in svcs.iter() {
+            if s.running && s.ctrl != 0 && count < 1 + MAX_SERVICES {
+                // SAFETY: `count` is bounded by the array length by the condition above.
+                unsafe { WAIT_HANDLES[count] = s.ctrl };
+                count += 1;
+            }
+        }
+        // Wake at the demo shutdown while the first service is still running and has not
+        // been asked to stop; otherwise sleep until something happens.
+        let deadline = match svcs.first() {
+            Some(s) if s.running && !s.requested_shutdown => shutdown_at,
+            _ => u64::MAX,
         };
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers sized for
+        // `1 + MAX_SERVICES`; `count` is within that.
         let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                1,
+                count as u64,
                 (&raw mut WAIT_RESULTS) as u64,
                 deadline,
             )
         };
         if waited < 1 {
-            // Deadline reached with the service still running: request shutdown once.
-            if running && !requested_shutdown {
+            // Deadline reached: request the demo shutdown once.
+            if let Some(s) = svcs.first_mut()
+                && s.running
+                && !s.requested_shutdown
+            {
                 Line::new()
                     .s(b"service-mgr: requesting graceful shutdown of '")
-                    .s(decl.name.as_bytes())
+                    .s(s.decl.name.as_bytes())
                     .s(b"'")
                     .end();
-                send_control(ctrl, CTRL_OP_SHUTDOWN);
-                requested_shutdown = true;
+                send_control(s.ctrl, CTRL_OP_SHUTDOWN);
+                s.requested_shutdown = true;
             }
             continue;
         }
-        // Drain every queued notification this wake delivered.
+
+        // 1. Drain every queued notification, collecting exit codes. Which child each
+        //    belongs to is unknowable here — see this function's doc comment. The vector is
+        //    **per wake**: a code with no death to pair with by the end of this iteration
+        //    belongs to a child service-mgr does not supervise.
+        let mut codes: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
         loop {
             // SAFETY: NOTIF is a valid 64-byte writable out-param.
             let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
@@ -764,85 +911,166 @@ fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mu
             // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
             let (kind, body) =
                 unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-            if kind != KIND_CHILD_EXITED || !running {
+            if kind != KIND_CHILD_EXITED {
                 continue;
             }
             let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
             let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-            // SAFETY: closing our own process + control handles (reaping).
-            unsafe {
-                syscall1(SYS_HANDLE_CLOSE, service_h as u64);
-                if ctrl != 0 {
-                    syscall1(SYS_HANDLE_CLOSE, ctrl);
-                }
-            }
-            service_h = 0;
-            ctrl = 0;
-            running = false;
             Line::new()
-                .s(b"service-mgr: '")
-                .s(decl.name.as_bytes())
-                .s(b"' exited pid=")
+                .s(b"service-mgr: reaped pid=")
                 .u(cpid as u64)
+                // `.i`, not `.u`: an exit code is signed.
                 .s(b" code=")
                 .i(code as i64)
                 .end();
+            codes.push(code);
+        }
+
+        // 2. Ask each running service's control channel whether its peer is gone. This
+        //    is the attribution: the handle that answers `PeerClosed` names the service.
+        let mut dead: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        for (i, s) in svcs.iter().enumerate() {
+            if !s.running || s.ctrl == 0 {
+                continue;
+            }
+            if channel_peer_closed(s.ctrl) {
+                dead.push(i);
+            }
+        }
+
+        for i in dead {
+            let code = if codes.is_empty() { None } else { Some(codes.remove(0)) };
+            // SAFETY: closing our own process + control handles (reaping).
+            unsafe {
+                if svcs[i].proc_h > 0 {
+                    syscall1(SYS_HANDLE_CLOSE, svcs[i].proc_h as u64);
+                }
+                if svcs[i].ctrl != 0 {
+                    syscall1(SYS_HANDLE_CLOSE, svcs[i].ctrl);
+                }
+            }
+            svcs[i].proc_h = 0;
+            svcs[i].ctrl = 0;
+            svcs[i].running = false;
+
+            let mut l = Line::new();
+            l.s(b"service-mgr: '").s(svcs[i].decl.name.as_bytes()).s(b"' exited");
+            match code {
+                Some(c) => l.s(b" code=").i(c as i64),
+                // Its notification has not arrived (or was consumed by a sibling that
+                // exited in the same wake). Named rather than printed as a fake `0`.
+                None => l.s(b" code=unknown"),
+            };
+            l.end();
 
             // A supervisor-requested shutdown is intentional — never restart it, even
             // under `policy = always`.
-            if requested_shutdown {
+            if svcs[i].requested_shutdown {
                 Line::new()
                     .s(b"service-mgr: '")
-                    .s(decl.name.as_bytes())
+                    .s(svcs[i].decl.name.as_bytes())
                     .s(b"' stopped as requested (policy=")
-                    .s(restart_name(decl.restart.policy))
+                    .s(restart_name(svcs[i].decl.restart.policy))
                     .s(b" overridden -- not restarting)")
                     .end();
                 continue;
             }
 
-            // Unexpected exit — apply the restart policy + backoff (Part D).
-            if !should_restart(decl.restart.policy, code) {
+            // An unknown code is treated as a failure: a crash that outran its
+            // notification is the case `on-failure` exists to restart.
+            if !should_restart(svcs[i].decl.restart.policy, code.unwrap_or(-1)) {
                 Line::new()
                     .s(b"service-mgr: '")
-                    .s(decl.name.as_bytes())
+                    .s(svcs[i].decl.name.as_bytes())
                     .s(b"' stopped (policy=")
-                    .s(restart_name(decl.restart.policy))
+                    .s(restart_name(svcs[i].decl.restart.policy))
                     .s(b", not restarting)")
                     .end();
                 continue;
             }
-            if decl.restart.max_attempts != 0 && attempts >= decl.restart.max_attempts {
+            if svcs[i].decl.restart.max_attempts != 0
+                && svcs[i].attempts >= svcs[i].decl.restart.max_attempts
+            {
                 Line::new()
                     .s(b"service-mgr: '")
-                    .s(decl.name.as_bytes())
+                    .s(svcs[i].decl.name.as_bytes())
                     .s(b"' gave up after ")
-                    .u(attempts as u64)
+                    .u(svcs[i].attempts as u64)
                     .s(b" restart(s)")
                     .end();
                 continue;
             }
-            let backoff = compute_backoff(&decl.restart, attempts);
+            let backoff = compute_backoff(&svcs[i].decl.restart, svcs[i].attempts);
             // Assembled across the `if` rather than emitted in pieces — the whole point of
             // the helper is that a conditional fragment does not become its own line.
             let mut l = Line::new();
             l.s(b"service-mgr: restarting '")
-                .s(decl.name.as_bytes())
+                .s(svcs[i].decl.name.as_bytes())
                 .s(b"' (attempt ")
-                .u((attempts + 1) as u64);
-            if decl.restart.max_attempts != 0 {
-                l.s(b" of ").u(decl.restart.max_attempts as u64);
+                .u((svcs[i].attempts + 1) as u64);
+            if svcs[i].decl.restart.max_attempts != 0 {
+                l.s(b" of ").u(svcs[i].decl.restart.max_attempts as u64);
             }
             l.s(b") after ").u(backoff / 1_000_000).s(b"ms backoff").end();
             sleep_ns(timer_h, backoff);
-            let (h, new_ctrl) = spawn_service(root_ns, &decl);
+            let (h, new_ctrl) = spawn_service(root_ns, &svcs[i].decl);
             if h > 0 {
-                service_h = h;
-                ctrl = new_ctrl;
-                running = true;
-                attempts += 1;
+                svcs[i].proc_h = h;
+                svcs[i].ctrl = new_ctrl;
+                svcs[i].running = true;
+                svcs[i].attempts += 1;
             }
         }
+
+        // Anything left belongs to a child this supervisor does not hold — `auth-service`
+        // and `session-mgr` are spawned by `bring_up_login_chain` and reach this same
+        // notification channel. Reported rather than dropped silently: on a release boot
+        // either of those exiting is a system fault, and this is the only place that sees it.
+        for code in codes {
+            Line::new()
+                .s(b"service-mgr: an unsupervised child exited code=")
+                .i(code as i64)
+                .end();
+        }
+    }
+}
+
+/// Whether `ch`'s peer has gone: drain the endpoint until it answers.
+///
+/// `sys_channel_recv` distinguishes the two empty cases — `WouldBlock` (`-11`) when the
+/// ring is merely empty and the peer is alive, `PeerClosed` (`-13`) when it is empty and
+/// the peer is gone. That difference is what makes a control channel an exit
+/// discriminator; see [`supervise`].
+///
+/// **A drain, not a single receive**, because a receive that returns `0` has *consumed* a
+/// message: a queued message would otherwise mask the close behind it and be silently
+/// eaten on the way. Today nothing can be queued here — a service's control end is granted
+/// `RECV | WAIT` and no `SEND` (`spawn_service`), so the channel is one-way by capability —
+/// but "the answer is right because the peer holds no send right" is a fact about a
+/// neighbouring function, and this one should not depend on it silently.
+///
+/// A message that *is* found is reported rather than dropped: there is no service→manager
+/// control protocol, so its arrival would mean the grant changed.
+fn channel_peer_closed(ch: u64) -> bool {
+    loop {
+        // SAFETY: RDY_MSG/RDY_HANDLES/RDY_COUNT are valid writable out-params; this is a
+        // non-blocking receive on a channel handle service-mgr owns.
+        let r = unsafe {
+            syscall4(
+                SYS_CHANNEL_RECV,
+                ch,
+                (&raw mut RDY_MSG) as u64,
+                (&raw mut RDY_HANDLES) as u64,
+                (&raw mut RDY_COUNT) as u64,
+            )
+        };
+        if r == KError::PeerClosed as i64 {
+            return true;
+        }
+        if r != 0 {
+            return false; // WouldBlock (alive and quiet), or an error we cannot act on
+        }
+        kprint(b"service-mgr: unexpected message on a control channel (dropped)\n");
     }
 }
 
