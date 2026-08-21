@@ -29,11 +29,20 @@
 #![no_std]
 #![no_main]
 
+/// `Line` builds its text on the heap, so this bin needs an allocator.
+#[global_allocator]
+static ALLOC: libheap::Heap = libheap::Heap;
+
+use libkern::debug::Line;
 use libkern::{
-    RIGHT_MAP_READ, SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP,
-    SYS_TEST_EXIT, SYS_WAIT, TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS, exit, kprint, syscall1,
-    syscall2, syscall4,
+    RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC,
+    SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_TEST_EXIT, SYS_WAIT,
+    TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS, exit, kprint, syscall1, syscall2, syscall4,
+    syscall5,
 };
+
+/// Page size, for the mapped-file checks below.
+const PAGE: u64 = 4096;
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
@@ -330,6 +339,411 @@ fn verdict(ok: bool) {
     unsafe { syscall1(SYS_TEST_EXIT, code as u64) };
 }
 
+// === the filesystem tests, moved out of PID 1 ==========================================
+//
+// Five of these lived in `init` — 32 % of the file — because `init` was where the boot
+// self-test ran. They exercise `fs-server-ext4` through the namespace, which any program
+// with the right bindings can do, and better: one that fails may do so without taking the
+// boot with it. Retrofit Part C.
+//
+// **They now gate the verdict, which they never did before.** Every failure path in `init`
+// was a bare `return` after a `FAIL` print — 19 of them — so a broken filesystem printed
+// `init: create MISMATCH` and the run passed. That is decoration wearing the word "test",
+// and exactly the class this plan is about, so each returns `bool` here and the verdict is
+// their conjunction.
+//
+// **`subtree_bind_test` moved too, but its `/subtreetest` binding could not.** A test-only
+// namespace bind is the one thing "data, not code" cannot express — `[handles].namespace` is
+// unparsed and a declared service gets `namespace: 0`, an inherited root — so `init` still
+// makes it under `selftest`, and that is the single cfg Part C could not remove. Removing it
+// anyway broke the demo harness's case 8, which needs a binding that is *also* an openable
+// directory to prove `move` refuses to recurse through a mount.
+//
+// What it smoke-tests — bind-mount sharing, one registration behind two names — is now
+// *also* a deterministic kernel host test,
+// `namespace::tests::one_registration_bound_twice_is_shared_not_duplicated`.
+
+/// Size of the Part-5 large-file fixture (`/system/large.bin`). MUST match the
+/// xtask generator (`tools/xtask/src/main.rs`). 32 KiB = 8 pages — past the old
+/// 64 KiB eager read cap, so reading it proves the page cache lifts the cap.
+/// (Was 64 pages; trimmed to 8 because each page demand-faults through the
+/// stateless fs-server fill at ~325 ms/page under QEMU — read-ahead is a Phase-3
+/// item, see docs/rationale/deferred-decisions.md.)
+const LARGE_FILE_BYTES: usize = 32 * 1024;
+
+/// The expected byte at file offset `i` of `/system/large.bin` — position-sensitive
+/// (the page index `i >> 12` in the high part) so a mis-faulted page is detected.
+/// MUST match the xtask generator.
+fn fill_byte(i: usize) -> u8 {
+    (((i >> 12) ^ i) & 0xFF) as u8
+}
+
+/// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
+/// a `MAP_WRITE` mapping, `sys_file_sync`, then re-resolve (a fresh `FileObject` that reads
+/// the block from disk) and verify the change persisted — proving the Model A write data path
+/// (dirty pages → write IRPs → device) with no fs-server metadata write.
+fn overwrite_test(root_ns: u64) -> bool {
+    let path = b"/system/rwtest";
+    let marker = [0xDEu8, 0xAD, 0xBE, 0xEF];
+
+    // 1. Map MAP_READ | MAP_WRITE; note an untouched byte, then overwrite bytes 0..4.
+    let (st, fh) = ns_lookup(root_ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
+    if st != 0 || fh == 0 {
+        kprint(b"boot-probe: rwtest lookup FAIL\n");
+        return false;
+    }
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"boot-probe: rwtest map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return false;
+    }
+    let base = addr as u64;
+    // SAFETY: byte 8 is within the mapped page; read the original (== 8) to compare later.
+    let orig8 = unsafe { ((base + 8) as *const u8).read_volatile() };
+    // SAFETY: bytes 0..4 are within the writable mapping — the write dirties the page.
+    for (i, m) in marker.iter().enumerate() {
+        unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
+    }
+    // 2. Flush the mapping's pages to disk (Model A write IRPs to the existing LBAs).
+    // SAFETY: `fh` is our writable FileObject handle.
+    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+        kprint(b"boot-probe: rwtest sync FAIL\n");
+    }
+
+    // 3. Re-resolve (a fresh FileObject reads from disk) and verify the overwrite persisted
+    //    and the untouched byte is unchanged.
+    let (st2, fh2) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
+    if st2 != 0 || fh2 == 0 {
+        kprint(b"boot-probe: rwtest re-read lookup FAIL\n");
+        return false;
+    }
+    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, PAGE, RIGHT_MAP_READ) };
+    if addr2 < 0 {
+        kprint(b"boot-probe: rwtest re-read map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
+        return false;
+    }
+    let base2 = addr2 as u64;
+    let mut ok = true;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: within the mapped page.
+        if unsafe { ((base2 + i as u64) as *const u8).read_volatile() } != *m {
+            ok = false;
+        }
+    }
+    // SAFETY: byte 8 within the page — must be unchanged.
+    let reread8 = unsafe { ((base2 + 8) as *const u8).read_volatile() };
+    if ok && reread8 == orig8 {
+        kprint(b"boot-probe: rwtest overwrite persisted + verified ok\n");
+        true
+    } else {
+        kprint(b"boot-probe: rwtest overwrite MISMATCH\n");
+        false
+    }
+}
+
+/// fs-server-rw Part D milestone (selftest): **grow** a file past EOF via `sys_file_grow`
+/// (the fs-server allocates a block + extends its extent tree + updates the inode), write
+/// into the newly-allocated region, `sys_file_sync`, then re-resolve and confirm the
+/// appended data persisted — proving the write path's metadata mutation end to end.
+fn grow_test(root_ns: u64) -> bool {
+    let path = b"/system/rwtest";
+    let marker = [0xC0u8, 0xFF, 0xEEu8, 0x11];
+    let new_size: u64 = 8000; // 4096 (1 block) → 8000 (2 blocks)
+
+    // 1. Grow-resolve: the fs-server grows the file, then replies its (2-block) map. The
+    //    lookup returns a PO; wait for the handle.
+    let po = unsafe {
+        syscall5(
+            SYS_FILE_GROW,
+            root_ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+            new_size,
+        )
+    };
+    if po < 0 {
+        kprint(b"boot-probe: grow submit FAIL\n");
+        return false;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    let (st, fh) = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        let w = syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        );
+        let status =
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
+        let handle = u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ]);
+        syscall1(SYS_HANDLE_CLOSE, po as u64);
+        if w != 1 { (-1, 0) } else { (status, handle) }
+    };
+    if st != 0 || fh == 0 {
+        kprint(b"boot-probe: grow FAIL\n");
+        return false;
+    }
+
+    // 2. Map the grown file; write a marker in the **new** region (the appended 2nd block).
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, new_size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"boot-probe: grow map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return false;
+    }
+    let base = addr as u64;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: offset `PAGE + i` is in the 2nd mapped page (the appended block).
+        unsafe { ((base + PAGE + i as u64) as *mut u8).write_volatile(*m) };
+    }
+    // SAFETY: `fh` is our writable handle.
+    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+        kprint(b"boot-probe: grow sync FAIL\n");
+    }
+
+    // 3. Re-resolve (a fresh FileObject reads from disk) and verify the appended data.
+    let (st2, fh2) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
+    if st2 != 0 || fh2 == 0 {
+        kprint(b"boot-probe: grow re-read FAIL\n");
+        return false;
+    }
+    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, new_size, RIGHT_MAP_READ) };
+    if addr2 < 0 {
+        kprint(b"boot-probe: grow re-read map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
+        return false;
+    }
+    let base2 = addr2 as u64;
+    let mut ok = true;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: within the 2nd mapped page.
+        if unsafe { ((base2 + PAGE + i as u64) as *const u8).read_volatile() } != *m {
+            ok = false;
+        }
+    }
+    if ok {
+        kprint(b"boot-probe: grow appended a block + persisted + verified ok\n");
+        true
+    } else {
+        kprint(b"boot-probe: grow MISMATCH\n");
+        false
+    }
+}
+
+/// fs-server-rw Part E milestone (selftest): **create** a brand-new file via
+/// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
+/// parent, then grows it to the target size), write into it, `sys_file_sync`, then
+/// re-resolve with a plain lookup and confirm both that the new path now resolves and that
+/// its data persisted — proving inode allocation + directory-entry insertion end to end.
+fn create_test(root_ns: u64) -> bool {
+    let path = b"/system/created";
+    let marker = [0xABu8, 0xCD, 0xEFu8, 0x42];
+    let new_size: u64 = 4096; // fresh file → 1 block.
+
+    // 1. Create-resolve: the fs-server creates the file, grows it, then replies its map.
+    let po = unsafe {
+        syscall5(
+            SYS_FILE_CREATE,
+            root_ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+            new_size,
+        )
+    };
+    if po < 0 {
+        kprint(b"boot-probe: create submit FAIL\n");
+        return false;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    let (st, fh) = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        let w = syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        );
+        let status =
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
+        let handle = u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ]);
+        syscall1(SYS_HANDLE_CLOSE, po as u64);
+        if w != 1 { (-1, 0) } else { (status, handle) }
+    };
+    if st != 0 || fh == 0 {
+        kprint(b"boot-probe: create FAIL\n");
+        return false;
+    }
+
+    // 2. Map the new file; write a marker at the start.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, new_size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"boot-probe: create map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return false;
+    }
+    let base = addr as u64;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: offset `i` is within the mapped first page.
+        unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
+    }
+    // SAFETY: `fh` is our writable handle.
+    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+        kprint(b"boot-probe: create sync FAIL\n");
+    }
+
+    // 3. Re-resolve with a **plain** lookup (proves the directory entry is on disk: a path
+    //    that did not exist before now resolves) and verify the data.
+    let (st2, fh2) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
+    if st2 != 0 || fh2 == 0 {
+        kprint(b"boot-probe: create re-read FAIL\n");
+        return false;
+    }
+    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, new_size, RIGHT_MAP_READ) };
+    if addr2 < 0 {
+        kprint(b"boot-probe: create re-read map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
+        return false;
+    }
+    let base2 = addr2 as u64;
+    let mut ok = true;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: within the mapped first page.
+        if unsafe { ((base2 + i as u64) as *const u8).read_volatile() } != *m {
+            ok = false;
+        }
+    }
+    if ok {
+        kprint(b"boot-probe: create new file + persisted + verified ok\n");
+        true
+    } else {
+        kprint(b"boot-probe: create MISMATCH\n");
+        false
+    }
+}
+
+/// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
+/// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
+/// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
+/// the position-sensitive content (so a mis-filled / mis-ordered page is caught) and
+/// log the result. Proves **multi-page demand faulting** past the old 64 KiB cap.
+fn read_large_file(root_ns: u64) -> bool {
+    let (st, fh) = ns_lookup(root_ns, b"/system/large.bin", RIGHT_MAP_READ);
+    if st != 0 || fh == 0 {
+        kprint(b"boot-probe: /system/large.bin lookup FAIL\n");
+        return false;
+    }
+    // Map the whole file lazily (a FileBacked VMA — no frames until faulted).
+    let addr =
+        unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, LARGE_FILE_BYTES as u64, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"boot-probe: large.bin map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return false;
+    }
+    let base = addr as u64;
+    let mut mismatches = 0u64;
+    let mut i = 0usize;
+    while i < LARGE_FILE_BYTES {
+        // First touch of each page faults; the kernel demand-fills it from the
+        // fs-server. Subsequent bytes in the page are plain (already-resident) reads.
+        // SAFETY: `base + i` is within the mapped [0, LARGE_FILE_BYTES) file range.
+        let got = unsafe { ((base + i as u64) as *const u8).read_volatile() };
+        if got != fill_byte(i) {
+            mismatches += 1;
+        }
+        i += 1;
+    }
+    let mut ok = false;
+    if mismatches == 0 {
+        Line::new()
+            .s(b"boot-probe: large.bin verified ")
+            .u(LARGE_FILE_BYTES as u64)
+            .s(b" bytes across ")
+            .u(LARGE_FILE_BYTES as u64 / PAGE)
+            .s(b" demand-faulted pages ok")
+            .end();
+        ok = true;
+    } else {
+        Line::new().s(b"boot-probe: large.bin MISMATCH count=").u(mismatches).end();
+    }
+    // SAFETY: closing our own handle (the mapping keeps the object alive meanwhile).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+    ok
+}
+
+/// auth+session Part B milestone (selftest): prove **subtree-scoped namespace
+/// binding** end to end. `mount_one` bound the fs endpoint a second time at
+/// `/subtreetest` scoped to base `/system` (sharing the server's registration), so a
+/// lookup of `/subtreetest/current-generation` must forward `system/current-generation`
+/// to the server and resolve to the *same* file as `/system/current-generation`. Read
+/// the leading bytes of both and confirm they match — the kernel prepended the base to
+/// the forwarded suffix, and the shared registration routed both replies correctly.
+fn subtree_bind_test(root_ns: u64) -> bool {
+    // Resolve + map the first page of `path` read-only; returns its address or 0.
+    fn map_first_page(root_ns: u64, path: &[u8]) -> u64 {
+        let (st, fh) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
+        if st != 0 || fh == 0 {
+            return 0;
+        }
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ) };
+        // The mapping pins its own reference to the object; close the handle.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        if addr < 0 { 0 } else { addr as u64 }
+    }
+
+    let direct = map_first_page(root_ns, b"/system/current-generation");
+    let via_sub = map_first_page(root_ns, b"/subtreetest/current-generation");
+    if direct == 0 || via_sub == 0 {
+        kprint(b"boot-probe: subtree resolve FAIL\n");
+        return false;
+    }
+    // Compare the leading bytes (the file is a short text line; the page tail is
+    // zero-padded, so the head suffices).
+    let mut same = true;
+    for i in 0..64u64 {
+        // SAFETY: both addresses map a full page; `i < 64 < PAGE`.
+        let a = unsafe { ((direct + i) as *const u8).read_volatile() };
+        let b = unsafe { ((via_sub + i) as *const u8).read_volatile() };
+        if a != b {
+            same = false;
+            break;
+        }
+    }
+    // SAFETY: unmap our two mappings (init runs forever — don't leak).
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, direct, PAGE);
+        syscall2(SYS_MEMORY_UNMAP, via_sub, PAGE);
+    }
+    if same {
+        kprint(b"boot-probe: subtree bind (/subtreetest -> /system) resolves + matches ok\n");
+        true
+    } else {
+        kprint(b"boot-probe: subtree bind MISMATCH\n");
+        false
+    }
+}
+
 /// Bootstrap registers, as `service-mgr`'s `SPAWN_SERVICE` fills them: `rdi` = this
 /// process's notification channel, `rsi` = the inherited LOOKUP-only root namespace,
 /// `rdx` = the control-channel endpoint (`RECV | WAIT`), `rcx` = `arg0` (unused).
@@ -355,7 +769,15 @@ fn verdict(ok: bool) {
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"boot-probe: up\n");
     let _ = control;
-    let ok = sched_gate(root_ns) && fp_gate();
+    // `&` and not `&&`: every check runs and reports, so one failure does not hide the
+    // rest — a boot that fails three of these should say three, not one.
+    let ok = sched_gate(root_ns)
+        & fp_gate()
+        & read_large_file(root_ns)
+        & overwrite_test(root_ns)
+        & grow_test(root_ns)
+        & create_test(root_ns)
+        & subtree_bind_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
     // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and

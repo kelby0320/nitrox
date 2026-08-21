@@ -1,6 +1,7 @@
 # Nitrox Test-Path Retrofit — Subproject Plan
 
-**Status:** 🚧 in progress. Planned 2026-08-21; **Parts A and B landed the same day** —
+**Status:** 🚧 in progress. Planned 2026-08-21; **Parts A, B and the first half of C landed
+the same day** —
 `parse_all` and the schema change under it, `boot-probe` started from a declaration,
 `service-mgr` holding more than one service, and `session-mgr` down to **zero** test cfgs
 with the verdict and the substrate gates moved out of it. Parts C and D are not started. Sits between Milestone 6 and Milestone 7 of
@@ -243,9 +244,37 @@ ordering box below real rather than theoretical.
 
 ## Part C — `init` ships PID 1
 
-- [ ] **The five filesystem tests leave PID 1** (Part A gives them somewhere to go). They test
-      `fs-server-ext4` through the namespace, which a program with the right bindings can do as
-      well as init can — better, since it may fail without taking the boot with it.
+- [x] **The five filesystem tests leave PID 1** ✅ (2026-08-21) — 376 lines out of `init`,
+      into `boot-probe`. They test `fs-server-ext4` through the namespace, which a program with
+      the right bindings can do as well as init can — better, since it may fail without taking
+      the boot with it.
+
+      **They now gate the run, which they never did.** Every failure path in `init` was a bare
+      `return` after a `FAIL` print — 19 of them — so a broken filesystem printed
+      `init: create MISMATCH` and the boot passed. Each returns `bool` now and the verdict is
+      their conjunction, `&` not `&&` so one failure does not hide the rest.
+
+- [x] **A kernel bug came with them, and only this move could have found it** ✅.
+      `AddressSpace::drop` took its own `LockRank::KernelObject` lock and then released the
+      VMAs it owns — and a VMA holds the last `ObjectRef` to a file-backed mapping, whose drop
+      takes the *file's* lock, same rank. `lock-order violation: acquiring KernelObject … while
+      holding KernelObject`, kernel panic.
+
+      It needed a process that **exits** holding the last reference to a file mapping. `init`
+      ran these tests and never exits; `boot-probe` maps `/system/large.bin`, closes its
+      handle, and exits. `Drop` has `&mut self`, so `SpinLock::get_mut` is both the fix and
+      simply correct — there is nothing to exclude.
+
+      **Found by `check-terminal`, not `test-qemu`**, for the reason Part B recorded: the probe
+      writes the verdict, so under `test-qemu` the machine stops before it can exit.
+
+- [ ] **`init` still has one `selftest` cfg, and closing it needs a mechanism.** The
+      `/subtreetest` binding cannot move: `[handles].namespace` is unparsed and a declared
+      service is spawned with `namespace: 0`, an inherited LOOKUP-only root — so "data, not
+      code" has no way to express a namespace bind. Two things need it: `boot-probe`'s
+      `subtree_bind_test`, and the demo harness's case 8, which needs a binding that is *also*
+      an openable directory to prove `move` refuses to recurse through a mount. Removing it
+      without checking broke the second one.
 
 - [ ] **The graphical spawns leave too.** `run_nxterm`, `run_ui_testclient`,
       `run_input_testclient`, `run_display_selftest` are declarations after Part A. This is also

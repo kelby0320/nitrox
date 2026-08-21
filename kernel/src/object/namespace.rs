@@ -888,6 +888,48 @@ mod tests {
         }
     }
 
+    /// **One registration, two names** — bind-mount semantics, and the property `init`'s
+    /// boot-time `subtree_bind_test` smoke-tested until 2026-08-21.
+    ///
+    /// Binding the same server twice must *share* its registration rather than mint a rival:
+    /// a second registration would own a second view of the same endpoint, and a reply meant
+    /// for one could be matched against the other. `session-mgr` depends on this every login —
+    /// it binds `/home` subtree-scoped to the fs endpoint `init` already bound at `/` — and
+    /// that path is exercised end to end by `cargo xtask test-interactive` steps 5a–5c.
+    /// This test is the deterministic half: same `ObjectRef`, two paths, one with a base.
+    #[test]
+    fn one_registration_bound_twice_is_shared_not_duplicated() {
+        let n = ns();
+        let reg = us_reg_target();
+        let same = reg.clone();
+        let addr = reg.as_ptr() as usize;
+        n.bind_userspace_server(b"/", reg, Rights::LOOKUP, SubtreeBase::empty()).unwrap();
+        let base = SubtreeBase::from_path(b"/system").unwrap();
+        n.bind_userspace_server(b"/subtreetest", same, Rights::LOOKUP, base).unwrap();
+
+        // The root mount forwards the whole path and carries no base.
+        let (direct, _, dsuf) = n.resolve(b"/system/current-generation").unwrap();
+        assert_eq!(dsuf, b"system/current-generation");
+        // The scoped binding forwards only the tail, and hands back the base to prepend —
+        // so the syscall layer joins them to the *same* server-relative path as above.
+        let (scoped, _, ssuf) = n.resolve(b"/subtreetest/current-generation").unwrap();
+        assert_eq!(ssuf, b"current-generation");
+
+        match (direct, scoped) {
+            (
+                ResolvedTarget::UserspaceServer(a, abase),
+                ResolvedTarget::UserspaceServer(b, bbase),
+            ) => {
+                // The whole point: **one** registration behind both names.
+                assert_eq!(a.as_ptr() as usize, addr);
+                assert_eq!(b.as_ptr() as usize, addr, "the second bind minted a rival");
+                assert!(abase.is_empty());
+                assert_eq!(bbase.as_path(), b"/system");
+            }
+            _ => panic!("expected userspace-server targets"),
+        }
+    }
+
     #[test]
     fn bind_userspace_server_hands_back_target_on_error() {
         let n = ns();
