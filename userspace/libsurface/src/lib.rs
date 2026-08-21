@@ -263,14 +263,15 @@ impl<T: Transport> Window<T> {
         Self::create(transport, CreateWindowRequest::new(width, height, role), count)
     }
 
-    /// A popup or dialog at `(x, y)` from its parent's origin.
+    /// A popup at `(x, y)` from its parent's origin.
     ///
     /// **The offset is the whole of a popup's placement**, and it travels with the create so
     /// the window is never briefly somewhere else. A manager does not place these: only the
     /// creator knows where the menu item it drops from was drawn (M6 C1).
     ///
-    /// `role` must be [`Role::Popup`] or [`Role::Dialog`]; for anything else the offset is
-    /// written as zero and a manager places the window as usual.
+    /// `role` must be [`Role::Popup`]. For every other role — including [`Role::Dialog`], which
+    /// names a parent but is placed by a manager like any other listed window — the offset is
+    /// written as zero and this behaves as [`new`](Self::new).
     ///
     /// # This cannot yet create a popup — `TODO(libsurface-multi-window)`
     ///
@@ -280,9 +281,8 @@ impl<T: Transport> Window<T> {
     /// protocol has no such limit; this API does, until it grows a session type that owns the
     /// transport and mints windows from it.
     ///
-    /// Usable today for a [`Role::Dialog`] or popup whose parent is on **another** window of
-    /// the same connection — which nothing can currently be — so in practice this is here for
-    /// the offset encoding and for the caller that arrives with the session type.
+    /// So in practice this is here for the offset encoding and for the caller that arrives with
+    /// the session type.
     pub fn new_at(
         transport: T,
         width: u32,

@@ -715,9 +715,14 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
 
     kprint(b"ui-testclient: the first configure carried the manager's placement\n");
 
-    // Held open for the same reason the B3 probe's session is: closing it makes the compositor
-    // tear the session down and repaint the whole screen.
-    core::mem::forget(t);
+    // **Closed, not leaked.** These probes used to `core::mem::forget` their transport, because
+    // closing a session makes the compositor tear it down and repaint the whole screen, which
+    // raced `check-display`'s capture. That race is gone — the gate now captures only once two
+    // consecutive screendumps match (B4) — and leaking was never free: an unread session's
+    // outbox never empties, so the compositor stays `parked` and wakes every
+    // `RETRY_INTERVAL_NS` to retry sends that can never land, for the rest of the boot. That is
+    // steady pressure on exactly the path `input-testclient`'s stall phase measures.
+    drop(t);
 }
 
 /// **A popup is placed by its creator, relative to its parent** — M6 C1, on the wire.
@@ -807,6 +812,69 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
 
     kprint(b"ui-testclient: a popup was placed by its creator, without the manager\n");
 
+    // 5. **And a `dialog` is the other way round on both counts.** It names a parent, but the
+    //    parent carries its desktop membership, its lifetime and its canvas exclusion — not its
+    //    position — so a manager places it and it is held like a `normal`. The offset below is
+    //    deliberately large and deliberately ignored.
+    //
+    //    Neither half of that is reachable from a host test: `placed_by_creator` lives in the
+    //    `#![no_main]` bin, which `cargo test -p compositor --lib` does not build. Without this
+    //    the two roles could be merged back into one arm and every gate would stay green
+    //    (PR #220 review, finding 2).
+    let dialog = raw_create(
+        &mut t,
+        &CreateWindowRequest::at(24, 18, Role::Dialog { parent }, 500, 400),
+        b"C1 dialog",
+    );
+
+    // Held: nothing answers as the manager yet, so no configure may arrive for it.
+    let mut slices = 0;
+    while slices < POPUP_CONFIGURE_SLICES {
+        match t.wait_event_timeout(&mut buf, POPUP_CONFIGURE_SLICE_NS) {
+            Ok(Some((OP_CONFIGURE, n))) => {
+                if ConfigureEvent::read(&buf[..n]).is_some_and(|c| c.window == dialog) {
+                    fail(b"ui-testclient: a dialog was configured with no manager answer\n");
+                }
+            }
+            // Somebody else's record; it cost no time, so it costs no budget.
+            Ok(Some(_)) => {}
+            Ok(None) => slices += 1,
+            Err(_) => fail(b"ui-testclient: C1 dialog channel error\n"),
+        }
+    }
+
+    // The manager places it, which releases the hold — and what the client is told is the
+    // manager's placement, not the offset it asked for.
+    let (dx, dy) = (301i32, 217i32);
+    if !place_window(mgr, dialog, dx, dy) {
+        fail(b"ui-testclient: C1 dialog Place was refused\n");
+    }
+    let mut waited = 0;
+    let got = loop {
+        match t.wait_event_timeout(&mut buf, POPUP_CONFIGURE_SLICE_NS) {
+            Ok(Some((OP_CONFIGURE, n))) => match ConfigureEvent::read(&buf[..n]) {
+                Some(c) if c.window == dialog => break c,
+                _ => {}
+            },
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                waited += 1;
+                if waited >= MGR_EVENT_TRIES {
+                    fail(b"ui-testclient: a placed dialog never got its held configure\n");
+                }
+            }
+            Err(_) => fail(b"ui-testclient: C1 dialog channel error\n"),
+        }
+    };
+    if (got.x, got.y) != (dx, dy) {
+        Line::new()
+            .s(b"ui-testclient: dialog at ").i(got.x as i64).s(b",").i(got.y as i64)
+            .s(b", manager placed ").i(dx as i64).s(b",").i(dy as i64).end();
+        fail(b"ui-testclient: a dialog took its creator's offset instead of the placement\n");
+    }
+
+    kprint(b"ui-testclient: a dialog was held for the manager and placed by it\n");
+
     // Destroying the parent takes the popup with it — transitively, which is the stack's rule.
     let mut body = [0u8; 8];
     body[..4].copy_from_slice(&parent.to_le_bytes());
@@ -814,8 +882,8 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     // answers only on failure. Passing a real buffer parks this thread waiting for a reply that
     // is never coming, which is a hang rather than an error.
     let _ = t.request(librsproto::surface::OP_DESTROY_WINDOW, &body[..4], None, &mut []);
-    // The session stays open for the run: closing it makes the compositor repaint everything.
-    core::mem::forget(t);
+    // Closed rather than leaked, for the reasons given in `verify_initial_configure`.
+    drop(t);
 }
 
 /// `CreateWindow` through the raw transport, returning the new id. `fail`s if it did not.

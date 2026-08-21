@@ -1682,19 +1682,20 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // With no manager there is nobody to ask, so it goes out at once and nothing about
             // the client's behaviour changes.
             //
-            // **A popup or dialog is never held**, however many managers are attached. Its
-            // position is its creator's business — a menu drops from an item only the client
-            // knows the position of — so there is nobody to wait for, and holding it would
-            // spend the full deadline on the interaction most sensitive to latency: every menu
-            // open would cost 200 ms the moment a shell attached (M6 C1).
+            // **A popup is never held**, however many managers are attached. Its position is
+            // its creator's business — a menu drops from an item only the client knows the
+            // position of — so there is nobody to wait for, and holding it would spend the full
+            // deadline on the interaction most sensitive to latency: every menu open would cost
+            // 200 ms the moment a shell attached (M6 C1).
+            //
+            // **A `dialog` is held like a `normal`.** It names a parent, but a manager places
+            // it, so there *is* somebody to wait for. Exempting it alongside popups was C1
+            // treating two roles as one because they share a wire shape; what they share is a
+            // parent field, not a placement rule.
             let placed_by_creator = srv
                 .stack
                 .window(configure.window)
-                .is_some_and(|w| matches!(
-                        w.role,
-                        librsproto::surface::Role::Popup { .. }
-                            | librsproto::surface::Role::Dialog { .. }
-                    ));
+                .is_some_and(|w| matches!(w.role, librsproto::surface::Role::Popup { .. }));
             // SAFETY: reading our own manager slot.
             if sent && !placed_by_creator && unsafe { MANAGER_CH } != 0 {
                 let mut now: u64 = 0;
