@@ -46,8 +46,14 @@ const DEMO_RUN_NS: u64 = 1_100_000_000; // ~1.1s (a few heartbeat beats)
 ///
 /// Bounded by the wait set: `sys_wait` takes at most `MAX_WAIT_HANDLES` handles, and this
 /// supervisor spends one on its notification channel and one per running service's control
-/// channel. Four is well inside that and well past what the system declares.
-const MAX_SERVICES: usize = 4;
+/// channel — so the ceiling is 31.
+///
+/// Twelve. A test image declares **seven** since retrofit Part C2 moved `init`'s graphical
+/// spawns and demo chain into declarations (`heartbeat`, `display-selftest`, `nxterm`,
+/// `ui-testclient`, `input-testclient`, `test-harness`, `boot-probe`); a release image
+/// declares one. This was four, which was "well past what the system declares" when the
+/// system declared two.
+const MAX_SERVICES: usize = 12;
 
 /// `notif`, plus one control-channel handle per running service — the wait set
 /// [`supervise`] builds. Other callers use the first slot with a count of one.
@@ -404,8 +410,42 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     // the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
     // register, so the log endpoint is handed over the control channel after spawn (below),
     // mirroring init's device handoff to an fs-server.
+    // **Declared authority.** Almost every service declares none; the demo chain declares
+    // `BIND_NAMESPACE` because it constructs a namespace and binds `/session/user` into it.
+    //
+    // **The kernel *attenuates*, it does not refuse.** `sys_process_spawn` computes
+    // `child = parent & requested` — a silent intersection — so a declaration asking for more
+    // than service-mgr holds spawns successfully with the extra bits simply gone. An earlier
+    // version of this comment said the spawn fails; it does not, and the log line below said
+    // "granted" for bits the child never received (PR #229 review, finding 2).
+    //
+    // service-mgr cannot check the subset itself: nothing reports a process its own syscaps
+    // (`/proc/self/status` carries pid and tid only), so it cannot know what it holds without
+    // hardcoding a second copy of init's grant. Filed as `TODO(spawn-syscap-attenuation)`.
+    // Until then the honest thing is to log what was **requested** and say so.
+    for u in &decl.unknown_syscaps {
+        Line::new()
+            .s(b"service-mgr: '")
+            .s(decl.name.as_bytes())
+            .s(b"' declares an unknown syscap '")
+            .s(u.as_bytes())
+            .s(b"' -- NOT granted")
+            .end();
+    }
+    if decl.syscaps != 0 {
+        // "requested", not "granted": the kernel intersects this with what service-mgr holds
+        // and reports nothing about what it dropped.
+        Line::new()
+            .s(b"service-mgr: '")
+            .s(decl.name.as_bytes())
+            .s(b"' requested syscaps 0x")
+            .u(decl.syscaps)
+            .s(b" (the kernel grants the subset service-mgr holds)")
+            .end();
+    }
     let h = unsafe {
         SPAWN_SERVICE.image = image;
+        SPAWN_SERVICE.syscaps = decl.syscaps;
         if svc_end != 0 {
             SPAWN_SERVICE.handles[0] = svc_end;
             SPAWN_SERVICE.handle_count = 1;
@@ -801,9 +841,11 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
         }
     };
 
-    // Start every declaration, in file order.
+    // Start every declaration, in file order — which *is* the start order, so "start B after
+    // A" is written by putting A first. `after` is the stronger claim: A has already exited.
     let mut svcs: alloc::vec::Vec<Supervised> = alloc::vec::Vec::new();
     for decl in decls {
+        await_dependencies(&decl, &svcs);
         let (proc_h, ctrl) = spawn_service(root_ns, &decl);
         // A service that could not be spawned is recorded as not running rather than
         // dropped: its declaration still describes what should exist, and the log line
@@ -1032,6 +1074,112 @@ fn supervise(notif: u64, root_ns: u64, decls: alloc::vec::Vec<ServiceDecl>) -> !
                 .i(code as i64)
                 .end();
         }
+    }
+}
+
+/// How long to wait for a service named in another's `after` to finish.
+///
+/// Bounded because the wait is for something that may never happen: `after` means "has
+/// exited", and nothing stops a declaration from naming a service that keeps running. A hang
+/// there would present as a boot that stops with no message, which is the worst failure this
+/// supervisor can produce; timing out and saying so is strictly better.
+const AFTER_TIMEOUT_NS: u64 = 20_000_000_000; // 20 s
+
+/// Block until every service `decl` lists in `after` has exited, or the wait times out.
+///
+/// **What `after` means here.** The schema says a dependency must "reach ready state", and
+/// for a service that exits — a one-shot — finishing *is* readiness. There is no readiness
+/// protocol for a service that keeps running, so this waits for the control channel to close,
+/// which is the same signal [`supervise`] attributes exits with.
+///
+/// **It orders backwards only.** A dependency is matched against the services already
+/// started, so naming one declared *later* in the file cannot wait for it — the file's order
+/// is the start order, and `after` strengthens it rather than reordering it.
+///
+/// Four things are **not** errors, and each is reported rather than fatal: a name that has not
+/// started (not in this image, or declared later), a service running without a control channel
+/// and so unwaitable, a dependency that already finished, and the timeout. The dependent still
+/// starts — refusing to start it would turn a mis-typed name into a boot that silently lacks a
+/// service.
+fn await_dependencies(decl: &ServiceDecl, svcs: &[Supervised]) {
+    for dep in &decl.after {
+        // **Only services already started are candidates**, so `after` orders *backwards* in
+        // file order. A name declared later in the file lands here, and the message must not
+        // say "not declared" — it is, four lines down, and `parsed service '<name>'` for it is
+        // earlier in the same transcript (PR #229 review, finding 5).
+        let Some(i) = svcs.iter().position(|s| &s.decl.name == dep) else {
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(decl.name.as_bytes())
+                .s(b"' waits on '")
+                .s(dep.as_bytes())
+                .s(b"', which has not started -- declared later in the file, or not at all")
+                .end();
+            continue;
+        };
+        if !svcs[i].running {
+            continue; // already finished — nothing to wait for, and nothing to say
+        }
+        if svcs[i].ctrl == 0 {
+            // **Running, but unwaitable.** The exit signal is the control channel closing, so
+            // a service whose channel could not be created cannot be waited on — `boot-probe`
+            // would start alongside a live `test-harness`, which is the race `after` exists to
+            // prevent. Silent until 2026-08-24 (PR #229 review, finding 4); the doc above
+            // promised it was reported, and it was not.
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(dep.as_bytes())
+                .s(b"' has no control channel -- cannot wait for it; starting '")
+                .s(decl.name.as_bytes())
+                .s(b"' UNORDERED")
+                .end();
+            continue;
+        }
+        Line::new()
+            .s(b"service-mgr: '")
+            .s(decl.name.as_bytes())
+            .s(b"' waits for '")
+            .s(dep.as_bytes())
+            .s(b"' to finish")
+            .end();
+        let deadline = now_ns().saturating_add(AFTER_TIMEOUT_NS);
+        let mut timed_out = false;
+        while !channel_peer_closed(svcs[i].ctrl) {
+            if now_ns() >= deadline {
+                timed_out = true;
+                break;
+            }
+            // Wait on the dependency's control channel itself: it signals when the peer
+            // closes, which is the exit. The deadline keeps a never-exiting dependency from
+            // parking this supervisor forever.
+            // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+            unsafe {
+                WAIT_HANDLES[0] = svcs[i].ctrl;
+                syscall4(
+                    SYS_WAIT,
+                    (&raw const WAIT_HANDLES) as u64,
+                    1,
+                    (&raw mut WAIT_RESULTS) as u64,
+                    deadline,
+                )
+            };
+        }
+        if timed_out {
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(dep.as_bytes())
+                .s(b"' did not finish within the wait -- starting '")
+                .s(decl.name.as_bytes())
+                .s(b"' anyway (does it ever exit?)")
+                .end();
+            continue;
+        }
+        // **Observed, not reaped.** Handling the exit here would strand its code — the
+        // `KIND_CHILD_EXITED` notification is still queued, and `supervise` is what pairs
+        // codes with deaths — and would skip the restart policy entirely. `PeerClosed` is
+        // level-triggered, so `supervise`'s first pass sees the same closed channel, drains
+        // the matching notification, and handles it exactly like any other exit.
+        Line::new().s(b"service-mgr: '").s(dep.as_bytes()).s(b"' finished").end();
     }
 }
 

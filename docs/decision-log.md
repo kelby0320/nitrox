@@ -17204,3 +17204,120 @@ Closing this needs a mechanism, not an edit.
 `init` still carries **20** `selftest` cfgs otherwise — the demo chain, the four graphical spawns,
 and the `cfg(not(selftest))` supervision of `service-mgr`. Those are ordinary code that becomes
 service declarations in C2, and they are the larger half of Part C.
+
+## 2026-08-24 — `init` ships PID 1: the demo chain and the graphical clients become data
+
+Test-path retrofit Part C2. `init` goes from 41 `selftest`/`test-harness` cfg sites to **one**,
+and from 2100 lines to 1419. The demo chain, the display self-test, `nxterm` and the two
+graphical test clients are service declarations now — started by `service-mgr` from
+`/initramfs/etc/services.toml`, which carries them only in a test image.
+
+**The sequencing the verdict rests on moved from code into the file.** `init::supervise` ran the
+demo chain synchronously and only then handed off, which is what kept `boot-probe`'s gates last —
+`fp_gate` completed in 2 of 15 KVM runs when it lived in the demo `parent`, because whoever owns
+the verdict races the chain. That is now `after = ["test-harness"]` on the probe. Ordinary start
+order needs nothing: declarations start in file order, so "`nxterm` before `ui-testclient`" — the
+window-stacking constraint the display gate depends on — is written by putting it first.
+
+**`after` means "has exited", not the schema's "reached ready state".** For a one-shot, finishing
+*is* readiness; for a service that keeps running there is no readiness protocol, so naming one
+would wait forever. `service-mgr` bounds the wait, says so, and starts the dependent anyway — as
+it does for a name that matches no declaration and for a dependency that failed to spawn. None of
+those is fatal, because refusing to start a service over a mis-typed name turns a typo into a
+silently missing service. A dependency *graph* with topological sorting is the general answer and
+is not built; nothing needs one.
+
+**Part A's judgement that `syscaps` was unnecessary was wrong, and the way it failed is the
+point.** That box was dropped on the strength of `boot-probe` needing no capabilities — true, and
+not the question. `init` spawned the demo chain with `BIND_NAMESPACE`, because it constructs a
+namespace and binds `/session/user` into it. Moved into a declaration that could not say so, the
+chain stopped at `test-harness: session user bind FAIL` — **and `test-qemu` passed**, with half
+the spawns missing, because `boot-probe` waits for the chain to *exit*, not to succeed.
+
+So two things landed together: `syscaps` is parsed and granted (an unrecognised name is reported
+and withheld, never dropped silently — a service starting with less authority than it declared
+fails somewhere else entirely), and `test-qemu` grew `check_demo_chain`, which requires
+`test-harness: all smoke tests passed`. That assertion replaces one `init` used to make by reading
+the chain's exit code, and it is negative-controlled by the real bug: remove the `syscaps` line
+and the gate fails with the stage the chain stopped at.
+
+**PID 1's supervision of `service-mgr` is now the same code in both images.** It was
+`#[cfg(not(feature = "selftest"))]` — a test image reaped the demo `parent` as its primary child
+instead — so init's restart-on-death was something `test-qemu` structurally could not exercise.
+`supervise` is three lines with no cfg. `test_exit` is unconditional too: `SYS_TEST_EXIT` is
+served only by a kernel built with its own `test-harness` feature, so elsewhere it returns
+`Unsupported` and a release `init` degrades to carrying on rather than diverging.
+
+**One cfg remains and the box stays open.** The `/subtreetest` binding still cannot be expressed
+as data, so `init`'s two builds are not byte-identical — 79,872 bytes against 83,968. Everything
+else about the file is now the same code in both.
+
+## 2026-08-24 — Three verdicts went missing when the spawns became declarations
+
+PR #229 review. Part C2 turned `init`'s spawns into service declarations, and each one that
+`init` had *adjudicated* lost its adjudicator — `policy = "never"` means `service-mgr` logs an
+exit code and does nothing with it. The demo chain was caught before merge; two more were not.
+
+- **`display-selftest`.** Forcing its hash comparison to fail printed `display-selftest: FAILED`,
+  `exited code=1`, and `integration tests PASSED`. Its exit code **2** is worse: the comment
+  deleted with `run_display_selftest` said folding "no framebuffer binding" into success "is how
+  the entire display arm could go missing with `test-qemu` still green, which is exactly what an
+  earlier version of this code did". `check-display` is not a substitute — a separate,
+  path-filtered workflow that does not read this code.
+- **Any service that fails to spawn.** `run_nxterm` and `run_ui_testclient` fired
+  `test_exit(false)` on a spawn failure; `spawn_service` logs and carries on.
+
+`check_display_selftest` and `check_every_service_started` close them. The second checks the
+*failure lines* rather than a list of expected services, so a new declaration is covered the day
+it is added and there is nothing to keep in step. Both negative-controlled against the real
+failures.
+
+**The general lesson, since this is the third time in one plan:** moving a program is not the
+change. Moving what *read its result* is. The retrofit's own rule — the shipping path is the
+tested path — says nothing about who adjudicates, and every one of these passed CI.
+
+---
+
+**`syscaps` does not do what this PR said it did.** Both the code comment and the schema stated
+that a declaration asking for more than `service-mgr` holds "fails the spawn rather than being
+granted it". The kernel computes `child = parent & requested` — a **silent intersection**. A
+declaration with `syscaps = ["LOAD_MODULE", "PHYSICAL_MEMORY"]` spawns fine, receives `0x0`, and
+the new log line asserted `granted syscaps 0x5`.
+
+That is the failure the `unknown_syscaps` machinery exists to prevent — a service starting with
+less authority than it declared — reintroduced for *recognised* names, with the log pointing away
+from it. Corrected: the line says **requested**, and names the attenuation. The spec and
+`service-manager.md` say so too; the latter claimed a parse-time subset check that has never
+existed, and cannot, because **nothing reports a process its own capability set**
+(`/proc/self/status` carries pid and tid). Filed as `TODO(spawn-syscap-attenuation)`, triggered by
+the first declaration wanting a capability `service-mgr` lacks.
+
+---
+
+**`after` orders backwards only, and the docs now say so.** A dependency is matched against
+services *already started*, so naming one declared later in the file cannot wait for it — the
+message said "which is not declared", of a service declared four lines down and named in the same
+transcript. Two consequences written down: the message now says "has not started — declared later
+in the file, or not at all", and the spec's "two services naming each other each wait out the
+bound" is wrong. The first does not wait at all.
+
+Also silent until now: a dependency that is running but has **no control channel** cannot be
+waited on, so the dependent starts unordered — precisely the race `after` exists to prevent, with
+nothing in the transcript saying the ordering had been skipped. It logs.
+
+---
+
+**Smaller, and each its own kind of drift.** `SYSCAP_NAMES` hardcoded the bit positions with a
+comment saying this crate does not depend on `libkern`; it does, and that table is the one place
+that turns a name into a grant. `after`/`syscaps` used `is_empty()` for first-wins, so
+`after = []` followed by `after = ["x"]` took the second — unlike every `[restart]` key, which
+uses a seen flag precisely so an empty-but-present value consumes its slot; for `syscaps` that is
+an appended line supplying a capability. And the `mem::take` the PR called load-bearing was the
+redundant one: with the `clear` kept, swapping it for `clone` left all tests passing.
+
+**`TODO(child-exit-attribution)`'s trigger has arrived and the bug is newly reachable.** Part C2
+made `supervise` unconditional, so `reap_loop` now runs with `parent_h = service_mgr_h` in a test
+image where the `selftest` path passed `0` — the misattribution branch could not fire at all
+before. Still latent, because init's remaining children are servers that are not expected to
+exit; the graphical clients are `service-mgr`'s children now, which is also why that entry's "plus
+the selftest demos" is gone.
