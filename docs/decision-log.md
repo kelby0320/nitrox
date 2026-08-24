@@ -17249,7 +17249,7 @@ served only by a kernel built with its own `test-harness` feature, so elsewhere 
 `Unsupported` and a release `init` degrades to carrying on rather than diverging.
 
 **One cfg remains and the box stays open.** The `/subtreetest` binding still cannot be expressed
-as data, so `init`'s two builds are not byte-identical — 79,872 bytes against 83,968. Everything
+as data, so `init`'s two builds are not byte-identical — 79,872 bytes against 83,976. Everything
 else about the file is now the same code in both.
 
 ## 2026-08-24 — Three verdicts went missing when the spawns became declarations
@@ -17321,3 +17321,71 @@ image where the `selftest` path passed `0` — the misattribution branch could n
 before. Still latent, because init's remaining children are servers that are not expected to
 exit; the graphical clients are `service-mgr`'s children now, which is also why that entry's "plus
 the selftest demos" is gone.
+
+## 2026-08-24 — The test-path retrofit closes, and its result becomes a gate
+
+Part D. Two decisions, one new check, and one thing the plan did not set out to find.
+
+**`test-qemu` and `test-interactive` stay two gates**, and the difference is now stateable rather
+than habitual. They cannot merge: `boot-probe` fires `SYS_TEST_EXIT(PASS)` and QEMU terminates, so
+a self-adjudicating image cannot afterwards be typed at. Pointing `test-interactive` at the test
+image with the device absent — what `check-terminal` does — would work mechanically and would give
+up the only thing it is for, booting the **release** image. That justification survives the
+retrofit: `sbin/init` still differs, the kernel is built with `test-harness`, and the store carries
+a package a release image does not.
+
+**`SYS_TEST_EXIT` stays, for a narrower reason than governing decision 4 gave it.** With four
+transcript checks on `test-qemu`, the device is no longer the adjudication — it is one signal of
+five, and everything it reports is also printed. An expect-only `test-qemu` is possible. Three
+things keep it: it **cannot be produced by accident** (a log line can; the syscall is served only
+by a kernel built with its own feature), it **terminates the run** at the decision point rather
+than leaving the runner to match a final line, and the **panic handler** fires it from a context
+where further output may not survive. The rule that follows is now in the convention doc: *the
+device is the verdict, the transcript is the coverage* — new adjudication goes to the transcript,
+which can say which of several things went wrong.
+
+**`cargo xtask check-images` makes the result a wall.** Of the initramfs's 7 files, **4 are
+byte-identical** between a test and a release image; the three that differ are two declaration
+files and `sbin/init`. The gate builds both archives and fails on any divergence not on a short
+allow-list. It runs in the QEMU job, which already builds both images.
+
+**What it catches, stated precisely.** Wiring `mode.features()` into a build that does not take
+one — the shape Part B removed from `session-mgr` — makes that program's ELF differ here. A bare
+`#[cfg(feature = "test-harness")]` does **not**: `eshell`, `fs-server-ext4` and `profile-server`
+declare no features, so it is inert in both modes. The first draft of this entry claimed the cfg
+alone fires it and said "confirmed by doing exactly that" — the probe that fired had *three*
+changes in it (the cfg, a `[features]` section, and the build wiring), and the result was credited
+to one of them (PR #230 review, finding 1). The invariant is "no build-mode-varying input reaches
+these programs", which is the one worth having.
+
+**What the plan finishes with, and what it did not anticipate.** `session-mgr` went 31 cfg sites →
+0, `init` 41 → 1. The one left is the `/subtreetest` binding, and the blocker turned out narrower
+than first recorded: not "data cannot express a namespace bind" but "`init.toml` has no bind-mount
+concept" — `MountSpec` already carries an unused `options` table, and a `[[mount]]` entry would
+spawn a redundant fs-server for a partition already mounted. Deferred past this plan by decision:
+it is capability work on the boot manifest, not retrofit.
+
+The lesson the plan did not have: **three separate times, moving a program out of a supervisor
+silently moved its verdict nowhere.** The demo chain, the display self-test, and every spawn
+failure each reached PASS with the failure printed on the console. Each was caught by a review or
+a probe; none by a gate. "The shipping path is the tested path" says nothing about who adjudicates,
+and relocating a program means relocating whatever read its result.
+
+---
+
+**Filed on the way out: `TODO(kstack-vmap-coherence)`.** `KernelStack::new` installs into the
+shared kernel vmap with no TLB shootdown, while `drop` has one and explains why. The 2026-05-29
+log named this exact residual — stale cached paging structures on another CPU, an `RSP0` push that
+faults, `#DF` — measured it at ~15 % under KVM boot-looping, and said closing it was the next step;
+it never got an open-item entry, so nothing tracked it for three months.
+
+Observed live during this part, and the accelerator is the whole story: **2 `#DF` in 14 local
+TCG boots** (~14 %), **0 in 6 local KVM boots**, and **0 in 83 CI boots** across 40 workflow runs.
+Every CI job passes `--kvm`, so the gates cannot see this — 83 consecutive green boots read as
+"fine". What it degrades is local development, where `cargo xtask check-terminal` with no flag is
+TCG.
+
+Two corrections to my own reading on the way: an initial 8 clean runs suggested the rate had
+decayed far below the log's 15 %, and two later failures said otherwise — the smaller sample was
+the wrong one to believe. And it is not caused by the retrofit; the plan changed which process
+runs these tests, not the kernel.

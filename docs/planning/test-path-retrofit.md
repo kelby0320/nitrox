@@ -1,7 +1,7 @@
 # Nitrox Test-Path Retrofit — Subproject Plan
 
-**Status:** 🚧 in progress. Planned 2026-08-21. **Parts A and B are complete and C1 has
-landed**; C2 and Part D are not started. Landed the same day:
+**Status:** ✅ complete (2026-08-24), bar one open box named in Part C. Planned 2026-08-21;
+Parts A, B and C1 landed that day, C2 and D on 2026-08-24. What it did:
 `parse_all` and the schema change under it, `boot-probe` started from a declaration,
 `service-mgr` holding more than one service, `session-mgr` down to **zero** test cfgs with the
 verdict and the substrate gates moved out of it, and the five filesystem tests out of PID 1 —
@@ -270,13 +270,28 @@ ordering box below real rather than theoretical.
       **Found by `check-terminal`, not `test-qemu`**, for the reason Part B recorded: the probe
       writes the verdict, so under `test-qemu` the machine stops before it can exit.
 
-- [ ] **The `/subtreetest` binding is the one cfg C1 could not remove, and closing it needs a
-      mechanism rather than an edit.** `[handles].namespace` is unparsed and a declared service
-      is spawned with `namespace: 0`, an inherited LOOKUP-only root — so "data, not code" has
-      no way to express a namespace bind. Two things need it: `boot-probe`'s
-      `subtree_bind_test`, and the demo harness's case 8, which needs a binding that is *also*
-      an openable directory to prove `move` refuses to recurse through a mount. Removing it
-      without checking broke the second one.
+- [ ] **The `/subtreetest` binding is the one cfg left in `init`, and the blocker is narrower
+      than this box first said.** It read "data cannot express a namespace bind", which is true
+      of *service* declarations — `[handles].namespace` is unparsed and a declared service gets
+      `namespace: 0`, an inherited LOOKUP-only root — and was over-generalised. `init` reads a
+      manifest too, `/initramfs/etc/init.toml`, and `MountSpec` already carries an
+      `options: Option<Table>` that nothing consumes.
+
+      **What is actually missing is a bind-mount concept in that manifest.** A `[[mount]]` entry
+      spawns an fs-server for a device; `/subtreetest` is a *second bind of the endpoint already
+      mounted at `/`*, scoped to a subtree, so declaring it as a mount would spawn a redundant
+      server for the same partition. The manifest needs "bind an already-mounted server's
+      endpoint at another path, with a subtree base" — which is not a test accommodation:
+      `session-mgr` does exactly that for `/home` on every login, and it is what `mount --bind`
+      is everywhere else.
+
+      Two things need the binding: `boot-probe`'s `subtree_bind_test`, and the demo harness's
+      case 8, which needs a binding that is *also* an openable directory to prove `move` refuses
+      to recurse through a mount. Removing it without checking broke the second one.
+
+      **Deferred past this plan deliberately** (maintainer's call, 2026-08-24): it is capability
+      work on the boot manifest — critical path — rather than retrofit, and the retrofit's value
+      does not depend on it.
 
       **`init` still has 20 `selftest` cfgs**, and they are C2's, not this one's: the demo
       chain (`run_test_harness`), the four `run_*` graphical spawns, and the
@@ -298,9 +313,10 @@ ordering box below real rather than theoretical.
       cfg, and `test_exit` is unconditional (the syscall returns `Unsupported` where the verdict
       device is absent, so a release `init` degrades rather than diverging).
 
-- [ ] **`init` compiles identically in both images** — not yet, and one thing blocks it: the
-      `/subtreetest` binding. 41 cfg sites became **1**. Closing the last one needs a way to put
-      a namespace bind in declaration data; see the box above.
+- [ ] **`init` compiles identically in both images** — not yet, and the same single thing
+      blocks it. 41 cfg sites became **1**; the two `sbin/init` ELFs are 79,872 and 83,976 bytes.
+      This box and the one above are the same box, and both wait on a bind-mount concept in
+      `init.toml`.
 
 - [x] **Two mechanisms the plan had written off** ✅. `after` and `syscaps` are parsed now.
       Part A dropped `syscaps` as unnecessary — true of `boot-probe`, false of the milestone:
@@ -309,34 +325,91 @@ ordering box below real rather than theoretical.
       ordering the verdict rests on, and it means "has exited" rather than the schema's
       unimplementable "reached ready state".
 
-## Part D — the gate set, reconciled
+## Part D — the gate set, reconciled ✅ complete (2026-08-24)
 
-- [ ] **Decide whether `test-qemu` and `test-interactive` remain two gates.** Once the test
-      image is the release image plus a service declaration, they boot nearly the same thing and
-      differ only in whether a host types at the prompt. Merging is plausible and is not
-      assumed here; what is *not* acceptable is two gates whose difference nobody can state.
+**The measurement the decisions rest on.** Of the initramfs's **7** files, **4 are
+byte-identical** between a test image and a release image. The three that differ are
+`etc/services.toml` and `etc/profiles/system.toml` — data — and `sbin/init`, the one remaining
+`#[cfg(feature = "selftest")]`. The *set of files* is identical in both.
 
-- [ ] **Record the expect-only option, and reject or take it deliberately.** Governing decision
-      4 keeps `SYS_TEST_EXIT`. If Part D concludes that host-side expect is sufficient — it is
-      what every other gate already does — then the syscall and the `isa-debug-exit` device go,
-      and that is a decision-log entry, not a refactor.
+(Seven, not eight: `TRAILER!!!` is the CPIO end-of-archive sentinel, and counting it inflated
+this by one everywhere it appeared — PR #230 review, finding 6.)
 
-- [ ] **Root `CLAUDE.md`'s build-command list gains `test-interactive` and `check-input`.**
-      Both run in CI; neither is listed. That omission is the likeliest reason the release-image
-      pattern never spread — a session reading the project's own command list does not learn
-      that the release image is bootable under test.
+- [x] **They remain two gates, and the difference is stateable** ✅.
 
-- [ ] **`docs/conventions/qemu-integration-tests.md`** describes the arrangement this plan
-      changes, and is a current-behaviour doc. It updates in the same change.
+      They **cannot** merge as things stand, and the reason is structural rather than
+      preferential: `boot-probe` fires `SYS_TEST_EXIT(PASS)` and QEMU terminates, so a
+      self-adjudicating image cannot afterwards be typed at. `test-interactive` could be
+      pointed at the test image without the `isa-debug-exit` device — that is exactly what
+      `check-terminal` does — but then it would no longer boot the **release** image, which is
+      its entire justification.
+
+      And that justification survives the retrofit: `sbin/init` still differs, the kernel is
+      built with `test-harness`, and the store carries a package a release image does not. The
+      two gates also assert different things — `test-qemu` adjudicates the substrate,
+      `test-interactive` drives the path a person takes.
+
+- [x] **`SYS_TEST_EXIT` stays, and now for a narrower reason** ✅.
+
+      Governing decision 4 kept it provisionally. Re-examined with `test-qemu` now carrying
+      **four** transcript checks, it is no longer the adjudication — it is one signal of five,
+      and everything it reports is also *printed*: a failed gate prints
+      `boot-probe: … FAIL`, a critical-path failure prints `init: critical-path failure`, a
+      panic prints `*** KERNEL PANIC ***`. An expect-only `test-qemu` is therefore possible.
+
+      Three things keep it. It is the only signal that **cannot be produced by accident** — a
+      log line can be; the syscall is served only by a kernel built with its own `test-harness`
+      feature. It **terminates the run** at the decision point instead of leaving the runner to
+      match a final line and kill QEMU. And the **kernel panic handler** can fire it from a
+      context where further output may not survive, which is the case where a transcript is
+      least trustworthy.
+
+      What changed is the balance, and the doc says so: the device is the verdict, the
+      transcript is the coverage, and new adjudication should go to the transcript.
+
+- [x] **Root `CLAUDE.md`'s build-command list** ✅ — `test-interactive` and `check-input` were
+      added with the plan itself; `check-images` joins them here.
+
+- [x] **`docs/conventions/qemu-integration-tests.md`** ✅ — updated in each part as the thing it
+      describes changed, rather than once at the end.
+
+- [x] **`cargo xtask check-images`, so the result is a wall and not a number** ✅. It builds both
+      initramfs archives and compares them entry by entry, failing on any divergence not on a
+      short allow-list. Runs in the QEMU job, which already builds both images.
+
+      **What it catches**, stated precisely because the first version of this box overstated it
+      (PR #230 review, finding 1): wiring `mode.features()` into a build that does not take one —
+      the shape Part B removed from `session-mgr` — makes that program's ELF differ here. A bare
+      `#[cfg(feature = "test-harness")]` does **not**, because `eshell`, `fs-server-ext4` and
+      `profile-server` declare no features, so it is inert in both modes. The invariant is "no
+      build-mode-varying input reaches these programs", which is the one worth having: a cfg
+      nothing can turn on is not a divergence.
+
+      The probe that *did* fire carried three changes — the cfg, a `[features]` section, and the
+      build wiring — and the result was credited to one of them. Running a compound probe and
+      attributing it to a component is the same error as an assertion with no negative control,
+      one level up.
 
 ## What "done" means
 
-- `grep -rn 'feature = "test-harness"\|feature = "selftest"' userspace/init/src userspace/session-mgr/src`
-  returns **nothing**.
-- The remaining sites are `nxterm`'s observation prints and the `test-harness` crate itself.
-- `test-qemu`, `test-interactive`, `check-display`, `check-terminal`, `check-input` and
-  `check-input --no-ps2-irq` all pass, and the boot verdict is written by one program.
-- The test image and the release image build the same `init` and the same `session-mgr`.
+Measured 2026-08-24. Three of four met; the fourth is one binding short, and the box for it is
+open above rather than reworded.
+
+- ✅ `session-mgr` has **zero** cfg sites (was 31). `init` has **one** (was 41) — the
+  `/subtreetest` binding, which needs a bind-mount concept in `init.toml`.
+- ✅ Everything else is `nxterm`'s observation prints (9) and the `test-harness` crate itself.
+- ✅ `test-qemu`, `test-interactive`, `check-display`, `check-terminal`, `check-input`,
+  `check-input --no-ps2-irq` and `check-images` all pass, and the boot verdict is written by one
+  program — `boot-probe`, which did not exist when this plan was written.
+- ⚠️ The two images build the same `session-mgr` and **not** the same `init`. Four of the
+  initramfs's seven files are byte-identical; of the three that differ, two are data.
+
+**And a thing worth recording that was not a criterion.** Three separate times, moving a program
+out of a supervisor silently moved its *verdict* nowhere — the demo chain, the display self-test,
+and every spawn failure each reached PASS with the failure printed. Each was caught by a review
+or a probe, never by a gate. The retrofit's rule is "the shipping path is the tested path"; the
+lesson it did not anticipate is that **relocating a program means relocating whatever read its
+result**, and nothing checks that for you.
 
 ## Out of scope, deliberately
 

@@ -125,6 +125,13 @@ impl KernelStack {
         // CPU has a cached translation for it), and the PD/PT are installed into
         // the shared-by-reference vmap hierarchy, so every address space sees them.
         // (Matches Linux, which shoots down only on unmap / permission-restrict.)
+        //
+        // **This argument was re-checked on 2026-08-24 and stands**, which is worth saying
+        // because an intermittent `#DF` is open (`TODO(unexplained-df)`) and the 2026-05-29
+        // log pointed at this area. The "freshly allocated" premise is load-bearing and holds:
+        // `kvmap`'s allocator is a bump pointer that **never reclaims VA**, so no CPU can hold
+        // a cached translation — stale or otherwise — for a VA being mapped here. A first
+        // draft of the deferral asserted the opposite and was wrong.
 
         // Paint the fresh stack so its high-water mark is measurable later (see
         // `watermark`). Instrumentation only — a production stack is left as the buddy

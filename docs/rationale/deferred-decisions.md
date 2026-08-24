@@ -498,6 +498,67 @@ schema used to describe), or **expose a process's own syscaps** so a supervisor 
 asking. Trigger: the first declaration wanting a capability `service-mgr` does not hold — a
 device manager with `LOAD_MODULE` is the obvious one.
 
+**An intermittent `#DF`, cause unestablished — `TODO(unexplained-df)`.** A double fault with a
+kernel `rip` (`0xffffffff8001e000`), a **user** `rsp`, and the stack pointer reported "not
+scannable" — the shape of a fault taken where no fault can be delivered.
+
+**Not new, and previously untracked.** The 2026-05-29 decision log named a residual it believed
+was the cause — *"an AP mutating the shared kernel-vmap page tables for its own kstacks leaves
+other cores' cached paging structures stale, so init's `RSP0` push faults → `#DF`"* — put the rate
+at ~15 % under KVM boot-looping after two partial fixes, and said closing it was the next step. It
+never got an open-item entry, so nothing has tracked it for three months; this entry is that.
+
+**That attribution does not survive re-checking, and this entry asserted it before checking.**
+The first draft said `KernelStack::new` needs a TLB shootdown because `drop` has one. It does not:
+`kstack.rs` argues, thirty lines below the install loop, that adding a mapping needs no cross-CPU
+invalidation on x86 — the VA is freshly allocated, so no CPU holds a cached translation for it,
+stale or otherwise. The premise holds: `kvmap`'s allocator is a bump pointer that **never reclaims
+VA**. x86 does not cache not-present translations, so there is nothing to invalidate. Linux does
+the same. So the install path is **ruled out**, and the earlier draft of this entry — plus a
+`TODO` marker placed on that loop — was wrong twice over: wrong about the mechanism, and written
+without reading the argument next to it.
+
+**Still live under TCG, and invisible to CI — which is the part that matters.** Measured
+2026-08-24:
+
+| Configuration | Boots | `#DF` |
+|---|---|---|
+| Local, **TCG** (no `--kvm`) | 14 | **2** (~14 %) |
+| Local, **KVM** (`--kvm`) | 6 | 0 |
+| **CI**, KVM (40 workflow runs) | 83 | 0 |
+
+So the gates cannot see it: every CI job passes `--kvm`, and 83 consecutive clean boots read as
+"fine". What it degrades is **local development**, because `cargo xtask check-terminal` with no
+flag is TCG — the default a session runs. A one-in-seven red on a gate that is green in CI is
+also the most expensive kind of flake to diagnose, since the obvious first move is to re-run and
+watch it pass.
+
+The 2026-05-29 figure of ~15 % was attributed to KVM boot-looping. Either the two partial fixes
+closed the KVM-visible path and left the TCG one, or that attribution was imprecise; six local
+KVM boots is too small a sample to say which, and the CI evidence only bounds it low.
+
+Both failures are the same fault: `#DF`, kernel `rip 0xffffffff8001e000`, a **user** `rsp`, and
+the stack pointer reported "not scannable" — the shape of a fault taken where no fault can be
+delivered. One landed during the demo chain's rename/move stage, the other after the terminal
+interaction. An initial reading of 8 clean runs suggested the rate had dropped far below 15 %;
+two more failures said otherwise, and the smaller sample was the wrong one to believe.
+
+**It is not caused by the retrofit** — the plan changed which *process* runs these tests, not the
+kernel — but the retrofit is why it is being seen: more of the gate set now boots the same image
+through the same paths, so a 15 % fault has more chances to show.
+
+**What is left to look at**, since the obvious candidate is out. The `#DF` shape — kernel `rip`,
+user `rsp` — says the CPU could not deliver an exception, which points at the entry path or the
+stack it switches to rather than at the stack's *mapping*: `RSP0`/IST loading, the per-CPU TSS, or
+a fault taken before the switch completes. TCG-only reproduction is itself a clue, since TCG's
+soft-MMU and its interrupt delivery differ from hardware in exactly that region. **Pre-allocating
+the vmap's intermediate tables at boot** would remove page-table allocation from thread creation
+entirely — which is how Linux avoids the class on x86-64 — and is worth doing on its own merits
+whether or not it is this.
+
+Trigger: it is live; the next occurrence, or any SMP work touching the vmap or the entry path.
+Reproduce with `cargo xtask check-terminal` **without** `--kvm`, several times.
+
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
 server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and

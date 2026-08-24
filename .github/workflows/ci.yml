@@ -178,6 +178,21 @@ jobs:
             ${{ runner.os }}-cargo-integration-
             ${{ runner.os }}-cargo-
 
+      # **The test image and the release image may differ only on a short allow-list.** Builds both
+      # initramfs archives and compares them file by file: four of the seven are
+      # byte-identical, and the three that are not are the two declaration files plus
+      # `sbin/init`, which still carries one `#[cfg(feature = "selftest")]`. A new divergence
+      # fails here — wiring `mode.features()` into a build that does not take one, the shape
+      # Part B removed from `session-mgr`, makes that program's ELF differ with nothing else in
+      # CI to notice. (A bare `#[cfg]` does not: those crates declare no features, so it is inert
+      # in both modes.)
+      #
+      # This is what turns `docs/planning/test-path-retrofit.md`'s result into a wall rather
+      # than a number in a doc. It runs in the QEMU job because it needs both images built,
+      # not because it boots anything.
+      - name: cargo xtask check-images
+        run: cargo xtask check-images
+
       # The whole boot, adjudicated: kernel -> init -> ext4 mount -> userspace demos
       # -> login chain, with the guest writing a verdict to isa-debug-exit and a
       # wall-clock timeout catching a hang. This is the gate that catches what host

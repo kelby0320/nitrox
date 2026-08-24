@@ -55,6 +55,7 @@ cargo xtask test-interactive # boot the RELEASE image and drive a real login + s
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
+cargo xtask check-images   # test vs release initramfs: differ only on a short allow-list
 ```
 
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
@@ -74,9 +75,14 @@ compiled and never ran. Retrofit Part B deleted that: `session-mgr` has **one** 
 every build and zero test cfgs, and its login proof lives here as steps 5a–5c.
 
 **Prefer this shape for anything user-facing**: a service should behave in a test image the way
-it behaves in a release one. `init` is the one that still does not —
-`docs/planning/test-path-retrofit.md` Part C is the plan that finishes it, and until then the
-test image differs from the release image by more than a service declaration.
+it behaves in a release one. `docs/planning/test-path-retrofit.md` is the plan that made that
+true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to one — and
+it is complete. The one left is `init`'s `/subtreetest` binding, which needs a **bind-mount
+concept in `init.toml`** and is deferred past that plan as capability work; the box naming it is
+still open there.
+
+`cargo xtask check-images` is what keeps the property: it fails if a test image and a release
+image start differing in anything new.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
