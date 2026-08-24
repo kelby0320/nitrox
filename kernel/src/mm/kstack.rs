@@ -91,6 +91,15 @@ impl KernelStack {
 
         // Install PTEs. Roll back installed PTEs + free all frames on
         // any failure (out of intermediate page-table frames).
+        //
+        // **No shootdown here, and the unmap path below has one — `TODO(kstack-vmap-coherence)`.**
+        // These PTEs, and any PD/PT frames the walk allocates, hang off the *shared* kernel-vmap
+        // PDPT and are therefore visible to every address space. x86 caches paging-structure
+        // entries as well as final translations, so a CPU that has walked this region before can
+        // hold a stale intermediate entry and miss a newly installed stack. The decision log
+        // (2026-05-29) named this as the residual cause of an intermittent `#DF` — a thread's
+        // first exception delivered onto a kernel stack whose translation is stale on the
+        // running CPU, so the `RSP0` push itself faults — and it is still open.
         let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
         let mut installed = 0usize;
         for i in 0..KERNEL_STACK_PAGES {

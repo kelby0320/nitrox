@@ -55,6 +55,7 @@ cargo xtask test-interactive # boot the RELEASE image and drive a real login + s
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
+cargo xtask check-images   # a test image may differ from a release image only in data
 ```
 
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)

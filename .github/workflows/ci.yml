@@ -184,6 +184,19 @@ jobs:
       # unit tests structurally cannot — every regression found during coreutils
       # Milestone 1 was caught here, and none of them would have failed the jobs
       # above. See docs/conventions/qemu-integration-tests.md.
+      # **The test image and the release image may differ only in data.** This builds both
+      # initramfs archives and compares them entry by entry: five of the eight are
+      # byte-identical, and the three that are not are the two declaration files plus
+      # `sbin/init`, which still carries one `#[cfg(feature = "selftest")]`. A new divergence
+      # fails here — adding a test-only branch to `eshell`, `fs-server-ext4` or
+      # `profile-server` makes its ELF differ, with nothing else in CI to notice.
+      #
+      # This is what turns `docs/planning/test-path-retrofit.md`'s result into a wall rather
+      # than a number in a doc. It runs in the QEMU job because it needs both images built,
+      # not because it boots anything.
+      - name: cargo xtask check-images
+        run: cargo xtask check-images
+
       - name: cargo xtask test-qemu --kvm
         run: cargo xtask test-qemu --kvm
 

@@ -114,6 +114,41 @@ the adjudicated run structurally cannot.
 would still reach the same verdict. If a defect *would* change the exit code, the exit code is
 the better assertion — a transcript match is coupled to log wording, which is a cost.
 
+### Why `isa-debug-exit` stays, when the transcript could carry everything
+
+Re-examined at the end of the test-path retrofit (2026-08-24), with `test-qemu` now carrying
+four transcript checks. Everything the exit code reports is **also printed**: a failed gate
+prints `boot-probe: … FAIL`, a critical-path failure prints `init: critical-path failure`, a
+panic prints `*** KERNEL PANIC ***`. An expect-only `test-qemu` is possible.
+
+Three things keep the device:
+
+- It **cannot be produced by accident**. A log line can be; `SYS_TEST_EXIT` is served only by a
+  kernel built with its own `test-harness` feature.
+- It **terminates the run** at the decision point, instead of leaving the runner to match a
+  final line and then kill QEMU.
+- The **kernel panic handler** fires it from a context where further output may not survive —
+  exactly where a transcript is least trustworthy.
+
+**What changed is the balance.** The device used to be the whole adjudication and is now one
+signal of five. The rule that follows: *the device is the verdict, the transcript is the
+coverage.* New adjudication goes to the transcript — it says which of several things went wrong,
+where an exit code says only that something did.
+
+### Why `test-qemu` and `test-interactive` are two gates
+
+They cannot merge, and the reason is structural. `boot-probe` fires PASS and QEMU terminates, so
+a self-adjudicating image cannot afterwards be typed at. `test-interactive` could be pointed at
+the test image with the device absent — that is what `check-terminal` does — but then it would
+not boot the **release** image, which is its whole justification.
+
+That justification survives the retrofit, and the measurement is `cargo xtask check-images`: of
+the initramfs's eight entries, five are byte-identical between the two images, and the three
+that differ are two declaration files and `sbin/init`. The kernel differs too (`test-harness`),
+and the store carries a package a release image does not. The gates also assert different
+things: `test-qemu` adjudicates the substrate, `test-interactive` drives the path a person
+takes.
+
 ## The `test-harness` feature
 
 `test-qemu` builds the kernel and `init` with the **`test-harness`** cargo feature

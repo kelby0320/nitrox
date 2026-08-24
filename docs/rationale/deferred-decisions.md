@@ -498,6 +498,40 @@ schema used to describe), or **expose a process's own syscaps** so a supervisor 
 asking. Trigger: the first declaration wanting a capability `service-mgr` does not hold — a
 device manager with `LOAD_MODULE` is the obvious one.
 
+**Kernel-vmap coherence on kstack *install* — `TODO(kstack-vmap-coherence)`.** `KernelStack::new`
+maps its pages into the **shared** kernel vmap with no TLB shootdown; the unmap path in `drop`
+has one, and says why ("another CPU could still hold a cached translation ... before the frame is
+recycled"). The install direction needs the same publication for a different reason: x86 caches
+paging-structure entries as well as final translations, so a CPU that has walked this region can
+hold a stale intermediate entry and miss a newly installed stack. The walk allocates PD/PT frames
+under the shared PDPT precisely when this bites.
+
+**Not new, and previously untracked.** The 2026-05-29 decision log named it as the residual after
+the SMP migration fixes — *"an AP mutating the shared kernel-vmap page tables for its own kstacks
+leaves other cores' cached paging structures stale, so init's `RSP0` push faults → `#DF`"* — put
+the rate at ~15 % under KVM boot-looping after two partial fixes, and said closing it was the next
+step. It never got an open-item entry, so nothing has tracked it since; this entry is that.
+
+**Still live, and at about the rate the log left it.** Measured 2026-08-24 under **TCG**
+(no `--kvm`), which the earlier figure was not: **1 failure in 9** `cargo xtask check-input` runs
+and **1 in 5** `cargo xtask check-terminal` runs — call it 10–20 %, against the ~15 % the log
+recorded three months earlier. It has not decayed; nothing has touched the cause.
+
+Both failures are the same fault: `#DF`, kernel `rip 0xffffffff8001e000`, a **user** `rsp`, and
+the stack pointer reported "not scannable" — the shape of a fault taken where no fault can be
+delivered. One landed during the demo chain's rename/move stage, the other after the terminal
+interaction. An initial reading of 8 clean runs suggested the rate had dropped far below 15 %;
+two more failures said otherwise, and the smaller sample was the wrong one to believe.
+
+**It is not caused by the retrofit** — the plan changed which *process* runs these tests, not the
+kernel — but the retrofit is why it is being seen: more of the gate set now boots the same image
+through the same paths, so a 15 % fault has more chances to show.
+
+Shapes: **shoot down on install** (symmetric with `drop`, and the cheapest correct thing —
+kstack construction is once per thread), or **pre-allocate the vmap's intermediate tables at
+boot** so no walk ever installs one, which removes the class rather than publishing it. Trigger:
+it is a live intermittent `#DF`; the next occurrence, or any SMP work that touches the vmap.
+
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
 server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and
