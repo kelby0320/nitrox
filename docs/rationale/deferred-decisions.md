@@ -512,10 +512,24 @@ leaves other cores' cached paging structures stale, so init's `RSP0` push faults
 the rate at ~15 % under KVM boot-looping after two partial fixes, and said closing it was the next
 step. It never got an open-item entry, so nothing has tracked it since; this entry is that.
 
-**Still live, and at about the rate the log left it.** Measured 2026-08-24 under **TCG**
-(no `--kvm`), which the earlier figure was not: **1 failure in 9** `cargo xtask check-input` runs
-and **1 in 5** `cargo xtask check-terminal` runs — call it 10–20 %, against the ~15 % the log
-recorded three months earlier. It has not decayed; nothing has touched the cause.
+**Still live under TCG, and invisible to CI — which is the part that matters.** Measured
+2026-08-24:
+
+| Configuration | Boots | `#DF` |
+|---|---|---|
+| Local, **TCG** (no `--kvm`) | 14 | **2** (~14 %) |
+| Local, **KVM** (`--kvm`) | 6 | 0 |
+| **CI**, KVM (40 workflow runs) | 83 | 0 |
+
+So the gates cannot see it: every CI job passes `--kvm`, and 83 consecutive clean boots read as
+"fine". What it degrades is **local development**, because `cargo xtask check-terminal` with no
+flag is TCG — the default a session runs. A one-in-seven red on a gate that is green in CI is
+also the most expensive kind of flake to diagnose, since the obvious first move is to re-run and
+watch it pass.
+
+The 2026-05-29 figure of ~15 % was attributed to KVM boot-looping. Either the two partial fixes
+closed the KVM-visible path and left the TCG one, or that attribution was imprecise; six local
+KVM boots is too small a sample to say which, and the CI evidence only bounds it low.
 
 Both failures are the same fault: `#DF`, kernel `rip 0xffffffff8001e000`, a **user** `rsp`, and
 the stack pointer reported "not scannable" — the shape of a fault taken where no fault can be

@@ -17372,9 +17372,13 @@ log named this exact residual — stale cached paging structures on another CPU,
 faults, `#DF` — measured it at ~15 % under KVM boot-looping, and said closing it was the next step;
 it never got an open-item entry, so nothing tracked it for three months.
 
-Observed live during this part, under TCG: **1 in 9** `check-input` runs and **1 in 5**
-`check-terminal` runs, both the same `#DF` — kernel `rip 0xffffffff8001e000`, a user `rsp`, stack
-"not scannable". That is 10–20 %, i.e. **the rate the log left it at**, not the decay an initial
-8-clean-run reading suggested; the smaller sample was the wrong one to believe. Not caused by the
-retrofit — the plan changed which process runs these tests, not the kernel — but surfaced by it,
-since more of the gate set now boots the same image through the same paths.
+Observed live during this part, and the accelerator is the whole story: **2 `#DF` in 14 local
+TCG boots** (~14 %), **0 in 6 local KVM boots**, and **0 in 83 CI boots** across 40 workflow runs.
+Every CI job passes `--kvm`, so the gates cannot see this — 83 consecutive green boots read as
+"fine". What it degrades is local development, where `cargo xtask check-terminal` with no flag is
+TCG.
+
+Two corrections to my own reading on the way: an initial 8 clean runs suggested the rate had
+decayed far below the log's 15 %, and two later failures said otherwise — the smaller sample was
+the wrong one to believe. And it is not caused by the retrofit; the plan changed which process
+runs these tests, not the kernel.
