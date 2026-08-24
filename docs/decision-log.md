@@ -17249,7 +17249,7 @@ served only by a kernel built with its own `test-harness` feature, so elsewhere 
 `Unsupported` and a release `init` degrades to carrying on rather than diverging.
 
 **One cfg remains and the box stays open.** The `/subtreetest` binding still cannot be expressed
-as data, so `init`'s two builds are not byte-identical — 79,872 bytes against 83,968. Everything
+as data, so `init`'s two builds are not byte-identical — 79,872 bytes against 83,976. Everything
 else about the file is now the same code in both.
 
 ## 2026-08-24 — Three verdicts went missing when the spawns became declarations
@@ -17344,12 +17344,19 @@ where further output may not survive. The rule that follows is now in the conven
 device is the verdict, the transcript is the coverage* — new adjudication goes to the transcript,
 which can say which of several things went wrong.
 
-**`cargo xtask check-images` makes the result a wall.** Of the initramfs's 8 entries, **5 are
+**`cargo xtask check-images` makes the result a wall.** Of the initramfs's 7 files, **4 are
 byte-identical** between a test and a release image; the three that differ are two declaration
 files and `sbin/init`. The gate builds both archives and fails on any divergence not on a short
-allow-list — add a `#[cfg(feature = "test-harness")]` to `eshell` and its ELF starts differing,
-which nothing else in CI would notice. Confirmed by doing exactly that. It runs in the QEMU job,
-which already builds both images.
+allow-list. It runs in the QEMU job, which already builds both images.
+
+**What it catches, stated precisely.** Wiring `mode.features()` into a build that does not take
+one — the shape Part B removed from `session-mgr` — makes that program's ELF differ here. A bare
+`#[cfg(feature = "test-harness")]` does **not**: `eshell`, `fs-server-ext4` and `profile-server`
+declare no features, so it is inert in both modes. The first draft of this entry claimed the cfg
+alone fires it and said "confirmed by doing exactly that" — the probe that fired had *three*
+changes in it (the cfg, a `[features]` section, and the build wiring), and the result was credited
+to one of them (PR #230 review, finding 1). The invariant is "no build-mode-varying input reaches
+these programs", which is the one worth having.
 
 **What the plan finishes with, and what it did not anticipate.** `session-mgr` went 31 cfg sites →
 0, `init` 41 → 1. The one left is the `/subtreetest` binding, and the blocker turned out narrower

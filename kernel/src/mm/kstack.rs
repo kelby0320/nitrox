@@ -91,15 +91,6 @@ impl KernelStack {
 
         // Install PTEs. Roll back installed PTEs + free all frames on
         // any failure (out of intermediate page-table frames).
-        //
-        // **No shootdown here, and the unmap path below has one — `TODO(kstack-vmap-coherence)`.**
-        // These PTEs, and any PD/PT frames the walk allocates, hang off the *shared* kernel-vmap
-        // PDPT and are therefore visible to every address space. x86 caches paging-structure
-        // entries as well as final translations, so a CPU that has walked this region before can
-        // hold a stale intermediate entry and miss a newly installed stack. The decision log
-        // (2026-05-29) named this as the residual cause of an intermittent `#DF` — a thread's
-        // first exception delivered onto a kernel stack whose translation is stale on the
-        // running CPU, so the `RSP0` push itself faults — and it is still open.
         let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
         let mut installed = 0usize;
         for i in 0..KERNEL_STACK_PAGES {
@@ -134,6 +125,13 @@ impl KernelStack {
         // CPU has a cached translation for it), and the PD/PT are installed into
         // the shared-by-reference vmap hierarchy, so every address space sees them.
         // (Matches Linux, which shoots down only on unmap / permission-restrict.)
+        //
+        // **This argument was re-checked on 2026-08-24 and stands**, which is worth saying
+        // because an intermittent `#DF` is open (`TODO(unexplained-df)`) and the 2026-05-29
+        // log pointed at this area. The "freshly allocated" premise is load-bearing and holds:
+        // `kvmap`'s allocator is a bump pointer that **never reclaims VA**, so no CPU can hold
+        // a cached translation — stale or otherwise — for a VA being mapped here. A first
+        // draft of the deferral asserted the opposite and was wrong.
 
         // Paint the fresh stack so its high-water mark is measurable later (see
         // `watermark`). Instrumentation only — a production stack is left as the buddy

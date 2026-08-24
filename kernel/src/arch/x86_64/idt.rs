@@ -730,6 +730,10 @@ fn vector_name(vector: u64) -> &'static str {
         5 => "#BR bound range exceeded",
         6 => "#UD invalid opcode",
         7 => "#NM device not available",
+        // `TODO(unexplained-df)` — an intermittent `#DF` is open, at ~14 % of local **TCG**
+        // boots and unseen in 83 CI boots (all `--kvm`). Kernel `rip`, a *user* `rsp`, stack
+        // "not scannable". Cause unestablished; see `deferred-decisions.md` for what has been
+        // ruled out.
         8 => "#DF double fault",
         10 => "#TS invalid TSS",
         11 => "#NP segment not present",

@@ -143,8 +143,8 @@ the test image with the device absent — that is what `check-terminal` does —
 not boot the **release** image, which is its whole justification.
 
 That justification survives the retrofit, and the measurement is `cargo xtask check-images`: of
-the initramfs's eight entries, five are byte-identical between the two images, and the three
-that differ are two declaration files and `sbin/init`. The kernel differs too (`test-harness`),
+the initramfs's seven files, four are byte-identical between the two images, and the three that
+differ are two declaration files and `sbin/init`. The kernel differs too (`test-harness`),
 and the store carries a package a release image does not. The gates also assert different
 things: `test-qemu` adjudicates the substrate, `test-interactive` drives the path a person
 takes.

@@ -314,8 +314,9 @@ ordering box below real rather than theoretical.
       device is absent, so a release `init` degrades rather than diverging).
 
 - [ ] **`init` compiles identically in both images** — not yet, and the same single thing
-      blocks it. 41 cfg sites became **1**; the ELFs differ by 4,096 bytes. This box and the one
-      above are the same box, and both wait on a bind-mount concept in `init.toml`.
+      blocks it. 41 cfg sites became **1**; the two `sbin/init` ELFs are 79,872 and 83,976 bytes.
+      This box and the one above are the same box, and both wait on a bind-mount concept in
+      `init.toml`.
 
 - [x] **Two mechanisms the plan had written off** ✅. `after` and `syscaps` are parsed now.
       Part A dropped `syscaps` as unnecessary — true of `boot-probe`, false of the milestone:
@@ -326,10 +327,13 @@ ordering box below real rather than theoretical.
 
 ## Part D — the gate set, reconciled ✅ complete (2026-08-24)
 
-**The measurement the decisions rest on.** Of the initramfs's **8** entries, **5 are
+**The measurement the decisions rest on.** Of the initramfs's **7** files, **4 are
 byte-identical** between a test image and a release image. The three that differ are
 `etc/services.toml` and `etc/profiles/system.toml` — data — and `sbin/init`, the one remaining
 `#[cfg(feature = "selftest")]`. The *set of files* is identical in both.
+
+(Seven, not eight: `TRAILER!!!` is the CPIO end-of-archive sentinel, and counting it inflated
+this by one everywhere it appeared — PR #230 review, finding 6.)
 
 - [x] **They remain two gates, and the difference is stateable** ✅.
 
@@ -371,9 +375,20 @@ byte-identical** between a test image and a release image. The three that differ
 
 - [x] **`cargo xtask check-images`, so the result is a wall and not a number** ✅. It builds both
       initramfs archives and compares them entry by entry, failing on any divergence not on a
-      short allow-list. Add a `#[cfg(feature = "test-harness")]` to `eshell` and its ELF starts
-      differing, with nothing else in CI to notice — confirmed by doing it. Runs in the QEMU job,
-      which already builds both images.
+      short allow-list. Runs in the QEMU job, which already builds both images.
+
+      **What it catches**, stated precisely because the first version of this box overstated it
+      (PR #230 review, finding 1): wiring `mode.features()` into a build that does not take one —
+      the shape Part B removed from `session-mgr` — makes that program's ELF differ here. A bare
+      `#[cfg(feature = "test-harness")]` does **not**, because `eshell`, `fs-server-ext4` and
+      `profile-server` declare no features, so it is inert in both modes. The invariant is "no
+      build-mode-varying input reaches these programs", which is the one worth having: a cfg
+      nothing can turn on is not a divergence.
+
+      The probe that *did* fire carried three changes — the cfg, a `[features]` section, and the
+      build wiring — and the result was credited to one of them. Running a compound probe and
+      attributing it to a component is the same error as an assertion with no negative control,
+      one level up.
 
 ## What "done" means
 
@@ -386,8 +401,8 @@ open above rather than reworded.
 - ✅ `test-qemu`, `test-interactive`, `check-display`, `check-terminal`, `check-input`,
   `check-input --no-ps2-irq` and `check-images` all pass, and the boot verdict is written by one
   program — `boot-probe`, which did not exist when this plan was written.
-- ⚠️ The two images build the same `session-mgr` and **not** the same `init`. Five of eight
-  initramfs entries are byte-identical; of the three that differ, two are data.
+- ⚠️ The two images build the same `session-mgr` and **not** the same `init`. Four of the
+  initramfs's seven files are byte-identical; of the three that differ, two are data.
 
 **And a thing worth recording that was not a criterion.** Three separate times, moving a program
 out of a supervisor silently moved its *verdict* nowhere — the demo chain, the display self-test,

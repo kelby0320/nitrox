@@ -3785,7 +3785,7 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// The initramfs entries a **test** image is allowed to differ from a **release** image in.
+/// The initramfs files a **test** image is allowed to differ from a **release** image in.
 ///
 /// Two are data — the extra service declarations, and the profile manifest that lists the
 /// test-harness store package. One is code: `sbin/init`, for the single `#[cfg(feature =
@@ -3800,14 +3800,30 @@ const IMAGE_DIVERGENCE_ALLOWED: &[&str] =
 /// `cargo xtask check-images` — a test image may differ from a release image only in **data**,
 /// plus the one code difference still on the books.
 ///
-/// Builds both initramfs archives and compares them entry by entry. A new divergence fails,
-/// which is what makes the retrofit's result a wall rather than a measurement: add a
-/// `#[cfg(feature = "test-harness")]` to `eshell`, `fs-server-ext4` or `profile-server` and its
-/// ELF starts differing here, with nothing else to notice.
+/// Builds both initramfs archives and compares them file by file. A new divergence fails,
+/// which is what makes the retrofit's result a wall rather than a measurement.
 ///
-/// It is deliberately a check on the **set** of differing entries rather than on a byte count:
+/// **What it actually catches**, stated precisely because the first version of this comment
+/// overstated it (PR #230 review, finding 1): wiring `mode.features()` into a build that does
+/// not take one — the shape Part B removed from `session-mgr` — makes that program's ELF differ
+/// here. A bare `#[cfg(feature = "test-harness")]` does **not**, because `eshell`,
+/// `fs-server-ext4` and `profile-server` declare no features, so the cfg is inert in both modes.
+/// The invariant is therefore "no build-mode-varying input reaches these programs", which is the
+/// useful one — a cfg that nothing can turn on is not a divergence.
+///
+/// A consequence worth knowing: most of the byte-identity is cargo not rebuilding a crate whose
+/// feature set did not change. That is the invariant holding, not an independent measurement of
+/// it.
+///
+/// It is deliberately a check on the **set** of differing files rather than on a byte count:
 /// the allowed three change size whenever a declaration is added, and pinning sizes would make
 /// this fail for the right reason at the wrong time.
+///
+/// **It is one-directional.** A file that *stops* differing — `sbin/init`, when the
+/// `/subtreetest` binding finally becomes manifest data — leaves the allow-list stale with
+/// nothing to say so. That is the harmless direction, and tightening it would mean failing a
+/// build for getting *better*; the cost is that the list needs pruning by hand when a box in
+/// `test-path-retrofit.md` closes.
 fn cmd_check_images() -> R<()> {
     let dir = build_cache().join("check-images");
     fs::create_dir_all(&dir)?;
@@ -3851,7 +3867,7 @@ fn cmd_check_images() -> R<()> {
         .into());
     }
     println!(
-        "check-images: {} initramfs entries, {} byte-identical between a test and a release \
+        "check-images: {} initramfs files, {} byte-identical between a test and a release \
          image; {:?} differ, all allowed ✓",
         r.len(),
         r.len() - differ.len(),
@@ -3861,6 +3877,10 @@ fn cmd_check_images() -> R<()> {
 }
 
 /// Parse a CPIO `newc` archive into `name -> contents`. Mirrors `cpio_entry`'s writer.
+///
+/// **`TRAILER!!!` is skipped.** It is the zero-byte end-of-archive sentinel, not a file, and
+/// counting it inflated every number this gate prints by one — "8 entries, 5 byte-identical"
+/// for what is 7 files and 4 (PR #230 review, finding 6).
 fn cpio_entries(blob: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut i = 0usize;
@@ -3874,7 +3894,9 @@ fn cpio_entries(blob: &[u8]) -> BTreeMap<String, Vec<u8>> {
         let name = String::from_utf8_lossy(&blob[i + 110..i + 110 + ns.saturating_sub(1)]).into_owned();
         i = (i + 110 + ns).div_ceil(4) * 4;
         let end = (i + fs).min(blob.len());
-        out.insert(name, blob[i..end].to_vec());
+        if name != "TRAILER!!!" {
+            out.insert(name, blob[i..end].to_vec());
+        }
         i = (i + fs).div_ceil(4) * 4;
     }
     out
