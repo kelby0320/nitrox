@@ -954,15 +954,23 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "  vector  {:#04x}  {}", f.vector, vector_name(f.vector));
     let _ = writeln!(w, "  error   {:#018x}", f.error_code);
     if f.vector == 14 || f.vector == 8 {
-        // #PF: CR2 holds the faulting linear address.
-        //
-        // **#DF too, and there it is the most useful field in the dump.** A double fault is
-        // usually a fault taken while delivering another one, so CR2 still holds the address
-        // the *first* fault could not translate — while the pushed `rip` is architecturally
-        // **undefined** for #DF and must not be read as the faulting instruction. Chasing
-        // `TODO(unexplained-df)` cost time to a `rip` that looked meaningful, was identical
-        // across rebuilds, and decoded to a different symbol in each.
+        // #PF: CR2 holds the faulting linear address. **#DF too** — a double fault is usually
+        // a fault taken while delivering another, so CR2 still holds the address the *first*
+        // one could not translate, and the pushed `rip` is architecturally undefined for #DF.
         let _ = writeln!(w, "  cr2     {:#018x}", regs::read_cr2());
+    }
+    if f.vector == 8 {
+        // **`LSTAR`, so the dump decodes itself.** The `syscall` stub is where a `#DF` with a
+        // kernel `cs` and a *user* `rsp` comes from: two short windows where ring 0 runs on
+        // the user stack, one at entry before `mov rsp, gs:[…]` and one at exit around
+        // `pop rsp` / `sysretq`. `rip - lstar` says immediately whether the fault was inside
+        // the stub and which end — and the address is otherwise unrecoverable, because every
+        // rebuild moves it and the failing kernel is long gone by the time anyone reads the
+        // transcript. Chasing `TODO(unexplained-df)` cost a full pass for want of this line:
+        // the `rip` was dismissed as meaningless when it in fact decoded to `sysretq`.
+        // SAFETY: `IA32_LSTAR` is architectural in long mode and this reads it in ring 0.
+        let lstar = unsafe { regs::rdmsr(0xC000_0082) };
+        let _ = writeln!(w, "  lstar   {:#018x}  (rip - lstar = offset into syscall_entry)", lstar);
     }
     let _ = writeln!(w, "  rip {:#018x}  cs {:#06x}", f.rip, f.cs);
     let _ = writeln!(w, "  rsp {:#018x}  ss {:#06x}", f.rsp, f.ss);

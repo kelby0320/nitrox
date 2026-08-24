@@ -563,18 +563,43 @@ for the mechanism *and* for the fix, and it took two runs instead of dozens.
 and describes the same `#PF`-then-`#DF` chain. The hazard was understood on entry — where SFMASK
 masks `IF` and IST2 covers NMI — and missed on exit, where neither applied.
 
-**It did not fix the observed fault**, which is the part worth carrying forward. After the `cli`:
-**1 failure in 20** `check-terminal` runs plus 14 clean `test-qemu` runs, against **2 in 14**
-before. Lower, not distinguishable from it on this sample, and certainly not zero — so at least
-one more ring-0-with-user-stack window exists.
+**Whether it fully fixed the fault is still open, and the numbers are why.** After the `cli`:
+**1 failure in 49 boots (~2 %)**, against **2 in 14 (~14 %)** before — a ~7× reduction, and the
+one post-fix failure has not recurred in the 45 boots since. Fisher's exact on 2/14 vs 1/49 gives
+p ≈ 0.09: suggestive, not conclusive, and *not* a demonstration that the fault is gone.
 
-**A methodological correction, because it cost time.** The `#DF` dump's `rip` was read as the
-faulting instruction. It is not: for `#DF` the pushed instruction pointer is architecturally
-**undefined**, and the value here — `0xffffffff8001e000` — is identical across rebuilds and
-decodes to a different symbol in each, which should have been the tell. `CR2` is the field that
-survives: it still holds the address the *first* fault could not translate. The dump now prints
-it for vector 8 as well as 14, so the next occurrence carries real evidence. None was captured in
-34 post-fix boots.
+The single post-fix failure cannot be decoded retroactively — its build's `LSTAR` was not
+recorded, which is exactly the gap the dump now closes. If it was `syscall_entry + 0x5C` in that
+build's layout it lands on `pop rsp` (one byte later, with the `cli` in front), which interrupts
+cannot reach; if the base had shifted it is something else entirely. The next occurrence will say.
+
+**A methodological correction, and then a correction to the correction.** The `rip` was first
+read as the faulting instruction, then dismissed — for `#DF` the pushed instruction pointer is
+architecturally **undefined**, and this one was identical across rebuilds while decoding to a
+different symbol in each, which looked like the tell.
+
+**Dismissing it was the bigger mistake.** QEMU pushed a meaningful `rip` here; the reason it
+"decoded to a different symbol" is that it was being compared against the *wrong build's* symbol
+table. Read against the failing build's `IA32_LSTAR` — `0xffffffff8001dfa4` — the value
+`0xffffffff8001e000` is `syscall_entry + 0x5C`, which in that layout is exactly the `sysretq`
+instruction. The clue had been pointing at the answer the whole time.
+
+So the dump now prints **`LSTAR` alongside `CR2` for vector 8**, and `rip - lstar` decodes itself.
+The address is otherwise unrecoverable: every rebuild moves it, and the failing kernel is gone by
+the time anyone reads the transcript. `CR2` is still worth having — it holds the address the
+first fault could not translate — but for this fault the offset is the field that talks.
+
+**Hypotheses closed with evidence, so they are not re-run.** *SFMASK not masking `IF` on some
+CPU* — a runtime probe on every ring-3 descent read `sfmask = 0x40600` (IF | DF | AC): armed
+correctly, and armed on APs as well as the BSP. *`enter_user`* — builds its `iretq` frame on the
+kernel stack and never loads a user `RSP` in ring 0. *The kstack install path* — ruled out above.
+
+**A dead end worth not repeating: raising the timer rate is not an accelerator.** At 20× (`TICK_NS`
+500 µs) five runs were clean; at 100× (100 µs) three of six failed — but with *different*
+signatures each time, a `#PF` with `cr2 = 0x10` and a `vector 0x46` with `rsp = 0`, neither
+matching the fault being hunted. It manufactures its own faults rather than accelerating the one
+you want, and "the probe increased failures" is not the same as "the probe increased failures of
+the kind I am hunting".
 
 **What is left to look at**, since the obvious candidate is out. The `#DF` shape — kernel `rip`,
 user `rsp` — says the CPU could not deliver an exception, which points at the entry path or the

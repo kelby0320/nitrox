@@ -17421,19 +17421,39 @@ deterministic `#DF` on the next boot; the same widened window with the `cli` in 
 Two runs, and it establishes the mechanism *and* the fix — against dozens of runs to move a rate
 estimate. For any race with a nameable window, this is cheaper and more conclusive than sampling.
 
-**A correction to how I read the evidence.** I built a hypothesis on the dump's `rip`, which was
-identical across two runs and looked like a hard clue. For `#DF` the pushed instruction pointer is
-architecturally **undefined**, and the tell was there to see: the same value across rebuilds,
-decoding to a different symbol in each. `CR2` is the field that survives a double fault — it still
-holds the address the *first* fault could not translate — and the dump now prints it for vector 8
-as well as 14. It is the field the next occurrence should be read from.
+**A correction, and then a correction to the correction — the second one is the lesson.** I built
+a hypothesis on the dump's `rip`, then dismissed it: for `#DF` the pushed instruction pointer is
+architecturally undefined, and this one was identical across rebuilds while decoding to a
+different symbol in each.
 
-**It did not fix the observed fault, and that is the headline.** After the `cli`: 1 failure in 20
-`check-terminal` runs plus 14 clean `test-qemu` runs, against 2 in 14 before. Lower, not
-statistically distinguishable on this sample, and not zero — so at least one more
-ring-0-with-user-stack window exists. `TODO(unexplained-df)` stays open with the new evidence
-attached; no `CR2` was captured in 34 post-fix boots, so the next occurrence is the thing to wait
-for.
+**Dismissing it was the bigger mistake.** QEMU pushed a meaningful `rip`; it "decoded to a
+different symbol" because it was being compared against the *wrong build's* symbol table. Read
+against the failing build's `IA32_LSTAR` (`0xffffffff8001dfa4`), `0xffffffff8001e000` is
+`syscall_entry + 0x5C` — in that layout, exactly the `sysretq` instruction. The clue had been
+pointing at the answer from the first dump, and I talked myself out of it with a true-but-
+inapplicable architectural fact.
+
+So the dump now prints **`LSTAR` beside `CR2` for vector 8**, and `rip - lstar` decodes itself.
+That address is otherwise unrecoverable — every rebuild moves it and the failing kernel is gone by
+the time anyone reads the transcript.
+
+**Whether it fully closed the fault is still open.** After the `cli`: **1 failure in 49 boots**
+(~2 %) against **2 in 14** (~14 %) before — a ~7× reduction, with the single post-fix failure not
+recurring in the 45 boots since. Fisher's exact gives p ≈ 0.09: suggestive, not proof. That one
+failure cannot be decoded retroactively because its build's `LSTAR` was not recorded, which is the
+gap the dump now closes.
+
+**Hypotheses closed with evidence rather than left hanging:** SFMASK is armed correctly on every
+CPU (`0x40600` = IF | DF | AC, read by a probe on every ring-3 descent — and the probe was itself
+validated by breaking SFMASK deliberately and watching it fire); `enter_user` builds its `iretq`
+frame on the kernel stack and never loads a user `RSP` in ring 0; the kstack install path was
+ruled out earlier.
+
+**And a dead end recorded so it is not repeated:** raising the timer rate is not an accelerator
+for this. At 100× (`TICK_NS` 100 µs) three of six runs failed — but with a `#PF` at `cr2 = 0x10`
+and a `vector 0x46` with `rsp = 0`, neither matching the fault being hunted. It manufactures its
+own faults. "The probe increased failures" is not "the probe increased failures of the kind I am
+hunting", and I nearly drew a conclusion from it.
 
 Landing the `cli` on its own merits: the window is real, the positive control demonstrates it is
 exploitable, and the fix costs one instruction on the syscall return path.
