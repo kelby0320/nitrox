@@ -953,8 +953,15 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "\n*** CPU EXCEPTION ***");
     let _ = writeln!(w, "  vector  {:#04x}  {}", f.vector, vector_name(f.vector));
     let _ = writeln!(w, "  error   {:#018x}", f.error_code);
-    if f.vector == 14 {
+    if f.vector == 14 || f.vector == 8 {
         // #PF: CR2 holds the faulting linear address.
+        //
+        // **#DF too, and there it is the most useful field in the dump.** A double fault is
+        // usually a fault taken while delivering another one, so CR2 still holds the address
+        // the *first* fault could not translate — while the pushed `rip` is architecturally
+        // **undefined** for #DF and must not be read as the faulting instruction. Chasing
+        // `TODO(unexplained-df)` cost time to a `rip` that looked meaningful, was identical
+        // across rebuilds, and decoded to a different symbol in each.
         let _ = writeln!(w, "  cr2     {:#018x}", regs::read_cr2());
     }
     let _ = writeln!(w, "  rip {:#018x}  cs {:#06x}", f.rip, f.cs);

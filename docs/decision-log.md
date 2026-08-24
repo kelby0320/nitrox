@@ -17389,3 +17389,51 @@ Two corrections to my own reading on the way: an initial 8 clean runs suggested 
 decayed far below the log's 15 %, and two later failures said otherwise — the smaller sample was
 the wrong one to believe. And it is not caused by the retrofit; the plan changed which process
 runs these tests, not the kernel.
+
+## 2026-08-24 — The `sysretq` exit window: a real bug found, and the fault it did not fix
+
+Chasing `TODO(unexplained-df)`. One genuine gap found and closed, one method worth keeping, one
+correction to how I was reading the evidence — and the fault itself is still open.
+
+**The gap.** The syscall exit stub restored the user `RSP` two instructions before leaving ring 0:
+
+```
+pop rax        // return value
+pop rsp        // user stack loaded — CS is still kernel
+sysretq
+```
+
+The syscall body runs with `IF` set (a blocked syscall resumes that way) and nothing re-masked it,
+so an interrupt could arrive in that window. At CPL 0 there is no privilege change, so the CPU
+pushes its frame onto the **user** stack; under SMAP that push faults, and delivering the fault on
+the same stack is a `#DF`. A `cli` before `pop rsp` closes it — `sysretq` restores the user's
+`IF` from R11 on the way out.
+
+**The entry side already carried this exact reasoning.** `idt.rs` puts NMI on IST2 because
+"`syscall_entry` has a two-instruction window after `swapgs` where RSP is still the *user* stack",
+and spells out the `#PF`-then-`#DF` chain. On entry, SFMASK masks `IF` and IST2 covers NMI. On
+exit neither applied, and nobody had asked the question in that direction. A hazard understood
+once is not a hazard understood everywhere it occurs.
+
+**The method is the reusable part: widen the window instead of waiting for the flake.** 256
+`pause` instructions between `pop rsp` and `sysretq` turn a ~14 % intermittent into a
+deterministic `#DF` on the next boot; the same widened window with the `cli` in front boots clean.
+Two runs, and it establishes the mechanism *and* the fix — against dozens of runs to move a rate
+estimate. For any race with a nameable window, this is cheaper and more conclusive than sampling.
+
+**A correction to how I read the evidence.** I built a hypothesis on the dump's `rip`, which was
+identical across two runs and looked like a hard clue. For `#DF` the pushed instruction pointer is
+architecturally **undefined**, and the tell was there to see: the same value across rebuilds,
+decoding to a different symbol in each. `CR2` is the field that survives a double fault — it still
+holds the address the *first* fault could not translate — and the dump now prints it for vector 8
+as well as 14. It is the field the next occurrence should be read from.
+
+**It did not fix the observed fault, and that is the headline.** After the `cli`: 1 failure in 20
+`check-terminal` runs plus 14 clean `test-qemu` runs, against 2 in 14 before. Lower, not
+statistically distinguishable on this sample, and not zero — so at least one more
+ring-0-with-user-stack window exists. `TODO(unexplained-df)` stays open with the new evidence
+attached; no `CR2` was captured in 34 post-fix boots, so the next occurrence is the thing to wait
+for.
+
+Landing the `cli` on its own merits: the window is real, the positive control demonstrates it is
+exploitable, and the fix costs one instruction on the syscall return path.

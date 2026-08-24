@@ -309,6 +309,24 @@ extern "C" fn syscall_entry() -> ! {
         "pop rdi",
         "pop rcx",                  // user RIP for sysretq
         "pop rax",                  // return value
+        // **Mask interrupts before the user stack is loaded**, and leave them masked until
+        // `sysretq` restores the user's RFLAGS (with IF) from R11.
+        //
+        // Between `pop rsp` and `sysretq` the CPU is in ring 0 with the *user* stack. An
+        // interrupt arriving there takes no privilege change, so it pushes its frame onto
+        // that stack; under SMAP the push faults, and delivering the fault on the same stack
+        // is a `#DF`. The syscall body runs with IF set — a blocked syscall resumes that way —
+        // and nothing re-masked it, so the window was live.
+        //
+        // The **entry** side already carried this reasoning: `idt.rs` puts NMI on IST2 because
+        // "`syscall_entry` has a two-instruction window after `swapgs` where RSP is still the
+        // *user* stack". There, SFMASK masks IF and IST2 covers NMI. Here neither applied.
+        //
+        // Proven by widening rather than by waiting: 256 `pause`s in this window make the
+        // `#DF` deterministic on the next boot, and the same widened window with this `cli`
+        // boots clean. **It does not close `TODO(unexplained-df)`** — that fault still occurs
+        // at a lower rate, so another such window exists.
+        "cli",
         "pop rsp",                  // restore user RSP
         // Every GPR has now been restored to the user's own saved value
         // (the pops above), except RAX (return value), RCX (user RIP), and

@@ -547,6 +547,35 @@ two more failures said otherwise, and the smaller sample was the wrong one to be
 kernel — but the retrofit is why it is being seen: more of the gate set now boots the same image
 through the same paths, so a 15 % fault has more chances to show.
 
+**One window found and closed, and it was not enough.** The `sysretq` exit stub restored the
+user `RSP` (`pop rsp`) two instructions before leaving ring 0, with **interrupts enabled** — the
+syscall body runs with `IF` set, and nothing re-masked it. An interrupt arriving there takes no
+privilege change, so the CPU pushes its frame onto the *user* stack; under SMAP that push faults,
+and delivering that fault on the same stack is a `#DF`. A `cli` before `pop rsp` closes it.
+
+**Proven by widening the window rather than waiting for the flake**: 256 `pause` instructions
+between `pop rsp` and `sysretq` turn a ~14 % intermittent into a deterministic `#DF` on the next
+boot; the same widened window with `cli` in front of it boots clean. That is a positive control
+for the mechanism *and* for the fix, and it took two runs instead of dozens.
+
+**The entry side already knew about this shape.** `idt.rs` puts NMI on IST2 because
+"`syscall_entry` has a two-instruction window after `swapgs` where RSP is still the *user* stack",
+and describes the same `#PF`-then-`#DF` chain. The hazard was understood on entry — where SFMASK
+masks `IF` and IST2 covers NMI — and missed on exit, where neither applied.
+
+**It did not fix the observed fault**, which is the part worth carrying forward. After the `cli`:
+**1 failure in 20** `check-terminal` runs plus 14 clean `test-qemu` runs, against **2 in 14**
+before. Lower, not distinguishable from it on this sample, and certainly not zero — so at least
+one more ring-0-with-user-stack window exists.
+
+**A methodological correction, because it cost time.** The `#DF` dump's `rip` was read as the
+faulting instruction. It is not: for `#DF` the pushed instruction pointer is architecturally
+**undefined**, and the value here — `0xffffffff8001e000` — is identical across rebuilds and
+decodes to a different symbol in each, which should have been the tell. `CR2` is the field that
+survives: it still holds the address the *first* fault could not translate. The dump now prints
+it for vector 8 as well as 14, so the next occurrence carries real evidence. None was captured in
+34 post-fix boots.
+
 **What is left to look at**, since the obvious candidate is out. The `#DF` shape — kernel `rip`,
 user `rsp` — says the CPU could not deliver an exception, which points at the entry path or the
 stack it switches to rather than at the stack's *mapping*: `RSP0`/IST loading, the per-CPU TSS, or
