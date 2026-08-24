@@ -5,7 +5,7 @@
 complete, 2026-07-21). Every stage below is exercised on each CI run by
 `cargo xtask test-qemu` (headless, adjudicated by `isa-debug-exit`) and
 `cargo xtask test-interactive` (expect-driven over the serial console).
-Verified against source 2026-08-21, when the filesystem checks moved out of `init` (the display arm's position in § 5 changed that day).
+Verified against source 2026-08-24, when the demo chain and the graphical clients became service declarations and §5 was rewritten (the display arm's position in § 5 changed that day).
 
 ## Overview
 
@@ -185,8 +185,8 @@ than an implementation detail.
    first only because they were initramfs-resident.
 5. **Hand off** to `service-mgr` and stay resident as supervisor.
 
-**`init` runs the same code in both images**, bar one namespace binding (retrofit Part C,
-2026-08-21). The demo chain, the display self-test, `nxterm` and the two graphical test
+**`init` runs the same code in both images**, bar one namespace binding (retrofit Part C1
+2026-08-21, Part C2 2026-08-24). The demo chain, the display self-test, `nxterm` and the two graphical test
 clients used to be spawned here under `selftest`; they are **service declarations** now,
 started by `service-mgr` from `/initramfs/etc/services.toml`, which carries them only in a
 test image. Their order is the file's order, and `after` holds `boot-probe` until the demo

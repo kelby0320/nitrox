@@ -1274,12 +1274,19 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                 // orphans have no handle here — the kernel tears them down; init observes.
                 //
                 // **This does not compare `cpid`, and init has more than one child.**
-                // `KIND_CHILD_EXITED` names a child by pid, and nothing maps a process
-                // handle to a pid — so whichever child exits first is taken for the primary.
-                // Latent rather than live, because the primary is the only child expected to
-                // exit; `service-mgr` hit the live version of this the moment it held two
-                // services. See `TODO(child-exit-attribution)`, whose trigger is the retrofit
-                // Part C that opens this file anyway.
+                // `KIND_CHILD_EXITED` names a child by pid, and nothing maps a process handle
+                // to a pid — so whichever child exits first is taken for the primary, and
+                // `service-mgr` gets respawned beside a live one.
+                //
+                // **Newly reachable, and still latent.** Under `selftest` this loop used to
+                // run with `parent_h = 0`, so the branch below could not fire at all; retrofit
+                // Part C2 made `supervise` unconditional, so a test image now runs it with
+                // `parent_h = service_mgr_h`. init's remaining children — the servers it
+                // binds — are not expected to exit, which is the only thing keeping this
+                // quiet. The graphical clients and the demo chain are `service-mgr`'s children
+                // now, not init's. See `TODO(child-exit-attribution)`; the trigger named
+                // "retrofit Part C" has arrived and the fix has not, because it needs a
+                // mechanism (a pid for a handle) rather than an edit here.
                 if parent_h != 0 {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };

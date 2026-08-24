@@ -2749,6 +2749,8 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             let transcript = captured.lock().map(|g| g.clone()).unwrap_or_default();
             check_login_chain(&transcript)?;
             check_demo_chain(&transcript)?;
+            check_display_selftest(&transcript)?;
+            check_every_service_started(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -2757,6 +2759,58 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
+}
+
+/// Assert that the display self-test **passed**.
+///
+/// **The same hole `check_demo_chain` closes, one declaration over.** `init` adjudicated this
+/// exit code and fired `test_exit(false)` on it; retrofit Part C2 made the self-test a
+/// declaration with `policy = "never"`, so `service-mgr` logs the code and does nothing with
+/// it, and `display-selftest` never calls `SYS_TEST_EXIT` itself. Forcing its hash comparison
+/// to fail produces `display-selftest: FAILED`, `exited code=1`, and `integration tests
+/// PASSED` (PR #229 review, finding 1).
+///
+/// Exit code **2** is the one the deleted comment singled out: it means the framebuffer
+/// binding was missing, and folding that into success "is how the entire display arm could go
+/// missing with `test-qemu` still green, which is exactly what an earlier version of this code
+/// did". Requiring the `PASSED` line rejects 1 and 2 alike, and rejects the self-test not
+/// running at all.
+///
+/// `check-display` is not a substitute: it is a separate, path-filtered workflow, and it does
+/// not read this exit code.
+fn check_display_selftest(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if !text.contains("display-selftest: PASSED") {
+        return Err("the display self-test did not pass — expected \
+             \"display-selftest: PASSED\" in the transcript. \"FAILED\" is a hash \
+             mismatch; no line at all (exit code 2) means it could not bind the framebuffer, \
+             which is the display arm going missing rather than a rendering bug."
+            .into());
+    }
+    println!("xtask: the display self-test passed ✓");
+    Ok(())
+}
+
+/// Assert that **every declared service actually started**.
+///
+/// `init` used to fire `test_exit(false)` when a spawn failed; `spawn_service` logs and carries
+/// on, so a `ui-testclient` that never starts reaches PASS. This is deliberately a check on the
+/// *failure* lines rather than a list of expected services: a new declaration is covered the
+/// day it is added, and there is nothing to keep in step (PR #229 review, finding 1).
+fn check_every_service_started(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    for pat in ["service-mgr: image not found", "service-mgr: spawn FAIL"] {
+        if let Some(i) = text.find(pat) {
+            let line: String = text[i..].lines().next().unwrap_or(pat).into();
+            return Err(format!(
+                "a declared service failed to start, and nothing in the guest fails the run \
+                 for it: {line:?}"
+            )
+            .into());
+        }
+    }
+    println!("xtask: every declared service started ✓");
+    Ok(())
 }
 
 /// Assert that the demo chain **finished**, not merely that it ran.

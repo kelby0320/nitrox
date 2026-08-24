@@ -51,8 +51,7 @@ a particular keystroke. See the decision log, 2026-08-13.
 |---|---|---|
 | Every substrate check passes | PASS (`0x10` → exit **33**) | **`boot-probe`**: `sched_gate`, `fp_gate`, and the four filesystem checks + `subtree_bind_test` |
 | Any one of them fails | FAIL (`0x11` → exit **35**) | `boot-probe`, same call |
-| A demo child crashes | FAIL | `init`, on the non-zero reap code |
-| Spawn / critical-path boot failure | FAIL | `init` (`supervise` spawn-fail; `emergency`) |
+| A critical-path boot failure | FAIL | `init` (`emergency`) |
 | Kernel `panic!` | FAIL | the kernel panic handler (`main.rs`) |
 | Kernel triple-fault | (nonzero) | QEMU itself, via `-no-reboot` |
 | Hang (no verdict) | timeout → FAIL | the runner's wall-clock timeout |
@@ -61,11 +60,16 @@ a particular keystroke. See the decision log, 2026-08-13.
 `session-mgr`, after its auto-login proved. The row above said `init` fired it, which had not
 been true for longer than that — `init` has no `test_exit(true)` call and only ever fires FAIL.
 
-**The ordering is `init::supervise`'s, and it is what makes the gates mean anything.** The demo
-chain runs synchronously and a non-zero exit fails the run there; only then is the login chain
-handed off, and only then does `service-mgr` start `boot-probe`. So the gates run last, which is
-the property `fp_gate` needs — it completed in 2 of 15 KVM runs when it lived in the demo
-`parent`, because whoever owns the verdict races the demo chain.
+**The ordering is the declarations file's**, since retrofit Part C2 (2026-08-24). `boot-probe`
+declares `after = ["test-harness"]`, so `service-mgr` does not start it until the demo chain has
+exited; everything else is started in file order. That is the property `fp_gate` needs — it
+completed in 2 of 15 KVM runs when it lived in the demo `parent`, because whoever owns the
+verdict races the demo chain. `init::supervise` enforced it by running the chain synchronously
+until C2; it does not any more, and it no longer reads the chain's exit code either.
+
+**Which is why more of the adjudication is on the host now.** A one-shot declared with
+`policy = "never"` has its exit code logged and read by nobody, so anything that used to be "init
+saw a non-zero exit" is a transcript check below.
 
 The runner treats exit **33** as the only pass; everything else (35, 124 timeout,
 triple-fault, signal) is a failure. `isa-debug-exit` can never produce exit `0`
@@ -77,15 +81,23 @@ A verdict is one bit, and some defects do not reach it. `test-qemu` therefore al
 against the **captured serial transcript** after a PASS, and a transcript check failing fails
 the run.
 
-`test-qemu` has one: **`check_login_chain`**, requiring
+`test-qemu` has four. **`check_login_chain`** requires
 `session-mgr: received fs + profile endpoints + auth channel`. It replaces a `verdict(false)`
 `session-mgr` used to fire when its endpoint handoff failed — a session supervisor adjudicating
 a test run — and without it a broken login chain reaches PASS, because nothing else in
 `test-qemu` reads it. It asserts the chain came *up*, not that anyone logged in: nothing types
 a password here.
 
-**`check-terminal` has the other: `check_service_attribution`**, and *why it is there* is the
-useful part. `service-mgr` supervises two children in a test image, and a supervisor that mixes
+**`check_demo_chain`** requires `test-harness: all smoke tests passed`, **`check_display_selftest`**
+requires `display-selftest: PASSED`, and **`check_every_service_started`** forbids
+`service-mgr: image not found` and `service-mgr: spawn FAIL`. All three replace adjudication
+`init` used to do by reading an exit code, and all three were added because the run passed
+without them: the demo chain stopped at `session user bind FAIL` with half the spawns missing, a
+forced display-selftest failure printed `FAILED` and `exited code=1`, and a service pointed at a
+nonexistent path simply never started.
+
+**`check-terminal` has one of its own: `check_service_attribution`**, and *why it is there* is
+the useful part. `service-mgr` supervises seven children in a test image, and a supervisor that mixes
 their exits up restarts a service that never stopped — while every child still exits 0 and the
 guest still reports PASS. It was run that way deliberately to confirm it. But once `boot-probe`
 became the verdict-writer, its last act terminates the machine, so under `test-qemu` nothing

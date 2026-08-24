@@ -58,7 +58,9 @@ Convention: store paths via the system profile (`/bin/network-manager` or direct
 
 ### `syscaps` (optional, array of strings; default `[]`)
 
-**Parsed and granted since 2026-08-21.** System capabilities granted to the service. Must be a subset of capabilities the service manager itself holds — the kernel rejects spawn requests that try to amplify, so a declaration asking for more fails the spawn rather than being granted it.
+**Parsed and requested since 2026-08-24.** System capabilities to grant the service. Must be a subset of what the service manager itself holds.
+
+**The kernel enforces that by attenuation, not by refusal**, and the difference matters when writing a declaration: `sys_process_spawn` computes `child = parent & requested`, so asking for more than the supervisor holds spawns the service successfully with the extra capabilities silently absent. Nothing reports the difference — not the kernel, and not the service manager, which has no way to read its own capability set. A service that needs a capability its supervisor lacks therefore fails at the point it tries to *use* it. See `TODO(spawn-syscap-attenuation)`.
 
 A name the service manager does not recognise is **reported and not granted**, rather than dropped silently: a service that starts with less authority than it declared fails somewhere else entirely, which is how this key came to be implemented — the demo chain stopped at `session user bind FAIL` when it was moved into a declaration that could not yet say `BIND_NAMESPACE`.
 
@@ -77,13 +79,15 @@ Most services should hold zero syscaps. Granting `BIND_NAMESPACE` is reserved fo
 
 ### `after` (optional, array of strings; default `[]`)
 
-**Parsed since 2026-08-21, with the narrow meaning that is implementable today.** Names of services that must have **finished** — exited — before this one is started.
+**Parsed since 2026-08-24, with the narrow meaning that is implementable today.** Names of services that must have **finished** — exited — before this one is started.
 
 For a service that exits (a one-shot), finishing *is* readiness. There is no readiness protocol for a service that keeps running, so naming one here would wait forever; the service manager bounds the wait, reports it, and starts the dependent anyway. A name matching no declaration, and a dependency that failed to spawn, are likewise reported and not fatal — refusing to start a service because of a mis-typed name would turn a typo into a silently missing service.
 
 **Ordinary start order does not need `after`.** Declarations are started in file order, so "start B after A" is written by putting A first. `after` is for the stronger claim that A has already *finished* — which is what orders the boot self-test: the substrate checks that fire the verdict must not run until the demo chain has exited.
 
-A dependency graph with topological sorting is the general answer and is not built; nothing yet needs one. Cycles are therefore not rejected at parse time — two services naming each other each wait out the bound and start.
+**`after` orders backwards only.** A dependency is matched against the services already started, so naming one declared *later* in the file does not wait for it — it is reported and the service starts. The file's order is the start order; `after` strengthens it rather than reordering it.
+
+A dependency graph with topological sorting is the general answer and is not built; nothing yet needs one. Cycles are therefore not rejected at parse time, and they do not deadlock either: of two services naming each other, the first does not wait at all (its dependency has not started) and the second waits out the bound.
 
 ### `before` (optional, array of strings; default `[]`)
 

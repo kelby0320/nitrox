@@ -412,8 +412,17 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     // mirroring init's device handoff to an fs-server.
     // **Declared authority.** Almost every service declares none; the demo chain declares
     // `BIND_NAMESPACE` because it constructs a namespace and binds `/session/user` into it.
-    // The kernel refuses amplification, so this can only ever be a subset of what service-mgr
-    // holds — a declaration asking for more fails the spawn rather than being granted.
+    //
+    // **The kernel *attenuates*, it does not refuse.** `sys_process_spawn` computes
+    // `child = parent & requested` — a silent intersection — so a declaration asking for more
+    // than service-mgr holds spawns successfully with the extra bits simply gone. An earlier
+    // version of this comment said the spawn fails; it does not, and the log line below said
+    // "granted" for bits the child never received (PR #229 review, finding 2).
+    //
+    // service-mgr cannot check the subset itself: nothing reports a process its own syscaps
+    // (`/proc/self/status` carries pid and tid only), so it cannot know what it holds without
+    // hardcoding a second copy of init's grant. Filed as `TODO(spawn-syscap-attenuation)`.
+    // Until then the honest thing is to log what was **requested** and say so.
     for u in &decl.unknown_syscaps {
         Line::new()
             .s(b"service-mgr: '")
@@ -424,11 +433,14 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
             .end();
     }
     if decl.syscaps != 0 {
+        // "requested", not "granted": the kernel intersects this with what service-mgr holds
+        // and reports nothing about what it dropped.
         Line::new()
             .s(b"service-mgr: '")
             .s(decl.name.as_bytes())
-            .s(b"' granted syscaps 0x")
+            .s(b"' requested syscaps 0x")
             .u(decl.syscaps)
+            .s(b" (the kernel grants the subset service-mgr holds)")
             .end();
     }
     let h = unsafe {
@@ -1080,24 +1092,48 @@ const AFTER_TIMEOUT_NS: u64 = 20_000_000_000; // 20 s
 /// protocol for a service that keeps running, so this waits for the control channel to close,
 /// which is the same signal [`supervise`] attributes exits with.
 ///
-/// Three things are **not** errors, and each is reported rather than fatal: a name that
-/// matches no declaration (it may simply not be in this image), a service that was declared
-/// but failed to spawn, and the timeout. In all three the dependent service still starts —
-/// refusing to start it would turn a mis-typed name into a boot that silently lacks a service.
+/// **It orders backwards only.** A dependency is matched against the services already
+/// started, so naming one declared *later* in the file cannot wait for it — the file's order
+/// is the start order, and `after` strengthens it rather than reordering it.
+///
+/// Four things are **not** errors, and each is reported rather than fatal: a name that has not
+/// started (not in this image, or declared later), a service running without a control channel
+/// and so unwaitable, a dependency that already finished, and the timeout. The dependent still
+/// starts — refusing to start it would turn a mis-typed name into a boot that silently lacks a
+/// service.
 fn await_dependencies(decl: &ServiceDecl, svcs: &[Supervised]) {
     for dep in &decl.after {
+        // **Only services already started are candidates**, so `after` orders *backwards* in
+        // file order. A name declared later in the file lands here, and the message must not
+        // say "not declared" — it is, four lines down, and `parsed service '<name>'` for it is
+        // earlier in the same transcript (PR #229 review, finding 5).
         let Some(i) = svcs.iter().position(|s| &s.decl.name == dep) else {
             Line::new()
                 .s(b"service-mgr: '")
                 .s(decl.name.as_bytes())
                 .s(b"' waits on '")
                 .s(dep.as_bytes())
-                .s(b"', which is not declared -- starting anyway")
+                .s(b"', which has not started -- declared later in the file, or not at all")
                 .end();
             continue;
         };
-        if !svcs[i].running || svcs[i].ctrl == 0 {
-            continue; // already finished, or never started — nothing to wait for
+        if !svcs[i].running {
+            continue; // already finished — nothing to wait for, and nothing to say
+        }
+        if svcs[i].ctrl == 0 {
+            // **Running, but unwaitable.** The exit signal is the control channel closing, so
+            // a service whose channel could not be created cannot be waited on — `boot-probe`
+            // would start alongside a live `test-harness`, which is the race `after` exists to
+            // prevent. Silent until 2026-08-24 (PR #229 review, finding 4); the doc above
+            // promised it was reported, and it was not.
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(dep.as_bytes())
+                .s(b"' has no control channel -- cannot wait for it; starting '")
+                .s(decl.name.as_bytes())
+                .s(b"' UNORDERED")
+                .end();
+            continue;
         }
         Line::new()
             .s(b"service-mgr: '")

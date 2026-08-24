@@ -416,8 +416,7 @@ channel's death is not a notification either.
 So a supervisor with two children learns *that* one exited and never *which*. Both supervisors
 already assume their way past it: `init`'s `reap_loop` attributes the first `ChildExited` to its
 primary child while `parent_h != 0`, without comparing the pid — and init has six or more children
-(fs-server, profile-server, compositor, input-server, tty-server, service-mgr, plus the selftest
-demos) — and `service-mgr`'s `supervise` does the same for its single service. Neither has been
+(fs-server, profile-server, compositor, input-server, tty-server, service-mgr) — and `service-mgr`'s `supervise` does the same for its single service. Neither has been
 bitten because in both cases only one child is *expected* to exit, which makes this a latent bug
 rather than a live one.
 
@@ -460,8 +459,15 @@ outruns its notification is the case worth restarting.
 
 **`init` is untouched and still has the original bug**: `reap_loop` attributes the first
 `ChildExited` to its primary child without comparing the pid. Its children do not all have control
-channels, so the fix above does not carry over. Trigger: `test-path-retrofit.md` Part C, which
-opens `init` anyway.
+channels, so `service-mgr`'s fix does not carry over.
+
+**The trigger named Part C has arrived, and the bug is newly *reachable* in a test image.** Part
+C2 made `init::supervise` unconditional, so `reap_loop` now runs with `parent_h = service_mgr_h`
+where the `selftest` path used to pass `0` — the branch could not fire at all before. It stays
+latent because init's remaining children are the servers it binds, none of which is expected to
+exit; the graphical clients and the demo chain are `service-mgr`'s children now, not init's (this
+entry said "plus the selftest demos" until 2026-08-24). Closing it needs one of the three shapes
+above, all of which touch the ABI or the notification path.
 
 The candidate fixes for the code, none chosen: **report the pid at spawn** (the kernel writes it
 back into a `SpawnArgs` field, or a new syscall reads it from a process handle) — smallest, but
@@ -469,6 +475,28 @@ back into a `SpawnArgs` field, or a new syscall reads it from a process handle) 
 **emit `KIND_PEER_CLOSED`** with the exit status folded in; or **carry the parent's handle** on
 `KIND_CHILD_EXITED` beside the pid, which answers the question directly and keeps the code on the
 same record.
+
+**`sys_process_spawn` drops syscaps the parent lacks, silently — `TODO(spawn-syscap-attenuation)`.**
+The kernel computes `child = parent & requested` (`kernel/src/syscall/table.rs`), which is the
+right rule and the wrong *report*: a spawn asking for more than the parent holds succeeds, and
+neither the kernel nor the parent learns which bits went missing. The child then fails at the
+point it first tries to use one, somewhere else entirely.
+
+Nothing is broken by it today — `service-mgr` holds `BIND_NAMESPACE` and the only declaration
+asking for a capability asks for that one. It became reachable when `syscaps` became declaration
+data (retrofit Part C2): before that, every grant was a `SpawnArgs` literal written next to the
+spawn, and now it is a name in a file.
+
+**A supervisor cannot check it either.** Nothing reports a process its own capability set —
+`/proc/self/status` carries pid and tid — so `service-mgr` cannot verify a declaration's subset
+without hardcoding a second copy of what `init` granted it. `service-manager.md` claimed a
+parse-time subset check for exactly this reason, and there has never been one.
+
+Shapes, none chosen: **report the drop** (spawn returns the granted set, or logs the difference),
+**refuse the spawn** on any requested bit the parent lacks (a stronger contract, and the one the
+schema used to describe), or **expose a process's own syscaps** so a supervisor can check before
+asking. Trigger: the first declaration wanting a capability `service-mgr` does not hold — a
+device manager with `LOAD_MODULE` is the obvious one.
 
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole

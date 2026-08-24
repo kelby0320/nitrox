@@ -109,15 +109,21 @@ pub struct ServiceDecl {
     pub restart: RestartConfig,
 }
 
-/// `SysCaps` bit for each name the schema recognises. The values mirror
-/// `libkern::syscaps::SysCaps`, which this crate does not depend on.
+/// `SysCaps` bit for each name the schema recognises, taken from `libkern` rather than
+/// written out.
+///
+/// An earlier version hardcoded the bit positions, with a comment claiming this crate does not
+/// depend on `libkern` — it does, and always has (PR #229 review, finding 6). `libkern` calls
+/// those positions normative, and this is the one place that turns a *name* into a *grant*: a
+/// third hand-maintained copy would grant the wrong capability on a renumbering, silently,
+/// with no gate to catch it.
 const SYSCAP_NAMES: &[(&str, u64)] = &[
-    ("LOAD_MODULE", 1 << 0),
-    ("BIND_NAMESPACE", 1 << 1),
-    ("PHYSICAL_MEMORY", 1 << 2),
-    ("REAL_TIME", 1 << 3),
-    ("SYSTEM_CLOCK", 1 << 4),
-    ("AUDIT_CONTROL", 1 << 5),
+    ("LOAD_MODULE", libkern::syscaps::SysCaps::LOAD_MODULE.bits()),
+    ("BIND_NAMESPACE", libkern::syscaps::SysCaps::BIND_NAMESPACE.bits()),
+    ("PHYSICAL_MEMORY", libkern::syscaps::SysCaps::PHYSICAL_MEMORY.bits()),
+    ("REAL_TIME", libkern::syscaps::SysCaps::REAL_TIME.bits()),
+    ("SYSTEM_CLOCK", libkern::syscaps::SysCaps::SYSTEM_CLOCK.bits()),
+    ("AUDIT_CONTROL", libkern::syscaps::SysCaps::AUDIT_CONTROL.bits()),
 ];
 
 /// Parse a `syscaps = [...]` array into `(bits, unknown_names)`.
@@ -149,6 +155,13 @@ pub fn parse_syscaps(list: &[String]) -> (u64, Vec<String>) {
 /// default would otherwise stay overwritable.
 #[derive(Default)]
 struct RestartSeen {
+    /// `after`, which is not a `[restart]` key but wants the same rule: `after = []` followed
+    /// by `after = ["x"]` must keep the empty list, exactly as `policy = "never"` followed by
+    /// `policy = "always"` keeps `never`. `is_empty()` cannot express that (PR #229 review,
+    /// finding 9).
+    after: bool,
+    /// `syscaps`, same reason.
+    syscaps: bool,
     policy: bool,
     max_attempts: bool,
     backoff: bool,
@@ -269,13 +282,16 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
                     executable: e,
                     syscaps: bits,
                     unknown_syscaps: unknown,
-                    after: core::mem::take(&mut after),
+                    after: after.clone(),
                     restart,
                 });
             }
-            // `mem::take` above empties it on the *emit* path; this covers the other one —
-            // a declaration skipped for having no `executable` must not hand its `after` to
-            // the next service. Pinned by `an_after_on_a_skipped_declaration_does_not_leak`.
+            // **This is the only thing that resets them**, and it has to cover both paths:
+            // a declaration that was emitted, and one skipped for having no `executable`. An
+            // earlier version took `after` by `mem::take` in the push and called this
+            // redundant; with the clear kept, the `take` was the decoration — swapping it for
+            // `clone` left all tests passing (PR #229 review, finding 10). Pinned by
+            // `an_after_on_a_skipped_declaration_does_not_leak`.
             after.clear();
             syscaps.clear();
         };
@@ -333,10 +349,12 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
                 executable = unquote(value).map(String::from)
             }
             // First-wins like the rest: a repeated `after` keeps the first list.
-            Section::Root if key == "after" && after.is_empty() => {
+            Section::Root if key == "after" && !seen.after => {
+                seen.after = true;
                 after = parse_string_array(value);
             }
-            Section::Root if key == "syscaps" && syscaps.is_empty() => {
+            Section::Root if key == "syscaps" && !seen.syscaps => {
+                seen.syscaps = true;
                 syscaps = parse_string_array(value);
             }
             // Every arm is guarded on **not yet seen** — see [`RestartSeen`].
@@ -680,11 +698,20 @@ backoff_max = \"2s\"\n";
         assert!(v[0].after.is_empty(), "b inherited a's dependency");
     }
 
-    /// First-wins, like every other key.
+    /// First-wins, like every other key — including when the first value is **empty**, which
+    /// `is_empty()` could not express and a `seen` flag can.
     #[test]
     fn a_repeated_after_keeps_the_first() {
         let d = one("[service.a]\nexecutable=\"/a\"\nafter=[\"first\"]\nafter=[\"second\"]\n");
         assert_eq!(d.after, ["first"]);
+        // `after = []` is a value, not an absence: a later line must not fill it in.
+        let e = one("[service.b]\nexecutable=\"/b\"\nafter=[]\nafter=[\"sneaked-in\"]\n");
+        assert!(e.after.is_empty(), "an appended line supplied a dependency");
+        // Same for `syscaps`, where the appended line is an authority grant.
+        let f = one(
+            "[service.c]\nexecutable=\"/c\"\nsyscaps=[]\nsyscaps=[\"BIND_NAMESPACE\"]\n",
+        );
+        assert_eq!(f.syscaps, 0, "an appended line supplied a capability");
     }
 
     /// `syscaps` names map to bits, and an unrecognised one is **carried out**, not dropped.

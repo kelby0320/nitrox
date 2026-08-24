@@ -27,8 +27,11 @@ supervisor holding `BIND_NAMESPACE`**, never by the service itself (see
 From the Phase 3 implementation plan (§ "Service manager"):
 
 1. **Parse service declarations** — TOML per [service-toml-schema](../spec/service-toml-schema.md).
-2. **Build a dependency graph** from `after`/`before`/`wants` and start services in
-   topological order (reject cycles at parse time).
+2. **Start services in file order**, waiting where `after` says to. A dependency *graph*
+   from `after`/`before`/`wants` with a topological sort is the general design and is **not
+   built**; `after` is implemented with the narrow meaning that is achievable — "this service
+   has exited" — and ordinary ordering comes from the order declarations appear in. `before`
+   and `wants` are unparsed. See [service-toml-schema](../spec/service-toml-schema.md).
 3. **Supervise** running services: observe exits via the notification channel and
    apply a **restart policy** (`never` / `on-failure` / `always`).
 4. **Back off** restarts (`none` / `linear` / `exponential`, bounded by
@@ -143,11 +146,16 @@ amplify — a child can never gain a capability its parent lacks).
 | `PHYSICAL_MEMORY` | **no** | Only `init` keeps this, for extreme recovery. A supervisor has no business with raw physical memory (called out explicitly in `userspace/init/CLAUDE.md`). |
 | `REAL_TIME` / `AUDIT_CONTROL` | **no** | No service-mgr need; a service wanting `REAL_TIME` acquires it another way, `AUDIT_CONTROL` belongs to the audit service's own grant path. |
 
-Each *service* then receives `service_syscaps = servicemgr_syscaps & decl.syscaps`
-— enforced **twice**: at parse time by service-mgr (the schema requires a
-declaration's `syscaps` to be a subset of what service-mgr holds) and again at spawn
-time by the kernel (`child = parent & args`, which silently masks any cap the parent
-lacks). **Most services get `[]`** (zero ambient capability); authority comes from
+Each *service* receives `service_syscaps = servicemgr_syscaps & decl.syscaps`, enforced
+**once**, by the kernel at spawn time (`child = parent & args`). That masking is silent: a
+declaration asking for more than service-mgr holds spawns successfully with the extra
+capabilities absent and nothing reported.
+
+There is **no parse-time subset check**, and this paragraph claimed one until 2026-08-24.
+service-mgr validates the *names* against the schema's table — an unrecognised one is reported
+and withheld — but it cannot check the subset, because nothing reports a process its own
+capability set (`/proc/self/status` carries pid and tid only). Closing that is
+`TODO(spawn-syscap-attenuation)`. **Most services get `[]`** (zero ambient capability); authority comes from
 the handles granted in `[service.<name>.handles]`, not from syscaps.
 
 **Binding is two-gated.** Every `sys_ns_bind` service-mgr issues is checked against
@@ -194,9 +202,10 @@ ever built.
                                                               └──▶ back to [starting]
 ```
 
-- **Parse** → `valid` or `misconfigured` (skipped, logged; per the schema's
-  parse-time validation: required fields, subset syscaps, acyclic graph, known
-  restart policy, valid handle kinds).
+- **Parse** → `valid` or `misconfigured` (skipped, logged). Implemented today: a declaration
+  with no `executable` is skipped, a duplicate name is dropped, and unrecognised `syscaps`
+  names are reported. Not implemented: the subset check and the acyclic check, neither of
+  which service-mgr is in a position to make (see above, and `after`'s note below).
 - **Start** in dependency order → `starting`; an RS-style service reaches `running`
   when it sends `Meta::Ready`; a plain service is `running` once spawned.
 - **Exit** → consult the restart policy; `on-failure` restarts only on abnormal
@@ -241,9 +250,13 @@ Non-RS services (a plain daemon with no endpoint to bind) skip steps 3–5: they
   Ready (RS) → await its `ChildExited` notification → apply policy. The notification
   channel drives reaping; per-service control channels drive lifecycle commands.
   Backoff waits are timer-driven (`sys_timer_*`), not busy sleeps.
-- **The dependency graph** is built once from the parsed declarations; a topological
-  order gates `starting` (a service waits until its `after`/`wants` set is
-  `running`/`ready`). Cycles are a parse-time rejection.
+- **Ordering** is the declaration file's order, plus `after`. `after` names services that
+  must have **exited** — for a one-shot, finishing is readiness, and there is no readiness
+  protocol for anything else — and it can only refer *backwards*, since a service is matched
+  against those already started. The wait is bounded and reported; a name that matches nothing
+  yet started, a dependency that failed to spawn, and a timeout are all logged and non-fatal.
+  Cycles are therefore not rejected: a forward reference simply does not wait. A real graph
+  with a topological sort remains the general answer, unbuilt.
 - **State table**: one entry per service (name, decl, state, control endpoint,
   child handle, restart bookkeeping). Bounded by the number of declarations.
 
