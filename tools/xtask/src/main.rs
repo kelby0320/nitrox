@@ -2748,6 +2748,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         Some(code) if code == PASS_EXIT => {
             let transcript = captured.lock().map(|g| g.clone()).unwrap_or_default();
             check_login_chain(&transcript)?;
+            check_demo_chain(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -2756,6 +2757,33 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
+}
+
+/// Assert that the demo chain **finished**, not merely that it ran.
+///
+/// **This replaces a check `init` used to make.** `init::supervise` ran the chain
+/// synchronously and failed the run on a non-zero exit; retrofit Part C2 made it a service
+/// declaration, so nothing in the guest reads its exit code any more — `policy = "never"`
+/// means service-mgr starts it once and does not react.
+///
+/// Without this, a chain that dies partway reaches PASS: the checks that follow it are
+/// `boot-probe`'s, and `boot-probe` waits for the chain to *exit*, not to succeed. That is not
+/// hypothetical — it happened on the first C2 boot. The chain stopped at
+/// `test-harness: session user bind FAIL`, because `init` had spawned it with
+/// `BIND_NAMESPACE` and the declaration could not yet say so, and `test-qemu` passed anyway
+/// with half the spawns missing.
+fn check_demo_chain(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if !text.contains("test-harness: all smoke tests passed") {
+        return Err("the demo chain did not finish — expected \
+             \"test-harness: all smoke tests passed\" in the transcript. The last \
+             \"test-harness:\" line names the stage it stopped at; a `FAIL` there is the \
+             real fault. `boot-probe` waits for the chain to exit, not to succeed, so the \
+             run reaches PASS either way and only this says otherwise."
+            .into());
+    }
+    println!("xtask: the demo chain finished (all smoke tests passed) ✓");
+    Ok(())
 }
 
 /// Assert that the login chain came up — `session-mgr` holding the endpoints it needs to
@@ -4592,9 +4620,60 @@ backoff_max = \"2s\"\n";
 /// executable appear and disappear together.
 const BOOT_PROBE_TOML: &str = "\
 \n\
+# The graphical self-tests and demo clients. `init` spawned these under `selftest` until\n\
+# retrofit Part C2; they are data now, so `init` is byte-identical in both images.\n\
+#\n\
+# **Order is file order.** `nxterm` must precede `ui-testclient` because windows stack in\n\
+# creation order at the origin and the display gate compares the top-left, so the largest\n\
+# window has to be at the bottom.\n\
+[service.display-selftest]\n\
+executable = \"/bin/display-selftest\"\n\
+description = \"Framebuffer + compositor self-test (one-shot)\"\n\
+\n\
+[service.display-selftest.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.nxterm]\n\
+executable = \"/bin/nxterm\"\n\
+description = \"The GUI terminal\"\n\
+after = [\"display-selftest\"]\n\
+\n\
+[service.nxterm.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.ui-testclient]\n\
+executable = \"/bin/ui-testclient\"\n\
+description = \"Toolkit + window-management test client\"\n\
+\n\
+[service.ui-testclient.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.input-testclient]\n\
+executable = \"/bin/input-testclient\"\n\
+description = \"Injected key + click test client\"\n\
+\n\
+[service.input-testclient.restart]\n\
+policy = \"never\"\n\
+\n\
+[service.test-harness]\n\
+executable = \"/bin/test-harness\"\n\
+description = \"The Phase 1-3 demo chain (one-shot)\"\n\
+# It creates a namespace and binds `/session/user` into it. `init` granted this directly\n\
+# when it spawned the chain; a declaration has to say so.\n\
+syscaps = [\"BIND_NAMESPACE\"]\n\
+\n\
+[service.test-harness.restart]\n\
+policy = \"never\"\n\
+\n\
+# **`after` is the ordering the boot verdict rests on.** The gates below run immediately\n\
+# before the only `SYS_TEST_EXIT(PASS)` call, so everything the run adjudicates has to have\n\
+# happened first — `fp_gate` was moved out of the demo chain precisely because whoever owns\n\
+# the verdict races it, and completed in 2 of 15 KVM runs there. `init::supervise` enforced\n\
+# this by running the chain synchronously; now the declaration says it.\n\
 [service.boot-probe]\n\
 executable = \"/bin/boot-probe\"\n\
 description = \"In-guest substrate checks and the boot verdict\"\n\
+after = [\"test-harness\"]\n\
 \n\
 [service.boot-probe.restart]\n\
 policy = \"never\"\n";

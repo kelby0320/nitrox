@@ -69,7 +69,7 @@ impl Default for RestartConfig {
     }
 }
 
-/// A parsed single-service declaration (the slice-A subset).
+/// A parsed single-service declaration (the subset the system uses).
 #[derive(Clone, Debug)]
 pub struct ServiceDecl {
     /// The service name, from the `[service.<name>]` header.
@@ -77,8 +77,63 @@ pub struct ServiceDecl {
     /// The declared executable path (mapped to an embedded image by the caller until
     /// a path-based ELF loader exists).
     pub executable: String,
+    /// System capabilities to grant at spawn, as a `SysCaps` bitmask.
+    ///
+    /// Names are the schema's (`"BIND_NAMESPACE"`, `"LOAD_MODULE"`, …); an unrecognised one
+    /// contributes nothing and is **reported** by the caller rather than dropped silently,
+    /// because a service that starts with less authority than it declared fails somewhere
+    /// else entirely — which is how this key came to be parsed at all. Retrofit Part A said
+    /// `syscaps` was not needed, on the strength of `boot-probe` needing none; Part C2 then
+    /// moved the demo chain into a declaration and it stopped at
+    /// `test-harness: session user bind FAIL`, because `init` had spawned it with
+    /// `BIND_NAMESPACE` and a declaration could not say so.
+    ///
+    /// The kernel refuses amplification, so this can only ever be a subset of what
+    /// `service-mgr` itself holds.
+    pub syscaps: u64,
+    /// `syscaps` entries this parser did not recognise, kept so the caller can report them.
+    /// Dropping them silently would downgrade a service's authority with no trace.
+    pub unknown_syscaps: Vec<String>,
+    /// Services that must have **finished** before this one starts.
+    ///
+    /// The schema calls this "must reach ready state", and for a service that exits — a
+    /// one-shot — finishing *is* readiness. There is no readiness protocol for a service
+    /// that keeps running, so naming one here would wait forever; `service-mgr` bounds the
+    /// wait and says so rather than hanging. See `docs/spec/service-toml-schema.md`.
+    ///
+    /// **Ordinary start order does not need this.** Declarations are started in file order,
+    /// so "start B after A" is written by putting A first. `after` is for the stronger claim:
+    /// *A has already exited*.
+    pub after: Vec<String>,
     /// The restart configuration.
     pub restart: RestartConfig,
+}
+
+/// `SysCaps` bit for each name the schema recognises. The values mirror
+/// `libkern::syscaps::SysCaps`, which this crate does not depend on.
+const SYSCAP_NAMES: &[(&str, u64)] = &[
+    ("LOAD_MODULE", 1 << 0),
+    ("BIND_NAMESPACE", 1 << 1),
+    ("PHYSICAL_MEMORY", 1 << 2),
+    ("REAL_TIME", 1 << 3),
+    ("SYSTEM_CLOCK", 1 << 4),
+    ("AUDIT_CONTROL", 1 << 5),
+];
+
+/// Parse a `syscaps = [...]` array into `(bits, unknown_names)`.
+///
+/// Unknown names come back rather than being dropped: granting less than a declaration asked
+/// for is a silent authority downgrade, and the failure it produces is somewhere else.
+pub fn parse_syscaps(list: &[String]) -> (u64, Vec<String>) {
+    let mut bits = 0u64;
+    let mut unknown = Vec::new();
+    for n in list {
+        match SYSCAP_NAMES.iter().find(|(name, _)| *name == n.as_str()) {
+            Some((_, b)) => bits |= b,
+            None => unknown.push(n.clone()),
+        }
+    }
+    (bits, unknown)
 }
 
 /// Which `[restart]` keys this declaration has already set.
@@ -140,6 +195,23 @@ fn unquote(v: &str) -> Option<&str> {
     v.strip_prefix('"')?.strip_suffix('"')
 }
 
+/// Parse an inline array of basic strings — `["a", "b"]` — into its elements.
+///
+/// Empty for anything that is not a well-formed array, and elements that are not quoted are
+/// skipped rather than taken raw: a service name is used to *wait* on a service, and a
+/// mangled one that silently matched nothing would look exactly like no dependency at all.
+/// Single-line only, which is what the declarations file writes; a multi-line array parses as
+/// empty and the service starts unordered, which the caller logs.
+fn parse_string_array(v: &str) -> Vec<String> {
+    let Some(inner) = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return Vec::new();
+    };
+    inner
+        .split(',')
+        .filter_map(|e| unquote(e.trim()).map(String::from))
+        .collect()
+}
+
 /// Parse a duration string (`"200ms"`, `"1s"`, `"5min"`) to nanoseconds. `None` on a
 /// malformed value or unrecognized unit.
 fn parse_duration_ns(v: &str) -> Option<u64> {
@@ -176,6 +248,8 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
     let mut out: Vec<ServiceDecl> = Vec::new();
     let mut name: Option<String> = None;
     let mut executable: Option<String> = None;
+    let mut after: Vec<String> = Vec::new();
+    let mut syscaps: Vec<String> = Vec::new();
     let mut restart = RestartConfig::default();
     let mut seen = RestartSeen::default();
     let mut section = Section::None;
@@ -188,8 +262,22 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
             if let (Some(n), Some(e)) = (name.take(), executable.take())
                 && !out.iter().any(|d: &ServiceDecl| d.name == n)
             {
-                out.push(ServiceDecl { name: n, executable: e, restart });
+                // The parser cannot log; carry unrecognised names out so the caller does.
+                let (bits, unknown) = parse_syscaps(&syscaps);
+                out.push(ServiceDecl {
+                    name: n,
+                    executable: e,
+                    syscaps: bits,
+                    unknown_syscaps: unknown,
+                    after: core::mem::take(&mut after),
+                    restart,
+                });
             }
+            // `mem::take` above empties it on the *emit* path; this covers the other one —
+            // a declaration skipped for having no `executable` must not hand its `after` to
+            // the next service. Pinned by `an_after_on_a_skipped_declaration_does_not_leak`.
+            after.clear();
+            syscaps.clear();
         };
     }
 
@@ -243,6 +331,13 @@ pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
             // `[service.<name>]` header harmless rather than a silent override.
             Section::Root if key == "executable" && executable.is_none() => {
                 executable = unquote(value).map(String::from)
+            }
+            // First-wins like the rest: a repeated `after` keeps the first list.
+            Section::Root if key == "after" && after.is_empty() => {
+                after = parse_string_array(value);
+            }
+            Section::Root if key == "syscaps" && syscaps.is_empty() => {
+                syscaps = parse_string_array(value);
             }
             // Every arm is guarded on **not yet seen** — see [`RestartSeen`].
             Section::Restart => match key {
@@ -541,6 +636,88 @@ backoff_max = \"2s\"\n";
         );
         assert_eq!(v.len(), 2);
         assert_eq!(v[1].name, "b");
+    }
+
+    /// `after` is parsed, and it is per declaration — the list does not leak to the next
+    /// service, in either direction.
+    #[test]
+    fn after_is_parsed_and_does_not_leak_between_services() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/a\"\nafter=[\"x\", \"y\"]\n\
+             [service.b]\nexecutable=\"/b\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].after, ["x", "y"]);
+        assert!(v[1].after.is_empty(), "b declared no dependency");
+    }
+
+    /// **Text a correct writer would never produce.** An element that is not a quoted string
+    /// is dropped rather than taken raw: `after` names a service to *wait* on, and a mangled
+    /// name that matched nothing would be indistinguishable from declaring no dependency.
+    #[test]
+    fn a_malformed_after_element_is_dropped_not_taken_raw() {
+        let d = one("[service.a]\nexecutable=\"/a\"\nafter=[\"good\", bare, \"also\"]\n");
+        assert_eq!(d.after, ["good", "also"]);
+        // Not an array at all: no dependency, rather than one called `\"oops\"`.
+        let e = one("[service.b]\nexecutable=\"/b\"\nafter=\"oops\"\n");
+        assert!(e.after.is_empty());
+        // An empty array is an empty list.
+        let f = one("[service.c]\nexecutable=\"/c\"\nafter=[]\n");
+        assert!(f.after.is_empty());
+    }
+
+    /// The failure the surviving `after.clear()` prevents, which the neighbouring leak test
+    /// cannot reach: `mem::take` empties the list when a declaration is *emitted*, so only a
+    /// declaration **skipped** for having no `executable` can carry its `after` forward.
+    #[test]
+    fn an_after_on_a_skipped_declaration_does_not_leak() {
+        let v = parse_all(
+            "[service.a]\nafter=[\"x\"]\ndescription=\"no exe\"\n\
+             [service.b]\nexecutable=\"/b\"\n",
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "b");
+        assert!(v[0].after.is_empty(), "b inherited a's dependency");
+    }
+
+    /// First-wins, like every other key.
+    #[test]
+    fn a_repeated_after_keeps_the_first() {
+        let d = one("[service.a]\nexecutable=\"/a\"\nafter=[\"first\"]\nafter=[\"second\"]\n");
+        assert_eq!(d.after, ["first"]);
+    }
+
+    /// `syscaps` names map to bits, and an unrecognised one is **carried out**, not dropped.
+    /// Retrofit Part A judged this key unnecessary; Part C2's demo chain then stopped at
+    /// `session user bind FAIL` for want of `BIND_NAMESPACE`, which is what a silent
+    /// authority downgrade looks like from three subsystems away.
+    #[test]
+    fn syscaps_names_map_to_bits_and_unknown_names_are_reported() {
+        let d = one(
+            "[service.a]\nexecutable=\"/a\"\nsyscaps=[\"BIND_NAMESPACE\", \"REAL_TIME\"]\n",
+        );
+        assert_eq!(d.syscaps, (1 << 1) | (1 << 3));
+        assert!(d.unknown_syscaps.is_empty());
+
+        let e = one("[service.b]\nexecutable=\"/b\"\nsyscaps=[\"BIND_NAMESPACE\", \"NOPE\"]\n");
+        assert_eq!(e.syscaps, 1 << 1, "the recognised half is still granted");
+        assert_eq!(e.unknown_syscaps, ["NOPE"], "and the other half is reported");
+
+        // Declaring none is zero, which is what almost every service should hold.
+        let f = one("[service.c]\nexecutable=\"/c\"\n");
+        assert_eq!(f.syscaps, 0);
+    }
+
+    /// Per declaration, like `after` — a grant must not leak to the next service.
+    #[test]
+    fn syscaps_do_not_leak_between_services() {
+        let v = parse_all(
+            "[service.a]\nexecutable=\"/a\"\nsyscaps=[\"BIND_NAMESPACE\"]\n\
+             [service.b]\nexecutable=\"/b\"\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].syscaps, 1 << 1);
+        assert_eq!(v[1].syscaps, 0, "b inherited a's authority");
     }
 
     #[test]

@@ -39,7 +39,7 @@ counted, everywhere.
 
 | Crate | cfg sites | Test apparatus | Shipping path, omitted under test | Lines that differ | Of the file |
 |---|---|---|---|---|---|
-| `init` | 41 | 657 | **15** | 672 | 32 % |
+| ~~`init`~~ | ~~41~~ **1** | ~~657~~ | ~~**15**~~ **0** | ~~672~~ ~30 | **~2 %** ✅ Part C |
 | ~~`session-mgr`~~ | ~~31~~ **0** | ~~241~~ | ~~**147**~~ | ~~388~~ | **0 %** ✅ Part B |
 | `nxterm` | 9 | 74 | 0 | 74 | 10 % |
 
@@ -168,9 +168,10 @@ selftest images. The probes move there; they do not need a new crate.
       `service-mgr` are byte-identical in both images and one of them reads a file with an
       extra table. Governing decision 3, concretely.
 
-- [ ] **`init`'s four `run_*` spawns become declarations too** — `run_test_harness`,
-      `run_display_selftest`, `run_ui_testclient`, `run_input_testclient`. Deferred to Part C,
-      which opens `init` anyway; the mechanism they need now exists.
+- [x] **`init`'s `run_*` spawns became declarations** ✅ (Part C2) — the demo chain, the
+      display self-test, `nxterm` and the two test clients. Their order is the file's order,
+      which preserves the one constraint that mattered: `nxterm` before `ui-testclient`,
+      because windows stack in creation order at the origin.
 
 - [x] **`service-mgr` holds more than one service** ✅ — and this was the part nobody planned
       for. **No supervisor in this system could tell its children's exits apart**:
@@ -284,15 +285,29 @@ ordering box below real rather than theoretical.
       have scoped C2 to a namespace-bind mechanism and nothing else (PR #228 review,
       finding 2).
 
-- [ ] **The graphical spawns leave too.** `run_nxterm`, `run_ui_testclient`,
-      `run_input_testclient`, `run_display_selftest` are declarations after Part A. This is also
-      the honest fix for a comment `init` already carries: *"Until Milestone 7 there is nothing
-      to launch `nxterm` from, so `init` does it in the test image and nowhere else."* There is
-      something to launch it from before M7 — a service declaration — and after M7 the real
-      answer is `desktop-shell`.
+- [x] **The graphical spawns left too** ✅ (Part C2). `run_nxterm`, `run_ui_testclient`,
+      `run_input_testclient` and `run_display_selftest` are declarations, which is also the
+      honest fix for a comment `init` carried: *"Until Milestone 7 there is nothing to launch
+      `nxterm` from."* There is — a service declaration — and after M7 the real answer is
+      `desktop-shell`.
 
-- [ ] **`init` compiles identically in both images**, which is the box that says this part is
-      done.
+- [x] **`init`'s supervision of `service-mgr` is the same code in both images** ✅. It was
+      `#[cfg(not(feature = "selftest"))]`: a test image reaped the demo `parent` as its primary
+      child instead, so PID 1's supervision — and its restart when `service-mgr` dies — was
+      code `test-qemu` structurally could not exercise. `supervise` is now three lines with no
+      cfg, and `test_exit` is unconditional (the syscall returns `Unsupported` where the verdict
+      device is absent, so a release `init` degrades rather than diverging).
+
+- [ ] **`init` compiles identically in both images** — not yet, and one thing blocks it: the
+      `/subtreetest` binding. 41 cfg sites became **1**. Closing the last one needs a way to put
+      a namespace bind in declaration data; see the box above.
+
+- [x] **Two mechanisms the plan had written off** ✅. `after` and `syscaps` are parsed now.
+      Part A dropped `syscaps` as unnecessary — true of `boot-probe`, false of the milestone:
+      the demo chain declares `BIND_NAMESPACE`, and moving it into a declaration without that
+      stopped it at `session user bind FAIL` **while `test-qemu` still passed**. `after` is the
+      ordering the verdict rests on, and it means "has exited" rather than the schema's
+      unimplementable "reached ready state".
 
 ## Part D — the gate set, reconciled
 

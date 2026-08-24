@@ -17204,3 +17204,50 @@ Closing this needs a mechanism, not an edit.
 `init` still carries **20** `selftest` cfgs otherwise — the demo chain, the four graphical spawns,
 and the `cfg(not(selftest))` supervision of `service-mgr`. Those are ordinary code that becomes
 service declarations in C2, and they are the larger half of Part C.
+
+## 2026-08-24 — `init` ships PID 1: the demo chain and the graphical clients become data
+
+Test-path retrofit Part C2. `init` goes from 41 `selftest`/`test-harness` cfg sites to **one**,
+and from 2100 lines to 1419. The demo chain, the display self-test, `nxterm` and the two
+graphical test clients are service declarations now — started by `service-mgr` from
+`/initramfs/etc/services.toml`, which carries them only in a test image.
+
+**The sequencing the verdict rests on moved from code into the file.** `init::supervise` ran the
+demo chain synchronously and only then handed off, which is what kept `boot-probe`'s gates last —
+`fp_gate` completed in 2 of 15 KVM runs when it lived in the demo `parent`, because whoever owns
+the verdict races the chain. That is now `after = ["test-harness"]` on the probe. Ordinary start
+order needs nothing: declarations start in file order, so "`nxterm` before `ui-testclient`" — the
+window-stacking constraint the display gate depends on — is written by putting it first.
+
+**`after` means "has exited", not the schema's "reached ready state".** For a one-shot, finishing
+*is* readiness; for a service that keeps running there is no readiness protocol, so naming one
+would wait forever. `service-mgr` bounds the wait, says so, and starts the dependent anyway — as
+it does for a name that matches no declaration and for a dependency that failed to spawn. None of
+those is fatal, because refusing to start a service over a mis-typed name turns a typo into a
+silently missing service. A dependency *graph* with topological sorting is the general answer and
+is not built; nothing needs one.
+
+**Part A's judgement that `syscaps` was unnecessary was wrong, and the way it failed is the
+point.** That box was dropped on the strength of `boot-probe` needing no capabilities — true, and
+not the question. `init` spawned the demo chain with `BIND_NAMESPACE`, because it constructs a
+namespace and binds `/session/user` into it. Moved into a declaration that could not say so, the
+chain stopped at `test-harness: session user bind FAIL` — **and `test-qemu` passed**, with half
+the spawns missing, because `boot-probe` waits for the chain to *exit*, not to succeed.
+
+So two things landed together: `syscaps` is parsed and granted (an unrecognised name is reported
+and withheld, never dropped silently — a service starting with less authority than it declared
+fails somewhere else entirely), and `test-qemu` grew `check_demo_chain`, which requires
+`test-harness: all smoke tests passed`. That assertion replaces one `init` used to make by reading
+the chain's exit code, and it is negative-controlled by the real bug: remove the `syscaps` line
+and the gate fails with the stage the chain stopped at.
+
+**PID 1's supervision of `service-mgr` is now the same code in both images.** It was
+`#[cfg(not(feature = "selftest"))]` — a test image reaped the demo `parent` as its primary child
+instead — so init's restart-on-death was something `test-qemu` structurally could not exercise.
+`supervise` is three lines with no cfg. `test_exit` is unconditional too: `SYS_TEST_EXIT` is
+served only by a kernel built with its own `test-harness` feature, so elsewhere it returns
+`Unsupported` and a release `init` degrades to carrying on rather than diverging.
+
+**One cfg remains and the box stays open.** The `/subtreetest` binding still cannot be expressed
+as data, so `init`'s two builds are not byte-identical — 79,872 bytes against 83,968. Everything
+else about the file is now the same code in both.

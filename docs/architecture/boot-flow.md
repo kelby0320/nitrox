@@ -185,11 +185,17 @@ than an implementation detail.
    first only because they were initramfs-resident.
 5. **Hand off** to `service-mgr` and stay resident as supervisor.
 
-Under the `selftest` / `test-harness` builds init additionally runs the **demo chain**
-(`run_test_harness`) after step 5 and before handing off, and a non-zero exit fails the run
-there. It also spawns the display self-test and the graphical test clients. Those are the
-last things in this file that a release build does not do — retrofit Part C2 turns them into
-service declarations.
+**`init` runs the same code in both images**, bar one namespace binding (retrofit Part C,
+2026-08-21). The demo chain, the display self-test, `nxterm` and the two graphical test
+clients used to be spawned here under `selftest`; they are **service declarations** now,
+started by `service-mgr` from `/initramfs/etc/services.toml`, which carries them only in a
+test image. Their order is the file's order, and `after` holds `boot-probe` until the demo
+chain has exited — the sequencing this function used to enforce by running the chain
+synchronously.
+
+Step 5 is therefore unconditional: spawn `service-mgr` and supervise it. That branch was
+`#[cfg(not(feature = "selftest"))]`, so a test image reaped the demo `parent` as its primary
+child instead and PID 1's restart-on-death was code no gate could reach.
 
 **The filesystem checks are no longer init's** (retrofit Part C1, 2026-08-21): the large-file
 read, overwrite, grow, create and subtree-bind checks moved to `boot-probe`, a declared
@@ -199,8 +205,9 @@ path in init was a bare `return` after a `FAIL` print. `init` keeps one thing th
 `/subtreetest` binding in `mount_one`, which cannot become declaration data because nothing
 in a declaration can express a namespace bind.
 
-**Who fires the verdict** is `boot-probe`, not init; init only ever fires FAIL, for a
-critical-path boot failure or a crashed demo chain. See
+**Who fires the verdict** is `boot-probe`, not init; init only ever fires FAIL, and now only
+for a critical-path boot failure — a demo chain that dies partway is caught by `test-qemu`'s
+transcript check rather than by init reading an exit code. See
 [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md).
 
 ## 6. service-mgr → session-mgr → login

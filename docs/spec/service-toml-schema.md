@@ -58,7 +58,9 @@ Convention: store paths via the system profile (`/bin/network-manager` or direct
 
 ### `syscaps` (optional, array of strings; default `[]`)
 
-System capabilities granted to the service. Must be a subset of capabilities the service manager itself holds — the kernel rejects spawn requests that try to amplify.
+**Parsed and granted since 2026-08-21.** System capabilities granted to the service. Must be a subset of capabilities the service manager itself holds — the kernel rejects spawn requests that try to amplify, so a declaration asking for more fails the spawn rather than being granted it.
+
+A name the service manager does not recognise is **reported and not granted**, rather than dropped silently: a service that starts with less authority than it declared fails somewhere else entirely, which is how this key came to be implemented — the demo chain stopped at `session user bind FAIL` when it was moved into a declaration that could not yet say `BIND_NAMESPACE`.
 
 Recognized values:
 
@@ -75,9 +77,13 @@ Most services should hold zero syscaps. Granting `BIND_NAMESPACE` is reserved fo
 
 ### `after` (optional, array of strings; default `[]`)
 
-Names of services that must reach "ready" state before this service is started. The service manager builds a dependency graph from these entries and topologically sorts startup.
+**Parsed since 2026-08-21, with the narrow meaning that is implementable today.** Names of services that must have **finished** — exited — before this one is started.
 
-Cycles in the graph are rejected at parse time.
+For a service that exits (a one-shot), finishing *is* readiness. There is no readiness protocol for a service that keeps running, so naming one here would wait forever; the service manager bounds the wait, reports it, and starts the dependent anyway. A name matching no declaration, and a dependency that failed to spawn, are likewise reported and not fatal — refusing to start a service because of a mis-typed name would turn a typo into a silently missing service.
+
+**Ordinary start order does not need `after`.** Declarations are started in file order, so "start B after A" is written by putting A first. `after` is for the stronger claim that A has already *finished* — which is what orders the boot self-test: the substrate checks that fire the verdict must not run until the demo chain has exited.
+
+A dependency graph with topological sorting is the general answer and is not built; nothing yet needs one. Cycles are therefore not rejected at parse time — two services naming each other each wait out the bound and start.
 
 ### `before` (optional, array of strings; default `[]`)
 

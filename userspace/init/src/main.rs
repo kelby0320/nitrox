@@ -141,127 +141,6 @@ static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
-/// Spawn args for the integration test harness (`/bin/test-harness`): no
-/// handles, inherit a LOOKUP-only handle to init's root namespace (so it resolves the
-/// kernel servers). It constructs fresh namespaces in its `ns`/`forward` checks, so init
-/// grants it `BIND_NAMESPACE`. Selftest builds only.
-#[cfg(feature = "selftest")]
-static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/test-harness
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0,
-    syscaps: SYSCAP_BIND_NAMESPACE,
-};
-/// Spawn args for `input-testclient` (display arm M3 Part A): no handles, inheriting a
-/// LOOKUP-only handle to init's root namespace so it resolves `/dev/input/raw/*`. **No
-/// syscaps** — authority over an input device is the namespace binding, nothing more, and
-/// that binding is the whole of the keylogging boundary.
-#[cfg(feature = "selftest")]
-static mut SPAWN_INPUTCLIENT: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/input-testclient
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0,
-    syscaps: 0,
-};
-
-/// Spawn `input-testclient`, which proves the i8042 actually delivers events.
-///
-/// Spawn-and-forget like the UI client: it exits on its own once the harness has injected,
-/// and init cannot usefully wait for a program whose completion depends on a host action.
-#[cfg(feature = "selftest")]
-fn run_input_testclient(root_ns: u64) {
-    // SAFETY: SPAWN_INPUTCLIENT is a valid writable arg block.
-    let h = unsafe {
-        spawn_program(root_ns, b"/bin/input-testclient", &raw mut SPAWN_INPUTCLIENT)
-    };
-    if h < 0 {
-        kprint(b"init: input-testclient spawn FAIL\n");
-        return;
-    }
-    // SAFETY: closing init's reference; `reap_loop` reaps it when it exits.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-}
-
-/// Spawn args for `nxterm` (display arm M5 Part B): no handles, inheriting a LOOKUP-only
-/// handle to init's root namespace so it resolves `/dev/draw/new` and the system font. **No
-/// syscaps** — authority over the display is the namespace binding, nothing more.
-///
-/// **Spawned under `selftest` only, and it stays that way through Part C.** This comment used to
-/// say `session-mgr` would start the terminal as part of building a session. That was reversed on
-/// 2026-08-12: `session-mgr` is the *serial* column's supervisor, and a terminal a person launches
-/// belongs to the graphical one — `desktop-shell`, spawned by `desktop-session-mgr`, neither of
-/// which exists yet. See `docs/design/graphical-session.md`. Until Milestone 7 there is nothing to
-/// launch `nxterm` from, so `init` does it in the test image and nowhere else.
-#[cfg(feature = "selftest")]
-static mut SPAWN_NXTERM: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/nxterm
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0,
-    syscaps: 0,
-};
-
-/// Spawn `nxterm`, the GUI terminal.
-///
-/// **Before `ui-testclient`, and the order is load-bearing.** Windows are all created at the
-/// origin and stack in creation order, with no way to position one (the plan dropped popup
-/// placement when the toolkit turned out not to need it). The display gate compares fixed
-/// regions at the top-left, so a window created *after* those would cover what it compares.
-/// The terminal is the largest window and therefore has to be at the bottom.
-#[cfg(feature = "selftest")]
-fn run_nxterm(root_ns: u64) {
-    // SAFETY: SPAWN_NXTERM is a valid writable arg block.
-    let h = unsafe { spawn_program(root_ns, b"/bin/nxterm", &raw mut SPAWN_NXTERM) };
-    if h < 0 {
-        kprint(b"init: nxterm spawn FAILED\n");
-        #[cfg(feature = "test-harness")]
-        test_exit(false);
-        return;
-    }
-    // SAFETY: closing init's reference; the terminal runs on and is reaped if it exits.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-}
-
-/// Spawn args for `ui-testclient` (display arm M2 Part D): no handles, inheriting a
-/// LOOKUP-only handle to init's root namespace so it resolves `/dev/draw/new`. **No
-/// syscaps** — authority over the display is the namespace binding, nothing more.
-#[cfg(feature = "selftest")]
-static mut SPAWN_UICLIENT: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/ui-testclient
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0,
-    syscaps: 0,
-};
-/// Spawn args for `display-selftest` (display arm M1 Part C): no handles, and it
-/// inherits a LOOKUP-only handle to init's root namespace so it resolves
-/// `/dev/framebuffer` and `/dev/framebuffer/info`. **No syscaps** — it binds nothing;
-/// authority over the display is the namespace binding itself. Selftest builds only.
-#[cfg(feature = "selftest")]
-static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /bin/display-selftest
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0,
-    syscaps: 0,
-};
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves
 /// `/dev/input/raw/*`. **No syscaps**: like every resource server, it does not hold
@@ -1136,7 +1015,12 @@ fn read_current_generation(root_ns: u64) {
 /// returning `()` rather than `!`: the syscall does not return in practice, but
 /// letting callers fall through means a missing exit device degrades to a normal
 /// boot instead of a hang. See `docs/conventions/qemu-integration-tests.md`.
-#[cfg(feature = "test-harness")]
+///
+/// **Unconditional, in every build** (retrofit Part C2). `SYS_TEST_EXIT` exists in `libkern`
+/// always and is served only by a kernel built with its own `test-harness` feature; anywhere
+/// else the syscall number is unknown and the call returns `Unsupported`. So a release init
+/// makes one pointless syscall on a path that is already a boot failure, and gains a code
+/// path identical to the tested one. `init` only ever fires **FAIL** — PASS is `boot-probe`'s.
 fn test_exit(ok: bool) {
     let code = if ok { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
     kprint(if ok {
@@ -1296,149 +1180,6 @@ unsafe fn close_retained_endpoints() {
     }
 }
 
-/// Run the integration test harness synchronously (selftest builds): spawn it, block
-/// until it exits, and report whether it exited `0`. A non-zero exit lets the caller
-/// fail the run; a hang means this never returns, so the runner's wall-clock timeout
-/// fails it. Its child processes (test-stages) are reaped by the harness, not init.
-#[cfg(feature = "selftest")]
-fn run_test_harness(notif: u64, root_ns: u64) -> bool {
-    kprint(b"init: running integration test harness\n");
-    // SAFETY: SPAWN_HARNESS is a valid writable arg block.
-    let h =
-        unsafe { spawn_program(root_ns, b"/bin/test-harness", &raw mut SPAWN_HARNESS) };
-    if h < 0 {
-        kprint(b"init: test-harness spawn FAIL\n");
-        return false;
-    }
-    loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
-        };
-        if waited < 1 {
-            continue;
-        }
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-        if r != 0 {
-            continue; // WouldBlock: drained
-        }
-        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-        let (kind, body) =
-            unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-        if kind == KIND_CHILD_EXITED {
-            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-            // SAFETY: closing our own process handle for the harness.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-            return code == 0;
-        }
-    }
-}
-
-/// Spawn `display-selftest` and adjudicate it.
-///
-/// The program reports three outcomes and this decides which of them matter: `0` passed,
-/// **`2` found no `/dev/framebuffer` binding**, anything else failed.
-///
-/// The `2` case is the one that needs a policy rather than a value judgement in the
-/// program. On a real machine with no display it is expected. Under `test-harness` the
-/// emulator always reports a framebuffer, so it means the binding is broken — and folding
-/// it into success is how the entire display arm could go missing with `test-qemu` still
-/// green, which is exactly what an earlier version of this code did.
-#[cfg(feature = "selftest")]
-fn run_display_selftest(notif: u64, root_ns: u64) {
-    // SAFETY: SPAWN_DISPLAY is a valid writable arg block.
-    let h = unsafe {
-        spawn_program(root_ns, b"/bin/display-selftest", &raw mut SPAWN_DISPLAY)
-    };
-    if h < 0 {
-        kprint(b"init: display-selftest spawn FAIL\n");
-        #[cfg(feature = "test-harness")]
-        test_exit(false);
-        return;
-    }
-    loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
-        };
-        if waited < 1 {
-            continue;
-        }
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-        if r != 0 {
-            continue; // WouldBlock: drained
-        }
-        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-        let (kind, body) =
-            unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-        if kind == KIND_CHILD_EXITED {
-            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-            // SAFETY: closing init's reference to the finished child.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-            match code {
-                0 => {}
-                2 => {
-                    kprint(b"init: display-selftest found no display\n");
-                    #[cfg(feature = "test-harness")]
-                    {
-                        kprint(b"init: ...but this build always has one -- FAILED\n");
-                        test_exit(false);
-                    }
-                }
-                _ => {
-                    kprint(b"init: display-selftest FAILED\n");
-                    #[cfg(feature = "test-harness")]
-                    test_exit(false);
-                }
-            }
-            return;
-        }
-    }
-}
-
-/// Spawn `ui-testclient` — the display arm's first real client.
-///
-/// **Spawned, not awaited.** On success the client *parks*: exiting would close its
-/// channel, and the compositor would correctly destroy its windows and repaint, leaving
-/// the display gate to capture an empty screen. So it reports its own failures through
-/// `SYS_TEST_EXIT` — the same verdict path init uses — and a successful run simply leaves
-/// its window on screen for the rest of the boot.
-///
-/// This is the first test that exercises a client and the compositor together. Everything
-/// before it tested one half: `libsurface` against a mock, the compositor against nothing. That
-/// is how a one-way protocol shipped with green CI.
-#[cfg(feature = "selftest")]
-fn run_ui_testclient(root_ns: u64) {
-    // SAFETY: SPAWN_UICLIENT is a valid writable arg block.
-    let h = unsafe {
-        spawn_program(root_ns, b"/bin/ui-testclient", &raw mut SPAWN_UICLIENT)
-    };
-    if h < 0 {
-        kprint(b"init: ui-testclient spawn FAIL\n");
-        #[cfg(feature = "test-harness")]
-        test_exit(false);
-        return;
-    }
-    // SAFETY: closing init's reference; the client runs on and is reaped by `reap_loop`
-    // if it ever does exit.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-}
 
 /// The healthy supervise path. **Normally**, hand off to the service manager: spawn
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
@@ -1465,39 +1206,8 @@ fn run_ui_testclient(root_ns: u64) {
 /// the verdict races the demo chain — and it survived the verdict moving out of `session-mgr`
 /// (retrofit Part B) only because of the sequencing below.
 fn supervise(notif: u64, root_ns: u64) -> ! {
-    #[cfg(feature = "selftest")]
-    {
-        // Serial adjudication (decision log 2026-07-24): run the integration test harness
-        // **first**, synchronously — a non-zero exit fails the run, and a hang fails it via
-        // the runner's wall-clock timeout (nothing ever reaches the verdict) — **then** hand
-        // off to the login chain. `service-mgr` starts `boot-probe` from that chain, and the
-        // probe fires the PASS verdict after its gates. (The earlier harness/login
-        // concurrency is retired with the parent/child demos.)
-        if !run_test_harness(notif, root_ns) {
-            kprint(b"init: integration test harness FAILED\n");
-            #[cfg(feature = "test-harness")]
-            test_exit(false);
-            // Interactive selftest: nothing to hand off to; reap orphans.
-            reap_loop(notif, root_ns, 0);
-        }
-        kprint(b"init: harness passed; handing off to login chain\n");
-        let smgr_h = spawn_service_mgr(root_ns);
-        if smgr_h >= 0 {
-            // service-mgr runs independently: it brings up the login chain — which reaches a
-            // `login:` prompt nobody answers under `test-qemu`, and a real one under
-            // `test-interactive` — and starts the declared services, `boot-probe` among them
-            // in a test image. The verdict comes from there. SAFETY: closing init's
-            // reference; service-mgr runs on.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
-        }
-        reap_loop(notif, root_ns, 0);
-    }
-    // Normal boot: hand off to the service manager and supervise it.
-    #[cfg(not(feature = "selftest"))]
-    {
-        let service_mgr_h = spawn_service_mgr(root_ns);
-        reap_loop(notif, root_ns, service_mgr_h);
-    }
+    let service_mgr_h = spawn_service_mgr(root_ns);
+    reap_loop(notif, root_ns, service_mgr_h);
 }
 
 /// The **emergency** path: a critical-path boot failure (bad manifest, failed
@@ -1506,24 +1216,23 @@ fn supervise(notif: u64, root_ns: u64) -> ! {
 /// See `userspace/init/CLAUDE.md` § "Failure → eshell".
 fn emergency(notif: u64, root_ns: u64) -> ! {
     kprint(b"init: critical-path failure -- dropping to emergency shell\n");
-    // Test-harness: a critical-path boot failure is a failed test run.
-    #[cfg(feature = "test-harness")]
+    // A critical-path boot failure is a failed test run. Outside `test-qemu` the verdict
+    // device is absent, the syscall returns `Unsupported`, and the boot carries on to the
+    // emergency shell below — which is what an operator wants on real hardware.
     test_exit(false);
     spawn_eshell(root_ns);
     reap_loop(notif, root_ns, 0);
 }
 
 /// Reap exited children forever (init is the eventual parent of every orphan).
-/// `parent_h` is the handle of the one child whose exit init reacts to — the demo
-/// `parent` under `selftest` (a crash fails the test run; the login chain is already
-/// up concurrently, so nothing is spawned on its exit), or `service-mgr` on a normal
-/// boot (its death is a critical fault → interim recovery brings a fresh one up) — or
-/// `0` if none is pending. All other orphans are logged and released.
+///
+/// `parent_h` is the handle of the one child whose exit init reacts to: **`service-mgr`**,
+/// whose death is a critical fault, in every build since retrofit Part C2 unified `supervise`.
+/// It used to be the demo `parent` under `selftest`, which is why the restart below was
+/// `#[cfg(not(feature = "selftest"))]` — so PID 1's supervision of `service-mgr`, and its
+/// recovery when it dies, were the code a test image did *not* run. `0` if none is pending;
+/// all other orphans are logged and released.
 fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
-    // `root_ns` is only needed on a normal boot (to respawn a dead service-mgr); under
-    // `selftest` the login chain is already up, so mark it used to avoid a warning.
-    #[cfg(feature = "selftest")]
-    let _ = root_ns;
     kprint(b"init: entering reaping loop\n");
     loop {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
@@ -1575,24 +1284,12 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
                     parent_h = 0;
-                    #[cfg(feature = "selftest")]
-                    {
-                        // Primary = the demo `parent`. The login chain is already running
-                        // concurrently (spawned in `supervise`) and owns the verdict; here
-                        // a crashed demo fails the run. session-mgr fires the final PASS once
-                        // it has authenticated the demo user under that concurrent load.
-                        #[cfg(feature = "test-harness")]
-                        if code != 0 {
-                            test_exit(false);
-                        }
-                        // The interactive console is session-mgr's `login:` prompt (via the
-                        // login chain), not eshell — eshell is the *emergency* shell only
-                        // (the `emergency` path). Nothing to spawn here.
-                    }
-                    #[cfg(not(feature = "selftest"))]
                     {
                         // Primary = service-mgr; its death is a critical fault. Interim
-                        // recovery until a reboot path exists: bring a fresh one up.
+                        // recovery until a reboot path exists: bring a fresh one up. This
+                        // was `#[cfg(not(feature = "selftest"))]`, so a test image ran a
+                        // different branch and never exercised it.
+                        let _ = code;
                         let smgr_h = spawn_service_mgr(root_ns);
                         if smgr_h >= 0 {
                             // SAFETY: closing init's reference; service-mgr runs independently.
@@ -1692,25 +1389,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
         kprint(b"init: no compositor; /dev/draw unavailable\n");
     }
 
-    #[cfg(feature = "selftest")]
-    run_display_selftest(notif, root_ns);
-
-    // The terminal first, because windows stack in creation order at the origin and it is the
-    // largest — see `run_nxterm`.
-    #[cfg(feature = "selftest")]
-    run_nxterm(root_ns);
-
-    // After the compositor is serving: the first client. Its committed buffers are what
-    // `check-display` compares, so it runs last and leaves the scene on screen.
-    #[cfg(feature = "selftest")]
-    run_ui_testclient(root_ns);
-
-    // The input client reads `/dev/input/raw/*`, which the i8042 driver published at boot.
-    // It parks its reads and announces `listening`; `cargo xtask check-input` injects from
-    // the host once it sees that line.
-    #[cfg(feature = "selftest")]
-    run_input_testclient(root_ns);
-
+    // The display self-test, the GUI terminal and the two test clients used to be spawned
+    // here under `selftest`. They are **service declarations** now (retrofit Part C2), started
+    // by `service-mgr` from `/initramfs/etc/services.toml` — which carries them only in a test
+    // image, so this file is byte-identical in both. Their order is the file's order, which is
+    // what preserves the one constraint that mattered: `nxterm` before `ui-testclient`,
+    // because windows stack in creation order at the origin and the display gate compares the
+    // top-left, so the largest window has to be at the bottom.
     supervise(notif, root_ns);
 }
 
