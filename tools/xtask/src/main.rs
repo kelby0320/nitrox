@@ -1294,21 +1294,6 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
     Ok(())
 }
 
-///
-/// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →
-/// `tty-server` → `nxsh` → back out → the terminal's grid. Every piece of it has its own test;
-/// none of those can tell you the pieces are joined.
-///
-/// **Asserted on the grid's contents, not on pixels.** What a shell prints is not fixed by this
-/// milestone, so comparing pixels would pin it — and the display gate already compares a
-/// *fixed* terminal render, which is the part that must not drift. Under `test-harness`,
-/// `nxterm` reports each completed grid line on the debug console; that is what this reads.
-///
-/// **It clicks before it types**, which is not ceremony. `nxterm` is created first so it sits at
-/// the bottom of the stack (windows stack at the origin in creation order and it is the
-/// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
-/// it, which is both how a user would do it and the only mechanism available: there is no op to
-/// raise a window, and there will not be until Milestone 6.
 /// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right
 /// one, then a session.
 ///
@@ -1471,13 +1456,35 @@ fn type_at_greeter(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
             }
         };
         press(qmp, &qcode)?;
-        // The redraw is the receipt. Its number is not asserted — the greeter counts every
-        // redraw including the ones a session teardown causes — only that one happened.
+        // The redraw is the receipt, and its number is not asserted — only that one happened.
+        //
+        // **One receipt is not one keystroke.** The greeter drains every queued event and
+        // presents once, so two keys that arrive in the same pump produce one redraw and this
+        // loop runs a receipt ahead until the next key supplies it. Measured on a passing
+        // run: 20 keystrokes produced 20 redraws in one phase and 34 produced 33 in another.
+        // That is fine and self-correcting — nothing is lost, and the drift stays far under
+        // the outbox's depth — but it is pacing, not a per-character acknowledgement, and the
+        // comment said otherwise (PR #236 review, finding 5).
         session.expect("desktop-session-mgr: greeter redraw ")?;
     }
     Ok(())
 }
 
+///
+/// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →
+/// `tty-server` → `nxsh` → back out → the terminal's grid. Every piece of it has its own test;
+/// none of those can tell you the pieces are joined.
+///
+/// **Asserted on the grid's contents, not on pixels.** What a shell prints is not fixed by this
+/// milestone, so comparing pixels would pin it — and the display gate already compares a
+/// *fixed* terminal render, which is the part that must not drift. Under `test-harness`,
+/// `nxterm` reports each completed grid line on the debug console; that is what this reads.
+///
+/// **It clicks before it types**, which is not ceremony. `nxterm` is created first so it sits at
+/// the bottom of the stack (windows stack at the origin in creation order and it is the
+/// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
+/// it, which is both how a user would do it and the only mechanism available: there is no op to
+/// raise a window, and there will not be until Milestone 6.
 /// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
 ///
 /// **Status 2026-08-13 (superseding an earlier status the same day): the flake was real, and it

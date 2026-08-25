@@ -215,13 +215,21 @@ transcript check rather than by init reading an exit code. See
 `service-mgr` reads service declarations, constructs each service's namespace and handle
 set, spawns it and supervises it. On the login path specifically:
 
-1. **`auth-service`** — spawn + `Ready` handshake, yielding the client channel.
-2. **`session-mgr`** — spawned with re-delegated `BIND_NAMESPACE`, then handed the
-   fs-server endpoint and the auth channel.
+1. **`session-mgr`** — spawned with re-delegated `BIND_NAMESPACE`, then handed the fs-server,
+   profile-server and tty-server endpoints. It resolves `/svc/auth` itself.
+2. **`desktop-session-mgr`** — the same, with its own duplicates of those three endpoints.
+   Non-fatal if it fails: a machine with a serial login is degraded, one with neither is
+   unreachable.
 
-`session-mgr` presents login, authenticates against `auth-service`, constructs the session
-namespace, and spawns `nxsh` into it with empty syscaps. **`nxsh` is the login leaf** as of
-2026-07-31; the throwaway `usersh` is gone.
+**`auth-service` is not spawned here.** It was until M7 Part C; it is a resource server bound
+at `/svc/auth`, and only `init` can bind into the root namespace — a declared service holds an
+inherited LOOKUP-only root. Both supervisors resolve their own session from that path.
+
+Each supervisor presents a login, authenticates against `auth-service`, constructs a session
+namespace and spawns a leader into it with empty syscaps: `nxsh` for the serial column
+(**the login leaf** as of 2026-07-31; the throwaway `usersh` is gone) and `desktop-shell` for
+the graphical one. **Two sessions run concurrently and neither arbitrates** (M7 Part D), which
+is what keeps serial the recovery path by construction.
 
 **Servers never register themselves.** In every handshake above, a supervisor holding
 `BIND_NAMESPACE` does the binding — see

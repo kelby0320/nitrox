@@ -28,6 +28,17 @@ on:
       # to fire PASS and QEMU still exits 33. This gate's expect timeout is the only thing
       # that sees it (PR #175 review, finding 3).
       - 'userspace/test-harness/**'
+      # **The greeter is a client in the image this gate compares**, as of M7 Part D. It
+      # creates a 420x200 window at the origin in *every* boot, and the gate passes today only
+      # because the windows created after it cover that region. A change to its size, its
+      # `Role`, or its ability to present at all changes what the guest composites — so
+      # without these two entries that break would surface later, on an unrelated PR that
+      # happened to touch a filtered path, looking like a compositing regression.
+      #
+      # `service-mgr` too: its spawn order is what puts the greeter at the bottom of the
+      # stack, which is the property the coverage rests on (PR #236 review, finding 2).
+      - 'userspace/desktop-session-mgr/**'
+      - 'userspace/service-mgr/**'
       # `librsproto` carries the Surface encoders and `WindowInfo`; every message on the
       # path from client to screen rides them.
       - 'userspace/librsproto/**'

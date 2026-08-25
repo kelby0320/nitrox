@@ -97,8 +97,15 @@ one category's ops, which is why nothing broke and why nothing noticed — only 
 
 Like the fs-server, the profile server and the logging service: spawned by a supervisor, bound
 into namespaces by a supervisor, never self-registering. It holds `/dev/console` and is bound
-at **`/dev/tty`** in each session namespace by `session-mgr`, exactly where `/dev/console` is
-bound today.
+at **`/dev/tty`** in each session namespace by whichever supervisor built it — `session-mgr`
+for the serial column and, since M7 Part D, `desktop-session-mgr` for the graphical one. Both
+bind it through the same `libsession::build_namespace`.
+
+**A graphical session gets `/dev/tty` but not `/dev/console`**, and the two are less different
+than that reads: a tty minted through this server sits on the **console backend**, so a
+graphical program that resolved `/dev/tty` would be reading the same physical console the
+serial column's login is using. Nothing does today — `desktop-shell` never resolves it — and
+`TODO(gui-dev-tty)` is where that is tracked, with its trigger now fired.
 
 The consequence is the point: **a session gets `/dev/tty` and not `/dev/console`.** It cannot
 reach the raw device at all, because the name is not in its namespace.
@@ -137,7 +144,7 @@ indistinguishable by type:
 
 | Role | Speaks | Who binds it |
 |---|---|---|
-| **forwarding endpoint** | `Namespace::Resolve`, sent by the kernel | init at `/dev/tty` in the root ns; session-mgr at `/dev/tty` in each session |
+| **forwarding endpoint** | `Namespace::Resolve`, sent by the kernel | init at `/dev/tty` in the root ns; `session-mgr` **or `desktop-session-mgr`** at `/dev/tty` in each session it builds |
 | **minted tty channel** | `Tty::ReadLine` / `Write` / `SetMode` / `Close` | nobody — it is *held*, not bound |
 
 The kernel adopts **any** bound `IpcChannel` as a userspace server, so binding a minted tty

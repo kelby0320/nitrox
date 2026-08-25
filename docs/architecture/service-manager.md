@@ -140,7 +140,7 @@ amplify — a child can never gain a capability its parent lacks).
 
 | SysCap | service-mgr holds? | Why |
 |---|---|---|
-| `BIND_NAMESPACE` | **yes — own use** | It registers each service's endpoint into the system namespace (the RS protocol's bind step). This is the defining supervisor capability. It also *re-delegates* `BIND_NAMESPACE` to `session-mgr` (an already-made decision — session-mgr gets its scoped bind capability from service-mgr). |
+| `BIND_NAMESPACE` | **yes — own use** | It registers each service's endpoint into the system namespace (the RS protocol's bind step). This is the defining supervisor capability. It also *re-delegates* `BIND_NAMESPACE` to **both login supervisors** — `session-mgr` and, since M7 Part D, `desktop-session-mgr` — each of which needs it to construct a session namespace. |
 | `LOAD_MODULE` | **yes — pass-through** | Not used by service-mgr directly; held so it can *delegate* it to the `device-manager` service (delegation can only attenuate — to grant a cap, you must hold it). |
 | `SYSTEM_CLOCK` | **yes — pass-through** | Same: held to delegate to a `time-sync` service, not exercised by service-mgr itself. |
 | `PHYSICAL_MEMORY` | **no** | Only `init` keeps this, for extreme recovery. A supervisor has no business with raw physical memory (called out explicitly in `userspace/init/CLAUDE.md`). |

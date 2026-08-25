@@ -84,7 +84,8 @@ authority, no device access. session-mgr reaches it over an rsproto channel.
 `auth-service` and binds its forwarding endpoint at `/svc/auth`; a supervisor resolves that
 path and gets a session channel of its own, minted per caller — the same shape
 `profile-server` serves `/bin` and the tty server serves `/dev/tty` with. `session-mgr` does
-this at startup, and `desktop-session-mgr` will do the same.
+this at startup, and so does `desktop-session-mgr` — once, not per attempt: the oracle's
+lifetime is the machine's.
 
 **Bound by `init`, not by the supervisor that used to spawn it.** `service-mgr` spawned
 `auth-service` until Part C, and the resource-server protocol says the supervisor that starts a
@@ -227,11 +228,14 @@ supervisor drops to on a critical-path failure — no longer the normal console.
 - Per-user **profile overlays** (a user profile layered over the system profile) —
   designed in [profiles-and-namespace-projection](profiles-and-namespace-projection.md);
   a session binds the system `/bin` only.
-- Session **tokens** and multi-session bookkeeping; logout / switch-user; concurrent
-  logins (one console, one session at a time). The **graphical** column beside this one —
-  `desktop-session-mgr`, its login window, and the session it constructs — is designed in
-  [graphical-session.md](../design/graphical-session.md) (2026-08-12) and not built; it is
-  what fires the concurrency question above.
+- Session **tokens** and multi-session bookkeeping; logout / switch-user. **Concurrent logins
+  are no longer deferred and no longer "one console, one session at a time"** — M7 Part D
+  built the graphical column, and `session-mgr` and `desktop-session-mgr` each authenticate
+  and run a session unaware of the other. Neither arbitrates and there is no registry, which
+  is what keeps serial the recovery path by construction; `cargo xtask check-login` logs in
+  on both in one boot and requires that neither session ended while the other started. The
+  accepted cost is that the same user may be logged in twice with two namespaces
+  ([graphical-session.md](../design/graphical-session.md) §6.2).
 - User *creation* and password *change* (the DB is read-only); persisted per-user
   state beyond the seeded home directory.
 - The real user shell (Phase 4).

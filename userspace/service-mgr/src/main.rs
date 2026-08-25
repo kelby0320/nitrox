@@ -658,9 +658,15 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
     if sess_h < 0 || sess_ctrl == 0 {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
+        // Both sets: the duplicates were minted before this spawn, so this path owns six
+        // handles rather than three. service-mgr never exits, so a leak here is permanent.
         // SAFETY: closing our own handles (nothing handed off).
-        // SAFETY: closing our own handles.
-        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
+        unsafe {
+            close_endpoints(fs_endpoint, profile_endpoint);
+            close_endpoints(fs_dup, profile_dup);
+            close_one(tty_endpoint);
+            close_one(tty_dup);
+        }
         return;
     }
     // Handoffs, in order: (1) the fs-server endpoint, (2) the profile-server endpoint,
@@ -700,6 +706,12 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
 /// namespace, exactly as every other graphical client does.
 fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bool {
     if fs == 0 {
+        // The duplicates are this function's to release once it declines to use them.
+        // SAFETY: closing our own handles.
+        unsafe {
+            close_one(profile);
+            close_one(tty);
+        }
         return false;
     }
     let (h, ctrl) =
@@ -709,9 +721,7 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bo
         // SAFETY: closing our own handles (nothing handed off).
         unsafe {
             close_endpoints(fs, profile);
-            if tty != 0 {
-                syscall1(SYS_HANDLE_CLOSE, tty);
-            }
+            close_one(tty);
         }
         return false;
     }
@@ -725,6 +735,17 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bo
         syscall1(SYS_HANDLE_CLOSE, h as u64);
     }
     true
+}
+
+/// Close one handle if there is one.
+///
+/// # Safety
+/// `h` must be a handle this process owns, or `0`.
+unsafe fn close_one(h: u64) {
+    if h != 0 {
+        // SAFETY: the caller guarantees `h` is ours.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
 }
 
 /// Duplicate an endpoint handle for a second supervisor, or `0` if there was none.

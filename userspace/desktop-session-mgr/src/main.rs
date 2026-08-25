@@ -182,9 +182,15 @@ impl Greeter {
 
     /// Clear both fields and put the caret back — after a session ends, and after a refusal.
     ///
-    /// **The password is cleared the moment it has been read**, whichever way the attempt
-    /// went. A greeter that left it on screen would keep a credential in a window that
-    /// outlives every session.
+    /// **The password leaves the screen the moment it has been read**, whichever way the
+    /// attempt went. A greeter outlives every session it starts, so one left in the field
+    /// would sit behind whatever the session drew.
+    ///
+    /// **Not a scrub.** `String::clear` sets the length to zero and leaves the bytes in the
+    /// allocation, so this is a claim about what is displayed and what a later attempt can
+    /// read back — not about this process's memory. The caller's stack copy is
+    /// volatile-zeroed after the session ends, which is the same distinction (PR #236 review,
+    /// finding 8).
     fn reset(&mut self) {
         self.user.clear();
         self.password.clear();
