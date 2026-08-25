@@ -19,7 +19,8 @@ edition = "2024"
 # (`graphical-session.md` §3).
 [dependencies]
 libkern = { path = "../libkern" }
-librsproto = { path = "../librsproto" }
+# `io` for `session::Dir`: the modal reads /bin as a forwarded directory.
+librsproto = { path = "../librsproto", features = ["io"] }
 libsurface = { path = "../libsurface" }
 libui = { path = "../libui" }
 libdraw = { path = "../libdraw", features = ["io"] }

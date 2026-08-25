@@ -28,9 +28,10 @@ use libkern::*;
 use librsproto::surface::{CreateWindowRequest, Edge, Role};
 use libsurface::Session;
 use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, padding, text};
+use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
+use libui::widget::{ListRow, ListState, Palette, TextFieldState, WidgetState, list_view, text_field};
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
@@ -70,9 +71,87 @@ fn fail(msg: &[u8]) -> ! {
     }
 }
 
+/// How wide the applications button is, in pixels.
+///
+/// The modal's **only** trigger for now. `desktop-shell.md` §4 gives it two — this button and
+/// the Super key — but the Super key is a *global hotkey*, which §8 makes a capability rather
+/// than an ambient grab, and the compositor has none. A `panel` does not take keyboard focus,
+/// so a key would not reach this process at all; a click routes to the window under the
+/// pointer whatever holds focus, which is why the button is the half that can exist yet.
+const APPS_BUTTON_W: u32 = 120;
+
 /// The top bar's element tree.
 fn bar_view() -> Element<()> {
-    padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("nitrox"))
+    row(alloc::vec![
+        sized(
+            libdraw::geom::Size::new(APPS_BUTTON_W, 0),
+            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
+        ),
+        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("nitrox")),
+    ])
+}
+
+/// The applications modal's size.
+const MODAL_W: u32 = 320;
+/// See [`MODAL_W`].
+const MODAL_H: u32 = 240;
+/// Bytes per row in the modal.
+const MODAL_PITCH: usize = (MODAL_W as usize) * 4;
+/// How tall one entry is.
+const ROW_H: u32 = 20;
+
+/// The applications modal's element tree: a filter field over a list of `/bin` programs.
+fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: ListState) -> (Element<()>, ListState) {
+    let palette = Palette::default();
+    let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, &palette);
+    // The list is given the space left after the field, so `visible` matches what is drawn.
+    let list_h = MODAL_H.saturating_sub(40);
+    let (list, state) = list_view(rows, state, list_h, ROW_H, |_| (), &palette);
+    (
+        padding(
+            Insets::all(8),
+            column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
+        ),
+        state,
+    )
+}
+
+/// Render the modal.
+fn render_modal(font: &Font, query: &TextFieldState, rows: &[ListRow<'_>], state: ListState) -> (MemFramebuffer, ListState) {
+    let geometry = Geometry::with_pitch(MODAL_W, MODAL_H, MODAL_PITCH, PixelFormat::XRGB8888)
+        .expect("the modal pitch is wide enough for a row");
+    let mut fb = MemFramebuffer::new(geometry);
+    let (ui, state) = modal_view(query, rows, state);
+    let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
+    let metrics = FontMetrics::new(font, FONT_PX);
+    let l = layout(&ui, bounds, &metrics);
+    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+    paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    (fb, state)
+}
+
+/// Read the programs `/bin` projects, as the modal's entries.
+///
+/// **`/bin` is a forwarded directory, not a set of bindings**, so `SYS_NS_ENUMERATE` does not
+/// see inside it — that walks the namespace's own bindings and `/bin` is one of them. The
+/// entries come from a directory session, the same way `list /bin` gets them.
+fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
+    use librsproto::session::Dir;
+    let mut names = alloc::vec::Vec::new();
+    let mut buf = [0u8; 4096];
+    let Ok(mut dir) = Dir::open(ns, b"/bin", &mut buf) else {
+        kprint(b"desktop-shell: /bin did not open; the modal will be empty\n");
+        return names;
+    };
+    let _ = dir.read_dir(|e| {
+        if e.name != b"." && e.name != b".." {
+            names.push(alloc::string::String::from_utf8_lossy(e.name).into_owned());
+        }
+        true
+    });
+    dir.close();
+    names.sort();
+    names
 }
 
 /// Render the top bar.
@@ -402,6 +481,19 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
         .u(BAR_H as u64)
         .end();
 
+    // The modal's entries, read once. `desktop-shell.md` §4: they are `/bin` programs, and
+    // that falls out of decisions already made — they are ordinary files in the namespace, so
+    // type-to-filter runs over them with no special mechanism.
+    let programs = read_bin(session_ns);
+    Line::new()
+        .s(b"desktop-shell: /bin lists ")
+        .u(programs.len() as u64)
+        .s(b" programs")
+        .end();
+    let mut modal: Option<u32> = None;
+    let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let query = TextFieldState::new();
+
     // Blocks on the compositor's event channel, never spins — a spinning leader keeps a run
     // queue non-empty, so the idle thread never runs and deferred reclamation stops for the
     // whole machine (the 2026-07-31 `logging-service` bug).
@@ -421,8 +513,93 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
         if session.pump().is_err() {
             fail(b"desktop-shell: compositor connection lost\n");
         }
-        while session.next_event().is_some() {}
+        while let Some((w, event)) = session.next_event() {
+            // A press on the applications button opens the modal. **A press, not a key**: a
+            // `panel` takes no keyboard focus, so a key never reaches this process — see
+            // `APPS_BUTTON_W`.
+            if w == window && modal.is_none() {
+                if let libsurface::WindowEvent::Pointer(p) = event {
+                    if p.kind == librsproto::surface::POINTER_BUTTON
+                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                        && p.x >= 0
+                        && (p.x as u32) < APPS_BUTTON_W
+                    {
+                        modal = open_modal(&mut session, window, &font, &programs, &mut modal_addrs, &query);
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Open the applications modal as a popup parented to the top bar.
+///
+/// **A `popup`, which is what M6 Part C made it possible to be.** A menu was a `Stack` layer
+/// over its window until then, and worked only because it happened to fit inside one; a modal
+/// wider than the bar it hangs from could not have been drawn that way at all. It is
+/// positioned by its creator and clipped by the *screen*, not by its parent.
+fn open_modal(
+    session: &mut Session<ChannelTransport>,
+    parent: u32,
+    font: &Font,
+    programs: &[alloc::string::String],
+    addrs: &mut [*mut u8; BUFFERS],
+    query: &TextFieldState,
+) -> Option<u32> {
+    let rows: alloc::vec::Vec<ListRow<'_>> = programs
+        .iter()
+        .enumerate()
+        // Keyed by index into the **unfiltered** list, which is what `ListRow::key`'s doc asks
+        // for: a filter reorders and shortens the rows, and an index into the filtered view
+        // would pair row 2's widget with row 3's element the moment a character is typed.
+        .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
+        .collect();
+    let (picture, _) = render_modal(font, query, &rows, ListState::default());
+    let bytes = picture.into_bytes();
+    let len = MODAL_PITCH * MODAL_H as usize;
+    if bytes.len() != len {
+        kprint(b"desktop-shell: modal render is not the size it declares\n");
+        return None;
+    }
+    let role = Role::Popup { parent };
+    let id = match session.create(&CreateWindowRequest::new(MODAL_W, MODAL_H, role), BUFFERS) {
+        Ok(id) => id,
+        Err(_) => {
+            kprint(b"desktop-shell: modal CreateWindow FAILED\n");
+            return None;
+        }
+    };
+    for i in 0..BUFFERS {
+        let Some((handle, addr)) = shared_buffer(len) else {
+            kprint(b"desktop-shell: modal buffer alloc FAILED\n");
+            return None;
+        };
+        addrs[i] = addr;
+        // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
+        // allocations, so they cannot overlap.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
+        let Some(mut w) = session.window(id) else {
+            return None;
+        };
+        if w.attach(i as u32, MODAL_W, MODAL_H, MODAL_PITCH as u32, handle).is_err() {
+            kprint(b"desktop-shell: modal AttachBuffer FAILED\n");
+            return None;
+        }
+    }
+    let Some(mut w) = session.window(id) else {
+        return None;
+    };
+    if w.commit(0, (0, 0, MODAL_W, MODAL_H)).is_err() {
+        kprint(b"desktop-shell: modal Commit FAILED\n");
+        return None;
+    }
+    Line::new()
+        .s(b"desktop-shell: applications modal open, window ")
+        .u(id as u64)
+        .s(b" listing ")
+        .u(programs.len() as u64)
+        .end();
+    Some(id)
 }
 
 #[panic_handler]

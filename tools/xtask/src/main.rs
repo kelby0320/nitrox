@@ -1388,6 +1388,27 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
     // the process is what distinguishes a session that runs from one that is merely spawned.
     session.expect("desktop-shell: top bar presented")?;
+    session.expect("desktop-shell: /bin lists ")?;
+
+    // 4. **The applications modal.** `desktop-shell.md` §4 gives it two triggers — this button
+    //    and the Super key — and only the button can exist yet: the Super key is a *global
+    //    hotkey*, which §8 makes a capability the compositor does not have, and a `panel` takes
+    //    no keyboard focus so a key would never reach the shell at all.
+    //
+    //    The bar spans the screen at y=0 and the button is its left 120px, so a press at
+    //    (60, 12) lands inside it. Asserted through the compositor's own `press at` line
+    //    first, for the reason `check-terminal` gives: it separates "the pointer was not
+    //    there" from "the pointer was there and nothing happened".
+    const APPS_CLICK: (i32, i32) = (60, 12);
+    // Unverified positioning, which is the open `check-terminal` flake (1 in 68): the
+    // pointer-confirmation work was reverted in PR #232 because reporting position per motion
+    // was too expensive in the compositor's input path. The press assertion below is what
+    // catches a drop, exactly as it does there.
+    move_pointer_to(&mut qmp, APPS_CLICK.0, APPS_CLICK.1)?;
+    qmp.send_button("left", true)?;
+    qmp.send_button("left", false)?;
+    session.expect(&format!("compositor: press at x={} y={}", APPS_CLICK.0, APPS_CLICK.1))?;
+    session.expect("desktop-shell: applications modal open")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
@@ -1433,6 +1454,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 /// `desktop-session-mgr` never reported a session ending — its leader blocks, so the only way
 /// that line appears is if the session came down.
 fn check_two_sessions(transcript: &str) -> R<()> {
+    // **An empty applications list would satisfy every expect above.** "`/bin` lists " matches
+    // "lists 0 programs", and "modal open" says nothing about its contents — so a session
+    // whose `/bin` failed to open would pass the whole gate. Asserted as an absence for the
+    // same reason the concurrency check is: `expect` cannot say "a number greater than zero".
+    if transcript.contains("desktop-shell: /bin lists 0 programs") {
+        return Err("the applications modal is empty: /bin projected no programs into the \
+             session namespace. The modal opening is not evidence it has anything in it"
+            .into());
+    }
     if !transcript.contains("desktop-shell: up (graphical session leader)") {
         return Err("the graphical session never started, so nothing was concurrent".into());
     }
