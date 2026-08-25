@@ -290,6 +290,7 @@ const COREUTILS: &[&str] = &[
 const SYSTEM_SERVICES: &[&str] = &[
     "service-mgr",
     "session-mgr",
+    "desktop-session-mgr",
     "auth-service",
     "logging-service",
     "heartbeat",
@@ -356,6 +357,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // test-only branch compile on the first try, which is how the thing Part B removed comes
     // back — the zero should be a wall, not a count.
     build_userspace_bin("session-mgr", None)?;
+    build_userspace_bin("desktop-session-mgr", None)?;
     build_userspace_bin("compositor", None)?;
     // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
     // the update are host-tested, the bin is the window and the event pump.

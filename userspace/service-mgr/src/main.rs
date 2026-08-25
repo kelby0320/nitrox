@@ -91,6 +91,24 @@ static mut SPAWN_SESSION: SpawnArgs = SpawnArgs {
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
 
+/// Spawn args for `desktop-session-mgr` — `session-mgr`'s graphical twin, same shape.
+///
+/// **Two supervisors, unaware of each other.** Neither arbitrates and there is no registry:
+/// serial stays the recovery path by construction rather than by care, which is
+/// `graphical-session.md` governing decision 3 holding trivially. It matches Linux, where
+/// `getty` and `gdm` do not coordinate either. The accepted cost is on the record: the same
+/// user may be logged in twice, with two namespaces.
+static mut SPAWN_DESKTOP_SESSION: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: SYSCAP_BIND_NAMESPACE,
+};
+
 /// Spawn args for the service being started/restarted. `image` and the control-channel
 /// handle are filled per spawn; a leaf service inherits a LOOKUP-only handle to
 /// service-mgr's namespace and holds no ambient capabilities.
@@ -627,6 +645,16 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     // first and the bind came back FAIL, which is how the constraint was found.
 
     // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint.
+    // Duplicated **before** the serial column takes its set, since `send_handle` moves.
+    // `TRANSFER | DUPLICATE` is what the hand-down needs and all it needs.
+    // SAFETY: duplicating our own endpoint handles with attenuated rights.
+    let (fs_dup, profile_dup, tty_dup) = unsafe {
+        (
+            dup_endpoint(fs_endpoint),
+            dup_endpoint(profile_endpoint),
+            dup_endpoint(tty_endpoint),
+        )
+    };
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
     if sess_h < 0 || sess_ctrl == 0 {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
@@ -652,7 +680,64 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
         syscall1(SYS_HANDLE_CLOSE, sess_ctrl);
         syscall1(SYS_HANDLE_CLOSE, sess_h as u64);
     }
+    // **The graphical twin.** It needs the same three endpoints, and `send_handle` *moves*
+    // them — so they are duplicated before the serial column is given its set. Duplicating
+    // first rather than after means a failure here costs the graphical login, not both:
+    // init makes the same argument where it retains the profile endpoint before binding it.
+    if !bring_up_desktop_session(root_ns, fs_dup, profile_dup, tty_dup) {
+        // Non-fatal by design. A machine with a serial login and no graphical one is
+        // degraded; a machine with neither is unreachable, and the serial column is already
+        // up by this point.
+        kprint(b"service-mgr: no graphical login (serial login is unaffected)\n");
+    }
     kprint(b"service-mgr: login chain up (auth-service + session-mgr)\n");
+}
+
+/// Spawn `desktop-session-mgr` and hand it its own copies of the three endpoints.
+///
+/// `false` if it could not be started. Its greeter is a compositor client, so unlike
+/// `session-mgr` it also needs `/dev/draw` — which it resolves itself from the inherited root
+/// namespace, exactly as every other graphical client does.
+fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bool {
+    if fs == 0 {
+        return false;
+    }
+    let (h, ctrl) =
+        spawn_with_control(root_ns, b"/bin/desktop-session-mgr", &raw mut SPAWN_DESKTOP_SESSION);
+    if h < 0 || ctrl == 0 {
+        kprint(b"service-mgr: desktop-session-mgr spawn FAIL\n");
+        // SAFETY: closing our own handles (nothing handed off).
+        unsafe {
+            close_endpoints(fs, profile);
+            if tty != 0 {
+                syscall1(SYS_HANDLE_CLOSE, tty);
+            }
+        }
+        return false;
+    }
+    // The same positional order `session-mgr` receives in, for the same reason.
+    send_handle(ctrl, fs);
+    send_handle(ctrl, profile);
+    send_handle(ctrl, tty);
+    // SAFETY: closing our own handles; the twin runs independently from here.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, ctrl);
+        syscall1(SYS_HANDLE_CLOSE, h as u64);
+    }
+    true
+}
+
+/// Duplicate an endpoint handle for a second supervisor, or `0` if there was none.
+///
+/// # Safety
+/// `h` must be a handle this process owns, or `0`.
+unsafe fn dup_endpoint(h: u64) -> u64 {
+    if h == 0 {
+        return 0;
+    }
+    // SAFETY: the caller guarantees `h` is ours.
+    let d = unsafe { syscall2(SYS_HANDLE_DUPLICATE, h, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
+    if d < 0 { 0 } else { d as u64 }
 }
 
 /// Bootstrap registers (see init's `_start`): `rdi` = notification channel, `rsi` =

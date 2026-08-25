@@ -1,0 +1,29 @@
+[package]
+name = "desktop-session-mgr"
+version = "0.1.0"
+edition = "2024"
+
+# `session-mgr`'s graphical twin: it authenticates a user, constructs their session namespace
+# and spawns the session leader — the same sequence, through the same `libsession` — but its
+# greeter is a **window** rather than a terminal prompt, so it is also a compositor client.
+#
+# Two supervisors, not one process with two faces. They are unaware of each other and neither
+# arbitrates: serial stays the recovery path by construction rather than by care, which is
+# `graphical-session.md` governing decision 3 holding trivially (§6.2, and the plan's Part D).
+#
+# It links `libsession`, so it inherits that crate's rule — no `libos`. The GUI half brings
+# `libsurface`, `libui` and `libdraw`, which `session-mgr` does not need and does not take.
+[dependencies]
+libkern = { path = "../libkern" }
+librsproto = { path = "../librsproto" }
+libstream = { path = "../libstream", features = ["io"] }
+libheap = { path = "../libheap" }
+libsession = { path = "../libsession" }
+libsurface = { path = "../libsurface" }
+libui = { path = "../libui" }
+libdraw = { path = "../libdraw", features = ["io"] }
+libinput = { path = "../libinput" }
+
+[[bin]]
+name = "desktop-session-mgr"
+path = "src/main.rs"
