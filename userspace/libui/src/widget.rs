@@ -236,6 +236,408 @@ pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, palette:
     )
 }
 
+
+/// Space between a text field's content and its edge.
+const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
+
+/// How wide the caret is, in pixels.
+const CARET: u32 = 2;
+
+/// What a masked field shows instead of each character.
+///
+/// `*` rather than a bullet, deliberately: the vendored DejaVu almost certainly has U+2022,
+/// but "almost certainly" is not a property a login screen should depend on, and a missing
+/// glyph in a password field is invisible to the person typing — they cannot read what it
+/// should have said. ASCII cannot go wrong here.
+const MASK_CHAR: char = '*';
+
+/// The editable content of a single-line text field.
+///
+/// **The state is the application's and the widget is a pure function of it**, which is not a
+/// style choice: [`Element::on_key`](crate::element::Element::on_key) is a *function pointer*,
+/// so a widget cannot close over anything to mutate. The application owns one of these, hands
+/// keys to [`apply`](Self::apply), and passes the result to [`text_field`] — the same shape as
+/// every other widget here, where "hovered" is state the caller passes in.
+///
+/// **A single line, not an editor.** `widget-toolkit.md` §8 keeps the *text area* out of the
+/// set until something needs one, and says it "returns when something needs it". A greeter's
+/// password box and a launcher's search box are that trigger, and they are narrower than the
+/// thing §8 is reserving: no wrapping, no selection, no undo, no multi-line cursor. Building
+/// the editor's widget now would be the guess §8 refuses to make.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TextFieldState {
+    /// What has been typed.
+    text: String,
+    /// Where the caret is, as a **byte** offset into `text`.
+    ///
+    /// Bytes rather than characters because that is what slicing needs, and every mutation
+    /// below keeps it on a character boundary — the invariant the whole type rests on.
+    cursor: usize,
+}
+
+impl TextFieldState {
+    /// An empty field.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A field holding `text`, caret at the end — where a caller pre-filling a username wants it.
+    pub fn with_text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.len();
+        Self { text, cursor }
+    }
+
+    /// What has been typed.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The caret's byte offset. Always on a character boundary.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether anything has been typed.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Empty it and put the caret back — what a supervisor does to a password field the
+    /// moment it has been read, so a rejected login does not leave it on screen.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Insert `c` at the caret and step over it.
+    pub fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the caret. No-op at the start.
+    pub fn backspace(&mut self) -> bool {
+        let Some(prev) = self.prev_boundary() else {
+            return false;
+        };
+        self.text.remove(prev);
+        self.cursor = prev;
+        true
+    }
+
+    /// Delete the character after the caret. No-op at the end.
+    pub fn delete(&mut self) -> bool {
+        if self.cursor >= self.text.len() {
+            return false;
+        }
+        self.text.remove(self.cursor);
+        true
+    }
+
+    /// Move the caret one character left.
+    pub fn left(&mut self) -> bool {
+        match self.prev_boundary() {
+            Some(prev) => {
+                self.cursor = prev;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move the caret one character right.
+    pub fn right(&mut self) -> bool {
+        let Some(c) = self.text[self.cursor..].chars().next() else {
+            return false;
+        };
+        self.cursor += c.len_utf8();
+        true
+    }
+
+    /// Move the caret to the start.
+    pub fn home(&mut self) -> bool {
+        let moved = self.cursor != 0;
+        self.cursor = 0;
+        moved
+    }
+
+    /// Move the caret to the end.
+    pub fn end(&mut self) -> bool {
+        let moved = self.cursor != self.text.len();
+        self.cursor = self.text.len();
+        moved
+    }
+
+    /// The byte offset of the character before the caret, if there is one.
+    fn prev_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor].chars().next_back().map(|c| self.cursor - c.len_utf8())
+    }
+
+    /// Apply a key, answering **whether the field changed** so a caller knows to repaint.
+    ///
+    /// One implementation of "what does this keycode do to a field", rather than one per
+    /// caller. The greeter and the applications modal are the two consumers Part A is designed
+    /// against, and key dispatch is the part they would otherwise each get subtly wrong —
+    /// Home and End are easy to omit, and a field that ignores them is noticeably broken.
+    ///
+    /// **Keys it does not claim are left alone**, which is the contract
+    /// [`Element::on_key`](crate::element::Element::on_key) is built around: Tab, Enter and
+    /// Escape belong to whatever is above the field — traversal, submission and dismissal are
+    /// not a text field's business — so this answers `false` and lets them bubble.
+    ///
+    /// ASCII only, because [`libinput::keymap::to_char`] is: the US layout is what the input
+    /// stack maps today, and a field that invented its own mapping would disagree with the
+    /// terminal about what a key means.
+    pub fn apply(&mut self, keycode: u16, modifiers: u16) -> bool {
+        match keycode {
+            KEY_BACKSPACE => self.backspace(),
+            KEY_DELETE => self.delete(),
+            KEY_LEFT => self.left(),
+            KEY_RIGHT => self.right(),
+            KEY_HOME => self.home(),
+            KEY_END => self.end(),
+            _ => match libinput::keymap::to_char(keycode, modifiers) {
+                // Control characters are not text. Ctrl-C folds to 0x03 in the keymap because
+                // a terminal needs it to; a field that inserted it would put an unprintable
+                // byte in a password.
+                Some(b) if b >= 0x20 && b < 0x7F => {
+                    self.insert(b as char);
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// `EV_KEY` codes for the editing keys, which [`libinput::keymap`] deliberately does not map —
+/// it answers "what text does this produce", and these produce none.
+const KEY_BACKSPACE: u16 = 14;
+/// See [`KEY_BACKSPACE`].
+const KEY_DELETE: u16 = 111;
+/// See [`KEY_BACKSPACE`].
+const KEY_LEFT: u16 = 105;
+/// See [`KEY_BACKSPACE`].
+const KEY_RIGHT: u16 = 106;
+/// See [`KEY_BACKSPACE`].
+const KEY_HOME: u16 = 102;
+/// See [`KEY_BACKSPACE`].
+const KEY_END: u16 = 107;
+
+/// A single-line text field, optionally masked.
+///
+/// **The caret is a `Row` split at the cursor**, not a measured x-offset: the text before it,
+/// a two-pixel fill, then the text after. A `Row` already lays children out left to right by
+/// their measured widths, so the caret lands exactly where the glyphs end without this widget
+/// measuring anything — and it stays correct for any font, because the same measurement that
+/// draws the text places the caret.
+///
+/// **Masked with [`MASK_CHAR`] per character, not per byte.** A mask built by repeating a byte
+/// would leak the encoded length of a multi-byte character and, worse, split one — so the
+/// number of stars would not be the number of keys pressed.
+///
+/// The caret is drawn from `state.active`, like the button's focus ring: a field in an
+/// unfocused window must not blink a caret for a keyboard it does not have.
+pub fn text_field<Msg>(
+    field: &TextFieldState,
+    masked: bool,
+    state: WidgetState,
+    palette: &Palette,
+) -> Element<Msg> {
+    let render = |s: &str| -> String {
+        if masked { core::iter::repeat_n(MASK_CHAR, s.chars().count()).collect() } else { s.into() }
+    };
+    let (before, after) = field.text.split_at(field.cursor);
+
+    let mut content = alloc::vec::Vec::with_capacity(3);
+    content.push(text(render(before)));
+    if state.active {
+        content.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
+    }
+    content.push(text(render(after)));
+
+    // `track` is the recessed-channel colour the scrollbar uses, and a text field is the same
+    // idea: a well the content sits in, rather than a face that stands out of the surface.
+    let mut layers = alloc::vec::Vec::with_capacity(3);
+    if state.active {
+        layers.push(fill(palette.focus_ring));
+        layers.push(padding(Insets::all(RING), fill(palette.track)));
+    } else {
+        layers.push(fill(palette.track));
+    }
+    layers.push(padding(FIELD_PAD, row(content)));
+    stack(layers).focusable()
+}
+
+
+#[cfg(test)]
+mod text_field_tests {
+    use super::*;
+    use crate::element::Node;
+
+    /// Tab, Enter and Escape are the whole reason `on_key` returns an `Option`. A field that
+    /// claimed them would make traversal, submission and dismissal impossible from a focused
+    /// field — the exact failure `Element::on_key`'s doc names.
+    #[test]
+    fn declines_the_keys_that_belong_above_it() {
+        const KEY_TAB: u16 = 15;
+        const KEY_ENTER: u16 = 28;
+        const KEY_ESC: u16 = 1;
+        for key in [KEY_TAB, KEY_ENTER, KEY_ESC] {
+            let mut f = TextFieldState::with_text("abc");
+            assert!(!f.apply(key, 0), "keycode {key} was claimed by the field");
+            assert_eq!(f.text(), "abc", "keycode {key} changed the text");
+        }
+    }
+
+    /// Negative control for the test above: a key the field *does* claim must answer `true`,
+    /// or "declines everything" would pass it.
+    #[test]
+    fn claims_the_keys_it_handles() {
+        const KEY_A: u16 = 30;
+        let mut f = TextFieldState::new();
+        assert!(f.apply(KEY_A, 0), "a letter was not claimed");
+        assert_eq!(f.text(), "a");
+    }
+
+    /// Ctrl-C folds to `0x03` in the keymap because a terminal needs it to. A field that
+    /// inserted what `to_char` returned would put an unprintable byte in a password.
+    #[test]
+    fn control_characters_are_not_text() {
+        const KEY_C: u16 = 46;
+        let mut f = TextFieldState::new();
+        assert!(!f.apply(KEY_C, librsproto::surface::MOD_CTRL), "Ctrl-C was treated as text");
+        assert_eq!(f.text(), "");
+        // Negative control: the same key without Ctrl *is* text.
+        assert!(f.apply(KEY_C, 0));
+        assert_eq!(f.text(), "c");
+    }
+
+    /// The caret is a byte offset that must never land inside a character. Every mutation
+    /// keeps it on a boundary, and slicing at it is what would panic if one did not.
+    #[test]
+    fn the_caret_stays_on_character_boundaries() {
+        let mut f = TextFieldState::new();
+        f.insert('é'); // two bytes
+        f.insert('x');
+        assert_eq!(f.cursor(), 3);
+        assert!(f.left());
+        assert_eq!(f.cursor(), 2, "left stopped inside the two-byte character");
+        assert!(f.left());
+        assert_eq!(f.cursor(), 0);
+        assert!(!f.left(), "left at the start reported a move");
+        // Slicing at the cursor is what a caret-splitting render does; it panics off-boundary.
+        let _ = f.text().split_at(f.cursor());
+        assert!(f.right());
+        assert_eq!(f.cursor(), 2, "right stopped inside the two-byte character");
+    }
+
+    /// Backspace deletes a *character*, not a byte.
+    #[test]
+    fn backspace_removes_a_whole_character() {
+        let mut f = TextFieldState::with_text("aé");
+        assert!(f.backspace());
+        assert_eq!(f.text(), "a");
+        assert!(f.backspace());
+        assert_eq!(f.text(), "");
+        assert!(!f.backspace(), "backspace on an empty field reported a change");
+    }
+
+    /// `delete` is the other direction, and is the one an implementation is most likely to
+    /// omit or alias to backspace.
+    #[test]
+    fn delete_removes_forward_and_backspace_removes_back() {
+        let mut f = TextFieldState::with_text("abc");
+        f.home();
+        assert!(f.delete());
+        assert_eq!(f.text(), "bc", "delete removed the wrong side");
+        assert_eq!(f.cursor(), 0, "delete moved the caret");
+        assert!(!f.backspace(), "backspace at the start reported a change");
+        f.end();
+        assert!(!f.delete(), "delete at the end reported a change");
+    }
+
+    /// Home and End answer whether they moved, so a caller can skip a repaint. Pressing Home
+    /// twice must not report a change the second time.
+    #[test]
+    fn home_and_end_report_only_real_movement() {
+        let mut f = TextFieldState::with_text("abc");
+        assert!(f.home());
+        assert!(!f.home(), "Home at the start reported a move");
+        assert!(f.end());
+        assert!(!f.end(), "End at the end reported a move");
+    }
+
+    /// A mask must count characters. Repeating a byte would print three stars for a
+    /// two-character string containing one multi-byte character.
+    #[test]
+    fn masking_counts_characters_not_bytes() {
+        let f = TextFieldState::with_text("aé");
+        assert_eq!(f.text().len(), 3, "the fixture is not multi-byte");
+        let e: Element<()> = text_field(&f, true, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        assert_eq!(rendered(&e), "**", "the mask leaked the byte length");
+        // Negative control: unmasked shows the real text.
+        let e: Element<()> = text_field(&f, false, WidgetState::default(), &Palette::default());
+        assert_eq!(rendered(&e), "aé");
+    }
+
+    /// The caret is drawn from `active`, so a field in an unfocused window does not blink one.
+    #[test]
+    fn the_caret_appears_only_when_active() {
+        let f = TextFieldState::with_text("ab");
+        let active: Element<()> =
+            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        let idle: Element<()> = text_field(&f, false, WidgetState::default(), &Palette::default());
+        assert_eq!(row_children(&active), 3, "no caret between the two text runs");
+        assert_eq!(row_children(&idle), 2, "an inactive field drew a caret");
+    }
+
+    /// The split is *at the cursor*, which is what puts the caret in the middle of the text
+    /// rather than always at the end.
+    #[test]
+    fn the_caret_splits_the_text_at_the_cursor() {
+        let mut f = TextFieldState::with_text("abcd");
+        f.home();
+        f.right();
+        let e: Element<()> =
+            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        assert_eq!(runs(&e), alloc::vec!["a", "bcd"], "the caret was not placed at the cursor");
+    }
+
+    /// Every `Text` run in the tree, in order.
+    fn runs<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<alloc::string::String> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut out);
+        out
+    }
+
+    fn walk<Msg>(e: &Element<Msg>, out: &mut alloc::vec::Vec<alloc::string::String>) {
+        if let Node::Text(s) = &e.node {
+            out.push(s.clone());
+        }
+        for c in e.children() {
+            walk(c, out);
+        }
+    }
+
+    /// The concatenated text, which is what a reader of the field would see.
+    fn rendered<Msg>(e: &Element<Msg>) -> alloc::string::String {
+        runs(e).concat()
+    }
+
+    /// How many children the content `Row` has — two text runs, plus the caret when active.
+    fn row_children<Msg>(e: &Element<Msg>) -> usize {
+        fn find<Msg>(e: &Element<Msg>) -> Option<usize> {
+            if let Node::Row { children, .. } = &e.node {
+                return Some(children.len());
+            }
+            e.children().find_map(find)
+        }
+        find(e).expect("the field has a content row")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
