@@ -101,6 +101,23 @@ pub struct NamespaceSpec<'a> {
     pub home: &'a [u8],
     /// The user's name, snapshotted at `/session/user`.
     pub user: &'a [u8],
+    /// Bind `/system/fonts` into the session, read-only.
+    ///
+    /// **A graphical session needs a font and a constructed namespace has none.** Every GUI
+    /// client before M7 Part E ran with an inherited *root* namespace and read
+    /// `/system/fonts/DejaVuSansMono.ttf` from there; `desktop-shell` is the first to run in a
+    /// namespace someone built, and it could not find one — the symptom was a leader that
+    /// logged "up" and exited.
+    ///
+    /// **A flag rather than always**, symmetric with [`bind_console`](Self::bind_console) and
+    /// for the same reason: a serial session has no use for a font, and a member bound for
+    /// nothing is still authority held. `session-mgr/CLAUDE.md` states the rule — adding a
+    /// member to a session namespace is a design decision each time.
+    ///
+    /// The alternative was vendoring the font into each binary, which is what `nxterm`'s
+    /// *host tests* do. At ~347 KiB per application that scales badly, and it would put a
+    /// resource in the binary that the system already serves as a resource.
+    pub bind_fonts: bool,
     /// Bind `/dev/console` into the session.
     ///
     /// **False for a graphical session**, and that is a decision rather than an omission:
@@ -193,6 +210,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         tty_endpoint,
         home,
         user,
+        bind_fonts,
         bind_console,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
@@ -293,6 +311,31 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
             kprint(b"libsession: /dev/tty bind FAIL\n");
         }
         has_tty = tr == 0;
+    }
+
+    // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
+    // uses. Read-only by construction: a subtree bind forwards to the same registration, and
+    // nothing in the session has a writable handle to it.
+    if bind_fonts && fs_endpoint != 0 {
+        let sub = b"/system/fonts";
+        let base = b"/system/fonts";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let fr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                sub.as_ptr() as u64,
+                sub.len() as u64,
+                fs_endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if fr != 0 {
+            // Non-fatal: the session exists, its clients just cannot render text. Worth
+            // reporting rather than failing a login over.
+            kprint(b"libsession: /system/fonts bind FAIL (clients cannot render text)\n");
+        }
     }
 
     // `/dev/console` → a direct-handle bind of the console device (resolved from our own

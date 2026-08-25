@@ -283,6 +283,7 @@ fn run_session(
     fs: u64,
     profile: u64,
     tty: u64,
+    draw: u64,
     user: &[u8],
     password: &[u8],
 ) -> bool {
@@ -304,11 +305,32 @@ fn run_session(
         tty_endpoint: tty,
         home: &home[..hl],
         user,
+        // Its clients render text, and a constructed namespace has no font without this.
+        bind_fonts: true,
         bind_console: false,
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
         return true;
+    }
+    // **`/dev/draw`, bound as a subtree and unscoped**, so the shell resolves both `new` (a
+    // window of its own) and `manage` (the manager channel). That breadth is deliberate and is
+    // exactly what an *application's* namespace will not get: Part E binds `/dev/draw/new`
+    // alone into those, which is what closes `TODO(manage-ungated)` — a narrow bind expresses
+    // "new and not manage" without any protocol change.
+    if draw != 0 {
+        let path = b"/dev/draw";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let dr = unsafe {
+            syscall4(SYS_NS_BIND, session_ns, path.as_ptr() as u64, path.len() as u64, draw)
+        };
+        if dr != 0 {
+            // Non-fatal: the session exists, the shell just cannot draw in it. Say so rather
+            // than failing a login the user completed.
+            kprint(b"desktop-session-mgr: /dev/draw bind FAIL (the shell cannot draw)\n");
+        } else {
+            kprint(b"desktop-session-mgr: /dev/draw bound into the session\n");
+        }
     }
     // **Reported from what was bound, not from what was asked for.** This was a hardcoded
     // "(no /dev/console)" and the gate's assertion on it passed with `bind_console: true` —
@@ -341,6 +363,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
+    // The compositor's forwarding endpoint — the one handoff the serial column does not get.
+    // `desktop-shell` needs `/dev/draw` **bound in the namespace it runs in**, not a
+    // connection handed to it: it resolves `manage` as well as `new`, and Part E gates
+    // applications by binding those two paths differently.
+    let draw_endpoint = recv_handoff(control);
     // The oracle, resolved rather than couriered — Part C. Once at startup: its lifetime is
     // the machine's, and re-resolving per attempt would mint a session per keystroke.
     let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
@@ -464,7 +491,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             greeter.reset();
             let ok = run_session(
                 root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
-                &user[..ul], &pass[..pl],
+                draw_endpoint, &user[..ul], &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.

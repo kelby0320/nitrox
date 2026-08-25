@@ -1377,6 +1377,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // something ran. `test-interactive` already pins the `libsession` line for the serial
     // column, where it is ordered against a prompt rather than against another process.
     session.expect("desktop-shell: up (graphical session leader)")?;
+    // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
+    // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
+    // it does not have — and presents a `panel` top bar. Asserting the window rather than only
+    // the process is what distinguishes a session that runs from one that is merely spawned.
+    session.expect("desktop-shell: top bar presented")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
@@ -1395,7 +1400,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
-    check_two_sessions(&transcript)?;
+    // **The transcript is written here too.** `expect` saves it on its own failures, but this
+    // check runs after `finish()` — so a concurrency failure used to report a verdict with no
+    // guest output to diagnose it from, and the file left on disk was a *stale* one from an
+    // earlier run. That is worse than none: it reads as evidence.
+    if let Err(e) = check_two_sessions(&transcript) {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let saved = fs::write(&path, &transcript).is_ok();
+        if saved {
+            println!("\nthe full transcript is at {}", path.display());
+        }
+        return Err(e);
+    }
     println!(
         "\nxtask: graphical login gate PASSED — refused a wrong password, ran a session, and a \
          serial login ran beside it ✓"

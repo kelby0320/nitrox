@@ -81,7 +81,12 @@ dependencies = [
 name = "desktop-shell"
 version = "0.1.0"
 dependencies = [
+ "libdraw",
+ "libheap",
  "libkern",
+ "librsproto",
+ "libsurface",
+ "libui",
 ]
 
 [[package]]

@@ -223,6 +223,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 tty_endpoint,
                 home: &home[..hl],
                 user: &user[..ul],
+                // A serial session renders no text, so it takes no fonts.
+                bind_fonts: false,
                 // The console *is* this column's terminal, so the serial session binds it.
                 // The graphical column will pass `false` — governing decision 3.
                 bind_console: true,
