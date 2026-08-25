@@ -193,6 +193,12 @@ fn shootdown(va: Option<VirtAddr>) {
         }
     }
 
+    // **This caller needs `interrupts_restore` to be unconditional**, and is the only one
+    // that does: `prev_if` is false (SFMASK masked `IF` at syscall entry), but *this function
+    // enabled interrupts itself* above, so "restoring" false has real work to do. While the
+    // `else` arm was a no-op — commented "leave IF clear — it already is" — the rest of every
+    // SMP `sys_memory_unmap` ran with `IF` set, out through the `sysretq` stub's window on the
+    // user stack. Do not reintroduce that no-op; `syscall_dispatch` asserts against it.
     // SAFETY: ring-0; restore the interrupt state captured above.
     unsafe { Cpu::interrupts_restore(prev_if) };
     // Re-enable preemption last; a reschedule latched during the window (a

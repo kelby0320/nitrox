@@ -17389,3 +17389,163 @@ Two corrections to my own reading on the way: an initial 8 clean runs suggested 
 decayed far below the log's 15 %, and two later failures said otherwise — the smaller sample was
 the wrong one to believe. And it is not caused by the retrofit; the plan changed which process
 runs these tests, not the kernel.
+
+## 2026-08-24 — The `sysretq` exit window: a real bug found, and the fault it did not fix
+
+Chasing `TODO(unexplained-df)`. One genuine gap found and closed, one method worth keeping, one
+correction to how I was reading the evidence — and the fault itself is still open.
+
+**The gap.** The syscall exit stub restored the user `RSP` two instructions before leaving ring 0:
+
+```
+pop rax        // return value
+pop rsp        // user stack loaded — CS is still kernel
+sysretq
+```
+
+Interrupts were not re-masked before that `pop rsp`, so an interrupt could arrive in that window.
+(This entry first said "the syscall body runs with `IF` set — a blocked syscall resumes that way".
+That is wrong, and the next section is what it cost.) At CPL 0 there is no privilege change, so the CPU
+pushes its frame onto the **user** stack; under SMAP that push faults, and delivering the fault on
+the same stack is a `#DF`. A `cli` before `pop rsp` closes it — `sysretq` restores the user's
+`IF` from R11 on the way out.
+
+**The entry side already carried this exact reasoning.** `idt.rs` puts NMI on IST2 because
+"`syscall_entry` has a two-instruction window after `swapgs` where RSP is still the *user* stack",
+and spells out the `#PF`-then-`#DF` chain. On entry, SFMASK masks `IF` and IST2 covers NMI. On
+exit neither applied, and nobody had asked the question in that direction. A hazard understood
+once is not a hazard understood everywhere it occurs.
+
+**The method is the reusable part: widen the window instead of waiting for the flake.** 256
+`pause` instructions between `pop rsp` and `sysretq` turn a ~14 % intermittent into a
+deterministic `#DF` on the next boot; the same widened window with the `cli` in front boots clean.
+Two runs, and it establishes the mechanism *and* the fix — against dozens of runs to move a rate
+estimate. For any race with a nameable window, this is cheaper and more conclusive than sampling.
+
+**A correction, and then a correction to the correction — the second one is the lesson.** I built
+a hypothesis on the dump's `rip`, then dismissed it: for `#DF` the pushed instruction pointer is
+architecturally undefined, and this one was identical across rebuilds while decoding to a
+different symbol in each.
+
+**Dismissing it was the bigger mistake.** QEMU pushed a meaningful `rip`; it "decoded to a
+different symbol" because it was being compared against the *wrong build's* symbol table. Read
+against the failing build's `IA32_LSTAR` (`0xffffffff8001dfa4`), `0xffffffff8001e000` is
+`syscall_entry + 0x5C` — in that layout, exactly the `sysretq` instruction. The clue had been
+pointing at the answer from the first dump, and I talked myself out of it with a true-but-
+inapplicable architectural fact.
+
+So the dump now prints **`LSTAR` beside `CR2` for vector 8**, and `rip - lstar` decodes itself.
+That address is otherwise unrecoverable — every rebuild moves it and the failing kernel is gone by
+the time anyone reads the transcript.
+
+**Whether it fully closed the fault is still open.** After the `cli`: **1 failure in 49 boots**
+(~2 %) against **2 in 14** (~14 %) before — a ~7× reduction, with the single post-fix failure not
+recurring in the 45 boots since. Fisher's exact gives p ≈ 0.09: suggestive, not proof. That one
+failure cannot be decoded retroactively because its build's `LSTAR` was not recorded, which is the
+gap the dump now closes.
+
+**Hypotheses closed with evidence rather than left hanging:** SFMASK is armed correctly on every
+CPU (`0x40600` = IF | DF | AC, read by a probe on every ring-3 descent — and the probe was itself
+validated by breaking SFMASK deliberately and watching it fire); `enter_user` builds its `iretq`
+frame on the kernel stack and never loads a user `RSP` in ring 0; the kstack install path was
+ruled out earlier.
+
+**And a dead end recorded so it is not repeated:** raising the timer rate is not an accelerator
+for this. At 100× (`TICK_NS` 100 µs) three of six runs failed — but with a `#PF` at `cr2 = 0x10`
+and a `vector 0x46` with `rsp = 0`, neither matching the fault being hunted. It manufactures its
+own faults. "The probe increased failures" is not "the probe increased failures of the kind I am
+hunting", and I nearly drew a conclusion from it.
+
+Landing the `cli` on its own merits: the window is real, the positive control demonstrates it is
+exploitable, and the fix costs one instruction on the syscall return path.
+
+## 2026-08-24 — `interrupts_restore` had an unstated precondition, and `tlb::shootdown` broke it
+
+The previous entry closed a window and left the real question open: *why was `IF` set at a
+syscall's exit at all?* It answered that with a guess — "a blocked syscall resumes that way" —
+and the guess was wrong. `switch_into` captures a thread's `IF` **before** the `SCHED` acquire,
+where SFMASK has already made it false, and restores that; a resuming syscall returns masked.
+Writing a plausible cause into the log instead of measuring one is what this entry corrects.
+
+**Measure first, and the answer is unambiguous.** Counters at syscall entry and exit over one
+boot: of **60,000** syscalls, entry was `IF=0` on all 60,000, and **647 returned with `IF` set —
+all 647 `SYS_MEMORY_UNMAP`**. Not the entry path, not the scheduler: something in that one
+syscall's body.
+
+**It is `tlb::shootdown`, and the bug is one level below it.** `shootdown` enables interrupts
+itself, and has to: it spins for peer ACKs, and an `IF`-masked spinner cannot service the
+shootdown IPI a peer is sending it at the same time — mask both sides and they deadlock. Having
+enabled them, it called `interrupts_restore(prev_if)` with the `prev_if = false` captured on the
+way in. And `interrupts_restore` was:
+
+```rust
+if prev { unsafe { regs::sti() } }
+// else: leave IF clear — it already is.
+```
+
+The `else` comment was true for every caller that arrived via `interrupts_disable`, and false for
+the one caller that had enabled `IF` on its own. The restore did nothing. **The whole tail of
+every SMP `sys_memory_unmap` after the shootdown ran with interrupts enabled**, out through the
+`sysretq` stub's ring-0-on-user-stack window — a far wider exposure than the two instructions the
+`cli` covered, and consistent with the `cli` moving the rate to ~2 % rather than to 0.
+
+**Fix the class, not the instance.** `interrupts_restore` is now unconditional (`if prev { sti }
+else { cli }`). Patching `tlb.rs`'s call site would have fixed this bug and left the trap armed
+for the next caller that manages `IF` itself; the other four call sites satisfy the old
+precondition only by accident of how they got there. A function named *restore* that silently
+declines to restore is the defect — one `cli` on a cold path buys the name back.
+
+**The guard was landing in a hole, and the re-review found it by running it.** A
+`debug_assert` on the syscall path is the *shallow-stack* panic case — `syscall_dispatch`'s
+frame sits a few hundred bytes below the stack top — and the panic handler carried its own copy
+of the poor-man's backtrace with **no page probe**, under a `SAFETY` comment asserting the thing
+that is false: "reading within the current kernel stack, which is mapped". A kernel stack's
+guard page is at the *bottom*, so scanning **up** 96 words from a shallow `rsp` runs off the top
+into unmapped vmap. The `#PF` lands *before* `arch::debug_exit(0x11)`, so the panic never
+delivers its verdict: the operator gets the correct one-line diagnosis, then forty lines of
+unrelated fault dump, then ninety seconds, then `TIMED OUT … likely a hang` — the wrong
+diagnosis, and precisely what `idt.rs`'s IST2 comment exists to prevent.
+
+**The fix already existed 170 lines away** and was written for this exact failure: `idt.rs`'s
+exception dump probes `Paging::translate` once per page and stops with `(stack ends at … —
+stopping)`, added after a CI capture came back as an empty candidate list followed by a `#PF`
+whose `CR2` was the page above `RSP`. The panic handler is now a caller of that same scanner
+(`arch::dump_stack_candidates`) instead of a second copy of the loop — the duplication is what
+let one copy learn the lesson and the other not. Two callers, one scan, one guard-page probe.
+
+Demonstrated both ways rather than reasoned about: with the `else { cli }` arm removed, the
+assert fires on the **first** boot, the scan stops at `0xffffc000000e9000` — the same address
+that was `CR2` in the re-review's `#PF` — and the run ends `FAILED (qemu exit 35)`. The verdict
+arrives. Running it also caught a defect no amount of reading would have: the header line
+printed twice, because the extracted scanner emits it and the old `writeln!` had been left
+behind.
+
+**An unrelated gate failure, diagnosed by an instrument someone else left behind.** Running the
+full set afterwards, `check-terminal` failed once — not a `#DF`: the boot was clean, `nxterm`
+reported `clicked` and `focus=1`, and the gate timed out on its *position* assertion, having
+wanted a press at `(397, 295)` and seen one at `(495, 351)`. That difference is exactly one
+`(-98, -56)` motion step, so 8 of the 9 injected moves arrived and one PS/2 packet was dropped.
+Six re-runs were clean: 1 in 68.
+
+This closes the open question in the 2026-08-18 promotion note, which recorded "the **one
+unreproduced failure** … at the click step: it is still unexplained", and justified promoting the
+gate anyway on the grounds that it now "asserts *where* the press landed before asserting that
+`nxterm` received it, so a recurrence reports coordinates rather than a bare timeout" — adding
+that the old gate "passed with a motion packet dropped, having never checked the cursor reached
+the point its arithmetic named". The recurrence came, it reported coordinates, and they name the
+cause. Dropped motion packets were always happening; the gate simply could not see them.
+
+**It is not this change's doing**, and the sample says so rather than the argument: all 68 of
+those runs had the `interrupts_restore` fix in. The mechanism is also the wrong shape — 29 motions
+injected in a tight host loop into a 16-byte PS/2 queue overflow on their own, and the extra
+masked window this change adds is the syscall's short tail, against a shootdown spin that runs
+with interrupts *enabled* and is unchanged. Left unfixed and recorded here rather than folded
+into an unrelated PR; the fix is gate-side (verify the cursor position and re-drive, rather than
+assume 29 relative moves all land).
+
+**Both polarities of the new guard were demonstrated.** A `debug_assert!(!interrupts_enabled())`
+at `syscall_dispatch`'s exit fires within two `test-qemu` boots on the unfixed tree and holds 8/8
+with the fix. Its *first* run was silent — `shootdown` returns early when no peer CPU is online,
+so that boot never took the slow path — and rather than read silence as success I forced
+`interrupts_enable()` in front of the assert and watched it panic. Twice this session a silent
+probe pointed the wrong way; the cost of proving an instrument can fire is one run.

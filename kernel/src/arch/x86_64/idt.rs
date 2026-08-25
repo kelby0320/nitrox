@@ -730,10 +730,13 @@ fn vector_name(vector: u64) -> &'static str {
         5 => "#BR bound range exceeded",
         6 => "#UD invalid opcode",
         7 => "#NM device not available",
-        // `TODO(unexplained-df)` — an intermittent `#DF` is open, at ~14 % of local **TCG**
-        // boots and unseen in 83 CI boots (all `--kvm`). Kernel `rip`, a *user* `rsp`, stack
-        // "not scannable". Cause unestablished; see `deferred-decisions.md` for what has been
-        // ruled out.
+        // `TODO(unexplained-df)` — an intermittent `#DF` that ran at ~14 % of local **TCG**
+        // boots (unseen in 83 CI boots, all `--kvm`): kernel `rip`, a *user* `rsp`, stack
+        // "not scannable". Two causes found and fixed — the `sysretq` stub's unmasked window
+        // on the user stack, and `interrupts_restore(false)` being a no-op, which let
+        // `tlb::shootdown` leave `IF` set for the rest of every SMP `sys_memory_unmap`.
+        // 45/45 TCG boots clean since. The entry stays open until it has soaked; see
+        // `deferred-decisions.md` for the evidence and what was ruled out.
         8 => "#DF double fault",
         10 => "#TS invalid TSS",
         11 => "#NP segment not present",
@@ -953,9 +956,24 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "\n*** CPU EXCEPTION ***");
     let _ = writeln!(w, "  vector  {:#04x}  {}", f.vector, vector_name(f.vector));
     let _ = writeln!(w, "  error   {:#018x}", f.error_code);
-    if f.vector == 14 {
-        // #PF: CR2 holds the faulting linear address.
+    if f.vector == 14 || f.vector == 8 {
+        // #PF: CR2 holds the faulting linear address. **#DF too** — a double fault is usually
+        // a fault taken while delivering another, so CR2 still holds the address the *first*
+        // one could not translate, and the pushed `rip` is architecturally undefined for #DF.
         let _ = writeln!(w, "  cr2     {:#018x}", regs::read_cr2());
+    }
+    if f.vector == 8 {
+        // **`LSTAR`, so the dump decodes itself.** The `syscall` stub is where a `#DF` with a
+        // kernel `cs` and a *user* `rsp` comes from: two short windows where ring 0 runs on
+        // the user stack, one at entry before `mov rsp, gs:[…]` and one at exit around
+        // `pop rsp` / `sysretq`. `rip - lstar` says immediately whether the fault was inside
+        // the stub and which end — and the address is otherwise unrecoverable, because every
+        // rebuild moves it and the failing kernel is long gone by the time anyone reads the
+        // transcript. Chasing `TODO(unexplained-df)` cost a full pass for want of this line:
+        // the `rip` was dismissed as meaningless when it in fact decoded to `sysretq`.
+        // SAFETY: `IA32_LSTAR` is architectural in long mode and this reads it in ring 0.
+        let lstar = unsafe { regs::rdmsr(super::syscall::MSR_LSTAR) };
+        let _ = writeln!(w, "  lstar   {:#018x}  (rip - lstar = offset into syscall_entry)", lstar);
     }
     let _ = writeln!(w, "  rip {:#018x}  cs {:#06x}", f.rip, f.cs);
     let _ = writeln!(w, "  rsp {:#018x}  ss {:#06x}", f.rsp, f.ss);
@@ -977,6 +995,17 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     Cpu::stop_the_machine()
 }
 
+/// Kernel text: the higher-half image base up to a generous bound. A stack word outside
+/// this range is data, not a return address.
+const TEXT_LO: u64 = 0xffff_ffff_8000_0000;
+const TEXT_HI: u64 = 0xffff_ffff_8100_0000;
+
+/// Stack words to scan. The interesting frames are within a few hundred bytes; the page
+/// probe in [`scan_stack_candidates`] stops the walk earlier whenever the stack does.
+/// (96 rather than the 64 this dump used, because the panic handler's own copy scanned
+/// 96 — taking the larger means neither caller loses depth to the unification.)
+const STACK_SCAN_WORDS: usize = 96;
+
 /// Scan the faulting stack for values that look like kernel-text addresses and
 /// print them, innermost first — a poor man's backtrace.
 ///
@@ -993,13 +1022,6 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
 /// perturb what it is measuring, and this named the faulting caller in one run after
 /// three rounds of hot-path probes had found nothing.
 fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
-    // Kernel text: the higher-half image base up to a generous bound. Values
-    // outside this are data, not return addresses.
-    const TEXT_LO: u64 = 0xffff_ffff_8000_0000;
-    const TEXT_HI: u64 = 0xffff_ffff_8100_0000;
-    /// Stack words to scan. The interesting frames are within a few hundred bytes.
-    const WORDS: usize = 64;
-
     // A ring-0 fault keeps the faulting stack (long mode always pushes SS:RSP), so
     // `f.rsp` is where that context's stack continues.
     let sp = f.rsp;
@@ -1033,9 +1055,43 @@ fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
         let label = ["rip", "cs", "rflags", "rsp", "ss"][i];
         let _ = writeln!(w, "    [rsp+{:#04x}] {label:>6} = {val:#018x}", i * 8);
     }
+    scan_stack_candidates(sp, w);
+}
+
+/// Scan a stack for words that look like kernel return addresses, **probing each page
+/// before reading it**.
+///
+/// Shared by the exception dump and the panic handler. The panic handler used to carry
+/// its own copy of this loop with no probe at all, under a `SAFETY` comment asserting
+/// the very thing that is not true — "reading within the current kernel stack, which is
+/// mapped". A kernel stack's guard page is at the *bottom*, so walking **up** from a
+/// shallow `rsp` leaves the mapped region at the stack top and faults. That turned any
+/// panic taken near the top of a stack — the normal case for a syscall-path assertion,
+/// whose frame sits a few hundred bytes down — into a `#PF` raised *before*
+/// `debug_exit` could write the fail verdict, so the run died on the 90 s wall-clock
+/// timeout and reported `likely a hang` over the correct one-line diagnosis (PR #231
+/// re-review, finding 6).
+/// Dump return-address candidates from the **caller's own** stack.
+///
+/// For a context with no [`ExceptionFrame`] to read `rsp` from — the panic handler. Reading
+/// this function's own stack pointer is correct and slightly better than the caller's: its
+/// frame sits just below, so the caller's return address is inside the scanned range.
+pub fn dump_stack_candidates(w: &mut impl Write) {
+    let sp: u64;
+    // SAFETY: reads the stack pointer into a register; touches no memory.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack)) };
+    scan_stack_candidates(sp, w);
+}
+
+fn scan_stack_candidates(sp: u64, w: &mut impl Write) {
+    if sp < TEXT_LO && !(0xffff_8000_0000_0000..0xffff_ffff_8000_0000).contains(&sp) {
+        let _ = writeln!(w, "  (stack pointer {sp:#018x} not scannable)");
+        return;
+    }
+    let root = PhysAddr::new(regs::read_cr3() & !0xFFF);
     let _ = writeln!(w, "  return-address candidates (innermost first):");
     let mut probed_page = u64::MAX;
-    for i in 0..WORDS {
+    for i in 0..STACK_SCAN_WORDS {
         let addr = sp + (i as u64) * 8;
         let page = addr & !(PAGE_SIZE as u64 - 1);
         if page != probed_page {
@@ -1070,11 +1126,15 @@ pub fn init() {
         //
         // **NMI (vector 2) runs on IST2**, live since `stop_the_machine` made it a delivered
         // vector — before that nothing in the tree sent an NMI. An IST=0 gate does not switch
-        // stacks, and NMI can arrive when RSP is not a kernel stack: `syscall_entry` has a
-        // two-instruction window after `swapgs` where RSP is still the *user* stack. The
-        // frame push would `#PF` under SMAP, take that fault on the same bad stack, and
-        // `#DF` — the machine still stops, but over a misleading double-fault dump instead of
-        // the real diagnosis.
+        // stacks, and NMI can arrive when RSP is not a kernel stack. The frame push would
+        // `#PF` under SMAP, take that fault on the same bad stack, and `#DF`.
+        //
+        // **`syscall_entry` has two such windows, and IST2 is the only thing covering the
+        // second.** At entry, RSP is the user stack for two instructions after `swapgs`; there
+        // SFMASK masks `IF`, so IST2 is what NMI needs. At exit, RSP is the user stack between
+        // `pop rsp` and `sysretq`; there a `cli` masks `IF` — but `cli` does not mask NMI, so
+        // IST2 is *again* the only cover. Do not conclude from SFMASK alone that IST2 is
+        // redundant: that reasoning reaches only the entry half (PR #231 review, finding 3).
         let ist = match vector {
             8 => 1,
             2 => 2,

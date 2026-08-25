@@ -46,7 +46,7 @@ use crate::syscall::table;
 const MSR_EFER: u32 = 0xC000_0080;
 const EFER_SCE: u64 = 1 << 0; // syscall enable
 const MSR_STAR: u32 = 0xC000_0081;
-const MSR_LSTAR: u32 = 0xC000_0082;
+pub(super) const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -244,7 +244,27 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     // SAFETY: the stub built a complete frame at the kernel stack top and
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };
-    table::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9)
+    let ret = table::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
+    // **A syscall body must not return with interrupts enabled.** `SFMASK` masks `IF` on
+    // entry and nothing in a syscall is entitled to leave it set: the stub's tail runs two
+    // instructions in ring 0 on the *user* stack (`pop rsp` / `sysretq`), and an interrupt
+    // there pushes onto that stack, faults under SMAP, and double-faults.
+    //
+    // The `cli` in the stub makes the window safe regardless — this catches the *cause*
+    // rather than the symptom, and names the syscall so the culprit is one line of log
+    // instead of a boot-loop.
+    //
+    // It is not decoration: on the tree before `tlb::shootdown` stopped leaking an enabled
+    // `IF`, it panics within two `test-qemu` boots. (The figure of *647 leaks in 60,000
+    // syscalls* that appears in the log entry came from a separate **counting** probe — a
+    // `debug_assert` stops at its first fire and could never have reported it. Two
+    // instruments, two claims; PR #231 re-review, finding 7.)
+    debug_assert!(
+        !<crate::arch::Cpu as crate::arch::cpu::ArchCpu>::interrupts_enabled(),
+        "syscall {} returned with interrupts enabled",
+        f.rax
+    );
+    ret
 }
 
 // --- Entry stub -----------------------------------------------------------
@@ -309,6 +329,39 @@ extern "C" fn syscall_entry() -> ! {
         "pop rdi",
         "pop rcx",                  // user RIP for sysretq
         "pop rax",                  // return value
+        // **Mask interrupts before the user stack is loaded**, and leave them masked until
+        // `sysretq` restores the user's RFLAGS (with IF) from R11.
+        //
+        // Between `pop rsp` and `sysretq` the CPU is in ring 0 with the *user* stack. An
+        // interrupt arriving there takes no privilege change, so it pushes its frame onto
+        // that stack; under SMAP the push faults, and delivering the fault on the same stack
+        // is a `#DF`.
+        //
+        // **What made the window live was `tlb::shootdown` leaking an enabled `IF`**, not — as
+        // a first draft of this comment said — a blocked syscall resuming with interrupts on.
+        // That path cannot do it: `switch_into` captures the thread's `IF` *before* the
+        // `SCHED` acquire, which SFMASK has already made false, and restores that. Measured:
+        // of 60,000 syscalls in a boot, 647 returned with `IF` set and **all 647** were
+        // `SYS_MEMORY_UNMAP`; body entry was `IF=0` on all 60,000 (PR #231 review, finding 1).
+        //
+        // That leak is fixed. The `cli` stays regardless: the stub should not depend on every
+        // kernel path having kept `IF` masked, and `syscall_dispatch`'s exit assertion is what
+        // catches a path that does not.
+        //
+        // The **entry** side already carried this reasoning: `idt.rs` puts NMI on IST2 because
+        // "`syscall_entry` has a two-instruction window after `swapgs` where RSP is still the
+        // *user* stack". There, SFMASK masks IF and IST2 covers NMI. Here neither applied.
+        //
+        // Proven by widening rather than by waiting: 256 `pause`s in this window make the
+        // `#DF` deterministic on the next boot, and the same widened window with this `cli`
+        // boots clean.
+        //
+        // The `cli` alone left the fault at a lower rate, which said something else was
+        // leaving `IF` set. It was: `interrupts_restore(false)` used to be a no-op, so
+        // `tlb::shootdown` — which enables interrupts itself and must — left them enabled for
+        // the rest of every SMP `sys_memory_unmap`. Fixed in `cpu.rs`; `syscall_dispatch`
+        // asserts on the way out that no body does it again.
+        "cli",
         "pop rsp",                  // restore user RSP
         // Every GPR has now been restored to the user's own saved value
         // (the pops above), except RAX (return value), RCX (user RIP), and
