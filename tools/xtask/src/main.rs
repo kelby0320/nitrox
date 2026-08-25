@@ -1393,9 +1393,49 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // column, where it is ordered against a prompt rather than against another process.
     session.expect("desktop-shell: up (graphical session leader)")?;
 
-    let _ = session.child.kill();
+    // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
+    //    asserted rather than tested. The graphical session is running *now* — its leader
+    //    blocks, so it does not end on its own — and the serial column's prompt has been live
+    //    on this same boot the whole time. Logging in there proves the two supervisors do not
+    //    contend: neither arbitrates, there is no registry, and serial stays the recovery
+    //    path by construction rather than by care.
+    //
+    //    The same user, twice, with two namespaces. That cost is named and accepted in
+    //    `graphical-session.md` §6.2 — it matches Linux, where `getty` and `gdm` do not
+    //    coordinate either.
+    session.send(DEMO_USER)?;
+    session.expect("password:")?;
+    session.send(DEMO_PASSWORD)?;
+    session.expect("/home>")?;
+
+    let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
-    println!("\nxtask: graphical login gate PASSED — refused a wrong password, then ran a session ✓");
+    check_two_sessions(&transcript)?;
+    println!(
+        "\nxtask: graphical login gate PASSED — refused a wrong password, ran a session, and a \
+         serial login ran beside it ✓"
+    );
+    Ok(())
+}
+
+/// Assert the graphical session was still running when the serial one started.
+///
+/// **An absence, which `expect` cannot express.** The two logins succeeding in sequence does
+/// not by itself prove they overlapped: a graphical session that ended the moment the serial
+/// one began would produce the same ordered lines. What distinguishes them is that
+/// `desktop-session-mgr` never reported a session ending — its leader blocks, so the only way
+/// that line appears is if the session came down.
+fn check_two_sessions(transcript: &str) -> R<()> {
+    if !transcript.contains("desktop-shell: up (graphical session leader)") {
+        return Err("the graphical session never started, so nothing was concurrent".into());
+    }
+    if transcript.contains("desktop-session-mgr: session ended") {
+        return Err("the graphical session ended before the serial login finished, so the two \
+             were sequential rather than concurrent. Its leader blocks and should outlive this \
+             gate — check the transcript for why it exited"
+            .into());
+    }
+    println!("xtask: a graphical and a serial session ran at the same time ✓");
     Ok(())
 }
 

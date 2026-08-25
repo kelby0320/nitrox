@@ -17810,3 +17810,60 @@ supervisor's login — the shape of the `TODO(tty-output-queue)` bug. Doing it p
 timer queue and per-session deferral, which is disproportionate to a hobby OS with no network
 stack.
 
+## 2026-08-25 — M7 Part D: the graphical arm starts existing for a person, and a message that was not checking itself
+
+`desktop-session-mgr` runs: a greeter window that draws before anyone has authenticated, takes
+a username and a masked password, authenticates through the same `libsession` and the same
+`/svc/auth` the serial column uses, builds a session namespace **without `/dev/console`**, and
+spawns a leader into it. `cargo xtask check-login` drives the whole thing over PS/2 against a
+release image.
+
+**This is where the display arm stops being test-only.** Every graphical client before it is
+`selftest`-gated — a release boot bound `/dev/draw`, drew a cursor and spawned nothing — so
+until now nothing on screen existed for anyone but a gate.
+
+**A new bin crate needs more than a `Cargo.toml`, and failing is how that surfaced.** Without
+`.cargo/config.toml` and `build.rs` the crate builds cleanly, stages into `/bin`, resolves at
+spawn, and then fails `SYS_PROCESS_SPAWN` with `InvalidArgument`: the ELF is `ET_DYN` and the
+loader rejects PIE. Nothing upstream of the spawn complains, so the error code was the only
+way in. Five existing crates carry a `.cargo/config.toml` whose header says "Build config for
+the `hello` userspace program" regardless of which crate it is in; the new one says what it
+prevents instead.
+
+**Part A's `on_key` `Option` earned itself here.** `TextFieldState::apply` declines Tab, Enter
+and Escape, so the greeter handles focus movement and submission while the fields handle text,
+and neither knows about the other. That was the stated reason for the `Option` return a
+milestone before anything used it.
+
+**A control found my own assertion was decoration**, which is the third time this milestone.
+`session namespace built (no /dev/console)` was a hardcoded string, so `check-login` passed
+just as happily with `bind_console: true` — the one claim Part D exists to establish, asserted
+against a message that never checked it. `libsession` now records what it bound
+(`session_has_console`) and the supervisor reports from that; with the control re-applied the
+guest prints `(WITH /dev/console)` and the gate fails. The lesson generalises past this
+instance: **a log line is not evidence unless it is derived from the thing it claims.**
+
+**A greeter has no echo, so the gate is paced on a redraw counter.** What a person typed is on
+screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
+`check-terminal` types one character at a time to stay behind. The counter is a *count*,
+deliberately: reporting what was typed would put a password on the console and reporting its
+length would leak it more slowly.
+
+**One ordering was removed rather than asserted.** `libsession: desktop-shell spawned …` comes
+from the parent after the setup message; `desktop-shell: up` comes from the child's first
+instruction. Their order is a race between two processes, and asserting it would be the flake
+PR #227's review caught — one that passes until it does not. The child's line is the stronger
+claim anyway: a parent saying it spawned something is not evidence the something ran.
+
+**Concurrency is demonstrated rather than decided.** `check-login` logs in graphically and then
+on serial in the same boot, and requires that `desktop-session-mgr` never reported a session
+ending in between — an absence `expect` cannot express, because two logins succeeding in
+sequence would look identical to two that overlapped. Negative-controlled by making the
+graphical leader exit immediately, which produces exactly that line and fails the gate.
+
+**The greeter's window lands at the origin before every other client's**, and that is now load-
+bearing rather than incidental: `service-mgr` brings the login chain up before declared
+services, so the greeter is bottom-most and the reference windows `check-display` and
+`check-terminal` depend on stack above it. It is also why `check-login` must boot the *release*
+image — in a `--selftest` boot the greeter holds no keyboard, so nothing typed would reach it.
+

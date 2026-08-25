@@ -1678,7 +1678,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       principal, home } | DENIED` is untouched, and that remains the evidence the split was drawn
       in the right place. What changes is plumbing, and saying so precisely is the correction.
 
-### Part D — `desktop-session-mgr`, the greeter, and the gate
+### Part D — `desktop-session-mgr`, the greeter, and the gate ✅ complete (2026-08-25)
 
 - [x] **`desktop-session-mgr`** ✅ (2026-08-25), `session-mgr`'s graphical twin: spawned by `service-mgr` with
       `BIND_NAMESPACE` re-delegated, plus the fs/profile/tty endpoints, an auth channel and — the
@@ -1703,7 +1703,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       driven by the PS/2 injection `check-input` and `check-terminal` already use, adjudicated on
       the host. Parts E and F then land against a gate that exists.
 
-- [ ] **Concurrency is decided: two independent sessions** (`graphical-session.md` §6.2,
+- [x] **Concurrency is decided: two independent sessions** ✅ (2026-08-25) — and demonstrated, not just decided: `check-login` logs in graphically and then on serial in the same boot, and requires that `desktop-session-mgr` never reported a session ending in between. (`graphical-session.md` §6.2,
       `session-and-auth.md`'s deferred "one console, one session at a time"). `session-mgr` and
       `desktop-session-mgr` each authenticate and run a session, unaware of each other. Serial
       stays the recovery path by construction, which is governing decision 3 holding trivially
