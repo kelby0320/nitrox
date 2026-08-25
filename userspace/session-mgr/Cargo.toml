@@ -8,6 +8,9 @@ libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }
 libstream = { path = "../libstream", features = ["io"] }
 libheap = { path = "../libheap" }
+# The shared session core, M7 Part B. This column moves onto it first so the serial login
+# proves it before the graphical one depends on it.
+libsession = { path = "../libsession" }
 
 # Bin-only, bare-target supervisor (no host-testable lib yet — Part D is syscall
 # plumbing; Part E may extract a testable line-editor/policy). Alloc-free — fixed

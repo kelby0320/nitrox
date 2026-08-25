@@ -1,0 +1,26 @@
+[package]
+name = "libsession"
+version = "0.1.0"
+edition = "2024"
+
+# The shared session core: **authenticate → construct the namespace → spawn the leader →
+# reap → tear down**. The same logic in both columns against different arguments, following
+# Linux's PAM precedent — a shared *library*, not a merged process
+# (`docs/design/graphical-session.md` §4).
+#
+# The greeter — the part that draws, or prompts on a terminal — stays in each supervisor,
+# which is where the two columns genuinely differ. What is here is everything after the
+# credentials are in hand and everything before the leader has exited.
+#
+# **`libkern` + `librsproto` + `libstream`, and no `libos`**, because `session-mgr` links
+# this and that is `session-mgr`'s rule (`userspace/session-mgr/CLAUDE.md`). Satisfiable
+# because `libstream` and `librsproto` depend only on `libkern`. No `libheap` either: an
+# allocator is the *binary's* to register, and this crate only uses `alloc`.
+[dependencies]
+libkern = { path = "../libkern" }
+librsproto = { path = "../librsproto" }
+libstream = { path = "../libstream", features = ["io"] }
+
+[lib]
+name = "libsession"
+path = "src/lib.rs"
