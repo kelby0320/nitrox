@@ -78,6 +78,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-shell"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
 name = "eshell"
 version = "0.1.0"
 dependencies = [

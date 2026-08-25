@@ -34,6 +34,7 @@ use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
 use libui::widget::{Palette, TextFieldState, WidgetState, text_field};
+use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
 
 /// `alloc` backing: the toolkit builds an element tree per frame and `libsession` builds the
 /// session's environment record.
@@ -94,6 +95,13 @@ struct Greeter {
     denied: bool,
 }
 
+/// `EV_KEY` codes the greeter acts on itself. The fields claim everything else through
+/// [`TextFieldState::apply`], which declines exactly these three so they can reach here — the
+/// reason `Element::on_key` returns an `Option` at all.
+const KEY_TAB: u16 = 15;
+/// See [`KEY_TAB`].
+const KEY_ENTER: u16 = 28;
+
 impl Greeter {
     /// An empty greeter, caret in the username field.
     fn new() -> Self {
@@ -130,6 +138,51 @@ impl Greeter {
         padding(Insets::all(16), column(rows))
     }
 
+    /// The field the caret is in.
+    fn active_field(&mut self) -> &mut TextFieldState {
+        match self.focus {
+            Focus::User => &mut self.user,
+            Focus::Password => &mut self.password,
+        }
+    }
+
+    /// Apply a key. `true` if anything changed and the greeter must be redrawn.
+    ///
+    /// **Tab and Enter are handled here, not by the field**, which is the split
+    /// `Element::on_key`'s `Option` return exists for: a field that swallowed Tab could never
+    /// be left, and one that swallowed Enter could never submit.
+    fn key(&mut self, keycode: u16, modifiers: u16) -> bool {
+        match keycode {
+            KEY_TAB => {
+                self.focus = match self.focus {
+                    Focus::User => Focus::Password,
+                    Focus::Password => Focus::User,
+                };
+                true
+            }
+            _ => {
+                // Any edit clears a previous refusal: a "login incorrect" that outlives the
+                // typing that answers it reads as a second failure.
+                let changed = self.active_field().apply(keycode, modifiers);
+                if changed && self.denied {
+                    self.denied = false;
+                }
+                changed
+            }
+        }
+    }
+
+    /// Clear both fields and put the caret back — after a session ends, and after a refusal.
+    ///
+    /// **The password is cleared the moment it has been read**, whichever way the attempt
+    /// went. A greeter that left it on screen would keep a credential in a window that
+    /// outlives every session.
+    fn reset(&mut self) {
+        self.user.clear();
+        self.password.clear();
+        self.focus = Focus::User;
+    }
+
     /// Render the current state into a fresh framebuffer.
     fn render(&self, font: &Font) -> MemFramebuffer {
         let geometry = Geometry::with_pitch(GREETER_W, GREETER_H, GREETER_PITCH, PixelFormat::XRGB8888)
@@ -164,12 +217,122 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, base as usize as *mut u8))
 }
 
+/// Receive the next control message on `ctrl` and return its transferred `handles[0]`.
+///
+/// A handoff carries exactly one moved handle and no payload; `0` on failure. The same shape
+/// `session-mgr` uses, and positional for the same reason — `service-mgr` sends an empty
+/// message for an endpoint it does not have, so a missing one shortens no one's count.
+fn recv_handoff(ctrl: u64) -> u64 {
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = ctrl;
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+    };
+    if waited != 1 {
+        return 0;
+    }
+    // SAFETY: valid recv out-params.
+    let r = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ctrl,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    if r != 0 {
+        return 0;
+    }
+    // SAFETY: the kernel wrote `RECV_COUNT` transferred handles into `RECV_HANDLES`.
+    unsafe {
+        if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] }
+    }
+}
+
+/// Buffers for the endpoint handoff.
+static mut RECV_MSG: [u8; 256] = [0; 256];
+/// See [`RECV_MSG`].
+static mut RECV_HANDLES: [u64; 8] = [0; 8];
+/// See [`RECV_MSG`].
+static mut RECV_COUNT: usize = 0;
+
+/// One attempt at a login: authenticate, build the session, run the leader, tear down.
+///
+/// Returns once the session has ended, so the greeter can draw again. `false` if the
+/// credentials were refused, which is the only outcome the greeter shows differently.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    root_ns: u64,
+    notif: u64,
+    auth_ch: u64,
+    fs: u64,
+    profile: u64,
+    tty: u64,
+    user: &[u8],
+    password: &[u8],
+) -> bool {
+    let mut home = [0u8; 256];
+    let Some(hl) = authenticate(auth_ch, user, password, &mut home) else {
+        kprint(b"desktop-session-mgr: login denied\n");
+        return false;
+    };
+    Line::new().s(b"desktop-session-mgr: login ok -> home=").s(&home[..hl]).end();
+
+    // **No `/dev/console` in a graphical session** — governing decision 3, and this is that
+    // flag's first caller since `libsession` gained it in Part B. Not "bound and unused": a
+    // binding a session holds is authority it has, and the console is shared with the serial
+    // column, which is the recovery path.
+    let session_ns = build_namespace(&NamespaceSpec {
+        root_ns,
+        fs_endpoint: fs,
+        profile_endpoint: profile,
+        tty_endpoint: tty,
+        home: &home[..hl],
+        user,
+        bind_console: false,
+    });
+    if session_ns == 0 {
+        kprint(b"desktop-session-mgr: session namespace FAIL\n");
+        return true;
+    }
+    kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
+
+    // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
+    // a real shell; what it has to be now is a process that proves the session runs.
+    let code = spawn_leader(root_ns, session_ns, notif, "desktop-shell");
+    // The leader has been reaped, so this drops the last reference to the namespace and with
+    // it every binding in it.
+    // SAFETY: closing the namespace we created for this session.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
+    Line::new().s(b"desktop-session-mgr: session ended (leader exit ").i(code as i64).s(b")").end();
+    true
+}
+
 /// Bootstrap registers, as `service-mgr`'s spawn fills them: `rdi` = the notification channel
 /// this supervisor reaps its session leader on, `rsi` = the inherited LOOKUP-only root
 /// namespace, `rdx` = the control channel the endpoints arrive over, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, _control: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"desktop-session-mgr: up\n");
+
+    // The endpoints, in `service-mgr`'s send order. Positional, like the serial column's.
+    let fs_endpoint = recv_handoff(control);
+    let profile_endpoint = recv_handoff(control);
+    let tty_endpoint = recv_handoff(control);
+    // The oracle, resolved rather than couriered — Part C. Once at startup: its lifetime is
+    // the machine's, and re-resolving per attempt would mint a session per keystroke.
+    let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if fs_endpoint == 0 || auth_status != 0 || auth_ch == 0 {
+        // A greeter that cannot authenticate is a window that wastes a screen. Say which half
+        // is missing — the two have completely different causes.
+        if fs_endpoint == 0 {
+            kprint(b"desktop-session-mgr: no fs endpoint; cannot build a session\n");
+        } else {
+            kprint(b"desktop-session-mgr: /svc/auth resolve FAIL\n");
+        }
+        fail(b"desktop-session-mgr: no graphical login\n");
+    }
 
     // The font, before the window: a greeter that cannot draw text has nothing to show, and
     // failing here reports the real cause rather than an empty window.
@@ -198,19 +361,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _control: u64, _arg0: u64) -
         Err(_) => fail(b"desktop-session-mgr: greeter CreateWindow FAILED\n"),
     };
 
-    let greeter = Greeter::new();
-    let picture = greeter.render(&font).into_bytes();
+    let mut greeter = Greeter::new();
     let len = GREETER_PITCH * GREETER_H as usize;
-    if picture.len() != len {
-        fail(b"desktop-session-mgr: greeter render is not the size it declares\n");
-    }
+    // **The mapped addresses are kept**, not dropped after attach: every keystroke redraws,
+    // so the greeter writes new pixels into whichever buffer the compositor has released.
+    let mut addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
             fail(b"desktop-session-mgr: greeter buffer alloc FAILED\n");
         };
-        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
-        // regions are distinct allocations, so they cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
+        addrs[i] = addr;
         let Some(mut w) = session.window(window) else {
             fail(b"desktop-session-mgr: greeter window vanished\n");
         };
@@ -218,10 +378,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _control: u64, _arg0: u64) -
             fail(b"desktop-session-mgr: greeter AttachBuffer FAILED\n");
         }
     }
-    let Some(mut w) = session.window(window) else {
-        fail(b"desktop-session-mgr: greeter window vanished\n");
-    };
-    if w.commit(0, (0, 0, GREETER_W, GREETER_H)).is_err() {
+    if !present(&mut session, window, &greeter, &font, &addrs, len) {
         fail(b"desktop-session-mgr: greeter Commit FAILED\n");
     }
     Line::new()
@@ -233,14 +390,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _control: u64, _arg0: u64) -
         .u(GREETER_H as u64)
         .end();
 
-    // The login flow arrives next; for now the greeter is on screen and this supervisor
-    // **blocks** on its event channel.
-    //
-    // Blocks, never spins. A supervisor that spins keeps a run queue non-empty, the idle
-    // thread never runs, and deferred handle reclamation lives there — so every exited
-    // process on the system stops being reaped and their pipes never close. That is the
-    // 2026-07-31 `logging-service` bug, found from a hung shell three subsystems away, and
-    // `session-mgr`'s own park comment records it.
+    // **The greeter loop.** Blocks on the event channel, never spins: a supervisor that spins
+    // keeps a run queue non-empty, the idle thread never runs, and deferred handle
+    // reclamation lives there — so every exited process on the system stops being reaped.
+    // That is the 2026-07-31 `logging-service` bug, and `session-mgr`'s park comment records
+    // the same thing.
     let ev = session.wait_handle();
     loop {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
@@ -254,11 +408,81 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _control: u64, _arg0: u64) -
                 u64::MAX,
             )
         };
-        // Drain whatever arrived so the channel does not stay signalled. Nothing acts on
-        // these yet; the login flow is what reads them.
-        let _ = session.pump();
-        while session.next_event().is_some() {}
+        if session.pump().is_err() {
+            fail(b"desktop-session-mgr: compositor connection lost\n");
+        }
+        let mut dirty = false;
+        let mut submit = false;
+        while let Some((w, event)) = session.next_event() {
+            if w != window {
+                continue;
+            }
+            if let libsurface::WindowEvent::Key(k) = event {
+                // Presses only. A greeter that acted on releases would type every character
+                // twice, and the repeat the compositor sends is a press too — which is what
+                // makes holding backspace work without any code here.
+                if k.pressed == 0 {
+                    continue;
+                }
+                if k.keycode == KEY_ENTER {
+                    submit = true;
+                } else if greeter.key(k.keycode, k.modifiers) {
+                    dirty = true;
+                }
+            }
+        }
+        if submit {
+            // Copied out before the fields are cleared, and cleared before the session runs:
+            // the password must not still be in the greeter while a session is on screen.
+            let mut user = [0u8; 64];
+            let mut pass = [0u8; 128];
+            let ul = greeter.user.text().len().min(user.len());
+            let pl = greeter.password.text().len().min(pass.len());
+            user[..ul].copy_from_slice(&greeter.user.text().as_bytes()[..ul]);
+            pass[..pl].copy_from_slice(&greeter.password.text().as_bytes()[..pl]);
+            greeter.reset();
+            let ok = run_session(
+                root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
+                &user[..ul], &pass[..pl],
+            );
+            // SAFETY: a local buffer this function owns; zeroed so a refused password does
+            // not sit in this process's stack for the machine's lifetime.
+            unsafe { core::ptr::write_volatile(&mut pass, [0u8; 128]) };
+            greeter.denied = !ok;
+            dirty = true;
+        }
+        if dirty && !present(&mut session, window, &greeter, &font, &addrs, len) {
+            fail(b"desktop-session-mgr: greeter redraw FAILED\n");
+        }
     }
+}
+
+/// Render the greeter into a free buffer and commit it. `false` if the compositor refused.
+fn present(
+    session: &mut Session<ChannelTransport>,
+    window: u32,
+    greeter: &Greeter,
+    font: &Font,
+    addrs: &[*mut u8; BUFFERS],
+    len: usize,
+) -> bool {
+    let picture = greeter.render(font).into_bytes();
+    if picture.len() != len {
+        return false;
+    }
+    let Some(mut w) = session.window(window) else {
+        return false;
+    };
+    // `acquire` blocks for a buffer the compositor is not displaying, which is what makes a
+    // redraw safe: writing into the committed one would tear the picture on screen.
+    let Ok(slot) = w.acquire() else {
+        return false;
+    };
+    let addr = addrs[slot as usize % BUFFERS];
+    // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two are
+    // distinct allocations, so they cannot overlap.
+    unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
+    w.commit(slot, (0, 0, GREETER_W, GREETER_H)).is_ok()
 }
 
 /// Wait set for the greeter's event channel.
