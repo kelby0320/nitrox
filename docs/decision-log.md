@@ -17754,3 +17754,59 @@ each other.
 registers `libheap` and `CLAUDE.md` records the decision; only the manifest still said
 otherwise.
 
+## 2026-08-25 — M7 Part C: `/svc/auth` becomes real, and init turns out to be the only one who can bind it
+
+`auth-service` now answers `Ns::Resolve` on a bound endpoint and mints a session channel per
+caller — the shape `profile-server` serves `/bin` with and the tty server serves `/dev/tty`
+with. Chosen over minting *N* endpoints at `Meta::Ready` because both shapes need the same
+session table and wait set, so the forwarder costs about twenty lines more and buys three
+things: it matches every other resource server in the tree, it makes
+`session-and-auth.md` true instead of needing the claim deleted a second time, and it puts the
+capability where this system puts every other one — who may authenticate is decided by who has
+`/svc/auth` in their namespace, not by a fixed list handed out at startup.
+
+**The binder had to move to `init`, and that was found by failing rather than by reasoning.**
+`service-mgr` spawned `auth-service`, and the resource-server protocol says the supervisor that
+starts a server registers it — so the bind went there first and came back `FAIL`. A declared
+service is spawned with `namespace: 0`, an **inherited LOOKUP-only root**, which cannot be bound
+into at all; `init` owns the root namespace and already binds `/bin`, `/log`, `/dev/tty`,
+`/dev/input/new` and `/dev/draw`. The rule is narrower than it reads: the supervisor that starts
+a server registers it *if it can bind*, and only init can bind the root.
+
+**A second failure worth recording because it presented three subsystems away.** The first
+working resolve asked for `RIGHT_SEND | RIGHT_RECV`, and the login then prompted, took the
+password, and never answered. `libsession::authenticate` **waits** on the channel, and a handle
+without `RIGHT_WAIT` makes `sys_wait` reject the whole set — so the symptom was a hung login and
+the cause was a missing right two crates away. `/dev/tty` had asked for `RIGHT_WAIT` all along;
+the new call site did not, because the rights list is written per call and nothing checks it
+against what the callee does.
+
+**The two-client claim is proven, not asserted.** `boot-probe` resolves `/svc/auth` twice while
+`session-mgr` already holds a session, so two *successful* resolves mean three concurrent
+sessions — which one spare slot cannot supply. (A first version also compared the two handle
+values, which is unfalsifiable: the probe holds the first open across the second resolve and
+`HandleTable::allocate` never re-issues a live slot, so the numbers differ whatever the server
+did. The count is what carries it; PR #235 review, finding 4.) Before Part C this could not have
+succeeded however it was asked. Without it the claim would have ridden on
+`desktop-session-mgr`, which does not exist until Part D, and a capability specified, reasoned
+about and reachable by nobody is exactly what PR #233's title cap turned out to be.
+Negative-controlled: capping `MAX_SESSIONS` at 1 fails the probe and the boot verdict.
+
+**The binding is unscoped, and that is a real widening — `TODO(svc-auth-ungated)`.** `/svc/auth`
+sits in the root namespace, so any process can attempt a password against 4096 PBKDF2
+iterations that `libcrypto` documents as "modest on purpose". `session-mgr`'s two-second pause
+after a failure is the only throttle in the system and is *session-mgr's* policy, which a caller
+that skips it does not inherit.
+
+**It is not the exposure it looks like, and the reason is the useful part**: `auth-service`
+resolves `/system/users` from that same root namespace, so the salted verifier database is
+already readable by anything that could reach the oracle. An online guess is strictly weaker
+than the offline attack already available, and both close with the same work — a supervisor
+that gets a constructed namespace instead of an inherited one.
+
+**A throttle in `auth-service` was considered and rejected on inspection**: it serves its
+clients from one loop with a wait set, so sleeping to slow an attacker would stall every other
+supervisor's login — the shape of the `TODO(tty-output-queue)` bug. Doing it properly needs a
+timer queue and per-session deferral, which is disproportionate to a hobby OS with no network
+stack.
+

@@ -1660,21 +1660,21 @@ The three things every later part draws with, none of which exist. Gated on the 
       This is why the retrofit is a prerequisite rather than a follow-up: factoring a `login()`
       that has two compilations would carry the fork into the shared crate.
 
-### Part C — one credential oracle, two clients
+### Part C — one credential oracle, two clients ✅ complete (2026-08-25)
 
-- [ ] **`auth-service` serves more than one client.** Two shapes, and the choice is the part's
+- [x] **`auth-service` serves more than one client** ✅ (2026-08-25). Two shapes, and the choice is the part's
       first job: mint *N* client endpoints at `Meta::Ready` and multiplex with a wait set (which
       is what the compositor does with `MAX_SESSIONS`), or become a namespace forwarder that each
       supervisor resolves its own session from. The second matches how `fs-server`,
       `profile-server` and the compositor already work, and matches what
       [`session-and-auth.md`](../architecture/session-and-auth.md) has claimed all along.
 
-- [ ] **Whichever is chosen, `/svc/auth` becomes true or the doc stops saying it.** An
+- [x] **`/svc/auth` is true** ✅ (2026-08-25) — the forwarder shape was chosen, so the doc's original claim is now the code's behaviour. An
       `architecture/` doc that describes a binding nobody makes is the failure root
       `CLAUDE.md` names — the source wins and the doc is a bug — and it is a doc two designs
       have now leaned on.
 
-- [ ] **The protocol does not change.** `Authenticate { username, password } → { AUTHENTICATED,
+- [x] **The protocol did not change** ✅ (2026-08-25). `Authenticate { username, password } → { AUTHENTICATED,
       principal, home } | DENIED` is untouched, and that remains the evidence the split was drawn
       in the right place. What changes is plumbing, and saying so precisely is the correction.
 

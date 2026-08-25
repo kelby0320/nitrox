@@ -92,15 +92,18 @@ DENIED` ([`rsproto-auth-ops.md`](../spec/rsproto-auth-ops.md)). That the graphic
 change *there* is the strongest evidence the existing split was drawn in the right place:
 credential validation was already separate from session lifecycle and namespace construction.
 
-**Its plumbing is not untouched, and an earlier draft said it was.** As built, `auth-service`
-creates exactly one channel pair at startup, transfers the one client end in `Meta::Ready`, and
-serves on the other — a single-client server, with `service-mgr` couriering the client end to
-`session-mgr`. There is no second endpoint for `desktop-session-mgr` to hold, and no `/svc/auth`
-to resolve one from: nothing in the tree binds anything under `/svc`, though
-[`session-and-auth.md`](../architecture/session-and-auth.md) claimed otherwise until 2026-08-21.
-Making the oracle serve two clients is Milestone 7 Part C. The correction matters because "no
-change here" was doing work in this document that it could not support (details pass,
-2026-08-21).
+**Its plumbing was not untouched, and an earlier draft said it was — resolved by M7 Part C
+(2026-08-25).** `auth-service` used to create exactly one channel pair at startup and transfer
+the one client end in `Meta::Ready`, with `service-mgr` couriering it to `session-mgr`: a
+single-client server, with no second endpoint for `desktop-session-mgr` to hold and no
+`/svc/auth` to resolve one from. It is a **namespace forwarder** now — `init` binds its endpoint
+at `/svc/auth` and it mints a session per caller — so `desktop-session-mgr` resolves its own,
+and the protocol did not change. See
+[`session-and-auth.md`](../architecture/session-and-auth.md) for the built shape.
+
+The correction is kept rather than deleted because "no change here" was doing work in this
+document that it could not support (details pass, 2026-08-21), and because this is the doc that
+governs Part D.
 
 **`profile-server` is also untouched, and is worth stating precisely because it is easy to
 misremember**: it projects the *system* profile, identical for every user. There is no per-user
@@ -111,10 +114,10 @@ profile lookup in session construction today — per-user overlays are deferred
 
 ```
 kernel ─spawns→ init (full SysCaps)
+  init ─spawns, binds /svc/auth→ auth-service (no caps; a forwarder, resolved by each client)
   init ─spawns, delegates BIND_NAMESPACE→ service-mgr
-    ├─spawns→ auth-service                    (no caps; a client channel, couriered down)
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
-    │      + fs ep, profile ep, tty ep, auth channel
+    │      + fs ep, profile ep, tty ep;  auth resolved from /svc/auth
     │      └─on login→ session ns ─spawns→ nxsh
     │
     └─spawns, re-delegates BIND_NAMESPACE→ desktop-session-mgr        ← new

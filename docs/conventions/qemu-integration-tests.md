@@ -82,7 +82,8 @@ against the **captured serial transcript** after a PASS, and a transcript check 
 the run.
 
 `test-qemu` has four. **`check_login_chain`** requires
-`session-mgr: received fs + profile endpoints + auth channel`. It replaces a `verdict(false)`
+`session-mgr: received fs + profile endpoints; auth resolved from /svc/auth` (the wording changed
+in M7 Part C, when the auth channel stopped being couriered and became a namespace resolve). It replaces a `verdict(false)`
 `session-mgr` used to fire when its endpoint handoff failed — a session supervisor adjudicating
 a test run — and without it a broken login chain reaches PASS, because nothing else in
 `test-qemu` reads it. It asserts the chain came *up*, not that anyone logged in: nothing types

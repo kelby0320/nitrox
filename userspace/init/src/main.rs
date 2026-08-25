@@ -141,6 +141,20 @@ static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
+/// Spawn args for `auth-service`: one moved handle — the control channel it sends
+/// `Meta::Ready` on — and an inherited LOOKUP-only namespace through which it resolves
+/// `/system/users`. **No syscaps**: like every resource server it does not hold
+/// `BIND_NAMESPACE`; init binds its endpoint on its behalf.
+static mut SPAWN_AUTH: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/auth-service
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
 /// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
 /// control channel — and a LOOKUP-only namespace handle through which it resolves
 /// `/dev/input/raw/*`. **No syscaps**: like every resource server, it does not hold
@@ -771,6 +785,75 @@ fn bind_logging_service(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the credential oracle and bind its forwarding endpoint at `/svc/auth`.
+///
+/// **Bound by init because only init can.** `service-mgr` spawned `auth-service` until M7
+/// Part C and would have been the natural binder — the supervisor that starts a resource
+/// server registers it — but a declared service is spawned with `namespace: 0`, an inherited
+/// **LOOKUP-only** root, so it cannot bind into it at all. Demonstrated rather than reasoned:
+/// the bind was written there first and came back `FAIL`. init owns the root namespace, and
+/// `session-and-auth.md` already calls auth-service "an ordinary userspace resource server",
+/// which is exactly what the other five bound here are.
+///
+/// Critical-path: without it no session can authenticate, which is a machine with no way in.
+fn bind_auth_service(root_ns: u64) -> bool {
+    // 1. Create the control channel (init keeps end 0, the server gets end 1).
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; earlier binds completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 2. Spawn it, moving the control endpoint into it (in rdx).
+    // SAFETY: SPAWN_AUTH is a valid writable arg block; spawn_program resolves the ELF,
+    // stamps it, spawns, and closes the image handle.
+    let as_h = unsafe {
+        SPAWN_AUTH.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/auth-service", &raw mut SPAWN_AUTH)
+    };
+    if as_h < 0 {
+        kprint(b"init: auth-service spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: auth-service Ready timeout/invalid\n");
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // 4. Bind at `/svc/auth`.
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/svc/auth".as_ptr() as u64, 9, endpoint) };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: auth-service bind FAIL at /svc/auth\n");
+        return false;
+    }
+
+    // `TODO(svc-auth-ungated)` — bound into the **root namespace**, which every process
+    // inherits, so anything can resolve the oracle and attempt a password. Recorded rather
+    // than glossed; it closes with the same namespace-construction work as
+    // `TODO(manage-ungated)`.
+    kprint(b"init: auth-service bound at /svc/auth\n");
+    // init keeps `as_h` (the long-lived server's process handle).
+    let _ = as_h;
+    true
+}
+
 /// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
 ///
 /// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
@@ -1353,6 +1436,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.
     if !bind_profile_server(root_ns) {
+        emergency(notif, root_ns);
+    }
+
+    // Spawn the credential oracle and bind it at `/svc/auth`. After `/bin` (it resolves
+    // `/bin/auth-service`) and before the service manager, so a session-mgr that starts
+    // immediately finds the oracle already there. Critical-path: no oracle, no way in.
+    if !bind_auth_service(root_ns) {
         emergency(notif, root_ns);
     }
 

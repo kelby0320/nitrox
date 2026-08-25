@@ -72,27 +72,9 @@ static mut RDY_MSG: [u8; 4096] = [0; 4096];
 static mut RDY_HANDLES: [u64; 8] = [0; 8];
 static mut RDY_COUNT: usize = 0;
 
-/// The resource-server protocol magic (`"RSMG"`) and `Meta::Ready` op — hand-parsed from
-/// the `IpcMsg` payload (offset 24: magic @0, op @6), like init. service-mgr does not
-/// build rsproto, only recognises Ready to take the endpoint it transfers.
-const RS_MAGIC: u32 = 0x5253_4D47;
-const RS_OP_READY: u16 = 0x0004;
 /// Bounded wait for a spawned server's Ready.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
-/// Spawn args for `auth-service`: its control endpoint is moved in at `rdx`
-/// (`handles[0]`), on which it sends `Meta::Ready` carrying the client channel. No
-/// ambient capabilities.
-static mut SPAWN_AUTH: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: 0,
-};
 
 /// Spawn args for `session-mgr`: its control endpoint is moved in at `rdx`
 /// (`handles[0]`), over which service-mgr hands it the fs-server endpoint + the auth
@@ -530,49 +512,6 @@ fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, 
     (h, smgr_end)
 }
 
-/// Wait (bounded) for a `Meta::Ready` on `ctrl` and return the endpoint it transfers
-/// (`handles[0]`), hand-parsing the rsproto envelope (magic + `Ready` op). `0` on
-/// timeout / error / an unexpected message.
-fn wait_ready(ctrl: u64) -> u64 {
-    // SAFETY: `&now` is a valid u64 out-param.
-    let mut now: u64 = 0;
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-    let deadline = now.saturating_add(READY_TIMEOUT_NS);
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS valid; one waiter, bounded deadline.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = ctrl;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
-    };
-    if waited < 1 {
-        return 0;
-    }
-    // SAFETY: valid recv out-params; on success the kernel installs handles[0].
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ctrl,
-            (&raw mut RDY_MSG) as u64,
-            (&raw mut RDY_HANDLES) as u64,
-            (&raw mut RDY_COUNT) as u64,
-        )
-    };
-    let count = unsafe { (&raw const RDY_COUNT).read() };
-    if rr != 0 || count < 1 {
-        return 0;
-    }
-    // SAFETY: read the envelope (payload at offset 24: magic @0, op @6) + handles[0].
-    let (magic, op, endpoint) = unsafe {
-        let magic = u32::from_le_bytes([RDY_MSG[24], RDY_MSG[25], RDY_MSG[26], RDY_MSG[27]]);
-        let op = u16::from_le_bytes([RDY_MSG[30], RDY_MSG[31]]);
-        (magic, op, (&raw const RDY_HANDLES[0]).read())
-    };
-    if magic != RS_MAGIC || op != RS_OP_READY {
-        // SAFETY: not the message we expected — drop the transferred endpoint.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-        return 0;
-    }
-    endpoint
-}
 
 /// Receive one handle from init's handoff channel: an empty message carrying at most one
 /// transferred handle. Returns `0` if the message was empty (init had that endpoint
@@ -682,38 +621,18 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     if profile_endpoint == 0 {
         kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
     }
-    // 1. auth-service — spawn + Ready handshake → the client channel session-mgr uses.
-    let (auth_h, auth_ctrl) = spawn_with_control(root_ns, b"/bin/auth-service", &raw mut SPAWN_AUTH);
-    if auth_h < 0 || auth_ctrl == 0 {
-        kprint(b"service-mgr: auth-service spawn FAIL\n");
-        // SAFETY: closing our own endpoints (login chain aborted).
-        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
-        return;
-    }
-    let auth_client = wait_ready(auth_ctrl);
-    // The control channel is done (auth-service serves on the client channel's peer).
-    // SAFETY: closing our own control + process handles for auth-service.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, auth_ctrl);
-        syscall1(SYS_HANDLE_CLOSE, auth_h as u64);
-    }
-    if auth_client == 0 {
-        kprint(b"service-mgr: auth-service Ready timeout/invalid\n");
-        // SAFETY: closing our own endpoints (login chain aborted).
-        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
-        return;
-    }
-    kprint(b"service-mgr: auth-service ready\n");
+    // auth-service is **init's** now (M7 Part C). It is a resource server bound at
+    // `/svc/auth`, and only init can bind into the root namespace: a declared service is
+    // spawned with `namespace: 0`, an inherited LOOKUP-only root. This was written here
+    // first and the bind came back FAIL, which is how the constraint was found.
 
-    // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint + auth channel.
+    // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint.
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
     if sess_h < 0 || sess_ctrl == 0 {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
         // SAFETY: closing our own handles (nothing handed off).
-        unsafe {
-            close_endpoints(fs_endpoint, profile_endpoint);
-            syscall1(SYS_HANDLE_CLOSE, auth_client);
-        }
+        // SAFETY: closing our own handles.
+        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
         return;
     }
     // Handoffs, in order: (1) the fs-server endpoint, (2) the profile-server endpoint,
@@ -724,7 +643,8 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     send_handle(sess_ctrl, fs_endpoint);
     send_handle(sess_ctrl, profile_endpoint);
     send_handle(sess_ctrl, tty_endpoint);
-    send_handle(sess_ctrl, auth_client);
+    // The auth channel is no longer couriered: session-mgr resolves `/svc/auth` for a
+    // session of its own, and so will `desktop-session-mgr`.
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
     // handle are no longer needed for Part D (session-mgr runs independently).
     // SAFETY: closing our own handles.
