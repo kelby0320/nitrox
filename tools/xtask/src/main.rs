@@ -12,6 +12,7 @@
 //!   check-images    fail if a test image and a release image differ by anything new
 //!   check-display   boot + screendump; compare the screen against a libdraw render
 //!   check-terminal  boot + type into the GUI terminal; assert the shell answered
+//!   check-login     boot the release image + drive the graphical greeter to a session
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -174,6 +175,7 @@ fn main() -> ExitCode {
         Some("check-images") => cmd_check_images(),
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
+        Some("check-login") => cmd_check_login(accel),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
@@ -210,6 +212,7 @@ fn print_help() {
            test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
            test-interactive  boot the release image and drive a real login + shell\n  \
            check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
+           check-login       type a wrong then a right password at the graphical greeter\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
@@ -1306,6 +1309,135 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
 /// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
 /// it, which is both how a user would do it and the only mechanism available: there is no op to
 /// raise a window, and there will not be until Milestone 6.
+/// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right
+/// one, then a session.
+///
+/// The sequence `test-interactive` runs on serial, driven the way `check-input` and
+/// `check-terminal` drive input, and adjudicated on the host. Built in Part D rather than at
+/// the end of the milestone so Parts E and F land against a gate that already exists.
+///
+/// **The release image, not the test one, and that is not a preference.** In the test image
+/// the greeter is bottom-most — `service-mgr` brings the login chain up before declared
+/// services, which is what keeps `check-display`'s reference windows undisturbed — so it does
+/// not hold the keyboard and nothing typed would reach it. In a release image it is the only
+/// window. That also makes this the gate that proves the graphical arm exists for a person:
+/// every other display gate boots `--selftest`.
+///
+/// **Paced on the greeter's redraw counter**, because a greeter has no echo. What was typed is
+/// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
+/// `check-terminal` types one character at a time to stay behind. Waiting for the redraw is
+/// the same discipline against a different receipt.
+fn cmd_check_login(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::Normal)?;
+    let ovmf = locate_ovmf()?;
+
+    let work = repo_root().join("tools/build-cache");
+    fs::create_dir_all(&work).ok();
+    let qmp_sock = work.join("qmp-login.sock");
+    let _ = fs::remove_file(&qmp_sock);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    println!("xtask: graphical login gate — booting the release image…\n");
+    let mut session = Session::spawn(cmd, "check-login")?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+
+    // 1. The greeter is up before anyone has authenticated. That is the claim Part D's second
+    //    box makes, and in a release image nothing else has drawn anything.
+    // The redraw is logged inside `present`, so it precedes the line that announces the
+    // window — asserting them the other way round consumes the transcript past it.
+    session.expect("desktop-session-mgr: greeter redraw 1")?;
+    session.expect("desktop-session-mgr: greeter presented")?;
+
+    // 2. **A wrong password is refused**, tested before the right one so a broken denial
+    //    cannot hide behind a successful login — the same ordering `test-interactive` uses.
+    type_at_greeter(&mut qmp, &mut session, DEMO_USER)?;
+    press(&mut qmp, "tab")?;
+    type_at_greeter(&mut qmp, &mut session, "wrong-password")?;
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-session-mgr: login denied")?;
+
+    // 3. The right one reaches a session. Each line is a distinct claim: the oracle answered,
+    //    the namespace was built **without a console**, and an unprivileged leader started in
+    //    it.
+    type_at_greeter(&mut qmp, &mut session, DEMO_USER)?;
+    press(&mut qmp, "tab")?;
+    type_at_greeter(&mut qmp, &mut session, DEMO_PASSWORD)?;
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-session-mgr: login ok -> home=/home/alice")?;
+    session.expect("desktop-session-mgr: session namespace built (no /dev/console)")?;
+    // **The leader's own line, and only it.** `libsession` logs "spawned … with its
+    // environment" from the *parent* after the setup message goes out, while the child logs
+    // this from its first instruction — so their order is a race between two processes, and
+    // asserting one would be a flake that passes until it does not (PR #227 review). This is
+    // the stronger claim anyway: the parent saying it spawned something is not evidence the
+    // something ran. `test-interactive` already pins the `libsession` line for the serial
+    // column, where it is ordered against a prompt rather than against another process.
+    session.expect("desktop-shell: up (graphical session leader)")?;
+
+    let _ = session.child.kill();
+    let _ = fs::remove_file(&qmp_sock);
+    println!("\nxtask: graphical login gate PASSED — refused a wrong password, then ran a session ✓");
+    Ok(())
+}
+
+/// Inject one key by qcode, press and release.
+fn press(qmp: &mut Qmp, qcode: &str) -> R<()> {
+    qmp.send_key(qcode, true)?;
+    qmp.send_key(qcode, false)?;
+    Ok(())
+}
+
+/// Type `text` at the greeter, one character at a time, waiting for each redraw.
+///
+/// **One at a time and waited for**, for the reason `check-terminal`'s typing loop gives: a
+/// word injected as fast as QMP can send it outruns a client that repaints between keystrokes,
+/// and the tail lands on a client that is not looking. A human types slower than this loop; a
+/// harness does not.
+fn type_at_greeter(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
+    for c in text.chars() {
+        let qcode = match c {
+            'a'..='z' => {
+                let mut s = String::new();
+                s.push(c);
+                s
+            }
+            '0'..='9' => c.to_string(),
+            ' ' => "spc".to_string(),
+            '-' => "minus".to_string(),
+            other => {
+                return Err(format!(
+                    "check-login cannot type {other:?}: add its qcode to `type_at_greeter`.                      The demo credentials are lowercase, digits, space and hyphen; a new one                      outside that set needs a mapping rather than a silent skip"
+                )
+                .into());
+            }
+        };
+        press(qmp, &qcode)?;
+        // The redraw is the receipt. Its number is not asserted — the greeter counts every
+        // redraw including the ones a session teardown causes — only that one happened.
+        session.expect("desktop-session-mgr: greeter redraw ")?;
+    }
+    Ok(())
+}
+
 /// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
 ///
 /// **Status 2026-08-13 (superseding an earlier status the same day): the flake was real, and it

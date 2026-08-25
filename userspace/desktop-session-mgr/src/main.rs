@@ -58,6 +58,14 @@ const FONT_PX: f32 = 16.0;
 /// How many buffers the greeter attaches.
 const BUFFERS: usize = 2;
 
+/// How many redraws to report before going quiet.
+///
+/// Generous: two login attempts at this demo's credential lengths is about seventy.
+const MAX_REDRAWS_LOGGED: u32 = 512;
+
+/// Redraws so far — see [`present`].
+static mut REDRAWS: u32 = 0;
+
 /// Write one line to the debug console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
@@ -296,7 +304,14 @@ fn run_session(
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
         return true;
     }
-    kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
+    // **Reported from what was bound, not from what was asked for.** This was a hardcoded
+    // "(no /dev/console)" and the gate's assertion on it passed with `bind_console: true` —
+    // decoration, found by running the control rather than by reading it.
+    if libsession::session_has_console() {
+        kprint(b"desktop-session-mgr: session namespace built (WITH /dev/console)\n");
+    } else {
+        kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
+    }
 
     // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
     // a real shell; what it has to be now is a process that proves the session runs.
@@ -482,7 +497,27 @@ fn present(
     // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two are
     // distinct allocations, so they cannot overlap.
     unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-    w.commit(slot, (0, 0, GREETER_W, GREETER_H)).is_ok()
+    let ok = w.commit(slot, (0, 0, GREETER_W, GREETER_H)).is_ok();
+    // **A redraw counter, and it is not decoration.** A greeter has no echo: what a person
+    // typed is on screen and nowhere else, so a harness driving it has nothing to pace
+    // against — and this window repaints 420×200 per keystroke, which is exactly the cost
+    // `check-terminal` types one character at a time to stay behind. This line is what the
+    // graphical login gate waits on between keystrokes.
+    //
+    // **A count, deliberately, and never the fields.** Reporting what was typed would put a
+    // password on the console; reporting its *length* would leak it more slowly. A monotonic
+    // count paces a harness, says "the greeter is still redrawing" to anyone debugging one
+    // that is not, and tells an observer nothing about the credential.
+    //
+    // Unconditional, like the compositor's press diagnostics, and capped for the same reason.
+    // SAFETY: single-threaded supervisor; one redraw at a time.
+    unsafe {
+        if REDRAWS < MAX_REDRAWS_LOGGED {
+            REDRAWS += 1;
+            Line::new().s(b"desktop-session-mgr: greeter redraw ").u(REDRAWS as u64).end();
+        }
+    }
+    ok
 }
 
 /// Wait set for the greeter's event channel.

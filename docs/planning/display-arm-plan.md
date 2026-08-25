@@ -1680,7 +1680,7 @@ The three things every later part draws with, none of which exist. Gated on the 
 
 ### Part D — `desktop-session-mgr`, the greeter, and the gate
 
-- [ ] **`desktop-session-mgr`**, `session-mgr`'s graphical twin: spawned by `service-mgr` with
+- [x] **`desktop-session-mgr`** ✅ (2026-08-25), `session-mgr`'s graphical twin: spawned by `service-mgr` with
       `BIND_NAMESPACE` re-delegated, plus the fs/profile/tty endpoints, an auth channel and — the
       new part — a `/dev/draw` connection, because its greeter is itself a compositor client.
       Presents a login **window**, calls the same `auth-service` over the same protocol,
@@ -1689,7 +1689,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       `/dev/console` is deliberately **not** bound into a graphical session — governing decision
       3's failure is on the record.
 
-- [ ] **The greeter draws before anyone has authenticated**, and outlives each session
+- [x] **The greeter draws before anyone has authenticated** ✅ (2026-08-25), and outlives each session
       (`graphical-session.md` §4). It is closer to `gdm`'s `class=greeter` than to anything
       `session-mgr` does, and it is the first compositor client that exists at boot in a release
       image.
@@ -1698,7 +1698,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       is skipped when no manager is attached, so the greeter composites without waiting for a
       shell that does not exist yet.
 
-- [ ] **The graphical login gate, built here rather than at the end of the milestone.** A wrong
+- [x] **The graphical login gate, built here rather than at the end of the milestone** ✅ (2026-08-25) — `cargo xtask check-login`. A wrong
       password, then a right one, then a shell — the sequence `test-interactive` runs on serial,
       driven by the PS/2 injection `check-input` and `check-terminal` already use, adjudicated on
       the host. Parts E and F then land against a gate that exists.

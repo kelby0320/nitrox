@@ -234,6 +234,16 @@ jobs:
       - name: cargo xtask check-terminal --kvm
         run: cargo xtask check-terminal --kvm
 
+      # The **graphical login**, and the only gate that boots a release image with a window
+      # in it. `test-interactive` covers the serial column's login on the same image;
+      # everything else display-side boots `--selftest`, where the greeter is bottom-most and
+      # holds no keyboard. Unconditional rather than path-filtered: it is the first thing that
+      # breaks if the compositor, the toolkit, `libsession` or `auth-service` regress, and a
+      # login nobody can complete is not a partial failure. Added with M7 Part D, which built
+      # it before Parts E and F so those land against a gate that exists.
+      - name: cargo xtask check-login --kvm
+        run: cargo xtask check-login --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve

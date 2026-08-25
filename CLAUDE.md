@@ -56,6 +56,7 @@ cargo xtask check-display  # boot + screendump; compare the screen to a libdraw 
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
 cargo xtask check-images   # test vs release initramfs: differ only on a short allow-list
+cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
 ```
 
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
@@ -88,6 +89,18 @@ image start differing in anything new.
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
 rendered there. It runs unconditionally in CI's QEMU job (promoted 2026-08-18); `check-input`
 stops at the test client's event log and `check-display` never types, so nothing else covers it.
+
+`cargo xtask check-login` is the **graphical login gate**, and the second of the two that boot a
+release image. It drives the greeter with the PS/2 injection `check-input` and `check-terminal`
+use — a wrong password, then a right one, then a session — and it is the only gate where the
+display arm exists for a person rather than for a test: everything else display-side boots
+`--selftest`. It runs unconditionally in CI's QEMU job. Landed with M7 Part D, deliberately
+*before* the shell it will eventually show, so Parts E and F land against a gate that exists.
+
+**It must boot the release image**, not the test one. In a `--selftest` boot the greeter is
+bottom-most — `service-mgr` brings the login chain up before declared services, which is what
+keeps `check-display`'s reference windows undisturbed — so it holds no keyboard and nothing
+typed reaches it.
 
 `cargo xtask check-display` is the display arm's **smoke gate**, not a per-commit one:
 it boots an image and compares the guest's screen against a `libdraw` render over QMP
