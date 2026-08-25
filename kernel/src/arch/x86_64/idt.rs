@@ -730,10 +730,13 @@ fn vector_name(vector: u64) -> &'static str {
         5 => "#BR bound range exceeded",
         6 => "#UD invalid opcode",
         7 => "#NM device not available",
-        // `TODO(unexplained-df)` — an intermittent `#DF` is open, at ~14 % of local **TCG**
-        // boots and unseen in 83 CI boots (all `--kvm`). Kernel `rip`, a *user* `rsp`, stack
-        // "not scannable". Cause unestablished; see `deferred-decisions.md` for what has been
-        // ruled out.
+        // `TODO(unexplained-df)` — an intermittent `#DF` that ran at ~14 % of local **TCG**
+        // boots (unseen in 83 CI boots, all `--kvm`): kernel `rip`, a *user* `rsp`, stack
+        // "not scannable". Two causes found and fixed — the `sysretq` stub's unmasked window
+        // on the user stack, and `interrupts_restore(false)` being a no-op, which let
+        // `tlb::shootdown` leave `IF` set for the rest of every SMP `sys_memory_unmap`.
+        // 45/45 TCG boots clean since. The entry stays open until it has soaked; see
+        // `deferred-decisions.md` for the evidence and what was ruled out.
         8 => "#DF double fault",
         10 => "#TS invalid TSS",
         11 => "#NP segment not present",
@@ -969,7 +972,7 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
         // transcript. Chasing `TODO(unexplained-df)` cost a full pass for want of this line:
         // the `rip` was dismissed as meaningless when it in fact decoded to `sysretq`.
         // SAFETY: `IA32_LSTAR` is architectural in long mode and this reads it in ring 0.
-        let lstar = unsafe { regs::rdmsr(0xC000_0082) };
+        let lstar = unsafe { regs::rdmsr(super::syscall::MSR_LSTAR) };
         let _ = writeln!(w, "  lstar   {:#018x}  (rip - lstar = offset into syscall_entry)", lstar);
     }
     let _ = writeln!(w, "  rip {:#018x}  cs {:#06x}", f.rip, f.cs);
@@ -1085,11 +1088,15 @@ pub fn init() {
         //
         // **NMI (vector 2) runs on IST2**, live since `stop_the_machine` made it a delivered
         // vector — before that nothing in the tree sent an NMI. An IST=0 gate does not switch
-        // stacks, and NMI can arrive when RSP is not a kernel stack: `syscall_entry` has a
-        // two-instruction window after `swapgs` where RSP is still the *user* stack. The
-        // frame push would `#PF` under SMAP, take that fault on the same bad stack, and
-        // `#DF` — the machine still stops, but over a misleading double-fault dump instead of
-        // the real diagnosis.
+        // stacks, and NMI can arrive when RSP is not a kernel stack. The frame push would
+        // `#PF` under SMAP, take that fault on the same bad stack, and `#DF`.
+        //
+        // **`syscall_entry` has two such windows, and IST2 is the only thing covering the
+        // second.** At entry, RSP is the user stack for two instructions after `swapgs`; there
+        // SFMASK masks `IF`, so IST2 is what NMI needs. At exit, RSP is the user stack between
+        // `pop rsp` and `sysretq`; there a `cli` masks `IF` — but `cli` does not mask NMI, so
+        // IST2 is *again* the only cover. Do not conclude from SFMASK alone that IST2 is
+        // redundant: that reasoning reaches only the entry half (PR #231 review, finding 3).
         let ist = match vector {
             8 => 1,
             2 => 2,

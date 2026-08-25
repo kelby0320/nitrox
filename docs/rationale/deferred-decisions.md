@@ -548,10 +548,16 @@ kernel — but the retrofit is why it is being seen: more of the gate set now bo
 through the same paths, so a 15 % fault has more chances to show.
 
 **One window found and closed, and it was not enough.** The `sysretq` exit stub restored the
-user `RSP` (`pop rsp`) two instructions before leaving ring 0, with **interrupts enabled** — the
-syscall body runs with `IF` set, and nothing re-masked it. An interrupt arriving there takes no
-privilege change, so the CPU pushes its frame onto the *user* stack; under SMAP that push faults,
-and delivering that fault on the same stack is a `#DF`. A `cli` before `pop rsp` closes it.
+user `RSP` (`pop rsp`) two instructions before leaving ring 0 **without re-masking interrupts**.
+An interrupt arriving there takes no privilege change, so the CPU pushes its frame onto the
+*user* stack; under SMAP that push faults, and delivering that fault on the same stack is a
+`#DF`. A `cli` before `pop rsp` closes it.
+
+*(This paragraph originally continued "the syscall body runs with `IF` set — a blocked syscall
+resumes that way". **Both halves were wrong**, and the second is what sent the next pass looking
+in the wrong place: `switch_into` captures a thread's `IF` before the `SCHED` acquire, which
+SFMASK has already made false, so a resuming syscall returns masked. What actually left `IF` set
+is below.)*
 
 **Proven by widening the window rather than waiting for the flake**: 256 `pause` instructions
 between `pop rsp` and `sysretq` turn a ~14 % intermittent into a deterministic `#DF` on the next
@@ -601,17 +607,48 @@ matching the fault being hunted. It manufactures its own faults rather than acce
 you want, and "the probe increased failures" is not the same as "the probe increased failures of
 the kind I am hunting".
 
-**What is left to look at**, since the obvious candidate is out. The `#DF` shape — kernel `rip`,
-user `rsp` — says the CPU could not deliver an exception, which points at the entry path or the
-stack it switches to rather than at the stack's *mapping*: `RSP0`/IST loading, the per-CPU TSS, or
-a fault taken before the switch completes. TCG-only reproduction is itself a clue, since TCG's
-soft-MMU and its interrupt delivery differ from hardware in exactly that region. **Pre-allocating
-the vmap's intermediate tables at boot** would remove page-table allocation from thread creation
-entirely — which is how Linux avoids the class on x86-64 — and is worth doing on its own merits
-whether or not it is this.
+**The source of the enabled `IF` — found, and it is `tlb::shootdown`.** The `cli` closed the
+window; it did not answer *why interrupts were on at a syscall's exit at all*, and that question
+turned out to have a specific answer. `shootdown` **enables interrupts itself** and must: it
+spins waiting for peer CPUs to acknowledge an IPI, and an `IF`-masked spinner cannot service the
+shootdown IPI a peer is simultaneously sending it — mask both sides and they deadlock. Having
+enabled them, it restored the state it captured on the way in:
 
-Trigger: it is live; the next occurrence, or any SMP work touching the vmap or the entry path.
-Reproduce with `cargo xtask check-terminal` **without** `--kvm`, several times.
+```rust
+let prev_if = Cpu::interrupts_enabled();     // false — SFMASK masked IF at syscall entry
+unsafe { Cpu::interrupts_enable() };          // required, per above
+{ let _guard = LOCK.lock(); /* IPIs; spin for ACKs */ }
+unsafe { Cpu::interrupts_restore(prev_if) };  // prev_if == false …
+```
+
+…and `interrupts_restore` was `if prev { sti }`, with an `else` arm that was a **no-op**,
+commented *"leave IF clear — it already is"*. That comment held for every caller that had reached
+it through `interrupts_disable`. It was false for the one caller that had enabled `IF` itself. So
+the restore did nothing, and **the entire tail of every SMP `sys_memory_unmap` after the shootdown
+ran with interrupts unexpectedly enabled** — through the syscall's return, and out through the
+`sysretq` stub's ring-0-on-user-stack window.
+
+**Measured before assuming.** A counter at syscall entry and exit over one boot: of **60,000**
+syscalls, **647 returned with `IF` set — and all 647 were `SYS_MEMORY_UNMAP`**. Entry was `IF=0`
+on all 60,000, which rules out the entry path and pins the leak to the body. This is a far wider
+exposure than the two instructions the `cli` covered, and it is consistent with the `cli` moving
+the rate to ~2 % rather than to zero.
+
+**The fix is to delete the precondition, not to patch the caller.** `interrupts_restore` is now
+unconditional — `if prev { sti } else { cli }` — so it does what its name says regardless of how
+the caller got there. Patching `tlb.rs` alone would have left the same trap armed for the next
+caller that enables interrupts on its own; the other four call sites all happen to satisfy the
+old precondition, which is precisely why it survived unnoticed.
+
+**A `debug_assert` at syscall exit keeps it closed**, and both polarities were demonstrated
+rather than assumed: it fires within two `test-qemu` boots on the unfixed tree, and holds across
+8/8 with the fix. (Its first run was silent, because `shootdown` has a fast path that returns
+early when no other CPU is online; a forced `interrupts_enable` before the assert confirmed the
+instrument worked before that silence was believed.)
+
+Trigger: the entry stays open until a TCG sample large enough to distinguish the post-fix rate
+from the ~2 % residual comes back clean. Reproduce with `cargo xtask check-terminal` **without**
+`--kvm`, several times.
 
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole

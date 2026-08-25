@@ -17403,8 +17403,9 @@ pop rsp        // user stack loaded — CS is still kernel
 sysretq
 ```
 
-The syscall body runs with `IF` set (a blocked syscall resumes that way) and nothing re-masked it,
-so an interrupt could arrive in that window. At CPL 0 there is no privilege change, so the CPU
+Interrupts were not re-masked before that `pop rsp`, so an interrupt could arrive in that window.
+(This entry first said "the syscall body runs with `IF` set — a blocked syscall resumes that way".
+That is wrong, and the next section is what it cost.) At CPL 0 there is no privilege change, so the CPU
 pushes its frame onto the **user** stack; under SMAP that push faults, and delivering the fault on
 the same stack is a `#DF`. A `cli` before `pop rsp` closes it — `sysretq` restores the user's
 `IF` from R11 on the way out.
@@ -17457,3 +17458,69 @@ hunting", and I nearly drew a conclusion from it.
 
 Landing the `cli` on its own merits: the window is real, the positive control demonstrates it is
 exploitable, and the fix costs one instruction on the syscall return path.
+
+## 2026-08-24 — `interrupts_restore` had an unstated precondition, and `tlb::shootdown` broke it
+
+The previous entry closed a window and left the real question open: *why was `IF` set at a
+syscall's exit at all?* It answered that with a guess — "a blocked syscall resumes that way" —
+and the guess was wrong. `switch_into` captures a thread's `IF` **before** the `SCHED` acquire,
+where SFMASK has already made it false, and restores that; a resuming syscall returns masked.
+Writing a plausible cause into the log instead of measuring one is what this entry corrects.
+
+**Measure first, and the answer is unambiguous.** Counters at syscall entry and exit over one
+boot: of **60,000** syscalls, entry was `IF=0` on all 60,000, and **647 returned with `IF` set —
+all 647 `SYS_MEMORY_UNMAP`**. Not the entry path, not the scheduler: something in that one
+syscall's body.
+
+**It is `tlb::shootdown`, and the bug is one level below it.** `shootdown` enables interrupts
+itself, and has to: it spins for peer ACKs, and an `IF`-masked spinner cannot service the
+shootdown IPI a peer is sending it at the same time — mask both sides and they deadlock. Having
+enabled them, it called `interrupts_restore(prev_if)` with the `prev_if = false` captured on the
+way in. And `interrupts_restore` was:
+
+```rust
+if prev { unsafe { regs::sti() } }
+// else: leave IF clear — it already is.
+```
+
+The `else` comment was true for every caller that arrived via `interrupts_disable`, and false for
+the one caller that had enabled `IF` on its own. The restore did nothing. **The whole tail of
+every SMP `sys_memory_unmap` after the shootdown ran with interrupts enabled**, out through the
+`sysretq` stub's ring-0-on-user-stack window — a far wider exposure than the two instructions the
+`cli` covered, and consistent with the `cli` moving the rate to ~2 % rather than to 0.
+
+**Fix the class, not the instance.** `interrupts_restore` is now unconditional (`if prev { sti }
+else { cli }`). Patching `tlb.rs`'s call site would have fixed this bug and left the trap armed
+for the next caller that manages `IF` itself; the other four call sites satisfy the old
+precondition only by accident of how they got there. A function named *restore* that silently
+declines to restore is the defect — one `cli` on a cold path buys the name back.
+
+**An unrelated gate failure, diagnosed by an instrument someone else left behind.** Running the
+full set afterwards, `check-terminal` failed once — not a `#DF`: the boot was clean, `nxterm`
+reported `clicked` and `focus=1`, and the gate timed out on its *position* assertion, having
+wanted a press at `(397, 295)` and seen one at `(495, 351)`. That difference is exactly one
+`(-98, -56)` motion step, so 8 of the 9 injected moves arrived and one PS/2 packet was dropped.
+Six re-runs were clean: 1 in 68.
+
+This closes the open question in the 2026-08-18 promotion note, which recorded "the **one
+unreproduced failure** … at the click step: it is still unexplained", and justified promoting the
+gate anyway on the grounds that it now "asserts *where* the press landed before asserting that
+`nxterm` received it, so a recurrence reports coordinates rather than a bare timeout" — adding
+that the old gate "passed with a motion packet dropped, having never checked the cursor reached
+the point its arithmetic named". The recurrence came, it reported coordinates, and they name the
+cause. Dropped motion packets were always happening; the gate simply could not see them.
+
+**It is not this change's doing**, and the sample says so rather than the argument: all 68 of
+those runs had the `interrupts_restore` fix in. The mechanism is also the wrong shape — 29 motions
+injected in a tight host loop into a 16-byte PS/2 queue overflow on their own, and the extra
+masked window this change adds is the syscall's short tail, against a shootdown spin that runs
+with interrupts *enabled* and is unchanged. Left unfixed and recorded here rather than folded
+into an unrelated PR; the fix is gate-side (verify the cursor position and re-drive, rather than
+assume 29 relative moves all land).
+
+**Both polarities of the new guard were demonstrated.** A `debug_assert!(!interrupts_enabled())`
+at `syscall_dispatch`'s exit fires within two `test-qemu` boots on the unfixed tree and holds 8/8
+with the fix. Its *first* run was silent — `shootdown` returns early when no peer CPU is online,
+so that boot never took the slow path — and rather than read silence as success I forced
+`interrupts_enable()` in front of the assert and watched it panic. Twice this session a silent
+probe pointed the wrong way; the cost of proving an instrument can fire is one run.

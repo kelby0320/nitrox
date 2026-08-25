@@ -162,12 +162,28 @@ impl ArchCpu for X86Cpu {
         unsafe { regs::sti() };
     }
 
+    /// Restore `IF` to `prev` — **set it either way**, rather than assuming the current
+    /// state.
+    ///
+    /// The `else` arm used to be a no-op, commented "leave IF clear — it already is". That
+    /// held for every caller that had reached here through `interrupts_disable`, and was
+    /// false for the one that had enabled `IF` *itself*: `tlb::shootdown` unmasks for the
+    /// duration of the IPI round-trip (it must — an `IF`-masked spinner cannot service a
+    /// peer's shootdown IPI), then called this with the `prev = false` it captured on the way
+    /// in. The no-op left interrupts **enabled** for the rest of the syscall, and its return
+    /// through the `sysretq` stub's ring-0-on-user-stack window (PR #231 review, finding 2).
+    ///
+    /// Making it unconditional costs one `cli` on a cold path and removes an unstated
+    /// precondition — the function now does what its name says regardless of how the caller
+    /// got here.
     unsafe fn interrupts_restore(prev: bool) {
         if prev {
             // SAFETY: ring-0; restoring a previously-enabled interrupt state.
             unsafe { regs::sti() };
+        } else {
+            // SAFETY: ring-0; restoring a previously-masked interrupt state.
+            unsafe { regs::cli() };
         }
-        // else: leave IF clear — it already is.
     }
 }
 
