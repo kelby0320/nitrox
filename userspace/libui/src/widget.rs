@@ -471,6 +471,393 @@ pub fn text_field<Msg>(
 }
 
 
+/// One row of a [`list_view`].
+///
+/// **Borrowed, and built fresh each frame from whatever the application already has.** That
+/// is the "model" in model-backed: a window list derives these from its window records and a
+/// launcher derives them from its filtered program list, neither keeping a parallel array of
+/// row widgets to reconcile by hand — which is the hand-rolled diffing `desktop-shell.md` §5
+/// says a list widget exists to avoid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ListRow<'a> {
+    /// Identity across frames.
+    ///
+    /// **Not the index.** [`Element::key`](crate::element::Element::key) exists because the
+    /// diff otherwise pairs by position, and its own doc names this failure: insert a row at
+    /// the top and "the diff pairs row 2's widget with row 3's element". A window list
+    /// reorders on every raise, so position is never stable here. Use the window id, or the
+    /// index into the *unfiltered* list — anything that survives the list changing shape.
+    pub key: u64,
+    /// What the row says.
+    pub label: &'a str,
+}
+
+/// Which row is selected, and how far the list is scrolled.
+///
+/// Scroll is a row index rather than a pixel offset: a list scrolls by whole rows, and the
+/// arithmetic that keeps a selection visible is unreadable in pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ListState {
+    /// The selected row, as an index into the rows passed to [`list_view`].
+    pub selected: Option<usize>,
+    /// The first visible row.
+    pub offset: usize,
+}
+
+impl ListState {
+    /// Move the selection down one row, answering whether anything changed.
+    ///
+    /// From nothing selected this selects the first row, which is what a launcher wants when
+    /// the user presses Down having only typed a query.
+    pub fn down(&mut self, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let next = match self.selected {
+            None => 0,
+            Some(i) if i + 1 < len => i + 1,
+            Some(i) => i,
+        };
+        let moved = self.selected != Some(next);
+        self.selected = Some(next);
+        moved
+    }
+
+    /// Move the selection up one row, answering whether anything changed.
+    pub fn up(&mut self) -> bool {
+        let Some(i) = self.selected else {
+            return false;
+        };
+        if i == 0 {
+            return false;
+        }
+        self.selected = Some(i - 1);
+        true
+    }
+
+    /// Scroll so the selected row is on screen, given how many rows fit.
+    ///
+    /// **The thing both callers would get wrong.** A selection moved with the keyboard walks
+    /// off the visible window and the list appears to stop responding — the state changed and
+    /// nothing on screen did. Called by [`list_view`] itself rather than left to the caller,
+    /// because a widget that can compute this and makes its callers do it is a widget that
+    /// will have two implementations of it.
+    pub fn ensure_visible(&mut self, visible: usize) {
+        let Some(i) = self.selected else {
+            return;
+        };
+        if visible == 0 {
+            return;
+        }
+        if i < self.offset {
+            self.offset = i;
+        } else if i >= self.offset + visible {
+            self.offset = i + 1 - visible;
+        }
+    }
+
+    /// Apply a key, answering whether the list changed.
+    ///
+    /// Declines everything it does not claim, for the reason
+    /// [`TextFieldState::apply`](TextFieldState::apply) does: Enter activates the selection
+    /// and Escape dismisses the list, and neither belongs to the list itself. A launcher's
+    /// query field and its results list are both focusable, and arrow keys have to reach the
+    /// list while the field holds focus — so a caller routes these itself rather than relying
+    /// on widget focus, which is why this takes a keycode instead of being wired to `on_key`.
+    pub fn apply(&mut self, keycode: u16, len: usize) -> bool {
+        match keycode {
+            KEY_DOWN => self.down(len),
+            KEY_UP => self.up(),
+            _ => false,
+        }
+    }
+}
+
+/// See [`KEY_BACKSPACE`].
+const KEY_UP: u16 = 103;
+/// See [`KEY_BACKSPACE`].
+const KEY_DOWN: u16 = 108;
+
+/// How much space a row's label gets around it.
+const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
+
+/// A scrolling list of rows, with one selected.
+///
+/// **The one model-backed widget** `desktop-shell.md` §5 settles on — "an explicit toolkit
+/// *plus one model-backed list widget*" covering the window list, the desktop previews and the
+/// launcher results, "which is essentially all of the churn, for a fraction of a diffing
+/// engine's machinery". Designed against two of those callers rather than one, because a model
+/// API drawn for a single consumer is the failure mode §5 was avoiding: a window list is
+/// **reordered and mutated in place** while a launcher's results are **replaced wholesale on
+/// every keystroke**, and those stress different halves — the first the keying, the second the
+/// selection and scroll surviving a list that changed length.
+///
+/// **Only the visible rows become elements.** That is the point of the widget rather than an
+/// optimisation: a list of a hundred windows costs as many elements as fit on screen, and the
+/// diff walks that many. `visible` comes from the height it is given, so a caller cannot get
+/// it out of step with the space it actually has.
+///
+/// `state` is taken by value and scrolled to follow the selection — see
+/// [`ensure_visible`](ListState::ensure_visible). A caller that wants the scroll to persist
+/// reads it back from the returned state.
+pub fn list_view<Msg>(
+    rows: &[ListRow<'_>],
+    state: ListState,
+    height: u32,
+    row_height: u32,
+    activate: fn(u64) -> Msg,
+    palette: &Palette,
+) -> (Element<Msg>, ListState) {
+    let mut state = state;
+    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    state.ensure_visible(visible);
+    // Never scrolled past the end: a list that shrinks under a stale offset would otherwise
+    // render blank while holding rows.
+    let max_offset = rows.len().saturating_sub(visible);
+    state.offset = state.offset.min(max_offset);
+
+    let last = (state.offset + visible).min(rows.len());
+    let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
+    for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
+        let selected = state.selected == Some(i);
+        let face = if selected { palette.face_hover } else { palette.track };
+        let row_el = stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))]);
+        items.push(sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key)));
+    }
+
+    let list = column(items);
+    let body = if rows.len() > visible {
+        let bar = ScrollState {
+            offset: state.offset as u32,
+            visible: visible as u32,
+            total: rows.len() as u32,
+        };
+        row(alloc::vec![
+            list.flex(1),
+            scrollbar(bar, SCROLLBAR_W, height, palette),
+        ])
+    } else {
+        list
+    };
+    (stack(alloc::vec![fill(palette.track), body]).focusable(), state)
+}
+
+/// How wide a list's scrollbar is, in pixels.
+const SCROLLBAR_W: u32 = 10;
+
+#[cfg(test)]
+mod list_view_tests {
+    use super::*;
+    use crate::element::Node;
+
+    fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
+        labels.iter().map(|&(key, label)| ListRow { key, label }).collect()
+    }
+
+    /// The whole point of the widget: a hundred rows cost as many elements as fit.
+    #[test]
+    fn only_the_visible_rows_become_elements() {
+        let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
+        let r = rows(&data);
+        let (e, _): (Element<u64>, _) =
+            list_view(&r, ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
+    }
+
+    /// Without keys the diff pairs by position, and its own doc names the failure: insert at
+    /// the top and "row 2's widget" pairs with "row 3's element".
+    #[test]
+    fn every_row_carries_its_key_not_its_index() {
+        let data = [(70u64, "a"), (80, "b"), (90, "c")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
+    }
+
+    /// The window-list caller: rows reorder in place on every raise.
+    #[test]
+    fn a_reordered_window_list_keeps_each_rows_identity() {
+        let before = [(1u64, "term"), (2, "editor")];
+        let after = [(2u64, "editor"), (1, "term")];
+        let (a, _): (Element<u64>, _) =
+            list_view(&rows(&before), ListState::default(), 100, 20, |k| k, &Palette::default());
+        let (b, _): (Element<u64>, _) =
+            list_view(&rows(&after), ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(keys(&a), alloc::vec![1, 2]);
+        assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
+    }
+
+    /// The launcher caller: results are replaced wholesale on every keystroke, so the list
+    /// gets shorter under a scroll offset that was valid a frame ago.
+    #[test]
+    fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
+        let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
+        let (_, state): (Element<u64>, _) = list_view(
+            &rows(&long),
+            ListState { selected: Some(19), offset: 0 },
+            100, 20, |k| k, &Palette::default(),
+        );
+        assert_eq!(state.offset, 15, "the scroll did not follow the selection");
+        let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
+        let (e, state): (Element<u64>, _) =
+            list_view(&rows(&short), state, 100, 20, |k| k, &Palette::default());
+        assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
+        assert_eq!(keys(&e).len(), 3, "the list rendered blank");
+    }
+
+    /// A selection moved with the keyboard must stay on screen.
+    #[test]
+    fn the_scroll_follows_the_selection_in_both_directions() {
+        let mut s = ListState { selected: Some(7), offset: 0 };
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 3, "scrolling down did not bring the selection into view");
+        s.selected = Some(1);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 1, "scrolling up did not bring the selection into view");
+        s.selected = Some(3);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 1, "a visible selection scrolled anyway");
+    }
+
+    /// Down from nothing selects the first row.
+    #[test]
+    fn down_from_nothing_selects_the_first_row() {
+        let mut s = ListState::default();
+        assert!(s.down(3));
+        assert_eq!(s.selected, Some(0));
+        assert!(s.down(3));
+        assert_eq!(s.selected, Some(1));
+    }
+
+    /// Both ends stop rather than wrapping, and report no change.
+    #[test]
+    fn the_selection_stops_at_both_ends() {
+        let mut s = ListState { selected: Some(2), offset: 0 };
+        assert!(!s.down(3), "the selection moved past the last row");
+        s.selected = Some(0);
+        assert!(!s.up(), "the selection moved above the first row");
+        let mut empty = ListState::default();
+        assert!(!empty.up());
+        assert_eq!(empty.selected, None);
+    }
+
+    /// Enter and Escape belong to whatever owns the list.
+    #[test]
+    fn declines_the_keys_that_belong_above_it() {
+        for key in [28u16, 1, 15] {
+            let mut s = ListState { selected: Some(1), offset: 0 };
+            assert!(!s.apply(key, 4), "keycode {key} was claimed by the list");
+            assert_eq!(s.selected, Some(1));
+        }
+        let mut s = ListState { selected: Some(1), offset: 0 };
+        assert!(s.apply(108, 4), "Down was not claimed");
+        assert_eq!(s.selected, Some(2));
+    }
+
+    /// The selected row paints differently, or selection is invisible.
+    #[test]
+    fn the_selected_row_is_painted_differently() {
+        let data = [(1u64, "a"), (2, "b")];
+        let p = Palette::default();
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, &p);
+        let faces = row_faces(&e);
+        assert_eq!(faces.len(), 2);
+        assert_ne!(faces[0], faces[1], "the selected row looks like the others");
+        assert_eq!(faces[1], p.face_hover, "the selected row is not the selected colour");
+    }
+
+    /// A scrollbar that is always there wastes width; one that never appears strands rows.
+    #[test]
+    fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
+        let p = Palette::default();
+        let few = [(1u64, "a"), (2, "b")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&few), ListState::default(), 100, 20, |k| k, &p);
+        assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
+        let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&many), ListState::default(), 100, 20, |k| k, &p);
+        assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
+    }
+
+    /// Each row's activation message carries that row's key.
+    #[test]
+    fn a_rows_message_carries_its_own_key() {
+        let data = [(11u64, "a"), (22, "b")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
+    }
+
+    /// Zero row height must not divide by zero.
+    #[test]
+    fn a_degenerate_row_height_is_not_a_division() {
+        let data = [(1u64, "a")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState::default(), 100, 0, |k| k, &Palette::default());
+        assert_eq!(keys(&e).len(), 0);
+    }
+
+    fn walk<Msg>(e: &Element<Msg>, f: &mut impl FnMut(&Element<Msg>)) {
+        f(e);
+        for c in e.children() {
+            walk(c, f);
+        }
+    }
+
+    fn keys<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<u64> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if let Some(k) = n.key {
+                out.push(k);
+            }
+        });
+        out
+    }
+
+    fn presses(e: &Element<u64>) -> alloc::vec::Vec<u64> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if let Some(m) = n.on_press {
+                out.push(m);
+            }
+        });
+        out
+    }
+
+    fn row_faces<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Rgb> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if n.key.is_none() {
+                return;
+            }
+            let mut first = None;
+            walk(n, &mut |c| {
+                if first.is_none() {
+                    if let Node::Fill(rgb) = &c.node {
+                        first = Some(*rgb);
+                    }
+                }
+            });
+            if let Some(rgb) = first {
+                out.push(rgb);
+            }
+        });
+        out
+    }
+
+    fn has_row_node<Msg>(e: &Element<Msg>) -> bool {
+        let mut found = false;
+        walk(e, &mut |n| {
+            if matches!(n.node, Node::Row { .. }) {
+                found = true;
+            }
+        });
+        found
+    }
+}
+
 #[cfg(test)]
 mod text_field_tests {
     use super::*;
