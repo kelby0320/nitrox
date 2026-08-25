@@ -30,7 +30,7 @@ use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::surface::{CreateWindowRequest, Edge, Role};
-use libsurface::Session;
+use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
@@ -471,8 +471,17 @@ fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
     true
 }
 
-/// Wait set for the compositor's event channel.
-static mut WAIT_HANDLES: [u64; 1] = [0; 1];
+/// Where a placed window's top-left goes: below the top bar, cascading so two launches do not
+/// land on top of each other.
+///
+/// **A policy, and the shell's to have.** M6 built placement, restacking and the
+/// initial-configure hold for a manager and nothing but a test client has ever supplied one —
+/// this is the first process with an opinion about where a window goes. The opinion is
+/// deliberately dull: below the bar, stepped. A real one is `desktop-shell.md`'s to specify.
+const CASCADE_STEP: i32 = 24;
+
+/// Wait set: the compositor's event channel, and the manager channel.
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
 /// One 24-byte `IoResult`.
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 
@@ -573,6 +582,34 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
         .u(BAR_H as u64)
         .end();
 
+    // **The manager channel, which makes this the compositor's first real manager.**
+    //
+    // Resolved from the session namespace, which binds the `/dev/draw` subtree unscoped and
+    // therefore reaches `manage`. An application's namespace binds `/dev/draw/new` alone and
+    // does not — that asymmetry is the whole of what closed `manage-ungated`, and holding this
+    // channel is the other half of it being a capability rather than a race.
+    //
+    // **Attaching a manager changes the compositor's behaviour**: a `normal` window's first
+    // `Configure` is held until the manager acts (M6 Part B4), so from here on nothing reaches
+    // the screen unless this process places it. That is the point — it is also why the top bar
+    // is created *before* this, since a `panel` that waited on a manager that did not exist yet
+    // would be waiting on itself.
+    // SAFETY: `session_ns` is live for this process's whole run.
+    let mut manager = match unsafe { ChannelTransport::manage(session_ns) } {
+        Ok(m) => {
+            kprint(b"desktop-shell: manager channel held\n");
+            Some(m)
+        }
+        Err(_) => {
+            // Not fatal: a shell that cannot manage is a shell that draws a bar and launches
+            // things, which is worse but not nothing. Say so — the alternative is a session
+            // where windows silently never appear.
+            kprint(b"desktop-shell: /dev/draw/manage unavailable; windows will not be placed\n");
+            None
+        }
+    };
+    let mut next_origin = BAR_H as i32;
+
     // The modal's entries, read once. `desktop-shell.md` §4: they are `/bin` programs, and
     // that falls out of decisions already made — they are ordinary files in the namespace, so
     // type-to-filter runs over them with no special mechanism.
@@ -591,17 +628,29 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
     // whole machine (the 2026-07-31 `logging-service` bug).
     let ev = session.wait_handle();
     loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+        // Both channels in one wait: the session's events and the manager's. Polling one
+        // while blocked on the other would make a held window wait for a keystroke.
+        let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for two waiters.
         unsafe {
             WAIT_HANDLES[0] = ev;
+            let n = if mgr_h != 0 {
+                WAIT_HANDLES[1] = mgr_h;
+                2
+            } else {
+                1
+            };
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                1,
+                n,
                 (&raw mut WAIT_RESULTS) as u64,
                 u64::MAX,
             )
         };
+        if let Some(m) = manager.as_mut() {
+            place_new_windows(m, &mut next_origin);
+        }
         if session.pump().is_err() {
             fail(b"desktop-shell: compositor connection lost\n");
         }
@@ -659,6 +708,47 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
                 present_modal(&mut session, id, &font, &query, &rows, &modal_addrs);
             }
         }
+    }
+}
+
+/// Drain the manager channel and place every window it announces.
+///
+/// **Placing is what releases a held window.** With a manager attached the compositor holds a
+/// `normal` window's first `Configure` until the manager acts, so a shell that received
+/// `WindowCreated` and did nothing would leave every launched application invisible — a
+/// failure that looks like the application never started.
+fn place_new_windows(mgr: &mut ChannelTransport, next_origin: &mut i32) {
+    use librsproto::surface::{MgrPlace, MgrWindowCreated, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED};
+    let mut buf = [0u8; 256];
+    // Zero timeout: drain what is queued and return. The outer `sys_wait` is what blocks.
+    while let Ok(Some((op, n))) = mgr.wait_event_timeout(&mut buf, 0) {
+        if op != OP_MGR_WINDOW_CREATED {
+            continue;
+        }
+        let Some(created) = MgrWindowCreated::read(&buf[..n]) else {
+            continue;
+        };
+        let (x, y) = (0, *next_origin);
+        *next_origin += CASCADE_STEP;
+        let place = MgrPlace { window: created.window, x, y };
+        let mut body = [0u8; 12];
+        if place.write(&mut body).is_none() {
+            continue;
+        }
+        let mut reply = [0u8; 64];
+        if mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_err() {
+            Line::new()
+                .s(b"desktop-shell: Place refused for window ")
+                .u(created.window as u64)
+                .end();
+            continue;
+        }
+        Line::new()
+            .s(b"desktop-shell: placed window ")
+            .u(created.window as u64)
+            .s(b" at 0,")
+            .i(y as i64)
+            .end();
     }
 }
 

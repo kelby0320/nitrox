@@ -1388,6 +1388,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
     // the process is what distinguishes a session that runs from one that is merely spawned.
     session.expect("desktop-shell: top bar presented")?;
+    // **The compositor's first real manager.** Everything M6 built for one -- placement,
+    // restacking, the initial-configure hold -- has been exercised by a test client until now.
+    // Holding the channel is also the other half of what closed `manage-ungated`: the shell's
+    // session namespace binds the `/dev/draw` subtree and reaches `manage`, an application's
+    // binds `/dev/draw/new` alone and does not.
+    session.expect("desktop-shell: manager channel held")?;
     session.expect("desktop-shell: /bin lists ")?;
 
     // 4. **The applications modal.** `desktop-shell.md` §4 gives it two triggers — this button
@@ -1402,6 +1408,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     const APPS_CLICK: (i32, i32) = (60, 12);
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
+    // **And the shell placed it**, which is the manager half actually doing something rather
+    // than merely holding a channel. Every window created while a manager is attached is
+    // announced to it, and a `normal` one's first `Configure` is *held* until the manager acts
+    // — so a shell that received `WindowCreated` and did nothing would leave launched
+    // applications invisible, a failure that looks like they never started.
+    session.expect("desktop-shell: placed window ")?;
 
     // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —
     //    the property `check-terminal` relies on when it says an open menu "is a topmost popup

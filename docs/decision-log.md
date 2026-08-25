@@ -17916,3 +17916,30 @@ have to wait for a ready before reaping — a change to the shared core for a gr
 does not hold `/dev/draw/manage`, so the initial-configure hold is still skipped and nothing
 places a launched window. Recorded in the plan as what remains rather than ticked through.
 
+## 2026-08-25 — M7 Part E closes: the compositor gets its first real manager
+
+`desktop-shell` now holds `/dev/draw/manage` and places the windows it is told about. Everything
+M6 built for a manager — placement, restacking, focus, the initial-configure hold, the five
+manager events — had been exercised by a test client until this.
+
+**Holding the channel is the other half of what closed `manage-ungated`.** The shell's session
+namespace binds the `/dev/draw` subtree and therefore reaches `manage`; an application's binds
+`/dev/draw/new` alone and does not. The asymmetry is the capability, and the first-come rule that
+used to separate managers stops being load-bearing.
+
+**Attaching a manager changes the compositor's behaviour, which is why the top bar is created
+first.** A `normal` window's first `Configure` is held until the manager acts, so a `panel`
+created after this would have been waiting on a manager that was itself waiting to draw.
+
+**Placement is exercised, and I checked rather than assumed.** `whoami` has no window, so the
+launch path alone proves nothing about placing — but every window created while a manager is
+attached is announced to it, including the shell's own applications modal. Confirmed by asserting
+a placement and watching it pass, then negative-controlled by removing the `place_new_windows`
+call: the gate fails. Without that check this would have been the fifth capability this milestone
+shipped that nothing reached.
+
+**What is deferred, and why it is not the same thing.** `/dev/desktop` — `TODO(desktop-endpoint)`
+— has no consumer, so building it would be exactly the shape above. The architectural claim of
+that box is separately true and demonstrated: the shell binds no endpoint of its own and holds
+`BIND_NAMESPACE` to construct application namespaces continuously.
+

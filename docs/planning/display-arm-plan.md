@@ -1712,9 +1712,9 @@ The three things every later part draws with, none of which exist. Gated on the 
       coordinate — and needs no registry, which is what `graphical-session.md` §1 says Nitrox
       does not need yet.
 
-### Part E — `desktop-shell`
+### Part E — `desktop-shell` ✅ complete (2026-08-25), bar the `/dev/desktop` binding — `TODO(desktop-endpoint)`
 
-- [ ] **The shell, minimally** — top bar ✅ and applications modal ✅ (2026-08-25); **window placement policy is not done**: the shell does not hold `/dev/draw/manage` yet, so the initial-configure hold is still skipped and nothing places a launched window. That is what remains of this box. Originally: the top bar, the applications modal, and window placement policy
+- [x] **The shell, minimally** ✅ (2026-08-25): the top bar, the applications modal, and window placement policy
       driving M6's manager ops. It is the compositor's first real manager — everything M6 built
       for one has been exercised by a test client until now.
 
