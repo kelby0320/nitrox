@@ -305,7 +305,7 @@ pub fn dispatch(
             };
             // Same ownership rule as every other op: a window belonging to another connection
             // answers `NotFound`, so a reply cannot be used to probe for other clients' ids.
-            if !conn.owned.contains(&id) {
+            if !conn.owns(id) {
                 return Outcome::Failed(SurfaceError::NotFound);
             }
             let Some(w) = stack.window_mut(id) else {

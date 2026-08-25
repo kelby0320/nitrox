@@ -19,6 +19,8 @@ libdraw = { path = "../libdraw" }
 # For `TextFieldState::apply`: one keycode-to-character mapping, shared with the terminal and
 # the compositor, rather than a second one that could disagree with them about a key.
 libinput = { path = "../libinput" }
+# For the `EV_KEY` codes the text field and list act on — the same set `libterm` imports.
+libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }
 #  for the baseline:  has no float transcendentals, and the ascent is a float.
 libm = { version = "0.2", default-features = false }

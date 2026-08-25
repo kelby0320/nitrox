@@ -22,6 +22,15 @@ use libdraw::format::Rgb;
 use libdraw::geom::Size;
 
 use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, text};
+// The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
+// `libterm::encode` already imports exactly this set from there, so a second copy is a second
+// thing that can disagree about a key. The same argument the `libinput` dependency is
+// justified by, applied to the codes as well as the mapping (PR #233 review, finding 3).
+// `libinput::keymap` does not map them because it answers "what text does this produce", and
+// these produce none.
+use libkern::abi::{
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP,
+};
 
 /// How a widget should look, given what the application knows about it.
 ///
@@ -411,19 +420,6 @@ impl TextFieldState {
     }
 }
 
-/// `EV_KEY` codes for the editing keys, which [`libinput::keymap`] deliberately does not map —
-/// it answers "what text does this produce", and these produce none.
-const KEY_BACKSPACE: u16 = 14;
-/// See [`KEY_BACKSPACE`].
-const KEY_DELETE: u16 = 111;
-/// See [`KEY_BACKSPACE`].
-const KEY_LEFT: u16 = 105;
-/// See [`KEY_BACKSPACE`].
-const KEY_RIGHT: u16 = 106;
-/// See [`KEY_BACKSPACE`].
-const KEY_HOME: u16 = 102;
-/// See [`KEY_BACKSPACE`].
-const KEY_END: u16 = 107;
 
 /// A single-line text field, optionally masked.
 ///
@@ -487,6 +483,11 @@ pub struct ListRow<'a> {
     /// the top and "the diff pairs row 2's widget with row 3's element". A window list
     /// reorders on every raise, so position is never stable here. Use the window id, or the
     /// index into the *unfiltered* list — anything that survives the list changing shape.
+    ///
+    /// **Must be unique among the rows in one list.** A repeat is
+    /// [`DiffError::DuplicateKey`](crate::diff::DiffError::DuplicateKey) — a hard error from
+    /// the diff, not a degraded pairing — which is worth knowing before reaching for a hash of
+    /// a name that two rows could share.
     pub key: u64,
     /// What the row says.
     pub label: &'a str,
@@ -573,11 +574,6 @@ impl ListState {
     }
 }
 
-/// See [`KEY_BACKSPACE`].
-const KEY_UP: u16 = 103;
-/// See [`KEY_BACKSPACE`].
-const KEY_DOWN: u16 = 108;
-
 /// How much space a row's label gets around it.
 const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 
@@ -594,8 +590,14 @@ const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 ///
 /// **Only the visible rows become elements.** That is the point of the widget rather than an
 /// optimisation: a list of a hundred windows costs as many elements as fit on screen, and the
-/// diff walks that many. `visible` comes from the height it is given, so a caller cannot get
-/// it out of step with the space it actually has.
+/// diff walks that many.
+///
+/// **`height` must be the height the parent will actually give it** — the same obligation
+/// [`scrollbar`] states, and this widget does not size itself to it, so a caller that lets the
+/// list flex will show a different number of rows than it built. Wrapping the result in
+/// `sized` is what [`crate::reference`] does and is the reliable way to keep the two in step.
+/// (An earlier version of this sentence claimed a caller "cannot get it out of step", which is
+/// exactly backwards; PR #233 review.)
 ///
 /// `state` is taken by value and scrolled to follow the selection — see
 /// [`ensure_visible`](ListState::ensure_visible). A caller that wants the scroll to persist
@@ -610,6 +612,19 @@ pub fn list_view<Msg>(
 ) -> (Element<Msg>, ListState) {
     let mut state = state;
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    // **The selection is clamped first, because it is an index into a list that may have just
+    // been replaced.** A launcher rebuilds its results on every keystroke, so a selection made
+    // against twenty of them is not an index into the three that remain — and a stale one is
+    // worse than useless: nothing paints as selected, `down` sees `i + 1 < len` fail and
+    // returns the same index so the key is *dead*, and a caller reading `selected` to decide
+    // what Enter activates gets an out-of-range index. Clamped to the last surviving row
+    // rather than cleared, so something is highlighted and the arrows work on the next press
+    // (PR #233 review, finding 2).
+    if let Some(i) = state.selected {
+        if i >= rows.len() {
+            state.selected = rows.len().checked_sub(1);
+        }
+    }
     state.ensure_visible(visible);
     // Never scrolled past the end: a list that shrinks under a stale offset would otherwise
     // render blank while holding rows.
@@ -699,10 +714,36 @@ mod list_view_tests {
         );
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
-        let (e, state): (Element<u64>, _) =
+        let (e, mut state): (Element<u64>, _) =
             list_view(&rows(&short), state, 100, 20, |k| k, &Palette::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
+
+        // **The selection half, which the first version of this test did not assert and so
+        // passed against a widget that left it dangling** (PR #233 review, finding 2). A
+        // selection of 19 into three rows highlights nothing, and `down` is *dead*: it takes
+        // `Some(i) if i + 1 < len` and otherwise returns `i` unchanged, so a stale index never
+        // comes back into range on its own.
+        assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
+        assert!(
+            row_faces(&e).iter().any(|f| *f == Palette::default().face_hover),
+            "no row is painted as selected"
+        );
+        assert!(!state.down(3), "the selection is already on the last row");
+        assert!(state.up(), "the arrow keys are dead after the shrink");
+        assert_eq!(state.selected, Some(1));
+    }
+
+    /// Shrinking to nothing leaves nothing selected, rather than row `-1`.
+    #[test]
+    fn a_list_that_empties_clears_the_selection() {
+        let (_, state): (Element<u64>, _) = list_view(
+            &[],
+            ListState { selected: Some(3), offset: 2 },
+            100, 20, |k| k, &Palette::default(),
+        );
+        assert_eq!(state.selected, None, "an empty list kept a selection");
+        assert_eq!(state.offset, 0);
     }
 
     /// A selection moved with the keyboard must stay on screen.

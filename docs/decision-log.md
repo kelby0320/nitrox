@@ -17664,3 +17664,47 @@ right-hand edge and nowhere else. Below y=96 it is wholly visible — confirmed 
 assumed by corrupting the host's expectation at y=210 and watching the gate report 20 differing
 pixels at (20,210).
 
+## 2026-08-25 — Part A's review: a cap that was never the cap, and a clamp that covered half its case
+
+Two blocking findings on PR #233, and both are the same shape — a test that exercised the
+component and not the path.
+
+**The title cap was 60 bytes, not 256.** The compositor's serve loop copies each request body
+into a fixed `MAX_BODY = 64` buffer before dispatch, so `dispatch` never saw more than 4 bytes
+of window id and 60 of title. Three things followed, none of which any test could see: the
+spec and the resolved deferral both stated 256 and were false; a title whose 61st byte began a
+multi-byte character failed `from_utf8` and came back `Malformed`, so a legitimate rename was
+**dropped rather than shortened** — the exact corruption `truncate_title` was written to
+prevent, reintroduced one frame up the stack; and because `title.len()` could never exceed 60,
+`truncate_title`'s walk-back and the truncation log were **unreachable in the shipped binary**.
+The headline decision of A3 did not take effect on the real path.
+
+Every truncation test called `dispatch` directly and handed it a 260-byte body no client can
+deliver. The component was right and the path was not, and testing the component is what hid
+it. `MAX_BODY` is now `4 + MAX_TITLE` with `const _: () = assert!(…)` tying the two together,
+because it is a number two files away from the one it has to track. Worth noting where that
+guard is checked: `cargo xtask test` builds the compositor **lib**, so it does not compile
+`main.rs` at all — the assertion fails the *image* build, which CI runs. Verified by putting
+64 back and watching `cargo xtask image` fail.
+
+**`list_view` clamped the scroll to a shrunken list but not the selection.** The launcher is
+the caller Part A is explicitly designed against, and the failure is the one that caller
+produces: twenty results, arrow down to row 19, type one more character, three remain. Nothing
+paints as selected; `down` takes `Some(i) if i + 1 < len` and otherwise returns `i` unchanged,
+so the key is **dead** rather than merely wrong; `up` has to be pressed seventeen times; and a
+caller reading `selected` to decide what Enter activates gets index 19 into three rows.
+
+The test that was supposed to cover this asserted on `state.offset` and the row count and
+never on `state.selected`, so it passed either way — the second decorative test this part has
+produced, both found by someone else running a control I had not. The selection is now clamped
+before `ensure_visible`, to the last surviving row rather than cleared so something stays
+highlighted and the arrows work on the next press, and the test asserts the selection, the
+highlight and that `up` still moves.
+
+**A smaller one worth keeping**: eight `EV_KEY` codes were re-declared privately in `widget.rs`
+when `libkern::abi` already publishes them and `libterm::encode` imports exactly that set. The
+`libinput` dependency in the same commit was justified as "one keycode-to-character mapping …
+rather than a second one that could disagree" — and the argument applies to the codes just as
+well as to the mapping. Applying a rule to the thing that suggested it and not to its neighbour
+is how two sources of truth get one commit apart.
+

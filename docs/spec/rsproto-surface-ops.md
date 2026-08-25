@@ -676,6 +676,7 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x0919` | `WindowDestroyed`| `MgrWindowRef`      | A window is gone (`other` unused, zero)        |
 | `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's committed rectangle changed — place *or* commit |
 | `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
+| `0x091C` | `WindowTitle`    | window id + UTF-8   | A window's title changed — see *Titles* below  |
 
 `WindowCreated` fires when the window is created, **before** its client has committed anything
 — that is what lets a manager place a window before it is first seen.

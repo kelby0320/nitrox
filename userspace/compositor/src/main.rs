@@ -70,8 +70,21 @@ const PAYLOAD_OFF: usize = 24;
 /// The background the screen is cleared to where no window covers.
 const BACKGROUND: Rgb = Rgb::new(0x0E, 0x14, 0x1B);
 
-/// Largest Surface request body (`AttachBuffer`/`Commit` are 24 bytes).
-const MAX_BODY: usize = 64;
+/// Largest Surface request body.
+///
+/// **Sized by `SetTitle`, which is the only variable-length one** — the fixed records are 24
+/// bytes or fewer. At 64 this silently capped a title at 60 bytes while the spec, the
+/// deferral and `truncate_title` all said 256, and the cut was at a raw byte offset: a title
+/// whose 61st byte began a multi-byte character came back `Malformed` and the rename never
+/// happened, which is the exact corruption `truncate_title` exists to prevent, reintroduced
+/// one frame further up. It also made `truncate_title`'s walk-back and `note_title_truncated`
+/// unreachable in the shipped binary, because `title.len()` could never exceed 60 (PR #233
+/// review, finding 1).
+///
+/// The assertion below is the point: this is a number two files away from the one it has to
+/// track, and nothing else would notice them drifting apart again.
+const MAX_BODY: usize = 4 + librsproto::surface::MAX_TITLE;
+const _: () = assert!(MAX_BODY >= 4 + librsproto::surface::MAX_TITLE);
 
 /// Two less than the wait limit: the forwarding endpoint takes the first slot and the
 /// input-server consumer channel the second.
@@ -636,7 +649,7 @@ fn flush_outboxes(srv: &mut Server) -> bool {
         srv.mgr_outbox.clear();
     } else {
         while let Some(ev) = srv.mgr_outbox.front() {
-            if !send_mgr_event(mgr, &ev) {
+            if !send_mgr_event(mgr, ev) {
                 break;
             }
             srv.mgr_outbox.pop();
@@ -1554,9 +1567,10 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
         return rr != KError::PeerClosed.as_i32() as i64;
     }
 
-    // Copy the body out rather than holding a borrow of `RECV_MSG` across dispatch. Every
-    // Surface body is at most 24 bytes, so this is a copy of nothing; the alternative is
-    // two live `static mut` borrows at once.
+    // Copy the body out rather than holding a borrow of `RECV_MSG` across dispatch; the
+    // alternative is two live `static mut` borrows at once. `MAX_BODY` is sized so a whole
+    // `SetTitle` fits — this `min` is a bounds check, not a policy, and when it *was* a policy
+    // it silently shortened titles to 60 bytes.
     let mut body_buf = [0u8; MAX_BODY];
     let (op, request_id, body_len, handle) = unsafe {
         let payload_len =
