@@ -17459,6 +17459,69 @@ hunting", and I nearly drew a conclusion from it.
 Landing the `cli` on its own merits: the window is real, the positive control demonstrates it is
 exploitable, and the fix costs one instruction on the syscall return path.
 
+## 2026-08-24 — A demo that was passing on luck, and two ways not to confirm an injected pointer
+
+Set out to fix a `check-terminal` flake and landed one thing, disproved four explanations, and
+established that the obvious fix for the flake cannot be built the obvious way. The flake stays
+open; what follows is so the next attempt starts from here rather than from the beginning.
+
+**The flake.** One run in 68: a press at (495, 351) against a target of (397, 295) — exactly
+one `(-98, -56)` step short, so 8 of 9 injected motions arrived and one PS/2 packet was lost.
+Typing is not exposed to this (`check-terminal` sends one key at a time and waits for its echo
+through `nxterm` → `tty-server` → `nxsh`, so it is self-throttling); positioning is, because
+`move_pointer_to` fires ~33 **unacknowledged** motions. PS/2 is a relative device, so it
+overshoots into a corner to clamp at a known point and walks back in wire-sized steps — and the
+two halves fail differently: the overshoot is self-correcting, while a drop during the walk
+leaves a permanent offset of exactly that step.
+
+**The loss is upstream of the guest**, so nothing inside can report it. The failing transcript
+has no `SYN_DROPPED`: `input-server`'s ring never overflowed because the byte never reached it.
+QEMU's PS/2 queue silently discards its overflow, and no consumer can account for an event it
+was never given. The only defence is for the injector to confirm where the pointer ended up —
+which needs the guest to say, and that is where both attempts died.
+
+**Attempt 1 — report the position on every motion that moved it. Too expensive, and it breaks
+the tests that matter.** A `Line` written from the compositor's input path costs a serial write
+per event, and `check-input` exists to exercise exactly that path under pressure: twelve motions
+before a keystroke (the historical regression where "the keystroke behind them went on the
+floor"), then forty deliberately overfilling the sixteen-slot ring to test coalescing and retry.
+The added latency perturbs both. It passed every local TCG gate and failed CI, which runs
+`--kvm` — a faster guest bunches the injected events closer together in guest time. Reproduced
+locally with `--kvm` at the stall test. **The lesson is the general one:** the compositor's input
+loop cannot afford per-event logging, and TCG-only testing will not tell you.
+
+**Attempt 2 — a zero-delta motion as an explicit "report now" sentinel.** One line per
+positioning and one comparison per event in the hot path, which would have been ideal. QEMU does
+not deliver it: zero reports, gate red. Not viable.
+
+**What is left for a third attempt**, none of it tried: locate the cursor in a QMP `screendump`
+(no guest change at all, and it cannot perturb guest timing); a compositor report triggered by
+something rare it already handles; or an idle-flush that logs a pending position when the input
+queue goes quiet. The first is the most promising precisely because it touches nothing in the
+guest.
+
+**What did land, and it is unrelated to the above: `test-qemu`'s `dead-log-source` demo was
+passing on luck.** It sampled idle CPUs ten times over one second while `ui-testclient` churns
+128 windows concurrently — and across six baseline runs on unmodified `main`, `ui-testclient`'s
+`PASSED` line landed *inside* that window five times. The CPU it held came free with barely
+enough window left to observe. Any timing shift moves it to the wrong side and fails this demo
+three subsystems from the cause, which is how attempt 1 first presented.
+
+It now samples until quiescent, up to five seconds, exiting the moment enough CPUs are idle.
+That costs no detection power, because the two cases are not symmetric: **a spin is permanent**
+and a CPU held by one never reads idle however long you look, while legitimate work finishes.
+Confirmed rather than assumed — a probe thread holding a CPU forever still fails the demo (*only
+2 of 4 CPUs ever went idle*, exit 1). A more patient test that could no longer see a spin would
+be worse than the flake it fixed.
+
+**Two hypotheses died on the way, recorded so they are not re-run.** A stack-frame theory that
+looked confirmed — `Line` carries a 256-byte buffer whose slot the compiler reserves whether or
+not the branch runs, and a 272-byte pad in the same place survived where a 1024-byte one did
+not. User stacks are **8 MiB** with a 1 MiB guard, so it never was. And the alarming `session 3
+outbox overflow, discarded …` lines in the failing transcript, which appear identically in
+passing runs and discriminate nothing; I had read them as evidence because they looked alarming.
+Both were disposed of by controls rather than by argument.
+
 ## 2026-08-24 — `interrupts_restore` had an unstated precondition, and `tlb::shootdown` broke it
 
 The previous entry closed a window and left the real question open: *why was `IF` set at a
