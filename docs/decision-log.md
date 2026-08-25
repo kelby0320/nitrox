@@ -17495,6 +17495,31 @@ for the next caller that manages `IF` itself; the other four call sites satisfy 
 precondition only by accident of how they got there. A function named *restore* that silently
 declines to restore is the defect — one `cli` on a cold path buys the name back.
 
+**The guard was landing in a hole, and the re-review found it by running it.** A
+`debug_assert` on the syscall path is the *shallow-stack* panic case — `syscall_dispatch`'s
+frame sits a few hundred bytes below the stack top — and the panic handler carried its own copy
+of the poor-man's backtrace with **no page probe**, under a `SAFETY` comment asserting the thing
+that is false: "reading within the current kernel stack, which is mapped". A kernel stack's
+guard page is at the *bottom*, so scanning **up** 96 words from a shallow `rsp` runs off the top
+into unmapped vmap. The `#PF` lands *before* `arch::debug_exit(0x11)`, so the panic never
+delivers its verdict: the operator gets the correct one-line diagnosis, then forty lines of
+unrelated fault dump, then ninety seconds, then `TIMED OUT … likely a hang` — the wrong
+diagnosis, and precisely what `idt.rs`'s IST2 comment exists to prevent.
+
+**The fix already existed 170 lines away** and was written for this exact failure: `idt.rs`'s
+exception dump probes `Paging::translate` once per page and stops with `(stack ends at … —
+stopping)`, added after a CI capture came back as an empty candidate list followed by a `#PF`
+whose `CR2` was the page above `RSP`. The panic handler is now a caller of that same scanner
+(`arch::dump_stack_candidates`) instead of a second copy of the loop — the duplication is what
+let one copy learn the lesson and the other not. Two callers, one scan, one guard-page probe.
+
+Demonstrated both ways rather than reasoned about: with the `else { cli }` arm removed, the
+assert fires on the **first** boot, the scan stops at `0xffffc000000e9000` — the same address
+that was `CR2` in the re-review's `#PF` — and the run ends `FAILED (qemu exit 35)`. The verdict
+arrives. Running it also caught a defect no amount of reading would have: the header line
+printed twice, because the extracted scanner emits it and the old `writeln!` had been left
+behind.
+
 **An unrelated gate failure, diagnosed by an instrument someone else left behind.** Running the
 full set afterwards, `check-terminal` failed once — not a `#DF`: the boot was clean, `nxterm`
 reported `clicked` and `focus=1`, and the gate timed out on its *position* assertion, having

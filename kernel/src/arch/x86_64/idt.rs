@@ -995,6 +995,17 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     Cpu::stop_the_machine()
 }
 
+/// Kernel text: the higher-half image base up to a generous bound. A stack word outside
+/// this range is data, not a return address.
+const TEXT_LO: u64 = 0xffff_ffff_8000_0000;
+const TEXT_HI: u64 = 0xffff_ffff_8100_0000;
+
+/// Stack words to scan. The interesting frames are within a few hundred bytes; the page
+/// probe in [`scan_stack_candidates`] stops the walk earlier whenever the stack does.
+/// (96 rather than the 64 this dump used, because the panic handler's own copy scanned
+/// 96 — taking the larger means neither caller loses depth to the unification.)
+const STACK_SCAN_WORDS: usize = 96;
+
 /// Scan the faulting stack for values that look like kernel-text addresses and
 /// print them, innermost first — a poor man's backtrace.
 ///
@@ -1011,13 +1022,6 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
 /// perturb what it is measuring, and this named the faulting caller in one run after
 /// three rounds of hot-path probes had found nothing.
 fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
-    // Kernel text: the higher-half image base up to a generous bound. Values
-    // outside this are data, not return addresses.
-    const TEXT_LO: u64 = 0xffff_ffff_8000_0000;
-    const TEXT_HI: u64 = 0xffff_ffff_8100_0000;
-    /// Stack words to scan. The interesting frames are within a few hundred bytes.
-    const WORDS: usize = 64;
-
     // A ring-0 fault keeps the faulting stack (long mode always pushes SS:RSP), so
     // `f.rsp` is where that context's stack continues.
     let sp = f.rsp;
@@ -1051,9 +1055,43 @@ fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
         let label = ["rip", "cs", "rflags", "rsp", "ss"][i];
         let _ = writeln!(w, "    [rsp+{:#04x}] {label:>6} = {val:#018x}", i * 8);
     }
+    scan_stack_candidates(sp, w);
+}
+
+/// Scan a stack for words that look like kernel return addresses, **probing each page
+/// before reading it**.
+///
+/// Shared by the exception dump and the panic handler. The panic handler used to carry
+/// its own copy of this loop with no probe at all, under a `SAFETY` comment asserting
+/// the very thing that is not true — "reading within the current kernel stack, which is
+/// mapped". A kernel stack's guard page is at the *bottom*, so walking **up** from a
+/// shallow `rsp` leaves the mapped region at the stack top and faults. That turned any
+/// panic taken near the top of a stack — the normal case for a syscall-path assertion,
+/// whose frame sits a few hundred bytes down — into a `#PF` raised *before*
+/// `debug_exit` could write the fail verdict, so the run died on the 90 s wall-clock
+/// timeout and reported `likely a hang` over the correct one-line diagnosis (PR #231
+/// re-review, finding 6).
+/// Dump return-address candidates from the **caller's own** stack.
+///
+/// For a context with no [`ExceptionFrame`] to read `rsp` from — the panic handler. Reading
+/// this function's own stack pointer is correct and slightly better than the caller's: its
+/// frame sits just below, so the caller's return address is inside the scanned range.
+pub fn dump_stack_candidates(w: &mut impl Write) {
+    let sp: u64;
+    // SAFETY: reads the stack pointer into a register; touches no memory.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack)) };
+    scan_stack_candidates(sp, w);
+}
+
+fn scan_stack_candidates(sp: u64, w: &mut impl Write) {
+    if sp < TEXT_LO && !(0xffff_8000_0000_0000..0xffff_ffff_8000_0000).contains(&sp) {
+        let _ = writeln!(w, "  (stack pointer {sp:#018x} not scannable)");
+        return;
+    }
+    let root = PhysAddr::new(regs::read_cr3() & !0xFFF);
     let _ = writeln!(w, "  return-address candidates (innermost first):");
     let mut probed_page = u64::MAX;
-    for i in 0..WORDS {
+    for i in 0..STACK_SCAN_WORDS {
         let addr = sp + (i as u64) * 8;
         let page = addr & !(PAGE_SIZE as u64 - 1);
         if page != probed_page {

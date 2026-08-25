@@ -2544,7 +2544,8 @@ unsafe fn switch_into(
     unsafe { context_switch(out_slot, next_sp, out_on_cpu) };
     // Resumed (cooperative path): restore the interrupt state this thread had
     // on entry. On the preemptive path the resume returns into the timer-stub
-    // epilogue (which `iretq`s IF back) and `saved_if` is false → no-op. A
+    // epilogue (which `iretq`s IF back) and `saved_if` is false → a redundant `cli` (it was
+    // a no-op until `interrupts_restore` became unconditional; same effect either way). A
     // terminal caller (`finish_exit`) never reaches this.
     // SAFETY: ring-0; restoring this thread's own captured interrupt state.
     unsafe { Cpu::interrupts_restore(saved_if) };

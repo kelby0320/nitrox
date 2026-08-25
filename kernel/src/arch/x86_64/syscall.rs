@@ -252,8 +252,13 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     //
     // The `cli` in the stub makes the window safe regardless — this catches the *cause*
     // rather than the symptom, and names the syscall so the culprit is one line of log
-    // instead of a boot-loop. It is not decoration: it fired 647 times in a 60,000-syscall
-    // boot before `tlb::shootdown` stopped leaking an enabled `IF` (PR #231 review).
+    // instead of a boot-loop.
+    //
+    // It is not decoration: on the tree before `tlb::shootdown` stopped leaking an enabled
+    // `IF`, it panics within two `test-qemu` boots. (The figure of *647 leaks in 60,000
+    // syscalls* that appears in the log entry came from a separate **counting** probe — a
+    // `debug_assert` stops at its first fire and could never have reported it. Two
+    // instruments, two claims; PR #231 re-review, finding 7.)
     debug_assert!(
         !<crate::arch::Cpu as crate::arch::cpu::ArchCpu>::interrupts_enabled(),
         "syscall {} returned with interrupts enabled",

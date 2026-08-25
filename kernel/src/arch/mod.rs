@@ -55,7 +55,7 @@ pub use x86_64::qemu::debug_exit;
 /// [`Cpu::stop_the_machine`](cpu::ArchCpu::stop_the_machine). For code that must not commit
 /// itself to a machine that is stopping, such as a core still in bring-up.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::idt::stopping;
+pub use x86_64::idt::{dump_stack_candidates, stopping};
 
 // Architecture-trait implementations, re-exported under neutral names (see
 // `docs/conventions/arch-boundary.md`): one trait per divergent behavioural
