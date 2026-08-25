@@ -54,8 +54,9 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
   allocation-free encoding path in `libstream` — would have cost more than it saved.
   `#![no_std]`/`#![no_main]` stay: `std` is not ported, and there is no runtime to hand a
   `main`.
-- **`libkern` + `librsproto` + `libstream` + `libheap`.** Still no `libos` unless a real
-  need appears. It remains a supervisor whose death is a system fault, so the *spirit* of
+- **`libkern` + `librsproto` + `libstream` + `libheap` + `libsession`.** Still no `libos`
+  unless a real need appears — and `libsession` was built to that rule for this reason, since
+  a dependency's dependencies are yours. It remains a supervisor whose death is a system fault, so the *spirit* of
   the rule — keep it minimal — still applies to everything else.
 - **No `panic!()` / `unwrap()`** in normal operation — degrade + log.
 - **Capability least-authority.** session-mgr holds `BIND_NAMESPACE` (to construct
