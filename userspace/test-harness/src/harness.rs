@@ -3125,21 +3125,40 @@ fn dead_log_source_demo(root_ns: u64) {
     // SAFETY: closing our own write end; the service holds the read end.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 
-    // 2. Sample occupancy across a second. This thread is running while it samples, so its
-    //    own CPU never reads idle — hence `online - 1` rather than `online`. Take the best
-    //    sample rather than any single one: a healthy system may momentarily have another
-    //    service awake, and one busy instant is not a spin.
+    // 2. Sample occupancy until the system is quiet — see the paragraph below for why that
+    //    is not a fixed window. This thread is running while it samples, so its own CPU never
+    //    reads idle — hence `online - 1` rather than `online`. Take the best sample rather
+    //    than any single one: a healthy system may momentarily have another service awake,
+    //    and one busy instant is not a spin.
     let online = cpus_online(root_ns);
     if online < 2 {
         kprint(b"test-harness: dead-log-source skipped (needs >= 2 CPUs)\n");
         return;
     }
+    // **Sample until the system is quiet, not for a fixed second.** Waiting longer costs no
+    // detection power, because the two cases it separates are not symmetric: a spin is
+    // *permanent* — a CPU held by one never reads idle however long you look — while a
+    // service doing legitimate work finishes and frees its CPU. So an early exit the moment
+    // enough CPUs are idle is safe (a spin can never reach it), and the long deadline only
+    // ever costs time on a system that was genuinely busy.
+    //
+    // **The fixed 1 s window was a race, and it was passing on luck.** `ui-testclient` churns
+    // 128 windows concurrently with this demo, and across six baseline runs its `PASSED` line
+    // landed *inside* the sampling window five times — the CPU it held came free with barely
+    // enough of the window left to observe. Anything that shifted timing slightly, including
+    // a compositor change whose code never executed, moved it to the wrong side and failed
+    // this demo three subsystems from the cause. The assertion was right; its patience was
+    // not.
+    const MAX_SAMPLES: u32 = 50; // 5 s at 100 ms, versus 1 s before
     let mut best = 0u64;
-    for _ in 0..10 {
+    for _ in 0..MAX_SAMPLES {
         timer_sleep_ms(100);
         let idle = idle_cpus(root_ns);
         if idle > best {
             best = idle;
+        }
+        if best + 1 >= online {
+            break;
         }
     }
     if best + 1 < online {
