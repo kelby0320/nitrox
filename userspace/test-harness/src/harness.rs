@@ -3125,10 +3125,11 @@ fn dead_log_source_demo(root_ns: u64) {
     // SAFETY: closing our own write end; the service holds the read end.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 
-    // 2. Sample occupancy across a second. This thread is running while it samples, so its
-    //    own CPU never reads idle — hence `online - 1` rather than `online`. Take the best
-    //    sample rather than any single one: a healthy system may momentarily have another
-    //    service awake, and one busy instant is not a spin.
+    // 2. Sample occupancy until the system is quiet — see the paragraph below for why that
+    //    is not a fixed window. This thread is running while it samples, so its own CPU never
+    //    reads idle — hence `online - 1` rather than `online`. Take the best sample rather
+    //    than any single one: a healthy system may momentarily have another service awake,
+    //    and one busy instant is not a spin.
     let online = cpus_online(root_ns);
     if online < 2 {
         kprint(b"test-harness: dead-log-source skipped (needs >= 2 CPUs)\n");
