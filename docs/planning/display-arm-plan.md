@@ -1640,9 +1640,9 @@ The three things every later part draws with, none of which exist. Gated on the 
 - [x] **`check-display`'s reference render covers both widgets** ✅ (2026-08-25). They are the first widgets since
       M4 and the gate is how a widget is known to draw what it claims.
 
-### Part B — the shared session core
+### Part B — the shared session core ✅ complete (2026-08-25)
 
-- [ ] **`libsession`**: "authenticate → construct the namespace → spawn the leader → reap →
+- [x] **`libsession`** ✅ (2026-08-25): "authenticate → construct the namespace → spawn the leader → reap →
       tear down", the same logic in both columns against different arguments. Linux's PAM
       precedent — a shared library, not a merged process
       ([`graphical-session.md`](../design/graphical-session.md) §4).
@@ -1653,7 +1653,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       their `io` feature. The greeter — the part that draws — stays in each supervisor, which is
       where they diverge anyway.
 
-- [ ] **`session-mgr` moves onto it first**, and `test-interactive` stays green. The serial column
+- [x] **`session-mgr` moves onto it first** ✅ (2026-08-25), and `test-interactive` stays green. The serial column
       proves the core before the graphical one depends on it; the alternative is a crate whose
       only caller is also new.
 

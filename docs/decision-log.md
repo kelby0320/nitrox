@@ -17708,3 +17708,49 @@ rather than a second one that could disagree" — and the argument applies to th
 well as to the mapping. Applying a rule to the thing that suggested it and not to its neighbour
 is how two sources of truth get one commit apart.
 
+## 2026-08-25 — M7 Part B: the session core factored out, and made to prove it is on the path
+
+`libsession` now holds **authenticate → construct the namespace → spawn the leader → reap →
+tear down**, and `session-mgr` runs on it. Following Linux's PAM precedent this is a shared
+*library*, not a merged process (`graphical-session.md` §4): the two supervisors keep separate
+principals and separate lifetimes, and only the logic they genuinely share moved.
+
+**The greeter stayed behind**, which is the line the split is drawn on. Prompting on a serial
+terminal and drawing a login window have nothing in common but their result, so each supervisor
+keeps its own; what crossed is everything from credentials-in-hand to leader-exited.
+`session-mgr` went 856 → 436 lines.
+
+**The ordering was the point, not a convenience.** `session-mgr` moves first and
+`test-interactive` stays green, so the serial column proves the core before the graphical one
+depends on it — the alternative being a crate whose only caller is also new, where a bug in
+either is indistinguishable from a bug in the other. It is also why the test-path retrofit was
+a prerequisite for this milestone rather than a follow-up: factoring a `login()` that had two
+compilations would have carried the fork into the shared crate.
+
+**A refactor that compiles and is linked can still be inert**, which is the lesson PR #233 paid
+for: the title cap was specified, tested in isolation, and unreachable on the real path. So
+`test-interactive` now asserts `libsession: nxsh spawned into the session namespace` between
+the password and the shell prompt. It is not decoration — changing that log line fails the gate
+— and it names the program, so a supervisor that quietly went back to spawning `nxsh` itself
+would be silent there rather than passing.
+
+**The one thing the columns differ on so far is `/dev/console`**, so `NamespaceSpec` carries a
+`bind_console` flag. A graphical session passes false — `graphical-session.md`'s governing
+decision 3 records the cost of binding a shared console into a windowed session — and the skip
+is total rather than "bound and then unused", because a binding a session holds is authority it
+has. **That flag has no caller until Part D and is therefore unexercised**, recorded here
+rather than left to look tested for the reason above.
+
+**Constraints held as the plan predicted**: `libkern` + `librsproto` + `libstream`, no `libos`,
+because `session-mgr` links this and a dependency's dependencies are yours. No `libheap`
+either — an allocator is the binary's to register and a library only uses `alloc`. The crate
+keeps its own `.bss` message buffers rather than reaching across the boundary for
+`session-mgr`'s, so a session's authentication and a supervisor's terminal I/O cannot tread on
+each other.
+
+**A stale comment found on the way**: `session-mgr/Cargo.toml` described the crate as
+"alloc-free — fixed `.bss` buffers, no `#[global_allocator]`", which had been false since
+2026-07-31, when the rule was lifted so a session could be handed its environment. `main.rs`
+registers `libheap` and `CLAUDE.md` records the decision; only the manifest still said
+otherwise.
+

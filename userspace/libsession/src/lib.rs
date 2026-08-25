@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+use libkern::debug::Line;
 use libkern::*;
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
 use librsproto::{OP_AUTHENTICATE, decode, encode};
@@ -415,4 +416,151 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     // SAFETY: closing our own PO handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
     (status, handle)
+}
+
+/// The notification slot this crate reaps into.
+static mut NOTIF: Notification = Notification::zeroed();
+
+/// Spawn args for the user shell: run in the **constructed session namespace** with
+/// **empty syscaps** (a fully unprivileged sandbox). `image`/`namespace` are filled at
+/// spawn.
+static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
+    image: 0,
+    // One handle: the setup channel. The shell is a **Tier-1** stage — it receives its
+    // `argv` and its **environment** the same way every pipeline stage does, rather than
+    // through a special case (Milestone 3.5 Part D).
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [u64::MAX; 4],
+    namespace: 0, // set at spawn = the session namespace
+    syscaps: 0,   // empty — the shell is sandboxed
+};
+
+/// The user's home *as seen from inside the session*.
+///
+/// session-mgr binds the user's home subtree at `/home`, so from within the session that
+/// path **is** the home directory — the outside path (`/home/alice`) is not nameable, and
+/// that is the point: absence is the sandbox.
+const SESSION_HOME: &str = "/home";
+
+/// Build the environment a session starts with.
+///
+/// A TSM1 `Record`, so it is typed: `PATH` is a `List<String>` rather than a colon-joined
+/// string, which makes a path *containing* a colon representable and leaves no room for two
+/// readers to split it differently.
+///
+/// **`USER` is deliberately absent.** Identity lives at `/session/user`, a namespace
+/// binding a process cannot forge because it cannot bind at all. Copying it into the
+/// environment would hand that property away for nothing: any process could then tell a
+/// child it was somebody else.
+pub fn session_env() -> libstream::wire::Record {
+    use libstream::wire::{Record, Schema, TypeModifiers, TypeTag, Value};
+    let schema = Schema::new()
+        .field("HOME", TypeTag::String, TypeModifiers::NONE)
+        .field("PWD", TypeTag::String, TypeModifiers::NONE)
+        .field("PATH", TypeTag::List, TypeModifiers::NONE);
+    let path: alloc::vec::Vec<Value> =
+        alloc::vec![Value::Str(alloc::string::String::from("/bin"))];
+    Record {
+        schema,
+        values: alloc::vec![
+            Value::Str(alloc::string::String::from(SESSION_HOME)),
+            // A session begins at home, which is also what makes a bare `list` mean
+            // something useful the moment you log in.
+            Value::Str(alloc::string::String::from(SESSION_HOME)),
+            Value::List(alloc::sync::Arc::from(path)),
+        ],
+    }
+}
+
+/// Spawn the user shell (`/initramfs/sbin/nxsh`) into `session_ns` (empty syscaps),
+/// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
+/// shell could not be spawned. This is the login's payoff: an unprivileged process in a
+/// per-user namespace, reaped by session-mgr.
+pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) -> i32 {
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
+
+    // `/bin/<program>`, resolved from the *supervisor's* namespace. The session's own `/bin`
+    // is the profile projection and is what the leader will resolve its children through;
+    // the leader's own image has to come from here, because the session namespace exists to
+    // be handed to it and not to be searched by its parent.
+    let mut path = alloc::string::String::from("/bin/");
+    path.push_str(program);
+    let image = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ).1;
+    if image == 0 {
+        Line::new().s(b"libsession: ").s(program.as_bytes()).s(b" image not found").end();
+        return -1;
+    }
+    let (setup_mgr, setup_shell) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => {
+            kprint(b"libsession: setup channel FAIL\n");
+            return -1;
+        }
+    };
+    // SAFETY: SPAWN_SHELL is a valid writable arg block; run in the session namespace.
+    let h = unsafe {
+        SPAWN_SHELL.image = image;
+        SPAWN_SHELL.namespace = session_ns;
+        SPAWN_SHELL.handles[0] = setup_shell;
+        SPAWN_SHELL.arg0 = bootstrap_arg0(true);
+        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
+    };
+    // The kernel copied the ELF during spawn; close our image handle.
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
+    if h < 0 {
+        Line::new().s(b"libsession: ").s(program.as_bytes()).s(b" spawn FAIL").end();
+        return -1;
+    }
+
+    // Hand the shell its `argv` and its environment. No streams: an interactive shell
+    // reads `/dev/console` from its own namespace, which is a capability it was *given*
+    // rather than a stream it was handed.
+    //
+    // **One `argv`, in every build.** Under `test-harness` this used to be a `-c` script —
+    // `$env.PWD == $env.HOME`, a write to home read back, and `list .` finding something —
+    // run after an auto-login, so the boot had a deterministic verdict without anyone
+    // typing. It proved the right three things in a build where the *typed* login did not
+    // exist: `login()` was a different function and the whole `tty_*` layer was compiled
+    // out. Those three assertions are now steps 5a–5c of `cargo xtask test-interactive`,
+    // which drives the release image (`docs/planning/test-path-retrofit.md` Part B).
+    let argv: &[&str] = &[program];
+
+    let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
+    // SAFETY: closing our end of the setup channel; the shell holds its own.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_mgr) };
+    if sent.is_err() {
+        kprint(b"libsession: setup message FAIL\n");
+        return -1;
+    }
+    Line::new()
+        .s(b"libsession: ")
+        .s(program.as_bytes())
+        .s(b" spawned into the session namespace with its environment")
+        .end();
+    // Reap it: block on the notification channel for its ChildExited, then read the code.
+    loop {
+        if !wait_one(notif) {
+            continue;
+        }
+        // Drain queued notifications.
+        loop {
+            // SAFETY: NOTIF is a valid 64-byte writable out-param.
+            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+            if r != 0 {
+                break;
+            }
+            let (kind, body) =
+                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            if kind == KIND_CHILD_EXITED {
+                let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+                // SAFETY: closing our reference to the exited shell (reaping).
+                unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+                return code;
+            }
+        }
+    }
 }

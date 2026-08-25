@@ -39,7 +39,7 @@ use libkern::*;
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 use librsproto::{decode, encode};
-use libsession::{NamespaceSpec, authenticate, ns_lookup, session_has_bin, session_has_tty};
+use libsession::{NamespaceSpec, authenticate, ns_lookup, session_has_bin, session_has_tty, spawn_leader};
 
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
@@ -52,61 +52,9 @@ static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: usize = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
-static mut NOTIF: Notification = Notification::zeroed();
 
-/// Spawn args for the user shell: run in the **constructed session namespace** with
-/// **empty syscaps** (a fully unprivileged sandbox). `image`/`namespace` are filled at
-/// spawn.
-static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
-    image: 0,
-    // One handle: the setup channel. The shell is a **Tier-1** stage — it receives its
-    // `argv` and its **environment** the same way every pipeline stage does, rather than
-    // through a special case (Milestone 3.5 Part D).
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [u64::MAX; 4],
-    namespace: 0, // set at spawn = the session namespace
-    syscaps: 0,   // empty — the shell is sandboxed
-};
 
-/// The user's home *as seen from inside the session*.
-///
-/// session-mgr binds the user's home subtree at `/home`, so from within the session that
-/// path **is** the home directory — the outside path (`/home/alice`) is not nameable, and
-/// that is the point: absence is the sandbox.
-const SESSION_HOME: &str = "/home";
 
-/// Build the environment a session starts with.
-///
-/// A TSM1 `Record`, so it is typed: `PATH` is a `List<String>` rather than a colon-joined
-/// string, which makes a path *containing* a colon representable and leaves no room for two
-/// readers to split it differently.
-///
-/// **`USER` is deliberately absent.** Identity lives at `/session/user`, a namespace
-/// binding a process cannot forge because it cannot bind at all. Copying it into the
-/// environment would hand that property away for nothing: any process could then tell a
-/// child it was somebody else.
-fn session_env() -> libstream::wire::Record {
-    use libstream::wire::{Record, Schema, TypeModifiers, TypeTag, Value};
-    let schema = Schema::new()
-        .field("HOME", TypeTag::String, TypeModifiers::NONE)
-        .field("PWD", TypeTag::String, TypeModifiers::NONE)
-        .field("PATH", TypeTag::List, TypeModifiers::NONE);
-    let path: alloc::vec::Vec<Value> =
-        alloc::vec![Value::Str(alloc::string::String::from("/bin"))];
-    Record {
-        schema,
-        values: alloc::vec![
-            Value::Str(alloc::string::String::from(SESSION_HOME)),
-            // A session begins at home, which is also what makes a bare `list` mean
-            // something useful the moment you log in.
-            Value::Str(alloc::string::String::from(SESSION_HOME)),
-            Value::List(alloc::sync::Arc::from(path)),
-        ],
-    }
-}
 
 /// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
@@ -207,85 +155,6 @@ fn recv_handoff(ctrl: u64) -> u64 {
 // genuinely differ (`docs/design/graphical-session.md` §4).
 
 
-/// Spawn the user shell (`/initramfs/sbin/nxsh`) into `session_ns` (empty syscaps),
-/// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
-/// shell could not be spawned. This is the login's payoff: an unprivileged process in a
-/// per-user namespace, reaped by session-mgr.
-fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
-    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
-
-    let image = ns_lookup(root_ns, b"/bin/nxsh", RIGHT_MAP_READ).1;
-    if image == 0 {
-        kprint(b"session-mgr: nxsh image not found\n");
-        return -1;
-    }
-    let (setup_mgr, setup_shell) = match pipe(4) {
-        Ok(p) => p,
-        Err(_) => {
-            kprint(b"session-mgr: setup channel FAIL\n");
-            return -1;
-        }
-    };
-    // SAFETY: SPAWN_SHELL is a valid writable arg block; run in the session namespace.
-    let h = unsafe {
-        SPAWN_SHELL.image = image;
-        SPAWN_SHELL.namespace = session_ns;
-        SPAWN_SHELL.handles[0] = setup_shell;
-        SPAWN_SHELL.arg0 = bootstrap_arg0(true);
-        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
-    };
-    // The kernel copied the ELF during spawn; close our image handle.
-    // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
-    if h < 0 {
-        kprint(b"session-mgr: nxsh spawn FAIL\n");
-        return -1;
-    }
-
-    // Hand the shell its `argv` and its environment. No streams: an interactive shell
-    // reads `/dev/console` from its own namespace, which is a capability it was *given*
-    // rather than a stream it was handed.
-    //
-    // **One `argv`, in every build.** Under `test-harness` this used to be a `-c` script —
-    // `$env.PWD == $env.HOME`, a write to home read back, and `list .` finding something —
-    // run after an auto-login, so the boot had a deterministic verdict without anyone
-    // typing. It proved the right three things in a build where the *typed* login did not
-    // exist: `login()` was a different function and the whole `tty_*` layer was compiled
-    // out. Those three assertions are now steps 5a–5c of `cargo xtask test-interactive`,
-    // which drives the release image (`docs/planning/test-path-retrofit.md` Part B).
-    let argv: &[&str] = &["nxsh"];
-
-    let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
-    // SAFETY: closing our end of the setup channel; the shell holds its own.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_mgr) };
-    if sent.is_err() {
-        kprint(b"session-mgr: setup message FAIL\n");
-        return -1;
-    }
-    kprint(b"session-mgr: nxsh spawned into the session namespace with its environment\n");
-    // Reap it: block on the notification channel for its ChildExited, then read the code.
-    loop {
-        if !wait_one(notif) {
-            continue;
-        }
-        // Drain queued notifications.
-        loop {
-            // SAFETY: NOTIF is a valid 64-byte writable out-param.
-            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-            if r != 0 {
-                break;
-            }
-            let (kind, body) =
-                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-            if kind == KIND_CHILD_EXITED {
-                let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-                // SAFETY: closing our reference to the exited shell (reaping).
-                unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-                return code;
-            }
-        }
-    }
-}
 
 /// Bootstrap registers: `rdi` = notification channel (reaps the user shell), `rsi` =
 /// the inherited (LOOKUP-only) root namespace, `rdx` = the control channel service-mgr
@@ -360,7 +229,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.
-            let code = spawn_user_shell(root_ns, session_ns, notif);
+            // `nxsh` here; the graphical column will pass `desktop-shell`. Everything
+            // else about the spawn -- the empty syscaps, the session namespace, the Tier-1
+            // setup channel carrying argv and the environment -- is identical, which is what
+            // made it worth sharing.
+            let code = spawn_leader(root_ns, session_ns, notif, "nxsh");
 
             // Tear the session down. The shell has been reaped, so this drops the last
             // reference to the namespace and with it every binding in it — the `/home`

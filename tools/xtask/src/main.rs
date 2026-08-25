@@ -757,6 +757,14 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     // 4. A correct password reaches a shell prompt.
     s.send(DEMO_PASSWORD)?;
+    // **Through the shared session core**, which is what makes this a check on M7 Part B
+    // rather than only on the login. `session-mgr` no longer spawns the shell itself: it
+    // calls `libsession::spawn_leader`, and this line is that function's. Without it the
+    // refactor could be inert — a crate that compiles, is linked, and is not on the path —
+    // which is exactly the shape of the title cap PR #233 shipped. The line names the
+    // program, so a supervisor that went back to spawning `nxsh` directly would be silent
+    // here rather than passing.
+    s.expect("libsession: nxsh spawned into the session namespace")?;
     s.expect("/home>")?;
     steps += 1;
 
