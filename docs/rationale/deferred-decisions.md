@@ -362,20 +362,6 @@ would still admit a few enormous ones. Trigger: the first untrusted client, or a
 memory budget, whichever comes first — the second is the better answer and the reason not to
 guess a number now. Raised by the PR #222 review.
 
-**Window titles: `Surface::SetTitle` and `WindowTitle` — `TODO(m6-b3b-titles)`.** M6 B3 shipped four
-of the five manager events — `WindowCreated`, `WindowDestroyed`, `WindowGeometry`,
-`WindowFocus`. The fifth, `WindowTitle` (`0x091C`), is not implemented, and neither is the
-client-facing `Surface::SetTitle` (`0x0909`) that would give a window a title to report. Both
-encodings are declared in `librsproto` so this does not renumber anything.
-
-Split off rather than carried because it is the only one of the five that needs machinery the
-others did not: a **new client-facing op**, and a **variable-length body** — every Surface
-record today is fixed-size, so a title needs a length convention, a cap, and a decision about
-what a client sending 64 KiB of title gets back. That is a wire-format question, not a window-
-management one, and answering it inside B3 would have held up the four events a window list
-actually needs to exist at all. Trigger: the desktop shell (M7) drawing a window list or
-titlebars, which is the first thing that can display a title.
-
 **`/dev/draw/manage` gates nothing yet — `TODO(manage-ungated)`.** The manager channel's
 capability is meant to be the *binding*: a supervisor puts it in the shell's namespace and nowhere
 else, which is how everything else in this system is gated. In Milestone 6 that gates nothing, and
@@ -1611,6 +1597,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Window titles: `Surface::SetTitle` and `WindowTitle` | 2026-08-25 | Built in M7 Part A, whose window list is the trigger the entry named. The two ops share the protocol's **first variable-length Surface record**: a 4-byte window id then UTF-8 bytes, with **no length field** — the body's own length gives it, and a second one would only be a way for the two to disagree. Over `MAX_TITLE` (256 bytes) is **truncated on a character boundary, not refused** (decided 2026-08-25): `SetTitle` is silent on success and has no reply a client reads, so refusing would need an error path built for the op specified not to have one. The boundary is the load-bearing part — cutting at 256 *bytes* can land inside a character, so a cap meant to bound memory would leave the title not UTF-8 at all. The compositor logs the first truncation and then stays quiet, for the reason a per-event log cost `check-input` on 2026-08-24. Not-UTF-8 or too short is `Malformed`; another connection's window is `NotFound`; an unchanged title produces no manager event, because that queue is bounded. |
 | Thread placement still targets a CPU that has parked | 2026-08-14 | `pick_target_cpu` and `pick_wake_cpu` now require the lock-free `online_mask` bit as well as `cpu_online[]`, so a core that parked forever is never *given* work. **Not applied to the stealing paths**, deliberately: `steal_one`/`steal_available` choose whom to take work *from*, and a parked CPU is exactly the queue you want drained — gating those would strand the threads it already holds. Demonstrated end-to-end by parking a CPU mid-boot: with the fix `test-qemu` passes, without it the boot self-test fails. |
 | `tlb::shootdown` waits on a CPU count that can go stale | 2026-08-14 | The countdown became a per-CPU acknowledgement **bitmask**, and the initiator stops waiting once every outstanding target has left `online_mask`. Sound because a bit is cleared only by `leave_online`, whose only caller is `halt_loop` — after which that CPU executes nothing but the halt loop forever and cannot use a stale translation. Not a timeout: a live but slow CPU stays in the mask and is still waited for. The mask also removes the count's own hazard, where a late decrement could silently satisfy the *next* request. |
 | `Ctrl-C` does not reach a running pipeline stage (`interrupt-reaches-a-stage`) | 2026-08-04 | **Two bugs, and my first diagnosis was wrong about both.** I had reported that the tty server never emitted the interrupt event for a line that starts a pipeline; re-probing showed it emits it every time. The event was reaching the shell's channel *before* the shell began waiting on it — and a channel signals its waiters at the moment a message is enqueued, so a waiter that arrives afterwards never sees that edge. The shell slept on a message already sitting in its queue. Both blocking points (the capture read of the tail, and `reap`) now **poll before blocking**. The second bug was `run_line`: the interrupt checkpoint lived only in `exec_block`, so a line typed at a prompt was checked inside its loops and never between its statements — the third time that same rule has been learned in this file, after `hoist_defs` and the stale `cd` guard. |

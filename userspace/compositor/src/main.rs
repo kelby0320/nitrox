@@ -778,7 +778,7 @@ fn unserialisable(what: &[u8]) -> bool {
 fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     use librsproto::surface::{
         MgrWindowCreated, MgrWindowRef, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
+        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE,
     };
     // Sized **from the types**, not from the byte counts the spec publishes — the same rule
     // `send_outbound` states and for the same reason: widening `PointerEvent` left a
@@ -807,6 +807,15 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
             match g.write(&mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_GEOMETRY, &body[..n]),
                 None => unserialisable(b"WindowGeometry"),
+            }
+        }
+        MgrEvent::Title { window, title } => {
+            // The one variable-length manager body, so its buffer is sized from the cap rather
+            // than from a type — `MAX_TITLE` plus the window id.
+            let mut body = [0u8; 4 + librsproto::surface::MAX_TITLE];
+            match librsproto::surface::title::write(*window, title, &mut body) {
+                Some(n) => send_input(ch, OP_MGR_WINDOW_TITLE, &body[..n]),
+                None => unserialisable(b"WindowTitle"),
             }
         }
         MgrEvent::Focus { window, focused } => {
@@ -1743,6 +1752,12 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                 // away — a release is never motion.
                 enqueue(srv, slot, Outbound::Release { window, buffer });
             }
+        }
+        Outcome::TitleSet { window } => {
+            // Nothing on screen changed — the compositor draws no titles — so there is no
+            // repaint here, only the manager event.
+            let title = srv.stack.window(window).map(|w| w.title.clone()).unwrap_or_default();
+            mgr_emit(srv, MgrEvent::Title { window, title });
         }
         Outcome::Failed(e) => {
             // **Logged a bounded number of times.** A rejection is client-driven, so this
