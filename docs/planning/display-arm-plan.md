@@ -1714,23 +1714,23 @@ The three things every later part draws with, none of which exist. Gated on the 
 
 ### Part E — `desktop-shell`
 
-- [ ] **The shell, minimally**: the top bar, the applications modal, and window placement policy
+- [ ] **The shell, minimally** — top bar ✅ and applications modal ✅ (2026-08-25); **window placement policy is not done**: the shell does not hold `/dev/draw/manage` yet, so the initial-configure hold is still skipped and nothing places a launched window. That is what remains of this box. Originally: the top bar, the applications modal, and window placement policy
       driving M6's manager ops. It is the compositor's first real manager — everything M6 built
       for one has been exercised by a test client until now.
 
-- [ ] **Constructing a namespace per application it spawns** — the load-bearing part.
+- [x] **Constructing a namespace per application it spawns** ✅ (2026-08-25) — the load-bearing part.
       `ui-composition-model.md` §5a requires it: the guarantee that "an application cannot compose
       other applications" rests on the shell being the process that built them, and the shell
       holds `BIND_NAMESPACE` for exactly this.
 
-- [ ] **The shell does not bind its own endpoint.** `desktop-session-mgr` binds `/dev/desktop`
+- [x] **The shell does not bind its own endpoint** ✅ (2026-08-25) — the architectural half. The `/dev/desktop` *binding* is `TODO(desktop-endpoint)`, deferred until something resolves it. `desktop-session-mgr` binds `/dev/desktop`
       into the session namespace, exactly as `init` binds the tty server's and `session-mgr` binds
       `/dev/tty`. The shell holds `BIND_NAMESPACE` to construct *application* namespaces
       continuously, not to register itself once — which is what reconciles a process that both
       serves and constructs with [`syscaps.md`](../architecture/syscaps.md)'s rule
       (`graphical-session.md` §3).
 
-- [ ] **`TODO(manage-ungated)` closes, by binding — which is what the deferral said.** An
+- [x] **`manage-ungated` closed, by binding — which is what the deferral said** ✅ (2026-08-25). An
       application's namespace binds `/dev/draw/new` **as its own path**, with subtree base
       `/new`, rather than binding the `/dev/draw` subtree. Resolving `/dev/draw/new` is an exact
       match, so the forwarded suffix is empty, the base becomes the whole of it, and the
@@ -1749,7 +1749,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       what a namespace can *reach* is decided by what it **binds**, not by how the server on the
       far side dispatches (PR #225 review, finding 1).
 
-- [ ] **Record the caveat, because it is what decides how long the cheap answer lasts.** A narrow
+- [x] **The caveat is recorded** ✅ (2026-08-25), in the resolved-deferral row. A narrow
       bind expresses "`new` and not `manage`". It cannot express "the `/dev/draw` subtree minus
       `manage`" — so the moment an application needs `/dev/draw/<id>/info` for ids it does not
       know in advance, a subtree bind is required again and `manage` comes with it. Today no

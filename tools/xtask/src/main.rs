@@ -1400,15 +1400,26 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //    first, for the reason `check-terminal` gives: it separates "the pointer was not
     //    there" from "the pointer was there and nothing happened".
     const APPS_CLICK: (i32, i32) = (60, 12);
-    // Unverified positioning, which is the open `check-terminal` flake (1 in 68): the
-    // pointer-confirmation work was reverted in PR #232 because reporting position per motion
-    // was too expensive in the compositor's input path. The press assertion below is what
-    // catches a drop, exactly as it does there.
-    move_pointer_to(&mut qmp, APPS_CLICK.0, APPS_CLICK.1)?;
-    qmp.send_button("left", true)?;
-    qmp.send_button("left", false)?;
-    session.expect(&format!("compositor: press at x={} y={}", APPS_CLICK.0, APPS_CLICK.1))?;
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
+
+    // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —
+    //    the property `check-terminal` relies on when it says an open menu "is a topmost popup
+    //    and takes the keyboard". The top bar could not receive these keys at all.
+    //
+    //    `whoami` is a coreutil rather than something with a window, and that is honest about
+    //    what Part E delivers: the launch *mechanism*, verified end to end. Part F is what
+    //    makes the thing launched worth looking at.
+    for c in "whoami".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    // Each line is a distinct claim: the namespace was built and **checked** before anything
+    // ran in it, and only then was the program spawned into it.
+    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
+    session.expect("desktop-shell: launched whoami into its own namespace")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
@@ -1474,6 +1485,42 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     }
     println!("xtask: a graphical and a serial session ran at the same time ✓");
     Ok(())
+}
+
+/// Position the pointer, click, and **confirm where the press landed** — retrying if it did
+/// not land there.
+///
+/// **The press is the receipt, and it already existed.** `move_pointer_to` fires ~33
+/// unacknowledged relative motions, and a dropped one leaves a permanent offset; the
+/// compositor already reports every press's position, so the retry needs no guest change at
+/// all. PR #232 tried reporting position per *motion* instead and it cost too much in the
+/// compositor's input path — this is the cheap half of that idea, using a receipt the protocol
+/// was already emitting.
+///
+/// Observed on the first full run of this gate: `input batch DROPPED (SYN_DROPPED)` and a
+/// press at (321, 312) with `win=none`. Retrying is safe here because a press that misses lands
+/// on nothing or merely focuses a window, and opening an already-open modal is guarded.
+fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
+    const ATTEMPTS: u32 = 3;
+    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
+    for attempt in 1..=ATTEMPTS {
+        move_pointer_to(qmp, x, y)?;
+        qmp.send_button("left", true)?;
+        qmp.send_button("left", false)?;
+        if session.expect_within(&format!("compositor: press at x={x} y={y}"), PER_ATTEMPT)? {
+            return Ok(());
+        }
+        println!("  note: the press did not land at ({x}, {y}) on attempt {attempt}/{ATTEMPTS}");
+        // The abandoned attempt's press must not satisfy the next one's wait.
+        session.skip_to_end()?;
+    }
+    Err(format!(
+        "the pointer never reached ({x}, {y}) in {ATTEMPTS} attempts. Injection is relative and \
+         unacknowledged, so a dropped PS/2 packet leaves a permanent offset — look for \
+         `input batch DROPPED (SYN_DROPPED)` in the transcript, and at the guest's input path \
+         rather than at this gate if it persists"
+    )
+    .into())
 }
 
 /// Inject one key by qcode, press and release.
@@ -2734,6 +2781,39 @@ impl Session {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Wait up to `timeout` for `pat`, answering **whether it arrived** rather than failing.
+    ///
+    /// For the one case where absence is retryable rather than a verdict: a click whose
+    /// positioning a dropped PS/2 packet left short. [`expect`](Self::expect) is right
+    /// everywhere else — a gate that treats a missing guest line as "try again" is a gate that
+    /// can pass while the guest is broken.
+    fn expect_within(&mut self, pat: &str, timeout: std::time::Duration) -> R<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                if let Some(i) = g[self.cursor..].find(pat) {
+                    self.cursor += i + pat.len();
+                    self.sent_since_match.clear();
+                    println!("  ok: saw {pat:?}");
+                    return Ok(true);
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Drop everything said so far without matching it — for discarding an abandoned attempt's
+    /// output, so a retry cannot match a line the previous try emitted.
+    fn skip_to_end(&mut self) -> R<()> {
+        let g = self.out.lock().map_err(|_| "transcript lock")?;
+        self.cursor = g.len();
+        Ok(())
     }
 
     /// Wait for `pat` in output not yet consumed. The guest paces the test.

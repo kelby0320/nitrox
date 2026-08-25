@@ -362,6 +362,28 @@ would still admit a few enormous ones. Trigger: the first untrusted client, or a
 memory budget, whichever comes first — the second is the better answer and the reason not to
 guess a number now. Raised by the PR #222 review.
 
+**`/dev/desktop` is not bound yet — `TODO(desktop-endpoint)`.** M7 Part E's plan has
+`desktop-session-mgr` binding the shell's endpoint at `/dev/desktop` in the session namespace,
+"exactly as `init` binds the tty server's and `session-mgr` binds `/dev/tty`". The *architectural*
+half of that box is built and demonstrated: `desktop-shell` **does not bind its own endpoint**,
+holds `BIND_NAMESPACE` to construct application namespaces continuously rather than to register
+itself once, and `verify_app_namespace` proves what it does bind. The binding itself is deferred.
+
+**Because nothing resolves it, and this milestone has been caught three times by exactly that
+shape.** PR #233's title cap was specified, tested in isolation and unreachable on the real path;
+`bind_console` sat unexercised for two parts; the two-client claim would have ridden on a process
+that did not exist. An endpoint with no consumer is the same thing again, and building it now
+would mean asserting a capability nobody exercises.
+
+It also costs more than it looks: the shell would have to send a `Meta::Ready` back to a
+supervisor that is blocked reaping it, so `spawn_leader` would need to wait for a ready before
+reaping — a change to the shared session core for a graphical-only need.
+
+Trigger: **the first process that resolves `/dev/desktop`** — an application talking to the shell,
+which is Part F's `nxterm` or the ports work in
+[`ui-composition-model.md`](../design/ui-composition-model.md). At that point the consumer and
+the binding land together and each can be checked against the other.
+
 **`/svc/auth` is reachable by every process — `TODO(svc-auth-ungated)`.** M7 Part C bound
 `auth-service` at `/svc/auth` so two supervisors can each hold a session, and bound it into the
 **root namespace**, which every process inherits. Until then only `session-mgr` held a channel,

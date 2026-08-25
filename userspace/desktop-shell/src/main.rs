@@ -8,9 +8,13 @@
 //! It draws a **top bar** across the screen, reserving space with a `panel` strut so ordinary
 //! windows do not sit under it.
 //!
-//! **It does not bind its own endpoint.** `desktop-session-mgr` binds `/dev/desktop` into the
-//! session namespace; the shell holds `BIND_NAMESPACE` to construct *application* namespaces
-//! continuously, not to register itself once (`graphical-session.md` §3).
+//! **It does not bind its own endpoint**, which is what reconciles a process that both serves
+//! and constructs with `syscaps.md` (`graphical-session.md` §3): it holds `BIND_NAMESPACE` to
+//! construct *application* namespaces continuously, not to register itself once.
+//!
+//! The `/dev/desktop` binding that would let an application talk back is `TODO(desktop-endpoint)`
+//! — deferred until something resolves it, because an endpoint with no consumer is the shape
+//! this milestone has already shipped three times.
 //!
 //! `#![no_std]` + `#![no_main]`, with `alloc` — the toolkit builds an element tree per frame.
 
@@ -128,6 +132,18 @@ fn render_modal(font: &Font, query: &TextFieldState, rows: &[ListRow<'_>], state
     let theme = Theme { font_px: FONT_PX, ..Theme::default() };
     paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     (fb, state)
+}
+
+/// The entries matching `q`, in order. An empty query matches everything.
+///
+/// Substring rather than prefix: a launcher that only matched from the start would make
+/// "term" fail to find `nxterm`, which is the one thing anybody will type.
+fn filter<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<&'a str> {
+    programs
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|name| q.is_empty() || name.contains(q))
+        .collect()
 }
 
 /// Read the programs `/bin` projects, as the modal's entries.
@@ -379,6 +395,82 @@ static mut RECV_HANDLES: [u64; 8] = [0; 8];
 /// See [`RECV_MSG`].
 static mut RECV_COUNT: usize = 0;
 
+/// Spawn args for a launched application: the namespace this shell constructed, and **no
+/// syscaps at all**.
+///
+/// An application constructs nothing and registers nothing. Whatever it can reach was bound
+/// into its namespace by this process — `ui-composition-model.md` §5a's guarantee that an
+/// application cannot compose other applications is exactly this line plus
+/// [`build_app_namespace`].
+static mut SPAWN_APP: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0, // set per launch = the namespace built for it
+    syscaps: 0,   // empty, and it stays empty
+};
+
+/// Launch `program` into a namespace built for it.
+///
+/// **The namespace is verified before anything runs in it**, and a shell that finds the gate
+/// open declines to launch. See [`verify_app_namespace`] for why that is behaviour rather than
+/// a test: an application that *can* reach `manage` never says so, and nothing downstream
+/// would notice.
+fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
+    if draw == 0 {
+        kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
+        return false;
+    }
+    let app_ns = build_app_namespace(draw);
+    if app_ns == 0 {
+        return false;
+    }
+    if !verify_app_namespace(app_ns) {
+        // SAFETY: closing the namespace; nothing was launched into it.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
+        kprint(b"desktop-shell: application namespace is not gated; refusing to launch\n");
+        return false;
+    }
+    // The image comes from the **session's** `/bin`, not the application's: the shell resolves
+    // what to run, and the namespace it built is what the program will run *in*.
+    let mut path = alloc::string::String::from("/bin/");
+    path.push_str(program);
+    let (st, image) = ns_lookup(session_ns, path.as_bytes(), RIGHT_MAP_READ);
+    if st != 0 || image == 0 {
+        Line::new().s(b"desktop-shell: ").s(program.as_bytes()).s(b" not found in /bin").end();
+        // SAFETY: closing the namespace we built for a launch that will not happen.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
+        return false;
+    }
+    // SAFETY: SPAWN_APP is a valid writable arg block.
+    let h = unsafe {
+        SPAWN_APP.image = image;
+        SPAWN_APP.namespace = app_ns;
+        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_APP) as u64)
+    };
+    // The kernel copied the ELF during spawn, and the namespace is the child's now.
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, image);
+        syscall1(SYS_HANDLE_CLOSE, app_ns);
+    }
+    if h < 0 {
+        Line::new().s(b"desktop-shell: ").s(program.as_bytes()).s(b" spawn FAIL").end();
+        return false;
+    }
+    // **Not reaped here.** This shell is not a supervisor of the applications it launches —
+    // `desktop-session-mgr` reaps *it*, and an application's exit is the compositor noticing
+    // its windows go away. Holding the process handle would make the shell responsible for a
+    // lifecycle it has no opinion about.
+    // SAFETY: closing the process handle; the child runs independently.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+    Line::new().s(b"desktop-shell: launched ").s(program.as_bytes()).s(b" into its own namespace").end();
+    true
+}
+
 /// Wait set for the compositor's event channel.
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
 /// One 24-byte `IoResult`.
@@ -492,7 +584,7 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
         .end();
     let mut modal: Option<u32> = None;
     let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    let query = TextFieldState::new();
+    let mut query = TextFieldState::new();
 
     // Blocks on the compositor's event channel, never spins — a spinning leader keeps a run
     // queue non-empty, so the idle thread never runs and deferred reclamation stops for the
@@ -513,12 +605,37 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
         if session.pump().is_err() {
             fail(b"desktop-shell: compositor connection lost\n");
         }
+        let mut modal_dirty = false;
         while let Some((w, event)) = session.next_event() {
             // A press on the applications button opens the modal. **A press, not a key**: a
             // `panel` takes no keyboard focus, so a key never reaches this process — see
             // `APPS_BUTTON_W`.
+            // **Keys go to the modal**, which is a popup and therefore takes the keyboard —
+            // the property `check-terminal` relies on when it says "an open menu is a topmost
+            // popup and takes the keyboard". The top bar could never receive these.
+            if Some(w) == modal {
+                if let libsurface::WindowEvent::Key(k) = event {
+                    if k.pressed != 0 {
+                        if k.keycode == KEY_ENTER {
+                            // The filtered list's first entry is what Enter launches. A
+                            // selection the user moved would come from `ListState`; nothing
+                            // moves it yet, and "the top hit" is what a launcher does with an
+                            // untouched list anyway.
+                            let filtered = filter(&programs, query.text());
+                            if let Some(name) = filtered.first() {
+                                launch(session_ns, draw_endpoint, name);
+                            } else {
+                                kprint(b"desktop-shell: nothing matches; not launching\n");
+                            }
+                        } else if query.apply(k.keycode, k.modifiers) {
+                            modal_dirty = true;
+                        }
+                    }
+                }
+            }
             if w == window && modal.is_none() {
                 if let libsurface::WindowEvent::Pointer(p) = event {
+
                     if p.kind == librsproto::surface::POINTER_BUTTON
                         && p.flags & librsproto::surface::POINTER_PRESSED != 0
                         && p.x >= 0
@@ -529,7 +646,53 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
                 }
             }
         }
+        // Redraw the modal when the query changed, so the filter is visible. A filter you
+        // cannot see is not a filter.
+        if modal_dirty {
+            if let Some(id) = modal {
+                let filtered = filter(&programs, query.text());
+                let rows: alloc::vec::Vec<ListRow<'_>> = filtered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| ListRow { key: i as u64, label: name })
+                    .collect();
+                present_modal(&mut session, id, &font, &query, &rows, &modal_addrs);
+            }
+        }
     }
+}
+
+/// Render the modal into a free buffer and commit it.
+fn present_modal(
+    session: &mut Session<ChannelTransport>,
+    id: u32,
+    font: &Font,
+    query: &TextFieldState,
+    rows: &[ListRow<'_>],
+    addrs: &[*mut u8; BUFFERS],
+) {
+    let len = MODAL_PITCH * MODAL_H as usize;
+    let (fb, _) = render_modal(font, query, rows, ListState::default());
+    let bytes = fb.into_bytes();
+    if bytes.len() != len {
+        return;
+    }
+    let Some(mut w) = session.window(id) else {
+        return;
+    };
+    // A buffer the compositor is not displaying — writing into the committed one would tear
+    // the picture on screen.
+    let Ok(slot) = w.acquire() else {
+        return;
+    };
+    let addr = addrs[slot as usize % BUFFERS];
+    if addr.is_null() {
+        return;
+    }
+    // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
+    // allocations, so they cannot overlap.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
+    let _ = w.commit(slot, (0, 0, MODAL_W, MODAL_H));
 }
 
 /// Open the applications modal as a popup parented to the top bar.
