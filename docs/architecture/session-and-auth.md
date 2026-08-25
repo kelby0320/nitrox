@@ -1,8 +1,10 @@
 # Sessions and authentication
 
 **Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20; last checked
-2026-08-21, when the `/svc/auth` claim under "Credential validation" was found to describe a
-binding that has never existed and was corrected). The full
+2026-08-25). **`/svc/auth` is real as of M7 Part C** — the binding this document described
+before 2026-08-21, found then to have never existed and removed, now exists. The paragraph
+under "Credential validation" is the current shape; the history is kept because a doc that
+quietly starts being right again teaches nobody why it was wrong. The full
 path — login → authenticate → per-user namespace → sandboxed user shell → home write —
 runs end to end. Living document; describes the architecture, with the build sequence
 in the [implementation plan](../planning/implementation-plan.md). What remains is
@@ -78,18 +80,30 @@ auth-service is an ordinary userspace resource server that answers one question.
 holds a read handle to the user DB and nothing else — no namespace-construction
 authority, no device access. session-mgr reaches it over an rsproto channel.
 
-**That channel is handed over, not resolved from a namespace.** This paragraph read
-"its endpoint is bound at `/svc/auth`" until 2026-08-21, and nothing in the tree has
-ever bound anything under `/svc`: `auth-service` creates **one** channel pair at
-startup and transfers the client end in its `Meta::Ready`, and `service-mgr` couriers
-that end to `session-mgr` over its control channel, positionally, alongside the fs,
-profile and tty endpoints. One server, one client, by construction.
+**That channel is resolved from a namespace, as of M7 Part C.** `init` spawns
+`auth-service` and binds its forwarding endpoint at `/svc/auth`; a supervisor resolves that
+path and gets a session channel of its own, minted per caller — the same shape
+`profile-server` serves `/bin` and the tty server serves `/dev/tty` with. `session-mgr` does
+this at startup, and `desktop-session-mgr` will do the same.
 
-The distinction is not pedantic — it is the difference between a second supervisor
-being able to reach the oracle and not. Milestone 7's `desktop-session-mgr` needs a
-channel of its own, which this shape cannot give it; see
-[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 7 Part C, which
-either makes `/svc/auth` real or settles on minting a second endpoint.
+**Bound by `init`, not by the supervisor that used to spawn it.** `service-mgr` spawned
+`auth-service` until Part C, and the resource-server protocol says the supervisor that starts a
+server registers it — but a declared service is spawned with `namespace: 0`, an inherited
+**LOOKUP-only** root, so it cannot bind into it. The bind was written in `service-mgr` first
+and came back `FAIL`, which is how the constraint was found rather than deduced. init owns the
+root namespace and already binds `/bin`, `/log`, `/dev/tty`, `/dev/input/new` and `/dev/draw`;
+this is the fifth.
+
+**What this replaced, and why it had to go.** `auth-service` created **one** channel pair at
+startup and transferred the client end in its `Meta::Ready`, which `service-mgr` couriered to
+`session-mgr` positionally alongside the fs, profile and tty endpoints — one server, one
+client, by construction. A second supervisor could not reach the oracle at all, which is what
+made this Milestone 7's problem rather than a tidiness question.
+
+**The binding is unscoped, and that is tracked.** `/svc/auth` sits in the root namespace, which
+every process inherits, so anything can resolve it — see `TODO(svc-auth-ungated)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md), including why an online oracle is
+strictly weaker than the offline attack the equally-unscoped `/system/users` already allows.
 
 The exchange is the `Auth` category of the resource-server protocol —
 `Authenticate { username, password } → { AUTHENTICATED, principal, home } | DENIED` —

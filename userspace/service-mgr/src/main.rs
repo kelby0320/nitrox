@@ -682,38 +682,18 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     if profile_endpoint == 0 {
         kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
     }
-    // 1. auth-service — spawn + Ready handshake → the client channel session-mgr uses.
-    let (auth_h, auth_ctrl) = spawn_with_control(root_ns, b"/bin/auth-service", &raw mut SPAWN_AUTH);
-    if auth_h < 0 || auth_ctrl == 0 {
-        kprint(b"service-mgr: auth-service spawn FAIL\n");
-        // SAFETY: closing our own endpoints (login chain aborted).
-        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
-        return;
-    }
-    let auth_client = wait_ready(auth_ctrl);
-    // The control channel is done (auth-service serves on the client channel's peer).
-    // SAFETY: closing our own control + process handles for auth-service.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, auth_ctrl);
-        syscall1(SYS_HANDLE_CLOSE, auth_h as u64);
-    }
-    if auth_client == 0 {
-        kprint(b"service-mgr: auth-service Ready timeout/invalid\n");
-        // SAFETY: closing our own endpoints (login chain aborted).
-        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
-        return;
-    }
-    kprint(b"service-mgr: auth-service ready\n");
+    // auth-service is **init's** now (M7 Part C). It is a resource server bound at
+    // `/svc/auth`, and only init can bind into the root namespace: a declared service is
+    // spawned with `namespace: 0`, an inherited LOOKUP-only root. This was written here
+    // first and the bind came back FAIL, which is how the constraint was found.
 
-    // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint + auth channel.
+    // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint.
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
     if sess_h < 0 || sess_ctrl == 0 {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
         // SAFETY: closing our own handles (nothing handed off).
-        unsafe {
-            close_endpoints(fs_endpoint, profile_endpoint);
-            syscall1(SYS_HANDLE_CLOSE, auth_client);
-        }
+        // SAFETY: closing our own handles.
+        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
         return;
     }
     // Handoffs, in order: (1) the fs-server endpoint, (2) the profile-server endpoint,
@@ -724,7 +704,8 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     send_handle(sess_ctrl, fs_endpoint);
     send_handle(sess_ctrl, profile_endpoint);
     send_handle(sess_ctrl, tty_endpoint);
-    send_handle(sess_ctrl, auth_client);
+    // The auth channel is no longer couriered: session-mgr resolves `/svc/auth` for a
+    // session of its own, and so will `desktop-session-mgr`.
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
     // handle are no longer needed for Part D (session-mgr runs independently).
     // SAFETY: closing our own handles.

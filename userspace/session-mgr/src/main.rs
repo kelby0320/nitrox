@@ -168,7 +168,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
-    let auth_ch = recv_handoff(control);
+    // **The auth channel is resolved, not couriered** (M7 Part C). `service-mgr` binds
+    // `auth-service` at `/svc/auth` and every supervisor asks the namespace for a session of
+    // its own — which is what lets `desktop-session-mgr` have one too. Before this it arrived
+    // here positionally as a fourth handle, and there was only ever one to hand out.
+    //
+    // Resolved once, at startup rather than per login: the oracle's lifetime is the machine's,
+    // and re-resolving on each attempt would mint a session per login.
+    // `RIGHT_WAIT` is not optional: `libsession::authenticate` blocks on this channel for
+    // the reply, and a handle without it makes `sys_wait` reject the whole set — which
+    // presents as a login that prompts, takes the password, and then never answers.
+    let (auth_status, auth_ch) =
+        ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if auth_status != 0 || auth_ch == 0 {
+        kprint(b"session-mgr: /svc/auth resolve FAIL; no session can authenticate\n");
+    }
     if fs_endpoint == 0 || auth_ch == 0 {
         // No verdict here any more. A supervisor that cannot build sessions is a boot
         // failure, but adjudicating one is not a session supervisor's job — it says what
@@ -183,7 +197,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     if profile_endpoint == 0 {
         kprint(b"session-mgr: no profile endpoint -- sessions will have no /bin\n");
     }
-    kprint(b"session-mgr: received fs + profile endpoints + auth channel\n");
+    kprint(b"session-mgr: received fs + profile endpoints; auth resolved from /svc/auth\n");
 
     // The session loop: authenticate a user, construct their per-user namespace, spawn
     // the shell into it, and reap it — the same way in every build.

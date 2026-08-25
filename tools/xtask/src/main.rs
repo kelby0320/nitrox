@@ -2879,7 +2879,7 @@ fn check_demo_chain(transcript: &[u8]) -> R<()> {
 /// cost of proving only that the handoffs were sent, not that they arrived.
 fn check_login_chain(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
-    if !text.contains("session-mgr: received fs + profile endpoints + auth channel") {
+    if !text.contains("session-mgr: received fs + profile endpoints; auth resolved from /svc/auth") {
         return Err("the login chain did not come up — session-mgr never reported its \
              endpoints (look for \"session-mgr: endpoint handoff FAIL\", or for \
              service-mgr failing to spawn it at all)"

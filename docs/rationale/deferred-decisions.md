@@ -362,6 +362,29 @@ would still admit a few enormous ones. Trigger: the first untrusted client, or a
 memory budget, whichever comes first — the second is the better answer and the reason not to
 guess a number now. Raised by the PR #222 review.
 
+**`/svc/auth` is reachable by every process — `TODO(svc-auth-ungated)`.** M7 Part C bound
+`auth-service` at `/svc/auth` so two supervisors can each hold a session, and bound it into the
+**root namespace**, which every process inherits. Until then only `session-mgr` held a channel,
+couriered to it by `service-mgr`; now anything can resolve the oracle and attempt a password,
+against a `DEFAULT_ITERATIONS` of 4096 that `libcrypto` documents as "modest on purpose … not a
+production authenticator". `session-mgr`'s two-second pause after a failure — the only throttle
+in the system — is a *session-mgr* policy and does not apply to a caller that skips it.
+
+**It is not the exposure it first looks like, and the reason matters more than the entry.**
+`auth-service` resolves `/system/users` from that same root namespace, so the salted verifier
+database is *already* readable by anything that could reach the oracle. An online guess is
+strictly weaker than the offline attack already available, and both have the same fix: a
+supervisor that gets a **constructed** namespace instead of an inherited one. That is the same
+work `TODO(manage-ungated)` needs and the same work `init`'s `/subtreetest` binding waits on —
+a bind-mount concept in `init.toml`.
+
+**A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
+its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
+supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly
+needs a timer queue and per-session deferral, which is disproportionate to a hobby OS with no
+network stack. Trigger: a constructed namespace for supervisors, or the first time this system
+has a remote attack surface.
+
 **`/dev/draw/manage` gates nothing yet — `TODO(manage-ungated)`.** The manager channel's
 capability is meant to be the *binding*: a supervisor puts it in the shell's namespace and nowhere
 else, which is how everything else in this system is gated. In Milestone 6 that gates nothing, and
