@@ -316,7 +316,8 @@ fn run_session(
     // **`/dev/draw`, bound as a subtree and unscoped**, so the shell resolves both `new` (a
     // window of its own) and `manage` (the manager channel). That breadth is deliberate and is
     // exactly what an *application's* namespace will not get: Part E binds `/dev/draw/new`
-    // alone into those, which is what closes `TODO(manage-ungated)` — a narrow bind expresses
+    // alone into those, which is what closed the `manage-ungated` deferral — a narrow bind
+    // expresses
     // "new and not manage" without any protocol change.
     if draw != 0 {
         let path = b"/dev/draw";
@@ -343,7 +344,13 @@ fn run_session(
 
     // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
     // a real shell; what it has to be now is a process that proves the session runs.
-    let code = spawn_leader(root_ns, session_ns, notif, "desktop-shell");
+    // **`BIND_NAMESPACE`, and only the graphical leader gets it.** The shell constructs a
+    // namespace per application it launches; `nxsh` is handed one and constructs nothing.
+    // The compositor endpoint travels with it: the shell binds `/dev/draw/new` into every
+    // application namespace it builds, and a binding cannot be re-bound.
+    let code = spawn_leader(
+        root_ns, session_ns, notif, "desktop-shell", SYSCAP_BIND_NAMESPACE, draw,
+    );
     // The leader has been reaped, so this drops the last reference to the namespace and with
     // it every binding in it.
     // SAFETY: closing the namespace we created for this session.

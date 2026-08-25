@@ -375,8 +375,9 @@ in the system — is a *session-mgr* policy and does not apply to a caller that 
 database is *already* readable by anything that could reach the oracle. An online guess is
 strictly weaker than the offline attack already available, and both have the same fix: a
 supervisor that gets a **constructed** namespace instead of an inherited one. That is the same
-work `TODO(manage-ungated)` needs and the same work `init`'s `/subtreetest` binding waits on —
-a bind-mount concept in `init.toml`.
+work that closed `manage-ungated` in M7 Part E, and the same work `init`'s `/subtreetest`
+binding waits on — a bind-mount concept in `init.toml`. The precedent is now concrete: a
+*constructed* namespace is what made a capability withholdable.
 
 **Availability is the other half, and it is the nearer one.** `open_auth_session` applies no
 per-caller cap and frees a slot only when the peer closes, so any holder of the inherited root
@@ -393,35 +394,6 @@ supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doin
 needs a timer queue and per-session deferral, which is disproportionate to a hobby OS with no
 network stack. Trigger: a constructed namespace for supervisors, or the first time this system
 has a remote attack surface.
-
-**`/dev/draw/manage` gates nothing yet — `TODO(manage-ungated)`.** The manager channel's
-capability is meant to be the *binding*: a supervisor puts it in the shell's namespace and nowhere
-else, which is how everything else in this system is gated. In Milestone 6 that gates nothing, and
-three facts compose to say so: `/dev/draw` is bound **unscoped** into init's root namespace
-(`userspace/init/src/main.rs`), every graphical client is spawned with `namespace: 0` and inherits
-it, and the compositor classifies resolves by **suffix alone** with no caller identity — it already
-records the consequence for a different suffix, *"Any holder of `/dev/draw` can resolve `info` in a
-loop."*
-
-So any graphical client could resolve `manage`, and the only thing separating them is the
-first-come rule — which makes the **race** the gate, when that rule exists to avoid one. M6's image
-relies on an *ordering* (the intended manager resolves first) and this entry is the record that it
-is an ordering rather than a capability.
-
-**Not a hole to plug in M6.** Namespace-based gating needs *per-client namespaces*, and the process
-that constructs them is `desktop-shell` ([`graphical-session.md`](../design/graphical-session.md)
-§3, §5a). Until it exists there is one namespace and everybody inherits it, so no binding can be
-given to one client and withheld from another. Trigger: **Milestone 7**, which closes it by binding
-`manage` only into the shell's session namespace — at which point the first-come rule stops being
-load-bearing and becomes a belt-and-braces check.
-
-**The mechanism, since M7's plan now rests on it** (`display-arm-plan.md` Milestone 7 Part E): an
-application's namespace binds `/dev/draw/new` as its own path with subtree base `/new`, not the
-`/dev/draw` subtree. The exact resolve matches and forwards `new`; `/dev/draw/manage` is not a
-component-boundary prefix match against that binding, so nothing answers it. The shell's session
-namespace binds the subtree and reaches both. It cannot express "the subtree minus `manage`",
-which is why an application that ever needs `/dev/draw/<id>/info` for ids it does not know in
-advance re-opens this.
 
 **A supervisor cannot tell its children's exits apart — `TODO(child-exit-attribution)`.**
 `KIND_CHILD_EXITED` carries the child's **pid** (body bytes 0–3), and nothing in the system maps
@@ -1650,6 +1622,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| `/dev/draw/manage` gates nothing | 2026-08-25 | Closed **by binding**, which is what the entry always said it would be. `desktop-shell` builds a namespace per application and binds `/dev/draw/new` **as its own path** with subtree base `/new`, not the `/dev/draw` subtree: the exact resolve matches and forwards `new`, while `/dev/draw/manage` is not a component-boundary prefix match against it (`match_suffix_offset`) and resolves to nothing. No protocol change and no second endpoint — a first draft specified one, reasoning that the compositor classifies by suffix with no caller identity; both premises are true and the conclusion does not follow, because what a namespace can *reach* is decided by what it **binds**. The shell's own session namespace binds the subtree unscoped and gets both. **Verified rather than asserted**: the shell checks the namespace it built before launching into it and refuses if `manage` is reachable, `check-login` asserts that verdict, and swapping the narrow bind for a subtree one makes the guest print `REACHES /dev/draw/manage -- refusing` and fails the gate. **Two caveats carried forward**: a narrow bind cannot express "the subtree *minus* `manage`", so the first application needing `/dev/draw/<id>/info` for unknown ids forces a subtree bind and `manage` returns — the second endpoint is the fallback and that is its trigger; and anything spawned with `namespace: 0` still inherits root, where `/dev/draw` is bound unscoped, so the selftest path stays ungated whatever session namespaces do. |
 | Window titles: `Surface::SetTitle` and `WindowTitle` | 2026-08-25 | Built in M7 Part A, whose window list is the trigger the entry named. The two ops share the protocol's **first variable-length Surface record**: a 4-byte window id then UTF-8 bytes, with **no length field** — the body's own length gives it, and a second one would only be a way for the two to disagree. Over `MAX_TITLE` (256 bytes) is **truncated on a character boundary, not refused** (decided 2026-08-25): `SetTitle` is silent on success and has no reply a client reads, so refusing would need an error path built for the op specified not to have one. The boundary is the load-bearing part — cutting at 256 *bytes* can land inside a character, so a cap meant to bound memory would leave the title not UTF-8 at all. The compositor logs the first truncation and then stays quiet, for the reason a per-event log cost `check-input` on 2026-08-24. **The 256 was very nearly a lie**: the serve loop copied request bodies into a 64-byte buffer, so the real cap was 60 and a title whose 61st byte began a multi-byte character came back `Malformed` instead of shortened — the exact corruption `truncate_title` exists to prevent, reintroduced one frame up the stack, with `truncate_title`'s walk-back unreachable in the shipped binary. Caught in review because every truncation test called `dispatch` directly with a body no client could deliver; the buffer is now sized from `MAX_TITLE` with a `const` assertion tying them together. Not-UTF-8 or too short is `Malformed`; another connection's window is `NotFound`; an unchanged title produces no manager event, because that queue is bounded. |
 | Thread placement still targets a CPU that has parked | 2026-08-14 | `pick_target_cpu` and `pick_wake_cpu` now require the lock-free `online_mask` bit as well as `cpu_online[]`, so a core that parked forever is never *given* work. **Not applied to the stealing paths**, deliberately: `steal_one`/`steal_available` choose whom to take work *from*, and a parked CPU is exactly the queue you want drained — gating those would strand the threads it already holds. Demonstrated end-to-end by parking a CPU mid-boot: with the fix `test-qemu` passes, without it the boot self-test fails. |
 | `tlb::shootdown` waits on a CPU count that can go stale | 2026-08-14 | The countdown became a per-CPU acknowledgement **bitmask**, and the initiator stops waiting once every outstanding target has left `online_mask`. Sound because a bit is cleared only by `leave_online`, whose only caller is `halt_loop` — after which that CPU executes nothing but the halt loop forever and cannot use a stale translation. Not a timeout: a live but slow CPU stays in the mask and is still waited for. The mask also removes the count's own hazard, where a late decrement could silently satisfy the *next* request. |

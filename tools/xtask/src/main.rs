@@ -1377,6 +1377,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // something ran. `test-interactive` already pins the `libsession` line for the serial
     // column, where it is ordered against a prompt rather than against another process.
     session.expect("desktop-shell: up (graphical session leader)")?;
+    // **The narrow bind, which is what closed the `manage-ungated` deferral.** The shell builds
+    // an application namespace and checks it *before* launching into it: `/dev/draw/new`
+    // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
+    // re-deriving it here keeps the check where the refusal is — a shell that found the gate
+    // open declines to launch, which is behaviour rather than a test.
+    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only

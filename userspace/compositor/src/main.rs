@@ -1273,7 +1273,8 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         // and a `MemoryObject` would pin the sender's frames with it. `serve_session` closes
         // its surplus for exactly this reason (PR #175 review, finding 2); the manager path
         // was the sibling that got missed (PR #216 review, finding 3). In M6 any `/dev/draw`
-        // holder can be the manager — see `TODO(manage-ungated)` — so "the manager would not
+        // holder can be the manager — until M7 Part E made the binding the gate — so "the
+        // manager would not
         // do that" is not a bound.
         let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
         for i in 0..hcount {
@@ -1358,7 +1359,8 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
 /// bound unscoped into init's root namespace and every graphical client inherits it, so any of
 /// them could ask. What actually separates them here is *order*: the intended manager resolves
 /// first. That is written down as an ordering rather than dressed up as a capability —
-/// `TODO(manage-ungated)`, closed by Milestone 7's per-client namespaces.
+/// Closed by M7 Part E's per-application namespaces: an application's binds `/dev/draw/new`
+/// alone, so `manage` resolves to nothing there.
 fn open_manager(serve_end: u64, request_id: u64) -> bool {
     // SAFETY: single-threaded server reading its own state.
     if unsafe { MANAGER_CH } != 0 {

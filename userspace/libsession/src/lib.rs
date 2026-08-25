@@ -496,7 +496,7 @@ static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [u64::MAX; 4],
     namespace: 0, // set at spawn = the session namespace
-    syscaps: 0,   // empty — the shell is sandboxed
+    syscaps: 0,   // set at spawn — see `spawn_leader`
 };
 
 /// The user's home *as seen from inside the session*.
@@ -540,7 +540,24 @@ pub fn session_env() -> libstream::wire::Record {
 /// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
 /// shell could not be spawned. This is the login's payoff: an unprivileged process in a
 /// per-user namespace, reaped by session-mgr.
-pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) -> i32 {
+/// **`syscaps` is the caller's to choose, and the two columns choose differently.** The serial
+/// leader gets `0` — `nxsh` is a sandboxed user shell and holds nothing. The graphical leader
+/// gets `SYSCAP_BIND_NAMESPACE`, because `desktop-shell` constructs a namespace per application
+/// it launches: `ui-composition-model.md` §5a rests the guarantee that "an application cannot
+/// compose other applications" on the shell being the process that built them.
+///
+/// That is what reconciles a process which both *serves* and *constructs* with
+/// [`syscaps.md`](../../../docs/architecture/syscaps.md) — the shell holds the capability to
+/// build application namespaces continuously, not to register itself once, and it does not
+/// bind its own endpoint at all (`graphical-session.md` §3).
+pub fn spawn_leader(
+    root_ns: u64,
+    session_ns: u64,
+    notif: u64,
+    program: &str,
+    syscaps: u64,
+    extra_handle: u64,
+) -> i32 {
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
 
     // `/bin/<program>`, resolved from the *supervisor's* namespace. The session's own `/bin`
@@ -565,6 +582,7 @@ pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) ->
     let h = unsafe {
         SPAWN_SHELL.image = image;
         SPAWN_SHELL.namespace = session_ns;
+        SPAWN_SHELL.syscaps = syscaps;
         SPAWN_SHELL.handles[0] = setup_shell;
         SPAWN_SHELL.arg0 = bootstrap_arg0(true);
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
@@ -591,6 +609,32 @@ pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) ->
     let argv: &[&str] = &[program];
 
     let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
+    // **A second handle, after the setup message and only if there is one.**
+    //
+    // Only `handles[0]` of a `SpawnArgs` reaches a child, so anything past the setup channel
+    // has to arrive *over* it — `service-mgr` makes the same observation where it couriers
+    // endpoints. The graphical leader needs the compositor's forwarding endpoint: it builds a
+    // namespace per application and binds `/dev/draw/new` into each, and a *binding* is not
+    // re-bindable — it resolves to a kernel registration and never back to the endpoint.
+    //
+    // Ordered after the setup message, so a leader reads `argv` and its environment first and
+    // this second message is simply the next one on the same channel.
+    if sent.is_ok() && extra_handle != 0 {
+        // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
+        unsafe {
+            SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
+            SEND_MSG[8] = 1;
+            SEND_HANDLES[0] = extra_handle;
+            syscall5(
+                SYS_CHANNEL_SEND,
+                setup_mgr,
+                (&raw const SEND_MSG) as u64,
+                (&raw const SEND_HANDLES) as u64,
+                1,
+                SENDMODE_NOBLOCK,
+            );
+        }
+    }
     // SAFETY: closing our end of the setup channel; the shell holds its own.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_mgr) };
     if sent.is_err() {

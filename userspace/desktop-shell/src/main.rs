@@ -108,6 +108,198 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, base as usize as *mut u8))
 }
 
+/// Construct the namespace one application runs in, and return its handle.
+///
+/// **The load-bearing part of the shell**, and the reason it holds `BIND_NAMESPACE` at all.
+/// `ui-composition-model.md` §5a rests the guarantee that *an application cannot compose other
+/// applications* on the shell being the process that built their namespaces — so authority is
+/// what the shell binds, not what an application asks for.
+///
+/// **`/dev/draw/new` is bound as its own path, with subtree base `/new`** — not the
+/// `/dev/draw` subtree. That single choice is what closes `the `manage-ungated` deferral`, and it needs
+/// no protocol change and no second endpoint:
+///
+/// - Resolving `/dev/draw/new` is an **exact match** against the binding, so the forwarded
+///   suffix is empty, the base supplies the whole of it, and the compositor classifies `new`
+///   and mints a session.
+/// - Resolving `/dev/draw/manage` is **not a component-boundary prefix match** against a
+///   binding of `/dev/draw/new` (`kernel/src/object/namespace.rs`, `match_suffix_offset`), so
+///   nothing in this namespace answers it.
+///
+/// A first draft of this milestone specified a second forwarding endpoint for management,
+/// couriered `init` → `service-mgr` → `desktop-session-mgr`, reasoning that the compositor
+/// classifies by suffix with no caller identity so binding could not distinguish. Both
+/// premises are true and the conclusion does not follow: what a namespace can *reach* is
+/// decided by what it **binds**, not by how the server on the far side dispatches
+/// (PR #225 review, finding 1).
+///
+/// **The caveat, because it decides how long this lasts.** A narrow bind expresses "`new` and
+/// not `manage`". It cannot express "the `/dev/draw` subtree *minus* `manage`" — so the first
+/// application that needs `/dev/draw/<id>/info` for ids it does not know in advance forces a
+/// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
+/// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
+/// that is its trigger.
+fn build_app_namespace(draw: u64) -> u64 {
+    let ns = unsafe { syscall0(SYS_NS_CREATE) };
+    if ns < 0 {
+        kprint(b"desktop-shell: application ns_create FAIL\n");
+        return 0;
+    }
+    let ns = ns as u64;
+
+    // `/dev/draw/new`, narrow. See this function's doc for why the base is `/new`.
+    let path = b"/dev/draw/new";
+    let base = b"/new";
+    // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+    let dr = unsafe {
+        syscall6(
+            SYS_NS_BIND,
+            ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            draw,
+            base.as_ptr() as u64,
+            base.len() as u64,
+        )
+    };
+    if dr != 0 {
+        kprint(b"desktop-shell: application /dev/draw/new bind FAIL\n");
+        // SAFETY: closing the namespace we just created.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
+        return 0;
+    }
+
+    // **No `/system/fonts` here yet, and the reason is a real gap rather than a choice.**
+    // Re-binding it needs the fs-server *endpoint*, and this process does not have one: its
+    // session namespace holds a `/system/fonts` **binding**, which resolves to a kernel
+    // registration and never back to the endpoint that would let it be bound elsewhere. The
+    // same asymmetry that stops an application re-binding `/bin` stops the shell here.
+    //
+    // Nothing this part launches renders text, so it costs nothing today. Part F is where it
+    // bites — `nxterm` in an application namespace needs a font — and the fix is the trip the
+    // compositor's endpoint already makes: `desktop-session-mgr` hands the shell the fs
+    // endpoint at spawn.
+    ns
+}
+
+/// Check the application namespace grants `new` and withholds `manage`, before anything runs
+/// in it.
+///
+/// **Verified rather than assumed, and by the process that built it.** The narrow bind is the
+/// whole of the `manage-ungated` deferral's answer, and it rests on a kernel matching rule
+/// (`match_suffix_offset`) that this file does not own. A shell that constructed the namespace
+/// wrongly and launched into it anyway would hand an application the manager channel — the
+/// exact thing the deferral is about — and nothing downstream would notice, because an
+/// application that *can* reach `manage` simply never says so.
+///
+/// Returns `false` if the namespace is not what it should be; the caller declines to launch.
+fn verify_app_namespace(ns: u64) -> bool {
+    let (new_st, new_h) = ns_lookup(ns, b"/dev/draw/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if new_h != 0 {
+        // SAFETY: closing a session this check minted; the application will make its own.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, new_h) };
+    }
+    let (manage_st, manage_h) =
+        ns_lookup(ns, b"/dev/draw/manage", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if manage_h != 0 {
+        // SAFETY: closing a handle this check should never have obtained.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, manage_h) };
+    }
+    if new_st != 0 || new_h == 0 {
+        kprint(b"desktop-shell: application namespace cannot reach /dev/draw/new\n");
+        return false;
+    }
+    if manage_st == 0 && manage_h != 0 {
+        kprint(b"desktop-shell: application namespace REACHES /dev/draw/manage -- refusing\n");
+        return false;
+    }
+    kprint(b"desktop-shell: application namespace grants new, withholds manage\n");
+    true
+}
+
+/// Resolve `path` in `ns`, returning `(status, handle)`.
+///
+/// **Async, like every potentially-blocking syscall here**: `SYS_NS_LOOKUP` returns a
+/// `PendingOperation` to wait on, and the status and handle are read out of the wait result —
+/// not an out-param. A first version of this wrote it synchronously and every resolve
+/// "failed", which is what a `PendingOperation` handle looks like when you read it as a
+/// status.
+fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe {
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
+    };
+    if po < 0 {
+        return (po as i32, 0);
+    }
+    if !wait_one(po as u64) {
+        // SAFETY: closing our own PO.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+        return (-1, 0);
+    }
+    // SAFETY: the kernel wrote one 24-byte IoResult: status at 8, handle at 16.
+    let (status, handle) = unsafe {
+        (
+            i32::from_le_bytes([
+                WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11],
+            ]),
+            u64::from_le_bytes([
+                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            ]),
+        )
+    };
+    // SAFETY: closing our own PO.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+    (status, if status == 0 { handle } else { 0 })
+}
+
+/// Receive and discard one message, waiting for it. `false` if the wait or receive failed.
+fn recv_message(ch: u64) -> bool {
+    if !wait_one(ch) {
+        return false;
+    }
+    // SAFETY: valid recv out-params.
+    let r = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    r == 0
+}
+
+/// Receive one message and return its first transferred handle, or `0`.
+fn recv_handle(ch: u64) -> u64 {
+    if !recv_message(ch) {
+        return 0;
+    }
+    // SAFETY: the kernel wrote `RECV_COUNT` transferred handles into `RECV_HANDLES`.
+    unsafe {
+        if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] }
+    }
+}
+
+/// Block until `h` is signalled.
+fn wait_one(h: u64) -> bool {
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = h;
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+    };
+    waited == 1
+}
+
+/// Recv buffers for the setup channel.
+static mut RECV_MSG: [u8; 4096] = [0; 4096];
+/// See [`RECV_MSG`].
+static mut RECV_HANDLES: [u64; 8] = [0; 8];
+/// See [`RECV_MSG`].
+static mut RECV_COUNT: usize = 0;
+
 /// Wait set for the compositor's event channel.
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
 /// One 24-byte `IoResult`.
@@ -117,8 +309,18 @@ static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
 /// `argv` and the environment, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, session_ns: u64, _setup: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -> ! {
     kprint(b"desktop-shell: up (graphical session leader)\n");
+
+    // Two messages arrive on the setup channel, in order: the Tier-1 `argv` + environment,
+    // then the compositor's forwarding endpoint. The second is what lets this process build
+    // application namespaces — a `/dev/draw` *binding* resolves to a kernel registration and
+    // never back to an endpoint, so the shell cannot re-bind what its own namespace holds.
+    let _ = recv_message(setup);
+    let draw_endpoint = recv_handle(setup);
+    if draw_endpoint == 0 {
+        kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
+    }
 
     // **Resolved from the session namespace, not from a root one.** This process has no root
     // handle: `spawn_leader` runs it in the namespace `desktop-session-mgr` constructed, which
@@ -175,6 +377,22 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, _setup: u64, _arg0: u64) 
     if w.commit(0, (0, 0, SCREEN_W, BAR_H)).is_err() {
         fail(b"desktop-shell: top bar Commit FAILED\n");
     }
+    // **Build one application namespace and check it**, before anything is launched into it.
+    // Part E's applications modal is what will call this per launch; doing it once here is
+    // what makes the narrow bind observable — and the shell refusing to launch when the check
+    // fails is the behaviour, not the test.
+    if draw_endpoint != 0 {
+        let app_ns = build_app_namespace(draw_endpoint);
+        if app_ns != 0 {
+            let ok = verify_app_namespace(app_ns);
+            // SAFETY: closing the namespace; nothing has been launched into it yet.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
+            if !ok {
+                kprint(b"desktop-shell: application namespaces are not gated; not launching\n");
+            }
+        }
+    }
+
     Line::new()
         .s(b"desktop-shell: top bar presented, window ")
         .u(window as u64)

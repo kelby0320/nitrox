@@ -771,8 +771,11 @@ pub struct FocusEvent {
 // subsystem in two files — the same call `Tty` made for its backend ops.
 //
 // **The capability is the binding, not a check.** None of these verifies ownership; that is the
-// point of a manager. `/dev/draw/manage` is what bounds who may hold one, and in Milestone 6
-// that binding gates nothing — see `TODO(manage-ungated)` and
+// point of a manager. `/dev/draw/manage` is what bounds who may hold one, and as of M7 Part E
+// that binding **does** gate: `desktop-shell` binds `/dev/draw/new` alone into every
+// application namespace it builds, with subtree base `/new`, so `manage` is not a
+// component-boundary prefix match against it and resolves to nothing. The shell's own session
+// namespace binds the `/dev/draw` subtree unscoped and gets both. See
 // `docs/design/graphical-session.md` §3.
 // ---------------------------------------------------------------------------
 

@@ -856,8 +856,9 @@ fn bind_auth_service(root_ns: u64) -> bool {
 
     // `TODO(svc-auth-ungated)` — bound into the **root namespace**, which every process
     // inherits, so anything can resolve the oracle and attempt a password. Recorded rather
-    // than glossed; it closes with the same namespace-construction work as
-    // `TODO(manage-ungated)`.
+    // than glossed. It closes with the same namespace-construction work that closed
+    // `manage-ungated` in M7 Part E: a supervisor that gets a *constructed* namespace rather
+    // than an inherited one.
     kprint(b"init: auth-service bound at /svc/auth\n");
     // init keeps `as_h` (the long-lived server's process handle).
     let _ = as_h;
