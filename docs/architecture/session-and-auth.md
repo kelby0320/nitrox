@@ -92,7 +92,7 @@ server registers it — but a declared service is spawned with `namespace: 0`, a
 **LOOKUP-only** root, so it cannot bind into it. The bind was written in `service-mgr` first
 and came back `FAIL`, which is how the constraint was found rather than deduced. init owns the
 root namespace and already binds `/bin`, `/log`, `/dev/tty`, `/dev/input/new` and `/dev/draw`;
-this is the fifth.
+this is the sixth.
 
 **What this replaced, and why it had to go.** `auth-service` created **one** channel pair at
 startup and transferred the client end in its `Meta::Ready`, which `service-mgr` couriered to
@@ -100,10 +100,16 @@ startup and transferred the client end in its `Meta::Ready`, which `service-mgr`
 client, by construction. A second supervisor could not reach the oracle at all, which is what
 made this Milestone 7's problem rather than a tidiness question.
 
-**The binding is unscoped, and that is tracked.** `/svc/auth` sits in the root namespace, which
-every process inherits, so anything can resolve it — see `TODO(svc-auth-ungated)` in
-[`deferred-decisions.md`](../rationale/deferred-decisions.md), including why an online oracle is
-strictly weaker than the offline attack the equally-unscoped `/system/users` already allows.
+**The binding is unscoped among the processes that hold the root namespace**, and that is
+tracked — `TODO(svc-auth-ungated)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md).
+
+**That set does not include a user's shell**, and saying otherwise would contradict the whole
+point of §Session construction below. A session gets a **constructed** namespace holding
+`/home`, `/bin`, `/session/user`, `/dev/tty` and `/dev/console` and nothing else; a shell has no
+root-namespace handle and cannot name `/svc/auth` at all. *Absence is the sandbox.* What can
+reach the oracle is what is spawned with `namespace: 0` — init's children and `service-mgr`'s
+declared services — which is exactly why `boot-probe` can test it.
 
 The exchange is the `Auth` category of the resource-server protocol —
 `Authenticate { username, password } → { AUTHENTICATED, principal, home } | DENIED` —

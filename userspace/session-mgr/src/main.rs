@@ -163,13 +163,15 @@ fn recv_handoff(ctrl: u64) -> u64 {
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"session-mgr: up\n");
     // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) profile
-    // server endpoint, (3) tty server endpoint, (4) auth channel. Positional — service-mgr sends an empty message
+    // server endpoint, (3) tty server endpoint. Positional — service-mgr sends an empty message
     // for an endpoint it does not have, so a missing one shortens no one's count.
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
-    // **The auth channel is resolved, not couriered** (M7 Part C). `service-mgr` binds
-    // `auth-service` at `/svc/auth` and every supervisor asks the namespace for a session of
+    // **The auth channel is resolved, not couriered** (M7 Part C). **`init`** binds
+    // `auth-service` at `/svc/auth` — not `service-mgr`, which spawned it and cannot bind,
+    // because a declared service holds an inherited LOOKUP-only root — and every supervisor
+    // asks the namespace for a session of
     // its own — which is what lets `desktop-session-mgr` have one too. Before this it arrived
     // here positionally as a fourth handle, and there was only ever one to hand out.
     //

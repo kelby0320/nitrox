@@ -3,9 +3,11 @@
 //! A request/reply resource server that validates credentials: it answers the `Auth`
 //! rsproto category (`Authenticate { username, password } → { AUTHENTICATED,
 //! principal, home } | DENIED`, `docs/spec/rsproto-auth-ops.md`) on a plain IPC
-//! channel. Unlike the fs / profile servers it is **not** a namespace forwarder — a
-//! client (session-mgr) holds a direct channel and sends `Authenticate` requests; no
-//! path is resolved. The credential logic (user-DB parse + PBKDF2 verify) is the
+//! channel. Like the fs / profile servers it **is** a namespace forwarder as of M7 Part C:
+//! `init` binds its endpoint at `/svc/auth` and it mints a session channel per caller that
+//! resolves there, which is what lets `session-mgr` and `desktop-session-mgr` each hold one.
+//! Before that it minted a single pair at startup and was a one-client oracle by
+//! construction. The credential logic (user-DB parse + PBKDF2 verify) is the
 //! host-tested `auth_service` library; this binary is the bare-target syscall
 //! plumbing: read `/system/users`, hand the supervisor a client endpoint via
 //! `Meta::Ready`, then serve.
@@ -344,56 +346,56 @@ fn open_auth_session(serve_end: u64, request_id: u64) {
 fn serve_session(ch: u64) {
     // SAFETY: valid recv out-params (an Authenticate carries no transferred handles).
     let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+    syscall4(
+        SYS_CHANNEL_RECV,
+        ch,
+        (&raw mut RECV_MSG) as u64,
+        (&raw mut RECV_HANDLES) as u64,
+        (&raw mut RECV_COUNT) as u64,
+    )
     };
     if rr != 0 {
-        // **A closed peer frees the slot.** Without this a supervisor that exited would hold
-        // one forever, and the set of clients would shrink by one per logout.
-        free_session(ch);
-        return;
+    // **A closed peer frees the slot.** Without this a supervisor that exited would hold
+    // one forever, and the set of clients would shrink by one per logout.
+    free_session(ch);
+    return;
     }
     let serve_end = ch;
 
-        // Decode the rsproto request from the IpcMsg payload (offset 24, `payload_len`),
-        // then build the reply into a local body buffer over non-aliasing statics.
-        let mut reply_body = [0u8; 512];
-        // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG;
-        // `USER_DB`/`USER_DB_LEN` are read-only here (written once at startup).
-        let (request_id, reply_len, error) = unsafe {
-            let payload_len =
-                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            let req = core::slice::from_raw_parts(
-                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            );
-            match decode(req) {
-                Ok(m) if m.op == OP_AUTHENTICATE => {
-                    let db = core::slice::from_raw_parts((&raw const USER_DB) as *const u8, USER_DB_LEN);
-                    match serve_authenticate(m.body, db, &mut reply_body) {
-                        Some(n) => (m.request_id, n, false),
-                        // Malformed request → an error reply.
-                        None => {
-                            let n = build_denied_reply(&mut reply_body).unwrap_or(0);
-                            (m.request_id, n, true)
-                        }
+    // Decode the rsproto request from the IpcMsg payload (offset 24, `payload_len`),
+    // then build the reply into a local body buffer over non-aliasing statics.
+    let mut reply_body = [0u8; 512];
+    // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG;
+    // `USER_DB`/`USER_DB_LEN` are read-only here (written once at startup).
+    let (request_id, reply_len, error) = unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        match decode(req) {
+            Ok(m) if m.op == OP_AUTHENTICATE => {
+                let db = core::slice::from_raw_parts((&raw const USER_DB) as *const u8, USER_DB_LEN);
+                match serve_authenticate(m.body, db, &mut reply_body) {
+                    Some(n) => (m.request_id, n, false),
+                    // Malformed request → an error reply.
+                    None => {
+                        let n = build_denied_reply(&mut reply_body).unwrap_or(0);
+                        (m.request_id, n, true)
                     }
                 }
-                // A non-Auth op on this channel: deny + error (wrong protocol).
-                Ok(m) => {
-                    let n = build_denied_reply(&mut reply_body).unwrap_or(0);
-                    (m.request_id, n, true)
-                }
-                Err(_) => (0, 0, true),
             }
-        };
+            // A non-Auth op on this channel: deny + error (wrong protocol).
+            Ok(m) => {
+                let n = build_denied_reply(&mut reply_body).unwrap_or(0);
+                (m.request_id, n, true)
+            }
+            Err(_) => (0, 0, true),
+        }
+    };
     if reply_len > 0 {
-        send_reply(serve_end, request_id, &reply_body[..reply_len], error);
+    send_reply(serve_end, request_id, &reply_body[..reply_len], error);
     }
 }
 

@@ -76,8 +76,13 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
 
 service-mgr spawns session-mgr with a control channel (`rdx`) + re-delegated
 `BIND_NAMESPACE`, then transfers, in order: (1) the fs-server forwarding endpoint,
-(2) the **profile-server** forwarding endpoint, (3) the auth channel. session-mgr `recv`s
-all three before doing anything. The endpoints are handed over IPC (not the namespace)
+(2) the **profile-server** forwarding endpoint, (3) the **tty-server** forwarding endpoint.
+session-mgr `recv`s all three before doing anything.
+
+**There is no auth handoff as of M7 Part C.** This list said the third was the auth channel —
+wrong twice over, since the third has been the tty endpoint for some time and the auth channel
+is now *resolved* from `/svc/auth` rather than couriered at all. It is the list most likely to
+be mis-applied, because the positional rule below is reasoned from it. The endpoints are handed over IPC (not the namespace)
 because constructing namespaces means binding *endpoint handles* — and a `UserspaceServer`
 binding resolves to a kernel registration record, never back to the endpoint, so a process
 holding a LOOKUP-only root namespace can *use* `/bin` but can never obtain what it would
@@ -85,7 +90,7 @@ take to bind it elsewhere.
 
 **The receives are positional.** A sender with an endpoint missing sends an *empty message*
 rather than skipping the send; skipping would shift every later handoff up a slot and land
-the auth channel where the profile endpoint belongs.
+the tty endpoint where the profile endpoint belongs.
 
 ## What a session namespace contains
 

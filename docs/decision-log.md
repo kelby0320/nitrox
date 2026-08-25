@@ -17782,8 +17782,11 @@ the new call site did not, because the rights list is written per call and nothi
 against what the callee does.
 
 **The two-client claim is proven, not asserted.** `boot-probe` resolves `/svc/auth` twice while
-`session-mgr` already holds a session, and requires two distinct handles — so the assertion is
-"it mints per caller", not "there was one spare slot". Before Part C this could not have
+`session-mgr` already holds a session, so two *successful* resolves mean three concurrent
+sessions — which one spare slot cannot supply. (A first version also compared the two handle
+values, which is unfalsifiable: the probe holds the first open across the second resolve and
+`HandleTable::allocate` never re-issues a live slot, so the numbers differ whatever the server
+did. The count is what carries it; PR #235 review, finding 4.) Before Part C this could not have
 succeeded however it was asked. Without it the claim would have ridden on
 `desktop-session-mgr`, which does not exist until Part D, and a capability specified, reasoned
 about and reachable by nobody is exactly what PR #233's title cap turned out to be.

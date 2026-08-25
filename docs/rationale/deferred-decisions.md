@@ -378,6 +378,15 @@ supervisor that gets a **constructed** namespace instead of an inherited one. Th
 work `TODO(manage-ungated)` needs and the same work `init`'s `/subtreetest` binding waits on —
 a bind-mount concept in `init.toml`.
 
+**Availability is the other half, and it is the nearer one.** `open_auth_session` applies no
+per-caller cap and frees a slot only when the peer closes, so any holder of the inherited root
+namespace can resolve `/svc/auth` up to `MAX_SESSIONS` (31) times and keep them; every later
+resolve then gets `WouldBlock`, and the caller's symptom is `session-mgr: /svc/auth resolve
+FAIL; no session can authenticate`. Not exploitable today — nothing hostile runs, and
+`session-mgr` resolves at boot before `service-mgr` starts anything — but
+`desktop-session-mgr` resolves *later*, in Part D, so the window widens exactly when a second
+supervisor arrives. Same fix as the rest of this entry (PR #235 review, finding 8).
+
 **A throttle in `auth-service` is not the answer, and was rejected on inspection.** It serves
 its clients from one loop with a wait set; sleeping to slow an attacker would stall every other
 supervisor's login, which is the shape of the `TODO(tty-output-queue)` bug. Doing it properly

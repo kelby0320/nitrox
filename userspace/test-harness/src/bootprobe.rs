@@ -748,6 +748,7 @@ fn subtree_bind_test(root_ns: u64) -> bool {
     }
 }
 
+
 /// Bootstrap registers, as `service-mgr`'s `SPAWN_SERVICE` fills them: `rdi` = this
 /// process's notification channel, `rsi` = the inherited LOOKUP-only root namespace,
 /// `rdx` = the control-channel endpoint (`RECV | WAIT`), `rcx` = `arg0` (unused).
@@ -769,41 +770,6 @@ fn subtree_bind_test(root_ns: u64) -> bool {
 /// **The verdict is fired, then the process exits.** `verdict` does not return under
 /// `test-qemu` (QEMU terminates), but it does everywhere else — every other gate boots this
 /// image without the `isa-debug-exit` device — so there is a real path past it.
-/// Prove `auth-service` serves **more than one client** — which is what M7 Part C claims and
-/// what nothing else here would check.
-///
-/// `session-mgr` resolves `/svc/auth` at startup and holds its session for the machine's life,
-/// so by the time this runs there is already one client. Resolving a second is the whole
-/// assertion: before Part C `auth-service` minted one channel pair at startup and handed the
-/// only client end to `session-mgr`, so this could not have succeeded however it was asked.
-///
-/// **Without this the claim rides on `desktop-session-mgr`, which does not exist until Part
-/// D.** A capability specified, reasoned about, and reachable by nobody is exactly what the
-/// title cap in PR #233 turned out to be, and the fix there was to test the path rather than
-/// the component. This is that, one part earlier.
-fn auth_multi_client_test(root_ns: u64) -> bool {
-    let (st, ch) = ns_lookup(root_ns, b"/svc/auth", libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
-    if st != 0 || ch == 0 {
-        kprint(b"boot-probe: /svc/auth second session FAIL\n");
-        return false;
-    }
-    // A second resolve, so the answer is not "one spare slot" but "it mints per caller".
-    let (st2, ch2) = ns_lookup(root_ns, b"/svc/auth", libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
-    // SAFETY: closing handles this process owns.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, ch);
-        if ch2 != 0 {
-            syscall1(SYS_HANDLE_CLOSE, ch2);
-        }
-    }
-    if st2 != 0 || ch2 == 0 || ch2 == ch {
-        kprint(b"boot-probe: /svc/auth third session FAIL (not minted per caller)\n");
-        return false;
-    }
-    kprint(b"boot-probe: /svc/auth mints a session per caller (session-mgr + 2) ok\n");
-    true
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"boot-probe: up\n");
@@ -831,6 +797,47 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // transcript.
     exit(if ok { 0 } else { 1 });
 }
+
+/// Prove `auth-service` serves **more than one client** — which is what M7 Part C claims and
+/// what nothing else here would check.
+///
+/// `session-mgr` resolves `/svc/auth` at startup and holds its session for the machine's life,
+/// so by the time this runs there is already one client. Resolving a second is the whole
+/// assertion: before Part C `auth-service` minted one channel pair at startup and handed the
+/// only client end to `session-mgr`, so this could not have succeeded however it was asked.
+///
+/// **Without this the claim rides on `desktop-session-mgr`, which does not exist until Part
+/// D.** A capability specified, reasoned about, and reachable by nobody is exactly what the
+/// title cap in PR #233 turned out to be, and the fix there was to test the path rather than
+/// the component. This is that, one part earlier.
+fn auth_multi_client_test(root_ns: u64) -> bool {
+    let (st, ch) = ns_lookup(root_ns, b"/svc/auth", libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
+    if st != 0 || ch == 0 {
+        kprint(b"boot-probe: /svc/auth second session FAIL\n");
+        return false;
+    }
+    // A second resolve, so the answer is not "one spare slot" but "it mints per caller".
+    let (st2, ch2) = ns_lookup(root_ns, b"/svc/auth", libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
+    // SAFETY: closing handles this process owns.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, ch);
+        if ch2 != 0 {
+            syscall1(SYS_HANDLE_CLOSE, ch2);
+        }
+    }
+    // **The count is the assertion, not the handle values.** Two *successful* resolves while
+    // `session-mgr` already holds one means three concurrent sessions, which one spare slot
+    // cannot supply. Comparing `ch2 == ch` would be decoration: the probe holds `ch` open
+    // across the second resolve and `HandleTable::allocate` never re-issues a live slot, so
+    // the numbers differ whatever the server did (PR #235 review, finding 4).
+    if st2 != 0 || ch2 == 0 {
+        kprint(b"boot-probe: /svc/auth third session FAIL (not minted per caller)\n");
+        return false;
+    }
+    kprint(b"boot-probe: /svc/auth mints a session per caller (session-mgr + 2) ok\n");
+    true
+}
+
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

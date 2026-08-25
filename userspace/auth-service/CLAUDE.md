@@ -12,9 +12,15 @@ decides *who you are*; it does **not** construct namespaces or issue authority �
 is session-mgr's job. Keeping the two split keeps the password DB out of the
 `BIND_NAMESPACE`-holding supervisor. See `docs/architecture/session-and-auth.md`.
 
-**Not a namespace forwarder.** Unlike fs-server / profile-server, it does not answer
-`Namespace::Resolve` — a client (session-mgr) holds a direct channel and sends
-`Authenticate` requests. It holds **no** `BIND_NAMESPACE` and no device access.
+**A namespace forwarder as of M7 Part C**, like fs-server / profile-server: `init` binds its
+endpoint at `/svc/auth`, it answers `Namespace::Resolve` there, and each caller gets a session
+channel of its own to send `Authenticate` on. It still holds **no** `BIND_NAMESPACE` and no
+device access — binding is init's, and answering a resolve is not the same authority as making
+one.
+
+This paragraph said the opposite until 2026-08-25, and the reason it changed is worth keeping:
+one channel pair minted at startup made it a **one-client** oracle by construction, which
+`desktop-session-mgr` could not share. See `docs/architecture/session-and-auth.md`.
 
 ## Structure
 
@@ -49,6 +55,8 @@ is session-mgr's job. Keeping the two split keeps the password DB out of the
 - `alloc` / `#[global_allocator]`.
 - Storing, logging, or returning a plaintext password.
 - Committing a password or verifier to the source tree (even in tests).
-- Holding `BIND_NAMESPACE`, constructing namespaces, or answering
-  `Namespace::Resolve` (auth-service is a credential oracle, not a resource/ns server).
+- Holding `BIND_NAMESPACE` or constructing namespaces. **Answering `Namespace::Resolve` is
+  no longer forbidden** — M7 Part C made it a forwarder so two supervisors can each hold a
+  session — but *binding* remains init's, and this server must never acquire the capability
+  to bind its own path.
 - Disclosing *why* a credential was denied (unknown user vs. wrong password).

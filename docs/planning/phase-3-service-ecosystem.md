@@ -460,7 +460,9 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
   subtree + shared-reg bind-mount). session-mgr fires the `test-harness` verdict.
   Sequenced after the demo chain (a concurrent direct-block + forwarded-lookup hang is
   tracked in `deferred-decisions.md`). Auth is reached over a **direct channel** (not
-  bound at `/svc/auth`) since session-mgr is the sole consumer. AHCI concurrent-command
+  bound at `/svc/auth`) since session-mgr is the sole consumer. **Both halves stopped being
+  true in M7 Part C**: it is bound there and session-mgr is no longer the only client. Left as
+  written because this is a `planning/` doc and records what Phase 3 decided. AHCI concurrent-command
   bug fixed along the way (single-slot queue + DPC-drain).
 - [x] **Part E — login + namespace construction + user shell** (the milestone):
   session-mgr authenticates (test-harness auto-login / interactive `nitrox login:` on

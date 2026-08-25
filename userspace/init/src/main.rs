@@ -793,7 +793,7 @@ fn bind_logging_service(root_ns: u64) -> bool {
 /// **LOOKUP-only** root, so it cannot bind into it at all. Demonstrated rather than reasoned:
 /// the bind was written there first and came back `FAIL`. init owns the root namespace, and
 /// `session-and-auth.md` already calls auth-service "an ordinary userspace resource server",
-/// which is exactly what the other four bound here are.
+/// which is exactly what the other five bound here are.
 ///
 /// Critical-path: without it no session can authenticate, which is a machine with no way in.
 fn bind_auth_service(root_ns: u64) -> bool {
