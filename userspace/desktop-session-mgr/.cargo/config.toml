@@ -1,0 +1,26 @@
+# Build config for `desktop-session-mgr`.
+#
+# Read by cargo when the build is invoked from this directory (xtask sets cwd to the crate
+# being built), so it does not affect the workspace crates that still build for the host.
+#
+# The goal is a static, non-PIE ELF (ET_EXEC) in the low half: **the kernel's ELF loader
+# rejects PIE/ET_DYN**, and without this file a new bin crate builds cleanly, stages into
+# `/bin`, resolves at spawn, and then fails `SYS_PROCESS_SPAWN` with `InvalidArgument` — which
+# is what happened here first. `user.ld` (passed via `build.rs`) fixes the load address; these
+# flags force the static/non-PIE small-code-model output.
+
+# `x86_64-unknown-nitrox` (custom spec, one directory up) rather than the
+# built-in `x86_64-unknown-none`: userspace needs a **hard-float** ABI, and no
+# stock freestanding x86_64 target provides one. The path is relative to the
+# build cwd, which xtask sets to this crate directory.
+[build]
+target = "../x86_64-unknown-nitrox.json"
+
+[target.x86_64-unknown-nitrox]
+rustflags = [
+    "-C", "code-model=small",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]

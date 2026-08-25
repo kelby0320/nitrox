@@ -1678,9 +1678,9 @@ The three things every later part draws with, none of which exist. Gated on the 
       principal, home } | DENIED` is untouched, and that remains the evidence the split was drawn
       in the right place. What changes is plumbing, and saying so precisely is the correction.
 
-### Part D — `desktop-session-mgr`, the greeter, and the gate
+### Part D — `desktop-session-mgr`, the greeter, and the gate ✅ complete (2026-08-25)
 
-- [ ] **`desktop-session-mgr`**, `session-mgr`'s graphical twin: spawned by `service-mgr` with
+- [x] **`desktop-session-mgr`** ✅ (2026-08-25), `session-mgr`'s graphical twin: spawned by `service-mgr` with
       `BIND_NAMESPACE` re-delegated, plus the fs/profile/tty endpoints, an auth channel and — the
       new part — a `/dev/draw` connection, because its greeter is itself a compositor client.
       Presents a login **window**, calls the same `auth-service` over the same protocol,
@@ -1689,7 +1689,7 @@ The three things every later part draws with, none of which exist. Gated on the 
       `/dev/console` is deliberately **not** bound into a graphical session — governing decision
       3's failure is on the record.
 
-- [ ] **The greeter draws before anyone has authenticated**, and outlives each session
+- [x] **The greeter draws before anyone has authenticated** ✅ (2026-08-25), and outlives each session
       (`graphical-session.md` §4). It is closer to `gdm`'s `class=greeter` than to anything
       `session-mgr` does, and it is the first compositor client that exists at boot in a release
       image.
@@ -1698,12 +1698,12 @@ The three things every later part draws with, none of which exist. Gated on the 
       is skipped when no manager is attached, so the greeter composites without waiting for a
       shell that does not exist yet.
 
-- [ ] **The graphical login gate, built here rather than at the end of the milestone.** A wrong
+- [x] **The graphical login gate, built here rather than at the end of the milestone** ✅ (2026-08-25) — `cargo xtask check-login`. A wrong
       password, then a right one, then a shell — the sequence `test-interactive` runs on serial,
       driven by the PS/2 injection `check-input` and `check-terminal` already use, adjudicated on
       the host. Parts E and F then land against a gate that exists.
 
-- [ ] **Concurrency is decided: two independent sessions** (`graphical-session.md` §6.2,
+- [x] **Concurrency is decided: two independent sessions** ✅ (2026-08-25) — and demonstrated, not just decided: `check-login` logs in graphically and then on serial in the same boot, and requires that `desktop-session-mgr` never reported a session ending in between. (`graphical-session.md` §6.2,
       `session-and-auth.md`'s deferred "one console, one session at a time"). `session-mgr` and
       `desktop-session-mgr` each authenticate and run a session, unaware of each other. Serial
       stays the recovery path by construction, which is governing decision 3 holding trivially

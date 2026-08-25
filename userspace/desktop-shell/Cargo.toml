@@ -1,0 +1,22 @@
+[package]
+name = "desktop-shell"
+version = "0.1.0"
+edition = "2024"
+
+# The graphical session's leader — `nxsh`'s counterpart in the other column.
+#
+# **Minimal on purpose, and this is M7 Part D's stub.** Part E builds the actual shell: the
+# top bar, the applications modal, window placement policy driving M6's manager ops, and a
+# constructed namespace per application it spawns. What it has to be *now* is a process that
+# proves a graphical session runs — spawned into the session namespace, unprivileged, reaped
+# by `desktop-session-mgr` — so Part D's login gate has something to assert and Parts E and F
+# land against a gate that already exists.
+#
+# It does not draw yet. Its session namespace has no `/dev/draw`: `build_namespace` binds the
+# serial column's set, and the graphical bind is listed under Part E along with `/dev/desktop`.
+[dependencies]
+libkern = { path = "../libkern" }
+
+[[bin]]
+name = "desktop-shell"
+path = "src/main.rs"

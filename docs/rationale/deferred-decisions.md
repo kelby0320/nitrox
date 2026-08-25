@@ -689,14 +689,35 @@ drains alongside everything else. Trigger: a second terminal emulator, or the fi
 stalled client is observed to affect another. Landed 2026-08-13 with M5 Part C
 (`userspace/tty-server/src/main.rs`).
 
-**`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`.** M5 Part C hands `nxterm`'s
-shell its terminal as a *handle* at spawn, the way `libstream` already passes streams. A
-`/dev/tty` resolved inside that window still reaches the session's console, because that binding
-belongs to a namespace `desktop-shell` will construct and no such process exists. Inert today —
-no program that could run inside a window resolves `/dev/tty` except `nxsh`, which will have been
-handed one — and wrong to fix in the tty server, because it is a property of how applications get
-their namespaces. (`session-mgr` resolves it for the login prompt and the test harness in the
-gate; neither runs in a window.) Trigger: **Milestone 7**, the graphical session;
+**`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`. Trigger fired 2026-08-25;
+still deferred, now for a narrower reason.** M5 Part C hands `nxterm`'s shell its terminal as a
+*handle* at spawn, the way `libstream` already passes streams. A `/dev/tty` resolved inside that
+window instead reaches the session's console.
+
+**What changed:** M7 Part D built `desktop-session-mgr`, so the graphical session namespace this
+entry was waiting on now exists — and it binds `/dev/tty`, because
+`libsession::build_namespace` binds it for both columns whenever a tty endpoint was handed
+down.
+
+**The sharp edge, which Part D's own reasoning did not cover.** That session deliberately has
+**no `/dev/console`** (governing decision 3), on the argument that "a binding a session holds is
+authority it has, and the console is shared with the serial column, which is the recovery path".
+That argument applies to `/dev/tty` just as well and was not applied to it: a tty minted through
+the tty server sits on the **console backend**, and `drive` hands each completed line to the
+first tty on that backend with an outstanding read. So a graphical-session program that called
+`Tty::ReadLine` could take a line the serial column's `nxsh` was waiting for — against the
+recovery path the console argument is about, and the exact failure the tty server records
+("a permanent read here swallowed their keystrokes, and the interactive login test timed out on
+a password prompt that never saw its input"). Withholding the console and not the tty was an
+incomplete application of the rule rather than a decision (PR #236 review, finding 3).
+
+**Still inert, which is why this is a record and not a fix.** `desktop-shell` never resolves
+`/dev/tty`, and it is the only thing in a graphical session. Fixing it in the tty server would
+be wrong for the reason this entry always gave — it is a property of how applications get their
+namespaces — and the shape belongs to the part that builds them.
+
+Trigger now: **Milestone 7 Part E**, where `desktop-shell` constructs a namespace per
+application and has to decide what `/dev/tty` means inside one;
 [`graphical-session.md`](../design/graphical-session.md) §6.1 holds the three candidate shapes.
 
 **Concurrent serial and graphical sessions — ~~deferred~~ ANSWERED 2026-08-21: two independent

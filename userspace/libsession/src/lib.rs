@@ -240,6 +240,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     // failing the login would trade a working shell for a missing `list`.
     let mut has_bin = false;
     let mut has_tty = false;
+    let mut has_console = false;
     if profile_endpoint != 0 {
         let bin = b"/bin";
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no subtree
@@ -317,12 +318,15 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         unsafe { syscall1(SYS_HANDLE_CLOSE, console) };
         if cr != 0 {
             kprint(b"libsession: /dev/console bind FAIL (shell has no console)\n");
+        } else {
+            has_console = true;
         }
     }
     // SAFETY: single-threaded session-mgr; one namespace is built at a time.
     unsafe {
         SESSION_HAS_BIN = has_bin;
         SESSION_HAS_TTY = has_tty;
+        SESSION_HAS_CONSOLE = has_console;
     }
     ns
 }
@@ -336,6 +340,20 @@ pub fn session_has_bin() -> bool {
 
 /// Set by [`build_session_namespace`]; see [`session_has_bin`].
 static mut SESSION_HAS_BIN: bool = false;
+
+/// Whether the last [`build_namespace`] bound `/dev/console`.
+///
+/// **Reported rather than assumed**, and that distinction was not free: the graphical
+/// supervisor printed a hardcoded "(no /dev/console)" until 2026-08-25, so its gate's
+/// assertion passed just as happily with `bind_console: true`. A message that states a fact
+/// it did not check is decoration, and the control is what found it.
+pub fn session_has_console() -> bool {
+    // SAFETY: single-threaded supervisor; one namespace is built at a time.
+    unsafe { SESSION_HAS_CONSOLE }
+}
+
+/// See [`session_has_console`].
+static mut SESSION_HAS_CONSOLE: bool = false;
 
 /// Whether the last-built session namespace got a terminal. Read only for the log line —
 /// which has to be able to say "no", the same reason `/bin` is reported separately.

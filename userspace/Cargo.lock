@@ -63,6 +63,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-session-mgr"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
+ "libheap",
+ "libinput",
+ "libkern",
+ "librsproto",
+ "libsession",
+ "libstream",
+ "libsurface",
+ "libui",
+]
+
+[[package]]
+name = "desktop-shell"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
 name = "eshell"
 version = "0.1.0"
 dependencies = [
