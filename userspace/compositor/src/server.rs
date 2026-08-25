@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 
 use librsproto::surface::{
     ConfigureEvent, OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW,
+    OP_SET_TITLE,
     build_create_window_reply,
     parse_attach_buffer_request, parse_commit_request, parse_create_window_request,
     parse_destroy_window_request,
@@ -102,6 +103,15 @@ pub enum Outcome {
         /// as a starved core (M5 Part B).
         dirty: Option<Rect>,
     },
+    /// A window was renamed; the manager needs telling.
+    ///
+    /// A variant rather than an [`Applied`](Outcome::Applied) with a flag, because a title
+    /// changes nothing on screen — the compositor draws no titles — and folding it into the
+    /// damage-carrying variant would invite a repaint for a request that dirtied nothing.
+    TitleSet {
+        /// The renamed window. Its new title is on the [`Window`](crate::Window).
+        window: u32,
+    },
     /// The request was rejected.
     Failed(SurfaceError),
 }
@@ -122,6 +132,34 @@ pub enum SurfaceError {
     NotFound,
     /// The request was well-formed but could not be applied.
     Rejected(StackError),
+}
+
+/// Whether an over-long title has already been reported.
+///
+/// Single-threaded, like every other counter in this server.
+static mut TITLE_TRUNCATED_LOGGED: bool = false;
+
+/// Report the **first** over-long title and then stay quiet.
+///
+/// Once, not per occurrence: a client that sends a long title once usually sends it on every
+/// update, and the cap is a normal outcome rather than a fault — the alternative is a serial
+/// write on a request path, which is what a per-motion log cost `check-input` on 2026-08-24.
+/// One line is enough to explain a title that came back shorter than it went out.
+fn note_title_truncated(len: usize) {
+    // SAFETY: single-threaded server; the same access pattern as the input diagnostics.
+    unsafe {
+        if TITLE_TRUNCATED_LOGGED {
+            return;
+        }
+        TITLE_TRUNCATED_LOGGED = true;
+    }
+    let mut l = libkern::debug::Line::new();
+    l.s(b"compositor: title of ")
+        .u(len as u64)
+        .s(b" bytes truncated to ")
+        .u(librsproto::surface::MAX_TITLE as u64)
+        .s(b" (further truncations not logged)");
+    l.end();
 }
 
 /// Dispatch one Surface-category request arriving on `conn`.
@@ -261,6 +299,33 @@ pub fn dispatch(
             }
         }
 
+        OP_SET_TITLE => {
+            let Some((id, title)) = librsproto::surface::title::read(body) else {
+                return Outcome::Failed(SurfaceError::Malformed);
+            };
+            // Same ownership rule as every other op: a window belonging to another connection
+            // answers `NotFound`, so a reply cannot be used to probe for other clients' ids.
+            if !conn.owns(id) {
+                return Outcome::Failed(SurfaceError::NotFound);
+            }
+            let Some(w) = stack.window_mut(id) else {
+                return Outcome::Failed(SurfaceError::NotFound);
+            };
+            let kept = librsproto::surface::title::truncate_title(title);
+            if kept.len() < title.len() {
+                note_title_truncated(title.len());
+            }
+            // Unchanged titles do not become manager traffic: a client that re-sets the same
+            // title on every frame is not hypothetical, and the outbox is a bounded queue that
+            // discards its oldest when it fills.
+            if w.title == kept {
+                return Outcome::Applied { release: None, dirty: Some(Rect::new(0, 0, 0, 0)) };
+            }
+            w.title.clear();
+            w.title.push_str(kept);
+            Outcome::TitleSet { window: id }
+        }
+
         OP_DESTROY_WINDOW => {
             let Some(window) = parse_destroy_window_request(body) else {
                 return Outcome::Failed(SurfaceError::Malformed);
@@ -350,7 +415,11 @@ mod tests {
         build_create_window_request, build_destroy_window_request, parse_create_window_reply,
     };
 
-    fn create(conn: &mut Connection, stack: &mut WindowStack, role: Role) -> Result<u32, SurfaceError> {
+    pub(super) fn create(
+        conn: &mut Connection,
+        stack: &mut WindowStack,
+        role: Role,
+    ) -> Result<u32, SurfaceError> {
         create_sized(conn, stack, role, 8, 8)
     }
 
@@ -791,3 +860,101 @@ mod tests {
             libdraw::geom::Rect::new(0, 24, 100, 26));
     }
 }
+
+#[cfg(test)]
+mod title_tests {
+    use super::tests::create;
+    use super::*;
+    use crate::Role;
+    use librsproto::surface::{MAX_TITLE, title};
+
+    /// Build a `SetTitle` body and dispatch it.
+    fn set_title(
+        conn: &mut Connection,
+        stack: &mut WindowStack,
+        window: u32,
+        s: &str,
+    ) -> Outcome {
+        let mut body = alloc::vec![0u8; 4 + s.len()];
+        let n = title::write(window, s, &mut body).expect("fits");
+        let mut reply = [0u8; 32];
+        dispatch(conn, stack, OP_SET_TITLE, &body[..n], &mut reply)
+    }
+
+    #[test]
+    fn a_title_is_stored_and_the_manager_is_told() {
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert_eq!(stack.window(w).unwrap().title, "", "a new window is unnamed");
+        assert!(matches!(set_title(&mut a, &mut stack, w, "nxterm"), Outcome::TitleSet { window } if window == w));
+        assert_eq!(stack.window(w).unwrap().title, "nxterm");
+    }
+
+    /// Re-setting the same title must not become manager traffic: a client that sets it every
+    /// frame would otherwise push the bounded queue's older events out.
+    #[test]
+    fn an_unchanged_title_produces_no_manager_event() {
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert!(matches!(set_title(&mut a, &mut stack, w, "same"), Outcome::TitleSet { .. }));
+        assert!(
+            matches!(set_title(&mut a, &mut stack, w, "same"), Outcome::Applied { .. }),
+            "the same title was announced twice"
+        );
+        // Negative control: a different title is announced.
+        assert!(matches!(set_title(&mut a, &mut stack, w, "other"), Outcome::TitleSet { .. }));
+    }
+
+    /// The same ownership rule as every other op — and `NotFound` rather than a distinct
+    /// error, so a reply cannot be used to probe for another client's window ids.
+    #[test]
+    fn another_connections_window_cannot_be_renamed() {
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let mut b = Connection::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert!(matches!(
+            set_title(&mut b, &mut stack, w, "mine now"),
+            Outcome::Failed(SurfaceError::NotFound)
+        ));
+        assert_eq!(stack.window(w).unwrap().title, "", "the window was renamed anyway");
+        // A window that never existed answers the same thing.
+        assert!(matches!(
+            set_title(&mut b, &mut stack, w + 99, "ghost"),
+            Outcome::Failed(SurfaceError::NotFound)
+        ));
+    }
+
+    /// Stored truncated, so a window's cost stays finite however chatty its client is.
+    #[test]
+    fn an_over_long_title_is_stored_truncated() {
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        let long = alloc::string::String::from_utf8(alloc::vec![b'x'; MAX_TITLE + 50]).unwrap();
+        assert!(matches!(set_title(&mut a, &mut stack, w, &long), Outcome::TitleSet { .. }));
+        assert_eq!(stack.window(w).unwrap().title.len(), MAX_TITLE);
+    }
+
+    /// A body that is not UTF-8 is malformed, not a silently-empty title.
+    #[test]
+    fn a_malformed_body_is_refused() {
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        let mut reply = [0u8; 32];
+        let bad = [w as u8, 0, 0, 0, 0xFF, 0xFE];
+        assert!(matches!(
+            dispatch(&mut a, &mut stack, OP_SET_TITLE, &bad, &mut reply),
+            Outcome::Failed(SurfaceError::Malformed)
+        ));
+        // Too short to name a window.
+        assert!(matches!(
+            dispatch(&mut a, &mut stack, OP_SET_TITLE, &[0u8; 2], &mut reply),
+            Outcome::Failed(SurfaceError::Malformed)
+        ));
+    }
+}
+

@@ -120,6 +120,13 @@ pub struct Window {
     pub buffers: Vec<AttachedBuffer>,
     /// The buffer last committed, if any — what compositing reads.
     pub committed: Option<u32>,
+    /// What the client called this window, or empty if it never said.
+    ///
+    /// **Stored here rather than derived**, because only the client knows it and only a
+    /// manager wants it — the compositor itself never draws a title. Bounded at
+    /// [`MAX_TITLE`](librsproto::surface::MAX_TITLE) on the way in, so a window's cost stays
+    /// finite however chatty its client is.
+    pub title: alloc::string::String,
     /// Whether this window's first `Configure` has been sent to its client.
     ///
     /// **A window is not composited until it has been configured** — M6 B4. The client is
@@ -420,6 +427,14 @@ impl WindowStack {
         self.windows.iter().find(|w| w.id == id)
     }
 
+    /// The window with `id`, mutably.
+    ///
+    /// The read-only [`window`](Self::window) covers every other caller; a title is the first
+    /// thing a request changes on a window without touching geometry or buffers.
+    pub fn window_mut(&mut self, id: u32) -> Option<&mut Window> {
+        self.windows.iter_mut().find(|w| w.id == id)
+    }
+
     /// Create a window and return its id.
     ///
     /// A popup or dialog must name a parent that exists — otherwise the compositor would
@@ -462,6 +477,7 @@ impl WindowStack {
             // Created unconfigured, whether or not anyone is going to answer. Whoever sends the
             // first `Configure` — the compositor at once, or a manager, or the deadline —
             // marks it, and until then the window exists without being on screen.
+            title: alloc::string::String::new(),
             configured: false,
         });
         Ok(id)

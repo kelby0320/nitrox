@@ -1,7 +1,8 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-08-20), and this document describes what
-exists.** Milestone 4 built
+**Status: built (2026-08-11, last checked 2026-08-25), and this document describes what
+exists.** M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
+the *text area* is still absent and a single line is not the same widget. Milestone 4 built
 all of it: the retained tree and the declarative `view` (`userspace/libui/src/element.rs`),
 measure/arrange layout (`layout.rs`), the keyed diff that damage falls out of (`diff.rs`),
 per-buffer damage accumulation (`damage.rs`), event routing with implicit capture
@@ -14,8 +15,8 @@ and compares against the guest's screen pixel for pixel.
 **What is specified here and not built**, each with its reason in place: the **application
 runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
 assembles it by hand and is the first application to do so), **theming** (§11), and the
-**text area** (§8, absent on purpose — the terminal's grid is a `custom` widget, so nothing yet
-needs one). The menu's **popup half** left this list in M5 Part B and left the toolkit
+**text area** (§8, still absent on purpose — M7 added a *single-line* field, which is a
+different widget, and the terminal's grid remains a `custom` one). The menu's **popup half** left this list in M5 Part B and left the toolkit
 entirely in M6 C3: a menu is a `popup` *window* now, parented to its application's window,
 positioned by the client at the anchor `locate` gives and clipped by the **screen**. `nxterm`
 still uses `locate`; it no longer uses `offset`, which has no consumer outside this crate's own
@@ -382,11 +383,36 @@ Bounded by Milestone 5, as §1 requires:
 | `scrollbar` | The terminal's scrollback |
 | `custom` | The escape hatch: a node with an opaque payload, a paint callback, and raw event delivery |
 
-**The text area is not in this set**, resolving the contradiction §1 found. Milestone 5's
-terminal grid is a `custom` widget by the plan's own decision, so nothing in Milestone 5
-would use a text area, and building one now would be a guess at an editor's requirements
-made a milestone before any editor exists. It returns when something needs it — plausibly
-the file browser or a "find" box — and its absence is exactly the rule working.
+**Two more arrived with Milestone 7 Part A**, by the same rule — an application needed them,
+so they exist:
+
+| Widget | Why it exists |
+|---|---|
+| `text_field` | The greeter's password box and the applications modal's search box. Single-line, optionally masked |
+| `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*" |
+
+**The text area is still not in this set**, and a single-line field is not it. §1's
+contradiction stands resolved the way it was: Milestone 5's terminal grid is a `custom` widget
+by the plan's own decision, so nothing there wanted a text area, and building an editor's
+widget remains a guess at requirements no editor has yet posed. What M7 needed was a password
+box and a search box — no wrapping, no selection, no undo, no multi-line cursor — which is the
+narrow thing §8 said would arrive when something needed it, arriving earlier and smaller than
+the thing it is still reserving.
+
+**What the two widgets are, at the toolkit's seam.** Both are pure functions of state the
+application owns, like every widget here — but both also ship a *state* type
+(`TextFieldState`, `ListState`) carrying the logic their callers would otherwise each
+reimplement: key dispatch for the field, and selection-follows-scroll for the list. That is
+not a retreat from §3's "a widget is a function": `Element::on_key` is a **function pointer**,
+so a widget cannot close over anything to mutate, and the editing rules have to live
+somewhere the application can call. Putting them next to the widget rather than in each
+caller is what stops two implementations of Home and End existing.
+
+`list_view` builds **only the rows that fit**, which is the point of it rather than an
+optimisation: a hundred windows cost as many elements as fit on screen, and the diff walks
+that many. It is designed against two callers deliberately — a window list is reordered in
+place, a launcher's results are replaced wholesale — because a model API drawn for one
+consumer is the failure §5 was avoiding.
 
 **A knock-on worth recording**: `deferred-decisions.md` gives key repeat the trigger "the
 first text field — M4's toolkit". With no text field in M4, that wording would say the

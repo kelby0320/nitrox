@@ -357,7 +357,9 @@ mod tests {
 /// manager whose receive ring is briefly full silently loses the event, and the compositor has
 /// no way to know. That exact defect was found in the manager's `Configure` path in review of
 /// PR #216.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Not `Copy`: [`Title`](MgrEvent::Title) owns its string, because the queue is drained
+/// later and a window can be destroyed in between.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MgrEvent {
     /// A window was created: id, role and the geometry its client asked for.
     Created(librsproto::surface::MgrWindowCreated),
@@ -368,6 +370,17 @@ pub enum MgrEvent {
     },
     /// A window's position or size changed, for any reason.
     Geometry(librsproto::surface::ConfigureEvent),
+    /// A window was renamed by its client.
+    ///
+    /// Carries the title **by value**. The queue is drained later and bounded, so a window can
+    /// be destroyed between the rename and the send; holding an id and reading the title back
+    /// then would report the wrong title or none.
+    Title {
+        /// Which window.
+        window: u32,
+        /// Its new title, already truncated to `MAX_TITLE`.
+        title: alloc::string::String,
+    },
     /// The keyboard moved to or from a window.
     Focus {
         /// Which window.
@@ -412,8 +425,11 @@ impl MgrOutbox {
     }
 
     /// The oldest queued event, if any.
-    pub fn front(&self) -> Option<MgrEvent> {
-        self.q.first().copied()
+    ///
+    /// By reference since [`MgrEvent::Title`] owns a string; the sender only reads it, and
+    /// [`pop`](Self::pop) is what removes it once it has gone out.
+    pub fn front(&self) -> Option<&MgrEvent> {
+        self.q.first()
     }
 
     /// Discard the oldest — call after it has been sent.

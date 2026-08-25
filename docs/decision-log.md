@@ -17612,3 +17612,99 @@ not. User stacks are **8 MiB** with a 1 MiB guard, so it never was. And the alar
 outbox overflow, discarded …` lines in the failing transcript, which appear identically in
 passing runs and discriminate nothing; I had read them as evidence because they looked alarming.
 Both were disposed of by controls rather than by argument.
+
+## 2026-08-25 — M7 Part A: two widgets whose shape the toolkit had already decided
+
+Milestone 7's first part builds the three things every later part draws with. Two of the three
+decisions were made for me by code that already existed, which is the more interesting half.
+
+**`Element::on_key` is a function pointer, not a closure.** So a widget cannot close over
+anything to mutate, and a text field cannot be a self-contained editor: the state is the
+application's and the widget is a pure function of it. That is the same shape as every other
+widget here, where "hovered" is state the caller passes in — so the toolkit's existing design
+settled it rather than a preference. `TextFieldState` and `ListState` carry the editing rules
+next to the widget, because `widget-toolkit.md` §3's "a widget is a function" does not say
+where the *rules* live, and putting them in each caller is how two implementations of Home and
+End come to exist.
+
+**`Element::key` already existed for exactly this.** Its doc says dynamic lists "must set it,
+or the diff pairs row 2's widget with row 3's element" — which is the model-backed list's whole
+requirement, so `list_view` works with the diff rather than around it. Only the rows that fit
+become elements; a hundred windows cost as many as fit on screen.
+
+**Designed against two callers, and they stressed opposite halves.** The plan says a model API
+drawn for a single consumer is the failure `desktop-shell.md` §5 was avoiding, and that turned
+out to be concrete rather than cautionary: a window list is **reordered in place**, which
+stresses the keying — keying by index instead of by window id fails the reorder test — while a
+launcher's results are **replaced wholesale on every keystroke**, which stresses selection and
+scroll surviving a length change. Select row 19 of 20, type one more character, three results
+remain: a stale offset renders blank while holding rows. Neither caller would have surfaced the
+other's bug.
+
+**Titles: the protocol's first variable-length Surface record**, closing `m6-b3b-titles` — the
+deferral M6 B3 split off precisely because it needed "a length convention, a cap, and a
+decision about what a client sending 64 KiB of title gets back". No length field, because the
+body arrives inside a message that already carries one and a second is only a way for the two
+to disagree. Truncate on a character boundary rather than refuse, decided with the maintainer:
+`SetTitle` is silent on success and has no reply a client reads, so refusing would need an
+error path built for the one op specified not to have one.
+
+**The boundary is the load-bearing half, and running its control found a test of mine that was
+decoration.** Cutting at 256 *bytes* can land inside a character, leaving the title not UTF-8
+at all — a cap meant to bound memory corrupting the string it bounds. The first boundary test
+used a string of nothing but `é`, where byte 256 *is* a boundary, so it passed against a naive
+`&s[..MAX_TITLE]`. One leading ASCII byte puts every boundary at an odd offset, and both
+boundary tests now fail against the naive slice.
+
+**The reference render's height went 160 → 260, and where the widgets sit is the reason.**
+`ui-testclient` stacks the three reference windows at the origin largest-first, so the
+terminal's 180×96 covers the toolkit window's top-left and the display gate excludes that
+region. A widget added at the top of the column would be compared over a few columns of its
+right-hand edge and nowhere else. Below y=96 it is wholly visible — confirmed rather than
+assumed by corrupting the host's expectation at y=210 and watching the gate report 20 differing
+pixels at (20,210).
+
+## 2026-08-25 — Part A's review: a cap that was never the cap, and a clamp that covered half its case
+
+Two blocking findings on PR #233, and both are the same shape — a test that exercised the
+component and not the path.
+
+**The title cap was 60 bytes, not 256.** The compositor's serve loop copies each request body
+into a fixed `MAX_BODY = 64` buffer before dispatch, so `dispatch` never saw more than 4 bytes
+of window id and 60 of title. Three things followed, none of which any test could see: the
+spec and the resolved deferral both stated 256 and were false; a title whose 61st byte began a
+multi-byte character failed `from_utf8` and came back `Malformed`, so a legitimate rename was
+**dropped rather than shortened** — the exact corruption `truncate_title` was written to
+prevent, reintroduced one frame up the stack; and because `title.len()` could never exceed 60,
+`truncate_title`'s walk-back and the truncation log were **unreachable in the shipped binary**.
+The headline decision of A3 did not take effect on the real path.
+
+Every truncation test called `dispatch` directly and handed it a 260-byte body no client can
+deliver. The component was right and the path was not, and testing the component is what hid
+it. `MAX_BODY` is now `4 + MAX_TITLE` with `const _: () = assert!(…)` tying the two together,
+because it is a number two files away from the one it has to track. Worth noting where that
+guard is checked: `cargo xtask test` builds the compositor **lib**, so it does not compile
+`main.rs` at all — the assertion fails the *image* build, which CI runs. Verified by putting
+64 back and watching `cargo xtask image` fail.
+
+**`list_view` clamped the scroll to a shrunken list but not the selection.** The launcher is
+the caller Part A is explicitly designed against, and the failure is the one that caller
+produces: twenty results, arrow down to row 19, type one more character, three remain. Nothing
+paints as selected; `down` takes `Some(i) if i + 1 < len` and otherwise returns `i` unchanged,
+so the key is **dead** rather than merely wrong; `up` has to be pressed seventeen times; and a
+caller reading `selected` to decide what Enter activates gets index 19 into three rows.
+
+The test that was supposed to cover this asserted on `state.offset` and the row count and
+never on `state.selected`, so it passed either way — the second decorative test this part has
+produced, both found by someone else running a control I had not. The selection is now clamped
+before `ensure_visible`, to the last surviving row rather than cleared so something stays
+highlighted and the arrows work on the next press, and the test asserts the selection, the
+highlight and that `up` still moves.
+
+**A smaller one worth keeping**: eight `EV_KEY` codes were re-declared privately in `widget.rs`
+when `libkern::abi` already publishes them and `libterm::encode` imports exactly that set. The
+`libinput` dependency in the same commit was justified as "one keycode-to-character mapping …
+rather than a second one that could disagree" — and the argument applies to the codes just as
+well as to the mapping. Applying a rule to the thing that suggested it and not to its neighbour
+is how two sources of truth get one commit apart.
+

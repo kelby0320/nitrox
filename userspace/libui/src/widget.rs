@@ -22,6 +22,15 @@ use libdraw::format::Rgb;
 use libdraw::geom::Size;
 
 use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, text};
+// The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
+// `libterm::encode` already imports exactly this set from there, so a second copy is a second
+// thing that can disagree about a key. The same argument the `libinput` dependency is
+// justified by, applied to the codes as well as the mapping (PR #233 review, finding 3).
+// `libinput::keymap` does not map them because it answers "what text does this produce", and
+// these produce none.
+use libkern::abi::{
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP,
+};
 
 /// How a widget should look, given what the application knows about it.
 ///
@@ -234,6 +243,827 @@ pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, palette:
         Size::new(0, height),
         stack(alloc::vec![fill(palette.face), row(items)]),
     )
+}
+
+
+/// Space between a text field's content and its edge.
+const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
+
+/// How wide the caret is, in pixels.
+const CARET: u32 = 2;
+
+/// What a masked field shows instead of each character.
+///
+/// `*` rather than a bullet, deliberately: the vendored DejaVu almost certainly has U+2022,
+/// but "almost certainly" is not a property a login screen should depend on, and a missing
+/// glyph in a password field is invisible to the person typing — they cannot read what it
+/// should have said. ASCII cannot go wrong here.
+const MASK_CHAR: char = '*';
+
+/// The editable content of a single-line text field.
+///
+/// **The state is the application's and the widget is a pure function of it**, which is not a
+/// style choice: [`Element::on_key`](crate::element::Element::on_key) is a *function pointer*,
+/// so a widget cannot close over anything to mutate. The application owns one of these, hands
+/// keys to [`apply`](Self::apply), and passes the result to [`text_field`] — the same shape as
+/// every other widget here, where "hovered" is state the caller passes in.
+///
+/// **A single line, not an editor.** `widget-toolkit.md` §8 keeps the *text area* out of the
+/// set until something needs one, and says it "returns when something needs it". A greeter's
+/// password box and a launcher's search box are that trigger, and they are narrower than the
+/// thing §8 is reserving: no wrapping, no selection, no undo, no multi-line cursor. Building
+/// the editor's widget now would be the guess §8 refuses to make.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TextFieldState {
+    /// What has been typed.
+    text: String,
+    /// Where the caret is, as a **byte** offset into `text`.
+    ///
+    /// Bytes rather than characters because that is what slicing needs, and every mutation
+    /// below keeps it on a character boundary — the invariant the whole type rests on.
+    cursor: usize,
+}
+
+impl TextFieldState {
+    /// An empty field.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A field holding `text`, caret at the end — where a caller pre-filling a username wants it.
+    pub fn with_text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.len();
+        Self { text, cursor }
+    }
+
+    /// What has been typed.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The caret's byte offset. Always on a character boundary.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether anything has been typed.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Empty it and put the caret back — what a supervisor does to a password field the
+    /// moment it has been read, so a rejected login does not leave it on screen.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Insert `c` at the caret and step over it.
+    pub fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the caret. No-op at the start.
+    pub fn backspace(&mut self) -> bool {
+        let Some(prev) = self.prev_boundary() else {
+            return false;
+        };
+        self.text.remove(prev);
+        self.cursor = prev;
+        true
+    }
+
+    /// Delete the character after the caret. No-op at the end.
+    pub fn delete(&mut self) -> bool {
+        if self.cursor >= self.text.len() {
+            return false;
+        }
+        self.text.remove(self.cursor);
+        true
+    }
+
+    /// Move the caret one character left.
+    pub fn left(&mut self) -> bool {
+        match self.prev_boundary() {
+            Some(prev) => {
+                self.cursor = prev;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move the caret one character right.
+    pub fn right(&mut self) -> bool {
+        let Some(c) = self.text[self.cursor..].chars().next() else {
+            return false;
+        };
+        self.cursor += c.len_utf8();
+        true
+    }
+
+    /// Move the caret to the start.
+    pub fn home(&mut self) -> bool {
+        let moved = self.cursor != 0;
+        self.cursor = 0;
+        moved
+    }
+
+    /// Move the caret to the end.
+    pub fn end(&mut self) -> bool {
+        let moved = self.cursor != self.text.len();
+        self.cursor = self.text.len();
+        moved
+    }
+
+    /// The byte offset of the character before the caret, if there is one.
+    fn prev_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor].chars().next_back().map(|c| self.cursor - c.len_utf8())
+    }
+
+    /// Apply a key, answering **whether the field changed** so a caller knows to repaint.
+    ///
+    /// One implementation of "what does this keycode do to a field", rather than one per
+    /// caller. The greeter and the applications modal are the two consumers Part A is designed
+    /// against, and key dispatch is the part they would otherwise each get subtly wrong —
+    /// Home and End are easy to omit, and a field that ignores them is noticeably broken.
+    ///
+    /// **Keys it does not claim are left alone**, which is the contract
+    /// [`Element::on_key`](crate::element::Element::on_key) is built around: Tab, Enter and
+    /// Escape belong to whatever is above the field — traversal, submission and dismissal are
+    /// not a text field's business — so this answers `false` and lets them bubble.
+    ///
+    /// ASCII only, because [`libinput::keymap::to_char`] is: the US layout is what the input
+    /// stack maps today, and a field that invented its own mapping would disagree with the
+    /// terminal about what a key means.
+    pub fn apply(&mut self, keycode: u16, modifiers: u16) -> bool {
+        match keycode {
+            KEY_BACKSPACE => self.backspace(),
+            KEY_DELETE => self.delete(),
+            KEY_LEFT => self.left(),
+            KEY_RIGHT => self.right(),
+            KEY_HOME => self.home(),
+            KEY_END => self.end(),
+            _ => match libinput::keymap::to_char(keycode, modifiers) {
+                // Control characters are not text. Ctrl-C folds to 0x03 in the keymap because
+                // a terminal needs it to; a field that inserted it would put an unprintable
+                // byte in a password.
+                Some(b) if b >= 0x20 && b < 0x7F => {
+                    self.insert(b as char);
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+
+/// A single-line text field, optionally masked.
+///
+/// **The caret is a `Row` split at the cursor**, not a measured x-offset: the text before it,
+/// a two-pixel fill, then the text after. A `Row` already lays children out left to right by
+/// their measured widths, so the caret lands exactly where the glyphs end without this widget
+/// measuring anything — and it stays correct for any font, because the same measurement that
+/// draws the text places the caret.
+///
+/// **Masked with [`MASK_CHAR`] per character, not per byte.** A mask built by repeating a byte
+/// would leak the encoded length of a multi-byte character and, worse, split one — so the
+/// number of stars would not be the number of keys pressed.
+///
+/// The caret is drawn from `state.active`, like the button's focus ring: a field in an
+/// unfocused window must not blink a caret for a keyboard it does not have.
+pub fn text_field<Msg>(
+    field: &TextFieldState,
+    masked: bool,
+    state: WidgetState,
+    palette: &Palette,
+) -> Element<Msg> {
+    let render = |s: &str| -> String {
+        if masked { core::iter::repeat_n(MASK_CHAR, s.chars().count()).collect() } else { s.into() }
+    };
+    let (before, after) = field.text.split_at(field.cursor);
+
+    let mut content = alloc::vec::Vec::with_capacity(3);
+    content.push(text(render(before)));
+    if state.active {
+        content.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
+    }
+    content.push(text(render(after)));
+
+    // `track` is the recessed-channel colour the scrollbar uses, and a text field is the same
+    // idea: a well the content sits in, rather than a face that stands out of the surface.
+    let mut layers = alloc::vec::Vec::with_capacity(3);
+    if state.active {
+        layers.push(fill(palette.focus_ring));
+        layers.push(padding(Insets::all(RING), fill(palette.track)));
+    } else {
+        layers.push(fill(palette.track));
+    }
+    layers.push(padding(FIELD_PAD, row(content)));
+    stack(layers).focusable()
+}
+
+
+/// One row of a [`list_view`].
+///
+/// **Borrowed, and built fresh each frame from whatever the application already has.** That
+/// is the "model" in model-backed: a window list derives these from its window records and a
+/// launcher derives them from its filtered program list, neither keeping a parallel array of
+/// row widgets to reconcile by hand — which is the hand-rolled diffing `desktop-shell.md` §5
+/// says a list widget exists to avoid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ListRow<'a> {
+    /// Identity across frames.
+    ///
+    /// **Not the index.** [`Element::key`](crate::element::Element::key) exists because the
+    /// diff otherwise pairs by position, and its own doc names this failure: insert a row at
+    /// the top and "the diff pairs row 2's widget with row 3's element". A window list
+    /// reorders on every raise, so position is never stable here. Use the window id, or the
+    /// index into the *unfiltered* list — anything that survives the list changing shape.
+    ///
+    /// **Must be unique among the rows in one list.** A repeat is
+    /// [`DiffError::DuplicateKey`](crate::diff::DiffError::DuplicateKey) — a hard error from
+    /// the diff, not a degraded pairing — which is worth knowing before reaching for a hash of
+    /// a name that two rows could share.
+    pub key: u64,
+    /// What the row says.
+    pub label: &'a str,
+}
+
+/// Which row is selected, and how far the list is scrolled.
+///
+/// Scroll is a row index rather than a pixel offset: a list scrolls by whole rows, and the
+/// arithmetic that keeps a selection visible is unreadable in pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ListState {
+    /// The selected row, as an index into the rows passed to [`list_view`].
+    pub selected: Option<usize>,
+    /// The first visible row.
+    pub offset: usize,
+}
+
+impl ListState {
+    /// Move the selection down one row, answering whether anything changed.
+    ///
+    /// From nothing selected this selects the first row, which is what a launcher wants when
+    /// the user presses Down having only typed a query.
+    pub fn down(&mut self, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let next = match self.selected {
+            None => 0,
+            Some(i) if i + 1 < len => i + 1,
+            Some(i) => i,
+        };
+        let moved = self.selected != Some(next);
+        self.selected = Some(next);
+        moved
+    }
+
+    /// Move the selection up one row, answering whether anything changed.
+    pub fn up(&mut self) -> bool {
+        let Some(i) = self.selected else {
+            return false;
+        };
+        if i == 0 {
+            return false;
+        }
+        self.selected = Some(i - 1);
+        true
+    }
+
+    /// Scroll so the selected row is on screen, given how many rows fit.
+    ///
+    /// **The thing both callers would get wrong.** A selection moved with the keyboard walks
+    /// off the visible window and the list appears to stop responding — the state changed and
+    /// nothing on screen did. Called by [`list_view`] itself rather than left to the caller,
+    /// because a widget that can compute this and makes its callers do it is a widget that
+    /// will have two implementations of it.
+    pub fn ensure_visible(&mut self, visible: usize) {
+        let Some(i) = self.selected else {
+            return;
+        };
+        if visible == 0 {
+            return;
+        }
+        if i < self.offset {
+            self.offset = i;
+        } else if i >= self.offset + visible {
+            self.offset = i + 1 - visible;
+        }
+    }
+
+    /// Apply a key, answering whether the list changed.
+    ///
+    /// Declines everything it does not claim, for the reason
+    /// [`TextFieldState::apply`](TextFieldState::apply) does: Enter activates the selection
+    /// and Escape dismisses the list, and neither belongs to the list itself. A launcher's
+    /// query field and its results list are both focusable, and arrow keys have to reach the
+    /// list while the field holds focus — so a caller routes these itself rather than relying
+    /// on widget focus, which is why this takes a keycode instead of being wired to `on_key`.
+    pub fn apply(&mut self, keycode: u16, len: usize) -> bool {
+        match keycode {
+            KEY_DOWN => self.down(len),
+            KEY_UP => self.up(),
+            _ => false,
+        }
+    }
+}
+
+/// How much space a row's label gets around it.
+const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
+
+/// A scrolling list of rows, with one selected.
+///
+/// **The one model-backed widget** `desktop-shell.md` §5 settles on — "an explicit toolkit
+/// *plus one model-backed list widget*" covering the window list, the desktop previews and the
+/// launcher results, "which is essentially all of the churn, for a fraction of a diffing
+/// engine's machinery". Designed against two of those callers rather than one, because a model
+/// API drawn for a single consumer is the failure mode §5 was avoiding: a window list is
+/// **reordered and mutated in place** while a launcher's results are **replaced wholesale on
+/// every keystroke**, and those stress different halves — the first the keying, the second the
+/// selection and scroll surviving a list that changed length.
+///
+/// **Only the visible rows become elements.** That is the point of the widget rather than an
+/// optimisation: a list of a hundred windows costs as many elements as fit on screen, and the
+/// diff walks that many.
+///
+/// **`height` must be the height the parent will actually give it** — the same obligation
+/// [`scrollbar`] states, and this widget does not size itself to it, so a caller that lets the
+/// list flex will show a different number of rows than it built. Wrapping the result in
+/// `sized` is what [`crate::reference`] does and is the reliable way to keep the two in step.
+/// (An earlier version of this sentence claimed a caller "cannot get it out of step", which is
+/// exactly backwards; PR #233 review.)
+///
+/// `state` is taken by value and scrolled to follow the selection — see
+/// [`ensure_visible`](ListState::ensure_visible). A caller that wants the scroll to persist
+/// reads it back from the returned state.
+pub fn list_view<Msg>(
+    rows: &[ListRow<'_>],
+    state: ListState,
+    height: u32,
+    row_height: u32,
+    activate: fn(u64) -> Msg,
+    palette: &Palette,
+) -> (Element<Msg>, ListState) {
+    let mut state = state;
+    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    // **The selection is clamped first, because it is an index into a list that may have just
+    // been replaced.** A launcher rebuilds its results on every keystroke, so a selection made
+    // against twenty of them is not an index into the three that remain — and a stale one is
+    // worse than useless: nothing paints as selected, `down` sees `i + 1 < len` fail and
+    // returns the same index so the key is *dead*, and a caller reading `selected` to decide
+    // what Enter activates gets an out-of-range index. Clamped to the last surviving row
+    // rather than cleared, so something is highlighted and the arrows work on the next press
+    // (PR #233 review, finding 2).
+    if let Some(i) = state.selected {
+        if i >= rows.len() {
+            state.selected = rows.len().checked_sub(1);
+        }
+    }
+    state.ensure_visible(visible);
+    // Never scrolled past the end: a list that shrinks under a stale offset would otherwise
+    // render blank while holding rows.
+    let max_offset = rows.len().saturating_sub(visible);
+    state.offset = state.offset.min(max_offset);
+
+    let last = (state.offset + visible).min(rows.len());
+    let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
+    for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
+        let selected = state.selected == Some(i);
+        let face = if selected { palette.face_hover } else { palette.track };
+        let row_el = stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))]);
+        items.push(sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key)));
+    }
+
+    let list = column(items);
+    let body = if rows.len() > visible {
+        let bar = ScrollState {
+            offset: state.offset as u32,
+            visible: visible as u32,
+            total: rows.len() as u32,
+        };
+        row(alloc::vec![
+            list.flex(1),
+            scrollbar(bar, SCROLLBAR_W, height, palette),
+        ])
+    } else {
+        list
+    };
+    (stack(alloc::vec![fill(palette.track), body]).focusable(), state)
+}
+
+/// How wide a list's scrollbar is, in pixels.
+const SCROLLBAR_W: u32 = 10;
+
+#[cfg(test)]
+mod list_view_tests {
+    use super::*;
+    use crate::element::Node;
+
+    fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
+        labels.iter().map(|&(key, label)| ListRow { key, label }).collect()
+    }
+
+    /// The whole point of the widget: a hundred rows cost as many elements as fit.
+    #[test]
+    fn only_the_visible_rows_become_elements() {
+        let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
+        let r = rows(&data);
+        let (e, _): (Element<u64>, _) =
+            list_view(&r, ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
+    }
+
+    /// Without keys the diff pairs by position, and its own doc names the failure: insert at
+    /// the top and "row 2's widget" pairs with "row 3's element".
+    #[test]
+    fn every_row_carries_its_key_not_its_index() {
+        let data = [(70u64, "a"), (80, "b"), (90, "c")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
+    }
+
+    /// The window-list caller: rows reorder in place on every raise.
+    #[test]
+    fn a_reordered_window_list_keeps_each_rows_identity() {
+        let before = [(1u64, "term"), (2, "editor")];
+        let after = [(2u64, "editor"), (1, "term")];
+        let (a, _): (Element<u64>, _) =
+            list_view(&rows(&before), ListState::default(), 100, 20, |k| k, &Palette::default());
+        let (b, _): (Element<u64>, _) =
+            list_view(&rows(&after), ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(keys(&a), alloc::vec![1, 2]);
+        assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
+    }
+
+    /// The launcher caller: results are replaced wholesale on every keystroke, so the list
+    /// gets shorter under a scroll offset that was valid a frame ago.
+    #[test]
+    fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
+        let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
+        let (_, state): (Element<u64>, _) = list_view(
+            &rows(&long),
+            ListState { selected: Some(19), offset: 0 },
+            100, 20, |k| k, &Palette::default(),
+        );
+        assert_eq!(state.offset, 15, "the scroll did not follow the selection");
+        let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
+        let (e, mut state): (Element<u64>, _) =
+            list_view(&rows(&short), state, 100, 20, |k| k, &Palette::default());
+        assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
+        assert_eq!(keys(&e).len(), 3, "the list rendered blank");
+
+        // **The selection half, which the first version of this test did not assert and so
+        // passed against a widget that left it dangling** (PR #233 review, finding 2). A
+        // selection of 19 into three rows highlights nothing, and `down` is *dead*: it takes
+        // `Some(i) if i + 1 < len` and otherwise returns `i` unchanged, so a stale index never
+        // comes back into range on its own.
+        assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
+        assert!(
+            row_faces(&e).iter().any(|f| *f == Palette::default().face_hover),
+            "no row is painted as selected"
+        );
+        assert!(!state.down(3), "the selection is already on the last row");
+        assert!(state.up(), "the arrow keys are dead after the shrink");
+        assert_eq!(state.selected, Some(1));
+    }
+
+    /// Shrinking to nothing leaves nothing selected, rather than row `-1`.
+    #[test]
+    fn a_list_that_empties_clears_the_selection() {
+        let (_, state): (Element<u64>, _) = list_view(
+            &[],
+            ListState { selected: Some(3), offset: 2 },
+            100, 20, |k| k, &Palette::default(),
+        );
+        assert_eq!(state.selected, None, "an empty list kept a selection");
+        assert_eq!(state.offset, 0);
+    }
+
+    /// A selection moved with the keyboard must stay on screen.
+    #[test]
+    fn the_scroll_follows_the_selection_in_both_directions() {
+        let mut s = ListState { selected: Some(7), offset: 0 };
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 3, "scrolling down did not bring the selection into view");
+        s.selected = Some(1);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 1, "scrolling up did not bring the selection into view");
+        s.selected = Some(3);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 1, "a visible selection scrolled anyway");
+    }
+
+    /// Down from nothing selects the first row.
+    #[test]
+    fn down_from_nothing_selects_the_first_row() {
+        let mut s = ListState::default();
+        assert!(s.down(3));
+        assert_eq!(s.selected, Some(0));
+        assert!(s.down(3));
+        assert_eq!(s.selected, Some(1));
+    }
+
+    /// Both ends stop rather than wrapping, and report no change.
+    #[test]
+    fn the_selection_stops_at_both_ends() {
+        let mut s = ListState { selected: Some(2), offset: 0 };
+        assert!(!s.down(3), "the selection moved past the last row");
+        s.selected = Some(0);
+        assert!(!s.up(), "the selection moved above the first row");
+        let mut empty = ListState::default();
+        assert!(!empty.up());
+        assert_eq!(empty.selected, None);
+    }
+
+    /// Enter and Escape belong to whatever owns the list.
+    #[test]
+    fn declines_the_keys_that_belong_above_it() {
+        for key in [28u16, 1, 15] {
+            let mut s = ListState { selected: Some(1), offset: 0 };
+            assert!(!s.apply(key, 4), "keycode {key} was claimed by the list");
+            assert_eq!(s.selected, Some(1));
+        }
+        let mut s = ListState { selected: Some(1), offset: 0 };
+        assert!(s.apply(108, 4), "Down was not claimed");
+        assert_eq!(s.selected, Some(2));
+    }
+
+    /// The selected row paints differently, or selection is invisible.
+    #[test]
+    fn the_selected_row_is_painted_differently() {
+        let data = [(1u64, "a"), (2, "b")];
+        let p = Palette::default();
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, &p);
+        let faces = row_faces(&e);
+        assert_eq!(faces.len(), 2);
+        assert_ne!(faces[0], faces[1], "the selected row looks like the others");
+        assert_eq!(faces[1], p.face_hover, "the selected row is not the selected colour");
+    }
+
+    /// A scrollbar that is always there wastes width; one that never appears strands rows.
+    #[test]
+    fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
+        let p = Palette::default();
+        let few = [(1u64, "a"), (2, "b")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&few), ListState::default(), 100, 20, |k| k, &p);
+        assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
+        let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&many), ListState::default(), 100, 20, |k| k, &p);
+        assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
+    }
+
+    /// Each row's activation message carries that row's key.
+    #[test]
+    fn a_rows_message_carries_its_own_key() {
+        let data = [(11u64, "a"), (22, "b")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState::default(), 100, 20, |k| k, &Palette::default());
+        assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
+    }
+
+    /// Zero row height must not divide by zero.
+    #[test]
+    fn a_degenerate_row_height_is_not_a_division() {
+        let data = [(1u64, "a")];
+        let (e, _): (Element<u64>, _) =
+            list_view(&rows(&data), ListState::default(), 100, 0, |k| k, &Palette::default());
+        assert_eq!(keys(&e).len(), 0);
+    }
+
+    fn walk<Msg>(e: &Element<Msg>, f: &mut impl FnMut(&Element<Msg>)) {
+        f(e);
+        for c in e.children() {
+            walk(c, f);
+        }
+    }
+
+    fn keys<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<u64> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if let Some(k) = n.key {
+                out.push(k);
+            }
+        });
+        out
+    }
+
+    fn presses(e: &Element<u64>) -> alloc::vec::Vec<u64> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if let Some(m) = n.on_press {
+                out.push(m);
+            }
+        });
+        out
+    }
+
+    fn row_faces<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Rgb> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if n.key.is_none() {
+                return;
+            }
+            let mut first = None;
+            walk(n, &mut |c| {
+                if first.is_none() {
+                    if let Node::Fill(rgb) = &c.node {
+                        first = Some(*rgb);
+                    }
+                }
+            });
+            if let Some(rgb) = first {
+                out.push(rgb);
+            }
+        });
+        out
+    }
+
+    fn has_row_node<Msg>(e: &Element<Msg>) -> bool {
+        let mut found = false;
+        walk(e, &mut |n| {
+            if matches!(n.node, Node::Row { .. }) {
+                found = true;
+            }
+        });
+        found
+    }
+}
+
+#[cfg(test)]
+mod text_field_tests {
+    use super::*;
+    use crate::element::Node;
+
+    /// Tab, Enter and Escape are the whole reason `on_key` returns an `Option`. A field that
+    /// claimed them would make traversal, submission and dismissal impossible from a focused
+    /// field — the exact failure `Element::on_key`'s doc names.
+    #[test]
+    fn declines_the_keys_that_belong_above_it() {
+        const KEY_TAB: u16 = 15;
+        const KEY_ENTER: u16 = 28;
+        const KEY_ESC: u16 = 1;
+        for key in [KEY_TAB, KEY_ENTER, KEY_ESC] {
+            let mut f = TextFieldState::with_text("abc");
+            assert!(!f.apply(key, 0), "keycode {key} was claimed by the field");
+            assert_eq!(f.text(), "abc", "keycode {key} changed the text");
+        }
+    }
+
+    /// Negative control for the test above: a key the field *does* claim must answer `true`,
+    /// or "declines everything" would pass it.
+    #[test]
+    fn claims_the_keys_it_handles() {
+        const KEY_A: u16 = 30;
+        let mut f = TextFieldState::new();
+        assert!(f.apply(KEY_A, 0), "a letter was not claimed");
+        assert_eq!(f.text(), "a");
+    }
+
+    /// Ctrl-C folds to `0x03` in the keymap because a terminal needs it to. A field that
+    /// inserted what `to_char` returned would put an unprintable byte in a password.
+    #[test]
+    fn control_characters_are_not_text() {
+        const KEY_C: u16 = 46;
+        let mut f = TextFieldState::new();
+        assert!(!f.apply(KEY_C, librsproto::surface::MOD_CTRL), "Ctrl-C was treated as text");
+        assert_eq!(f.text(), "");
+        // Negative control: the same key without Ctrl *is* text.
+        assert!(f.apply(KEY_C, 0));
+        assert_eq!(f.text(), "c");
+    }
+
+    /// The caret is a byte offset that must never land inside a character. Every mutation
+    /// keeps it on a boundary, and slicing at it is what would panic if one did not.
+    #[test]
+    fn the_caret_stays_on_character_boundaries() {
+        let mut f = TextFieldState::new();
+        f.insert('é'); // two bytes
+        f.insert('x');
+        assert_eq!(f.cursor(), 3);
+        assert!(f.left());
+        assert_eq!(f.cursor(), 2, "left stopped inside the two-byte character");
+        assert!(f.left());
+        assert_eq!(f.cursor(), 0);
+        assert!(!f.left(), "left at the start reported a move");
+        // Slicing at the cursor is what a caret-splitting render does; it panics off-boundary.
+        let _ = f.text().split_at(f.cursor());
+        assert!(f.right());
+        assert_eq!(f.cursor(), 2, "right stopped inside the two-byte character");
+    }
+
+    /// Backspace deletes a *character*, not a byte.
+    #[test]
+    fn backspace_removes_a_whole_character() {
+        let mut f = TextFieldState::with_text("aé");
+        assert!(f.backspace());
+        assert_eq!(f.text(), "a");
+        assert!(f.backspace());
+        assert_eq!(f.text(), "");
+        assert!(!f.backspace(), "backspace on an empty field reported a change");
+    }
+
+    /// `delete` is the other direction, and is the one an implementation is most likely to
+    /// omit or alias to backspace.
+    #[test]
+    fn delete_removes_forward_and_backspace_removes_back() {
+        let mut f = TextFieldState::with_text("abc");
+        f.home();
+        assert!(f.delete());
+        assert_eq!(f.text(), "bc", "delete removed the wrong side");
+        assert_eq!(f.cursor(), 0, "delete moved the caret");
+        assert!(!f.backspace(), "backspace at the start reported a change");
+        f.end();
+        assert!(!f.delete(), "delete at the end reported a change");
+    }
+
+    /// Home and End answer whether they moved, so a caller can skip a repaint. Pressing Home
+    /// twice must not report a change the second time.
+    #[test]
+    fn home_and_end_report_only_real_movement() {
+        let mut f = TextFieldState::with_text("abc");
+        assert!(f.home());
+        assert!(!f.home(), "Home at the start reported a move");
+        assert!(f.end());
+        assert!(!f.end(), "End at the end reported a move");
+    }
+
+    /// A mask must count characters. Repeating a byte would print three stars for a
+    /// two-character string containing one multi-byte character.
+    #[test]
+    fn masking_counts_characters_not_bytes() {
+        let f = TextFieldState::with_text("aé");
+        assert_eq!(f.text().len(), 3, "the fixture is not multi-byte");
+        let e: Element<()> = text_field(&f, true, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        assert_eq!(rendered(&e), "**", "the mask leaked the byte length");
+        // Negative control: unmasked shows the real text.
+        let e: Element<()> = text_field(&f, false, WidgetState::default(), &Palette::default());
+        assert_eq!(rendered(&e), "aé");
+    }
+
+    /// The caret is drawn from `active`, so a field in an unfocused window does not blink one.
+    #[test]
+    fn the_caret_appears_only_when_active() {
+        let f = TextFieldState::with_text("ab");
+        let active: Element<()> =
+            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        let idle: Element<()> = text_field(&f, false, WidgetState::default(), &Palette::default());
+        assert_eq!(row_children(&active), 3, "no caret between the two text runs");
+        assert_eq!(row_children(&idle), 2, "an inactive field drew a caret");
+    }
+
+    /// The split is *at the cursor*, which is what puts the caret in the middle of the text
+    /// rather than always at the end.
+    #[test]
+    fn the_caret_splits_the_text_at_the_cursor() {
+        let mut f = TextFieldState::with_text("abcd");
+        f.home();
+        f.right();
+        let e: Element<()> =
+            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        assert_eq!(runs(&e), alloc::vec!["a", "bcd"], "the caret was not placed at the cursor");
+    }
+
+    /// Every `Text` run in the tree, in order.
+    fn runs<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<alloc::string::String> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut out);
+        out
+    }
+
+    fn walk<Msg>(e: &Element<Msg>, out: &mut alloc::vec::Vec<alloc::string::String>) {
+        if let Node::Text(s) = &e.node {
+            out.push(s.clone());
+        }
+        for c in e.children() {
+            walk(c, out);
+        }
+    }
+
+    /// The concatenated text, which is what a reader of the field would see.
+    fn rendered<Msg>(e: &Element<Msg>) -> alloc::string::String {
+        runs(e).concat()
+    }
+
+    /// How many children the content `Row` has — two text runs, plus the caret when active.
+    fn row_children<Msg>(e: &Element<Msg>) -> usize {
+        fn find<Msg>(e: &Element<Msg>) -> Option<usize> {
+            if let Node::Row { children, .. } = &e.node {
+                return Some(children.len());
+            }
+            e.children().find_map(find)
+        }
+        find(e).expect("the field has a content row")
+    }
 }
 
 #[cfg(test)]

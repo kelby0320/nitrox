@@ -676,6 +676,7 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x0919` | `WindowDestroyed`| `MgrWindowRef`      | A window is gone (`other` unused, zero)        |
 | `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's committed rectangle changed — place *or* commit |
 | `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
+| `0x091C` | `WindowTitle`    | window id + UTF-8   | A window's title changed — see *Titles* below  |
 
 `WindowCreated` fires when the window is created, **before** its client has committed anything
 — that is what lets a manager place a window before it is first seen.
@@ -700,14 +701,34 @@ remove.
 `WindowFocus` reports both halves of a transition: the window losing focus, then the window
 gaining it. Either may be absent — nothing had focus, or nothing takes it.
 
-## Reserved, not yet implemented
+## Titles, and the one variable-length body
 
-`SetTitle` (`0x0909`) and the manager event op `0x091C` (`WindowTitle`) are
-defined in `librsproto` and **not implemented by the compositor**. They are M6 Part B3b, which
-is open: a title needs a client-facing op to set one and a variable-length body to carry it,
-neither of which the four events above needed. Nothing sends or receives them today; the
-encodings are declared so B3b does not have to renumber, and this section exists so a second
-implementation does not read them as live.
+`SetTitle` (`0x0909`, client → server) and `WindowTitle` (`0x091C`, server → manager) are
+**built as of M7 Part A**, closing what M6 Part B3 split off. They share the protocol's first
+variable-length Surface record:
+
+| Field | Bytes | Notes |
+|---|---|---|
+| `window` | 4, little-endian | which window |
+| `title` | the rest of the body | UTF-8, at most `MAX_TITLE` = 256 bytes |
+
+**There is no length field.** The body's own length gives the title's, because a Surface body
+arrives inside a message that already carries one; a second length would be a way for the two
+to disagree.
+
+**Over-length is truncated on a character boundary, not refused.** `SetTitle` is silent on
+success and has no reply a client reads, so refusing would need an error path built for the op
+that was specified not to have one — and a dropped tail on a title is benign in a way a
+dropped message is not. The boundary is the part that matters: cutting at 256 *bytes* can land
+inside a multi-byte character, which would leave the title not UTF-8 at all, so a cap meant to
+bound memory would corrupt the string it bounds. The compositor logs the first truncation and
+then stays quiet.
+
+A body that is not UTF-8, or too short to hold a window id, is `Malformed`. Renaming another
+connection's window is `NotFound` — the same answer as a window that never existed, so a reply
+cannot be used to probe for other clients' ids. Re-setting an unchanged title produces no
+manager event, because the manager queue is bounded and a client that sets its title every
+frame would otherwise push older events out of it.
 
 ## See also
 

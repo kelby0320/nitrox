@@ -837,21 +837,21 @@ pub const OP_MGR_WINDOW_GEOMETRY: u16 = 0x091A;
 pub const OP_MGR_WINDOW_FOCUS: u16 = 0x091B;
 /// `Manage::WindowTitle` — server → manager: this window's title changed.
 ///
-/// **Reserved: encoding defined, not implemented — `TODO(m6-b3b-titles)`.** It and
-/// [`OP_SET_TITLE`] are the title half of Part B3, which needs a client-facing op and a
-/// variable-length body; the four lifecycle events above are built. Declared so the title
-/// work does not renumber.
+/// Body: [`title`] — a window id then UTF-8 bytes. Sent when a client names its window with
+/// [`OP_SET_TITLE`], which is the only way a title changes. Built in M7 Part A, closing the
+/// `m6-b3b-titles` deferral; the four lifecycle events above shipped in M6 B3.
 pub const OP_MGR_WINDOW_TITLE: u16 = 0x091C;
 
-/// `Surface::SetTitle` — a client naming its own window. **Reserved: not implemented.** No
-/// client sends it and the compositor does not answer it. Would be client → server, silent on
-/// success.
+/// `Surface::SetTitle` — a client naming its own window. Client → server, **silent on
+/// success**; a malformed body gets the usual error reply.
 ///
-/// Body: the window id, then UTF-8 bytes, up to [`MAX_TITLE`]. A title is the one piece of a
-/// window a *manager* needs and only the *client* knows.
+/// Body: [`title`] — the window id, then UTF-8 bytes. Longer than [`MAX_TITLE`] is truncated
+/// on a character boundary rather than refused, for the reason
+/// [`title::truncate_title`] gives. A title is the one piece of a window a *manager* needs
+/// and only the *client* knows.
 pub const OP_SET_TITLE: u16 = 0x0909;
 
-/// The longest window title accepted, in bytes. **Reserved** with [`OP_SET_TITLE`].
+/// The longest window title accepted, in bytes.
 ///
 /// Bounded at the protocol edge for the reason [`MAX_STRUT_RESERVE`] is: it arrives off the wire
 /// from a client, it is stored per window for the compositor's life, and a manager forwarding it
@@ -911,6 +911,76 @@ pub struct MgrWindowRef {
 }
 
 const _: () = assert!(core::mem::size_of::<MgrWindowRef>() == 8);
+
+/// The **first variable-length Surface record**, shared by [`OP_SET_TITLE`] (client → server)
+/// and [`OP_MGR_WINDOW_TITLE`] (server → manager).
+///
+/// Layout: a 4-byte little-endian window id, then the title's UTF-8 bytes, **and nothing
+/// else**. There is no length field: the body's own length gives it, because a Surface body
+/// arrives inside a message that already carries one. Adding a second length would create two
+/// sources of truth for the same number and a way for them to disagree.
+///
+/// This is the wire-format question the `m6-b3b-titles` deferral split off from M6 B3 — "a
+/// length convention, a cap, and a decision about what a client sending 64 KiB of title gets
+/// back".
+/// The convention is above, the cap is [`MAX_TITLE`], and the answer to the third is
+/// [`truncate_title`].
+pub mod title {
+    use super::MAX_TITLE;
+
+    /// Parse a title record into `(window, title)`.
+    ///
+    /// `None` on a body too short to hold a window id, or one whose title is not UTF-8 — a
+    /// title is displayed, so a client that sends bytes nobody can render is malformed rather
+    /// than merely unlucky. The returned title is **not** truncated; that is
+    /// [`truncate_title`]'s job at the point of storage, so a parser stays a parser.
+    pub fn read(b: &[u8]) -> Option<(u32, &str)> {
+        if b.len() < 4 {
+            return None;
+        }
+        let window = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let title = core::str::from_utf8(&b[4..]).ok()?;
+        Some((window, title))
+    }
+
+    /// Serialise `(window, title)`. `None` if `out` cannot hold it.
+    ///
+    /// The caller is expected to have passed `title` through [`truncate_title`] already; this
+    /// does not silently shorten, because a writer that truncates hides the one place the
+    /// decision should be visible.
+    pub fn write(window: u32, title: &str, out: &mut [u8]) -> Option<usize> {
+        let n = 4 + title.len();
+        if out.len() < n {
+            return None;
+        }
+        out[0..4].copy_from_slice(&window.to_le_bytes());
+        out[4..n].copy_from_slice(title.as_bytes());
+        Some(n)
+    }
+
+    /// The longest prefix of `title` that fits in [`MAX_TITLE`] bytes, **cut on a character
+    /// boundary**.
+    ///
+    /// **Truncate rather than reject**, decided 2026-08-25. [`OP_SET_TITLE`] is silent on
+    /// success and has no reply a client reads, so rejecting would need an error path built
+    /// for the one op that was specified not to have one — and a dropped tail on a title is
+    /// benign in a way a dropped message is not. Every windowing system in use does the same.
+    ///
+    /// **On a character boundary**, which is the part that is easy to get wrong: slicing at
+    /// `MAX_TITLE` bytes can land inside a multi-byte character, and the result is not UTF-8
+    /// at all — so a cap meant to bound memory would instead corrupt the string, and a
+    /// manager decoding it would see a malformed record rather than a shortened title.
+    pub fn truncate_title(title: &str) -> &str {
+        if title.len() <= MAX_TITLE {
+            return title;
+        }
+        let mut end = MAX_TITLE;
+        while end > 0 && !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        &title[..end]
+    }
+}
 
 impl MgrWindowRef {
     /// Serialise into exactly 8 little-endian bytes.
@@ -1630,5 +1700,101 @@ mod tests {
         let mut small = [0u8; 4];
         let req = CreateWindowRequest::new(1, 1, Role::Normal);
         assert!(build_create_window_request(&mut small, &req).is_none());
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::title::{read, truncate_title, write};
+    use super::MAX_TITLE;
+
+    /// The body's own length carries the title's, so a round trip must not need a length field.
+    #[test]
+    fn a_title_round_trips_without_a_length_field() {
+        let mut buf = [0u8; 4 + MAX_TITLE];
+        let n = write(7, "nxterm", &mut buf).expect("fits");
+        assert_eq!(n, 4 + 6);
+        assert_eq!(read(&buf[..n]), Some((7, "nxterm")));
+    }
+
+    /// An empty title is a title — a client clearing its name, not a malformed record.
+    #[test]
+    fn an_empty_title_is_valid() {
+        let mut buf = [0u8; 8];
+        let n = write(3, "", &mut buf).expect("fits");
+        assert_eq!(n, 4);
+        assert_eq!(read(&buf[..n]), Some((3, "")));
+    }
+
+    /// Fewer than four bytes cannot name a window.
+    #[test]
+    fn a_body_too_short_for_a_window_id_is_refused() {
+        for len in 0..4 {
+            assert_eq!(read(&[0u8; 3][..len]), None, "a {len}-byte body parsed");
+        }
+    }
+
+    /// A title is displayed, so bytes nobody can render are malformed rather than unlucky.
+    #[test]
+    fn a_title_that_is_not_utf8_is_refused() {
+        let body = [1u8, 0, 0, 0, 0xFF, 0xFE];
+        assert_eq!(read(&body), None);
+    }
+
+    /// The whole point of the cap: slicing at `MAX_TITLE` bytes can land inside a character,
+    /// and the result would not be UTF-8 at all — a cap meant to bound memory corrupting the
+    /// string it bounds.
+    #[test]
+    fn truncation_cuts_on_a_character_boundary() {
+        // **The fixture is offset by one byte on purpose.** 'é' is two bytes (0xC3 0xA9), so a
+        // string of nothing but 'é' has a boundary at byte 256 and a naive `&s[..MAX_TITLE]`
+        // would pass this test — which is what a first version of it did, caught by running
+        // the control. One leading ASCII byte puts every boundary at an odd offset, so the
+        // cap lands *inside* a character and the walk back is the only thing that can work.
+        let mut raw = [0u8; 259];
+        raw[0] = b'a';
+        for pair in raw[1..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&[0xC3, 0xA9]);
+        }
+        let s = core::str::from_utf8(&raw).expect("the fixture is valid UTF-8");
+        assert_eq!(s.len(), 259);
+        assert!(!s.is_char_boundary(MAX_TITLE), "the fixture does not straddle the cap");
+        let kept = truncate_title(s);
+        assert!(kept.len() <= MAX_TITLE, "the cap was exceeded");
+        assert_eq!(kept.len(), 255, "the straddling character was not dropped whole");
+        // It is still a string: the bug this guards would make this line fail to even exist.
+        assert!(core::str::from_utf8(kept.as_bytes()).is_ok());
+    }
+
+    /// Where the cap falls mid-character, the character goes rather than being split.
+    #[test]
+    fn a_character_straddling_the_cap_is_dropped_whole() {
+        // 255 ASCII bytes, then a two-byte character straddling byte 256.
+        let mut raw = [b'a'; 257];
+        raw[255] = 0xC3;
+        raw[256] = 0xA9;
+        let s = core::str::from_utf8(&raw).expect("the fixture is valid UTF-8");
+        assert_eq!(s.len(), 257);
+        let kept = truncate_title(s);
+        assert_eq!(kept.len(), 255, "the straddling character was split at the cap");
+        assert!(kept.ends_with('a'));
+    }
+
+    /// A title that fits is returned untouched — the negative control for the two above.
+    #[test]
+    fn a_title_within_the_cap_is_not_touched() {
+        let s = "a normal window title";
+        assert_eq!(truncate_title(s), s);
+        let raw = [b'a'; MAX_TITLE];
+        let exact = core::str::from_utf8(&raw).expect("ASCII");
+        assert_eq!(truncate_title(exact).len(), MAX_TITLE, "an exactly-sized title was cut");
+    }
+
+    /// `write` refuses a buffer it would overrun rather than shortening silently.
+    #[test]
+    fn write_refuses_a_buffer_it_would_overrun() {
+        let mut small = [0u8; 8];
+        assert_eq!(write(1, "abcdef", &mut small), None);
+        assert_eq!(write(1, "abcd", &mut small), Some(8));
     }
 }
