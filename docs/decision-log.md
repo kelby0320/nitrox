@@ -17612,3 +17612,55 @@ not. User stacks are **8 MiB** with a 1 MiB guard, so it never was. And the alar
 outbox overflow, discarded …` lines in the failing transcript, which appear identically in
 passing runs and discriminate nothing; I had read them as evidence because they looked alarming.
 Both were disposed of by controls rather than by argument.
+
+## 2026-08-25 — M7 Part A: two widgets whose shape the toolkit had already decided
+
+Milestone 7's first part builds the three things every later part draws with. Two of the three
+decisions were made for me by code that already existed, which is the more interesting half.
+
+**`Element::on_key` is a function pointer, not a closure.** So a widget cannot close over
+anything to mutate, and a text field cannot be a self-contained editor: the state is the
+application's and the widget is a pure function of it. That is the same shape as every other
+widget here, where "hovered" is state the caller passes in — so the toolkit's existing design
+settled it rather than a preference. `TextFieldState` and `ListState` carry the editing rules
+next to the widget, because `widget-toolkit.md` §3's "a widget is a function" does not say
+where the *rules* live, and putting them in each caller is how two implementations of Home and
+End come to exist.
+
+**`Element::key` already existed for exactly this.** Its doc says dynamic lists "must set it,
+or the diff pairs row 2's widget with row 3's element" — which is the model-backed list's whole
+requirement, so `list_view` works with the diff rather than around it. Only the rows that fit
+become elements; a hundred windows cost as many as fit on screen.
+
+**Designed against two callers, and they stressed opposite halves.** The plan says a model API
+drawn for a single consumer is the failure `desktop-shell.md` §5 was avoiding, and that turned
+out to be concrete rather than cautionary: a window list is **reordered in place**, which
+stresses the keying — keying by index instead of by window id fails the reorder test — while a
+launcher's results are **replaced wholesale on every keystroke**, which stresses selection and
+scroll surviving a length change. Select row 19 of 20, type one more character, three results
+remain: a stale offset renders blank while holding rows. Neither caller would have surfaced the
+other's bug.
+
+**Titles: the protocol's first variable-length Surface record**, closing `m6-b3b-titles` — the
+deferral M6 B3 split off precisely because it needed "a length convention, a cap, and a
+decision about what a client sending 64 KiB of title gets back". No length field, because the
+body arrives inside a message that already carries one and a second is only a way for the two
+to disagree. Truncate on a character boundary rather than refuse, decided with the maintainer:
+`SetTitle` is silent on success and has no reply a client reads, so refusing would need an
+error path built for the one op specified not to have one.
+
+**The boundary is the load-bearing half, and running its control found a test of mine that was
+decoration.** Cutting at 256 *bytes* can land inside a character, leaving the title not UTF-8
+at all — a cap meant to bound memory corrupting the string it bounds. The first boundary test
+used a string of nothing but `é`, where byte 256 *is* a boundary, so it passed against a naive
+`&s[..MAX_TITLE]`. One leading ASCII byte puts every boundary at an odd offset, and both
+boundary tests now fail against the naive slice.
+
+**The reference render's height went 160 → 260, and where the widgets sit is the reason.**
+`ui-testclient` stacks the three reference windows at the origin largest-first, so the
+terminal's 180×96 covers the toolkit window's top-left and the display gate excludes that
+region. A widget added at the top of the column would be compared over a few columns of its
+right-hand edge and nowhere else. Below y=96 it is wholly visible — confirmed rather than
+assumed by corrupting the host's expectation at y=210 and watching the gate report 20 differing
+pixels at (20,210).
+

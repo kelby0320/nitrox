@@ -54,16 +54,26 @@ use libdraw::text::Font;
 use crate::element::{Edge, Element, Insets, custom, docked, dock, padding, text};
 use crate::layout::layout;
 use crate::paint::{FontMetrics, Theme, paint};
-use crate::widget::{Palette, ScrollState, WidgetState, button, menu_bar, scrollbar};
+use crate::widget::{
+    ListRow, ListState, Palette, ScrollState, TextFieldState, WidgetState, button, list_view,
+    menu_bar, scrollbar, text_field,
+};
 
 /// The reference UI's width, in pixels.
 pub const WIDTH: u32 = 320;
 /// The reference UI's height, in pixels.
 ///
-/// Tall enough that the flexed custom node gets real space after the two labels and the
-/// button have taken their measured heights. At 120 it was squeezed to nothing, the callback
-/// drew zero pixels, and every other assertion here still passed.
-pub const HEIGHT: u32 = 160;
+/// Tall enough that the flexed custom node gets real space after the measured widgets have
+/// taken theirs. At 120 it was squeezed to nothing, the callback drew zero pixels, and every
+/// other assertion here still passed.
+///
+/// **Raised from 160 to 260 in M7 Part A**, for the text field and the list. The extra height
+/// is not decoration: `ui-testclient` stacks the three reference windows at the origin
+/// largest-first, so the terminal's 180×96 covers this window's top-left corner and the
+/// display gate excludes that region. Anything added at the top of the column would be
+/// compared over a few columns of its right-hand edge and nowhere else. Below y=96 the whole
+/// widget is visible, which is what makes the gate a check on how they draw.
+pub const HEIGHT: u32 = 260;
 /// The reference UI's stride, in bytes.
 ///
 /// **Not** `WIDTH × 4` (1280): the extra 12 bytes are three pixels of row padding, for the
@@ -95,7 +105,29 @@ pub enum Msg {
     Edit,
     /// The button.
     Run,
+    /// A list row was activated. Carries the row's key.
+    Row(u64),
 }
+
+/// The rows the reference list holds.
+///
+/// **More than fit**, so the list draws its scrollbar and leaves rows unbuilt — the two things
+/// that distinguish it from a column of labels. Keys are deliberately not `0..n`, so a render
+/// that keyed by index would still look right here and a *diff* test elsewhere would catch it;
+/// this gate is about pixels.
+const ROWS: [ListRow<'static>; 6] = [
+    ListRow { key: 41, label: "alpha" },
+    ListRow { key: 42, label: "beta" },
+    ListRow { key: 43, label: "gamma" },
+    ListRow { key: 44, label: "delta" },
+    ListRow { key: 45, label: "epsilon" },
+    ListRow { key: 46, label: "zeta" },
+];
+
+/// How tall each list row is, and how tall the list is — three rows of six visible.
+const ROW_H: u32 = 20;
+/// See [`ROW_H`].
+const LIST_H: u32 = 60;
 
 /// The reference UI's element tree.
 ///
@@ -131,9 +163,36 @@ pub fn view() -> Element<Msg> {
                 button("Run", Msg::Run, WidgetState { active: true, ..Default::default() }, &palette)
                     .flex(0),
                 custom(CUSTOM_KIND, Size::new(64, 24)).flex(1),
+                // **Masked, with the caret mid-string.** Both are things a field can get
+                // wrong in a way only a picture shows: a mask built per byte would draw the
+                // wrong number of stars, and a caret drawn at the end rather than at the
+                // cursor would look plausible in isolation. `active` so the ring and the
+                // caret are drawn at all.
+                text_field(&reference_field(), true, WidgetState { active: true, ..Default::default() }, &palette),
+                // **Selected row 1, scrolled to 0**, so the highlight is visible and is not
+                // the first row — a list that painted every row the selected colour, or that
+                // always highlighted row 0, would both pass a picture that chose either.
+                reference_list(&palette),
             ]),
         ),
     )
+}
+
+/// The field the reference UI draws: masked, with the caret two characters from the end.
+fn reference_field() -> TextFieldState {
+    let mut f = TextFieldState::with_text("passw");
+    f.left();
+    f.left();
+    f
+}
+
+/// The list the reference UI draws, dropping the state it scrolls to.
+fn reference_list(palette: &Palette) -> Element<Msg> {
+    let state = ListState { selected: Some(1), offset: 0 };
+    let (e, _) = list_view(&ROWS, state, LIST_H, ROW_H, Msg::Row, palette);
+    // Fixed height: the list is the last thing in the column and would otherwise take
+    // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
+    crate::element::sized(Size::new(0, LIST_H), e)
 }
 
 /// Paint the custom node: a pattern varying along both axes, clipped to `clip`.

@@ -1608,12 +1608,12 @@ and mints a session; `/dev/draw/manage` is not a component-boundary prefix match
 binding, so it resolves to nothing. Part E, and the caveat that decides how long it lasts is
 there too.
 
-### Part A — the two widgets, and window titles
+### Part A — the two widgets, and window titles ✅ complete (2026-08-25)
 
 The three things every later part draws with, none of which exist. Gated on the host and through
 `check-display` before anything new spawns.
 
-- [ ] **A single-line text field**, with a masked mode. The greeter needs it for a password and
+- [x] **A single-line text field**, with a masked mode ✅ (2026-08-25). The greeter needs it for a password and
       the applications modal needs it for a search; `widget-toolkit.md` §8 says the **text
       area** is deliberately absent and that it "returns when something needs it — plausibly the
       file browser or a *find* box". This is that trigger, arriving earlier and narrower: a
@@ -1624,20 +1624,20 @@ The three things every later part draws with, none of which exist. Gated on the 
       traversal, and `on_key` returning `Option<Msg>` **specifically** so a focused field cannot
       swallow a menu accelerator. The plumbing is there and unexercised.
 
-- [ ] **A model-backed list view.** The window list, the launcher results and (in M8) the desktop
+- [x] **A model-backed list view** ✅ (2026-08-25). The window list, the launcher results and (in M8) the desktop
       previews are `desktop-shell.md` §2's churn, and §5's answer to the toolkit question is one
       widget covering all three rather than a diffing engine. **Design it against two callers,
       not one** — a list of windows and a filtered list of programs — because a model API drawn
       for a single consumer is the failure mode §5 was avoiding.
 
-- [ ] **Window titles — `TODO(m6-b3b-titles)` closes here.** `Surface::SetTitle` (`0x0909`) and
+- [x] **Window titles ✅ (2026-08-25)** — the `m6-b3b-titles` deferral closed here. `Surface::SetTitle` (`0x0909`) and
       `WindowTitle` (`0x091C`) are declared in `librsproto` and unimplemented; the deferral's own
       trigger is "the desktop shell (M7) drawing a window list", and a window list without titles
       is a row of blanks. This brings the wire-format question the deferral split off: the
       **first variable-length Surface record**, so a length convention, a cap, and a stated answer
       for a client that sends 64 KiB of title.
 
-- [ ] **`check-display`'s reference render covers both widgets.** They are the first widgets since
+- [x] **`check-display`'s reference render covers both widgets** ✅ (2026-08-25). They are the first widgets since
       M4 and the gate is how a widget is known to draw what it claims.
 
 ### Part B — the shared session core
