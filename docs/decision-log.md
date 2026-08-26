@@ -18273,3 +18273,59 @@ requests down `/dev/draw/manage` and reads each back through `/dev/draw/<id>/inf
 isolation, and unreachable on the path a client actually uses. Negative-controlled by making
 `dispatch` answer `Ok` and change nothing: the gate times out, which is PR #216's rule that a
 reply says the compositor answered and not that anything happened.
+
+## 2026-08-26 — PR #240 review: a grab taken away, and the three things nobody was told
+
+Part A dropped the pointer grab when a window left the screen, which fixed the bug PR #239's
+review predicted — and the block that did it had three defects of its own, all found by probes
+run against the branch rather than by reading it.
+
+**A leave derived from state already cleared can never be emitted.** The block set
+`inside = None` and *then* called `update_crossing`, which derives the leave **from** `inside`.
+So the router had forgotten who was owed one and emitted the enter alone: a client whose window
+was minimized under the cursor kept its hover state indefinitely, because nothing else would ever
+tell it. The leave is emitted explicitly now, **before** the id is forgotten, and the two cases
+are finally distinguished — a *destroyed* window is unreachable and its id is simply dropped, a
+window that is merely off screen is still in the stack, still has a client, and is told.
+
+**The tail of a broken sequence was handed to whoever was underneath.** With the grab cleared,
+`target` falls through to `hit`, so the event that provoked the reconciliation went to the window
+below — a release for a press it never saw. Both halves are what the grab exists to prevent, and
+`widget-toolkit.md` states the rule directly: a drag that ends outside a scrollbar must still
+deliver the release, or the scrollbar believes it is being dragged forever. The departing window
+now receives **the release that closes the sequence it was granted, then a leave**, and nothing is
+delivered to anyone until every button comes up.
+
+That release is the interesting call. A window that is off screen must not receive pointer input
+— except this is not input *to* it, it is the close of a sequence granted while it was on screen,
+which is the same reason a grab delivers outside the window's own bounds at all. Withholding it
+leaves a `libui` client holding a `capture` that only a release clears, so the next press after
+the window returns routes to the stale widget rather than the one clicked.
+
+**And the flag had to be set unconditionally, not from the button mask.** The first fix wrote
+`grab_broken = self.buttons != 0`, which reads zero exactly when the provoking event *is* the
+release — precisely the case the flag exists for. That was caught by the test written for the
+defect failing, not by review.
+
+**The block ran before the state mirror, so every record it emitted was stamped with the previous
+event's `buttons` and `modifiers`.** A release ending a shift-drag produced a leave saying shift
+was still held beside a button record saying it was not, breaking the invariant the mirror's own
+comment states: every record in one batch carries the same answer. Reconciliation moved after it.
+
+**The spec claimed parity with `Dropped` that the code never had** — "the crossing state
+re-derived, exactly as it is when input is dropped". On `Dropped`, `inside` is intact and the
+paired leave and enter both go out; here the leave half was structurally unreachable. The spec now
+describes the actual sequence, including that crossings stay suppressed until the buttons come up
+and that a destroyed window receives none of it.
+
+**`Applied { window: 0 }` became `Option<u32>`.** The sentinel was provably safe — `next_id` starts
+at 1, so `release_configure` could never match — but it made a runtime invariant of `WindowStack`
+load-bearing for a decision two modules away with nothing enforcing the connection. The type says
+it now.
+
+Also from the review: an assertion using `unwrap_or(false)` that would have passed on `Err`;
+`info()`'s two new fields, which no host test pinned (deleting either passed 126/126 and only the
+guest gate caught it); and `work_area`, which is a fourth site asking a visibility question and
+deliberately answers it differently — a bar that is minimized or on another desktop is a bar that
+is coming back, and a work area that grew while it was away would relayout every maximised window
+twice per desktop switch. That is now written down where the next reader will look.

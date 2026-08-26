@@ -714,11 +714,29 @@ compositor rather than a condition repeated at each site, because they are alrea
 compositing, by focus, and by hit-testing, and a fourth site is exactly how a window becomes
 invisible-but-clickable.
 
-**A window that stops being on screen loses the pointer grab.** A press grabs, and every
-pointer event up to the matching release goes to the grabbed window even after the cursor
-leaves it — so without this, minimizing or switching away from a window mid-drag keeps
-delivering motion and the release to a window that is not on screen. The grab is dropped and
-the crossing state re-derived, exactly as it is when input is dropped.
+**A window that stops being on screen loses the pointer grab, and is told.** A press grabs,
+and every pointer event up to the matching release goes to the grabbed window even after the
+cursor leaves it — so without this, minimizing or switching away from a window mid-drag keeps
+delivering motion and the release to a window that is not on screen.
+
+What the departing window receives, in this order:
+
+1. **A `PointerEvent` of kind `POINTER_BUTTON` with `POINTER_PRESSED` clear** — the release
+   that closes the sequence, naming the button that opened the grab. The grab exists so a press
+   and its release reach one window even when the cursor leaves it; the window going off screen
+   ends the grab, and this is the last thing the compositor owes it. A client left holding a
+   pointer capture that only a release clears would act on the next press with stale state.
+2. **`POINTER_LEAVE`**, if the cursor was inside it.
+
+Then **nothing at all until every button comes up**: the tail of that sequence is not delivered
+to whatever is underneath, which would be a release for a press that window never saw. Crossing
+events stay suppressed for the same span, exactly as they are during an ordinary drag — a button
+is still down, and walking enters and leaves across the windows the cursor passes would announce
+a pointer nobody can act on. When the last button is released, input resumes and the window under
+the cursor is entered normally.
+
+A window that has been **destroyed** gets none of this: it is unreachable, so its id is simply
+forgotten. The suppression above still applies, because the sequence has still lost its owner.
 
 ## Manager events (`0x0918`–`0x091C`)
 

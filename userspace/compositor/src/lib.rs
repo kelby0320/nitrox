@@ -35,6 +35,7 @@ use libdraw::framebuffer::{Framebuffer, Geometry};
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, STICKY_DESKTOP,
+    WINDOW_FLAG_MINIMIZED,
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
@@ -802,6 +803,16 @@ impl WindowStack {
     ///
     /// Over-reservation is clamped rather than allowed to invert the rectangle: panels
     /// claiming more than the screen leave an empty work area, not a negative one.
+    ///
+    /// **It counts every panel, including ones that are not on screen — deliberately, and this
+    /// is the one place that question is answered differently from
+    /// [`visible_on`](Window::visible_on).** The declared-not-derived rule above was written
+    /// against the fullscreen case, where the panel is still on its desktop and still wants its
+    /// space. M8 Part A added two more ways to be off screen, and neither changes the answer:
+    /// a bar minimized or sitting on another desktop is a bar that is coming back, and a work
+    /// area that grew while it was away would relayout every maximised window twice per desktop
+    /// switch. A panel that should stop reserving is destroyed, not hidden (PR #240 review,
+    /// optional 5).
     pub fn work_area(&self, screen: Rect) -> Rect {
         let (mut top, mut bottom, mut left, mut right) = (0u32, 0u32, 0u32, 0u32);
         for w in &self.windows {
@@ -2074,7 +2085,7 @@ mod tests {
         assert!(s.set_window_desktop(w, 2).unwrap(), "leaving the current desktop is visible");
         assert!(!s.set_window_desktop(w, 3).unwrap(), "2 -> 3 changes nothing on screen");
         assert!(!s.set_minimized(w, true).unwrap(), "already hidden");
-        assert!(s.set_window_desktop(w, 1).unwrap_or(false) == false, "still minimized: no change");
+        assert!(!s.set_window_desktop(w, 1).unwrap(), "still minimized: no change");
         assert!(s.set_minimized(w, false).unwrap(), "back on desktop 1 and un-minimized");
     }
 
@@ -2211,6 +2222,26 @@ mod tests {
         assert_eq!(fb.get_pixel(0, 7), Some(row_colour(15)), "and the last row it has");
         // Past the popup's extent (it ends at 8,8) the background shows through.
         assert_eq!(fb.get_pixel(9, 9), Some(Rgb::new(0, 0, 0)), "nothing beyond it");
+    }
+
+    #[test]
+    fn info_publishes_the_desktop_and_the_minimized_bit() {
+        // Deleting either line in `info()` passed every host test until this one existed —
+        // only the guest gate caught it, and a host test is cheaper than a boot
+        // (PR #240 review, optional 4).
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert_eq!(s.info(w).unwrap().desktop, 1, "created onto the current desktop");
+        assert_eq!(s.info(w).unwrap().flags & WINDOW_FLAG_MINIMIZED, 0);
+
+        s.set_window_desktop(w, 4).unwrap();
+        s.set_minimized(w, true).unwrap();
+        let info = s.info(w).unwrap();
+        assert_eq!(info.desktop, 4, "the attribute a manager set is what `info` publishes");
+        assert_ne!(info.flags & WINDOW_FLAG_MINIMIZED, 0, "and the minimized bit is set");
+
+        s.set_minimized(w, false).unwrap();
+        assert_eq!(s.info(w).unwrap().flags & WINDOW_FLAG_MINIMIZED, 0, "and cleared again");
     }
 
     #[test]

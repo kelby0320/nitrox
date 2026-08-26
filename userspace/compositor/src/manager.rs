@@ -37,13 +37,20 @@ pub enum MgrOutcome {
     /// pixels change depends on every overlap in the stack, and computing that exactly would be a
     /// second compositor.
     Applied {
-        /// The window the request named.
+        /// The window the request named, or `None` for a request that names none.
         ///
         /// Carried rather than left for the caller to re-decode: acting on a window is what
         /// releases its held initial `Configure` (M6 B4), and reading the id back out of the
         /// request body would depend on every manager op happening to put it at offset 0 —
         /// true today, and exactly the kind of coincidence that stops being true quietly.
-        window: u32,
+        ///
+        /// **`Option`, not a zero sentinel.** `SetCurrentDesktop` is the first manager request
+        /// that names no window, and it first shipped as `window: 0` on the argument that zero
+        /// is never a window id, so the caller's lookup finds nothing. True — and it makes a
+        /// runtime invariant of `WindowStack::next_id` load-bearing for a *release-the-held-
+        /// configure* decision two modules away, with nothing enforcing the connection. The
+        /// type says it instead (PR #240 review, answer 4).
+        window: Option<u32>,
         /// The region this request changed, or `None` for "repaint everything".
         dirty: Option<Rect>,
     },
@@ -88,7 +95,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.place(req.window, Point::new(req.x, req.y)) {
-                Ok(d) => MgrOutcome::Applied { window: req.window, dirty: Some(d.rect()) },
+                Ok(d) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(d.rect()) },
                 Err(e) => refused(e),
             }
         }
@@ -111,7 +118,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // **A restack repaints everything.** Which pixels change depends on every
                 // overlap in the stack; deriving the exact region would be a second compositor,
                 // and a restack is a user-scale event rather than a per-frame one.
-                Ok(()) => MgrOutcome::Applied { window: req.window, dirty: None },
+                Ok(()) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
                 Err(e) => refused(e),
             }
         }
@@ -146,9 +153,9 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // minimizing one that is already hidden — changes nothing on screen, and a full
                 // repaint per such request would make a shell that tidies windows in the
                 // background repaint the screen for each one.
-                Ok(true) => MgrOutcome::Applied { window: req.window, dirty: None },
+                Ok(true) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
                 Ok(false) => {
-                    MgrOutcome::Applied { window: req.window, dirty: Some(Rect::new(0, 0, 0, 0)) }
+                    MgrOutcome::Applied { window: Some(req.window), dirty: Some(Rect::new(0, 0, 0, 0)) }
                 }
                 Err(e) => refused(e),
             }
@@ -158,15 +165,12 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.set_current_desktop(req.desktop) {
-                // **`window: 0`, which is no window.** Every other manager request names one and
-                // `Applied.window` exists to release that window's held initial `Configure`;
-                // this request names none, so it releases none. Zero is never a window id —
-                // `WindowStack::new` starts `next_id` at 1 — so the caller's `release_configure`
-                // finds nothing and does nothing, which is the correct behaviour rather than a
-                // tolerated one.
-                Ok(true) => MgrOutcome::Applied { window: 0, dirty: None },
+                // **`None`, because this request names no window.** Every other manager request
+                // names one, and `Applied.window` exists so the caller can release that
+                // window's held initial `Configure`; this one releases none.
+                Ok(true) => MgrOutcome::Applied { window: None, dirty: None },
                 Ok(false) => {
-                    MgrOutcome::Applied { window: 0, dirty: Some(Rect::new(0, 0, 0, 0)) }
+                    MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }
                 }
                 Err(e) => refused(e),
             }
@@ -357,7 +361,7 @@ mod tests {
         // which pixels changed depends on every overlap, the same case a restack is.
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 2)),
-            MgrOutcome::Applied { window: w, dirty: None },
+            MgrOutcome::Applied { window: Some(w), dirty: None },
         );
         assert_eq!(s.window(w).unwrap().desktop, 2);
 
@@ -365,14 +369,14 @@ mod tests {
         // rectangle is how this codebase already says "repaint nothing".
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 3)),
-            MgrOutcome::Applied { window: w, dirty: Some(Rect::new(0, 0, 0, 0)) },
+            MgrOutcome::Applied { window: Some(w), dirty: Some(Rect::new(0, 0, 0, 0)) },
         );
 
         // Minimize takes any non-zero value as true, as the spec publishes.
         dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 1));
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_MINIMIZED, &value_body(w, 7)),
-            MgrOutcome::Applied { window: w, dirty: None },
+            MgrOutcome::Applied { window: Some(w), dirty: None },
         );
         assert!(s.window(w).unwrap().minimized);
     }
@@ -388,14 +392,14 @@ mod tests {
         MgrDesktop { desktop: 5 }.write(&mut b).unwrap();
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
-            MgrOutcome::Applied { window: 0, dirty: None },
+            MgrOutcome::Applied { window: None, dirty: None },
         );
         assert_eq!(s.current_desktop(), 5);
 
         // Switching to the desktop already current changes nothing on screen.
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
-            MgrOutcome::Applied { window: 0, dirty: Some(Rect::new(0, 0, 0, 0)) },
+            MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
         );
     }
 
