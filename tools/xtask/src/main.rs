@@ -1463,7 +1463,17 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // session namespace binds the `/dev/draw` subtree and reaches `manage`, an application's
     // binds `/dev/draw/new` alone and does not.
     session.expect("desktop-shell: manager channel held")?;
+    // **The bottom bar, and it exists only because a manager does** (M8 Part C). A `panel`'s
+    // dock edge tells the compositor how much space to reserve; it does not move the window, so
+    // a bottom bar that was never *placed* would sit at the origin under the top one. The top
+    // bar goes up before the manager attaches and this one after, which is the whole reason
+    // they are created in different places.
+    session.expect("desktop-shell: bottom bar presented")?;
     session.expect("desktop-shell: /bin lists ")?;
+    // After `/bin`, because the chord is registered on the loop's first pass and the programs
+    // are read before the loop. `expect` scans forward, so asserting these out of order times
+    // out on a line already behind the cursor.
+    session.expect("desktop-shell: Super+H minimizes the focused window")?;
 
     // 4. **The applications modal.** `desktop-shell.md` §4 gives it two triggers — this button
     //    and the Super key — and only the button can exist yet: the Super key is a *global
@@ -1477,12 +1487,6 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     const APPS_CLICK: (i32, i32) = (60, 12);
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
-    // **And the shell placed it**, which is the manager half actually doing something rather
-    // than merely holding a channel. Every window created while a manager is attached is
-    // announced to it, and a `normal` one's first `Configure` is *held* until the manager acts
-    // — so a shell that received `WindowCreated` and did nothing would leave launched
-    // applications invisible, a failure that looks like they never started.
-    session.expect("desktop-shell: placed window ")?;
 
     // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —
     //    the property `check-terminal` relies on when it says an open menu "is a topmost popup
@@ -1506,6 +1510,20 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // the flake PR #227's review caught and PR #236's avoided. What `nxterm` did is checked
     // against the whole transcript below, where order does not matter.
     session.expect("desktop-shell: applications modal closed")?;
+    // **And the shell placed it**, which is the manager half actually doing something rather
+    // than merely holding a channel. Every window created while a manager is attached is
+    // announced to it, and a `normal` one's first `Configure` is *held* until the manager acts
+    // — so a shell that received `WindowCreated` and did nothing would leave launched
+    // applications invisible, a failure that looks like they never started.
+    //
+    // **Asserted against the launched terminal, and after the close.** It sat after the modal
+    // *opened* until M8 Part C, where the shell stopped placing its own windows — a modal is a
+    // `popup`, placed by its creator and never held for anyone, so the line it matched was a
+    // placement that could not have been load-bearing. The terminal's placement arrives one
+    // loop iteration after the close, when its `WindowCreated` is drained.
+    session.expect("desktop-shell: placed window ")?;
+    // And it is listed, focused, because it has the keyboard.
+    session.expect("desktop-shell: window list [")?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
     //    so it stayed on top of whatever was launched and the bar's click handler — gated on
@@ -1514,6 +1532,39 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //    proxy for it (PR #237 review, finding 6).
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
+
+    // 6b. **The window list, and the two things you can do to a window from it** (M8 Part C).
+    //
+    //     The launched terminal is a `normal` window, so it is listed — and it holds the
+    //     keyboard, so the bar shows it focused. Clicking a focused entry puts the window away;
+    //     clicking it again brings it back. This is the first thing in the shell that reflects
+    //     compositor state continuously rather than at one moment, so the assertions are about
+    //     what the list *says*, not only that a click was received.
+    //
+    //     The bar is the bottom 24 rows of an 800-high screen, and entries are 180px wide from
+    //     the left — so (90, 788) is inside the first one.
+    const LIST_CLICK: (i32, i32) = (90, 788);
+    // Close the modal first: it is a popup on top, and a press meant for the bar would land in
+    // it. Escape is what the modal itself declines to type.
+    press(&mut qmp, "esc")?;
+    session.expect("desktop-shell: applications modal closed")?;
+
+    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    session.expect("desktop-shell: minimized window ")?;
+    // The list still holds it — minimizing is not closing, and a taskbar that dropped the entry
+    // would leave no way to get the window back.
+    session.expect("desktop-shell: window list [")?;
+
+    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    session.expect("desktop-shell: raised window ")?;
+
+    // And the chord, which is the half a taskbar alone does not cover: putting a window away
+    // without reaching for its entry. `Super+H`.
+    qmp.send_key("meta_l", true)?;
+    qmp.send_key("h", true)?;
+    qmp.send_key("h", false)?;
+    qmp.send_key("meta_l", false)?;
+    session.expect("desktop-shell: Super+H minimized window ")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
