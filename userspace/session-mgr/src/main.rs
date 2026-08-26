@@ -152,7 +152,7 @@ fn recv_handoff(ctrl: u64) -> u64 {
 // `authenticate`, `build_namespace`, `session_has_bin`/`session_has_tty` and `ns_lookup`
 // moved to `libsession` in M7 Part B — the shared session core both supervisors run. What
 // stays here is the *greeter*: prompting on a terminal, which is where the two columns
-// genuinely differ (`docs/design/graphical-session.md` §4).
+// genuinely differ (`docs/architecture/graphical-session.md` §4).
 
 
 
@@ -251,7 +251,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // else about the spawn -- the empty syscaps, the session namespace, the Tier-1
             // setup channel carrying argv and the environment -- is identical, which is what
             // made it worth sharing.
-            let code = spawn_leader(root_ns, session_ns, notif, "nxsh", 0, 0);
+            let code = spawn_leader(root_ns, session_ns, notif, "nxsh", &[], 0, &[]);
 
             // Tear the session down. The shell has been reaped, so this drops the last
             // reference to the namespace and with it every binding in it — the `/home`

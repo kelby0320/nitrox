@@ -776,7 +776,7 @@ pub struct FocusEvent {
 // application namespace it builds, with subtree base `/new`, so `manage` is not a
 // component-boundary prefix match against it and resolves to nothing. The shell's own session
 // namespace binds the `/dev/draw` subtree unscoped and gets both. See
-// `docs/design/graphical-session.md` §3.
+// `docs/architecture/graphical-session.md` §3.
 // ---------------------------------------------------------------------------
 
 /// `Manage::Place` — put a window's top-left corner at an absolute screen position.

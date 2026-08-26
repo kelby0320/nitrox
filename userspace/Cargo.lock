@@ -85,6 +85,7 @@ dependencies = [
  "libheap",
  "libkern",
  "librsproto",
+ "libstream",
  "libsurface",
  "libui",
 ]

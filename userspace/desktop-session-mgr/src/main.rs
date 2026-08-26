@@ -348,8 +348,26 @@ fn run_session(
     // namespace per application it launches; `nxsh` is handed one and constructs nothing.
     // The compositor endpoint travels with it: the shell binds `/dev/draw/new` into every
     // application namespace it builds, and a binding cannot be re-bound.
+    // **Four endpoints, in the order the shell reads them.** It binds all four into the
+    // namespaces it constructs per application — the compositor's so a window can be made, the
+    // fs-server's so text can be rendered, the tty server's so a terminal emulator can obtain a
+    // terminal, and the profile server's so an application can spawn programs. Each is an
+    // *endpoint* rather than the session's binding of it, because a binding resolves to a
+    // kernel registration and never back to one.
+    // **The real home, as an argument.** The shell binds `/home` into every application
+    // namespace it constructs, and that bind needs the subtree base — which its own namespace
+    // cannot tell it, because there `/home` *is* the home and a binding does not resolve back
+    // to its base. Not authority: the fs endpoint above is the authority, and this only says
+    // which subtree of it an application should see (PR #238 review, finding 3).
+    let home_str = core::str::from_utf8(&home[..hl]).unwrap_or("");
     let code = spawn_leader(
-        root_ns, session_ns, notif, "desktop-shell", SYSCAP_BIND_NAMESPACE, draw,
+        root_ns,
+        session_ns,
+        notif,
+        "desktop-shell",
+        &[home_str],
+        SYSCAP_BIND_NAMESPACE,
+        &[draw, fs, tty, profile],
     );
     // The leader has been reaped, so this drops the last reference to the namespace and with
     // it every binding in it.

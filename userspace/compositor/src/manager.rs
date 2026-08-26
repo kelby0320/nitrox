@@ -15,7 +15,7 @@
 //! inherits it, and resolves are classified by suffix with no caller identity. Namespace-based
 //! gating needs *per-client namespaces*, and the process that constructs them is `desktop-shell`
 //! — closed in M7 Part E, where `desktop-shell` binds `/dev/draw/new` alone into each
-//! application namespace. See `docs/design/graphical-session.md` §3.
+//! application namespace. See `docs/architecture/graphical-session.md` §3.
 
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{

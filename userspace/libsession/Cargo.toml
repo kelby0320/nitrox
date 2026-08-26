@@ -6,7 +6,7 @@ edition = "2024"
 # The shared session core: **authenticate → construct the namespace → spawn the leader →
 # reap → tear down**. The same logic in both columns against different arguments, following
 # Linux's PAM precedent — a shared *library*, not a merged process
-# (`docs/design/graphical-session.md` §4).
+# (`docs/architecture/graphical-session.md` §4).
 #
 # The greeter — the part that draws, or prompts on a terminal — stays in each supervisor,
 # which is where the two columns genuinely differ. What is here is everything after the

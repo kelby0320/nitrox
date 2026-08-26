@@ -242,7 +242,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
 /// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
 /// that is its trigger.
-fn build_app_namespace(draw: u64) -> u64 {
+fn build_app_namespace(draw: u64, fs: u64, tty: u64, profile: u64, home: &str) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
         kprint(b"desktop-shell: application ns_create FAIL\n");
@@ -272,16 +272,103 @@ fn build_app_namespace(draw: u64) -> u64 {
         return 0;
     }
 
-    // **No `/system/fonts` here yet, and the reason is a real gap rather than a choice.**
-    // Re-binding it needs the fs-server *endpoint*, and this process does not have one: its
-    // session namespace holds a `/system/fonts` **binding**, which resolves to a kernel
-    // registration and never back to the endpoint that would let it be bound elsewhere. The
-    // same asymmetry that stops an application re-binding `/bin` stops the shell here.
+    // `/system/fonts`, read-only, so an application can render text. The same subtree bind the
+    // session itself gets — an application that could not draw text would be a window of
+    // rectangles.
+    if fs != 0 {
+        let fpath = b"/system/fonts";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let fr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                fpath.as_ptr() as u64,
+                fpath.len() as u64,
+                fs,
+                fpath.as_ptr() as u64,
+                fpath.len() as u64,
+            )
+        };
+        if fr != 0 {
+            kprint(b"desktop-shell: application /system/fonts bind FAIL\n");
+        }
+    }
+
+    // **`/dev/tty`, which is `graphical-session.md` §6.1's first shape and Part F's answer.**
     //
-    // Nothing this part launches renders text, so it costs nothing today. Part F is where it
-    // bites — `nxterm` in an application namespace needs a font — and the fix is the trip the
-    // compositor's endpoint already makes: `desktop-session-mgr` hands the shell the fs
-    // endpoint at spawn.
+    // The path names the tty *server*, not a device: each resolve mints a **fresh terminal**
+    // (`tty-server`'s `open_tty`), exactly as `/dev/draw/new` mints a compositor session per
+    // caller. So two terminal emulators in two namespaces each get their own, attach their own
+    // backend, and share nothing — the binding does not need to be per-window because the
+    // minting already is.
+    //
+    // §6.1's *second* shape — absent from application namespaces, the terminal handed down —
+    // stays true one level in: `nxterm` resolves this to obtain a terminal, then hands **that
+    // handle** to the `nxsh` it hosts, because a binding cannot name a particular window. The
+    // emulator does not need to name one; it makes one.
+    if tty != 0 {
+        let tpath = b"/dev/tty";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let tr = unsafe {
+            syscall4(SYS_NS_BIND, ns, tpath.as_ptr() as u64, tpath.len() as u64, tty)
+        };
+        if tr != 0 {
+            kprint(b"desktop-shell: application /dev/tty bind FAIL\n");
+        }
+    }
+
+    // **`/bin`, because a terminal has to be able to host a shell.** `nxterm` spawns `nxsh`,
+    // and without this it launches, finds a font and a terminal, and then reports
+    // `/bin/nxsh not found` — a window that opens and immediately has nothing in it.
+    //
+    // **What an application namespace holds is `/dev/draw/new`, `/system/fonts`, `/dev/tty`,
+    // `/bin` and the user's `/home`** — the session's members less the manager channel and
+    // less `/session/user`, and with `/dev/draw` narrowed to `/new` rather than the session's
+    // whole subtree. That narrowing is what M7 is about. *Which* applications get which of
+    // these is a per-application policy and a later question: there is no manifest to read it
+    // from, and inventing one here would be guessing at what `ui-composition-model.md` wants
+    // before anything asks.
+    if profile != 0 {
+        let bpath = b"/bin";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let br = unsafe {
+            syscall4(SYS_NS_BIND, ns, bpath.as_ptr() as u64, bpath.len() as u64, profile)
+        };
+        if br != 0 {
+            kprint(b"desktop-shell: application /bin bind FAIL\n");
+        }
+    }
+
+    // **`/home`, scoped to the user's subtree — because otherwise the environment lies.**
+    // `session_env()` sets `HOME` and `PWD` to `/home`, and `launch` forwards that record
+    // unchanged, so a terminal opened here started its `nxsh` with `PWD=/home` in a namespace
+    // where `/home` resolved to nothing. `nxsh` resolves every relative path against `PWD`, so
+    // `list .`, `cd`, and `open ./x` all failed in the graphical column while passing in the
+    // serial one — and no gate saw it, because the grid renders only under `test-harness`
+    // (PR #238 review, finding 3).
+    //
+    // The six-argument bind, with `home` as the subtree base: the same shape
+    // `libsession::build_namespace` uses, so an application sees exactly the user's home and
+    // not the `/home` above it. Binding the fs endpoint whole-tree here would hand every
+    // application every user's files, which is the opposite of what this function is for.
+    if fs != 0 && !home.is_empty() {
+        let hpath = b"/home";
+        // SAFETY: valid namespace handle, path and base pointers, and endpoint handle.
+        let hr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                hpath.as_ptr() as u64,
+                hpath.len() as u64,
+                fs,
+                home.as_ptr() as u64,
+                home.len() as u64,
+            )
+        };
+        if hr != 0 {
+            kprint(b"desktop-shell: application /home subtree bind FAIL\n");
+        }
+    }
     ns
 }
 
@@ -296,7 +383,7 @@ fn build_app_namespace(draw: u64) -> u64 {
 /// application that *can* reach `manage` simply never says so.
 ///
 /// Returns `false` if the namespace is not what it should be; the caller declines to launch.
-fn verify_app_namespace(ns: u64) -> bool {
+fn verify_app_namespace(ns: u64, expect_home: bool) -> bool {
     let (new_st, new_h) = ns_lookup(ns, b"/dev/draw/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if new_h != 0 {
         // SAFETY: closing a session this check minted; the application will make its own.
@@ -333,7 +420,27 @@ fn verify_app_namespace(ns: u64) -> bool {
             .end();
         return false;
     }
-    kprint(b"desktop-shell: application namespace grants new, withholds manage\n");
+    // **`/home` too, because the environment names it.** An application starts with
+    // `PWD=/home`, so a namespace where that does not resolve gives a shell whose every
+    // relative path fails — and nothing downstream reports it, since a terminal's output goes
+    // to the grid and the grid renders only under `test-harness`. Checked by the process that
+    // built the namespace, for the same reason `manage` is (PR #238 review, finding 3).
+    if expect_home {
+        let (home_st, home_h) = ns_lookup(ns, b"/home", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+        if home_h != 0 {
+            // SAFETY: closing a session this check minted; the application will make its own.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, home_h) };
+        }
+        if home_st != 0 || home_h == 0 {
+            Line::new()
+                .s(b"desktop-shell: application namespace cannot reach /home (status ")
+                .i(home_st as i64)
+                .s(b") -- refusing")
+                .end();
+            return false;
+        }
+    }
+    kprint(b"desktop-shell: application namespace grants new + /home, withholds manage\n");
     true
 }
 
@@ -429,11 +536,14 @@ static mut RECV_COUNT: usize = 0;
 /// [`build_app_namespace`].
 static mut SPAWN_APP: SpawnArgs = SpawnArgs {
     image: 0,
-    handle_count: 0,
-    move_mask: 0,
+    // One handle: the setup channel. An application is a **Tier-1** stage — it receives its
+    // `argv` and its environment the way every pipeline stage does, rather than through a
+    // special case.
+    handle_count: 1,
+    move_mask: 1,
     arg0: 0,
     handles: [0; 4],
-    rights: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
     namespace: 0, // set per launch = the namespace built for it
     syscaps: 0,   // empty, and it stays empty
 };
@@ -444,16 +554,25 @@ static mut SPAWN_APP: SpawnArgs = SpawnArgs {
 /// open declines to launch. See [`verify_app_namespace`] for why that is behaviour rather than
 /// a test: an application that *can* reach `manage` never says so, and nothing downstream
 /// would notice.
-fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
+fn launch(
+    session_ns: u64,
+    draw: u64,
+    fs: u64,
+    tty: u64,
+    profile: u64,
+    program: &str,
+    env: &libstream::wire::Record,
+    home: &str,
+) -> bool {
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(draw);
+    let app_ns = build_app_namespace(draw, fs, tty, profile, home);
     if app_ns == 0 {
         return false;
     }
-    if !verify_app_namespace(app_ns) {
+    if !verify_app_namespace(app_ns, !home.is_empty()) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         kprint(b"desktop-shell: application namespace is not gated; refusing to launch\n");
@@ -470,10 +589,24 @@ fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         return false;
     }
+    // The setup channel this application will read its `argv` and environment from. Depth
+    // one, because one message is what goes down it — sized from the payload, which is the
+    // lesson `spawn_leader`'s `pipe(4)` taught when a fifth message was dropped silently.
+    let Ok((setup_ours, setup_theirs)) = libstream::setup::pipe(1) else {
+        kprint(b"desktop-shell: application setup channel FAIL\n");
+        // SAFETY: closing handles for a launch that will not happen.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, image);
+            syscall1(SYS_HANDLE_CLOSE, app_ns);
+        }
+        return false;
+    };
     // SAFETY: SPAWN_APP is a valid writable arg block.
     let h = unsafe {
         SPAWN_APP.image = image;
         SPAWN_APP.namespace = app_ns;
+        SPAWN_APP.handles[0] = setup_theirs;
+        SPAWN_APP.arg0 = libstream::setup::bootstrap_arg0(true);
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_APP) as u64)
     };
     // The kernel copied the ELF during spawn, and the namespace is the child's now.
@@ -484,6 +617,15 @@ fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
     }
     if h < 0 {
         Line::new().s(b"desktop-shell: ").s(program.as_bytes()).s(b" spawn FAIL").end();
+        // **Both ends, because nothing else will take them.** A spawn that fails leaves the
+        // child's end still ours — `handles[0]` transfers on success only — so returning here
+        // without closing leaks two handles per failed launch, in a process that lives for the
+        // whole session and can be asked to launch again and again (PR #238 review, finding 7).
+        // SAFETY: closing a setup channel pair for a process that does not exist.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, setup_ours);
+            syscall1(SYS_HANDLE_CLOSE, setup_theirs);
+        }
         return false;
     }
     // **Not reaped here.** This shell is not a supervisor of the applications it launches —
@@ -492,6 +634,23 @@ fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
     // lifecycle it has no opinion about.
     // SAFETY: closing the process handle; the child runs independently.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+    // `argv[0]` is the program name, as every Tier-1 stage's is. No streams: an application
+    // is not a pipeline stage with a parent reading its output — a terminal makes its own.
+    let sent = libstream::setup::send_setup_env(
+        setup_ours,
+        &libstream::setup::Streams::default(),
+        &[program],
+        env,
+    )
+    .is_ok();
+    // SAFETY: closing our end of the setup channel.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
+    if !sent {
+        // Reported rather than swallowed: the application is already running and will find no
+        // setup message, which presents as a program with no environment rather than as a
+        // failure to launch.
+        Line::new().s(b"desktop-shell: ").s(program.as_bytes()).s(b" got no setup message").end();
+    }
     Line::new().s(b"desktop-shell: launched ").s(program.as_bytes()).s(b" into its own namespace").end();
     true
 }
@@ -514,17 +673,39 @@ static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
 /// `argv` and the environment, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> ! {
     kprint(b"desktop-shell: up (graphical session leader)\n");
 
     // Two messages arrive on the setup channel, in order: the Tier-1 `argv` + environment,
     // then the compositor's forwarding endpoint. The second is what lets this process build
     // application namespaces — a `/dev/draw` *binding* resolves to a kernel registration and
     // never back to an endpoint, so the shell cannot re-bind what its own namespace holds.
-    let _ = recv_message(setup);
+    // **The shell's own environment, kept rather than discarded**, because every application
+    // it launches gets one derived from it — `$env.HOME` and `PATH` should mean the same thing
+    // in a window as at a serial prompt.
+    let (argv, env) = match libstream::setup::bootstrap(notif, session_ns, setup, arg0).setup() {
+        Some(Ok(s)) => (s.argv, s.env),
+        _ => (alloc::vec::Vec::new(), libstream::wire::Record::default()),
+    };
+    // `argv[1]` is the user's real home, e.g. `/home/alice` — see `spawn_leader`'s `argv_rest`.
+    // Empty means an application's `/home` cannot be scoped, so it is left unbound rather than
+    // bound to something wider than the session's own.
+    let home: &str = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+    if home.is_empty() {
+        kprint(b"desktop-shell: no home in argv; applications get no /home\n");
+    }
     let draw_endpoint = recv_handle(setup);
+    let fs_endpoint = recv_handle(setup);
+    let tty_endpoint = recv_handle(setup);
+    let profile_endpoint = recv_handle(setup);
     if draw_endpoint == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
+    }
+    if fs_endpoint == 0 || tty_endpoint == 0 {
+        // Degraded rather than fatal, and specific: an application without fonts draws
+        // rectangles, and one without a tty cannot be a terminal. Both are worth naming,
+        // because the symptom is a launched program that exits without saying why.
+        kprint(b"desktop-shell: applications will have no fonts or no terminal\n");
     }
 
     // **Resolved from the session namespace, not from a root one.** This process has no root
@@ -594,9 +775,10 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
     // resolve gets an honest answer from a namespace that does not bind it.
     let mut may_launch = false;
     if draw_endpoint != 0 {
-        let app_ns = build_app_namespace(draw_endpoint);
+        let app_ns =
+            build_app_namespace(draw_endpoint, fs_endpoint, tty_endpoint, profile_endpoint, home);
         if app_ns != 0 {
-            may_launch = verify_app_namespace(app_ns);
+            may_launch = verify_app_namespace(app_ns, !home.is_empty());
             // SAFETY: closing the namespace; nothing has been launched into it yet.
             unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         }
@@ -710,7 +892,10 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
                             if !may_launch {
                                 kprint(b"desktop-shell: launching is disabled; ignoring\n");
                             } else if let Some(name) = filtered.first() {
-                                launch(session_ns, draw_endpoint, name);
+                                launch(
+                                    session_ns, draw_endpoint, fs_endpoint, tty_endpoint,
+                                    profile_endpoint, name, &env, home,
+                                );
                                 // **Closed after launching, and this was the bug.** `modal`
                                 // was set once and never cleared, so the popup stayed on top
                                 // of whatever was launched and the top bar's click handler —

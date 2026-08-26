@@ -13,7 +13,7 @@
 //! would find the session's console. The handle travels in the setup message, which is where
 //! `docs/spec/process-spawn-args.md` says everything beyond the four bootstrap registers
 //! belongs, and it is the same thing Unix does by inheriting fd 0/1/2 instead of looking them
-//! up. `docs/design/graphical-session.md` §6.1 owns making the resolved path work here too.
+//! up. `docs/architecture/graphical-session.md` §6.1 owns making the resolved path work here too.
 
 use libkern::abi::SpawnArgs;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT};
@@ -284,7 +284,14 @@ impl Backend {
 /// # Safety
 ///
 /// `root_ns` must be this process's live root namespace and `terminal` a channel it owns.
-pub unsafe fn spawn_shell(root_ns: u64, terminal: u64) -> i64 {
+/// `env` is forwarded from this terminal's **own** setup message, not invented here.
+///
+/// It was `Record::default()` until M7 Part F, which was invisible while `nxterm` was only
+/// ever spawned by `init` with no environment of its own — the shell it hosts simply had none
+/// either. Launched from `desktop-shell` into a constructed namespace, that becomes a terminal
+/// whose shell has no `$env.HOME` while every serial login's does, and the asymmetry is the
+/// bug: a graphical terminal should be the same shell in a window.
+pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Record) -> i64 {
     let image = ns_lookup(root_ns, b"/bin/nxsh", libkern::RIGHT_MAP_READ);
     if image == 0 {
         kprint(b"nxterm: /bin/nxsh not found\n");
@@ -324,9 +331,22 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64) -> i64 {
         &streams,
         Some(terminal),
         &["nxsh"],
-        &libstream::wire::Record::default(),
+        env,
     )
     .is_ok();
+    if sent {
+        // **Reported here, beside the send, rather than where the environment arrived.** This
+        // number is what a launched terminal hands its shell, and it is the only part of the
+        // chain a *release* image shows: the shell's own banner goes to the tty, which for a
+        // windowed terminal means the grid, which renders only under `test-harness`. Reading
+        // it at the far end of the function from `_start` would let the two drift — a send
+        // changed back to `Record::default()` would still log a healthy count.
+        libkern::debug::Line::new()
+            .s(b"nxterm: hosting a shell (env: ")
+            .u(env.values.len() as u64)
+            .s(b" fields)")
+            .end();
+    }
     // SAFETY: closing our end of the setup channel.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
     if !sent {

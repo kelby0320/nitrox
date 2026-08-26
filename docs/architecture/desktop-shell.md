@@ -1,10 +1,24 @@
-# Nitrox: Desktop Shell — Design Notes (v1)
+# Nitrox: Desktop Shell
 
 ## Status
 
-**Not built.** This describes a subsystem with no code behind it; the build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
-when the desktop shell lands (Milestone 7).
+**Partly built, and checked 2026-08-25** — Milestone 7 Part E built the shell;
+[`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
+2026-08-25, revision 2.
+
+**This document outruns its code on purpose, so read it section by section.** What is built:
+the **top bar** (§3), the **applications modal** (§4) — `/bin` listed through the profile
+server, filtered as you type — **launching** (§6's spawn half), each application into a
+namespace the shell constructs, and **placement and window management** (§8), the shell driving
+`Place`/`Raise`/`SetFocus` as the compositor's attached manager. The toolkit question §5 settled
+is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
+
+What is **not**: the **bottom bar** and its **window list** — §2's table calls it persistent
+and §§1, 7 and 8 describe it as present, but `desktop-shell` draws a top bar only; the
+**overview** (§6's zoomed-out half) and the **desktop indicator**, both Milestone 8, the shell
+today having one implicit desktop; and the **system tray** (§9), which is v2 and an
+inter-process protocol rather than a widget. Sections describing those describe intent,
+not behaviour — the rule the rest of `architecture/` follows does not hold there.
 
 What a user actually sees and touches: the bars, the applications modal, the overview, and
 the desktop indicator. Settled with the maintainer 2026-08-04, with two items deliberately

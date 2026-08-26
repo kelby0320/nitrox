@@ -1382,7 +1382,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
     // re-deriving it here keeps the check where the refusal is — a shell that found the gate
     // open declines to launch, which is behaviour rather than a test.
-    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -1419,10 +1419,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //    the property `check-terminal` relies on when it says an open menu "is a topmost popup
     //    and takes the keyboard". The top bar could not receive these keys at all.
     //
-    //    `whoami` is a coreutil rather than something with a window, and that is honest about
-    //    what Part E delivers: the launch *mechanism*, verified end to end. Part F is what
-    //    makes the thing launched worth looking at.
-    for c in "whoami".chars() {
+    //    **`nxterm`, which is what makes the milestone visible**: a person types into the
+    //    applications modal and a terminal opens. Part E launched a coreutil because the
+    //    mechanism was the deliverable; Part F is the thing launched being worth looking at.
+    for c in "nxterm".chars() {
         let mut qcode = String::new();
         qcode.push(c);
         press(&mut qmp, &qcode)?;
@@ -1430,8 +1430,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
-    session.expect("desktop-shell: launched whoami into its own namespace")?;
+    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
+    session.expect("desktop-shell: launched nxterm into its own namespace")?;
+    // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
+    // shell closing the modal, so an `expect` between the two is a race between processes —
+    // the flake PR #227's review caught and PR #236's avoided. What `nxterm` did is checked
+    // against the whole transcript below, where order does not matter.
     session.expect("desktop-shell: applications modal closed")?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
@@ -1486,6 +1490,51 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 /// `desktop-session-mgr` never reported a session ending — its leader blocks, so the only way
 /// that line appears is if the session came down.
 fn check_two_sessions(transcript: &str) -> R<()> {
+    // **The terminal opened and hosted a shell**, which is what makes M7 visible: a person
+    // typed in the applications modal and got a terminal. It found a font, a terminal and
+    // `/bin` in the namespace the shell built for it — none of which an application namespace
+    // had before Part F.
+    //
+    // Checked against the transcript rather than with an `expect`, because `nxterm` runs
+    // concurrently with the shell and ordering the two would be a race. **Not the grid line**:
+    // `nxterm::report_row` is `test-harness`-only and this gate boots a release image, so
+    // asserting `"nxterm: grid> …"` here could never have passed — which is how the first
+    // version of this check failed.
+    // **And its shell got an environment — asserted from the shell, not from its parent.**
+    // M7 Part F's second claim: `nxterm` took no setup message and handed `nxsh` a
+    // `Record::default()`, so a terminal launched into a constructed namespace would give its
+    // shell no `$env.HOME` while every serial login's has one.
+    //
+    // **This reads `nxsh`'s own line, and the first version did not.** It read `nxterm:
+    // hosting a shell (env: N)`, which `nxterm` logs from the environment it *received* — so
+    // breaking the forward to `nxsh` and leaving the receipt intact kept the gate green. A
+    // parent cannot testify to what its child was given; only the child can. Demonstrated in
+    // review by doing exactly that (PR #238 review, finding 1).
+    //
+    // Two shells must report, because this gate runs two sessions: the terminal
+    // `desktop-shell` launched, and the serial login beside it. Counting them is what stops an
+    // absence-only check from passing when no shell started at all.
+    let shells = transcript.matches("nxsh: up (env: ").count();
+    if transcript.contains("nxsh: up (env: 0 fields)") {
+        return Err("a shell started with an empty environment, so its `$env.HOME` is unset. \
+             Somewhere between `desktop-session-mgr` and `nxsh` a setup message was not sent \
+             or not forwarded"
+            .into());
+    }
+    if shells < 2 {
+        return Err(format!(
+            "expected two shells to report an environment (the launched terminal's and the \
+             serial login's); saw {shells}. A shell that never started cannot have an empty \
+             environment, which is why absence alone is not the check."
+        )
+        .into());
+    }
+    if !transcript.contains("nxterm: hosting a shell") {
+        return Err("the launched terminal never hosted a shell. `nxterm: no shell` means it \
+             could not spawn one — most likely `/bin` is missing from the application \
+             namespace; no `nxterm:` line at all means it never started"
+            .into());
+    }
     // **An empty applications list would satisfy every expect above.** "`/bin` lists " matches
     // "lists 0 programs", and "modal open" says nothing about its contents — so a session
     // whose `/bin` failed to open would pass the whole gate. Asserted as an absence for the

@@ -153,12 +153,16 @@ wrong about how something works:
   same change.
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
-  is what a subsystem *will* be. Today it holds exactly four documents, all describing the
-  display system **above Milestone 5**: `display-substrate.md` (the parts above the
-  compositor), `ui-composition-model.md` (ports, desktops, templates), `desktop-shell.md`, and
-  `graphical-session.md` (who logs a graphical user in and spawns the shell). What is built has
-  moved out — `input-subsystem.md` and `widget-toolkit.md` graduated to `architecture/` on
-  2026-08-12 — so the rule to apply is simply "`design/` means not built".
+  is what a subsystem *will* be. Today it holds exactly three documents. Two describe the
+  display system **above Milestone 7** — `display-substrate.md` (the parts above the
+  compositor) and `ui-composition-model.md` (ports, desktops) — and `fault-survival.md`
+  (added 2026-08-19) is not a display document at all: it is where the kernel's
+  fault-survival intent is written down. What is built has moved out —
+  `input-subsystem.md` and `widget-toolkit.md` graduated on 2026-08-12, and `desktop-shell.md`
+  and `graphical-session.md` on 2026-08-25 with Milestone 7 — so the rule to apply is simply
+  "`design/` means not built". `desktop-shell.md` is the one doc that graduated while still
+  outrunning its code (its overview and tray are M8 and v2); its Status line says which
+  sections are which, which is the pattern to copy rather than to spread.
   `planning/` is what is intended, with checkboxes for what is done. `archive/` is superseded.
   **Never conclude "the system does X" from any of them.**
 - **`decision-log.md` is a dated record and is append-only.** Entries are true as of their

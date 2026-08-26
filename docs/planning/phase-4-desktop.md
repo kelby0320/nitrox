@@ -556,7 +556,7 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 desktops) and
 [`docs/architecture/input-subsystem.md`](../architecture/input-subsystem.md) (the path from an
 interrupt to a keystroke in a window: kernel drivers, the `input-server`, `libinput`) and
-[`docs/design/desktop-shell.md`](../design/desktop-shell.md) (bars, applications modal,
+[`docs/architecture/desktop-shell.md`](../architecture/desktop-shell.md) (bars, applications modal,
 overview), all settled 2026-08-04. **Build order:
 [`display-arm-plan.md`](display-arm-plan.md)** — nine milestones, three prerequisites, starting
 with the test gate and putting the widget toolkit before the first application. Milestone 7 adds a

@@ -1520,6 +1520,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // what preserves the one constraint that mattered: `nxterm` before `ui-testclient`,
     // because windows stack in creation order at the origin and the display gate compares the
     // top-left, so the largest window has to be at the bottom.
+    //
+    // **And the real answer arrived (M7 Part F, 2026-08-25.)** The comment this file carried
+    // from 2026-08-12 — *"Until Milestone 7 there is nothing to launch `nxterm` from"* — is
+    // answered twice over: retrofit C2 gave the test image a declaration, and `desktop-shell`
+    // now launches a terminal from the applications modal into a namespace it constructed, in
+    // a **release** image, which is what `cargo xtask check-login` boots. The declarations
+    // above stay, and are not a duplicate of that path: they put a terminal and the test
+    // clients on screen *without a login*, which is what lets `check-display` and
+    // `check-terminal` test the display arm without depending on authentication.
     supervise(notif, root_ns);
 }
 
