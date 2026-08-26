@@ -622,7 +622,13 @@ fn send_handle(ctrl: u64, handle: u64) {
 /// service-mgr does not *use* either endpoint. It is a courier: neither the fs-server's
 /// `/home` nor the profile's `/bin` is service-mgr's to bind, and holding them any longer
 /// than the trip down would be authority it has no use for.
-fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, tty_endpoint: u64) {
+fn bring_up_login_chain(
+    root_ns: u64,
+    fs_endpoint: u64,
+    profile_endpoint: u64,
+    tty_endpoint: u64,
+    draw_endpoint: u64,
+) {
     if fs_endpoint == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
         // A profile endpoint without an fs endpoint is no more usable — a session with
@@ -690,7 +696,7 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
     // them — so they are duplicated before the serial column is given its set. Duplicating
     // first rather than after means a failure here costs the graphical login, not both:
     // init makes the same argument where it retains the profile endpoint before binding it.
-    if !bring_up_desktop_session(root_ns, fs_dup, profile_dup, tty_dup) {
+    if !bring_up_desktop_session(root_ns, fs_dup, profile_dup, tty_dup, draw_endpoint) {
         // Non-fatal by design. A machine with a serial login and no graphical one is
         // degraded; a machine with neither is unreachable, and the serial column is already
         // up by this point.
@@ -704,13 +710,14 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, t
 /// `false` if it could not be started. Its greeter is a compositor client, so unlike
 /// `session-mgr` it also needs `/dev/draw` — which it resolves itself from the inherited root
 /// namespace, exactly as every other graphical client does.
-fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bool {
+fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64, draw: u64) -> bool {
     if fs == 0 {
         // The duplicates are this function's to release once it declines to use them.
         // SAFETY: closing our own handles.
         unsafe {
             close_one(profile);
             close_one(tty);
+            close_one(draw);
         }
         return false;
     }
@@ -722,6 +729,7 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bo
         unsafe {
             close_endpoints(fs, profile);
             close_one(tty);
+            close_one(draw);
         }
         return false;
     }
@@ -729,6 +737,8 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64) -> bo
     send_handle(ctrl, fs);
     send_handle(ctrl, profile);
     send_handle(ctrl, tty);
+    // The fourth, and the one the serial column does not get.
+    send_handle(ctrl, draw);
     // SAFETY: closing our own handles; the twin runs independently from here.
     unsafe {
         syscall1(SYS_HANDLE_CLOSE, ctrl);
@@ -776,18 +786,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
     kprint(b"service-mgr: up\n");
     // The handoffs, in init's send order: the fs-server endpoint, then the profile
     // server's. Positional — see `bring_up_login_chain`.
-    let (fs_endpoint, profile_endpoint, tty_endpoint) = if handoff == 0 {
-        (0, 0, 0)
+    let (fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint) = if handoff == 0 {
+        (0, 0, 0, 0)
     } else {
         let fs = recv_handoff(handoff);
         let profile = recv_handoff(handoff);
         let tty = recv_handoff(handoff);
+        // The compositor's forwarding endpoint. Only the graphical column takes it: a serial
+        // session has no use for `/dev/draw`, and handing it one would be authority for
+        // nothing.
+        let draw = recv_handoff(handoff);
         // SAFETY: closing our own handoff-channel end; every handoff is in hand.
         unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
-        (fs, profile, tty)
+        (fs, profile, tty, draw)
     };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
-    bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint, tty_endpoint);
+    bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint);
     supervise(notif, root_ns, load_declarations(root_ns));
 }
 

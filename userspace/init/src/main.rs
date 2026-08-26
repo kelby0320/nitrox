@@ -80,6 +80,16 @@ static mut PROFILE_ENDPOINT: u64 = 0;
 /// channel as a server, so binding a client channel silently produces a namespace entry
 /// that answers `Namespace::Resolve` with `Unsupported`.
 static mut TTY_ENDPOINT: u64 = 0;
+
+/// The compositor's **forwarding** endpoint, retained after the `/dev/draw` bind so init can
+/// hand it down for a *graphical session* namespace to bind.
+///
+/// The fourth endpoint to make this trip, and the first that only one of the two login
+/// columns wants: a serial session has no use for a compositor. `desktop-shell` needs
+/// `/dev/draw` bound in the session namespace it runs in — a connection handle would not do,
+/// because the shell resolves `manage` as well as `new`, and Part E gates *applications* by
+/// binding the two paths differently.
+static mut DRAW_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -846,8 +856,9 @@ fn bind_auth_service(root_ns: u64) -> bool {
 
     // `TODO(svc-auth-ungated)` — bound into the **root namespace**, which every process
     // inherits, so anything can resolve the oracle and attempt a password. Recorded rather
-    // than glossed; it closes with the same namespace-construction work as
-    // `TODO(manage-ungated)`.
+    // than glossed. It closes with the same namespace-construction work that closed
+    // `manage-ungated` in M7 Part E: a supervisor that gets a *constructed* namespace rather
+    // than an inherited one.
     kprint(b"init: auth-service bound at /svc/auth\n");
     // init keeps `as_h` (the long-lived server's process handle).
     let _ = as_h;
@@ -1035,8 +1046,22 @@ fn bind_compositor(root_ns: u64) -> bool {
     // SAFETY: closing init's own control endpoint.
     unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
 
+    // Keep a second handle *before* binding, for the graphical supervisor to bind into each
+    // session — the same ordering argument `/dev/tty` makes: duplicating first means a failure
+    // is a failure to bind at all, rather than a bound `/dev/draw` no session can be given.
+    // SAFETY: duplicating our own endpoint handle with attenuated rights.
+    let retained = unsafe {
+        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+    };
     // SAFETY: binding the compositor's forwarding endpoint as a subtree at /dev/draw.
     let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/draw".as_ptr() as u64, 9, endpoint) };
+    if br == 0 && retained >= 0 {
+        // SAFETY: single-threaded init.
+        unsafe { DRAW_ENDPOINT = retained as u64 };
+    } else if retained >= 0 {
+        // SAFETY: the bind failed; nothing will use the duplicate.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
+    }
     // The binding takes its own reference, so init's handle goes either way.
     // SAFETY: closing init's reference to the endpoint.
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
@@ -1149,7 +1174,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // Handing it a live but permanently empty channel would leave it blocked on a handoff
     // that is never coming, turning a degraded restart into a hung one.
     // SAFETY: single-threaded init.
-    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 && TTY_ENDPOINT == 0 } {
+    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 && TTY_ENDPOINT == 0 && DRAW_ENDPOINT == 0 } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
         return unsafe {
@@ -1202,6 +1227,8 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         PROFILE_ENDPOINT = 0;
         send_handle(init_end, TTY_ENDPOINT);
         TTY_ENDPOINT = 0;
+        send_handle(init_end, DRAW_ENDPOINT);
+        DRAW_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h

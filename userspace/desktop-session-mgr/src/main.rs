@@ -283,6 +283,7 @@ fn run_session(
     fs: u64,
     profile: u64,
     tty: u64,
+    draw: u64,
     user: &[u8],
     password: &[u8],
 ) -> bool {
@@ -304,11 +305,33 @@ fn run_session(
         tty_endpoint: tty,
         home: &home[..hl],
         user,
+        // Its clients render text, and a constructed namespace has no font without this.
+        bind_fonts: true,
         bind_console: false,
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
         return true;
+    }
+    // **`/dev/draw`, bound as a subtree and unscoped**, so the shell resolves both `new` (a
+    // window of its own) and `manage` (the manager channel). That breadth is deliberate and is
+    // exactly what an *application's* namespace will not get: Part E binds `/dev/draw/new`
+    // alone into those, which is what closed the `manage-ungated` deferral — a narrow bind
+    // expresses
+    // "new and not manage" without any protocol change.
+    if draw != 0 {
+        let path = b"/dev/draw";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let dr = unsafe {
+            syscall4(SYS_NS_BIND, session_ns, path.as_ptr() as u64, path.len() as u64, draw)
+        };
+        if dr != 0 {
+            // Non-fatal: the session exists, the shell just cannot draw in it. Say so rather
+            // than failing a login the user completed.
+            kprint(b"desktop-session-mgr: /dev/draw bind FAIL (the shell cannot draw)\n");
+        } else {
+            kprint(b"desktop-session-mgr: /dev/draw bound into the session\n");
+        }
     }
     // **Reported from what was bound, not from what was asked for.** This was a hardcoded
     // "(no /dev/console)" and the gate's assertion on it passed with `bind_console: true` —
@@ -321,7 +344,13 @@ fn run_session(
 
     // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
     // a real shell; what it has to be now is a process that proves the session runs.
-    let code = spawn_leader(root_ns, session_ns, notif, "desktop-shell");
+    // **`BIND_NAMESPACE`, and only the graphical leader gets it.** The shell constructs a
+    // namespace per application it launches; `nxsh` is handed one and constructs nothing.
+    // The compositor endpoint travels with it: the shell binds `/dev/draw/new` into every
+    // application namespace it builds, and a binding cannot be re-bound.
+    let code = spawn_leader(
+        root_ns, session_ns, notif, "desktop-shell", SYSCAP_BIND_NAMESPACE, draw,
+    );
     // The leader has been reaped, so this drops the last reference to the namespace and with
     // it every binding in it.
     // SAFETY: closing the namespace we created for this session.
@@ -341,6 +370,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
+    // The compositor's forwarding endpoint — the one handoff the serial column does not get.
+    // `desktop-shell` needs `/dev/draw` **bound in the namespace it runs in**, not a
+    // connection handed to it: it resolves `manage` as well as `new`, and Part E gates
+    // applications by binding those two paths differently.
+    let draw_endpoint = recv_handoff(control);
     // The oracle, resolved rather than couriered — Part C. Once at startup: its lifetime is
     // the machine's, and re-resolving per attempt would mint a session per keystroke.
     let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
@@ -377,31 +411,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // read as a compositing regression. The plan's Milestone 6 Part D says the same thing
     // about `init`'s spawn order — "a stale comment asserting a retired invariant is what the
     // last two milestones each shipped once".
-    let window = match session.create(&CreateWindowRequest::new(GREETER_W, GREETER_H, Role::Normal), BUFFERS) {
-        Ok(id) => id,
-        Err(_) => fail(b"desktop-session-mgr: greeter CreateWindow FAILED\n"),
-    };
-
     let mut greeter = Greeter::new();
     let len = GREETER_PITCH * GREETER_H as usize;
     // **The mapped addresses are kept**, not dropped after attach: every keystroke redraws,
     // so the greeter writes new pixels into whichever buffer the compositor has released.
     let mut addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
-            fail(b"desktop-session-mgr: greeter buffer alloc FAILED\n");
-        };
-        addrs[i] = addr;
-        let Some(mut w) = session.window(window) else {
-            fail(b"desktop-session-mgr: greeter window vanished\n");
-        };
-        if w.attach(i as u32, GREETER_W, GREETER_H, GREETER_PITCH as u32, handle).is_err() {
-            fail(b"desktop-session-mgr: greeter AttachBuffer FAILED\n");
-        }
-    }
-    if !present(&mut session, window, &greeter, &font, &addrs, len) {
-        fail(b"desktop-session-mgr: greeter Commit FAILED\n");
-    }
+    let mut window = match open_greeter(&mut session, &font, &greeter, &mut addrs, len) {
+        Some(id) => id,
+        None => fail(b"desktop-session-mgr: greeter could not be drawn\n"),
+    };
     Line::new()
         .s(b"desktop-session-mgr: greeter presented, window ")
         .u(window as u64)
@@ -462,20 +480,83 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             user[..ul].copy_from_slice(&greeter.user.text().as_bytes()[..ul]);
             pass[..pl].copy_from_slice(&greeter.password.text().as_bytes()[..pl]);
             greeter.reset();
+            // **The greeter's window goes away for the duration of the session.**
+            //
+            // `graphical-session.md` says the greeter *outlives* each session, and that is
+            // about the **process**, not the window: a login window left mapped sits at the
+            // origin underneath whatever the session draws, and the moment anything raises it
+            // it covers the shell's top bar — which is exactly what happened when a dropped
+            // PS/2 packet sent a click to (160, 112) instead of the bar, and every later click
+            // then landed on the greeter instead. Found by a negative control, not by
+            // reasoning (M7 Part E).
+            //
+            // Destroyed rather than hidden because the protocol has no "hide": a window is
+            // mapped or it does not exist, and recreating one is what M6 Part A's
+            // initial-configure handshake is already built for.
+            if let Some(w) = session.window(window) {
+                let _ = w.destroy();
+            }
             let ok = run_session(
                 root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
-                &user[..ul], &pass[..pl],
+                draw_endpoint, &user[..ul], &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.
             unsafe { core::ptr::write_volatile(&mut pass, [0u8; 128]) };
+            // **Set before the window is drawn, not after.** `open_greeter` presents, and
+            // `view()` reads `denied` — so setting it afterwards drew a blank greeter and the
+            // refusal never appeared. The next keystroke clears `denied` before its own
+            // redraw, so the message was reachable only by pressing Tab, and the gate asserts
+            // the *kprint* rather than the rendering, so nothing caught it (PR #237 review,
+            // finding 4). `Greeter::view`'s own comment describes what that state is: a
+            // refusal a user cannot see is a login that appears to have done nothing.
             greeter.denied = !ok;
-            dirty = true;
+            // Back to a login window. A fresh one rather than a retained one, for the reason
+            // above — and its buffers with it, since the old window's are gone.
+            match open_greeter(&mut session, &font, &greeter, &mut addrs, len) {
+                Some(id) => window = id,
+                None => fail(b"desktop-session-mgr: could not draw the greeter again\n"),
+            }
+            dirty = false;
         }
         if dirty && !present(&mut session, window, &greeter, &font, &addrs, len) {
             fail(b"desktop-session-mgr: greeter redraw FAILED\n");
         }
     }
+}
+
+/// Create the greeter window, attach fresh buffers, and present it. `None` if any step failed.
+///
+/// Called for the first login and again after every session, because the window is destroyed
+/// for the duration of one — see the call site for why.
+fn open_greeter(
+    session: &mut Session<ChannelTransport>,
+    font: &Font,
+    greeter: &Greeter,
+    addrs: &mut [*mut u8; BUFFERS],
+    len: usize,
+) -> Option<u32> {
+    // **This window lands at the origin, and is created before every other client's.**
+    // `service-mgr` brings the login chain up before it starts declared services, so the
+    // greeter is bottom-most and the reference windows `check-display` and `check-terminal`
+    // depend on stack above it. That is load-bearing rather than incidental: a greeter created
+    // *after* them would cover the regions those gates compare, and the failure would read as
+    // a compositing regression.
+    let window = session
+        .create(&CreateWindowRequest::new(GREETER_W, GREETER_H, Role::Normal), BUFFERS)
+        .ok()?;
+    for i in 0..BUFFERS {
+        let (handle, addr) = shared_buffer(len)?;
+        addrs[i] = addr;
+        let mut w = session.window(window)?;
+        if w.attach(i as u32, GREETER_W, GREETER_H, GREETER_PITCH as u32, handle).is_err() {
+            return None;
+        }
+    }
+    if !present(session, window, greeter, font, addrs, len) {
+        return None;
+    }
+    Some(window)
 }
 
 /// Render the greeter into a free buffer and commit it. `false` if the compositor refused.

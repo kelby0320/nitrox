@@ -1377,6 +1377,70 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // something ran. `test-interactive` already pins the `libsession` line for the serial
     // column, where it is ordered against a prompt rather than against another process.
     session.expect("desktop-shell: up (graphical session leader)")?;
+    // **The narrow bind, which is what closed the `manage-ungated` deferral.** The shell builds
+    // an application namespace and checks it *before* launching into it: `/dev/draw/new`
+    // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
+    // re-deriving it here keeps the check where the refusal is — a shell that found the gate
+    // open declines to launch, which is behaviour rather than a test.
+    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
+    // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
+    // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
+    // it does not have — and presents a `panel` top bar. Asserting the window rather than only
+    // the process is what distinguishes a session that runs from one that is merely spawned.
+    session.expect("desktop-shell: top bar presented")?;
+    // **The compositor's first real manager.** Everything M6 built for one -- placement,
+    // restacking, the initial-configure hold -- has been exercised by a test client until now.
+    // Holding the channel is also the other half of what closed `manage-ungated`: the shell's
+    // session namespace binds the `/dev/draw` subtree and reaches `manage`, an application's
+    // binds `/dev/draw/new` alone and does not.
+    session.expect("desktop-shell: manager channel held")?;
+    session.expect("desktop-shell: /bin lists ")?;
+
+    // 4. **The applications modal.** `desktop-shell.md` §4 gives it two triggers — this button
+    //    and the Super key — and only the button can exist yet: the Super key is a *global
+    //    hotkey*, which §8 makes a capability the compositor does not have, and a `panel` takes
+    //    no keyboard focus so a key would never reach the shell at all.
+    //
+    //    The bar spans the screen at y=0 and the button is its left 120px, so a press at
+    //    (60, 12) lands inside it. Asserted through the compositor's own `press at` line
+    //    first, for the reason `check-terminal` gives: it separates "the pointer was not
+    //    there" from "the pointer was there and nothing happened".
+    const APPS_CLICK: (i32, i32) = (60, 12);
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+    // **And the shell placed it**, which is the manager half actually doing something rather
+    // than merely holding a channel. Every window created while a manager is attached is
+    // announced to it, and a `normal` one's first `Configure` is *held* until the manager acts
+    // — so a shell that received `WindowCreated` and did nothing would leave launched
+    // applications invisible, a failure that looks like they never started.
+    session.expect("desktop-shell: placed window ")?;
+
+    // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —
+    //    the property `check-terminal` relies on when it says an open menu "is a topmost popup
+    //    and takes the keyboard". The top bar could not receive these keys at all.
+    //
+    //    `whoami` is a coreutil rather than something with a window, and that is honest about
+    //    what Part E delivers: the launch *mechanism*, verified end to end. Part F is what
+    //    makes the thing launched worth looking at.
+    for c in "whoami".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    // Each line is a distinct claim: the namespace was built and **checked** before anything
+    // ran in it, and only then was the program spawned into it.
+    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
+    session.expect("desktop-shell: launched whoami into its own namespace")?;
+    session.expect("desktop-shell: applications modal closed")?;
+
+    // 6. **And the top bar still works.** The modal used to be opened once and never closed,
+    //    so it stayed on top of whatever was launched and the bar's click handler — gated on
+    //    there being no modal — was inert for the rest of the session: no second launch, no
+    //    way back. Clicking again is the direct test; asserting the close alone would be a
+    //    proxy for it (PR #237 review, finding 6).
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
@@ -1395,7 +1459,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
-    check_two_sessions(&transcript)?;
+    // **The transcript is written here too.** `expect` saves it on its own failures, but this
+    // check runs after `finish()` — so a concurrency failure used to report a verdict with no
+    // guest output to diagnose it from, and the file left on disk was a *stale* one from an
+    // earlier run. That is worse than none: it reads as evidence.
+    if let Err(e) = check_two_sessions(&transcript) {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let saved = fs::write(&path, &transcript).is_ok();
+        if saved {
+            println!("\nthe full transcript is at {}", path.display());
+        }
+        return Err(e);
+    }
     println!(
         "\nxtask: graphical login gate PASSED — refused a wrong password, ran a session, and a \
          serial login ran beside it ✓"
@@ -1411,6 +1486,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 /// `desktop-session-mgr` never reported a session ending — its leader blocks, so the only way
 /// that line appears is if the session came down.
 fn check_two_sessions(transcript: &str) -> R<()> {
+    // **An empty applications list would satisfy every expect above.** "`/bin` lists " matches
+    // "lists 0 programs", and "modal open" says nothing about its contents — so a session
+    // whose `/bin` failed to open would pass the whole gate. Asserted as an absence for the
+    // same reason the concurrency check is: `expect` cannot say "a number greater than zero".
+    if transcript.contains("desktop-shell: /bin lists 0 programs") {
+        return Err("the applications modal is empty: /bin projected no programs into the \
+             session namespace. The modal opening is not evidence it has anything in it"
+            .into());
+    }
     if !transcript.contains("desktop-shell: up (graphical session leader)") {
         return Err("the graphical session never started, so nothing was concurrent".into());
     }
@@ -1422,6 +1506,42 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     }
     println!("xtask: a graphical and a serial session ran at the same time ✓");
     Ok(())
+}
+
+/// Position the pointer, click, and **confirm where the press landed** — retrying if it did
+/// not land there.
+///
+/// **The press is the receipt, and it already existed.** `move_pointer_to` fires ~33
+/// unacknowledged relative motions, and a dropped one leaves a permanent offset; the
+/// compositor already reports every press's position, so the retry needs no guest change at
+/// all. PR #232 tried reporting position per *motion* instead and it cost too much in the
+/// compositor's input path — this is the cheap half of that idea, using a receipt the protocol
+/// was already emitting.
+///
+/// Observed on the first full run of this gate: `input batch DROPPED (SYN_DROPPED)` and a
+/// press at (321, 312) with `win=none`. Retrying is safe here because a press that misses lands
+/// on nothing or merely focuses a window, and opening an already-open modal is guarded.
+fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
+    const ATTEMPTS: u32 = 3;
+    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
+    for attempt in 1..=ATTEMPTS {
+        move_pointer_to(qmp, x, y)?;
+        qmp.send_button("left", true)?;
+        qmp.send_button("left", false)?;
+        if session.expect_within(&format!("compositor: press at x={x} y={y}"), PER_ATTEMPT)? {
+            return Ok(());
+        }
+        println!("  note: the press did not land at ({x}, {y}) on attempt {attempt}/{ATTEMPTS}");
+        // The abandoned attempt's press must not satisfy the next one's wait.
+        session.skip_to_end()?;
+    }
+    Err(format!(
+        "the pointer never reached ({x}, {y}) in {ATTEMPTS} attempts. Injection is relative and \
+         unacknowledged, so a dropped PS/2 packet leaves a permanent offset — look for \
+         `input batch DROPPED (SYN_DROPPED)` in the transcript, and at the guest's input path \
+         rather than at this gate if it persists"
+    )
+    .into())
 }
 
 /// Inject one key by qcode, press and release.
@@ -2682,6 +2802,39 @@ impl Session {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Wait up to `timeout` for `pat`, answering **whether it arrived** rather than failing.
+    ///
+    /// For the one case where absence is retryable rather than a verdict: a click whose
+    /// positioning a dropped PS/2 packet left short. [`expect`](Self::expect) is right
+    /// everywhere else — a gate that treats a missing guest line as "try again" is a gate that
+    /// can pass while the guest is broken.
+    fn expect_within(&mut self, pat: &str, timeout: std::time::Duration) -> R<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                if let Some(i) = g[self.cursor..].find(pat) {
+                    self.cursor += i + pat.len();
+                    self.sent_since_match.clear();
+                    println!("  ok: saw {pat:?}");
+                    return Ok(true);
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Drop everything said so far without matching it — for discarding an abandoned attempt's
+    /// output, so a retry cannot match a line the previous try emitted.
+    fn skip_to_end(&mut self) -> R<()> {
+        let g = self.out.lock().map_err(|_| "transcript lock")?;
+        self.cursor = g.len();
+        Ok(())
     }
 
     /// Wait for `pat` in output not yet consumed. The guest paces the test.

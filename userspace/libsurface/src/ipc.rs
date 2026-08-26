@@ -119,9 +119,11 @@ impl ChannelTransport {
     /// it created. There is one: a second resolve is refused, because two managers placing
     /// windows is a race with no arbiter.
     ///
-    /// **The capability is the binding**, and in Milestone 6 that binding gates nothing —
-    /// `/dev/draw` is bound unscoped into init's root namespace and every graphical client
-    /// inherits it. See `TODO(manage-ungated)`.
+    /// **The capability is the binding**, and as of M7 Part E it gates: an application runs in
+    /// a namespace `desktop-shell` built, which binds `/dev/draw/new` alone, so `manage`
+    /// resolves to nothing there. It still gates nothing for anything spawned with
+    /// `namespace: 0`, which inherits the root where `/dev/draw` is bound unscoped — a
+    /// property of the selftest path rather than of the design.
     ///
     /// # Safety
     ///

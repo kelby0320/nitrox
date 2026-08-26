@@ -223,6 +223,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 tty_endpoint,
                 home: &home[..hl],
                 user: &user[..ul],
+                // A serial session renders no text, so it takes no fonts.
+                bind_fonts: false,
                 // The console *is* this column's terminal, so the serial session binds it.
                 // The graphical column will pass `false` — governing decision 3.
                 bind_console: true,
@@ -249,7 +251,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // else about the spawn -- the empty syscaps, the session namespace, the Tier-1
             // setup channel carrying argv and the environment -- is identical, which is what
             // made it worth sharing.
-            let code = spawn_leader(root_ns, session_ns, notif, "nxsh");
+            let code = spawn_leader(root_ns, session_ns, notif, "nxsh", 0, 0);
 
             // Tear the session down. The shell has been reaped, so this drops the last
             // reference to the namespace and with it every binding in it — the `/home`

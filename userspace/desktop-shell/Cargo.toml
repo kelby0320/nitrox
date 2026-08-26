@@ -3,19 +3,29 @@ name = "desktop-shell"
 version = "0.1.0"
 edition = "2024"
 
-# The graphical session's leader — `nxsh`'s counterpart in the other column.
+# The graphical session's leader, and **the compositor's first real manager**. Everything M6
+# built for one — placement, restacking, focus, the initial-configure hold, the five manager
+# events — has been exercised by a test client until now.
 #
-# **Minimal on purpose, and this is M7 Part D's stub.** Part E builds the actual shell: the
-# top bar, the applications modal, window placement policy driving M6's manager ops, and a
-# constructed namespace per application it spawns. What it has to be *now* is a process that
-# proves a graphical session runs — spawned into the session namespace, unprivileged, reaped
-# by `desktop-session-mgr` — so Part D's login gate has something to assert and Parts E and F
-# land against a gate that already exists.
+# It draws a top bar, holds `/dev/draw/manage`, and constructs a namespace per application it
+# spawns. That last part is the load-bearing one: `ui-composition-model.md` §5a rests the
+# guarantee that "an application cannot compose other applications" on the shell being the
+# process that built them.
 #
-# It does not draw yet. Its session namespace has no `/dev/draw`: `build_namespace` binds the
-# serial column's set, and the graphical bind is listed under Part E along with `/dev/desktop`.
+# **It does not bind its own endpoint**, which is what reconciles a process that both serves
+# and constructs with `syscaps.md` (`graphical-session.md` §3): it holds `BIND_NAMESPACE` to
+# construct *application* namespaces continuously, not to register itself once.
+#
+# The `/dev/desktop` binding that would let an application talk back is
+# `TODO(desktop-endpoint)` — deferred until something resolves it.
 [dependencies]
 libkern = { path = "../libkern" }
+# `io` for `session::Dir`: the modal reads /bin as a forwarded directory.
+librsproto = { path = "../librsproto", features = ["io"] }
+libsurface = { path = "../libsurface" }
+libui = { path = "../libui" }
+libdraw = { path = "../libdraw", features = ["io"] }
+libheap = { path = "../libheap" }
 
 [[bin]]
 name = "desktop-shell"

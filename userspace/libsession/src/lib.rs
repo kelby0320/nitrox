@@ -101,6 +101,23 @@ pub struct NamespaceSpec<'a> {
     pub home: &'a [u8],
     /// The user's name, snapshotted at `/session/user`.
     pub user: &'a [u8],
+    /// Bind `/system/fonts` into the session, read-only.
+    ///
+    /// **A graphical session needs a font and a constructed namespace has none.** Every GUI
+    /// client before M7 Part E ran with an inherited *root* namespace and read
+    /// `/system/fonts/DejaVuSansMono.ttf` from there; `desktop-shell` is the first to run in a
+    /// namespace someone built, and it could not find one — the symptom was a leader that
+    /// logged "up" and exited.
+    ///
+    /// **A flag rather than always**, symmetric with [`bind_console`](Self::bind_console) and
+    /// for the same reason: a serial session has no use for a font, and a member bound for
+    /// nothing is still authority held. `session-mgr/CLAUDE.md` states the rule — adding a
+    /// member to a session namespace is a design decision each time.
+    ///
+    /// The alternative was vendoring the font into each binary, which is what `nxterm`'s
+    /// *host tests* do. At ~347 KiB per application that scales badly, and it would put a
+    /// resource in the binary that the system already serves as a resource.
+    pub bind_fonts: bool,
     /// Bind `/dev/console` into the session.
     ///
     /// **False for a graphical session**, and that is a decision rather than an omission:
@@ -193,6 +210,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         tty_endpoint,
         home,
         user,
+        bind_fonts,
         bind_console,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
@@ -293,6 +311,31 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
             kprint(b"libsession: /dev/tty bind FAIL\n");
         }
         has_tty = tr == 0;
+    }
+
+    // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
+    // uses. Read-only by construction: a subtree bind forwards to the same registration, and
+    // nothing in the session has a writable handle to it.
+    if bind_fonts && fs_endpoint != 0 {
+        let sub = b"/system/fonts";
+        let base = b"/system/fonts";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let fr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                sub.as_ptr() as u64,
+                sub.len() as u64,
+                fs_endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if fr != 0 {
+            // Non-fatal: the session exists, its clients just cannot render text. Worth
+            // reporting rather than failing a login over.
+            kprint(b"libsession: /system/fonts bind FAIL (clients cannot render text)\n");
+        }
     }
 
     // `/dev/console` → a direct-handle bind of the console device (resolved from our own
@@ -453,7 +496,7 @@ static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [u64::MAX; 4],
     namespace: 0, // set at spawn = the session namespace
-    syscaps: 0,   // empty — the shell is sandboxed
+    syscaps: 0,   // set at spawn — see `spawn_leader`
 };
 
 /// The user's home *as seen from inside the session*.
@@ -497,7 +540,24 @@ pub fn session_env() -> libstream::wire::Record {
 /// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
 /// shell could not be spawned. This is the login's payoff: an unprivileged process in a
 /// per-user namespace, reaped by session-mgr.
-pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) -> i32 {
+/// **`syscaps` is the caller's to choose, and the two columns choose differently.** The serial
+/// leader gets `0` — `nxsh` is a sandboxed user shell and holds nothing. The graphical leader
+/// gets `SYSCAP_BIND_NAMESPACE`, because `desktop-shell` constructs a namespace per application
+/// it launches: `ui-composition-model.md` §5a rests the guarantee that "an application cannot
+/// compose other applications" on the shell being the process that built them.
+///
+/// That is what reconciles a process which both *serves* and *constructs* with
+/// [`syscaps.md`](../../../docs/architecture/syscaps.md) — the shell holds the capability to
+/// build application namespaces continuously, not to register itself once, and it does not
+/// bind its own endpoint at all (`graphical-session.md` §3).
+pub fn spawn_leader(
+    root_ns: u64,
+    session_ns: u64,
+    notif: u64,
+    program: &str,
+    syscaps: u64,
+    extra_handle: u64,
+) -> i32 {
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
 
     // `/bin/<program>`, resolved from the *supervisor's* namespace. The session's own `/bin`
@@ -522,6 +582,7 @@ pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) ->
     let h = unsafe {
         SPAWN_SHELL.image = image;
         SPAWN_SHELL.namespace = session_ns;
+        SPAWN_SHELL.syscaps = syscaps;
         SPAWN_SHELL.handles[0] = setup_shell;
         SPAWN_SHELL.arg0 = bootstrap_arg0(true);
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
@@ -548,6 +609,61 @@ pub fn spawn_leader(root_ns: u64, session_ns: u64, notif: u64, program: &str) ->
     let argv: &[&str] = &[program];
 
     let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
+    // **A second handle, after the setup message and only if there is one.**
+    //
+    // Only `handles[0]` of a `SpawnArgs` reaches a child, so anything past the setup channel
+    // has to arrive *over* it — `service-mgr` makes the same observation where it couriers
+    // endpoints. The graphical leader needs the compositor's forwarding endpoint: it builds a
+    // namespace per application and binds `/dev/draw/new` into each, and a *binding* is not
+    // re-bindable — it resolves to a kernel registration and never back to the endpoint.
+    //
+    // Ordered after the setup message, so a leader reads `argv` and its environment first and
+    // this second message is simply the next one on the same channel.
+    if sent.is_ok() && extra_handle != 0 {
+        // **Duplicated, because a handle on an IPC message is always a *move*.** `sys_channel_send`
+        // closes the sender's handle on success, so sending `extra_handle` directly would leave
+        // the caller's copy dead — and the caller reuses it for every later session. The symptom
+        // was every graphical login after the first getting no `/dev/draw` at all (PR #237
+        // review, finding 2).
+        // SAFETY: duplicating a handle the caller owns, with the rights a re-bind needs.
+        let moved = unsafe {
+            syscall2(SYS_HANDLE_DUPLICATE, extra_handle, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+        };
+        if moved < 0 {
+            kprint(b"libsession: could not duplicate the leader's extra handle\n");
+        } else {
+            // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
+            let r = unsafe {
+                // **Scrub the payload first.** This buffer is the crate's, and `authenticate`
+                // filled it with an `Authenticate` request — the username and password in the
+                // clear. Restamping only the header would send all `MSG_LEN` bytes anyway, so
+                // the leader would receive the login password and hold it in `.bss` for the life
+                // of the process. `desktop-session-mgr` volatile-zeroes its own stack copy two
+                // lines from here; handing the same bytes to a child instead would make that
+                // pointless (PR #237 review, finding 1).
+                SEND_MSG[PAYLOAD_OFF..].fill(0);
+                SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
+                SEND_MSG[8] = 1;
+                SEND_HANDLES[0] = moved as u64;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    setup_mgr,
+                    (&raw const SEND_MSG) as u64,
+                    (&raw const SEND_HANDLES) as u64,
+                    1,
+                    SENDMODE_NOBLOCK,
+                )
+            };
+            // Checked and reported, like `send_setup_env`'s result three lines up. Silence here
+            // is what made finding 2 invisible: the supervisor announced a session starting
+            // normally while the leader had been given nothing.
+            if r != 0 {
+                kprint(b"libsession: the leader's extra handle was not delivered\n");
+                // SAFETY: the send failed, so the duplicate is still ours.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, moved as u64) };
+            }
+        }
+    }
     // SAFETY: closing our end of the setup channel; the shell holds its own.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_mgr) };
     if sent.is_err() {

@@ -14,7 +14,8 @@
 //! the gap: `/dev/draw` is bound unscoped into init's root namespace, every graphical client
 //! inherits it, and resolves are classified by suffix with no caller identity. Namespace-based
 //! gating needs *per-client namespaces*, and the process that constructs them is `desktop-shell`
-//! — Milestone 7. See `TODO(manage-ungated)` and `docs/design/graphical-session.md` §3.
+//! — closed in M7 Part E, where `desktop-shell` binds `/dev/draw/new` alone into each
+//! application namespace. See `docs/design/graphical-session.md` §3.
 
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{

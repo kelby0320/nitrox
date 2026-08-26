@@ -17867,3 +17867,87 @@ services, so the greeter is bottom-most and the reference windows `check-display
 `check-terminal` depend on stack above it. It is also why `check-login` must boot the *release*
 image — in a `--selftest` boot the greeter holds no keyboard, so nothing typed would reach it.
 
+## 2026-08-25 — M7 Part E: a namespace per application, and a greeter that would not get out of the way
+
+`desktop-shell` becomes the graphical session's real leader: a `panel` top bar, an applications
+modal listing what `/bin` projects, a namespace built and **checked** per launch, and a program
+spawned into it. `manage-ungated` closes.
+
+**The narrow bind was the whole answer, and it needed nothing new.** An application's namespace
+binds `/dev/draw/new` as its own path with subtree base `/new`: the exact resolve forwards
+`new`, while `/dev/draw/manage` is not a component-boundary prefix match against it. A first
+draft of the milestone specified a second forwarding endpoint on the reasoning that the
+compositor classifies by suffix with no caller identity — both premises true, conclusion false,
+because what a namespace can *reach* is decided by what it binds.
+
+**The shell verifies the gate before launching through it, and refuses if it is open.** That is
+behaviour rather than a test: the bind rests on a kernel matching rule the shell does not own,
+and an application that *can* reach `manage` never says so, so nothing downstream would notice.
+
+**Three plumbing facts, all the same fact.** A *binding* is not re-bindable — it resolves to a
+kernel registration and never back to an endpoint. So the compositor endpoint had to travel to
+the shell (over its setup channel, since only `handles[0]` of a `SpawnArgs` reaches a child); a
+constructed session had no font until `NamespaceSpec` gained `bind_fonts`; and an application
+namespace still has none, which is Part F's to fix by the same trip.
+
+**A negative control found a real bug, and it was not the one being controlled.** Forcing a
+dropped PS/2 packet made a click land at (160, 112) instead of the top bar — on the **greeter**,
+which was still mapped at the origin behind the running session. Raising it covered the shell's
+bar, and every later click went to a window that was not reading. `graphical-session.md` says the
+greeter *outlives* each session; that is about the **process**, and the window has to go. It is
+now destroyed for the duration of a session and recreated after — the protocol has no "hide", and
+recreating is what M6's initial-configure handshake is already built for.
+
+**The click is self-correcting now, using a receipt the protocol already emitted.** PR #232 tried
+reporting the pointer position per *motion* and it cost too much in the compositor's input path;
+the compositor already reports every **press**, so the gate positions, clicks, and retries if the
+press did not land where it aimed. No guest change at all. The first full run of this gate had
+already flaked exactly this way, with `input batch DROPPED (SYN_DROPPED)`.
+
+**`/dev/desktop` is deferred rather than built — `TODO(desktop-endpoint)`.** The architectural
+half of that box is done and demonstrated: the shell does not bind its own endpoint and holds
+`BIND_NAMESPACE` to construct application namespaces continuously. The binding itself has no
+consumer, and an endpoint nobody resolves is the shape this milestone has already shipped three
+times — the title cap, `bind_console`, the two-client claim. It also costs more than it looks:
+the shell would send `Meta::Ready` to a supervisor blocked reaping it, so `spawn_leader` would
+have to wait for a ready before reaping — a change to the shared core for a graphical-only need.
+
+**Window placement policy is not done**, and Part E's first box is ticked only in half. The shell
+does not hold `/dev/draw/manage`, so the initial-configure hold is still skipped and nothing
+places a launched window. Recorded in the plan as what remains rather than ticked through.
+
+## 2026-08-25 — M7 Part E closes: the compositor gets its first real manager
+
+`desktop-shell` now holds `/dev/draw/manage` and places the windows it is told about. Everything
+M6 built for a manager — placement, restacking, focus, the initial-configure hold, the five
+manager events — had been exercised by a test client until this.
+
+**Holding the channel is the other half of what closed `manage-ungated`.** The shell's session
+namespace binds the `/dev/draw` subtree and therefore reaches `manage`; an application's binds
+`/dev/draw/new` alone and does not. The asymmetry is the capability, and the first-come rule
+becomes a second line of defence rather than the only one.
+
+**It does not stop being load-bearing, which an earlier draft of this entry claimed.** The two
+refusals are not interchangeable: once a manager is held, a second `manage` resolve is answered
+`WouldBlock` — meaning it *reached the compositor* — while a correctly narrow namespace returns
+`NotFound` from the kernel without the compositor seeing it. A check that treats any error as
+"withheld" therefore passes for exactly the mis-construction it exists to catch, which is what
+the shell's launch-time verification did until review demonstrated it by widening the namespace
+on that path alone and watching the gate go green (PR #237 review, finding 3).
+
+**Attaching a manager changes the compositor's behaviour, which is why the top bar is created
+first.** A `normal` window's first `Configure` is held until the manager acts, so a `panel`
+created after this would have been waiting on a manager that was itself waiting to draw.
+
+**Placement is exercised, and I checked rather than assumed.** `whoami` has no window, so the
+launch path alone proves nothing about placing — but every window created while a manager is
+attached is announced to it, including the shell's own applications modal. Confirmed by asserting
+a placement and watching it pass, then negative-controlled by removing the `place_new_windows`
+call: the gate fails. Without that check this would have been the fifth capability this milestone
+shipped that nothing reached.
+
+**What is deferred, and why it is not the same thing.** `/dev/desktop` — `TODO(desktop-endpoint)`
+— has no consumer, so building it would be exactly the shape above. The architectural claim of
+that box is separately true and demonstrated: the shell binds no endpoint of its own and holds
+`BIND_NAMESPACE` to construct application namespaces continuously.
+
