@@ -2008,12 +2008,16 @@ also reach the focused window.
 
 ### Part C — the bottom bar and the window list
 
-- [ ] **A second panel, docked `Bottom` with a strut.** The mechanism exists — the top bar
+- [x] **A second panel, docked `Bottom` with a strut** ✅ — and created *after* the manager
+      is held, unlike the top bar. A dock edge tells the compositor what to reserve; it does not
+      move the window, so a bottom bar has to be **placed**, and only a manager can place. The mechanism exists — the top bar
       already reserves space this way — so this is the shell managing two panel windows rather
       than new substrate. It closes half of what `desktop-shell.md`'s Status line lists as not
       built.
 
-- [ ] **The window list, from events the shell already receives.** `WindowCreated`,
+- [x] **The window list, from events the shell already receives** ✅ — and the shell had been
+      **discarding three of the four**: `place_new_windows` read every manager event and acted
+      only on `WindowCreated`. Desktop filtering is Part D's, since nothing switches yet. `WindowCreated`,
       `WindowDestroyed` and `WindowFocus` have been in hand since M6 Part B, which shipped four
       of its five events, and `WindowTitle` since M7 Part A, which closed the fifth
       (`TODO(m6-b3b-titles)`) — all four are in hand today; the
@@ -2021,15 +2025,22 @@ also reach the focused window.
       raises and focuses. The focused window is shown as such — the first thing in the shell
       that reflects compositor state continuously rather than at a moment.
 
-- [ ] **Minimize and restore, from the window list.** Added 2026-08-26. The list is already this
+- [x] **Minimize and restore, from the window list** ✅ — clicking the focused entry puts its
+      window away, clicking any other brings it forward, and `Super+H` does the first without
+      reaching for the bar. The chord is Part B's mechanism getting its first real consumer. Added 2026-08-26. The list is already this
       part's work and it is exactly the right restore path — it is the answer to "where did my
       window go", which is the question minimize otherwise leaves unanswered. A minimized window
       stays listed and is shown as minimized; clicking it restores and focuses. Without a title
       bar there is no minimize *button* yet, so the gesture is the list entry and a hotkey; the
       button arrives with decorations in M9.
 
-- [ ] **`check-display`'s reference render is updated in the same change**, not after: a new
-      permanent bar changes every screen the display gate compares.
+- [x] **The gate that sees the bar is `check-login`, not `check-display`** ✅ — the box had this
+      wrong and the premise is worth recording. `desktop-shell` runs only in a **session**, and a
+      `--selftest` boot never logs in, so the shell's bars have never been on `check-display`'s
+      screen; its reference render needed no change and got none. Verified rather than assumed:
+      the only `desktop-shell` line in a `check-display` run is the one saying it was *built*.
+      The bottom bar, the window list, minimize, restore and the chord are all asserted in
+      `check-login`, which boots a release image and logs in.
 
 ### Part D — desktops in the shell
 

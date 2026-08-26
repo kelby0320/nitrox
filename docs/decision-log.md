@@ -18436,3 +18436,101 @@ which does not care which field collides. And `TODO(focus-change-key-balance)` i
 shape the reviewer named without filing: a key held across a focus change is delivered to one
 window and released to another. Harmless today only because `KeyEvent` carries `modifiers` on
 every record, so no client accumulates them.
+
+## 2026-08-26 — Milestone 8 Part C: the bottom bar, and three events the shell had been throwing away
+
+A second panel across the foot of the screen, listing every `normal` window: click one to bring
+it forward, click the focused one to put it away, or press `Super+H`. It is the first thing in
+the shell that reflects compositor state **continuously** rather than at a moment.
+
+**The shell was already being told everything it needed, and discarding most of it.**
+`place_new_windows` read every manager event and acted on `WindowCreated` alone — `Destroyed`,
+`Title` and `Focus` fell through its `_ => continue`. Those four are exactly the facts a taskbar
+shows, which is why the window list needed no new protocol: a shell that polled
+`/dev/draw/<id>/info` for them would be keeping a second copy of the stack and racing it.
+
+**A bottom bar has to be placed, and only a manager can place** — so it is created *after* the
+manager channel is taken, where the top bar is deliberately created before. A `panel`'s dock edge
+tells the compositor how much space to reserve; it does not move the window. The top bar goes
+first precisely because a panel created while no manager exists is not held, and this one goes
+second for the opposite reason.
+
+**Then the shell placed its own bar on top of itself.** Every window created while a manager is
+attached is announced to it, the shell's own included — so the cascade moved the bar it had just
+placed at the foot of the screen up to `0,24`, under the top bar. Only `normal` windows are held
+for a manager and only they want placing: a `panel` positions itself and a `popup` is placed by
+its creator. The drain skips both now.
+
+**And that exposed an assertion that had never proved what it claimed.** `check-login` asserted
+`desktop-shell: placed window ` immediately after the applications modal opened, with a comment
+about a `normal` window's held `Configure` and applications that would otherwise be invisible.
+The line it actually matched was the *modal* being placed — a `popup`, placed by its creator,
+never held for anyone. So the claim was true of a window the assertion was not looking at, and it
+went green for two milestones. It now asserts against the launched terminal, after the modal
+closes.
+
+**One channel wants one reader.** The chord did nothing at first, and the reason took a boot to
+see: `place_new_windows` drains the manager channel, and a second helper drained it again for
+`Hotkey` events — finding nothing, because the first loop had already read them and fallen
+through. Two drains on one channel do not share; the second simply does not see what the first
+consumed, and says nothing about it. The hotkey arm lives in the one drain now.
+
+**The gate that sees the bar is `check-login`, and the plan said `check-display`.** The box read
+"`check-display`'s reference render is updated in the same change: a new permanent bar changes
+every screen the display gate compares". It does not: `desktop-shell` runs only in a **session**,
+and a `--selftest` boot never logs in — so the shell's bars have never been on that gate's
+screen. Checked rather than assumed: the only `desktop-shell` line in a `check-display` run is
+the one saying it was built. The premise was wrong when the box was written, in the details pass,
+and nothing since had needed to notice.
+
+Three controls, each run: placing the shell's own windows again (the bar lands under the top one
+and the list click hits nothing), ignoring `WindowFocus` (nothing is ever marked focused, so
+clicking raises instead of minimizing), and dropping the `Hotkey` arm (the chord does nothing).
+Each fails exactly its own assertion.
+
+## 2026-08-26 — PR #242 review: a shell that waited on itself, and a title nothing ever set
+
+Nine findings. The blocking one is the most instructive thing in Part C.
+
+**The bottom bar deadlocked the shell against its own manager hold.** It was created *after*
+`manage()`, on the reasoning that it has to be placed and only a manager can place. But a `panel`
+is held for the manager exactly like a `normal` window — only a `popup` is exempt — and
+`Session::create` blocks until the first `Configure` arrives. So the shell parked inside `create`,
+unable to drain the manager channel and therefore unable to send the `Place` that would have
+released it. **Only the 200 ms configure deadline broke the tie**, and every session start paid
+it. `Place` works on an already-created window, so the create belongs beside the top bar where
+nothing is held; only the placement waits.
+
+**The second cost is the one worth remembering.** `no manager answer for window N; showing it`
+exists to name a wedged or absent manager — "a wedged or slow shell must delay a window, never
+lose it". It began firing on every healthy boot, so it stopped being a signal, and nothing
+asserted its absence. `check-login` now fails if it appears at all. A timer built for broken
+managers had acquired its first well-behaved client, and the only evidence was a line nobody was
+reading.
+
+**`SetTitle` shipped in M7 Part A with no way for a client to send one.** The compositor stored
+titles, `WindowTitle` reported them, the spec documented the truncation rule — and `libsurface`
+exposed no wrapper, so every title was empty, the event was never emitted, and Part C's window
+list read `window 6` for every entry. The shell's title arm was code no boot could reach.
+`Window::set_title` exists now and `nxterm` names itself, which makes the bar show `nxterm` and
+gives that arm its first gate. A capability with no consumer for a milestone and a half, found by
+someone asking what the list would actually display.
+
+**`WindowDestroyed`'s arm still has no gate**, and cannot get one cheaply: no gate closes a
+`normal` window inside a session, because the only way to close the launched terminal is through
+its shell, which draws into the grid — and the grid renders only under `test-harness`. Recorded
+rather than papered over.
+
+Also fixed: `Super+H` searched past `MAX_ENTRIES`, so a window the bar could not show could be
+minimized and never restored — the exact outcome that bound exists to prevent, with the chord
+invalidating the bound's own justification. The bar's repaint kept its own buffer index and
+advanced it even when the commit did not go out, which inverts the phase and thereafter writes
+into the buffer being displayed; it uses `acquire` now, as `present_modal` twelve lines below
+already did. Request bodies are sized from their types rather than hand-written lengths, and the
+hotkey path no longer skips both its success *and* its failure line when a body will not
+serialise. `place_new_windows`' 256-byte buffer was four bytes short of a maximum title, which
+silently truncated and left a stale label forever, since titles are re-sent only on change.
+`raise_window` returns whether it worked instead of logging success unconditionally, and sends
+`MgrWindowRef` — the shape `dispatch` actually parses — rather than one that matched only because
+a field happened to be zero. And the loop no longer blocks with manager events parked inside the
+transport after a request.

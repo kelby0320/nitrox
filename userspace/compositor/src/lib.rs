@@ -862,7 +862,7 @@ impl WindowStack {
         // mutable state a manager changes over the window's life.
         info.desktop = w.desktop;
         if w.minimized {
-            info.flags |= librsproto::surface::WINDOW_FLAG_MINIMIZED;
+            info.flags |= WINDOW_FLAG_MINIMIZED;
         }
         Some(info)
     }
