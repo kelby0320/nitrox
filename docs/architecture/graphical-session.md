@@ -179,13 +179,28 @@ them as support without noticing (PR #193 review, finding 4):
 *ordinary* resource server, and the reason given is that it would otherwise register itself. So the
 property to preserve is not "the shell must not serve" but:
 
-> **`desktop-shell` does not bind its own endpoint.** `desktop-session-mgr` binds `/dev/desktop`
-> into the session namespace, exactly as `init` binds the tty server's endpoint and `session-mgr`
-> binds `/dev/tty`. The shell holds `BIND_NAMESPACE` to construct *application* namespaces —
-> continuously, as its job — not to register itself once.
+> **`desktop-shell` does not register itself.** It holds `BIND_NAMESPACE` to construct
+> *application* namespaces — continuously, as its job — not to make itself reachable once.
 
-That keeps the RS startup protocol intact: the shell sends `Meta::Ready` with its endpoint and a
-supervisor binds it, like every other server in the system.
+**Amended 2026-08-26; the substance held and the mechanism did not.** This block used to read
+"does not bind its own endpoint", and said `desktop-session-mgr` would bind `/dev/desktop` into
+the session namespace exactly as `init` binds the tty server's — the shell sending `Meta::Ready`
+and a supervisor binding it, like every other server. Planning Milestone 8 Part F found that
+mechanism has **no consumer**: the session namespace is the shell's own and nothing else runs in
+it, so the binding would exist for nobody. What actually needs to reach `/dev/desktop` is an
+application — a `desktop` command under a terminal's shell — and an application's namespace is
+one the shell *constructs*, where it already binds five endpoints.
+
+So the shell binds its own endpoint **into the namespaces it constructs**, and none into the
+session namespace. The prohibited act is a resource server making itself reachable in a namespace
+a supervisor owns; deciding what a child it created may reach is the constructor role, which this
+process already has and already exercises. It also removes a cost
+[`deferred-decisions.md`](../rationale/deferred-decisions.md) had named against this box: no
+`Meta::Ready` handshake, and no change to `spawn_leader` to wait for a ready before it reaps.
+
+**Status: not built.** Neither binding exists today —
+[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 8 Part F is where it lands,
+together with the consumer that proves the resolve works.
 
 **Two things follow, and both are consequences rather than free.** The trusted set widens — a
 `BIND_NAMESPACE` holder that also draws on screen and parses input is a larger, more exposed

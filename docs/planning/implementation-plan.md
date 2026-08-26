@@ -93,8 +93,15 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     *graphical* user in or spawns the desktop shell. That column is specified now in
     [docs/architecture/graphical-session.md](../architecture/graphical-session.md), and the milestones above
     M5 changed shape — M6 is window management, **M7 is the graphical session** (new), M8 is
-    desktops and the overview, M9 applications and drag-and-drop between them. (M8/M9 were
-    rescoped 2026-08-21 when durable window-to-window wiring was cut — see the decision log.)
+    desktops and the overview — **detail-passed 2026-08-26**, six parts plus minimize, with the
+    desktop lifecycle, sticky windows and windows-on-no-desktop settled. **M9 (new, 2026-08-26)
+    is window decorations and interaction** — drag-to-move, maximize, snap to edge and corner —
+    inserted ahead of applications because an interactive drag needs somebody to own a grab
+    region, so decorations are snap's prerequisite rather than polish after it. M10 is
+    applications and drag-and-drop between them; M11 is themes and visual polish. (Desktops and
+    the applications milestone — M8, and what is now M10 — were rescoped 2026-08-21 when durable
+    window-to-window wiring was cut; the milestone numbered 9 on that date is today's M10. See
+    the decision log.)
     Design in
     [docs/design/display-substrate.md](../design/display-substrate.md) +
     [docs/design/ui-composition-model.md](../design/ui-composition-model.md);

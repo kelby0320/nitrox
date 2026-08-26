@@ -313,8 +313,21 @@ Two properties keep it a workspace rather than a cage:
 - **Windows move between desktops** — one attribute change (§2a), since membership lives only
   in the compositor.
 
-Two cases are named but not settled: a window on **no** desktop (just created, or mid-move), and
-**sticky** windows on all desktops, which every DE has and which breaks a plain 1:1.
+Two cases were named but not settled; **both are settled by Milestone 8's details pass
+(2026-08-26)**, in [`display-arm-plan.md`](../planning/display-arm-plan.md):
+
+- **A window on no desktop does not exist.** A window is assigned to the current desktop when it
+  is created, and moving it is a single attribute write — so the transient this worried about
+  ("just created, or mid-move") is never observable. Removing the state is cheaper than
+  specifying what renders it.
+- **Sticky is `desktop = 0`**, reserved in the attribute now even though the UI to set it may
+  land later. Rendering is `w.desktop == 0 || w.desktop == current`, which is the whole of the
+  break in the 1:1 — one comparison, not a second membership model.
+
+**Lifecycle, also settled 2026-08-26: naming pins a desktop.** An unnamed empty desktop is
+removed; a named one is kept; the list always ends with one empty unnamed desktop to create into.
+This makes "name it if it turns out to matter", above, the lifecycle rule itself rather than a
+separate mechanism.
 
 A third — **dialogs** — is settled by revision 3. It was "genuinely *on* a desktop and should be
 listed, but the canvas should not offer it as a wirable node", which was a filter by `role`
@@ -330,9 +343,10 @@ Still open, from this document:
   designed for a mechanism that no longer exists. Naming, stream-versus-message, what happens when
   nothing is listening, and which server owns the path are all unsettled. This is the live
   question in this document.
-- **Sticky windows and windows on no desktop** (§6). The *dialog filtering* half of this question
-  is gone with the canvas — a `dialog` is now distinguished by being listed and parented, not by
-  what a canvas declines to offer.
+- ~~**Sticky windows and windows on no desktop**~~ (§6) — **answered 2026-08-26** by Milestone 8's
+  details pass: sticky is `desktop = 0`, and a window is never on no desktop. The *dialog
+  filtering* half of this question had already gone with the canvas — a `dialog` is distinguished
+  by being listed and parented, not by what a canvas declines to offer.
 
 Answered or made moot by revision 3:
 

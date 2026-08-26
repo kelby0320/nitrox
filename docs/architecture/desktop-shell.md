@@ -188,12 +188,16 @@ a role into a shipped protocol is the kind of change that touches every client.
 
 ## 9. Open questions
 
-- **Desktop lifecycle — shelved, not decided.** GNOME 3 auto-removes a workspace when it empties;
-  an explicit "new empty desktop" button implies desktops live until closed. The two fight, and
-  the maintainer has deliberately deferred choosing. The argument that used to settle it — saved
-  desktops pulling toward explicit lifecycle, since a template-instantiated desktop vanishing
-  would surprise — went with templates in composition revision 3, so the question is now open on
-  its own terms.
+- ~~**Desktop lifecycle — shelved, not decided.**~~ **Decided 2026-08-26: naming pins it.** GNOME
+  3 auto-removes a workspace when it empties; an explicit "new empty desktop" button implies
+  desktops live until closed. The two fight, and the argument that used to settle it — saved
+  desktops pulling toward explicit lifecycle — went with templates in composition revision 3, so
+  the question came back open on its own terms. The answer uses the naming that
+  [`ui-composition-model.md`](../design/ui-composition-model.md) §6 already had: an **unnamed**
+  empty desktop is removed, a **named** one is kept, and the list always ends with one empty
+  unnamed desktop to create into. A scratch desktop costs nothing and cleans itself up; a
+  purposeful one survives its last window closing; and a name a user deliberately set is never
+  discarded, which was GNOME 3's surprise. Built in Milestone 8 Part D.
 - **The system tray is v2.** It is an *inter-process protocol* — applications register icons and
   receive click callbacks — and that is real scope, not a widget.
 - **Does the launcher search beyond programs?** Files and open windows are the obvious

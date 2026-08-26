@@ -379,10 +379,28 @@ It also costs more than it looks: the shell would have to send a `Meta::Ready` b
 supervisor that is blocked reaping it, so `spawn_leader` would need to wait for a ready before
 reaping — a change to the shared session core for a graphical-only need.
 
+**That cost is gone, 2026-08-26, because the binding it belonged to is not the one being built.**
+It assumed a *supervisor* binding `/dev/desktop` into the session namespace, which is what
+`graphical-session.md` §3 specified. Planning M8 Part F found that binding has no consumer — the
+session namespace is the shell's own — while the thing that does need to resolve the path is an
+application, whose namespace the shell **constructs**. So the shell binds its endpoint there
+directly, no handshake is needed, and `spawn_leader` is untouched. The entry's argument is
+unchanged and still decides the case; only one of its two costs turned out to be an artefact of
+the wrong mechanism.
+
 Trigger: **the first process that resolves `/dev/desktop`** — an application talking to the shell,
 which is Part F's `nxterm` or the ports work in
 [`ui-composition-model.md`](../design/ui-composition-model.md). At that point the consumer and
 the binding land together and each can be checked against the other.
+
+**Trigger fired 2026-08-26, and the resolution is scheduled with its consumer attached.** M7 Part
+F's `nxterm` did *not* fire it — a launched terminal resolves `/dev/tty`, `/bin` and `/home`, and
+never needs to talk to the shell. Milestone 8's details pass does: desktops give `/dev/desktop`
+something to serve (`new`, `current`, `N/info`, `N/windows/`), and the plan puts the binding and
+its first consumer — a small `desktop` command — in the **same part** (M8 Part F), precisely so
+this entry's own argument is honoured rather than merely cited. If that command slips, the
+binding slips with it; a bound endpoint nothing resolves is the shape this entry exists to
+refuse.
 
 **`/svc/auth` is reachable by every process — `TODO(svc-auth-ungated)`.** M7 Part C bound
 `auth-service` at `/svc/auth` so two supervisors can each hold a session, and bound it into the
