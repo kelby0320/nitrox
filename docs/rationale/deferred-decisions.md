@@ -760,6 +760,28 @@ holding by construction rather than by care. Nothing `logind`-shaped is needed, 
 for two sessions forecloses one later. See
 [`graphical-session.md`](../architecture/graphical-session.md) §6.2 for the costs accepted.
 
+**A key held across a focus change is never released — `TODO(focus-change-key-balance)`.** A
+press goes to whoever is focused; if focus moves before the release, that release goes to a
+different window or to none, and the first is left believing the key is still down. Reachable
+since M8 Part A made a desktop switch move focus, and reached routinely by M8 Part B's own
+chords: `Super+F1` delivers `meta_l` down to the focused window, empties the current desktop, and
+`meta_l` up then arrives with no focus candidate at all.
+
+**Harmless today, and the reason is specific rather than lucky.** `KeyEvent` carries `modifiers`
+on **every** record, so no client accumulates held-modifier state of its own — a window that
+believes `Super` is down learns otherwise from the next keystroke it receives. It bites the first
+time something reads key state rather than per-event modifiers: a game, a chorded shortcut inside
+an application, or anything that draws a caret differently while a key is held.
+
+**Named rather than fixed because the answer is a policy question, not an edit.** The compositor
+could synthesise a release to the departing window, as it now does for a pointer grab broken by a
+window leaving the screen (PR #240 review) — the shapes are identical. But a pointer grab is a
+sequence the compositor *granted*, while keyboard focus is a property it merely reports, and
+synthesising releases for every key held across every focus change is a larger claim about what
+focus means. Trigger: the first client that tracks held keys, or M9's decorations, where a drag
+that starts on a title bar will raise the same question for the keyboard. Identified in PR #241
+review, answer 4.
+
 **A scrollbar's grab offset — `TODO(scroll-grab)`.** `ScrollState::offset_at` puts the thumb's
 *centre* under the cursor, so grabbing a thumb near either of its ends makes it jump by up to
 half its length before the drag begins. Every toolkit that avoids this remembers where within

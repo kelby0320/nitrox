@@ -723,20 +723,28 @@ could impersonate the launcher — take the chord that opens the applications mo
 own window instead. The capability is holding `/dev/draw/manage`, which is one holder at a time
 and which an application's namespace does not bind.
 
-### `Hotkey` (`0x091F`)
-
-Event, 8 bytes: the same `MgrHotkey` body — `id`, `mods`, `code`. Sent to the manager when a
-registered chord is **pressed**.
-
-**A matched chord is consumed, not copied.** The focused window receives neither the press nor
-its release. Delivering both would make every hotkey also type into whatever has the keyboard —
+**A matched chord is consumed, not copied.** The focused window receives **no record of it at
+all**: not the press, not its release, and not the key repeat a held press would otherwise arm.
+Delivering any of them would make every hotkey also type into whatever has the keyboard —
 `Super+2` would switch desktops *and* put a `2` in the terminal.
 
-**The release is swallowed by keycode, not by re-matching.** A user who lets go of `Super`
-before `2` releases a chord that no longer matches, so a compositor that re-tested the modifiers
-on release would deliver a release for a press the window never saw — the same defect as handing
-a broken pointer grab's release to the window underneath. The compositor remembers which
-keycodes it consumed and swallows their releases whatever the modifiers then say.
+Three rules make that true, and each exists because a simpler version was wrong:
+
+- **The release is swallowed by keycode, not by re-matching.** A user who lets go of `Super`
+  before `2` releases a chord that no longer matches, so a compositor that re-tested the
+  modifiers on release would deliver a release for a press the window never saw.
+- **A key already down cannot begin a chord.** Pressing `2` alone and *then* holding `Super`
+  makes the repeat of `2` match — and that press was already delivered, so swallowing its
+  release would leave the window a press it never saw released. A chord fires on the transition
+  into it.
+- **A consumed press arms no key repeat.** Repeat is armed from the physical transition, so
+  without this a chord held past the repeat delay delivers its key to the focused window and
+  keeps doing so — bypassing routing entirely, since repeats are enqueued to the focused
+  session directly.
+
+**Every registered chord is forgotten when the manager channel closes.** The table is routing
+policy its holder asked for; left behind, chords would go on being consumed and delivered to
+nobody, and a replacement manager would inherit ids it did not choose.
 
 ### What is on screen
 
@@ -775,7 +783,7 @@ the cursor is entered normally.
 A window that has been **destroyed** gets none of this: it is unreachable, so its id is simply
 forgotten. The suppression above still applies, because the sequence has still lost its owner.
 
-## Manager events (`0x0918`–`0x091C`)
+## Manager events (`0x0918`–`0x091C`, `0x091F`)
 
 Sent by the compositor **to** the manager channel, unsolicited. They are records, not
 requests: there is no reply, and the manager cannot refuse one.
@@ -807,6 +815,12 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's committed rectangle changed — place *or* commit |
 | `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
 | `0x091C` | `WindowTitle`    | window id + UTF-8   | A window's title changed — see *Titles* below  |
+| `0x091F` | `Hotkey`         | `MgrHotkey`         | A registered chord was **pressed** — see [`RegisterHotkey`](#registerhotkey-0x091e) |
+
+`Hotkey` is numbered after the block above because it was added later; it is a manager event
+like the rest. Its body is the same `MgrHotkey` the registration carried, echoed back — the
+manager already knows the chord by the id it chose, and echoing `mods` and `code` costs four
+bytes and lets a manager that lost track tell them apart.
 
 `WindowCreated` fires when the window is created, **before** its client has committed anything
 — that is what lets a manager place a window before it is first seen.

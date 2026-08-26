@@ -1975,15 +1975,17 @@ also reach the focused window.
 
 ### Part B — global hotkeys
 
-- [x] **`RegisterHotkey(mods, code)` on the manager channel** ✅ — the *manager* picks the
-      id, the way a client picks a buffer id, so the reply needs no body., answered with an id, and a
-      `Hotkey` event carrying it. Capability-gated by construction: the manager channel is the
-      only place the request is accepted, and `verify_app_namespace` already proves an
-      application cannot reach it.
+- [x] **`RegisterHotkey(mods, code)` on the manager channel** ✅, answered with an empty body
+      and a `Hotkey` event carrying the chord back. **The manager picks the id**, the way a
+      client picks a buffer id, so the reply needs to carry nothing. Capability-gated by
+      construction: the manager channel is the only place the request is accepted, and
+      `verify_app_namespace` already proves an application cannot reach it.
 
-- [x] **A registered chord is consumed** ✅, not duplicated — and its **release is swallowed
-      by keycode**, not by re-matching, since letting go of `Super` before the key releases a
-      chord that no longer matches. The compositor matches before focus
+- [x] **A registered chord is consumed** ✅, not duplicated — and the focused window gets **no
+      record of it at all**: not the press, not the release, and not the key repeat a held press
+      would otherwise arm. Three rules, each because a simpler version was wrong: the release is
+      swallowed by keycode rather than by re-matching; a key already down cannot begin a chord;
+      and a consumed press arms no repeat (PR #241 review, blocking 1). The compositor matches before focus
       routing and does not also deliver the key to the focused window — with a test that types
       the chord into a focused text field and asserts nothing lands in it.
 

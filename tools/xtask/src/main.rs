@@ -1238,6 +1238,13 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     for want in ["desktop 2", "desktop 1"] {
         qmp.send_key("meta_l", true)?;
         qmp.send_key("f1", true)?;
+        // **Held past the repeat delay, which is the whole of what the first version missed.**
+        // Repeat is armed from the *physical* transition, so a consumed chord used to arm one
+        // anyway and deliver its key to the focused window 400 ms later, bypassing the router
+        // entirely. Injecting down-and-up back to back never reached that timer, so the gate was
+        // blind to it — `input-testclient` logs repeats like any other key, so holding the chord
+        // is all that was needed (PR #241 review, blocking 1). `REPEAT_DELAY_NS` is 400 ms.
+        std::thread::sleep(std::time::Duration::from_millis(700));
         qmp.send_key("f1", false)?;
         qmp.send_key("meta_l", false)?;
         // **The positive half, and it is what makes the absence at the end mean anything.**
@@ -1245,6 +1252,18 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
         // would produce the same silence as one correctly consumed.
         session.expect(&format!("ui-testclient: hotkey fired -> {want}"))?;
     }
+    // **And a chord whose action moves nothing, held past the repeat delay.** The two above
+    // switch desktops, which empties the current one — so `focus_candidate` becomes `None` and
+    // `fire_repeat` cancels itself, making this gate immune to a wrongly-armed repeat by
+    // coincidence of what the client does with the chord. `Super+Space` only prints, so focus
+    // stays where it is and a repeat that should not exist lands in the focused window's log.
+    qmp.send_key("meta_l", true)?;
+    qmp.send_key("spc", true)?;
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    qmp.send_key("spc", false)?;
+    qmp.send_key("meta_l", false)?;
+    session.expect("ui-testclient: quiet chord fired")?;
+
     // No wait for focus here: the compositor announces it back **between** the two chords, so
     // an expect placed after them scans forward past a line already emitted and times out. The
     // click assertions below are what depend on the window being back, and they say so.
@@ -1290,13 +1309,15 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     // its release — `win key` is the compositor's delivery and `widget key` is `libui`'s router
     // one layer above it, so checking both says the chord stopped at the compositor rather than
     // being dropped later by luck.
-    for line in ["win key code=59", "widget key code=59"] {
+    // 59 is F1, 57 is Space — the two chords this client registers.
+    for line in ["win key code=59", "widget key code=59", "win key code=57"] {
         if transcript.contains(line) {
             return Err(format!(
                 "input gate FAILED: a registered chord reached the focused window — the \
-                 transcript contains \"{line}\". `Super+F1` is registered by `ui-testclient`, so \
-                 the compositor must consume both its press and its release; delivering them \
-                 makes every hotkey also type into whatever has the keyboard"
+                 transcript contains \"{line}\". `ui-testclient` registers `Super+F1` (59) and \
+                 `Super+Space` (57), so the compositor must consume each chord's press, its \
+                 release, and any repeat armed from it; delivering any of them makes every \
+                 hotkey also type into whatever has the keyboard"
             )
             .into());
         }

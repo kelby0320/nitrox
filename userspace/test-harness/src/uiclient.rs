@@ -1503,7 +1503,7 @@ fn park(notif: u64) -> ! {
 /// comes back — a compositor that filtered a window out permanently, or lost its buffer on the
 /// way, would pass a one-way check and fail this one.
 fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
-    use libkern::abi::KEY_F1;
+    use libkern::abi::{KEY_F1, KEY_SPACE};
     use librsproto::surface::{MOD_META, MgrHotkey, OP_MGR_HOTKEY, OP_MGR_REGISTER_HOTKEY};
     let _ = notif;
 
@@ -1528,6 +1528,23 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
     if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok() {
         fail(b"ui-testclient: a duplicate hotkey id was ACCEPTED\n");
     }
+    // **A second chord whose action moves nothing**, and it exists for one reason: key repeat.
+    // A consumed chord must not arm a repeat, and the only gate that can see that is one where
+    // the chord is *held* — but `Super+F1` empties the current desktop, so `focus_candidate`
+    // becomes `None` and `fire_repeat` cancels itself. The gate was immune by coincidence of
+    // what this client did with the chord, which is why the control passed against a compositor
+    // that did arm one (PR #241 review, blocking 1). This chord only prints, so focus is
+    // untouched and a wrongly-armed repeat reaches the focused window and is logged there.
+    const QUIET_ID: u32 = 0x8002;
+    let quiet = MgrHotkey { id: QUIET_ID, mods: MOD_META, code: KEY_SPACE };
+    let mut body = [0u8; 8];
+    if quiet.write(&mut body).is_none() {
+        fail(b"ui-testclient: could not encode the quiet chord\n");
+    }
+    let mut reply = [0u8; 8];
+    if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_err() {
+        fail(b"ui-testclient: registering the quiet chord was refused\n");
+    }
     kprint(b"ui-testclient: hotkey registered, waiting\n");
 
     let mut current: u32 = 1;
@@ -1538,6 +1555,11 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
                 let Some(got) = MgrHotkey::read(&buf[..n]) else {
                     fail(b"ui-testclient: a Hotkey event did not decode\n");
                 };
+                if got.id == QUIET_ID {
+                    // Nothing is changed on purpose — see where it is registered.
+                    kprint(b"ui-testclient: quiet chord fired\n");
+                    continue;
+                }
                 if got.id != HOTKEY_ID {
                     fail(b"ui-testclient: a Hotkey event named a chord we never registered\n");
                 }

@@ -978,7 +978,8 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let mut logical = [libinput::Logical::Dropped; libinput::MAX_PER_GROUP];
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
-                restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+                let routed = srv.router.route(l, &mut srv.stack, &mut out);
+                restacked |= routed.restacked;
                 // **Drained per event, not per batch.** A chord and the window events it
                 // causes have to reach the manager in the order they happened, and the
                 // manager acts on this batch before the next one is routed.
@@ -1038,7 +1039,16 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                 // Repeat follows the *physical* key, so it is armed from the interpreted
                 // transition rather than from what the router decided to do with it: a key
                 // that reached no window still stops repeating when it comes up.
-                if let libinput::Logical::Key { keycode, pressed, modifiers } = *l {
+                //
+                // **Except a key the router consumed**, which is the one case where "reached no
+                // window" is a decision rather than an accident. A registered chord that armed a
+                // repeat would deliver its key to the focused window 400 ms later and 25 times a
+                // second after that — bypassing the router entirely, since `fire_repeat` enqueues
+                // straight to the focused session. Holding `Super+1` while already on desktop 1
+                // filled the terminal with `1`s (PR #241 review, blocking 1).
+                if let libinput::Logical::Key { keycode, pressed, modifiers } = *l
+                    && !routed.consumed
+                {
                     srv.repeat = compositor::Repeat::after_key(
                         srv.repeat,
                         keycode,
@@ -1361,13 +1371,17 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                         .end();
                     reply_on_session(ch, op, request_id, &[]);
                 }
-                Err(e) => {
-                    let err = match e {
-                        compositor::input::HotkeyError::ZeroId => KError::InvalidArgument,
-                        _ => KError::WouldBlock,
-                    };
+                Err(_) => {
+                    // **`InvalidArgument` for all three, which is what the spec publishes and
+                    // what `surface_errno` maps `Rejected` to for every other request here.**
+                    // The first version answered a duplicate id and a full table with
+                    // `WouldBlock` — and this server uses `WouldBlock` for a genuinely
+                    // transient condition, a `manage` resolve arriving while another manager
+                    // holds the channel. There is no unregister, so a full table never empties:
+                    // a manager that read "busy, retry" would retry forever (PR #241 review,
+                    // finding 4).
                     kprint(b"compositor: a hotkey registration was refused\n");
-                    reply_error_on_session(ch, op, request_id, err);
+                    reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
                 }
             }
         }
@@ -1452,6 +1466,12 @@ fn open_manager(serve_end: u64, request_id: u64) -> bool {
 /// windows that no longer exist — with no resync op to repair the picture.
 fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
     srv.mgr_outbox.clear();
+    // **The chord table goes with it**, for the reason the queued events do: it is routing
+    // policy the departed manager asked for. Left behind, every registered chord keeps being
+    // consumed and delivered to nobody — `mgr_emit` early-returns with no channel — so the key
+    // silently reaches nothing for the life of the compositor, and a replacement manager
+    // inherits the dead one's ids and is refused its own (PR #241 review, finding 3).
+    srv.router.clear_hotkeys();
     // **Every window it was going to place is shown now, not after the deadline.** The clients
     // holding those windows are blocked, and waiting out a timer for a manager that has
     // demonstrably gone is latency bought for nothing.

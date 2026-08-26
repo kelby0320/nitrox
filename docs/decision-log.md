@@ -18380,3 +18380,59 @@ the duplicate. The compositor takes libdraw's now.
 **release** image, which contains no `test-harness` crate — so it reported success while
 `ui-testclient` did not compile. Two missing imports were only found when `check-display` built
 the test image. Checking a build means checking the artifact that contains the code changed.
+
+## 2026-08-26 — PR #241 review: a chord that typed anyway, and a table that outlived its owner
+
+Four findings, and the blocking one falsified a sentence this part had just added to the spec.
+
+**A consumed chord still armed key repeat, so holding one typed its key into the focused
+window.** Repeat is armed from the *physical* transition — deliberately, so a key that reached no
+window still stops repeating when it comes up — and `route` answered only "did the stack
+restack", so a chord press and an ordinary keystroke were indistinguishable from outside. Four
+hundred milliseconds later `fire_repeat` enqueued the key straight to the focused session,
+bypassing routing entirely. Holding `Super+1` while already on desktop 1 would have filled the
+terminal with `1`s: *exactly* the outcome the consumption rule exists to prevent, reached by the
+one path consumption could not see. `route` returns a `Routed { restacked, consumed }` now, and
+the binary arms no repeat for a consumed key.
+
+**The gate that should have caught it was immune by coincidence, and the first fix did not
+help.** `check-input` injected the chord down-and-up back to back, so the 400 ms timer never
+elapsed — holding it fixed that, and the control still passed. The reason is that the chord's
+*action* empties the current desktop, so `focus_candidate()` becomes `None` and `fire_repeat`
+cancels itself. The gate was blind because of what the client did with the chord, not because of
+how long the key was held. `ui-testclient` now registers a **second chord that only prints**;
+held past the repeat delay with focus untouched, a wrongly-armed repeat lands in the focused
+window's log and the control fails as it should. Generalising: a gate for "X does not happen"
+has to be run in a state where X *would* happen.
+
+**A key already down cannot begin a chord.** Press `2`, then hold `Super`: the repeat of `2`
+matches `Super+2`, so the chord fired and the physical release was swallowed — leaving the window
+a press it never saw released. The router tracks delivered keys as well as consumed ones now, and
+a chord fires on the transition *into* it.
+
+**`Logical::Dropped` clears both.** `Dropped` means the held-key state is unknown, and `consumed`
+is a belief about a held key: a swallowed release left the keycode recorded forever, so the next
+*ordinary* press of it was delivered and its release swallowed — a window holding a key down for
+the rest of its life. That is the phantom-held-key bug `Dropped` exists one layer down to prevent,
+reproduced one layer up.
+
+**The chord table outlived the manager, and the PR claimed the opposite.** "A manager holds the
+channel for its whole life and the table dies with it" was simply false: `close_manager` cleared
+the outbox and the pending configures and left the chords. Every registered chord went on being
+consumed and delivered to nobody, silently, for the life of the compositor — and a replacement
+manager inherited ids it had not chosen, so re-registering its own returned `DuplicateId`.
+`close_manager` clears the table now, on the same reasoning its own comment already gave for the
+queued events: they describe a world the departed manager asked about.
+
+**The refusal errno contradicted the spec shipped beside it.** Duplicate id and full table
+answered `WouldBlock`, which this server uses for a genuinely transient condition — a `manage`
+resolve arriving while another manager holds the channel. There is no unregister, so a full table
+never empties: a manager reading "busy, retry" would retry forever. All three refusals are
+`InvalidArgument`, which is what `Rejected` maps to everywhere else here.
+
+Also: a duplicate *chord* under a different id is refused too, since `find` returns the first
+match and the second would be permanently silent — the same argument that refused a duplicate id,
+which does not care which field collides. And `TODO(focus-change-key-balance)` is filed for the
+shape the reviewer named without filing: a key held across a focus change is delivered to one
+window and released to another. Harmless today only because `KeyEvent` carries `modifiers` on
+every record, so no client accumulates them.
