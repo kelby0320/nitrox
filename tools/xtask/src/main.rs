@@ -2036,6 +2036,14 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The second line is the contract B1 exists to state: one manager at a time. The compositor
     // refuses a second resolve rather than deposing the first, and until the client asked twice
     // that branch was unreachable, so the rule was pinned by nothing at all.
+    // **M8 Part A: the desktop requests, driven the way a client drives them.** The filtering
+    // itself is pinned by `compositor`'s own tests, over the same functions the binary calls.
+    // What those cannot reach is the wire — that a body encoded by a client, sent down
+    // `/dev/draw/manage`, lands in the right arm of `dispatch` and is answered — which is the
+    // gap PR #233's title cap fell into. The client sets a desktop and a minimized flag, reads
+    // each back through `/dev/draw/<id>/info`, checks a current desktop of 0 is refused, and
+    // restores everything, so this changes no pixel the comparison below walks.
+    session.expect("ui-testclient: desktop and minimized requests round-tripped through info")?;
     session.expect("ui-testclient: reference windows placed via /dev/draw/manage")?;
     session.expect("ui-testclient: a second /dev/draw/manage was refused")?;
 

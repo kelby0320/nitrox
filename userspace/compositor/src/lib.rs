@@ -34,7 +34,8 @@ use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry};
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role,
+    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, STICKY_DESKTOP,
+    WINDOW_FLAG_MINIMIZED,
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
@@ -135,6 +136,39 @@ pub struct Window {
     /// rather than a convention, and it is the gate a manager's window of opportunity is built
     /// from. Set by [`mark_configured`](WindowStack::mark_configured).
     pub configured: bool,
+    /// Which desktop this window is on; [`STICKY_DESKTOP`] means all of them.
+    ///
+    /// Set to the stack's current desktop at creation, and changed only by a manager. **The
+    /// compositor holds the attribute and nothing else about desktops** — no list, no names,
+    /// no lifecycle. Which desktops exist is the desktop shell's, which is what keeps the two
+    /// from being able to disagree.
+    pub desktop: u32,
+    /// Hidden without leaving its desktop.
+    ///
+    /// **A separate attribute rather than a reserved `desktop` value**, because a minimized
+    /// window is still *on* its desktop: it restores there and it belongs in that desktop's
+    /// window list. Folding the two would make restoring a guess about where it came from.
+    pub minimized: bool,
+}
+
+impl Window {
+    /// Whether this window is on screen when `current` is the current desktop.
+    ///
+    /// **The one predicate for "on screen", and the reason it is a method.** Compositing,
+    /// focus and hit-testing each need it, and until M8 Part A two of them carried their own
+    /// copy of the `configured` half. A fourth site that forgets a clause is precisely how a
+    /// window becomes invisible but still clickable, which is the bug this part was most
+    /// likely to ship (`display-arm-plan.md`, M8 Part A).
+    ///
+    /// It deliberately says nothing about *whether there is anything to draw* — a window with
+    /// no committed buffer is on screen and empty. Compositing skips it a step later, because
+    /// "has pixels" is a different question from "is visible", and hit-testing wants the
+    /// window that is there rather than the one that has drawn.
+    pub fn visible_on(&self, current: u32) -> bool {
+        self.configured
+            && !self.minimized
+            && (self.desktop == STICKY_DESKTOP || self.desktop == current)
+    }
 }
 
 impl Window {
@@ -164,6 +198,8 @@ pub enum StackError {
     DuplicateBuffer,
     /// This connection already holds [`MAX_WINDOWS_PER_CONNECTION`] windows.
     TooManyWindows,
+    /// [`STICKY_DESKTOP`] was given where a real desktop was required.
+    StickyIsNotADesktop,
 }
 
 /// How many windows one connection may hold at once.
@@ -392,6 +428,8 @@ pub struct WindowStack {
     ///
     /// Drained like [`removed_log`](Self::removed_log), and for the same reason.
     geometry_log: Vec<u32>,
+    /// Which desktop is composited. Never [`STICKY_DESKTOP`] — see [`Self::set_current_desktop`].
+    current_desktop: u32,
 }
 
 impl Default for WindowStack {
@@ -414,6 +452,10 @@ impl WindowStack {
             next_id: 1,
             removed_log: Vec::new(),
             geometry_log: Vec::new(),
+            // **One, not zero.** Zero is `STICKY_DESKTOP`, and a compositor whose current
+            // desktop was the sticky value would composite only sticky windows and make every
+            // window it created afterwards sticky too, by the create-onto-current rule.
+            current_desktop: 1,
         }
     }
 
@@ -479,6 +521,11 @@ impl WindowStack {
             // marks it, and until then the window exists without being on screen.
             title: alloc::string::String::new(),
             configured: false,
+            // **Onto the current desktop**, which is what makes "a window is never on no
+            // desktop" true by construction rather than by care: there is no window-exists-
+            // but-is-unassigned moment for anything to have to render.
+            desktop: self.current_desktop,
+            minimized: false,
         });
         Ok(id)
     }
@@ -496,6 +543,53 @@ impl WindowStack {
             }
             _ => false,
         }
+    }
+
+    /// Which desktop is composited.
+    pub fn current_desktop(&self) -> u32 {
+        self.current_desktop
+    }
+
+    /// Move `window` to `desktop`; [`STICKY_DESKTOP`] puts it on all of them.
+    ///
+    /// Returns whether the window's **visibility** changed, which is what the caller needs to
+    /// decide whether to repaint — moving a window between two desktops that are both not the
+    /// current one changes nothing on screen.
+    ///
+    /// **Any non-zero id is accepted, and zero is an id rather than an error.** This function
+    /// cannot validate a desktop because the compositor does not know which desktops exist;
+    /// that is the desktop shell's, and asking here would be keeping a second copy of it.
+    pub fn set_window_desktop(&mut self, window: u32, desktop: u32) -> Result<bool, StackError> {
+        let current = self.current_desktop;
+        let w = self.windows.iter_mut().find(|w| w.id == window).ok_or(StackError::NoSuchWindow)?;
+        let was = w.visible_on(current);
+        w.desktop = desktop;
+        Ok(was != w.visible_on(current))
+    }
+
+    /// Minimize or restore `window`. Returns whether its visibility changed.
+    pub fn set_minimized(&mut self, window: u32, minimized: bool) -> Result<bool, StackError> {
+        let current = self.current_desktop;
+        let w = self.windows.iter_mut().find(|w| w.id == window).ok_or(StackError::NoSuchWindow)?;
+        let was = w.visible_on(current);
+        w.minimized = minimized;
+        Ok(was != w.visible_on(current))
+    }
+
+    /// Switch which desktop is composited. Returns whether it changed.
+    ///
+    /// **`STICKY_DESKTOP` is refused, and it is the only value this validates.** `0` means "on
+    /// every desktop", so a current desktop of `0` would composite only sticky windows *and* —
+    /// by [`create`](Self::create) assigning the current desktop — make every window created
+    /// afterwards silently sticky, which is a state nothing could undo without knowing what
+    /// each window's desktop should have been.
+    pub fn set_current_desktop(&mut self, desktop: u32) -> Result<bool, StackError> {
+        if desktop == STICKY_DESKTOP {
+            return Err(StackError::StickyIsNotADesktop);
+        }
+        let changed = self.current_desktop != desktop;
+        self.current_desktop = desktop;
+        Ok(changed)
     }
 
 
@@ -709,6 +803,16 @@ impl WindowStack {
     ///
     /// Over-reservation is clamped rather than allowed to invert the rectangle: panels
     /// claiming more than the screen leave an empty work area, not a negative one.
+    ///
+    /// **It counts every panel, including ones that are not on screen — deliberately, and this
+    /// is the one place that question is answered differently from
+    /// [`visible_on`](Window::visible_on).** The declared-not-derived rule above was written
+    /// against the fullscreen case, where the panel is still on its desktop and still wants its
+    /// space. M8 Part A added two more ways to be off screen, and neither changes the answer:
+    /// a bar minimized or sitting on another desktop is a bar that is coming back, and a work
+    /// area that grew while it was away would relayout every maximised window twice per desktop
+    /// switch. A panel that should stop reserving is destroyed, not hidden (PR #240 review,
+    /// optional 5).
     pub fn work_area(&self, screen: Rect) -> Rect {
         let (mut top, mut bottom, mut left, mut right) = (0u32, 0u32, 0u32, 0u32);
         for w in &self.windows {
@@ -746,14 +850,21 @@ impl WindowStack {
     pub fn info(&self, id: u32) -> Option<librsproto::surface::WindowInfo> {
         let w = self.window(id)?;
         let bounds = w.bounds();
-        Some(librsproto::surface::WindowInfo::new(
+        let mut info = librsproto::surface::WindowInfo::new(
             w.id,
             w.role,
             bounds.origin.x,
             bounds.origin.y,
             bounds.size.w,
             bounds.size.h,
-        ))
+        );
+        // Set after construction: `new` takes what `CreateWindow` fixes, and these two are
+        // mutable state a manager changes over the window's life.
+        info.desktop = w.desktop;
+        if w.minimized {
+            info.flags |= librsproto::surface::WINDOW_FLAG_MINIMIZED;
+        }
+        Some(info)
     }
 
     /// The topmost window that may take keyboard focus, if any.
@@ -766,7 +877,11 @@ impl WindowStack {
         // goes on top of the stack, so without this it becomes the candidate the instant it is
         // created — before anyone has placed it, and for as long as its configure is held
         // (PR #218 review, finding 3).
-        self.windows.iter().rev().find(|w| w.configured && w.role.takes_focus()).map(|w| w.id)
+        self.windows
+            .iter()
+            .rev()
+            .find(|w| w.visible_on(self.current_desktop) && w.role.takes_focus())
+            .map(|w| w.id)
     }
 
     /// Composite the stack into `fb`, repainting `damage` — **without the cursor**.
@@ -790,11 +905,14 @@ impl WindowStack {
     {
         let mut surfaces: Vec<SurfaceRef<'_>> = Vec::new();
         for w in &self.windows {
-            // **Not composited until configured** (M6 B4). A client that commits before its
-            // first `Configure` — an older one, or one that ignores the obligation — would
-            // otherwise paint at the default origin and then jump when the manager places it,
-            // which is the whole symptom this ordering exists to remove.
-            if !w.configured {
+            // **Not composited unless it is on screen** — configured (M6 B4), not minimized,
+            // and on the current desktop or sticky. A client that commits before its first
+            // `Configure` would otherwise paint at the default origin and then jump when the
+            // manager places it, which is the symptom the configure ordering exists to remove;
+            // the other two clauses are M8 Part A's. All three live in
+            // [`Window::visible_on`](Window::visible_on) so that this site and hit-testing
+            // cannot drift apart.
+            if !w.visible_on(self.current_desktop) {
                 continue;
             }
             let Some(buffer_id) = w.committed else { continue };
@@ -1826,6 +1944,151 @@ mod tests {
         assert!(!s.mark_configured(w), "marking twice is not a second transition");
     }
 
+    /// A configured, committed white 8×8 window at the origin, ready to composite.
+    fn drawable(s: &mut WindowStack, src: &mut MapSource) -> u32 {
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::new(0xFF, 0xFF, 0xFF));
+        s.commit(&commit(w, 0)).unwrap();
+        s.mark_configured(w);
+        w
+    }
+
+    #[test]
+    fn a_window_on_another_desktop_is_not_composited_and_comes_back_when_you_switch_to_it() {
+        let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
+        let mut fb = MemFramebuffer::new(screen);
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        drawable(&mut s, &mut src);
+        let black = Rgb::new(0, 0, 0);
+        let white = Rgb::new(0xFF, 0xFF, 0xFF);
+
+        s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
+        assert_eq!(fb.get_pixel(0, 0), Some(white), "precondition: on the current desktop");
+
+        assert!(s.set_current_desktop(2).unwrap(), "the switch changed something");
+        s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
+        assert_eq!(fb.get_pixel(0, 0), Some(black), "desktop 2 does not show desktop 1's window");
+
+        // **Nothing was destroyed, and no commit is needed to get it back** — the window kept
+        // its buffer, so switching back is a filter changing its mind rather than a client
+        // being asked to redraw. That is what makes a desktop switch cheap.
+        s.set_current_desktop(1).unwrap();
+        s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
+        assert_eq!(fb.get_pixel(0, 0), Some(white), "and back again, with no further commit");
+    }
+
+    #[test]
+    fn a_sticky_window_composites_on_every_desktop() {
+        let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
+        let mut fb = MemFramebuffer::new(screen);
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = drawable(&mut s, &mut src);
+        s.set_window_desktop(w, STICKY_DESKTOP).unwrap();
+
+        for d in [1u32, 2, 99] {
+            s.set_current_desktop(d).unwrap();
+            s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
+            assert_eq!(
+                fb.get_pixel(0, 0),
+                Some(Rgb::new(0xFF, 0xFF, 0xFF)),
+                "a sticky window is on desktop {d} too"
+            );
+        }
+    }
+
+    #[test]
+    fn a_minimized_window_is_not_composited_though_it_stays_on_its_desktop() {
+        let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
+        let mut fb = MemFramebuffer::new(screen);
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = drawable(&mut s, &mut src);
+
+        assert!(s.set_minimized(w, true).unwrap(), "visibility changed");
+        s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
+        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(0, 0, 0)), "minimized: off screen");
+
+        // **Still on desktop 1**, which is the whole reason this is a separate attribute: a
+        // window list is built per desktop, and a minimized window has to appear in the right
+        // one to be restorable from it.
+        assert_eq!(s.window(w).unwrap().desktop, 1, "minimizing did not move it");
+        assert!(s.set_minimized(w, false).unwrap());
+        s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
+        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "restored");
+    }
+
+    #[test]
+    fn focus_does_not_land_on_a_window_that_is_not_on_screen() {
+        // Focus is derived from the stack — the topmost focusable window — so a window hidden
+        // by either attribute must stop being a candidate. Otherwise switching desktops leaves
+        // the keyboard pointed at something invisible and every keystroke is lost, which is the
+        // same argument that made unconfigured windows non-candidates in M6 B4.
+        let mut s = WindowStack::new();
+        let lower = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        s.mark_configured(lower);
+        let upper = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        s.mark_configured(upper);
+        assert_eq!(s.focus_candidate(), Some(upper));
+
+        s.set_minimized(upper, true).unwrap();
+        assert_eq!(s.focus_candidate(), Some(lower), "minimized: not a candidate");
+
+        s.set_minimized(upper, false).unwrap();
+        s.set_window_desktop(upper, 2).unwrap();
+        assert_eq!(s.focus_candidate(), Some(lower), "on another desktop: not a candidate");
+
+        s.set_window_desktop(lower, 2).unwrap();
+        assert_eq!(s.focus_candidate(), None, "nothing on this desktop takes focus");
+    }
+
+    #[test]
+    fn a_window_is_created_onto_the_current_desktop() {
+        // This is what makes "a window is never on no desktop" true by construction rather
+        // than by care — there is no assigned-later moment for anything to have to render.
+        let mut s = WindowStack::new();
+        let first = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert_eq!(s.window(first).unwrap().desktop, 1);
+
+        s.set_current_desktop(4).unwrap();
+        let second = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert_eq!(s.window(second).unwrap().desktop, 4, "created onto the current desktop");
+        assert_eq!(s.window(first).unwrap().desktop, 1, "and the earlier one did not move");
+    }
+
+    #[test]
+    fn the_sticky_value_is_refused_as_a_current_desktop() {
+        // `0` means "on every desktop". A current desktop of `0` would composite only sticky
+        // windows *and*, by create-onto-current, make every window created afterwards sticky —
+        // a state nothing could undo without knowing what each window's desktop should have
+        // been. `desktop switch N` takes N off a command line, so this is one keystroke away
+        // (PR #239 review, finding 7).
+        let mut s = WindowStack::new();
+        assert_eq!(s.set_current_desktop(STICKY_DESKTOP), Err(StackError::StickyIsNotADesktop));
+        assert_eq!(s.current_desktop(), 1, "and the current desktop is unchanged");
+
+        // A *window* may be sticky: the value is reserved, not forbidden.
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert!(s.set_window_desktop(w, STICKY_DESKTOP).is_ok());
+    }
+
+    #[test]
+    fn moving_a_window_between_two_hidden_desktops_reports_no_visible_change() {
+        // The caller repaints the screen when this says `true`. A shell tidying windows in the
+        // background would otherwise repaint once per window for changes nobody can see.
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        s.mark_configured(w);
+
+        assert!(s.set_window_desktop(w, 2).unwrap(), "leaving the current desktop is visible");
+        assert!(!s.set_window_desktop(w, 3).unwrap(), "2 -> 3 changes nothing on screen");
+        assert!(!s.set_minimized(w, true).unwrap(), "already hidden");
+        assert!(!s.set_window_desktop(w, 1).unwrap(), "still minimized: no change");
+        assert!(s.set_minimized(w, false).unwrap(), "back on desktop 1 and un-minimized");
+    }
+
     /// A popup lands at its parent's origin plus the offset its creator asked for (C1).
     #[test]
     fn a_popup_is_created_at_its_offset_from_the_parent() {
@@ -1959,6 +2222,26 @@ mod tests {
         assert_eq!(fb.get_pixel(0, 7), Some(row_colour(15)), "and the last row it has");
         // Past the popup's extent (it ends at 8,8) the background shows through.
         assert_eq!(fb.get_pixel(9, 9), Some(Rgb::new(0, 0, 0)), "nothing beyond it");
+    }
+
+    #[test]
+    fn info_publishes_the_desktop_and_the_minimized_bit() {
+        // Deleting either line in `info()` passed every host test until this one existed —
+        // only the guest gate caught it, and a host test is cheaper than a boot
+        // (PR #240 review, optional 4).
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert_eq!(s.info(w).unwrap().desktop, 1, "created onto the current desktop");
+        assert_eq!(s.info(w).unwrap().flags & WINDOW_FLAG_MINIMIZED, 0);
+
+        s.set_window_desktop(w, 4).unwrap();
+        s.set_minimized(w, true).unwrap();
+        let info = s.info(w).unwrap();
+        assert_eq!(info.desktop, 4, "the attribute a manager set is what `info` publishes");
+        assert_ne!(info.flags & WINDOW_FLAG_MINIMIZED, 0, "and the minimized bit is set");
+
+        s.set_minimized(w, false).unwrap();
+        assert_eq!(s.info(w).unwrap().flags & WINDOW_FLAG_MINIMIZED, 0, "and cleared again");
     }
 
     #[test]

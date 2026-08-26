@@ -209,9 +209,30 @@ pub struct WindowInfo {
     pub reserve: u32,
     /// A popup or dialog's parent window; zero otherwise.
     pub parent: u32,
+    /// Which desktop the window is on. **[`STICKY_DESKTOP`] (`0`) means every desktop.**
+    pub desktop: u32,
+    /// Window state bits — see [`WINDOW_FLAG_MINIMIZED`]. All other bits are reserved and zero.
+    ///
+    /// **A bitfield rather than a `minimized` boolean**, so the next window state (`maximized`,
+    /// which M9 needs) costs a bit instead of another growth of this struct, and so a reader
+    /// that does not know a bit degrades to "not set" rather than to a length mismatch.
+    pub flags: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<WindowInfo>() == 32);
+/// The `desktop` value meaning **every** desktop — a sticky window.
+///
+/// Reserved rather than discovered: `0` is what an uninitialised field holds, and a window
+/// whose desktop was never set showing up everywhere is a far more legible failure than one
+/// that vanishes.
+pub const STICKY_DESKTOP: u32 = 0;
+
+/// [`WindowInfo::flags`] bit 0 — the window is minimized.
+pub const WINDOW_FLAG_MINIMIZED: u32 = 1;
+
+const _: () = assert!(core::mem::size_of::<WindowInfo>() == 40);
+
+/// Bytes in a serialised [`WindowInfo`] — the exact size of a `/dev/draw/<N>/info` object.
+pub const WINDOW_INFO_LEN: usize = 40;
 
 impl WindowInfo {
     /// Build the info for a window with `role` at `(x, y)`, sized `width × height`.
@@ -221,12 +242,27 @@ impl WindowInfo {
             Role::Panel { dock, reserve } => (dock.tag(), reserve, 0),
             Role::Popup { parent } | Role::Dialog { parent } => (0, 0, parent),
         };
-        Self { id, width, height, x, y, role: role.tag(), dock, reserve, parent }
+        // `desktop` and `flags` are set by the caller after construction: this constructor
+        // takes what `CreateWindow` fixes, and both of those are mutable state the compositor
+        // owns rather than creation parameters.
+        Self {
+            id,
+            width,
+            height,
+            x,
+            y,
+            role: role.tag(),
+            dock,
+            reserve,
+            parent,
+            desktop: STICKY_DESKTOP,
+            flags: 0,
+        }
     }
 
     /// Serialise into `out`; returns the length written.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < 32 {
+        if out.len() < WINDOW_INFO_LEN {
             return None;
         }
         put_u32(out, 0, self.id);
@@ -238,15 +274,17 @@ impl WindowInfo {
         put_u16(out, 22, self.dock);
         put_u32(out, 24, self.reserve);
         put_u32(out, 28, self.parent);
-        Some(32)
+        put_u32(out, 32, self.desktop);
+        put_u32(out, 36, self.flags);
+        Some(WINDOW_INFO_LEN)
     }
 
-    /// Parse from the first 32 bytes of a mapped `info` object.
+    /// Parse from the first 40 bytes of a mapped `info` object.
     ///
     /// Returns `None` if the slice is short: a truncated read would otherwise produce a
     /// plausible window with zeroed geometry.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 32 {
+        if b.len() < WINDOW_INFO_LEN {
             return None;
         }
         Some(Self {
@@ -259,6 +297,8 @@ impl WindowInfo {
             dock: get_u16(b, 22),
             reserve: get_u32(b, 24),
             parent: get_u32(b, 28),
+            desktop: get_u32(b, 32),
+            flags: get_u32(b, 36),
         })
     }
 }
@@ -794,6 +834,23 @@ pub const OP_MGR_LOWER: u16 = 0x0912;
 pub const OP_MGR_RAISE_ABOVE: u16 = 0x0913;
 /// `Manage::SetFocus` — give a window the keyboard.
 pub const OP_MGR_SET_FOCUS: u16 = 0x0914;
+/// `Manage::SetWindowDesktop` — move a window to a desktop; [`STICKY_DESKTOP`] for all of them.
+///
+/// The compositor stores the attribute and filters on it, and knows nothing about *which*
+/// desktops exist — that is the desktop shell's, and this way the two cannot disagree.
+pub const OP_MGR_SET_WINDOW_DESKTOP: u16 = 0x0916;
+/// `Manage::SetMinimized` — hide a window without moving it off its desktop.
+///
+/// **A second attribute rather than a reserved `desktop` value**: a minimized window is still
+/// on its desktop, restores there, and belongs in that desktop's window list, so folding the
+/// two would make restoring a guess.
+pub const OP_MGR_SET_MINIMIZED: u16 = 0x0917;
+/// `Manage::SetCurrentDesktop` — switch which desktop is composited.
+///
+/// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every other manager
+/// request names a window in its first four bytes and this one names none, because it is a
+/// property of the screen. `0` is refused — see [`MgrDesktop`].
+pub const OP_MGR_SET_CURRENT_DESKTOP: u16 = 0x091D;
 /// `Manage::Configure` — ask a window to be a given size and position.
 ///
 /// The manager's half of the [`Configure`](OP_CONFIGURE) a client receives. Sent in answer to a
@@ -860,6 +917,73 @@ pub const OP_SET_TITLE: u16 = 0x0909;
 /// from a client, it is stored per window for the compositor's life, and a manager forwarding it
 /// has to fit it in a message. Long enough for any sentence anyone puts in a title bar.
 pub const MAX_TITLE: usize = 256;
+
+/// A manager request naming one window and one `u32` — [`SetWindowDesktop`](OP_MGR_SET_WINDOW_DESKTOP)
+/// and [`SetMinimized`](OP_MGR_SET_MINIMIZED).
+///
+/// Shared because the two have the same shape and the same failure (`NotFound`); the field is
+/// named `value` rather than `desktop` so neither op reads as the other's special case.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrWindowValue {
+    /// Window the request names.
+    pub window: u32,
+    /// The desktop id, or the minimized flag — see the op.
+    pub value: u32,
+}
+
+impl MgrWindowValue {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 8 {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.value);
+        Some(8)
+    }
+
+    /// Parse from the first 8 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(Self { window: get_u32(b, 0), value: get_u32(b, 4) })
+    }
+}
+
+/// A manager request naming a desktop and no window —
+/// [`SetCurrentDesktop`](OP_MGR_SET_CURRENT_DESKTOP).
+///
+/// **`0` is not a legal current desktop**, and it is the one value this request validates.
+/// `0` means sticky, so a current of `0` would blank every non-sticky window *and* — by the
+/// rule that a window is created onto the current desktop — make everything created afterwards
+/// silently sticky.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrDesktop {
+    /// The desktop to switch to. Never [`STICKY_DESKTOP`].
+    pub desktop: u32,
+}
+
+impl MgrDesktop {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 4 {
+            return None;
+        }
+        put_u32(out, 0, self.desktop);
+        Some(4)
+    }
+
+    /// Parse from the first 4 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(Self { desktop: get_u32(b, 0) })
+    }
+}
 
 /// A manager request naming one window and a point — [`Place`](OP_MGR_PLACE).
 #[repr(C)]
@@ -1609,8 +1733,10 @@ mod tests {
             dock: 0x6162,
             reserve: 0x7172_7374,
             parent: 0x8182_8384,
+            desktop: 0x9192_9394,
+            flags: 0xA1A2_A3A4,
         };
-        let mut b = [0u8; 32];
+        let mut b = [0u8; WINDOW_INFO_LEN];
         info.write(&mut b).unwrap();
         assert_eq!(&b[0..4], &0x1112_1314u32.to_le_bytes(), "id @0");
         assert_eq!(&b[4..8], &0x2122_2324u32.to_le_bytes(), "width @4");
@@ -1621,6 +1747,48 @@ mod tests {
         assert_eq!(&b[22..24], &0x6162u16.to_le_bytes(), "dock @22");
         assert_eq!(&b[24..28], &0x7172_7374u32.to_le_bytes(), "reserve @24");
         assert_eq!(&b[28..32], &0x8182_8384u32.to_le_bytes(), "parent @28");
+        assert_eq!(&b[32..36], &0x9192_9394u32.to_le_bytes(), "desktop @32");
+        assert_eq!(&b[36..40], &0xA1A2_A3A4u32.to_le_bytes(), "flags @36");
+    }
+
+    #[test]
+    fn a_short_info_buffer_is_refused_rather_than_written_partially() {
+        // **The growth from 32 to 40 bytes is exactly where a short write becomes plausible.**
+        // Every existing caller sized its buffer at 32, and a `write` that filled what it could
+        // would hand a reader a window whose desktop and flags are whatever the memory held —
+        // for a sticky, minimized window in the worst case, which is invisible *and* everywhere.
+        let info = WindowInfo::new(1, Role::Normal, 0, 0, 8, 8);
+        let mut small = [0u8; 32];
+        assert_eq!(info.write(&mut small), None, "a 32-byte buffer must be refused, not filled");
+        let mut exact = [0u8; WINDOW_INFO_LEN];
+        assert_eq!(info.write(&mut exact), Some(WINDOW_INFO_LEN));
+    }
+
+    #[test]
+    fn a_new_window_info_is_not_accidentally_sticky_or_minimized() {
+        // `STICKY_DESKTOP` is 0, which is also what an uninitialised field holds — so the
+        // constructor's defaults are the one place that reserved value can be shipped by
+        // accident. The compositor sets `desktop` from its current one straight after; this
+        // pins what the struct itself claims.
+        let info = WindowInfo::new(7, Role::Normal, 1, 2, 8, 8);
+        assert_eq!(info.desktop, STICKY_DESKTOP);
+        assert_eq!(info.flags & WINDOW_FLAG_MINIMIZED, 0);
+    }
+
+    #[test]
+    fn the_two_manager_request_bodies_round_trip_and_refuse_short_input() {
+        let mut b = [0u8; 8];
+        MgrWindowValue { window: 0x1112_1314, value: 0x2122_2324 }.write(&mut b).unwrap();
+        assert_eq!(&b[0..4], &0x1112_1314u32.to_le_bytes(), "window @0");
+        assert_eq!(&b[4..8], &0x2122_2324u32.to_le_bytes(), "value @4");
+        assert_eq!(MgrWindowValue::read(&b).unwrap().value, 0x2122_2324);
+        assert_eq!(MgrWindowValue::read(&b[..7]), None, "7 bytes must not parse");
+
+        let mut d = [0u8; 4];
+        MgrDesktop { desktop: 0x3132_3334 }.write(&mut d).unwrap();
+        assert_eq!(&d[0..4], &0x3132_3334u32.to_le_bytes(), "desktop @0");
+        assert_eq!(MgrDesktop::read(&d).unwrap().desktop, 0x3132_3334);
+        assert_eq!(MgrDesktop::read(&d[..3]), None, "3 bytes must not parse");
     }
 
     #[test]
@@ -1635,7 +1803,7 @@ mod tests {
         for (role, dock, reserve, parent) in cases {
             let info = WindowInfo::new(7, role, -3, 12, 640, 480);
             let n = info.write(&mut buf).unwrap();
-            assert_eq!(n, 32);
+            assert_eq!(n, WINDOW_INFO_LEN);
             let got = WindowInfo::read(&buf[..n]).unwrap();
             assert_eq!(got, info);
             assert_eq!(got.id, 7);
@@ -1648,9 +1816,11 @@ mod tests {
 
     #[test]
     fn a_truncated_info_is_refused_rather_than_read_short() {
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; WINDOW_INFO_LEN];
         WindowInfo::new(1, Role::Normal, 0, 0, 8, 8).write(&mut buf).unwrap();
-        for short in 0..32 {
+        // Up to and including 32 — the size this struct was before M8 Part A grew it, and so
+        // the length every existing caller's buffer happens to be.
+        for short in 0..WINDOW_INFO_LEN {
             assert!(WindowInfo::read(&buf[..short]).is_none(), "len {short}");
         }
         assert!(WindowInfo::read(&buf).is_some());

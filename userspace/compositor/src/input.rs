@@ -31,6 +31,21 @@ use librsproto::surface::{
 use crate::WindowStack;
 use crate::outbox::Outbound;
 
+/// Whether a window the router still names is usable, hidden, or gone.
+///
+/// Three states rather than a boolean because the two failure cases need different treatment:
+/// a hidden window can still be *told* it is losing the pointer, and a destroyed one cannot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowState {
+    /// In the stack and on screen.
+    OnScreen,
+    /// In the stack, but minimized or on another desktop — reachable, not visible.
+    OffScreen,
+    /// No longer in the stack.
+    Gone,
+}
+use WindowState::{Gone, OffScreen, OnScreen};
+
 /// Cursor position, crossing state, and the implicit grab.
 ///
 /// Not part of [`WindowStack`]: the stack is what the screen looks like, and none of this
@@ -45,6 +60,21 @@ pub struct InputRouter {
     inside: Option<u32>,
     /// The window holding the implicit grab, if a button is down.
     grab: Option<u32>,
+    /// Which button opened [`grab`](Self::grab) — the one a synthetic release names when the
+    /// grab is taken away by something other than that button coming up.
+    ///
+    /// One code rather than a mask: a grab is opened by exactly one press (`grab.is_none()`
+    /// gates it), so this is the button whose sequence the compositor promised to finish.
+    /// A second button pressed during a drag never opened a grab and is not owed a close.
+    grab_button: u16,
+    /// A grab ended because its window left the screen, and the buttons are still down.
+    ///
+    /// **Until they come up, pointer input goes nowhere.** Without this, `target` falls
+    /// through to `hit` and the window *underneath* receives the release for a press it never
+    /// saw — and in `libui` a bare release fires nothing, so the defect is silent until the
+    /// day a client acts on one. The sequence belonged to a window that can no longer receive
+    /// it; handing its tail to a different window is not a repair (PR #240 review, blocking 1b).
+    grab_broken: bool,
     /// Buttons held, mirrored from the last event that carried them.
     ///
     /// Stamped onto **every** record, not just `POINTER_BUTTON`. A drag is motion with a
@@ -67,7 +97,16 @@ impl InputRouter {
             screen.origin.x + (screen.size.w / 2) as i32,
             screen.origin.y + (screen.size.h / 2) as i32,
         );
-        Self { pointer, screen, inside: None, grab: None, buttons: 0, modifiers: 0 }
+        Self {
+            pointer,
+            screen,
+            inside: None,
+            grab: None,
+            grab_button: 0,
+            grab_broken: false,
+            buttons: 0,
+            modifiers: 0,
+        }
     }
 
     /// Where the cursor is, in screen coordinates.
@@ -105,16 +144,6 @@ impl InputRouter {
         stack: &mut WindowStack,
         out: &mut Vec<Outbound>,
     ) -> bool {
-        // A window can be destroyed between one event and the next, and the router is not
-        // on the destroy path. Dropping stale ids here rather than wiring a callback keeps
-        // the two apart and cannot go out of date: the stack is the authority, so ask it.
-        if self.inside.is_some_and(|w| stack.window(w).is_none()) {
-            self.inside = None;
-        }
-        if self.grab.is_some_and(|w| stack.window(w).is_none()) {
-            self.grab = None;
-        }
-
         // Mirror the interpreter's state before anything is emitted. Enter and leave are
         // generated *by* the router rather than arriving as events, so they have no state of
         // their own to read; taking it from the event that provoked them is what lets every
@@ -131,6 +160,19 @@ impl InputRouter {
                 self.modifiers = 0;
             }
         }
+
+        // **Reconcile with the stack — after the mirror above, not before it.** A window can
+        // be destroyed between one event and the next, and since M8 Part A it can also be
+        // minimized or moved to another desktop, which leaves it in the stack. The router is
+        // on none of those paths, so it asks the stack rather than being called back: the
+        // stack is the authority, and a question asked here cannot go out of date.
+        //
+        // It runs *after* the mirror because it emits — the leave below is a record like any
+        // other, and records in one batch have to agree about `buttons` and `modifiers`. When
+        // this block ran first it stamped the *previous* event's state onto them, so a release
+        // that ended a shift-drag produced a leave saying shift was still down beside a button
+        // record saying it was not (PR #240 review, blocking 1c).
+        self.reconcile_with(stack, out);
 
         match *ev {
             Logical::Key { keycode, pressed, modifiers } => {
@@ -169,6 +211,9 @@ impl InputRouter {
                     // topmost window *containing the point*, and raising that window leaves
                     // it topmost there too, so re-testing afterwards cannot differ.
                     self.grab = self.hit(stack);
+                    // Remembered for the release the compositor owes this window if the grab
+                    // ends any way other than this button coming up.
+                    self.grab_button = button;
                     if let Some(window) = self.grab
                         && stack.window(window).is_some_and(|w| w.role.takes_focus())
                     {
@@ -187,7 +232,12 @@ impl InputRouter {
                 if !pressed && buttons == 0 {
                     // Last button up: the grab ends, and the cursor may have been dragged
                     // somewhere else entirely while it was held, so re-derive the crossing.
+                    //
+                    // This is also where a *broken* grab is finally settled: the sequence it
+                    // belonged to is over, so input resumes and the window under the cursor
+                    // gets its enter — the half deliberately withheld until now.
                     self.grab = None;
+                    self.grab_broken = false;
                     self.update_crossing(stack, out);
                 }
                 restacked
@@ -197,10 +247,83 @@ impl InputRouter {
                 // Buttons are no longer trustworthy — a release may be the event that was
                 // lost, and a grab that outlives its button never ends. `libinput` has
                 // already reset what it accumulated; this is the same reset one layer up.
-                if self.grab.take().is_some() {
+                //
+                // A broken grab is cleared here too: `Dropped` says the button state itself is
+                // unknown, so waiting for a release that may never be reported would wedge
+                // input for the life of the process.
+                let had = self.grab.take().is_some() || self.grab_broken;
+                self.grab_broken = false;
+                if had {
                     self.update_crossing(stack, out);
                 }
                 false
+            }
+        }
+    }
+
+    /// Drop router state that names a window which is gone or no longer on screen.
+    ///
+    /// **Two cases, and they differ in whether the window can be told.** A destroyed window is
+    /// unreachable, so its id is simply forgotten. One that is merely off screen — minimized,
+    /// or on another desktop — is still in the stack, still has a client, and is mid-way
+    /// through an interaction the compositor promised to finish. It is told.
+    fn reconcile_with(&mut self, stack: &WindowStack, out: &mut Vec<Outbound>) {
+        let cur = stack.current_desktop();
+        // Borrow-free classification: `emit` takes `&self`, so decide first, then act.
+        let state = |id: u32| match stack.window(id) {
+            None => Gone,
+            Some(w) if !w.visible_on(cur) => OffScreen,
+            Some(_) => OnScreen,
+        };
+
+        if let Some(id) = self.grab
+            && !matches!(state(id), OnScreen)
+        {
+            // **The grab is why filtering hit-testing alone is not enough.** Every pointer
+            // event up to the matching release goes to the grab holder *without* consulting
+            // `hit`, so minimizing or switching away mid-drag would keep delivering motion and
+            // the release to a window that is not on screen — the "invisible but still
+            // hit-testable" bug, by the one path a hit-test filter cannot see (PR #239 review,
+            // finding 2).
+            if matches!(state(id), OffScreen) {
+                // **Close the sequence, do not abandon it.** The grab exists so that a press
+                // and its release reach one window even when the cursor leaves it; the window
+                // going off screen ends the grab, and the release is the last thing the
+                // compositor owes it. Without this the client is left holding a pointer
+                // capture that only a release clears — in `libui`, `capture` survives, and the
+                // next press after the window comes back routes to the stale widget rather
+                // than the one clicked (PR #240 review, blocking 1b).
+                //
+                // This is not "input to an off-screen window": it is the tail of a sequence
+                // granted while it was on screen, which is the same reason a grab delivers
+                // outside the window's own bounds.
+                self.emit(id, POINTER_BUTTON, self.grab_button, 0, stack, out);
+            }
+            self.grab = None;
+            // **Unconditionally, not `self.buttons != 0`.** The mirror above has already
+            // absorbed the provoking event, so when that event *is* the release the mask reads
+            // zero and a condition on it would leave the flag clear — letting `target` fall
+            // through to `hit` and deliver this very release to the window underneath, which
+            // is the case this flag exists for. A grab existing at all means a button was
+            // down; the sequence is broken either way. The last-button-up branch below clears
+            // it in the same event when the release is what provoked this.
+            self.grab_broken = true;
+        }
+
+        if let Some(id) = self.inside {
+            match state(id) {
+                OnScreen => {}
+                // **The leave is emitted before the id is forgotten**, which is the whole of
+                // the ordering. The first version cleared `inside` and then called
+                // `update_crossing`, which derives the leave *from* `inside` — so the router
+                // had already forgotten who was owed one and emitted only the enter. A client
+                // whose window is minimized under the cursor kept its hover state forever,
+                // because nothing else would tell it (PR #240 review, blocking 1a).
+                OffScreen => {
+                    self.emit(id, POINTER_LEAVE, 0, 0, stack, out);
+                    self.inside = None;
+                }
+                Gone => self.inside = None,
             }
         }
     }
@@ -228,22 +351,38 @@ impl InputRouter {
             // its rectangle in the stack — at the default origin, at its requested size — so
             // without this a click anywhere inside it lands on a window the compositor has
             // decided not to draw, in front of the visible one underneath (PR #218 review,
-            // finding 3).
-            .find(|w| w.configured && w.bounds().contains(self.pointer.x, self.pointer.y))
+            // finding 3). Since M8 Part A the same is true of a minimized window and of one on
+            // another desktop, and all three clauses are `visible_on` so that this and
+            // `compose_into` cannot answer differently.
+            .find(|w| {
+                w.visible_on(stack.current_desktop())
+                    && w.bounds().contains(self.pointer.x, self.pointer.y)
+            })
             .map(|w| w.id)
     }
 
     /// Who a pointer event goes to: the grab holder if there is one, else what is under the
     /// cursor.
     fn target(&self, stack: &WindowStack) -> Option<u32> {
+        if self.grab_broken {
+            // The sequence still running belonged to a window that can no longer receive it.
+            // `hit` would hand its tail to whoever is underneath — a release for a press that
+            // window never saw.
+            return None;
+        }
         self.grab.or_else(|| self.hit(stack))
     }
 
     /// Emit leave/enter if the cursor changed windows. A no-op while grabbed.
     fn update_crossing(&mut self, stack: &WindowStack, out: &mut Vec<Outbound>) {
-        if self.grab.is_some() {
+        if self.grab.is_some() || self.grab_broken {
             // Crossings during a drag would tell a window the cursor left while it is still
             // receiving that cursor's events — two contradictory statements at once.
+            //
+            // **A broken grab counts as a drag for this purpose**, because from the user's
+            // side it is one: a button is still down. Resuming crossings the moment the grab
+            // is taken away would walk enters and leaves across every window the cursor
+            // crosses on the way to the release, none of which can receive the release.
             return;
         }
         let now = self.hit(stack);
@@ -444,6 +583,237 @@ mod tests {
 
         let out = go(&mut r, &mut s, key(30, true));
         assert_eq!(out[0].window(), term, "but the keystroke still goes to the terminal");
+    }
+
+    #[test]
+    fn a_window_on_another_desktop_cannot_be_clicked() {
+        // The fresh-press half of "invisible but still hit-testable". `hit()` is where the
+        // filter lives, so this is the half a filter in `hit()` does catch — and on its own it
+        // is not enough to prove the rule, which is what the next test is for.
+        let mut s = WindowStack::new();
+        let here = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let gone = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        s.set_window_desktop(gone, 2).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, button(true));
+        // `gone` is above `here` in the stack and covers the same pixels, so without the
+        // filter it would take the click.
+        assert!(
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == here)),
+            "the click went to the window that is actually on screen"
+        );
+        assert!(
+            !out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == gone)),
+            "and not to the one on desktop 2"
+        );
+    }
+
+    #[test]
+    fn switching_desktops_mid_drag_takes_the_grab_away_from_the_hidden_window() {
+        // **The half a filter in `hit()` cannot reach**, and the reason this rule needed two
+        // controls. `target()` is `grab.or_else(hit)`, so once a press has grabbed, every
+        // event until the release bypasses hit-testing entirely — and nothing clears `grab` on
+        // a desktop switch, which is not a destroy, not a last-button-up and not a `Dropped`.
+        // An implementation that filters only `hit()` passes the test above and fails here
+        // (PR #239 review, finding 2).
+        let mut s = WindowStack::new();
+        let dragged = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        let out = go(&mut r, &mut s, button(true));
+        assert!(
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == dragged)),
+            "precondition: the press landed and grabbed"
+        );
+
+        // The manager switches desktops while the button is still held.
+        s.set_current_desktop(2).unwrap();
+
+        // The next event is what the router reconciles on. The window is owed exactly two
+        // things and no more: the release that closes the sequence it was granted, and the
+        // leave that says the cursor is no longer in it.
+        let out = go(&mut r, &mut s, drag(10, 10));
+        let to_dragged: Vec<_> = out
+            .iter()
+            .filter_map(|o| match o {
+                Outbound::Pointer { event } if event.window == dragged => Some(event.kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            to_dragged,
+            alloc::vec![POINTER_BUTTON, POINTER_LEAVE],
+            "the closing release then the leave, in that order and nothing else"
+        );
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Outbound::Pointer { event }
+                    if event.window == dragged && event.kind == POINTER_BUTTON
+                        && event.flags & POINTER_PRESSED == 0
+            )),
+            "the synthetic button record is a release, not a press"
+        );
+
+        // And from here it is owed nothing at all: motion during the rest of the drag, and the
+        // real release, both go nowhere.
+        let out = go(&mut r, &mut s, drag(5, 5));
+        assert!(out.is_empty(), "no records at all while a broken grab's buttons are down");
+        let out = go(&mut r, &mut s, button(false));
+        assert!(
+            !out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == dragged)),
+            "the real release does not reach it either -- it already got its close"
+        );
+    }
+
+    #[test]
+    fn minimizing_the_grab_holder_takes_the_grab_away_too() {
+        // The same rule by the other route. Named separately because the two reach
+        // `visible_on` through different attributes, and a fix that special-cased the desktop
+        // comparison would pass the test above and fail this one.
+        let mut s = WindowStack::new();
+        let dragged = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        go(&mut r, &mut s, button(true));
+
+        s.set_minimized(dragged, true).unwrap();
+
+        let out = go(&mut r, &mut s, drag(5, 5));
+        let kinds: Vec<_> = out
+            .iter()
+            .filter_map(|o| match o {
+                Outbound::Pointer { event } if event.window == dragged => Some(event.kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, alloc::vec![POINTER_BUTTON, POINTER_LEAVE], "closed, then left");
+        assert!(
+            !out.iter().any(|o| matches!(
+                o,
+                Outbound::Pointer { event }
+                    if event.window == dragged && event.kind == POINTER_MOTION
+            )),
+            "a minimized window keeps receiving the drag it grabbed"
+        );
+    }
+
+    #[test]
+    fn minimizing_the_window_under_the_cursor_pairs_a_leave_with_the_enter() {
+        // **The leave has to be emitted before the id is forgotten.** The first version cleared
+        // `inside` and *then* re-derived the crossing, which derives the leave from `inside` —
+        // so it emitted the enter alone and the window under the cursor at minimize time never
+        // learned the pointer had gone. In `libui` that leaves the hovered widget highlighted
+        // for as long as the window stays hidden, since nothing else would clear it
+        // (PR #240 review, blocking 1a).
+        let mut s = WindowStack::new();
+        let under = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let over = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        assert_eq!(r.inside, Some(over), "precondition: the cursor is in the top window");
+
+        s.set_minimized(over, true).unwrap();
+        let out = go(&mut r, &mut s, motion(1, 1));
+
+        let leave = out.iter().any(|o| matches!(
+            o, Outbound::Pointer { event } if event.window == over && event.kind == POINTER_LEAVE));
+        let enter = out.iter().any(|o| matches!(
+            o, Outbound::Pointer { event } if event.window == under && event.kind == POINTER_ENTER));
+        assert!(leave, "the window that lost the cursor is owed a leave");
+        assert!(enter, "and the one that gained it an enter");
+    }
+
+    #[test]
+    fn breaking_a_grab_gives_the_release_to_nobody_else() {
+        // The tail of a sequence belongs to the window that was granted it. Handing it to
+        // whatever is underneath means a release for a press that window never saw — and in
+        // `libui` a bare release fires nothing, so the defect stays silent until a client acts
+        // on one (PR #240 review, blocking 1b).
+        let mut s = WindowStack::new();
+        let under = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let over = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        go(&mut r, &mut s, button(true));
+
+        s.set_minimized(over, true).unwrap();
+        let out = go(&mut r, &mut s, button(false));
+        assert!(
+            !out.iter().any(|o| matches!(
+                o, Outbound::Pointer { event } if event.window == under
+                    && event.kind == POINTER_BUTTON)),
+            "the window underneath must not receive a release for a press it never saw"
+        );
+        // **An enter is fine and correct**: the buttons are up, the sequence is over, and the
+        // cursor really is inside `under`. What must not arrive is the button record.
+        assert!(
+            out.iter().any(|o| matches!(
+                o, Outbound::Pointer { event } if event.window == under
+                    && event.kind == POINTER_ENTER)),
+            "and once the sequence is over it is entered normally"
+        );
+
+        // Once the buttons are up the world resumes: the next press reaches `under` normally.
+        let out = go(&mut r, &mut s, button(true));
+        assert!(
+            out.iter().any(|o| matches!(
+                o, Outbound::Pointer { event } if event.window == under
+                    && event.kind == POINTER_BUTTON)),
+            "input resumes after the broken grab's buttons come up"
+        );
+    }
+
+    #[test]
+    fn the_records_a_broken_grab_emits_carry_the_provoking_events_modifiers() {
+        // Every record in one batch has to agree about `buttons` and `modifiers` — the router
+        // generates enters and leaves itself, so it stamps them from the event that provoked
+        // them. Reconciling *before* that mirror stamped the previous event's state instead, so
+        // a release ending a shift-drag produced a leave saying shift was still held beside a
+        // button record saying it was not (PR #240 review, blocking 1c).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        go(
+            &mut r,
+            &mut s,
+            Logical::Button { button: BTN_LEFT, pressed: true, buttons: 1, modifiers: MOD_SHIFT },
+        );
+
+        s.set_minimized(w, true).unwrap();
+        // Shift released along with the button — the provoking event says neither is held.
+        let out = go(
+            &mut r,
+            &mut s,
+            Logical::Button { button: BTN_LEFT, pressed: false, buttons: 0, modifiers: 0 },
+        );
+        for o in &out {
+            let Outbound::Pointer { event } = o else { continue };
+            assert_eq!(event.modifiers, 0, "kind {} carries a stale modifier", event.kind);
+            assert_eq!(event.buttons, 0, "kind {} carries a stale button mask", event.kind);
+        }
+        assert!(!out.is_empty(), "the window is owed its close, so there is something to check");
+    }
+
+    #[test]
+    fn a_sticky_window_is_clickable_on_every_desktop() {
+        // The reserved value has to work, not merely be reserved: `desktop == 0` is the one
+        // value `visible_on` accepts regardless of the current desktop.
+        let mut s = WindowStack::new();
+        let bar = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        s.set_window_desktop(bar, librsproto::surface::STICKY_DESKTOP).unwrap();
+        s.set_current_desktop(7).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, button(true));
+        assert!(
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == bar)),
+            "a sticky window takes the click on desktop 7"
+        );
     }
 
     #[test]

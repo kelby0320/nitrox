@@ -1110,7 +1110,12 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
     let Some(info) = srv.stack.info(id) else {
         return reply_resolve_error(serve_end, request_id, KError::NotFound);
     };
-    let mut bytes = [0u8; 32];
+    // **Sized from the constant, not from the number that was right when this was written.**
+    // `WindowInfo` grew from 32 to 40 bytes in M8 Part A, and a literal here would have made
+    // `write` refuse — turning every `info` resolve into `KernelError` — or, if `write` had
+    // filled what it could instead, published a window whose desktop and flags were whatever
+    // the stack memory held.
+    let mut bytes = [0u8; librsproto::surface::WINDOW_INFO_LEN];
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
     }
@@ -1299,7 +1304,11 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             // A manager that only wants to position a window sends `Place` and nothing else;
             // making it wait out the deadline would mean every launch is slow by design. The
             // configure goes out carrying the origin the manager just set.
-            release_configure(srv, fb, window);
+            // `None` is a request that named no window — `SetCurrentDesktop` — so there is
+            // no held configure to release.
+            if let Some(window) = window {
+                release_configure(srv, fb, window);
+            }
             match dirty {
                 // Nothing on screen changed — placing a window that has not committed, which
                 // is the manager's ordinary case during the handshake.

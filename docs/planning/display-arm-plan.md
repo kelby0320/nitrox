@@ -1907,7 +1907,7 @@ also reach the focused window.
 
 ### Part A — the compositor learns desktops
 
-- [ ] **`desktop` becomes a window attribute, and `current` a compositor-wide one.** `0` is
+- [x] **`desktop` becomes a window attribute, and `current` a compositor-wide one** ✅. `0` is
       sticky; new windows are created onto `current`. Two manager requests —
       `SetWindowDesktop(window, desktop)` and `SetCurrentDesktop(desktop)` — and `desktop` joins
       `/dev/draw/N/info`. The compositor validates nothing about *which* desktops exist, because
@@ -1918,13 +1918,16 @@ also reach the focused window.
       `desktop switch N` taking `N` off a command line, which puts `desktop switch 0` one
       keystroke away (PR #239 review, finding 7).
 
-- [ ] **Rendering, focus and input all follow the filter, and the last is the one that bites.**
+- [x] **Rendering, focus and input all follow the filter, and the last is the one that bites** ✅ —
+      one predicate, `Window::visible_on`, used by `compose_into`, `focus_candidate` and `hit`.
       A window off the current desktop must not paint, must not be focusable, and must not
       receive pointer or key events — a window that is invisible but still hit-testable is the
       bug this part is most likely to ship. On a desktop switch the compositor focuses the
       topmost window on the new desktop, and the manager may override with `SetFocus`.
 
-- [ ] **The in-flight pointer grab is the half a filter in `hit()` does not cover.** Added
+- [x] **The in-flight pointer grab is the half a filter in `hit()` does not cover** ✅ — widened
+      the router's existing lazy reconciliation from *gone* to *not on screen*, which is the seam
+      that already existed for destroys and cannot go out of date. Added
       2026-08-26 (PR #239 review, finding 2). `InputRouter::target()` is
       `self.grab.or_else(|| self.hit(stack))`, and `hit()` is where the existing on-screen
       predicate lives — so the natural place to add the desktop filter is inside `hit()`, and
@@ -1935,19 +1938,27 @@ also reach the focused window.
       grab-holder **drops the grab and re-derives the crossing state**, which is what `Dropped`
       already does.
 
-- [ ] **A gate that fails for the right reason, with two controls rather than one.** Unit tests
-      over `dispatch` are not enough — PR #233's lesson is that a handler test passes while no
-      real caller can reach the behaviour. The gate drives the real path: two windows on two
-      desktops, switch, screendump, and compare against a `libdraw` render the way
-      `check-display` already does. Controls:
-      **(a)** leave the filter out of `hit()` and show the gate catches a *fresh* click landing
-      on a window that is not on screen; and
-      **(b)** switch desktops **mid-drag** and show the gate catches motion and release still
-      being delivered. Control (a) alone passes for an implementation that filters `hit()` and
-      leaks the grab — which is the implementation this part will most likely produce, so the
-      one-control version would have been decoration.
+- [x] **A gate that fails for the right reason, with two controls rather than one** ✅ — and the
+      *screendump* half moved to Part B, deliberately. Both controls were run and both are
+      decisive:
+      **(a)** filter only on `configured` (the pre-Part-A predicate) → the fresh-press test
+      fails; **(b)** keep `hit()` filtered and revert *only* the grab reconciliation → exactly
+      the two mid-drag tests fail and the fresh-press one still passes. (b) is the one that
+      matters: it proves the two halves are covered independently, which a single control
+      cannot show.
 
-- [ ] **`minimized` is a second attribute, and deliberately not a desktop value.** Added
+      **What did not land, and why.** The box said "screendump, and compare against a `libdraw`
+      render the way `check-display` already does". That needs the host to hold the guest in a
+      switched state, and `ui-testclient` **parks on `sys_wait` rather than reading input** — it
+      has no way to be told to switch. The natural trigger is Part B's global hotkey, which is
+      exactly a host-injectable state change, so the screendump comparison is a Part B box now
+      rather than a silently dropped one. What did land in the guest is the coverage a host test
+      genuinely cannot give: `ui-testclient` drives all three requests down `/dev/draw/manage`
+      and reads each back through `/dev/draw/<id>/info`, which is the **wire** — the gap PR #233
+      fell into. Negative-controlled by making `dispatch` answer `Ok` and change nothing: the
+      gate times out, the same "a reply is not an effect" trap PR #216 turned into a rule.
+
+- [x] **`minimized` is a second attribute, and deliberately not a desktop value** ✅. Added
       2026-08-26. A minimized window is still *on* its desktop — it restores there and it belongs
       in that desktop's window list — so folding it into `desktop` as a reserved id would conflate
       two orthogonal properties and make "restore" mean "guess where it came from". The filter
@@ -1955,7 +1966,11 @@ also reach the focused window.
       joins the two requests above. No client cooperation is involved: a minimized window is
       simply not composited, which is why this lands here and maximize does not (see M9).
 
-- [ ] **Spec first, because this is protocol.** `docs/spec/rsproto-surface-ops.md` gains the three
+- [x] **Spec first, because this is protocol** ✅. `WindowInfo` grew 32 → 40 bytes with
+      `desktop` and a `flags` bitfield — a bitfield so M9's `maximized` costs a bit rather than
+      another growth. Three callers sized a buffer at the old literal; all now use
+      `WINDOW_INFO_LEN`, and the test client's was a **silent** break (the image builds, `read`
+      just returns `None`). `docs/spec/rsproto-surface-ops.md` gains the three
       requests, both attributes and the sticky reservation before the code lands.
 
 ### Part B — global hotkeys
@@ -1971,6 +1986,15 @@ also reach the focused window.
 
 - [ ] **`check-input` grows the chord**, since it is the gate that already injects PS/2 events
       over QMP and reads a client's event log.
+
+- [ ] **And the screendump Part A could not take.** Moved here 2026-08-26: comparing a switched
+      screen against a `libdraw` render needs the host to hold the guest on another desktop, and
+      `ui-testclient` parks on `sys_wait` rather than reading input, so nothing could tell it to
+      switch. A registered hotkey is precisely a host-injectable state change — inject the chord,
+      let the client switch and say so, screendump, and compare. Part A's filtering is pinned by
+      unit tests over the functions the binary calls and by a wire round-trip through
+      `/dev/draw/<id>/info`; this is the piece that would catch the guest being consistent with
+      itself and wrong, which is what `check-display` exists for.
 
 ### Part C — the bottom bar and the window list
 

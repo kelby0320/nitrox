@@ -19,8 +19,9 @@
 
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    MgrPlace, MgrWindowRef, OP_MGR_CONFIGURE, OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE,
-    OP_MGR_RAISE_ABOVE, OP_MGR_SET_FOCUS,
+    MgrDesktop, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE, OP_MGR_LOWER,
+    OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_SET_CURRENT_DESKTOP,
+    OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED, OP_MGR_SET_WINDOW_DESKTOP,
 };
 
 use crate::server::SurfaceError;
@@ -36,13 +37,20 @@ pub enum MgrOutcome {
     /// pixels change depends on every overlap in the stack, and computing that exactly would be a
     /// second compositor.
     Applied {
-        /// The window the request named.
+        /// The window the request named, or `None` for a request that names none.
         ///
         /// Carried rather than left for the caller to re-decode: acting on a window is what
         /// releases its held initial `Configure` (M6 B4), and reading the id back out of the
         /// request body would depend on every manager op happening to put it at offset 0 —
         /// true today, and exactly the kind of coincidence that stops being true quietly.
-        window: u32,
+        ///
+        /// **`Option`, not a zero sentinel.** `SetCurrentDesktop` is the first manager request
+        /// that names no window, and it first shipped as `window: 0` on the argument that zero
+        /// is never a window id, so the caller's lookup finds nothing. True — and it makes a
+        /// runtime invariant of `WindowStack::next_id` load-bearing for a *release-the-held-
+        /// configure* decision two modules away, with nothing enforcing the connection. The
+        /// type says it instead (PR #240 review, answer 4).
+        window: Option<u32>,
         /// The region this request changed, or `None` for "repaint everything".
         dirty: Option<Rect>,
     },
@@ -69,6 +77,9 @@ pub enum MgrOutcome {
 fn refused(e: StackError) -> MgrOutcome {
     MgrOutcome::Failed(match e {
         StackError::NoSuchWindow => SurfaceError::NotFound,
+        // The spec publishes `Malformed` for this: a current desktop of `STICKY_DESKTOP` is a
+        // request that cannot mean anything, not a request the compositor declined to serve.
+        StackError::StickyIsNotADesktop => SurfaceError::Malformed,
         other => SurfaceError::Rejected(other),
     })
 }
@@ -84,7 +95,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.place(req.window, Point::new(req.x, req.y)) {
-                Ok(d) => MgrOutcome::Applied { window: req.window, dirty: Some(d.rect()) },
+                Ok(d) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(d.rect()) },
                 Err(e) => refused(e),
             }
         }
@@ -107,7 +118,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // **A restack repaints everything.** Which pixels change depends on every
                 // overlap in the stack; deriving the exact region would be a second compositor,
                 // and a restack is a user-scale event rather than a per-frame one.
-                Ok(()) => MgrOutcome::Applied { window: req.window, dirty: None },
+                Ok(()) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
                 Err(e) => refused(e),
             }
         }
@@ -123,6 +134,45 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 width: req.width,
                 height: req.height,
                 origin: Point::new(req.x, req.y),
+            }
+        }
+        OP_MGR_SET_WINDOW_DESKTOP | OP_MGR_SET_MINIMIZED => {
+            let Some(req) = MgrWindowValue::read(body) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            let r = if op == OP_MGR_SET_WINDOW_DESKTOP {
+                stack.set_window_desktop(req.window, req.value)
+            } else {
+                stack.set_minimized(req.window, req.value != 0)
+            };
+            match r {
+                // **`dirty` is `None` when it changed, and `Some(empty)` when it did not.** A
+                // window appearing or disappearing changes pixels wherever it overlapped
+                // anything, which is the same "cannot name the region" case a restack is. But
+                // moving a window between two desktops that are both not the current one — or
+                // minimizing one that is already hidden — changes nothing on screen, and a full
+                // repaint per such request would make a shell that tidies windows in the
+                // background repaint the screen for each one.
+                Ok(true) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
+                Ok(false) => {
+                    MgrOutcome::Applied { window: Some(req.window), dirty: Some(Rect::new(0, 0, 0, 0)) }
+                }
+                Err(e) => refused(e),
+            }
+        }
+        OP_MGR_SET_CURRENT_DESKTOP => {
+            let Some(req) = MgrDesktop::read(body) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            match stack.set_current_desktop(req.desktop) {
+                // **`None`, because this request names no window.** Every other manager request
+                // names one, and `Applied.window` exists so the caller can release that
+                // window's held initial `Configure`; this one releases none.
+                Ok(true) => MgrOutcome::Applied { window: None, dirty: None },
+                Ok(false) => {
+                    MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }
+                }
+                Err(e) => refused(e),
             }
         }
         _ => MgrOutcome::Failed(SurfaceError::Malformed),
@@ -294,5 +344,99 @@ mod tests {
             );
         }
         assert_eq!(dispatch(&mut s, 0x09FF, &[]), MgrOutcome::Failed(SurfaceError::Malformed));
+    }
+
+    fn value_body(window: u32, value: u32) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        MgrWindowValue { window, value }.write(&mut b).unwrap();
+        b
+    }
+
+    #[test]
+    fn the_desktop_requests_reach_the_stack_and_report_whether_the_screen_changed() {
+        let (mut s, ids) = stack_with(1);
+        let w = ids[0];
+
+        // Off the current desktop: the screen changed, so the whole of it must be repainted —
+        // which pixels changed depends on every overlap, the same case a restack is.
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 2)),
+            MgrOutcome::Applied { window: Some(w), dirty: None },
+        );
+        assert_eq!(s.window(w).unwrap().desktop, 2);
+
+        // Between two desktops that are both hidden: nothing on screen changed, and an empty
+        // rectangle is how this codebase already says "repaint nothing".
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 3)),
+            MgrOutcome::Applied { window: Some(w), dirty: Some(Rect::new(0, 0, 0, 0)) },
+        );
+
+        // Minimize takes any non-zero value as true, as the spec publishes.
+        dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 1));
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_MINIMIZED, &value_body(w, 7)),
+            MgrOutcome::Applied { window: Some(w), dirty: None },
+        );
+        assert!(s.window(w).unwrap().minimized);
+    }
+
+    #[test]
+    fn switching_the_current_desktop_names_no_window() {
+        // **`window: 0` is the point.** `Applied.window` exists so the caller can release that
+        // window's held initial `Configure`; this request names none, so it must release none.
+        // Zero is never a window id — `next_id` starts at 1 — so the caller looks for nothing
+        // and finds nothing.
+        let (mut s, _) = stack_with(1);
+        let mut b = [0u8; 4];
+        MgrDesktop { desktop: 5 }.write(&mut b).unwrap();
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
+            MgrOutcome::Applied { window: None, dirty: None },
+        );
+        assert_eq!(s.current_desktop(), 5);
+
+        // Switching to the desktop already current changes nothing on screen.
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
+            MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
+        );
+    }
+
+    #[test]
+    fn a_current_desktop_of_zero_is_malformed_on_the_wire() {
+        // The spec publishes `Malformed` rather than a refusal: a current desktop of
+        // `STICKY_DESKTOP` is a request that cannot mean anything, not one the compositor
+        // declined to serve. Checked here because `refused()` maps every other `StackError`
+        // to `Rejected`, so this one relies on an explicit arm.
+        let (mut s, _) = stack_with(1);
+        let mut b = [0u8; 4];
+        MgrDesktop { desktop: librsproto::surface::STICKY_DESKTOP }.write(&mut b).unwrap();
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
+            MgrOutcome::Failed(SurfaceError::Malformed),
+        );
+        assert_eq!(s.current_desktop(), 1, "and the current desktop is untouched");
+    }
+
+    #[test]
+    fn the_new_requests_refuse_an_unknown_window_and_a_short_body() {
+        let (mut s, _) = stack_with(1);
+        for op in [OP_MGR_SET_WINDOW_DESKTOP, OP_MGR_SET_MINIMIZED] {
+            assert_eq!(
+                dispatch(&mut s, op, &value_body(999, 1)),
+                MgrOutcome::Failed(SurfaceError::NotFound),
+                "op {op:#06x} accepted a window that does not exist",
+            );
+            assert_eq!(
+                dispatch(&mut s, op, &[0u8; 7]),
+                MgrOutcome::Failed(SurfaceError::Malformed),
+                "op {op:#06x} accepted 7 bytes",
+            );
+        }
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &[0u8; 3]),
+            MgrOutcome::Failed(SurfaceError::Malformed),
+        );
     }
 }

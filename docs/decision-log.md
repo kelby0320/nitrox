@@ -18219,3 +18219,113 @@ re-derives crossing, as `Dropped` does) and a second control that switches deskt
 is the same lesson as PR #238's finding 1, one milestone after PR #238's version of it: a control has
 to be chosen against the implementation the work will plausibly produce, not against a strawman
 that fails for any reason at all.
+
+## 2026-08-26 — Milestone 8 Part A: the compositor learns desktops
+
+Two attributes, one predicate, and three manager requests. The compositor gains a `desktop` per
+window, a `current` for the screen, and `minimized` — and **no notion of a desktop object**: no
+list, no names, no lifecycle. Which desktops exist is `desktop-shell`'s, which is what stops the
+two from being able to disagree, and it means `SetWindowDesktop` validates nothing about the id
+it is given. An id no window is on is simply an empty screen.
+
+**One predicate, because there were already two copies of half of it.** "Is this window on
+screen" was `w.configured` in `compose_into` and `w.configured` again in `hit`, and Part A would
+have made it a three-clause condition in both plus `focus_candidate`. It is `Window::visible_on`
+now, and the three sites call it. A fourth site that forgets a clause is exactly how a window
+becomes invisible-but-clickable — which is the bug this part was most likely to ship, and which
+the review of #239 had already found in the plan.
+
+**The pointer grab is the path a filter on hit-testing cannot see, and the fix was to widen a
+seam rather than add one.** `target()` is `grab.or_else(|| hit(stack))`, so once a press has
+grabbed, every event until the release bypasses hit-testing — and `grab` is cleared on
+stack-leave, last-button-up and `Dropped`, none of which a desktop switch is. The router already
+reconciled itself against the stack at the top of `route`, on the argument that "the stack is the
+authority, so ask it" rather than wiring a callback from the destroy path. That question was
+*is it gone*; it is now *is it on screen*, and minimizing or switching away mid-drag drops the
+grab and re-derives the crossing exactly as `Dropped` does. A manager request is no more on the
+router's path than a destroy is, so the same seam is the right one.
+
+**Two controls, and the second is the one that proves anything.** Reverting `hit()` to the
+pre-Part-A predicate fails all three routing tests — which looks convincing and is not, because
+it fails the mid-drag tests for the wrong reason (after the grab is dropped, the unfiltered
+`hit()` re-delivers to the same window). The decisive control keeps `hit()` filtered and reverts
+*only* the grab reconciliation: exactly the two mid-drag tests fail, and the fresh-press one
+passes. That is what shows the two halves are covered independently rather than by one filter
+twice.
+
+**`WindowInfo` grew 32 → 40 bytes, and the interesting part is what that broke silently.** Three
+call sites had sized a buffer at the literal `32`: the compositor's `reply_window_info`, and the
+test client's `map`/`from_raw_parts`/`unmap` trio. The compositor's would have turned every
+`info` resolve into `KernelError` — loud. The test client's would have made `WindowInfo::read`
+return `None` for every window, and the image still builds, so the gate would have reported "no
+info" rather than a mismatch. All three take `WINDOW_INFO_LEN` now. `flags` is a bitfield rather
+than a `minimized` boolean so M9's `maximized` costs a bit instead of another growth — and so a
+reader that does not know a bit degrades to "not set" rather than to a length mismatch.
+
+**What the guest gate covers, and what it does not.** The plan's box asked for a screendump
+compared against a `libdraw` render. That needs the host to hold the guest on another desktop,
+and `ui-testclient` parks on `sys_wait` rather than reading input — there is no way to tell it to
+switch. The trigger that makes it natural is Part B's global hotkey, which is precisely a
+host-injectable state change, so the screendump moved to Part B as a box rather than being
+dropped. What landed instead is the coverage a host test cannot give: the client drives all three
+requests down `/dev/draw/manage` and reads each back through `/dev/draw/<id>/info`. That is the
+**wire** — the gap PR #233's title cap fell into, where a feature was specified, tested in
+isolation, and unreachable on the path a client actually uses. Negative-controlled by making
+`dispatch` answer `Ok` and change nothing: the gate times out, which is PR #216's rule that a
+reply says the compositor answered and not that anything happened.
+
+## 2026-08-26 — PR #240 review: a grab taken away, and the three things nobody was told
+
+Part A dropped the pointer grab when a window left the screen, which fixed the bug PR #239's
+review predicted — and the block that did it had three defects of its own, all found by probes
+run against the branch rather than by reading it.
+
+**A leave derived from state already cleared can never be emitted.** The block set
+`inside = None` and *then* called `update_crossing`, which derives the leave **from** `inside`.
+So the router had forgotten who was owed one and emitted the enter alone: a client whose window
+was minimized under the cursor kept its hover state indefinitely, because nothing else would ever
+tell it. The leave is emitted explicitly now, **before** the id is forgotten, and the two cases
+are finally distinguished — a *destroyed* window is unreachable and its id is simply dropped, a
+window that is merely off screen is still in the stack, still has a client, and is told.
+
+**The tail of a broken sequence was handed to whoever was underneath.** With the grab cleared,
+`target` falls through to `hit`, so the event that provoked the reconciliation went to the window
+below — a release for a press it never saw. Both halves are what the grab exists to prevent, and
+`widget-toolkit.md` states the rule directly: a drag that ends outside a scrollbar must still
+deliver the release, or the scrollbar believes it is being dragged forever. The departing window
+now receives **the release that closes the sequence it was granted, then a leave**, and nothing is
+delivered to anyone until every button comes up.
+
+That release is the interesting call. A window that is off screen must not receive pointer input
+— except this is not input *to* it, it is the close of a sequence granted while it was on screen,
+which is the same reason a grab delivers outside the window's own bounds at all. Withholding it
+leaves a `libui` client holding a `capture` that only a release clears, so the next press after
+the window returns routes to the stale widget rather than the one clicked.
+
+**And the flag had to be set unconditionally, not from the button mask.** The first fix wrote
+`grab_broken = self.buttons != 0`, which reads zero exactly when the provoking event *is* the
+release — precisely the case the flag exists for. That was caught by the test written for the
+defect failing, not by review.
+
+**The block ran before the state mirror, so every record it emitted was stamped with the previous
+event's `buttons` and `modifiers`.** A release ending a shift-drag produced a leave saying shift
+was still held beside a button record saying it was not, breaking the invariant the mirror's own
+comment states: every record in one batch carries the same answer. Reconciliation moved after it.
+
+**The spec claimed parity with `Dropped` that the code never had** — "the crossing state
+re-derived, exactly as it is when input is dropped". On `Dropped`, `inside` is intact and the
+paired leave and enter both go out; here the leave half was structurally unreachable. The spec now
+describes the actual sequence, including that crossings stay suppressed until the buttons come up
+and that a destroyed window receives none of it.
+
+**`Applied { window: 0 }` became `Option<u32>`.** The sentinel was provably safe — `next_id` starts
+at 1, so `release_configure` could never match — but it made a runtime invariant of `WindowStack`
+load-bearing for a decision two modules away with nothing enforcing the connection. The type says
+it now.
+
+Also from the review: an assertion using `unwrap_or(false)` that would have passed on `Err`;
+`info()`'s two new fields, which no host test pinned (deleting either passed 126/126 and only the
+guest gate caught it); and `work_area`, which is a fourth site asking a visibility question and
+deliberately answers it differently — a bar that is minimized or on another desktop is a bar that
+is coming back, and a work area that grew while it was away would relayout every maximised window
+twice per desktop switch. That is now written down where the next reader will look.
