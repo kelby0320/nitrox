@@ -30,9 +30,17 @@ top of that column was empty. It is specified now in
 shape: the old Milestone 6 ("windows, ports, desktops") bundled work at three different
 dependency depths, so it splits into **M6 — window management** (compositor only),
 **M7 — the graphical session** (new: login, `desktop-session-mgr`, `desktop-shell`), and
-**M8 — desktops and the overview**; the old M7 becomes **M9**. (M8 said "desktops, ports,
+**M8 — desktops and the overview**; the old M7 becomes **M10**. (M8 said "desktops, ports,
 templates" until durable window-to-window wiring was cut on 2026-08-21; ports survive as paths
 and are unscheduled, and templates went with the wiring.)
+
+**Renumbered again 2026-08-26**, when minimize/maximize and snap-to-edge were raised: a new
+**M9 — window decorations and interaction** goes in ahead of applications, which become **M10**,
+and visual theming becomes **M11**. The reason is in this document already — `Place`'s spec note
+says a relative move "would only serve an interactive drag, which needs a grab offset the
+compositor does not keep. **It comes back with decorations, or not at all.**" Drag-to-move needs
+somebody to own a grab region, so decorations are the *prerequisite* for snap rather than polish
+that follows it. Themes are the polish half, and they are what M11 is.
 
 ## What this is
 
@@ -153,7 +161,7 @@ graduates with the milestone that finishes its subsystem.
 | `graphical-session.md` | **M7** | the milestone that builds the graphical login |
 | `desktop-shell.md` | **M7** | the milestone the shell lands in |
 | `ui-composition-model.md` | **M8** | ports and desktops, which M8 builds |
-| `display-substrate.md` | **M9** | input, text and capture are finished there |
+| `display-substrate.md` | **M10** | input, text and capture are finished there |
 
 Added 2026-08-10 once there were five of these rather than three, because
 `input-subsystem.md`'s subsystem finished with M3 and its box was simply never written — the
@@ -1849,26 +1857,267 @@ that never logged in — which is exactly the confusion that would otherwise cos
 
 ## Milestone 8 — desktops and the overview
 
-Sketched. The remainder of the old Milestone 6, now resting on a shell that exists.
+**Details pass 2026-08-26.** The remainder of the old Milestone 6, now resting on a shell that
+exists. Six parts, in dependency order; the shape follows Milestone 7's, where each part is
+gated before the next begins.
 
 **Rescoped 2026-08-21**, when durable window-to-window wiring was cut
 ([`ui-composition-model.md`](../design/ui-composition-model.md) revision 3). Ports-as-wiring, the
 default-handler fallback and templates went with it; desktops never depended on any of them.
 
-- [ ] **Graduate `ui-composition-model.md`** to `docs/architecture/` — this milestone builds the
-      desktops it specifies. Ports are the part that will still be unbuilt, so the graduation has
-      to say so rather than move the whole document.
+### Governing decisions
 
-Multiple desktops and **the overview** — thumbnail capture, the frozen image grid, the desktop
-sidebar (desktop shell §6). Desktop membership as a filtered view of the compositor's window set;
-moving windows between desktops.
+These were the open questions; they are answered here so the parts below can be built rather
+than re-argued.
 
-**No longer here:** ports with `list` discovery as a *wiring* surface, wiring by `sys_ns_bind`
-into an application's namespace, the default-handler fallback, and templates
-(`instantiate`/`extract`/`save`, `open ./code.nxg | desktop`). Ports themselves survive as paths
-and are unscheduled — see `TODO(port-shape-rework)`.
+**1. Membership lives in the compositor, policy lives in the shell.** The compositor gains a
+`desktop` attribute per window and one `current` value, and renders, focuses and routes input to
+the windows matching it. It gains *no notion of a desktop object* — no list, no names, no
+lifecycle. Which desktops exist, what they are called and when they disappear is the shell's,
+which is what keeps composition §6's split ("the compositor owns pixels, surfaces, windows, focus
+and input routing; the desktop shell owns desktops") true of the code and not only of the prose.
 
-## Milestone 9 — applications, and drag-and-drop between them
+**2. A window is on exactly one desktop, or on all of them — there is no third state.** This
+settles composition §7's "windows on **no** desktop": a window is assigned to the current desktop
+when it is created, and moving it is one attribute write, so the transient the question worried
+about never exists. **Sticky is `desktop = 0`**, reserved now even though the UI to set it may
+land later, because a reserved value costs nothing today and is awkward to retrofit into a
+shipped attribute. Rendering is `w.desktop == 0 || w.desktop == current`.
+
+**3. Naming pins a desktop** — the lifecycle §9 shelved, decided 2026-08-26. An **unnamed** empty
+desktop is removed; a **named** one is kept. The list always ends with exactly one empty unnamed
+desktop to create into, and there is always at least one desktop. This makes composition §6's
+"name it if it turns out to matter" the lifecycle rule rather than a separate mechanism: a scratch
+desktop costs nothing and cleans itself up, a purposeful one survives its last window closing.
+It also avoids GNOME 3's surprise, where a name a user set is discarded silently.
+
+**4. Thumbnails are frozen, and the shell owns the memory.** `Capture` takes a window and a
+buffer handle the *shell* allocated, and the compositor scales into it — the mirror image of
+`AttachBuffer`, where a client allocates and the compositor reads. The compositor gains one
+operation and no allocation policy. Capture is at thumbnail size, once per window per overview
+open (desktop-shell §6).
+
+**5. Hotkeys are gated by the manager channel.** Registration is a manager request, not a client
+one, for the reason desktop-shell §8 gives: any application able to register `Super` could
+impersonate the launcher. A registered chord is consumed before focus routing, so it does not
+also reach the focused window.
+
+### Part A — the compositor learns desktops
+
+- [ ] **`desktop` becomes a window attribute, and `current` a compositor-wide one.** `0` is
+      sticky; new windows are created onto `current`. Two manager requests —
+      `SetWindowDesktop(window, desktop)` and `SetCurrentDesktop(desktop)` — and `desktop` joins
+      `/dev/draw/N/info`. The compositor validates nothing about *which* desktops exist, because
+      it does not know: any non-zero id is acceptable, and an id with no windows is simply an
+      empty screen.
+
+- [ ] **Rendering, focus and input all follow the filter, and the last is the one that bites.**
+      A window off the current desktop must not paint, must not be focusable, and must not
+      receive pointer or key events — a window that is invisible but still hit-testable is the
+      bug this part is most likely to ship. On a desktop switch the compositor focuses the
+      topmost window on the new desktop, and the manager may override with `SetFocus`.
+
+- [ ] **A gate that fails for the right reason.** Unit tests over `dispatch` are not enough —
+      PR #233's lesson is that a handler test passes while no real caller can reach the
+      behaviour. The gate drives the real path: two windows on two desktops, switch, screendump,
+      and compare against a `libdraw` render the way `check-display` already does. Negative
+      control: leave the input filter out and show the gate catches a click landing on a window
+      that is not on screen.
+
+- [ ] **`minimized` is a second attribute, and deliberately not a desktop value.** Added
+      2026-08-26. A minimized window is still *on* its desktop — it restores there and it belongs
+      in that desktop's window list — so folding it into `desktop` as a reserved id would conflate
+      two orthogonal properties and make "restore" mean "guess where it came from". The filter
+      becomes `!minimized && (desktop == 0 || desktop == current)`, and `Manage::SetMinimized`
+      joins the two requests above. No client cooperation is involved: a minimized window is
+      simply not composited, which is why this lands here and maximize does not (see M9).
+
+- [ ] **Spec first, because this is protocol.** `docs/spec/rsproto-surface-ops.md` gains the three
+      requests, both attributes and the sticky reservation before the code lands.
+
+### Part B — global hotkeys
+
+- [ ] **`RegisterHotkey(mods, code)` on the manager channel**, answered with an id, and a
+      `Hotkey` event carrying it. Capability-gated by construction: the manager channel is the
+      only place the request is accepted, and `verify_app_namespace` already proves an
+      application cannot reach it.
+
+- [ ] **A registered chord is consumed**, not duplicated. The compositor matches before focus
+      routing and does not also deliver the key to the focused window — with a test that types
+      the chord into a focused text field and asserts nothing lands in it.
+
+- [ ] **`check-input` grows the chord**, since it is the gate that already injects PS/2 events
+      over QMP and reads a client's event log.
+
+### Part C — the bottom bar and the window list
+
+- [ ] **A second panel, docked `Bottom` with a strut.** The mechanism exists — the top bar
+      already reserves space this way — so this is the shell managing two panel windows rather
+      than new substrate. It closes half of what `desktop-shell.md`'s Status line lists as not
+      built.
+
+- [ ] **The window list, from events the shell already receives.** `WindowCreated`,
+      `WindowDestroyed`, `WindowTitle` and `WindowFocus` are all in hand since M6 Part B; the
+      list shows `normal` windows on the current desktop, excludes the shell's own, and a click
+      raises and focuses. The focused window is shown as such — the first thing in the shell
+      that reflects compositor state continuously rather than at a moment.
+
+- [ ] **Minimize and restore, from the window list.** Added 2026-08-26. The list is already this
+      part's work and it is exactly the right restore path — it is the answer to "where did my
+      window go", which is the question minimize otherwise leaves unanswered. A minimized window
+      stays listed and is shown as minimized; clicking it restores and focuses. Without a title
+      bar there is no minimize *button* yet, so the gesture is the list entry and a hotkey; the
+      button arrives with decorations in M9.
+
+- [ ] **`check-display`'s reference render is updated in the same change**, not after: a new
+      permanent bar changes every screen the display gate compares.
+
+### Part D — desktops in the shell
+
+- [ ] **The desktop list, and the lifecycle rule.** Governing decision 3, implemented: create,
+      switch, name, and the auto-removal with its two exceptions (named, or the trailing empty).
+      The shell holds the list; the compositor is told only `SetCurrentDesktop`.
+
+- [ ] **The indicator** (desktop-shell §7) — the current desktop's name, or its number when
+      unnamed, at the end of the bottom bar. Clicking it opens the overview, which lands in
+      Part E; until then it is the switch affordance itself.
+
+- [ ] **`Super+N` switches and `Super+Shift+N` moves the focused window**, both on Part B's
+      hotkeys, both ending in one attribute write. The move is deliberately available without
+      the overview open, which is the half of "Both" that the drag cannot cover.
+
+- [ ] **A gate over the lifecycle rule specifically**, because it is the part with a rule rather
+      than a mechanism: open a window on a fresh desktop, close it, and show the desktop is
+      gone; name one, close its last window, and show it is not. An unnamed desktop that
+      survives, or a named one that vanishes, must fail the gate.
+
+### Part E — capture and the overview
+
+- [ ] **`Capture(window, buffer, width, height)`** — governing decision 4. The compositor
+      area-averages the window's current contents into the shell's buffer. Deterministic, so a
+      gate can compare a thumbnail against a `libdraw` downscale of the same source.
+
+- [ ] **The overview**: a fullscreen window the shell creates, fills with the current desktop's
+      frozen thumbnails, and destroys on close — the applications modal's lifecycle, which
+      already works. A sidebar previews the other desktops and switches between them, which
+      costs only a different set of captures.
+
+- [ ] **Drag a thumbnail onto a sidebar desktop to move its window.** Shell-internal drag: press,
+      motion and release on the shell's own window, ending in `SetWindowDesktop`. This is *not*
+      M10's structural drag-and-drop, which is between applications and needs protocol.
+      `TODO(scroll-grab)`'s press-relative offset question is the same one, and this is the
+      second consumer that deferral named — so it is answered here or explicitly re-deferred.
+
+- [ ] **A gate that opens the overview and drops a window on another desktop**, then verifies
+      by switching to that desktop and comparing the screen.
+
+### Part F — `/dev/desktop`, its first consumer, and the graduations
+
+- [ ] **Bind `/dev/desktop`, discharging `TODO(desktop-endpoint)`** — the shell serves `new`,
+      `current`, and `N/info` + `N/windows/` as composition §2a specifies, and
+      `desktop-session-mgr` binds it into the session namespace.
+
+- [ ] **Ship it with a consumer, in the same part.** That deferral exists because this milestone
+      has been caught three times shipping a specified, tested, unreachable capability (PRs #233,
+      #236, #237), and a bound endpoint nothing resolves is exactly that shape. A small `desktop`
+      command — `desktop list`, `desktop switch N`, `desktop name N <label>` — is the consumer,
+      and it is also the first evidence that the desktop model is reachable from the command line
+      rather than only from the shell that implements it.
+
+- [ ] **Graduate [`ui-composition-model.md`](../design/ui-composition-model.md)** to
+      `docs/architecture/` with a Status line saying what is built. **Ports stay unbuilt**
+      (`TODO(port-shape-rework)`), so the graduation follows `desktop-shell.md`'s pattern: name
+      the sections that describe behaviour and the sections that describe intent, rather than
+      moving a document that outruns its code.
+
+- [ ] **Close the questions this milestone answered** — composition §7's sticky/no-desktop item
+      and `desktop-shell.md` §9's lifecycle item both resolve here, and `design/` drops to one
+      document.
+
+### What "done" means
+
+- Several desktops, created on demand, switched from the indicator, a hotkey, or the overview.
+- A window moved between desktops by dragging its thumbnail and by `Super+Shift+N`.
+- An unnamed desktop cleans itself up when its last window closes; a named one does not.
+- The overview shows frozen thumbnails of the current desktop, with a sidebar for the others.
+- An application still cannot reach `/dev/draw/manage`, register a hotkey, or capture a window.
+- `grep -rn 'feature = "test-harness"' userspace/desktop-shell userspace/compositor` returns
+  nothing new — the retrofit's rule holds for everything this milestone adds.
+
+### Out of scope, deliberately
+
+- **Ports as a wiring surface**, the default-handler fallback, and templates — cut in composition
+  revision 3. Ports survive as paths and are unscheduled (`TODO(port-shape-rework)`).
+- **Maximize, snap-to-edge, and drag-to-move** — Milestone 9. Maximize is not withheld for
+  tidiness: `Manage::Configure` already carries size and position, but `nxterm` *declines* every
+  `Configure` on purpose (resizing `libterm`'s grid and reflowing scrollback is "a different
+  problem", M5), so maximize today would be a no-op on the only application there is. The client
+  half is the work, and it belongs with the milestone that also gives the gesture a title bar.
+- **The system tray** — `desktop-shell.md` §9 marks it v2; it is an inter-process protocol.
+- **Live thumbnails** — an optimisation with a trigger (§9), not a v1 goal.
+- **A full desktop switcher in the bar** — §7 argues the indicator first, and that it is additive.
+- **A UI polishing pass.** Named here so it is tracked rather than assumed: the shell is
+  deliberately plain, and polish is worth more once there is more to polish (maintainer,
+  2026-08-26).
+
+## Milestone 9 — window decorations and interaction
+
+Sketched 2026-08-26, and **inserted here rather than after applications** because this document
+already said where it belongs: `Place`'s spec note explains there is no relative `Move` because
+one "would only serve an interactive drag, which needs a grab offset the compositor does not
+keep — **it comes back with decorations, or not at all**". Drag-to-move needs somebody to own a
+grab region, and a title bar is also where minimize and maximize buttons live. So decorations are
+the *prerequisite* for snap-to-edge, not polish that follows it. The polish half — colours,
+fonts, styling — is Milestone 11.
+
+**The central question, for this milestone's details pass: client-side or server-side
+decorations?** Today Nitrox is implicitly CSD — `nxterm` draws its own chrome, and the compositor
+draws nothing but what clients commit. The two shapes differ in where the drag is observed:
+
+- **CSD with a move request** (the Wayland shape, and the current inclination): clients keep
+  drawing their chrome and gain `StartMove` / `StartResize`, handing the compositor an
+  interactive drag it then owns. The compositor learns pointer-grab semantics it mostly has
+  already (`input.rs` keeps an implicit grab), and gains no rendering.
+- **SSD**: the compositor draws title bars and owns the drag outright. It already has the one
+  input it would need — `SetTitle` landed in M7 Part A for the window list — but it gains a
+  renderer, a theme, and hit-testing for buttons, against "the compositor stays small".
+
+Whichever wins, **snap needs the compositor to know a drag is in progress and where the pointer
+is**, which is the thing neither `Place` nor `Configure` can express today.
+
+- [ ] **The decorations decision, and its details pass.** CSD-plus-move-request or SSD, settled
+      before anything below is built, because every item below reads on it.
+
+- [ ] **Interactive move and resize.** The request, the grab, and the release — and the rule that
+      a window being interactively moved is not being `Place`d by the manager at the same time.
+
+- [ ] **Title bars with buttons**: close, minimize (the attribute M8 built), maximize.
+
+- [ ] **`nxterm` honours `Configure`.** The blocker for everything sized: it declines resizes
+      today, deliberately — "resizing `libterm`'s grid and reflowing its scrollback is a
+      different problem, not a parameter of this one" (M5). A first version may resize the grid
+      *without* reflowing scrollback, which is what several real terminals did for years and is a
+      far smaller problem than full reflow. Until this lands, maximize and snap are no-ops on the
+      only application there is.
+
+- [ ] **Maximize**, to the work area — the struts already exist, so this is `Configure` to a rect
+      the shell computes, plus restore-to-previous-geometry.
+
+- [ ] **Snap to edge and corner** — drag to an edge for half the screen, a corner for a quarter,
+      with a preview overlay while the pointer is held there. The same mechanism as maximize
+      (`Configure` to a rect) with a different rect and a gesture, which is why it costs little
+      once the drag is owned.
+
+### Out of scope, deliberately
+
+- **A snap-layouts dropdown** (the Windows 11 affordance: drag to the top edge and pick from
+  several layouts). Maintainer's call 2026-08-26, and it costs nothing to defer — it is an
+  *affordance* over the identical mechanism, a menu that ends in the same `Configure`-to-a-rect,
+  so nothing about adding it later has to be undone. Trigger: wanting a layout that the edge and
+  corner gestures cannot express.
+- **Themes and visual styling** — Milestone 11.
+
+## Milestone 10 — applications, and drag-and-drop between them
 
 Sketched. A file browser and a text editor, as ordinary applications rather than as parts to be
 wired together, and the one composition mechanism that survived: **structural drag-and-drop** —
@@ -1884,6 +2133,20 @@ went with it.
 
 - [ ] **Graduate `display-substrate.md`** to `docs/architecture/` — by the end of this milestone
       the substrate is fully built.
+
+## Milestone 11 — themes and visual polish
+
+Sketched 2026-08-26, and named rather than left implicit. The shell is deliberately plain: M7
+and M8 build what a desktop *does*, and M9 gives windows the chrome they are interacted through.
+This is where how it *looks* becomes the work — a theme the shell, the toolkit and the
+decorations share, rather than three sets of hardcoded colours.
+
+**Its trigger is that there is something to polish.** Polishing earlier means restyling surfaces
+that are about to change shape, and a theme abstracted from one consumer is a guess; `libui`
+already carries a `Theme` and a `Palette`, so the question this milestone answers is whether
+those are the right seam once decorations and the bars are also consumers of them.
+
+Deliberately unscheduled beyond that: it gates nothing, and nothing gates it.
 
 ## What this unblocks
 

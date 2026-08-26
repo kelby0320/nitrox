@@ -384,6 +384,15 @@ which is Part F's `nxterm` or the ports work in
 [`ui-composition-model.md`](../design/ui-composition-model.md). At that point the consumer and
 the binding land together and each can be checked against the other.
 
+**Trigger fired 2026-08-26, and the resolution is scheduled with its consumer attached.** M7 Part
+F's `nxterm` did *not* fire it — a launched terminal resolves `/dev/tty`, `/bin` and `/home`, and
+never needs to talk to the shell. Milestone 8's details pass does: desktops give `/dev/desktop`
+something to serve (`new`, `current`, `N/info`, `N/windows/`), and the plan puts the binding and
+its first consumer — a small `desktop` command — in the **same part** (M8 Part F), precisely so
+this entry's own argument is honoured rather than merely cited. If that command slips, the
+binding slips with it; a bound endpoint nothing resolves is the shape this entry exists to
+refuse.
+
 **`/svc/auth` is reachable by every process — `TODO(svc-auth-ungated)`.** M7 Part C bound
 `auth-service` at `/svc/auth` so two supervisors can each hold a session, and bound it into the
 **root namespace**, which every process inherits. Until then only `session-mgr` held a channel,

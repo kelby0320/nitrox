@@ -18063,3 +18063,108 @@ With this, **Milestone 7 is complete**. A release image boots to a login window,
 reaches a desktop, and the applications modal launches a terminal into a namespace the shell
 constructed — while `session-mgr` still offers `login:` on serial and `test-interactive` still
 passes.
+
+## 2026-08-26 — Milestone 8's details pass: desktops, and three questions that had been shelved
+
+Milestone 7 shipped and was used — a release image boots to a login window, authenticates, and
+launches a terminal from the applications modal. Milestone 8 was one paragraph marked "Sketched",
+so this is its details pass, in the same shape M7's was: settle the open questions first, then a
+part order where each part is gated before the next begins.
+
+**Naming pins a desktop — the lifecycle, decided.** `desktop-shell.md` §9 shelved this
+deliberately, and the argument that used to settle it (a template-instantiated desktop vanishing
+would surprise) went with templates in composition revision 3, so it came back open on its own
+terms. GNOME 3 auto-removes an empty workspace; an explicit "new desktop" button implies desktops
+live until closed. **The answer reuses the naming `ui-composition-model.md` §6 already had**: an
+unnamed empty desktop is removed, a named one is kept, and the list always ends with one empty
+unnamed desktop to create into. "Name it if it turns out to matter" becomes the lifecycle rule
+rather than a second mechanism, so a scratch desktop costs nothing and cleans itself up, a
+purposeful one survives its last window closing, and a name a user deliberately set is never
+discarded — which was the half of GNOME 3's behaviour worth avoiding.
+
+**A window on no desktop does not exist, and sticky is `desktop = 0`.** Composition §7 carried
+both as open. The first is answered by *removing the state* rather than specifying it: a window is
+assigned to the current desktop at creation and moving it is one attribute write, so the transient
+the question worried about ("just created, or mid-move") is never observable. The second is a
+reserved value in an attribute that has not shipped yet — free today, awkward to retrofit later —
+and it makes the whole of the break in a 1:1 membership model a single comparison,
+`w.desktop == 0 || w.desktop == current`, instead of a second model.
+
+**Membership in the compositor, policy in the shell.** The compositor gains a `desktop` attribute
+and one `current` value and gains *no notion of a desktop object* — no list, no names, no
+lifecycle. That is what keeps composition §6's split true of the code and not only of the prose,
+and it is the same reasoning that kept the compositor out of window placement in M6: it owns
+mechanism, the shell owns policy.
+
+**Capture inverts `AttachBuffer`, deliberately.** The overview's frozen thumbnails need one new
+operation, and the question was who allocates. The shell does: `Capture` takes a buffer handle the
+shell made and the compositor scales into it — the mirror of a client allocating a buffer the
+compositor reads. The compositor gains an operation and no allocation policy, which is the same
+"stays small" argument `desktop-shell.md` §6 used to reject a scale-transform pipeline.
+
+**`/dev/desktop` is scheduled with its consumer in the same part.** `TODO(desktop-endpoint)`'s
+trigger fired here — desktops finally give the path something to serve. M7 Part F did *not* fire
+it, which is worth recording because the entry named `nxterm` as a candidate: a launched terminal
+resolves `/dev/tty`, `/bin` and `/home` and never talks to the shell. The entry's argument was
+that an endpoint with no consumer is the shape that caught this milestone three times (PRs #233,
+#236, #237), so the plan puts the binding and a small `desktop` command in **one part**, and says
+that if the command slips the binding slips with it. Citing that argument while building the
+endpoint alone would have been the same mistake wearing a footnote.
+
+**Scope, chosen by the maintainer**: the bottom bar and its window list (the indicator has no home
+without it, and `desktop-shell.md`'s Status line lists it as unbuilt), global hotkeys, sticky
+windows, and `/dev/desktop`. Moving a window between desktops gets **both** gestures — dragging a
+thumbnail in the overview, and `Super+Shift+N` — because the chord is nearly free once membership
+is one attribute write, and it covers the case where the overview is not open.
+
+**A UI polishing pass is named as out of scope rather than left implicit** (maintainer,
+2026-08-26): the shell is deliberately plain, and polish is worth more once there is more to
+polish.
+
+## 2026-08-26 — minimize, maximize and snap: a renumber, and why decorations come first
+
+Raised after Milestone 8's details pass: minimize and maximize should be in there somewhere, plus
+snap-to-edge and corner on a drag, and — separately — decorations and themes as "a further
+milestone once the functionality is in place". Investigating the three turned that last
+assumption around.
+
+**The three are not one feature, and they rest on different things.**
+
+**Minimize is cheap, and it joins M8.** It is an attribute the compositor filters on, and Part C's
+window list is already exactly its restore path — "where did my window go" answered by the thing
+being built anyway. It is deliberately **not** a reserved `desktop` value: a minimized window is
+still *on* its desktop, restores there, and belongs in that desktop's list, so folding the two
+would conflate orthogonal properties and make restore a guess. The filter becomes
+`!minimized && (desktop == 0 || desktop == current)`. No client cooperation is involved, which is
+the whole reason it can land here.
+
+**Maximize is not cheap, and the blocker is the client.** `Manage::Configure` already carries size
+and position, so the manager half exists. But `nxterm` **declines every `Configure`**, on purpose
+and legally — its comment says honouring a resize means resizing `libterm`'s grid and reflowing
+scrollback, which M5 called "a different problem, not a parameter of this one". So maximize today
+would be a no-op on the only application there is. The work is a terminal that can resize, not a
+manager that can ask.
+
+**Snap presupposes drag-to-move, which does not exist — and this document had already said why.**
+`Place`'s spec note explains there is no relative `Move` because one "would only serve an
+interactive drag, which needs a grab offset the compositor does not keep. **It comes back with
+decorations, or not at all.**" Somebody has to own a grab region, and that is a title bar.
+
+**So decorations are the prerequisite for the feature, not polish that follows it** — which
+inverts the assumption in the request. A new **Milestone 9 — window decorations and interaction**
+is inserted ahead of applications (now M10), holding the CSD/SSD decision, interactive
+move/resize, title bars with buttons, `nxterm` honouring `Configure`, maximize and snap. Themes —
+the part that genuinely *is* polish — become **M11**, unscheduled, gating nothing.
+
+**The inclination for the decorations fork, to be settled by M9's own details pass**: CSD with a
+move request, the Wayland shape. Clients keep drawing their chrome as `nxterm` already does and
+gain `StartMove`/`StartResize`, handing the compositor an interactive drag. The compositor gains
+pointer-grab semantics it mostly has (`input.rs` keeps an implicit grab) and gains no renderer,
+which is the same "stays small" argument that rejected a scale-transform pipeline for the
+overview. SSD is the alternative and is not dismissed: it already has the one input it would need,
+since `SetTitle` landed in M7 Part A.
+
+**The Windows 11 snap-layouts dropdown is deferred, and deferring it costs nothing.** It is an
+*affordance* over the identical mechanism — a menu whose entries each end in the same
+`Configure`-to-a-rect — so adding it later requires undoing nothing. Recorded with a trigger:
+wanting a layout the edge and corner gestures cannot express.
