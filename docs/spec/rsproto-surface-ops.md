@@ -626,7 +626,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0917`, `0x091D`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -700,6 +700,43 @@ a window in its first four bytes; this one names none, because it is a property 
 rather than of a window. The block is not a category — see the note under
 [`Configure`](#configure-0x0915) — but the shape difference is real, and a reader who assumes
 "offset 0 is a window id" is right about every request in that range and would be wrong here.
+
+### `RegisterHotkey` (`0x091E`)
+
+Request, 8 bytes: `id` (u32), `mods` (u16), `code` (u16). Asks the compositor to route a key
+chord to the manager instead of to the focused window. `Malformed` if the body is short or `id`
+is zero; `Rejected` if `id` is already registered or the table is full (**16 entries**).
+
+**The manager picks the `id`**, the way a client picks a buffer id in
+[`AttachBuffer`](#attachbuffer-0x0901) — so the reply carries no body and the manager can name
+the chord in its own state before the answer arrives. Zero is reserved so a zeroed body cannot
+register anything.
+
+**`mods` must match exactly.** `Super+Shift+2` and `Super+2` are different chords, and a
+prefix match would make the first fire the second. A chord with `mods == 0` is a bare key.
+
+There is no unregister. A manager holds the channel for its whole life and the table dies with
+it; adding one is additive if a manager ever needs to rebind at runtime.
+
+**Why this is a manager request and not a client one.** Any application able to register `Super`
+could impersonate the launcher — take the chord that opens the applications modal and show its
+own window instead. The capability is holding `/dev/draw/manage`, which is one holder at a time
+and which an application's namespace does not bind.
+
+### `Hotkey` (`0x091F`)
+
+Event, 8 bytes: the same `MgrHotkey` body — `id`, `mods`, `code`. Sent to the manager when a
+registered chord is **pressed**.
+
+**A matched chord is consumed, not copied.** The focused window receives neither the press nor
+its release. Delivering both would make every hotkey also type into whatever has the keyboard —
+`Super+2` would switch desktops *and* put a `2` in the terminal.
+
+**The release is swallowed by keycode, not by re-matching.** A user who lets go of `Super`
+before `2` releases a chord that no longer matches, so a compositor that re-tested the modifiers
+on release would deliver a release for a press the window never saw — the same defect as handing
+a broken pointer grab's release to the window underneath. The compositor remembers which
+keycodes it consumed and swallows their releases whatever the modifiers then say.
 
 ### What is on screen
 

@@ -361,6 +361,12 @@ mod tests {
 /// later and a window can be destroyed in between.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MgrEvent {
+    /// A registered chord was pressed — `Manage::Hotkey`.
+    ///
+    /// Queued like every other manager record so it arrives in order with the window events
+    /// around it: a chord that moves a window and the geometry change it causes must not
+    /// reach the manager the wrong way round.
+    Hotkey(librsproto::surface::MgrHotkey),
     /// A window was created: id, role and the geometry its client asked for.
     Created(librsproto::surface::MgrWindowCreated),
     /// A window went away.

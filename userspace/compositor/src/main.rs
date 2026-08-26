@@ -68,7 +68,13 @@ const MSG_LEN: usize = 4096;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 /// The background the screen is cleared to where no window covers.
-const BACKGROUND: Rgb = Rgb::new(0x0E, 0x14, 0x1B);
+///
+/// **Taken from `libdraw::scene` rather than declared here**, which it was until M8 Part B. The
+/// two were the same literal, and the display gate has always depended on that: its reference
+/// render fills with `scene::BACKGROUND` and is compared against pixels this constant painted,
+/// so a change to either alone would have failed the gate with a colour mismatch rather than
+/// naming the duplicate. One constant cannot drift from itself.
+const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 
 /// Largest Surface request body.
 ///
@@ -790,8 +796,9 @@ fn unserialisable(what: &[u8]) -> bool {
 /// Send one queued manager event. `false` if the channel would not take it.
 fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     use librsproto::surface::{
-        MgrWindowCreated, MgrWindowRef, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE,
+        MgrHotkey, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY, OP_MGR_WINDOW_CREATED,
+        OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
+        OP_MGR_WINDOW_TITLE,
     };
     // Sized **from the types**, not from the byte counts the spec publishes — the same rule
     // `send_outbound` states and for the same reason: widening `PointerEvent` left a
@@ -800,6 +807,13 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     // sent. A queue whose purpose is that nothing is lost must not be one field away from
     // losing everything (PR #217 review, finding 5).
     match ev {
+        MgrEvent::Hotkey(hk) => {
+            let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
+            match hk.write(&mut body) {
+                Some(n) => send_input(ch, OP_MGR_HOTKEY, &body[..n]),
+                None => unserialisable(b"Hotkey"),
+            }
+        }
         MgrEvent::Created(c) => {
             let mut body = [0u8; core::mem::size_of::<MgrWindowCreated>()];
             match c.write(&mut body) {
@@ -965,6 +979,12 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
                 restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+                // **Drained per event, not per batch.** A chord and the window events it
+                // causes have to reach the manager in the order they happened, and the
+                // manager acts on this batch before the next one is routed.
+                for hk in srv.router.take_hotkeys() {
+                    mgr_emit(srv, MgrEvent::Hotkey(hk));
+                }
                 // **Where a press landed, always — not through `log_route`.** That path is
                 // capped at `MAX_LOGGED_ROUTES` and only sees records that were *delivered*,
                 // so the two things a failing gate most needs are exactly the two it cannot
@@ -1321,6 +1341,35 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             // click-to-focus makes, for the same reason.
             announce_focus(srv);
             reply_on_session(ch, op, request_id, &[]);
+        }
+        MgrOutcome::RegisterHotkey(hk) => {
+            // **Applied here because the table is the router's**, and answered with the same
+            // empty body every other manager request gets: the manager chose the id, so there
+            // is nothing to tell it back. A refusal is a refusal — never a silent replacement,
+            // which would leave a manager holding two chords under one id and wondering why
+            // one of them never fires.
+            match srv.router.register_hotkey(hk) {
+                Ok(()) => {
+                    Line::new()
+                        .s(b"compositor: hotkey ")
+                        .u(hk.id as u64)
+                        .s(b" registered (mods ")
+                        .u(hk.mods as u64)
+                        .s(b", code ")
+                        .u(hk.code as u64)
+                        .s(b")")
+                        .end();
+                    reply_on_session(ch, op, request_id, &[]);
+                }
+                Err(e) => {
+                    let err = match e {
+                        compositor::input::HotkeyError::ZeroId => KError::InvalidArgument,
+                        _ => KError::WouldBlock,
+                    };
+                    kprint(b"compositor: a hotkey registration was refused\n");
+                    reply_error_on_session(ch, op, request_id, err);
+                }
+            }
         }
         MgrOutcome::Configure { window, width, height, origin } => {
             // Forwarded to the window's *client*, which is a third party: the manager asked,

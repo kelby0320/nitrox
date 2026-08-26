@@ -19,9 +19,10 @@
 
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    MgrDesktop, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE, OP_MGR_LOWER,
-    OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_SET_CURRENT_DESKTOP,
-    OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED, OP_MGR_SET_WINDOW_DESKTOP,
+    MgrDesktop, MgrHotkey, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE,
+    OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_REGISTER_HOTKEY,
+    OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED,
+    OP_MGR_SET_WINDOW_DESKTOP,
 };
 
 use crate::server::SurfaceError;
@@ -56,6 +57,12 @@ pub enum MgrOutcome {
     },
     /// Refused, with the reason.
     Failed(SurfaceError),
+    /// A chord the caller must give to the input router.
+    ///
+    /// Separate from `Applied` because it changes nothing on screen and names no window, and
+    /// separate from a direct call because the table is the router's — this module is given a
+    /// `WindowStack` and nothing else, which is what keeps it host-testable.
+    RegisterHotkey(MgrHotkey),
     /// A `Configure` the caller must forward to the window's client.
     ///
     /// Not performed here because it is a message to a *third* party — the manager asked, the
@@ -174,6 +181,15 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 }
                 Err(e) => refused(e),
             }
+        }
+        OP_MGR_REGISTER_HOTKEY => {
+            let Some(hk) = MgrHotkey::read(body) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            // **Handed back rather than applied here.** The chord table lives in the input
+            // router, which this module holds no reference to — the same reason `Configure` is
+            // handed back: it is not the stack's to change.
+            MgrOutcome::RegisterHotkey(hk)
         }
         _ => MgrOutcome::Failed(SurfaceError::Malformed),
     }
@@ -417,6 +433,27 @@ mod tests {
             MgrOutcome::Failed(SurfaceError::Malformed),
         );
         assert_eq!(s.current_desktop(), 1, "and the current desktop is untouched");
+    }
+
+    #[test]
+    fn registering_a_chord_is_handed_back_rather_than_applied() {
+        // Like `Configure`, and for a comparable reason: the chord table belongs to the input
+        // router, which this module is not given. Being handed back is what keeps `dispatch`
+        // testable against a bare `WindowStack`.
+        let (mut s, _) = stack_with(1);
+        let hk = MgrHotkey { id: 3, mods: 8, code: 59 };
+        let mut b = [0u8; 8];
+        hk.write(&mut b).unwrap();
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_REGISTER_HOTKEY, &b),
+            MgrOutcome::RegisterHotkey(hk),
+            "the chord is passed through unchanged, mods and code included"
+        );
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_REGISTER_HOTKEY, &b[..7]),
+            MgrOutcome::Failed(SurfaceError::Malformed),
+            "7 bytes is not a chord"
+        );
     }
 
     #[test]

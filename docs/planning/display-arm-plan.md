@@ -1975,26 +1975,34 @@ also reach the focused window.
 
 ### Part B — global hotkeys
 
-- [ ] **`RegisterHotkey(mods, code)` on the manager channel**, answered with an id, and a
+- [x] **`RegisterHotkey(mods, code)` on the manager channel** ✅ — the *manager* picks the
+      id, the way a client picks a buffer id, so the reply needs no body., answered with an id, and a
       `Hotkey` event carrying it. Capability-gated by construction: the manager channel is the
       only place the request is accepted, and `verify_app_namespace` already proves an
       application cannot reach it.
 
-- [ ] **A registered chord is consumed**, not duplicated. The compositor matches before focus
+- [x] **A registered chord is consumed** ✅, not duplicated — and its **release is swallowed
+      by keycode**, not by re-matching, since letting go of `Super` before the key releases a
+      chord that no longer matches. The compositor matches before focus
       routing and does not also deliver the key to the focused window — with a test that types
       the chord into a focused text field and asserts nothing lands in it.
 
-- [ ] **`check-input` grows the chord**, since it is the gate that already injects PS/2 events
-      over QMP and reads a client's event log.
+- [x] **`check-input` grows the chord** ✅ — injected on the real PS/2 wire, into a stack where a
+      real client holds the keyboard, and the transcript must contain neither `win key code=59`
+      nor `widget key code=59`. **The first placement was vacuous and the control caught it**: run
+      after `input-testclient: PASSED`, the client has stopped logging, so a compositor that
+      delivered the chord produced the same silence as one that consumed it. It runs inside the
+      live window phase now, twice so the desktop ends where it started.
 
-- [ ] **And the screendump Part A could not take.** Moved here 2026-08-26: comparing a switched
-      screen against a `libdraw` render needs the host to hold the guest on another desktop, and
-      `ui-testclient` parks on `sys_wait` rather than reading input, so nothing could tell it to
-      switch. A registered hotkey is precisely a host-injectable state change — inject the chord,
-      let the client switch and say so, screendump, and compare. Part A's filtering is pinned by
-      unit tests over the functions the binary calls and by a wire round-trip through
-      `/dev/draw/<id>/info`; this is the piece that would catch the guest being consistent with
-      itself and wrong, which is what `check-display` exists for.
+- [x] **And the screendump Part A could not take** ✅. `ui-testclient` no longer parks: it
+      registers a chord and serves it for the rest of its life, so `check-display` injects
+      `Super+F1`, waits for the guest to say it switched, captures, and asserts every pixel of the
+      scene region is background — then chords back and compares the restored scene against the
+      `libdraw` render **pixel for pixel, with no client commit in between**. The round trip is
+      both ways on purpose: a one-way check passes for a compositor that filtered a window out
+      permanently or lost its buffer on the way. Negative-controlled by removing the desktop
+      clause from `compose_into` *only* — leaving hit-testing filtered — which is precisely the
+      guest-consistent-and-wrong case a host test cannot reach: 660 of 2048 pixels still drawn.
 
 ### Part C — the bottom bar and the window list
 

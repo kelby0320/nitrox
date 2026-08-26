@@ -18329,3 +18329,54 @@ guest gate caught it); and `work_area`, which is a fourth site asking a visibili
 deliberately answers it differently — a bar that is minimized or on another desktop is a bar that
 is coming back, and a work area that grew while it was away would relayout every maximised window
 twice per desktop switch. That is now written down where the next reader will look.
+
+## 2026-08-26 — Milestone 8 Part B: global hotkeys, and the gate Part A could not take
+
+A chord registered on the manager channel is routed to the manager instead of the focused
+window. Sixteen entries, the manager picks the id, and there is no unregister — a manager holds
+the channel for its whole life and the table dies with it.
+
+**The manager picks the id, which is why the reply carries no body.** The same shape a client
+picks a buffer id in `AttachBuffer`, and for the same reason: the caller can name the thing in its
+own state before the answer arrives. Zero is reserved so a zeroed body registers nothing.
+
+**A matched chord is consumed rather than copied**, or every hotkey would also type into whatever
+has the keyboard — `Super+2` would switch desktops *and* put a `2` in the terminal. **The release
+is swallowed by keycode, not by re-matching the chord**, because letting go of `Super` before the
+key is the ordinary way to release one: a compositor that re-tested the modifiers on release would
+deliver a release for a press the window never saw. That is the same defect as handing a broken
+pointer grab's tail to the window underneath, one milestone later and in a different subsystem.
+
+**`ui-testclient` stopped parking, and that is what unlocked Part A's missing gate.** Until now it
+waited on a notification nothing signals, so the screen it left behind was the only thing a gate
+could look at — which is exactly why Part A could not screendump a *switched* desktop: nothing
+host-side could tell the guest to switch. A registered chord is that channel. `check-display` now
+injects `Super+F1`, waits for the guest to say it switched, captures, asserts every pixel of the
+scene region is background, chords back, and compares the restored scene against the `libdraw`
+render pixel for pixel **with no client commit in between** — which is what says a desktop switch
+is a filter changing its mind rather than a redraw.
+
+The round trip is deliberately both ways: a one-way check passes for a compositor that filtered a
+window out permanently, or dropped its buffer on the way. Negative-controlled by removing the
+desktop clause from `compose_into` **only**, leaving hit-testing filtered — precisely the
+guest-consistent-and-wrong case no host test can reach, and the gate reported 660 of 2048 pixels
+still drawn.
+
+**The `check-input` assertion was vacuous in its first placement, and only the control found it.**
+It ran after `input-testclient: PASSED`, where the client has stopped logging window events — so a
+compositor that delivered the chord produced the same silence as one that consumed it, and the
+control (fire *and* deliver) passed. Moved inside the live window phase, and injected twice so the
+desktop ends where it started, it fails as it should. This is the third time in three parts that a
+gate assertion looked like coverage and was not, and the pattern is the same each time: the
+absence being asserted has to be an absence *the observer could have reported*.
+
+**One background constant, not two.** The compositor declared its own `BACKGROUND` with the same
+literal as `libdraw::scene::BACKGROUND`, and the display gate has always depended on the two
+agreeing — its reference render fills with one and is compared against pixels painted by the
+other. A change to either alone would have failed the gate as a colour mismatch rather than naming
+the duplicate. The compositor takes libdraw's now.
+
+**A note on how the build was verified, because it misled me.** `cargo xtask image` builds the
+**release** image, which contains no `test-harness` crate — so it reported success while
+`ui-testclient` did not compile. Two missing imports were only found when `check-display` built
+the test image. Checking a build means checking the artifact that contains the code changed.
