@@ -379,6 +379,15 @@ It also costs more than it looks: the shell would have to send a `Meta::Ready` b
 supervisor that is blocked reaping it, so `spawn_leader` would need to wait for a ready before
 reaping — a change to the shared session core for a graphical-only need.
 
+**That cost is gone, 2026-08-26, because the binding it belonged to is not the one being built.**
+It assumed a *supervisor* binding `/dev/desktop` into the session namespace, which is what
+`graphical-session.md` §3 specified. Planning M8 Part F found that binding has no consumer — the
+session namespace is the shell's own — while the thing that does need to resolve the path is an
+application, whose namespace the shell **constructs**. So the shell binds its endpoint there
+directly, no handshake is needed, and `spawn_leader` is untouched. The entry's argument is
+unchanged and still decides the case; only one of its two costs turned out to be an artefact of
+the wrong mechanism.
+
 Trigger: **the first process that resolves `/dev/desktop`** — an application talking to the shell,
 which is Part F's `nxterm` or the ports work in
 [`ui-composition-model.md`](../design/ui-composition-model.md). At that point the consumer and

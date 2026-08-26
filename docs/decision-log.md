@@ -18168,3 +18168,54 @@ since `SetTitle` landed in M7 Part A.
 *affordance* over the identical mechanism — a menu whose entries each end in the same
 `Configure`-to-a-rect — so adding it later requires undoing nothing. Recorded with a trigger:
 wanting a layout the edge and corner gestures cannot express.
+
+## 2026-08-26 — PR #239 review: the consumer that could not reach its endpoint
+
+Six fixes from the M8 details pass review. Two are worth recording; the rest were stale numbering
+the renumber missed, and are in the PR.
+
+**`/dev/desktop`'s consumer could not have resolved it, and the fix removed a cost rather than
+adding one.** Part F paired the binding with a `desktop` command precisely so the endpoint would
+not ship unreachable — `TODO(desktop-endpoint)`'s whole argument. But the command is a `/bin`
+program, and a `/bin` program runs under the `nxsh` that `nxterm` spawns with `namespace: 0`,
+inheriting `nxterm`'s namespace: the **hand-written five-bind list** `build_app_namespace`
+constructs, not a projection of the session's. The part bound `/dev/desktop` into the *session*
+namespace, which that command cannot see. An endpoint with a consumer that cannot reach it is the
+deferral's own failure mode wearing a fix — which is a sharper version of the same mistake, since
+it would have looked answered.
+
+**The correction is that the session-namespace binding has no consumer at all.** The session
+namespace is the shell's own and nothing else runs in it. What needs `/dev/desktop` is an
+application, and an application's namespace is one the shell *constructs*. So the shell binds its
+endpoint into the namespaces it constructs and none into the session namespace — and the
+`Meta::Ready` handshake `deferred-decisions.md` named as this box's second cost, with its change
+to `spawn_leader` to wait for a ready before reaping, **is not needed at all**. The cost was an
+artefact of the wrong mechanism.
+
+`graphical-session.md` §3 is amended to match. Its substance survives — the shell does not
+register *itself*, which is what the "resource servers don't self-register" rule protects — while
+its mechanism sentence does not. Deciding what a child it created may reach is the constructor
+role the shell already holds `BIND_NAMESPACE` for and already exercises five times; making itself
+reachable in a namespace a supervisor owns is the prohibited act, and it still does not do that.
+The remaining question is the capability one, and it is now named in the part rather than
+discovered in it: binding `/dev/desktop` into every application namespace grants every application
+the ability to create and switch desktops, which is strictly more than an application has today.
+Granted deliberately for v1, because withholding mutation leaves `desktop switch` unable to work
+and a disarmed consumer is the shape being avoided; the narrow-bind that withholds
+`/dev/draw/manage` is kept as the escape hatch.
+
+**A one-control negative test would have passed for the implementation the part will produce.**
+Part A's rule is that a window off the current desktop must not be hit-testable, and its control
+was "leave the input filter out and show the gate catches a click on an off-screen window". But
+`InputRouter::target()` is `self.grab.or_else(|| self.hit(stack))`, and `hit()` is where the
+existing on-screen predicate lives — so the filter naturally goes in `hit()`, which leaves the
+retained grab unfiltered, and `grab` is cleared on stack-leave, last-button-up and `Dropped` but
+**not on a desktop switch**. Hold a button, press `Super+2`, and motion and release keep reaching
+a window that is not on screen. The control is a *fresh press*, which goes through `hit()`, so it
+passes for exactly that implementation.
+
+The part now carries the rule (switching or minimizing the grab-holder drops the grab and
+re-derives crossing, as `Dropped` does) and a second control that switches desktops mid-drag. This
+is the same lesson as PR #238's finding 1, one milestone after PR #238's version of it: a control has
+to be chosen against the implementation the work will plausibly produce, not against a strawman
+that fails for any reason at all.

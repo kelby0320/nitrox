@@ -161,7 +161,7 @@ graduates with the milestone that finishes its subsystem.
 | `graphical-session.md` | **M7** | the milestone that builds the graphical login |
 | `desktop-shell.md` | **M7** | the milestone the shell lands in |
 | `ui-composition-model.md` | **M8** | ports and desktops, which M8 builds |
-| `display-substrate.md` | **M10** | input, text and capture are finished there |
+| `display-substrate.md` | **M9** | the last substrate piece is M9's, not M10's — see below |
 
 Added 2026-08-10 once there were five of these rather than three, because
 `input-subsystem.md`'s subsystem finished with M3 and its box was simply never written — the
@@ -1523,10 +1523,13 @@ predict.
 - **Interactive move and resize** — the *gesture*. M6 gives `Place`, which sets an absolute
   origin; turning a drag into a sequence of placements needs a grab offset, which is
   `TODO(scroll-grab)`'s question ("M6's window management, which needs press-relative dragging
-  for window moves anyway") and needs a decoration to grab. Both move together, to M7 — and the
-  absence of the gesture is why B2 has no relative `Move`.
-- **Terminal reflow**, per question 3.
-- **Desktops, thumbnails, global hotkeys** — M8, M8, M7.
+  for window moves anyway") and needs a decoration to grab. Both move together — to M7 when this
+  was written, and **to M9 as of 2026-08-26**, the milestone that finally builds decorations and
+  the interactive gesture together (PR #239 review, finding 10). The absence of the gesture is
+  why B2 has no relative `Move`.
+- **Terminal reflow**, per question 3 — **M9**, where it is the blocker for maximize and snap.
+- **Desktops, thumbnails, global hotkeys** — M8, M8, and **M8 Part B** (hotkeys were pencilled
+  in at M7 and did not land there).
 
 ### The risk worth naming
 
@@ -1909,7 +1912,11 @@ also reach the focused window.
       `SetWindowDesktop(window, desktop)` and `SetCurrentDesktop(desktop)` — and `desktop` joins
       `/dev/draw/N/info`. The compositor validates nothing about *which* desktops exist, because
       it does not know: any non-zero id is acceptable, and an id with no windows is simply an
-      empty screen.
+      empty screen. **`current` is never `0`**, and that is the one thing it does validate:
+      `0` means sticky, so a current of `0` would blank every non-sticky window *and* make every
+      window created afterwards silently sticky, by the create-onto-current rule. Part F ships
+      `desktop switch N` taking `N` off a command line, which puts `desktop switch 0` one
+      keystroke away (PR #239 review, finding 7).
 
 - [ ] **Rendering, focus and input all follow the filter, and the last is the one that bites.**
       A window off the current desktop must not paint, must not be focusable, and must not
@@ -1917,12 +1924,28 @@ also reach the focused window.
       bug this part is most likely to ship. On a desktop switch the compositor focuses the
       topmost window on the new desktop, and the manager may override with `SetFocus`.
 
-- [ ] **A gate that fails for the right reason.** Unit tests over `dispatch` are not enough —
-      PR #233's lesson is that a handler test passes while no real caller can reach the
-      behaviour. The gate drives the real path: two windows on two desktops, switch, screendump,
-      and compare against a `libdraw` render the way `check-display` already does. Negative
-      control: leave the input filter out and show the gate catches a click landing on a window
-      that is not on screen.
+- [ ] **The in-flight pointer grab is the half a filter in `hit()` does not cover.** Added
+      2026-08-26 (PR #239 review, finding 2). `InputRouter::target()` is
+      `self.grab.or_else(|| self.hit(stack))`, and `hit()` is where the existing on-screen
+      predicate lives — so the natural place to add the desktop filter is inside `hit()`, and
+      that leaves the grab path entirely unfiltered. `grab` is cleared when the window leaves the
+      stack, on last-button-up, and on `Dropped`; **a desktop switch is none of those.** Hold a
+      button down, press `Super+2`, and motion and release keep reaching a window that is not on
+      screen. Same for minimizing mid-drag. The rule: switching desktops or minimizing the
+      grab-holder **drops the grab and re-derives the crossing state**, which is what `Dropped`
+      already does.
+
+- [ ] **A gate that fails for the right reason, with two controls rather than one.** Unit tests
+      over `dispatch` are not enough — PR #233's lesson is that a handler test passes while no
+      real caller can reach the behaviour. The gate drives the real path: two windows on two
+      desktops, switch, screendump, and compare against a `libdraw` render the way
+      `check-display` already does. Controls:
+      **(a)** leave the filter out of `hit()` and show the gate catches a *fresh* click landing
+      on a window that is not on screen; and
+      **(b)** switch desktops **mid-drag** and show the gate catches motion and release still
+      being delivered. Control (a) alone passes for an implementation that filters `hit()` and
+      leaks the grab — which is the implementation this part will most likely produce, so the
+      one-control version would have been decoration.
 
 - [ ] **`minimized` is a second attribute, and deliberately not a desktop value.** Added
       2026-08-26. A minimized window is still *on* its desktop — it restores there and it belongs
@@ -1957,7 +1980,9 @@ also reach the focused window.
       built.
 
 - [ ] **The window list, from events the shell already receives.** `WindowCreated`,
-      `WindowDestroyed`, `WindowTitle` and `WindowFocus` are all in hand since M6 Part B; the
+      `WindowDestroyed` and `WindowFocus` have been in hand since M6 Part B, which shipped four
+      of its five events, and `WindowTitle` since M7 Part A, which closed the fifth
+      (`TODO(m6-b3b-titles)`) — all four are in hand today; the
       list shows `normal` windows on the current desktop, excludes the shell's own, and a click
       raises and focuses. The focused window is shown as such — the first thing in the shell
       that reflects compositor state continuously rather than at a moment.
@@ -2013,16 +2038,51 @@ also reach the focused window.
 
 ### Part F — `/dev/desktop`, its first consumer, and the graduations
 
-- [ ] **Bind `/dev/desktop`, discharging `TODO(desktop-endpoint)`** — the shell serves `new`,
-      `current`, and `N/info` + `N/windows/` as composition §2a specifies, and
-      `desktop-session-mgr` binds it into the session namespace.
+- [ ] **The shell serves `/dev/desktop`** — `new`, `current`, and `N/info` + `N/windows/` as
+      composition §2a specifies.
+
+- [ ] **It is bound into *application* namespaces, not into the session namespace** — corrected
+      2026-08-26 (PR #239 review, finding 1), and the correction is the whole of what makes the
+      next box work. The first draft had `desktop-session-mgr` binding it into the session
+      namespace, following [`graphical-session.md`](../architecture/graphical-session.md) §3. But
+      the consumer is a `/bin` command, and a `/bin` command runs under the `nxsh` that `nxterm`
+      spawns with `namespace: 0` — inheriting `nxterm`'s namespace, which is the **hand-written
+      five-bind list** `build_app_namespace` constructs, not a projection of the session's. So
+      `desktop list` would have failed to resolve the very path the part had just bound: an
+      endpoint with a consumer that cannot reach it, which is `TODO(desktop-endpoint)`'s own
+      failure mode wearing a fix.
+
+      **And the session-namespace binding turns out to have no consumer at all.** The session
+      namespace is the shell's own, and nothing else runs in it. Building it anyway is exactly
+      what that deferral refuses, so it is not built — which also **removes the cost the deferral
+      named**: no `Meta::Ready` handshake, and no change to `spawn_leader` to wait for a ready
+      before reaping. §3's substance survives — the shell does not register *itself* with its
+      supervisor — and only its mechanism sentence changes; see the box below.
+
+- [ ] **Settle what an application may do with it, because binding it grants that.** Every
+      application in the session reaches `new`, `current` and switching — strictly more than
+      applications have today, since one cannot even raise its own window. The narrow-bind
+      mechanism that withholds `/dev/draw/manage` while granting `/dev/draw/new` is available
+      here too, and the honest v1 is nonetheless to **grant the subtree**: withholding mutation
+      leaves `desktop switch` with no way to work, and a binding whose only consumer is disarmed
+      is the shape this part exists to avoid. Recorded as a decision with the narrowing kept as
+      an escape hatch. `verify_app_namespace` gains `/dev/desktop` as a positive check, beside
+      `new` granted and `manage` withheld.
 
 - [ ] **Ship it with a consumer, in the same part.** That deferral exists because this milestone
       has been caught three times shipping a specified, tested, unreachable capability (PRs #233,
       #236, #237), and a bound endpoint nothing resolves is exactly that shape. A small `desktop`
       command — `desktop list`, `desktop switch N`, `desktop name N <label>` — is the consumer,
       and it is also the first evidence that the desktop model is reachable from the command line
-      rather than only from the shell that implements it.
+      rather than only from the shell that implements it. **The gate types it into a real
+      terminal**, because that is the only way to prove the resolve works from where a user is —
+      the same lesson as `check-login` asserting from `nxsh` rather than from its parent.
+
+- [ ] **Re-check [`graphical-session.md`](../architecture/graphical-session.md) §3 against what
+      shipped.** Its block was amended when this part was planned — the shell does not
+      self-register, and binds its endpoint into the namespaces it *constructs* rather than into
+      the session namespace — and it carries a "not built" status until this part lands. Clear
+      that status, and confirm the prose matches the code rather than the plan.
 
 - [ ] **Graduate [`ui-composition-model.md`](../design/ui-composition-model.md)** to
       `docs/architecture/` with a Status line saying what is built. **Ports stay unbuilt**
@@ -2031,8 +2091,9 @@ also reach the focused window.
       moving a document that outruns its code.
 
 - [ ] **Close the questions this milestone answered** — composition §7's sticky/no-desktop item
-      and `desktop-shell.md` §9's lifecycle item both resolve here, and `design/` drops to one
-      document.
+      and `desktop-shell.md` §9's lifecycle item both resolve here, and `design/` drops to
+      **two** documents — `display-substrate.md` and `fault-survival.md`, the latter not a
+      display document and not graduating with this arm.
 
 ### What "done" means
 

@@ -4,13 +4,15 @@
 
 **Partly built.** Milestones 1–2 have landed: `libdraw`, the `/dev/framebuffer` binding,
 the compositor serving `/dev/draw`, and `libsurface` (named `libui` until M4 Part A).
-Input (§5), text (§6), thumbnail capture
-(§4b) and global hotkeys (§5a) have **no code**. The build order is
+**Input (§5) landed in M3 and text (§6) in M4–M5**; thumbnail capture (§4b) and global hotkeys
+(§5a) have **no code** and are scheduled into M8 (Parts E and B). The build order is
 [`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
 when its **subsystem** is built, not when the first milestone touching it lands — the plan
-carries that checkbox at Milestone 10, where input, text and capture are finished (Milestone 7
-in the numbering before the 2026-08-12 re-scope, and Milestone 9 before the 2026-08-26 one that
-inserted window decorations and interaction).
+carries that checkbox at **Milestone 9**, because the last substrate piece is the pointer-grab
+semantics an interactive move needs, which is §5 and which M9 builds. It is *not* M10: the
+applications milestone adds nothing to the substrate. (Milestone 7 in the numbering before the
+2026-08-12 re-scope; briefly Milestone 10 in this plan's first draft, corrected by PR #239
+review, finding 4.)
 
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
