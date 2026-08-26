@@ -620,19 +620,48 @@ pub fn spawn_leader(
     // Ordered after the setup message, so a leader reads `argv` and its environment first and
     // this second message is simply the next one on the same channel.
     if sent.is_ok() && extra_handle != 0 {
-        // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
-        unsafe {
-            SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
-            SEND_MSG[8] = 1;
-            SEND_HANDLES[0] = extra_handle;
-            syscall5(
-                SYS_CHANNEL_SEND,
-                setup_mgr,
-                (&raw const SEND_MSG) as u64,
-                (&raw const SEND_HANDLES) as u64,
-                1,
-                SENDMODE_NOBLOCK,
-            );
+        // **Duplicated, because a handle on an IPC message is always a *move*.** `sys_channel_send`
+        // closes the sender's handle on success, so sending `extra_handle` directly would leave
+        // the caller's copy dead — and the caller reuses it for every later session. The symptom
+        // was every graphical login after the first getting no `/dev/draw` at all (PR #237
+        // review, finding 2).
+        // SAFETY: duplicating a handle the caller owns, with the rights a re-bind needs.
+        let moved = unsafe {
+            syscall2(SYS_HANDLE_DUPLICATE, extra_handle, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+        };
+        if moved < 0 {
+            kprint(b"libsession: could not duplicate the leader's extra handle\n");
+        } else {
+            // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
+            let r = unsafe {
+                // **Scrub the payload first.** This buffer is the crate's, and `authenticate`
+                // filled it with an `Authenticate` request — the username and password in the
+                // clear. Restamping only the header would send all `MSG_LEN` bytes anyway, so
+                // the leader would receive the login password and hold it in `.bss` for the life
+                // of the process. `desktop-session-mgr` volatile-zeroes its own stack copy two
+                // lines from here; handing the same bytes to a child instead would make that
+                // pointless (PR #237 review, finding 1).
+                SEND_MSG[PAYLOAD_OFF..].fill(0);
+                SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
+                SEND_MSG[8] = 1;
+                SEND_HANDLES[0] = moved as u64;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    setup_mgr,
+                    (&raw const SEND_MSG) as u64,
+                    (&raw const SEND_HANDLES) as u64,
+                    1,
+                    SENDMODE_NOBLOCK,
+                )
+            };
+            // Checked and reported, like `send_setup_env`'s result three lines up. Silence here
+            // is what made finding 2 invisible: the supervisor announced a session starting
+            // normally while the leader had been given nothing.
+            if r != 0 {
+                kprint(b"libsession: the leader's extra handle was not delivered\n");
+                // SAFETY: the send failed, so the duplicate is still ours.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, moved as u64) };
+            }
         }
     }
     // SAFETY: closing our end of the setup channel; the shell holds its own.

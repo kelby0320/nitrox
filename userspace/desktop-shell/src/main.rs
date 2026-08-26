@@ -29,6 +29,11 @@ use libdraw::geom::Rect;
 use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
+
+/// `EV_KEY` code for Escape — the modal's dismissal.
+const KEY_ESC: u16 = 1;
+/// `EV_KEY` code for Enter — the modal's launch.
+const KEY_ENTER: u16 = 28;
 use librsproto::surface::{CreateWindowRequest, Edge, Role};
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
@@ -52,6 +57,9 @@ const SYSTEM_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
 const SCREEN_W: u32 = 1280;
 /// The top bar's height.
 const BAR_H: u32 = 24;
+/// The screen's height, which bounds the placement cascade. Fixed for the same reason
+/// [`SCREEN_W`] is.
+const SCREEN_H: i32 = 800;
 /// Bytes per row.
 const BAR_PITCH: usize = (SCREEN_W as usize) * 4;
 /// Text size, in pixels per em.
@@ -211,7 +219,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// what the shell binds, not what an application asks for.
 ///
 /// **`/dev/draw/new` is bound as its own path, with subtree base `/new`** — not the
-/// `/dev/draw` subtree. That single choice is what closes `the `manage-ungated` deferral`, and it needs
+/// `/dev/draw` subtree. That single choice is what closed the `manage-ungated` deferral, and it needed
 /// no protocol change and no second endpoint:
 ///
 /// - Resolving `/dev/draw/new` is an **exact match** against the binding, so the forwarded
@@ -304,8 +312,25 @@ fn verify_app_namespace(ns: u64) -> bool {
         kprint(b"desktop-shell: application namespace cannot reach /dev/draw/new\n");
         return false;
     }
-    if manage_st == 0 && manage_h != 0 {
-        kprint(b"desktop-shell: application namespace REACHES /dev/draw/manage -- refusing\n");
+    // **A refusal is not the same as an absence, and treating them alike made this check
+    // pass for the exact mis-construction it exists to catch.**
+    //
+    // Once this shell holds the manager channel, the compositor answers a *second* `manage`
+    // resolve with `WouldBlock` — the first-come rule, nothing to do with whether the path is
+    // bound. So a namespace that wrongly bound the whole `/dev/draw` subtree looked identical
+    // to one that bound `new` alone, and the launch-time check announced "withholds manage"
+    // while handing an application the subtree. Demonstrated in review by widening the
+    // namespace on the launch path only: the gate went green (PR #237 review, finding 3).
+    //
+    // `WouldBlock` means the resolve **reached the compositor**, which is precisely what must
+    // not happen. Only `NotFound` — nothing in this namespace answers that path — is the
+    // property being checked.
+    if manage_st != KError::NotFound.as_i32() {
+        Line::new()
+            .s(b"desktop-shell: application namespace can REACH /dev/draw/manage (status ")
+            .i(manage_st as i64)
+            .s(b") -- refusing")
+            .end();
         return false;
     }
     kprint(b"desktop-shell: application namespace grants new, withholds manage\n");
@@ -561,16 +586,23 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
     // Part E's applications modal is what will call this per launch; doing it once here is
     // what makes the narrow bind observable — and the shell refusing to launch when the check
     // fails is the behaviour, not the test.
+    // **The startup check gates, rather than only reporting.** It used to `kprint` and let
+    // `launch` stay reachable, so a shell that knew its namespaces were wrong would launch into
+    // them anyway (PR #237 review, finding 3).
+    //
+    // It runs here, *before* the manager channel is taken, which is the only moment a `manage`
+    // resolve gets an honest answer from a namespace that does not bind it.
+    let mut may_launch = false;
     if draw_endpoint != 0 {
         let app_ns = build_app_namespace(draw_endpoint);
         if app_ns != 0 {
-            let ok = verify_app_namespace(app_ns);
+            may_launch = verify_app_namespace(app_ns);
             // SAFETY: closing the namespace; nothing has been launched into it yet.
             unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
-            if !ok {
-                kprint(b"desktop-shell: application namespaces are not gated; not launching\n");
-            }
         }
+    }
+    if !may_launch {
+        kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
     }
 
     Line::new()
@@ -665,14 +697,28 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
             if Some(w) == modal {
                 if let libsurface::WindowEvent::Key(k) = event {
                     if k.pressed != 0 {
-                        if k.keycode == KEY_ENTER {
+                        if k.keycode == KEY_ESC {
+                            // Dismissed without launching. The field declines Escape for
+                            // exactly this — see `TextFieldState::apply`.
+                            close_modal(&mut session, &mut modal, &mut query);
+                        } else if k.keycode == KEY_ENTER {
                             // The filtered list's first entry is what Enter launches. A
                             // selection the user moved would come from `ListState`; nothing
                             // moves it yet, and "the top hit" is what a launcher does with an
                             // untouched list anyway.
                             let filtered = filter(&programs, query.text());
-                            if let Some(name) = filtered.first() {
+                            if !may_launch {
+                                kprint(b"desktop-shell: launching is disabled; ignoring\n");
+                            } else if let Some(name) = filtered.first() {
                                 launch(session_ns, draw_endpoint, name);
+                                // **Closed after launching, and this was the bug.** `modal`
+                                // was set once and never cleared, so the popup stayed on top
+                                // of whatever was launched and the top bar's click handler —
+                                // gated on `modal.is_none()` — was inert for the rest of the
+                                // session. There was no second launch and no way back, and
+                                // the gate clicks once so it passed (PR #237 review,
+                                // finding 6).
+                                close_modal(&mut session, &mut modal, &mut query);
                             } else {
                                 kprint(b"desktop-shell: nothing matches; not launching\n");
                             }
@@ -729,7 +775,11 @@ fn place_new_windows(mgr: &mut ChannelTransport, next_origin: &mut i32) {
             continue;
         };
         let (x, y) = (0, *next_origin);
+        // Wrapped, or the 34th window is placed below an 800px screen and never seen.
         *next_origin += CASCADE_STEP;
+        if *next_origin > SCREEN_H - CASCADE_STEP {
+            *next_origin = BAR_H as i32;
+        }
         let place = MgrPlace { window: created.window, x, y };
         let mut body = [0u8; 12];
         if place.write(&mut body).is_none() {
@@ -785,6 +835,20 @@ fn present_modal(
     let _ = w.commit(slot, (0, 0, MODAL_W, MODAL_H));
 }
 
+/// Destroy the modal and forget it, so the top bar accepts a click again.
+///
+/// The query is reset with it: a launcher that reopened still filtered by the last thing
+/// launched would be showing a stale answer to a question nobody asked.
+fn close_modal(session: &mut Session<ChannelTransport>, modal: &mut Option<u32>, query: &mut TextFieldState) {
+    if let Some(id) = modal.take() {
+        if let Some(w) = session.window(id) {
+            let _ = w.destroy();
+        }
+        query.clear();
+        Line::new().s(b"desktop-shell: applications modal closed, window ").u(id as u64).end();
+    }
+}
+
 /// Open the applications modal as a popup parented to the top bar.
 ///
 /// **A `popup`, which is what M6 Part C made it possible to be.** A menu was a `Stack` layer
@@ -822,28 +886,46 @@ fn open_modal(
             return None;
         }
     };
+    // **Every failure past `create` destroys the window.** Returning `None` without it left
+    // the compositor holding a mapped popup whose id this process had forgotten — never
+    // closable, never committable to — while `addrs` kept a half-written new mapping that the
+    // next `present_modal` would write through (PR #237 review, finding 7).
+    let mut ok = true;
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
             kprint(b"desktop-shell: modal buffer alloc FAILED\n");
-            return None;
+            ok = false;
+            break;
         };
         addrs[i] = addr;
         // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
         // allocations, so they cannot overlap.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
         let Some(mut w) = session.window(id) else {
-            return None;
+            ok = false;
+            break;
         };
         if w.attach(i as u32, MODAL_W, MODAL_H, MODAL_PITCH as u32, handle).is_err() {
             kprint(b"desktop-shell: modal AttachBuffer FAILED\n");
-            return None;
+            ok = false;
+            break;
         }
     }
-    let Some(mut w) = session.window(id) else {
-        return None;
-    };
-    if w.commit(0, (0, 0, MODAL_W, MODAL_H)).is_err() {
-        kprint(b"desktop-shell: modal Commit FAILED\n");
+    if ok {
+        match session.window(id) {
+            Some(mut w) => {
+                if w.commit(0, (0, 0, MODAL_W, MODAL_H)).is_err() {
+                    kprint(b"desktop-shell: modal Commit FAILED\n");
+                    ok = false;
+                }
+            }
+            None => ok = false,
+        }
+    }
+    if !ok {
+        if let Some(w) = session.window(id) {
+            let _ = w.destroy();
+        }
         return None;
     }
     Line::new()

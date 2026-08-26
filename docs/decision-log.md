@@ -17924,8 +17924,16 @@ manager events — had been exercised by a test client until this.
 
 **Holding the channel is the other half of what closed `manage-ungated`.** The shell's session
 namespace binds the `/dev/draw` subtree and therefore reaches `manage`; an application's binds
-`/dev/draw/new` alone and does not. The asymmetry is the capability, and the first-come rule that
-used to separate managers stops being load-bearing.
+`/dev/draw/new` alone and does not. The asymmetry is the capability, and the first-come rule
+becomes a second line of defence rather than the only one.
+
+**It does not stop being load-bearing, which an earlier draft of this entry claimed.** The two
+refusals are not interchangeable: once a manager is held, a second `manage` resolve is answered
+`WouldBlock` — meaning it *reached the compositor* — while a correctly narrow namespace returns
+`NotFound` from the kernel without the compositor seeing it. A check that treats any error as
+"withheld" therefore passes for exactly the mis-construction it exists to catch, which is what
+the shell's launch-time verification did until review demonstrated it by widening the namespace
+on that path alone and watching the gate go green (PR #237 review, finding 3).
 
 **Attaching a manager changes the compositor's behaviour, which is why the top bar is created
 first.** A `normal` window's first `Configure` is held until the manager acts, so a `panel`

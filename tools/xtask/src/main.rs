@@ -1432,6 +1432,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // ran in it, and only then was the program spawned into it.
     session.expect("desktop-shell: application namespace grants new, withholds manage")?;
     session.expect("desktop-shell: launched whoami into its own namespace")?;
+    session.expect("desktop-shell: applications modal closed")?;
+
+    // 6. **And the top bar still works.** The modal used to be opened once and never closed,
+    //    so it stayed on top of whatever was launched and the bar's click handler — gated on
+    //    there being no modal — was inert for the rest of the session: no second launch, no
+    //    way back. Clicking again is the direct test; asserting the close alone would be a
+    //    proxy for it (PR #237 review, finding 6).
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader

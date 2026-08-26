@@ -55,12 +55,27 @@ the per-connection set** and checks membership before dispatch.
 
 **The manager channel is the deliberate exception, and that is what it is for.** Every op on
 it names a window by id and none checks ownership: managing windows one did not create is the
-whole capability, and the *binding* is what bounds who may hold it. In M6 that binding gates
-nothing — `/dev/draw` is bound unscoped into init's root namespace, so any graphical client
-could ask, and what separates the intended manager from the rest is **order**: the first to
-resolve `manage` gets it and a second resolve is refused (`WouldBlock`) rather than served,
-because two managers placing windows is a race with no arbiter. Recorded as
-`TODO(manage-ungated)` and closed by M7's per-client namespaces.
+whole capability, and the *binding* is what bounds who may hold it. As of **M7 Part E that binding gates**: an application runs
+in a namespace `desktop-shell` built, which binds `/dev/draw/new` **as its own path** with
+subtree base `/new`, so `manage` is not a component-boundary prefix match against it and
+resolves to nothing there. The shell's own session namespace binds the `/dev/draw` subtree
+unscoped and reaches both.
+
+The first-come rule remains: the first resolve of `manage` gets it and a second is refused with
+`WouldBlock` rather than served, because two managers placing windows is a race with no arbiter.
+It is now a second line of defence rather than the only one — **and the two answers are not
+interchangeable**. `WouldBlock` means the resolve *reached the compositor*, so a namespace that
+wrongly bound the subtree returns it while a correctly narrow one returns `NotFound` from the
+kernel without the compositor ever seeing it. A caller checking whether a namespace withholds
+`manage` must require `NotFound` specifically; treating any error as "withheld" makes the check
+pass for exactly the mis-construction it is meant to catch (PR #237 review).
+
+In Milestone 6 this gated nothing — `/dev/draw` was bound unscoped into init's root namespace
+and every graphical client inherited it, so order was all that separated the intended manager
+from the rest. That was tracked as `manage-ungated` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md) and is now in its resolved table.
+It still gates nothing for anything spawned with `namespace: 0`, which inherits that root — a
+property of the selftest path rather than of the design.
 
 Without that rule, holding `/dev/draw` (which this spec makes the whole of the authority to
 create windows) would also be the authority to destroy anyone else's. The composition

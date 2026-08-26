@@ -12,11 +12,12 @@ edition = "2024"
 # guarantee that "an application cannot compose other applications" on the shell being the
 # process that built them.
 #
-# **It does not bind its own endpoint.** `desktop-session-mgr` binds `/dev/desktop` into the
-# session namespace, exactly as `init` binds the tty server's. The shell holds
-# `BIND_NAMESPACE` to construct *application* namespaces continuously, not to register itself
-# once — which is what reconciles a process that both serves and constructs with `syscaps.md`
-# (`graphical-session.md` §3).
+# **It does not bind its own endpoint**, which is what reconciles a process that both serves
+# and constructs with `syscaps.md` (`graphical-session.md` §3): it holds `BIND_NAMESPACE` to
+# construct *application* namespaces continuously, not to register itself once.
+#
+# The `/dev/desktop` binding that would let an application talk back is
+# `TODO(desktop-endpoint)` — deferred until something resolves it.
 [dependencies]
 libkern = { path = "../libkern" }
 # `io` for `session::Dir`: the modal reads /bin as a forwarded directory.

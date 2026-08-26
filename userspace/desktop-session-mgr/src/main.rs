@@ -503,13 +503,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.
             unsafe { core::ptr::write_volatile(&mut pass, [0u8; 128]) };
+            // **Set before the window is drawn, not after.** `open_greeter` presents, and
+            // `view()` reads `denied` — so setting it afterwards drew a blank greeter and the
+            // refusal never appeared. The next keystroke clears `denied` before its own
+            // redraw, so the message was reachable only by pressing Tab, and the gate asserts
+            // the *kprint* rather than the rendering, so nothing caught it (PR #237 review,
+            // finding 4). `Greeter::view`'s own comment describes what that state is: a
+            // refusal a user cannot see is a login that appears to have done nothing.
+            greeter.denied = !ok;
             // Back to a login window. A fresh one rather than a retained one, for the reason
             // above — and its buffers with it, since the old window's are gone.
             match open_greeter(&mut session, &font, &greeter, &mut addrs, len) {
                 Some(id) => window = id,
                 None => fail(b"desktop-session-mgr: could not draw the greeter again\n"),
             }
-            greeter.denied = !ok;
             dirty = false;
         }
         if dirty && !present(&mut session, window, &greeter, &font, &addrs, len) {
