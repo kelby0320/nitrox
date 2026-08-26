@@ -18219,3 +18219,57 @@ re-derives crossing, as `Dropped` does) and a second control that switches deskt
 is the same lesson as PR #238's finding 1, one milestone after PR #238's version of it: a control has
 to be chosen against the implementation the work will plausibly produce, not against a strawman
 that fails for any reason at all.
+
+## 2026-08-26 — Milestone 8 Part A: the compositor learns desktops
+
+Two attributes, one predicate, and three manager requests. The compositor gains a `desktop` per
+window, a `current` for the screen, and `minimized` — and **no notion of a desktop object**: no
+list, no names, no lifecycle. Which desktops exist is `desktop-shell`'s, which is what stops the
+two from being able to disagree, and it means `SetWindowDesktop` validates nothing about the id
+it is given. An id no window is on is simply an empty screen.
+
+**One predicate, because there were already two copies of half of it.** "Is this window on
+screen" was `w.configured` in `compose_into` and `w.configured` again in `hit`, and Part A would
+have made it a three-clause condition in both plus `focus_candidate`. It is `Window::visible_on`
+now, and the three sites call it. A fourth site that forgets a clause is exactly how a window
+becomes invisible-but-clickable — which is the bug this part was most likely to ship, and which
+the review of #239 had already found in the plan.
+
+**The pointer grab is the path a filter on hit-testing cannot see, and the fix was to widen a
+seam rather than add one.** `target()` is `grab.or_else(|| hit(stack))`, so once a press has
+grabbed, every event until the release bypasses hit-testing — and `grab` is cleared on
+stack-leave, last-button-up and `Dropped`, none of which a desktop switch is. The router already
+reconciled itself against the stack at the top of `route`, on the argument that "the stack is the
+authority, so ask it" rather than wiring a callback from the destroy path. That question was
+*is it gone*; it is now *is it on screen*, and minimizing or switching away mid-drag drops the
+grab and re-derives the crossing exactly as `Dropped` does. A manager request is no more on the
+router's path than a destroy is, so the same seam is the right one.
+
+**Two controls, and the second is the one that proves anything.** Reverting `hit()` to the
+pre-Part-A predicate fails all three routing tests — which looks convincing and is not, because
+it fails the mid-drag tests for the wrong reason (after the grab is dropped, the unfiltered
+`hit()` re-delivers to the same window). The decisive control keeps `hit()` filtered and reverts
+*only* the grab reconciliation: exactly the two mid-drag tests fail, and the fresh-press one
+passes. That is what shows the two halves are covered independently rather than by one filter
+twice.
+
+**`WindowInfo` grew 32 → 40 bytes, and the interesting part is what that broke silently.** Three
+call sites had sized a buffer at the literal `32`: the compositor's `reply_window_info`, and the
+test client's `map`/`from_raw_parts`/`unmap` trio. The compositor's would have turned every
+`info` resolve into `KernelError` — loud. The test client's would have made `WindowInfo::read`
+return `None` for every window, and the image still builds, so the gate would have reported "no
+info" rather than a mismatch. All three take `WINDOW_INFO_LEN` now. `flags` is a bitfield rather
+than a `minimized` boolean so M9's `maximized` costs a bit instead of another growth — and so a
+reader that does not know a bit degrades to "not set" rather than to a length mismatch.
+
+**What the guest gate covers, and what it does not.** The plan's box asked for a screendump
+compared against a `libdraw` render. That needs the host to hold the guest on another desktop,
+and `ui-testclient` parks on `sys_wait` rather than reading input — there is no way to tell it to
+switch. The trigger that makes it natural is Part B's global hotkey, which is precisely a
+host-injectable state change, so the screendump moved to Part B as a box rather than being
+dropped. What landed instead is the coverage a host test cannot give: the client drives all three
+requests down `/dev/draw/manage` and reads each back through `/dev/draw/<id>/info`. That is the
+**wire** — the gap PR #233's title cap fell into, where a feature was specified, tested in
+isolation, and unreachable on the path a client actually uses. Negative-controlled by making
+`dispatch` answer `Ok` and change nothing: the gate times out, which is PR #216's rule that a
+reply says the compositor answered and not that anything happened.

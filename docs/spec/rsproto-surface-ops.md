@@ -108,7 +108,7 @@ its windows should be destroyed.
 ## Reading a window's metadata — `/dev/draw/<N>/info`
 
 Resolving **`/dev/draw/<N>/info`**, where `<N>` is a decimal window id, answers with a
-**`MemoryObject` of exactly 32 bytes** (`OBJECT_KIND_MEMOBJ`) holding one `WindowInfo`. The
+**`MemoryObject` of exactly 40 bytes** (`OBJECT_KIND_MEMOBJ`) holding one `WindowInfo`. The
 same shape `/dev/framebuffer/info` uses: a resolve answers with an object the caller maps,
 not with a message.
 
@@ -123,8 +123,15 @@ not with a message.
 | 22 | 2 | `u16` | `dock` edge for a panel; otherwise zero |
 | 24 | 4 | `u32` | `reserve` for a panel; otherwise zero |
 | 28 | 4 | `u32` | `parent` for a popup/dialog; otherwise zero |
+| 32 | 4 | `u32` | `desktop` — which desktop the window is on; **`0` means sticky**, on all of them |
+| 36 | 4 | `u32` | `flags` — bit 0 `minimized`; all other bits reserved, zero |
 
-All fields are little-endian. A read of fewer than 32 bytes is **refused, not read short**.
+All fields are little-endian. A read of fewer than 40 bytes is **refused, not read short**.
+
+**Grown from 32 to 40 bytes in Milestone 8 Part A**, when desktops arrived. `flags` is a
+bitfield rather than a `minimized` boolean so the next window state — `maximized`, which
+Milestone 9 needs — costs a bit rather than another growth, and so a reader that ignores an
+unknown bit degrades to "not minimized" rather than to a length mismatch.
 
 **`width`/`height` report the committed buffer's geometry**, not the size requested at
 `CreateWindow` — the request is an aspiration and the commit is a fact, and they may
@@ -619,7 +626,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0915`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -660,7 +667,60 @@ The reply says the compositor accepted the request, **not** that the client has 
 `Configure` is forwarded to a third party, and whether it arrives is a property of that client's
 receive ring. `NotFound` if no such window.
 
-## Manager events (`0x0918`–`0x091B`)
+### `SetWindowDesktop` (`0x0916`)
+
+Request, 8 bytes: `window` (u32), `desktop` (u32). Moves the window to that desktop. **`0` is
+sticky** — the window is on every desktop. `NotFound` if no such window.
+
+Any non-zero id is accepted. The compositor does **not** know which desktops exist: it stores
+the attribute and filters on it, and an id no window is on is simply an empty screen. Which
+desktops exist, what they are called, and when they disappear is the desktop shell's, and
+nothing here can be made inconsistent with it.
+
+### `SetMinimized` (`0x0917`)
+
+Request, 8 bytes: `window` (u32), `minimized` (u32 — zero or one; any non-zero value means
+minimized). `NotFound` if no such window.
+
+**Minimized is a second attribute, not a reserved `desktop` value.** A minimized window is
+still *on* its desktop: it restores there and it belongs in that desktop's window list, so
+folding the two would make restoring a guess about where the window came from.
+
+### `SetCurrentDesktop` (`0x091D`)
+
+Request, 4 bytes: `desktop` (u32). Switches which desktop is composited.
+
+**`0` is refused** with `Malformed`, and it is the only value this op validates. `0` means
+sticky, so a current desktop of `0` would blank every non-sticky window *and*, by the rule that
+a new window is created onto the current desktop, make every window created afterwards silently
+sticky.
+
+**Numbered outside the `0x0910`–`0x0917` block on purpose.** Every other manager request names
+a window in its first four bytes; this one names none, because it is a property of the screen
+rather than of a window. The block is not a category — see the note under
+[`Configure`](#configure-0x0915) — but the shape difference is real, and a reader who assumes
+"offset 0 is a window id" is right about every request in that range and would be wrong here.
+
+### What is on screen
+
+A window is composited, focusable, and able to receive pointer events when **all** of:
+
+- it has been configured (see [`Configure`](#configure-0x0908)), **and**
+- it is not minimized, **and**
+- its `desktop` is `0` or equals the current desktop.
+
+**One predicate, in one place.** These three conditions are a single function in the
+compositor rather than a condition repeated at each site, because they are already needed by
+compositing, by focus, and by hit-testing, and a fourth site is exactly how a window becomes
+invisible-but-clickable.
+
+**A window that stops being on screen loses the pointer grab.** A press grabs, and every
+pointer event up to the matching release goes to the grabbed window even after the cursor
+leaves it — so without this, minimizing or switching away from a window mid-drag keeps
+delivering motion and the release to a window that is not on screen. The grab is dropped and
+the crossing state re-derived, exactly as it is when input is dropped.
+
+## Manager events (`0x0918`–`0x091C`)
 
 Sent by the compositor **to** the manager channel, unsolicited. They are records, not
 requests: there is no reply, and the manager cannot refuse one.

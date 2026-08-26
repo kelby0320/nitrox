@@ -234,14 +234,19 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
         unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable object holding one `WindowInfo`.
     let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }).ok()?;
-    let addr = obj.map(32).ok()?;
-    // SAFETY: the compositor serves exactly 32 bytes of `WindowInfo` here.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 32) };
+    // **The constant, not the literal it used to equal.** `WindowInfo` grew from 32 to 40 bytes
+    // in M8 Part A; mapping 32 here would leave `read` refusing the short slice and this
+    // function returning `None` for every window — a *silent* failure, because the image still
+    // builds and the gate would report "no info" rather than a mismatch.
+    const N: usize = librsproto::surface::WINDOW_INFO_LEN;
+    let addr = obj.map(N).ok()?;
+    // SAFETY: the compositor serves exactly `N` bytes of `WindowInfo` here.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, N) };
     let info = librsproto::surface::WindowInfo::read(bytes);
     // Unmap once the snapshot is read. `info` mints a fresh object per resolve, so a client
     // that polls it and never unmaps leaks a page each time — the same defect the compositor
     // had on its side of this exchange (PR #175 review, finding 1).
-    let _ = obj.unmap(addr as *mut u8, 32);
+    let _ = obj.unmap(addr as *mut u8, N);
     info
 }
 
@@ -554,6 +559,98 @@ fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) -> bool
     }
     let mut reply = [0u8; 8];
     mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_ok()
+}
+
+/// Drive the three desktop requests over the real manager channel and read each back.
+///
+/// **What this covers that a host unit test cannot.** `compose_into`, `hit` and
+/// `focus_candidate` are exercised directly by `compositor`'s own tests, and those are the
+/// functions the binary calls — so the filtering itself is pinned there. What no host test can
+/// reach is the **wire**: that a real client's request, encoded into a body and sent down
+/// `/dev/draw/manage`, is routed to the right arm of `dispatch` and answered. That is the gap
+/// PR #233 fell into, where a title cap was specified, tested in isolation, and unreachable on
+/// the path a client actually uses.
+///
+/// **The window ends exactly where it started**, so this changes no pixel the display gate
+/// compares — the round trip is the assertion, not a state left behind.
+fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32) {
+    use librsproto::surface::{
+        MgrDesktop, MgrWindowValue, OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_MINIMIZED,
+        OP_MGR_SET_WINDOW_DESKTOP, STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
+    };
+
+    /// Send one `window`+`value` request; `false` if the compositor did not answer `Ok`.
+    fn send_value(mgr: &mut ChannelTransport, op: u16, window: u32, value: u32) -> bool {
+        let mut body = [0u8; 8];
+        if (MgrWindowValue { window, value }).write(&mut body).is_none() {
+            return false;
+        }
+        let mut reply = [0u8; 8];
+        mgr.request(op, &body, None, &mut reply).is_ok()
+    }
+
+    // Desktop, there and back. Read back through `info` rather than trusting the reply: an
+    // `Ok` says the compositor answered, which is the distinction PR #216 turned into a rule.
+    if !send_value(mgr, OP_MGR_SET_WINDOW_DESKTOP, window, 2) {
+        fail(b"ui-testclient: SetWindowDesktop was refused\n");
+    }
+    let Some(info) = read_window_info(root_ns, window) else {
+        fail(b"ui-testclient: could not read back a window's desktop\n");
+    };
+    if info.desktop != 2 {
+        Line::new()
+            .s(b"ui-testclient: SetWindowDesktop had no effect -- info says desktop ")
+            .u(info.desktop as u64)
+            .end();
+        fail(b"");
+    }
+    if !send_value(mgr, OP_MGR_SET_WINDOW_DESKTOP, window, 1) {
+        fail(b"ui-testclient: SetWindowDesktop back to 1 was refused\n");
+    }
+
+    // Minimized, there and back — the second attribute, and a separate bit in `info` so that a
+    // compositor folding the two into one would fail here rather than look equivalent.
+    if !send_value(mgr, OP_MGR_SET_MINIMIZED, window, 1) {
+        fail(b"ui-testclient: SetMinimized was refused\n");
+    }
+    let Some(info) = read_window_info(root_ns, window) else {
+        fail(b"ui-testclient: could not read back a minimized window\n");
+    };
+    if info.flags & WINDOW_FLAG_MINIMIZED == 0 {
+        fail(b"ui-testclient: SetMinimized had no effect -- info does not say minimized\n");
+    }
+    if info.desktop != 1 {
+        fail(b"ui-testclient: minimizing moved the window off its desktop\n");
+    }
+    if !send_value(mgr, OP_MGR_SET_MINIMIZED, window, 0) {
+        fail(b"ui-testclient: restoring from minimized was refused\n");
+    }
+
+    // The current desktop, and the one value it refuses. `STICKY_DESKTOP` as a *current*
+    // desktop would composite only sticky windows and make everything created afterwards
+    // sticky, so the compositor rejects it — and this is the only place that rejection is
+    // reached the way a real caller reaches it.
+    let mut body = [0u8; 4];
+    if (MgrDesktop { desktop: STICKY_DESKTOP }).write(&mut body).is_none() {
+        fail(b"ui-testclient: could not encode a SetCurrentDesktop body\n");
+    }
+    let mut reply = [0u8; 8];
+    if mgr.request(OP_MGR_SET_CURRENT_DESKTOP, &body, None, &mut reply).is_ok() {
+        fail(b"ui-testclient: the compositor ACCEPTED a current desktop of 0\n");
+    }
+    // And a legal switch is accepted — then straight back, so the scene the display gate
+    // compares is the one this client drew.
+    for d in [2u32, 1] {
+        let mut body = [0u8; 4];
+        if (MgrDesktop { desktop: d }).write(&mut body).is_none() {
+            fail(b"ui-testclient: could not encode a SetCurrentDesktop body\n");
+        }
+        let mut reply = [0u8; 8];
+        if mgr.request(OP_MGR_SET_CURRENT_DESKTOP, &body, None, &mut reply).is_err() {
+            fail(b"ui-testclient: a legal SetCurrentDesktop was refused\n");
+        }
+    }
+    kprint(b"ui-testclient: desktop and minimized requests round-tripped through info\n");
 }
 
 /// Place `window` at `(x, y)` and read the origin back through `/dev/draw/<id>/info`.
@@ -1326,6 +1423,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         for id in [_ui_window.id(), _term_window.id(), win.id()] {
             verify_placement(&mut mgr, root_ns, id, 0, 0);
         }
+        // **After the placements, before the scene is declared presented.** It restores every
+        // attribute it touches, so it leaves the screen exactly as the placements left it.
+        verify_desktop_requests(&mut mgr, root_ns, win.id());
         kprint(b"ui-testclient: reference windows placed via /dev/draw/manage\n");
 
         // **Exercise the one-manager rule, which is the whole of B1's contract.** The

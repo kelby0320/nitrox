@@ -108,11 +108,30 @@ impl InputRouter {
         // A window can be destroyed between one event and the next, and the router is not
         // on the destroy path. Dropping stale ids here rather than wiring a callback keeps
         // the two apart and cannot go out of date: the stack is the authority, so ask it.
-        if self.inside.is_some_and(|w| stack.window(w).is_none()) {
+        //
+        // **Not gone — *not on screen*, which since M8 Part A is the wider condition.** A
+        // window can also be minimized or moved to another desktop between two events, and
+        // that leaves it in the stack. Widening the question here rather than adding a second
+        // check is deliberate: this is the one place the router reconciles itself with the
+        // stack, and a manager request is not on the router's path any more than a destroy is.
+        let cur = stack.current_desktop();
+        let off_screen = |id: u32| !stack.window(id).is_some_and(|w| w.visible_on(cur));
+        if self.inside.is_some_and(off_screen) {
             self.inside = None;
         }
-        if self.grab.is_some_and(|w| stack.window(w).is_none()) {
+        if self.grab.is_some_and(off_screen) {
+            // **The grab is why a filter on hit-testing alone is not enough.** Every pointer
+            // event up to the matching release goes to the grab holder *without* consulting
+            // `hit`, so minimizing or switching away from a window mid-drag would keep
+            // delivering motion and the release to a window that is not on screen — the
+            // "invisible but still hit-testable" bug, reached by the one path a hit-test
+            // filter cannot see (PR #239 review, finding 2).
+            //
+            // Dropped rather than transferred, and the crossing re-derived, exactly as
+            // `Logical::Dropped` does: the cursor may be over something else entirely by now,
+            // and the window that held it is owed no more events.
             self.grab = None;
+            self.update_crossing(stack, out);
         }
 
         // Mirror the interpreter's state before anything is emitted. Enter and leave are
@@ -228,8 +247,13 @@ impl InputRouter {
             // its rectangle in the stack — at the default origin, at its requested size — so
             // without this a click anywhere inside it lands on a window the compositor has
             // decided not to draw, in front of the visible one underneath (PR #218 review,
-            // finding 3).
-            .find(|w| w.configured && w.bounds().contains(self.pointer.x, self.pointer.y))
+            // finding 3). Since M8 Part A the same is true of a minimized window and of one on
+            // another desktop, and all three clauses are `visible_on` so that this and
+            // `compose_into` cannot answer differently.
+            .find(|w| {
+                w.visible_on(stack.current_desktop())
+                    && w.bounds().contains(self.pointer.x, self.pointer.y)
+            })
             .map(|w| w.id)
     }
 
@@ -444,6 +468,102 @@ mod tests {
 
         let out = go(&mut r, &mut s, key(30, true));
         assert_eq!(out[0].window(), term, "but the keystroke still goes to the terminal");
+    }
+
+    #[test]
+    fn a_window_on_another_desktop_cannot_be_clicked() {
+        // The fresh-press half of "invisible but still hit-testable". `hit()` is where the
+        // filter lives, so this is the half a filter in `hit()` does catch — and on its own it
+        // is not enough to prove the rule, which is what the next test is for.
+        let mut s = WindowStack::new();
+        let here = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let gone = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        s.set_window_desktop(gone, 2).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, button(true));
+        // `gone` is above `here` in the stack and covers the same pixels, so without the
+        // filter it would take the click.
+        assert!(
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == here)),
+            "the click went to the window that is actually on screen"
+        );
+        assert!(
+            !out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == gone)),
+            "and not to the one on desktop 2"
+        );
+    }
+
+    #[test]
+    fn switching_desktops_mid_drag_takes_the_grab_away_from_the_hidden_window() {
+        // **The half a filter in `hit()` cannot reach**, and the reason this rule needed two
+        // controls. `target()` is `grab.or_else(hit)`, so once a press has grabbed, every
+        // event until the release bypasses hit-testing entirely — and nothing clears `grab` on
+        // a desktop switch, which is not a destroy, not a last-button-up and not a `Dropped`.
+        // An implementation that filters only `hit()` passes the test above and fails here
+        // (PR #239 review, finding 2).
+        let mut s = WindowStack::new();
+        let dragged = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        let out = go(&mut r, &mut s, button(true));
+        assert!(
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == dragged)),
+            "precondition: the press landed and grabbed"
+        );
+
+        // The manager switches desktops while the button is still held.
+        s.set_current_desktop(2).unwrap();
+
+        let out = go(&mut r, &mut s, drag(10, 10));
+        assert!(
+            !out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == dragged)),
+            "motion must not reach a window that is no longer on screen"
+        );
+        let out = go(&mut r, &mut s, button(false));
+        assert!(
+            !out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == dragged)),
+            "and neither must the release"
+        );
+    }
+
+    #[test]
+    fn minimizing_the_grab_holder_takes_the_grab_away_too() {
+        // The same rule by the other route. Named separately because the two reach
+        // `visible_on` through different attributes, and a fix that special-cased the desktop
+        // comparison would pass the test above and fail this one.
+        let mut s = WindowStack::new();
+        let dragged = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        go(&mut r, &mut s, button(true));
+
+        s.set_minimized(dragged, true).unwrap();
+
+        let out = go(&mut r, &mut s, drag(5, 5));
+        assert!(
+            !out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == dragged)),
+            "a minimized window keeps receiving the drag it grabbed"
+        );
+    }
+
+    #[test]
+    fn a_sticky_window_is_clickable_on_every_desktop() {
+        // The reserved value has to work, not merely be reserved: `desktop == 0` is the one
+        // value `visible_on` accepts regardless of the current desktop.
+        let mut s = WindowStack::new();
+        let bar = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        s.set_window_desktop(bar, librsproto::surface::STICKY_DESKTOP).unwrap();
+        s.set_current_desktop(7).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, button(true));
+        assert!(
+            out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == bar)),
+            "a sticky window takes the click on desktop 7"
+        );
     }
 
     #[test]

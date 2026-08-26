@@ -1110,7 +1110,12 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
     let Some(info) = srv.stack.info(id) else {
         return reply_resolve_error(serve_end, request_id, KError::NotFound);
     };
-    let mut bytes = [0u8; 32];
+    // **Sized from the constant, not from the number that was right when this was written.**
+    // `WindowInfo` grew from 32 to 40 bytes in M8 Part A, and a literal here would have made
+    // `write` refuse — turning every `info` resolve into `KernelError` — or, if `write` had
+    // filled what it could instead, published a window whose desktop and flags were whatever
+    // the stack memory held.
+    let mut bytes = [0u8; librsproto::surface::WINDOW_INFO_LEN];
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
     }
