@@ -26,6 +26,9 @@ libsurface = { path = "../libsurface" }
 libui = { path = "../libui" }
 libdraw = { path = "../libdraw", features = ["io"] }
 libheap = { path = "../libheap" }
+# The Tier-1 setup message: the shell receives one and hands a derived one to every
+# application it launches, so a program in a window starts the same way a pipeline stage does.
+libstream = { path = "../libstream", features = ["io"] }
 
 [[bin]]
 name = "desktop-shell"

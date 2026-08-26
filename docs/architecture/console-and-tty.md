@@ -216,7 +216,7 @@ Two things changed shape and are worth naming, because both were assumptions rat
 - **The terminal handle is handed down, not resolved.** `/dev/tty` is a namespace binding, so a
   program cannot resolve its way to a *particular* window; the emulator passes the handle in the
   child's setup message. Making the *resolved* path work inside a window needs a namespace built
-  per application, which is [`graphical-session.md`](../design/graphical-session.md) §6.1's
+  per application, which is [`graphical-session.md`](graphical-session.md) §6.1's
   question and Milestone 7's work (`TODO(gui-dev-tty)`).
 
 ## Stage 3 — line editing, history, and where they belong

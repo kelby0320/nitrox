@@ -152,7 +152,7 @@ fn recv_handoff(ctrl: u64) -> u64 {
 // `authenticate`, `build_namespace`, `session_has_bin`/`session_has_tty` and `ns_lookup`
 // moved to `libsession` in M7 Part B — the shared session core both supervisors run. What
 // stays here is the *greeter*: prompting on a terminal, which is where the two columns
-// genuinely differ (`docs/design/graphical-session.md` §4).
+// genuinely differ (`docs/architecture/graphical-session.md` §4).
 
 
 

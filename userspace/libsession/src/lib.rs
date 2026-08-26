@@ -4,7 +4,7 @@
 //! The same sequence runs in both columns — `session-mgr` on a terminal and, from M7 Part D,
 //! `desktop-session-mgr` in a window — against different arguments. Following Linux's PAM
 //! precedent this is a **shared library, not a merged process**
-//! (`docs/design/graphical-session.md` §4): the two supervisors stay separate principals with
+//! (`docs/architecture/graphical-session.md` §4): the two supervisors stay separate principals with
 //! separate lifetimes, and only the logic they genuinely share lives here.
 //!
 //! **The greeter is not here.** Prompting on a terminal and drawing a login window have

@@ -10,7 +10,7 @@ editing under *this* directory, so rules that live only next to the twin do not 
 Authenticate → construct the namespace → spawn the leader → reap → tear down, exactly as the
 serial column does, through the same [`libsession`](../libsession/src/lib.rs). It differs in
 one place: **its greeter is a window**. That split is the whole reason `libsession` exists
-(`docs/design/graphical-session.md` §4), and it is the line to keep — anything that is not
+(`docs/architecture/graphical-session.md` §4), and it is the line to keep — anything that is not
 "how a user is asked for credentials" belongs in `libsession`, where both columns get it.
 
 It is also the first compositor client to exist in a **release** image. Everything graphical

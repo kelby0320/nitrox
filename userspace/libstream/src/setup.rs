@@ -175,7 +175,7 @@ pub struct SetupPayload {
     /// It exists because `/dev/tty` is a **namespace binding**, one per session, so a
     /// program cannot resolve its way to a *particular* terminal. A terminal emulator hands
     /// the shell it hosts the terminal it attached its backend to, the way Unix inherits
-    /// fd 0/1/2 rather than looking them up. See `docs/design/graphical-session.md` §6.1
+    /// fd 0/1/2 rather than looking them up. See `docs/architecture/graphical-session.md` §6.1
     /// for what closes this properly.
     pub terminal: bool,
 }

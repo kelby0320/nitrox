@@ -235,7 +235,7 @@ supervisor drops to on a critical-path failure — no longer the normal console.
   is what keeps serial the recovery path by construction; `cargo xtask check-login` logs in
   on both in one boot and requires that neither session ended while the other started. The
   accepted cost is that the same user may be logged in twice with two namespaces
-  ([graphical-session.md](../design/graphical-session.md) §6.2).
+  ([graphical-session.md](graphical-session.md) §6.2).
 - User *creation* and password *change* (the DB is read-only); persisted per-user
   state beyond the seeded home directory.
 - The real user shell (Phase 4).

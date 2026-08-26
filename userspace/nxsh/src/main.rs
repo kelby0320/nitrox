@@ -757,7 +757,7 @@ fn repl(
     // the shell it hosts the terminal whose backend it holds, because `/dev/tty` is a
     // namespace binding and cannot name a *particular* window — the same reason Unix
     // inherits fd 0/1/2 rather than looking them up. Resolving is still the ordinary path
-    // and is what a serial login does. See `docs/design/graphical-session.md` §6.1 for what
+    // and is what a serial login does. See `docs/architecture/graphical-session.md` §6.1 for what
     // makes the resolved path work inside a window too.
     let tty = match terminal {
         Some(t) => t,

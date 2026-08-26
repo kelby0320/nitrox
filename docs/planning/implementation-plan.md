@@ -81,11 +81,17 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     complete (2026-08-20)**: Part A (placement, restacking, move damage and the initial-configure
     handshake), Part B (the manager seam and four of its five events), Part C (popups positioned
     by their creator and clipped to the screen) and Part D (the spec). **M7 — the graphical
-    session — was planned in detail 2026-08-21** and carries a prerequisite outside the display
-    arm: [test-path-retrofit.md](test-path-retrofit.md), which lands first.)
+    session — ✅ complete (2026-08-25)**: Part A (text field and list view, window titles), Part B
+    (`libsession`, the session core both columns share), Part C (`auth-service` at `/svc/auth`),
+    Part D (`desktop-session-mgr`, the greeter, and `check-login`), Part E (`desktop-shell` — top
+    bar, applications modal, per-application namespaces, window management) and Part F (`nxterm`
+    launchable, with an environment). Its prerequisite outside the display arm,
+    [test-path-retrofit.md](test-path-retrofit.md), landed first — which is why the whole
+    milestone is proved on a **release** image by `cargo xtask check-login` rather than by a
+    harness build.)
     **Re-scoped 2026-08-12** after a gap surfaced while planning Part C: nothing said who logs a
     *graphical* user in or spawns the desktop shell. That column is specified now in
-    [docs/design/graphical-session.md](../design/graphical-session.md), and the milestones above
+    [docs/architecture/graphical-session.md](../architecture/graphical-session.md), and the milestones above
     M5 changed shape — M6 is window management, **M7 is the graphical session** (new), M8 is
     desktops and the overview, M9 applications and drag-and-drop between them. (M8/M9 were
     rescoped 2026-08-21 when durable window-to-window wiring was cut — see the decision log.)

@@ -1,16 +1,30 @@
-# Nitrox: The Graphical Session — Design Notes (v1)
+# Nitrox: The Graphical Session
 
 ## Status
 
-**Not built.** This describes a subsystem with no code behind it; the build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
-when the graphical session lands (Milestone 7).
+**Built, and checked 2026-08-25** — Milestone 7 (Parts A–F). Graduated from `design/` on
+2026-08-25, revision 2.
 
-Written 2026-08-12, from a gap found while planning Milestone 5 Part C: the plan had
+What exists: [`auth-service`](../../userspace/auth-service) answers `Auth::Authenticate` at
+`/svc/auth`; [`desktop-session-mgr`](../../userspace/desktop-session-mgr) draws the greeter,
+authenticates through it, builds the session namespace and spawns the session leader;
+[`desktop-shell`](../../userspace/desktop-shell) is that leader — top bar, applications modal,
+a namespace constructed per application, window placement. The two supervisors share
+[`libsession`](../../userspace/libsession), so the serial and graphical columns authenticate
+and build namespaces through one implementation. `cargo xtask check-login` boots a **release**
+image, refuses a wrong password, logs in, launches a terminal, and proves a serial login runs
+beside it.
+
+What is **not** built, and is named as such below: §6.3's session services (nothing exists that
+must outlive or precede the shell), and the multi-desktop model
+[`ui-composition-model.md`](../design/ui-composition-model.md) describes — the shell ships one
+implicit desktop, and the overview and desktop indicator are Milestone 8.
+
+Originally written 2026-08-12, from a gap found while planning Milestone 5 Part C: the plan had
 `session-mgr` spawning `nxterm`, and the maintainer's question — *"nxterm is a desktop app the
 way gnome-terminal is; should session-mgr really be spawning it?"* — turned out to have no
 answer anywhere in `docs/`. A grep for *display manager*, *graphical login*, *greeter* returns
-nothing. [`ui-composition-model.md`](ui-composition-model.md) §6 assigns "spawning applications"
+nothing. [`ui-composition-model.md`](../design/ui-composition-model.md) §6 assigns "spawning applications"
 to the desktop shell and §5a says the shell "holds a full-rights handle to every application's
 namespace because it *created* those namespaces at spawn" — but nothing says who authenticates
 a graphical user, or who spawns the shell. **The top of that column was empty.** This document
@@ -149,7 +163,7 @@ application needs a *constructed* namespace where a shell's child can inherit on
 ### The shell also serves, and that has to be reconciled
 
 `desktop-shell` is **both** a namespace constructor and a resource server:
-[`ui-composition-model.md`](ui-composition-model.md) has `/dev/desktop/` "served by the desktop
+[`ui-composition-model.md`](../design/ui-composition-model.md) has `/dev/desktop/` "served by the desktop
 shell", and `/dev/desktop/1/windows/` as a filtered view of the compositor's window set. That
 combination runs straight at two rules this document otherwise leans on, and an earlier draft cited
 them as support without noticing (PR #193 review, finding 4):
@@ -227,19 +241,31 @@ naming it.
 
 ## 6. Open questions
 
-**6.1 — What is `/dev/tty` inside a graphical application?** The serial session binds one
-forwarding endpoint for everything in it, so every program reaches the same console. A graphical
-session's applications each get a namespace `desktop-shell` constructs, and a terminal emulator's
-`/dev/tty` should reach *its own window* — which is a different binding per application. Three
-shapes, none chosen:
+**6.1 — What is `/dev/tty` inside a graphical application? — ANSWERED 2026-08-25 by Milestone 7
+Part F: it is the tty server's *factory*, bound uniformly.** The question assumed a terminal
+emulator's `/dev/tty` "should reach its own window — which is a different binding per
+application", and therefore that the answer had to be a per-application binding, an absence, or
+named terminal groups. All three take `/dev/tty` to be a *name for a terminal*. It is not: it
+resolves to the tty server's endpoint, which **mints** terminals. The per-application part comes
+from minting and from `Tty::AttachBackend`, not from the binding.
 
-- `desktop-shell` binds a per-application `/dev/tty` when the application asks for one at spawn.
-- `/dev/tty` is absent from application namespaces, and a terminal is handed its tty as a handle
-  (which is what Milestone 5 Part C does as an interim — see the plan).
-- The tty server grows a notion of terminal groups addressable by name.
+So an application namespace binds `/dev/tty` the same way for every application
+(`desktop-shell`'s `build_app_namespace`), and `nxterm` opens a terminal, attaches its own
+window as that terminal's backend, and hands the terminal to `nxsh` **as a handle** — which is
+why two terminals do not contend: each mints its own, on its own backend. `nxsh` takes a
+handed-down terminal when its parent gives one and resolves `/dev/tty` otherwise, which is the
+second shape's mechanism confirmed, without the first clause: the name stays present, because
+minting is what it is for.
 
-This is the question Milestone 5 Part C defers rather than answers, and it belongs here because
-it is a property of how applications get their namespaces, not of the tty server's backend.
+**One edge is left, and it is an attenuation problem rather than a naming one.** A terminal
+minted *without* attaching a backend sits on the **console** backend, and `drive` gives each
+completed line to the first tty there with an outstanding read — so a graphical-session program
+that opened one and read could take a line the serial column's `nxsh` is waiting for. That is
+the console authority §5's governing decision 3 deliberately withholds from this session,
+reachable by a different route. Nothing does it today (`nxterm` attaches, `desktop-shell` never
+opens a terminal), and closing it needs a mechanism to hand out a mint-only `/dev/tty` rather
+than an edit here. It stays tracked as `TODO(gui-dev-tty)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md), narrowed to exactly this.
 
 **6.2 — Are serial and graphical sessions concurrent? — ANSWERED 2026-08-21: two independent
 sessions.** `session-mgr` and `desktop-session-mgr` each authenticate and run a session, unaware
@@ -288,9 +314,9 @@ Milestone 7 Part E.
 ## References
 
 - [`session-and-auth.md`](../architecture/session-and-auth.md) — the serial column, as built
-- [`ui-composition-model.md`](ui-composition-model.md) — §5a/§6, the shell's namespace authority
+- [`ui-composition-model.md`](../design/ui-composition-model.md) — §5a/§6, the shell's namespace authority
 - [`desktop-shell.md`](desktop-shell.md) — what the shell presents
-- [`display-substrate.md`](display-substrate.md) — the mechanism beneath both
+- [`display-substrate.md`](../design/display-substrate.md) — the mechanism beneath both
 - [`why-supervisor-registration.md`](../rationale/why-supervisor-registration.md) — why a leaf
   never constructs its own authority
 - [`display-arm-plan.md`](../planning/display-arm-plan.md) — the build order

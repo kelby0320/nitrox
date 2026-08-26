@@ -14260,7 +14260,7 @@ shell. So the plan reached for the only supervisor below `service-mgr` holding `
 **The model is two parallel stacks**, as the maintainer put it: log in on serial and `session-mgr`
 gives you `nxsh`; log in on the keyboard and something gives you a `desktop-shell`. Linux's shape
 exactly — `getty`/`login` and `sshd` beside `gdm` → `gnome-session` → `gnome-shell` — and now
-written down in [`graphical-session.md`](design/graphical-session.md).
+written down in [`graphical-session.md`](architecture/graphical-session.md).
 
 ### Two supervisors, sharing a crate — the PAM answer, not the logind one
 
@@ -17951,3 +17951,68 @@ shipped that nothing reached.
 that box is separately true and demonstrated: the shell binds no endpoint of its own and holds
 `BIND_NAMESPACE` to construct application namespaces continuously.
 
+
+## 2026-08-25 — Milestone 7 Part F: `nxterm` becomes launchable, and Milestone 7 closes
+
+A click in the applications modal opens a terminal with a working shell in it, in a **release**
+image. That is the milestone's visible claim, and `cargo xtask check-login` now boots it.
+
+**`/dev/tty` in a graphical application: the question dissolved rather than resolved.**
+`graphical-session.md` §6.1 held three candidate shapes for what `/dev/tty` should mean inside an
+application namespace — a per-application binding, an absence with the terminal handed over as a
+handle, or named terminal groups. **All three assume `/dev/tty` names a terminal.** It does not:
+it resolves to the tty *server*, which **mints** them. So the namespace binds it uniformly for
+every application, `nxterm` mints a terminal and attaches its own window as that terminal's
+backend, and `nxsh` receives the terminal **as a handle**. Two terminals never contend because
+each mints its own on its own backend — which is the maintainer's question ("if we try to open
+two nxterms will this be a problem") answered by the mechanism rather than by a policy.
+
+`TODO(gui-dev-tty)` is therefore **narrowed, not discharged**, and the plan's box said
+"discharged". What survives is an attenuation problem: a terminal minted *without* attaching a
+backend sits on the **console** backend, where `drive` hands each completed line to the first tty
+with an outstanding read — so a graphical-session program could take a line the serial column's
+`nxsh` is waiting for. That is precisely the console authority governing decision 3 withholds
+from this session, reachable by another route. Nothing does it (`nxterm` attaches; the shell never
+opens a terminal), but Part F moved it from *inert* to *reachable*, because the modal now launches
+real applications into namespaces that bind `/dev/tty`. Closing it needs a mint-only `/dev/tty` —
+an attenuated endpoint or a server-side refusal — which is a capability mechanism, not an edit to
+`build_app_namespace`. Withholding the binding is not available: minting is how `nxterm` gets a
+terminal at all.
+
+**A launched terminal's shell gets a real environment, and the evidence sits beside the send.**
+`nxterm` took no setup channel and spawned `nxsh` with `Record::default()`, so a terminal in a
+constructed namespace would have given its shell no `$env.HOME` while every serial login's had
+one. It now receives a setup message and forwards it, and `desktop-shell` keeps the environment it
+receives and hands each launched application a setup channel carrying `argv` + env.
+
+The gate asserts this from `nxterm: hosting a shell (env: N fields)`. **Where that line is emitted
+was the actual decision.** The first version logged it in `_start`, from the environment as it
+*arrived* — which would have read a healthy `3` even if the forward had been changed back to
+`Record::default()`, an assertion that passes for the broken version. It is emitted inside
+`spawn_shell` instead, from the same binding `send_setup_full` consumes, two lines apart. There is
+no release-visible observation further down the chain: `nxsh`'s banner goes to its tty, which for
+a windowed terminal is the grid, and the grid renders only under `test-harness` — so this is the
+end of what a release image can show, and the gate's comment says so rather than implying more.
+Negative-controlled by making `desktop-shell` send nothing: the gate fails with the right verdict.
+The count is three, matching a serial login.
+
+**`init` stops spawning graphical clients — done by retrofit C2, closed here.** The comment
+`init` carried from 2026-08-12, *"Until Milestone 7 there is nothing to launch `nxterm` from"*, is
+answered twice: C2 made the test image's clients service declarations, and `desktop-shell` now
+launches a terminal in a release image. The declarations stay and are **not** a duplicate of that
+path — they put a terminal and the test clients on screen *without a login*, which is what lets
+`check-display` and `check-terminal` exercise the display arm without depending on
+authentication. A gate that had to log in first would couple the display arm to the auth arm.
+
+**`graphical-session.md` and `desktop-shell.md` graduated to `architecture/`**, each with a Status
+line naming what is built. `desktop-shell.md` is the first document to graduate while still
+outrunning its code: its overview and desktop indicator are M8, its tray is v2. Rather than hold
+the whole document back — the shell it describes *is* built, and leaving it in `design/` would
+make `design/` mean two different things — its Status line says which sections describe behaviour
+and which describe intent. That is a pattern to copy deliberately and not to spread: the default
+remains that an `architecture/` doc is true throughout.
+
+With this, **Milestone 7 is complete**. A release image boots to a login window, a typed password
+reaches a desktop, and the applications modal launches a terminal into a namespace the shell
+constructed — while `session-mgr` still offers `login:` on serial and `test-interactive` still
+passes.

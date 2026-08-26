@@ -683,8 +683,18 @@ drains alongside everything else. Trigger: a second terminal emulator, or the fi
 stalled client is observed to affect another. Landed 2026-08-13 with M5 Part C
 (`userspace/tty-server/src/main.rs`).
 
-**`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`. Trigger fired 2026-08-25;
-still deferred, now for a narrower reason.** M5 Part C hands `nxterm`'s shell its terminal as a
+**`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`. The naming question is
+ANSWERED 2026-08-25 (M7 Part F); what is left is one attenuation, and it keeps the marker.**
+The original question — which of three shapes gives a terminal emulator a `/dev/tty` that means
+*its own window* — dissolved rather than resolved. All three shapes assumed `/dev/tty` names a
+terminal; it names the tty **server**, which mints them. Application namespaces bind it
+uniformly, `nxterm` mints a terminal and attaches its own window as the backend, and `nxsh`
+receives that terminal **as a handle** — so two terminals never contend, and no per-application
+binding or named terminal group is needed. See
+[`graphical-session.md`](../architecture/graphical-session.md) §6.1.
+
+**What remains is the sharp edge below**, unchanged by that answer and now reachable, because
+`desktop-shell` launches real applications into namespaces that bind `/dev/tty`: M5 Part C hands `nxterm`'s shell its terminal as a
 *handle* at spawn, the way `libstream` already passes streams. A `/dev/tty` resolved inside that
 window instead reaches the session's console.
 
@@ -710,9 +720,18 @@ incomplete application of the rule rather than a decision (PR #236 review, findi
 be wrong for the reason this entry always gave — it is a property of how applications get their
 namespaces — and the shape belongs to the part that builds them.
 
-Trigger now: **Milestone 7 Part E**, where `desktop-shell` constructs a namespace per
-application and has to decide what `/dev/tty` means inside one;
-[`graphical-session.md`](../design/graphical-session.md) §6.1 holds the three candidate shapes.
+**No longer inert, and that is what changed on 2026-08-25.** The sentence above said
+"`desktop-shell` never resolves `/dev/tty`, and it is the only thing in a graphical session".
+Part F ended that: the applications modal launches `nxterm` into a namespace binding
+`/dev/tty`, so a program in a graphical session can now mint a terminal. Nothing *misuses* it —
+`nxterm` attaches a backend, which is the whole point of the mechanism — but the gap between
+"nothing does this" and "nothing can" is the gap this entry is about.
+
+Trigger now: **the first application in a graphical session that is not a terminal emulator**,
+or any second consumer of `/dev/tty` there. The fix is a mint-only `/dev/tty` — an attenuated
+endpoint, or a tty-server op that refuses a console-backed open — and it is a capability
+mechanism, which is why it is not an edit to `build_app_namespace`. Withholding the binding
+instead is not available: minting is how `nxterm` gets its terminal at all.
 
 **Concurrent serial and graphical sessions — ~~deferred~~ ANSWERED 2026-08-21: two independent
 sessions.** `session-and-auth.md` deferred "one console, one session at a time"; two supervisors
@@ -721,7 +740,7 @@ able to authenticate independently fired it, and Milestone 7's details pass sett
 other — so serial staying available while a graphical session runs is governing decision 3
 holding by construction rather than by care. Nothing `logind`-shaped is needed, and nothing built
 for two sessions forecloses one later. See
-[`graphical-session.md`](../design/graphical-session.md) §6.2 for the costs accepted.
+[`graphical-session.md`](../architecture/graphical-session.md) §6.2 for the costs accepted.
 
 **A scrollbar's grab offset — `TODO(scroll-grab)`.** `ScrollState::offset_at` puts the thumb's
 *centre* under the cursor, so grabbing a thumb near either of its ends makes it jump by up to

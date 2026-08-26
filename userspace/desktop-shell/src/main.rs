@@ -483,11 +483,14 @@ static mut RECV_COUNT: usize = 0;
 /// [`build_app_namespace`].
 static mut SPAWN_APP: SpawnArgs = SpawnArgs {
     image: 0,
-    handle_count: 0,
-    move_mask: 0,
+    // One handle: the setup channel. An application is a **Tier-1** stage — it receives its
+    // `argv` and its environment the way every pipeline stage does, rather than through a
+    // special case.
+    handle_count: 1,
+    move_mask: 1,
     arg0: 0,
     handles: [0; 4],
-    rights: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
     namespace: 0, // set per launch = the namespace built for it
     syscaps: 0,   // empty, and it stays empty
 };
@@ -498,7 +501,15 @@ static mut SPAWN_APP: SpawnArgs = SpawnArgs {
 /// open declines to launch. See [`verify_app_namespace`] for why that is behaviour rather than
 /// a test: an application that *can* reach `manage` never says so, and nothing downstream
 /// would notice.
-fn launch(session_ns: u64, draw: u64, fs: u64, tty: u64, profile: u64, program: &str) -> bool {
+fn launch(
+    session_ns: u64,
+    draw: u64,
+    fs: u64,
+    tty: u64,
+    profile: u64,
+    program: &str,
+    env: &libstream::wire::Record,
+) -> bool {
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
@@ -524,10 +535,24 @@ fn launch(session_ns: u64, draw: u64, fs: u64, tty: u64, profile: u64, program: 
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         return false;
     }
+    // The setup channel this application will read its `argv` and environment from. Depth
+    // one, because one message is what goes down it — sized from the payload, which is the
+    // lesson `spawn_leader`'s `pipe(4)` taught when a fifth message was dropped silently.
+    let Ok((setup_ours, setup_theirs)) = libstream::setup::pipe(1) else {
+        kprint(b"desktop-shell: application setup channel FAIL\n");
+        // SAFETY: closing handles for a launch that will not happen.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, image);
+            syscall1(SYS_HANDLE_CLOSE, app_ns);
+        }
+        return false;
+    };
     // SAFETY: SPAWN_APP is a valid writable arg block.
     let h = unsafe {
         SPAWN_APP.image = image;
         SPAWN_APP.namespace = app_ns;
+        SPAWN_APP.handles[0] = setup_theirs;
+        SPAWN_APP.arg0 = libstream::setup::bootstrap_arg0(true);
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_APP) as u64)
     };
     // The kernel copied the ELF during spawn, and the namespace is the child's now.
@@ -546,6 +571,23 @@ fn launch(session_ns: u64, draw: u64, fs: u64, tty: u64, profile: u64, program: 
     // lifecycle it has no opinion about.
     // SAFETY: closing the process handle; the child runs independently.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+    // `argv[0]` is the program name, as every Tier-1 stage's is. No streams: an application
+    // is not a pipeline stage with a parent reading its output — a terminal makes its own.
+    let sent = libstream::setup::send_setup_env(
+        setup_ours,
+        &libstream::setup::Streams::default(),
+        &[program],
+        env,
+    )
+    .is_ok();
+    // SAFETY: closing our end of the setup channel.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
+    if !sent {
+        // Reported rather than swallowed: the application is already running and will find no
+        // setup message, which presents as a program with no environment rather than as a
+        // failure to launch.
+        Line::new().s(b"desktop-shell: ").s(program.as_bytes()).s(b" got no setup message").end();
+    }
     Line::new().s(b"desktop-shell: launched ").s(program.as_bytes()).s(b" into its own namespace").end();
     true
 }
@@ -568,14 +610,20 @@ static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
 /// `argv` and the environment, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> ! {
     kprint(b"desktop-shell: up (graphical session leader)\n");
 
     // Two messages arrive on the setup channel, in order: the Tier-1 `argv` + environment,
     // then the compositor's forwarding endpoint. The second is what lets this process build
     // application namespaces — a `/dev/draw` *binding* resolves to a kernel registration and
     // never back to an endpoint, so the shell cannot re-bind what its own namespace holds.
-    let _ = recv_message(setup);
+    // **The shell's own environment, kept rather than discarded**, because every application
+    // it launches gets one derived from it — `$env.HOME` and `PATH` should mean the same thing
+    // in a window as at a serial prompt.
+    let env = match libstream::setup::bootstrap(notif, session_ns, setup, arg0).setup() {
+        Some(Ok(s)) => s.env,
+        _ => libstream::wire::Record::default(),
+    };
     let draw_endpoint = recv_handle(setup);
     let fs_endpoint = recv_handle(setup);
     let tty_endpoint = recv_handle(setup);
@@ -775,7 +823,7 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
                             } else if let Some(name) = filtered.first() {
                                 launch(
                                     session_ns, draw_endpoint, fs_endpoint, tty_endpoint,
-                                    profile_endpoint, name,
+                                    profile_endpoint, name, &env,
                                 );
                                 // **Closed after launching, and this was the bug.** `modal`
                                 // was set once and never cleared, so the popup stayed on top

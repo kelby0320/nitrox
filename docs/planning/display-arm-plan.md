@@ -26,7 +26,7 @@ per-backend routing, and `nxterm` hosting `nxsh` over what is a pty with the pie
 `session-mgr` spawning `nxterm`, which assigns a graphical job to the serial column's supervisor.
 Nothing in `docs/` said who authenticates a graphical user or who spawns the desktop shell — the
 top of that column was empty. It is specified now in
-[`graphical-session.md`](../design/graphical-session.md), and the milestones below it changed
+[`graphical-session.md`](../architecture/graphical-session.md), and the milestones below it changed
 shape: the old Milestone 6 ("windows, ports, desktops") bundled work at three different
 dependency depths, so it splits into **M6 — window management** (compositor only),
 **M7 — the graphical session** (new: login, `desktop-session-mgr`, `desktop-shell`), and
@@ -44,9 +44,9 @@ the source of truth for *the order*.
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
 - **Semantics:** [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
   — windows, ports, desktops.
-- **The shell itself:** [`docs/design/desktop-shell.md`](../design/desktop-shell.md)
+- **The shell itself:** [`docs/architecture/desktop-shell.md`](../architecture/desktop-shell.md)
   — bars, applications modal, overview, and the operations it demands of the compositor.
-- **Who logs you in:** [`docs/design/graphical-session.md`](../design/graphical-session.md)
+- **Who logs you in:** [`docs/architecture/graphical-session.md`](../architecture/graphical-session.md)
   — the graphical column beside `session-mgr`'s serial one, and what the two share.
 
 The typed shell + coreutils subproject ([`shell-coreutils-plan.md`](shell-coreutils-plan.md)) is
@@ -1007,7 +1007,7 @@ This is the part with a real design question in it, and it is not "add a write p
       is the wrong thing to fix here. (Not "nothing in the tree resolves it", which an earlier
       draft claimed and is false: `session-mgr` resolves it for the login prompt and the test
       harness resolves it in the gate. Neither runs in a window — PR #193 review, finding 7.) It gets a `TODO(gui-dev-tty)` and an entry in `deferred-decisions.md`
-      triggered on Milestone 7, where [`graphical-session.md`](../design/graphical-session.md)
+      triggered on Milestone 7, where [`graphical-session.md`](../architecture/graphical-session.md)
       §6.1 owns the question.
 
 - [x] **C4 — does a dead backend end that terminal's ttys?** ✅ 2026-08-13 — yes, it does.
@@ -1026,7 +1026,7 @@ This is the part with a real design question in it, and it is not "add a write p
 **What Part C no longer contains.** An earlier draft had `session-mgr` spawning `nxterm` and
 registering it. That assigned a graphical job to the serial column's supervisor, and it did so
 because the process that should own it — `desktop-session-mgr` — did not exist in any document.
-It does now ([`graphical-session.md`](../design/graphical-session.md)), it lands in Milestone 7,
+It does now ([`graphical-session.md`](../architecture/graphical-session.md)), it lands in Milestone 7,
 and Part C is what its title says: the tty server's second backend. `nxterm` stays spawned by
 `init` in the test image until there is something to launch it from.
 
@@ -1139,7 +1139,7 @@ to avoid exactly that.
 
 **This is not a hole to plug in M6; it is M7's work arriving early.** Namespace-based gating needs
 *per-client namespaces*, and the process that constructs them is `desktop-shell`
-([`graphical-session.md`](../design/graphical-session.md) §3, §5a). Until it exists, no binding can
+([`graphical-session.md`](../architecture/graphical-session.md) §3, §5a). Until it exists, no binding can
 be given to one client and withheld from another, because there is one namespace and everybody
 inherits it.
 
@@ -1532,7 +1532,7 @@ a third thing to maintain and its feedback is worth less than it costs.
 
 **New in the 2026-08-12 re-scope**, and the piece whose absence caused the M5 Part C
 misassignment: nothing in `docs/` said who authenticates a graphical user or who spawns the
-desktop shell. [`graphical-session.md`](../design/graphical-session.md) now specifies it.
+desktop shell. [`graphical-session.md`](../architecture/graphical-session.md) now specifies it.
 
 **Planned in detail 2026-08-21.** The details pass found that the 45-line sketch this replaces
 described roughly half the milestone: three of its parts are work the sketch did not name at all,
@@ -1645,7 +1645,7 @@ The three things every later part draws with, none of which exist. Gated on the 
 - [x] **`libsession`** ✅ (2026-08-25): "authenticate → construct the namespace → spawn the leader → reap →
       tear down", the same logic in both columns against different arguments. Linux's PAM
       precedent — a shared library, not a merged process
-      ([`graphical-session.md`](../design/graphical-session.md) §4).
+      ([`graphical-session.md`](../architecture/graphical-session.md) §4).
 
       **Constraint:** `libkern` + `librsproto` + `libstream` + `libheap`, no `libos`, because
       `session-mgr` links it ([`session-mgr/CLAUDE.md`](../../userspace/session-mgr/CLAUDE.md)).
@@ -1767,24 +1767,49 @@ The three things every later part draws with, none of which exist. Gated on the 
 What makes the milestone visible: a person clicks an entry in the applications modal and a
 terminal opens.
 
-- [ ] **The shell spawns `nxterm` into a namespace it constructed**, and M5 Part C's
-      `TODO(gui-dev-tty)` is discharged. `graphical-session.md` §6.1 holds three candidate shapes;
+- [x] **The shell spawns `nxterm` into a namespace it constructed** ✅, and §6.1 is answered —
+      though `TODO(gui-dev-tty)` is *narrowed* rather than discharged, which the box did not
+      anticipate. The three candidate shapes all assumed `/dev/tty` names a terminal. It names
+      the tty **server**, which mints them: the namespace binds it uniformly, `nxterm` mints one
+      and attaches its own window as the backend, and `nxsh` gets that terminal as a **handle**
+      — so two terminals cannot contend, and neither a per-application binding nor named
+      terminal groups are needed. What survives is not a naming question but an attenuation one:
+      a terminal minted *without* a backend sits on the **console**, which is authority this
+      session withholds elsewhere, and closing it needs a mint-only `/dev/tty` rather than an
+      edit to `build_app_namespace`. Original box: `graphical-session.md` §6.1 holds three candidate shapes;
       the second is already what the code does — `nxsh` takes a handed-down terminal when its
       parent gives one and resolves `/dev/tty` otherwise, and its comment points at §6.1. The part
       confirms that as the answer or replaces it, and either way §6.1 stops being an open
       question.
 
-- [ ] **`nxterm` gets an environment, and hands it down.** It currently spawns `nxsh` with
+- [x] **`nxterm` gets an environment, and hands it down** ✅. It takes a setup channel of its
+      own and forwards the environment to `nxsh`; `desktop-shell` keeps the environment it
+      receives and gives every application it launches a setup channel carrying `argv` + env.
+      A launched terminal's shell now sees three environment fields, the same as a serial
+      login's. `check-login` asserts it from `nxterm: hosting a shell (env: N fields)`, logged
+      **beside the send** rather than where the environment arrived, so the two cannot drift —
+      and the assertion was negative-controlled by making `desktop-shell` send nothing, which
+      the gate caught. Original box: It currently spawns `nxsh` with
       `Record::default()` and takes no setup channel of its own, so a terminal launched into a
       constructed namespace would give its shell no `$env.HOME` — unlike every serial login. It
       needs to receive a setup message and forward it.
 
-- [ ] **`init` stops spawning graphical clients.** The retrofit made them service declarations;
+- [x] **`init` stops spawning graphical clients** ✅ — done by retrofit Part C2, closed here.
+      The comment from 2026-08-12 is answered twice: C2 made the test image's clients service
+      declarations, and `desktop-shell` now launches a terminal in a **release** image. The
+      declarations stay, and are not a duplicate: they put a terminal on screen *without a
+      login*, which is what lets `check-display` and `check-terminal` test the display arm
+      without depending on authentication. Original box: The retrofit made them service declarations;
       this part makes the real answer real, and closes the comment `init` has carried since
       2026-08-12: *"Until Milestone 7 there is nothing to launch `nxterm` from."*
 
-- [ ] **Graduate [`graphical-session.md`](../design/graphical-session.md) and
-      [`desktop-shell.md`](../design/desktop-shell.md)** to `docs/architecture/` — this milestone
+- [x] **Graduated [`graphical-session.md`](../architecture/graphical-session.md) and
+      [`desktop-shell.md`](../architecture/desktop-shell.md)** ✅ to `docs/architecture/`
+      (2026-08-25), each with a Status line naming what is built. `desktop-shell.md` is the
+      first doc to graduate while still outrunning its code — its overview and desktop
+      indicator are M8, its tray is v2 — so its Status line says which sections describe
+      behaviour and which describe intent, rather than the whole document being trusted.
+      `design/` now holds two documents. Original box: — this milestone
       builds both. `desktop-shell.md`'s overview (§6) and tray (§9) are M8 and v2 respectively, so
       the graduation says what is built rather than moving a document that outruns its code.
 

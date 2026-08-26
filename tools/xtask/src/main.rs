@@ -1500,6 +1500,17 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     // `nxterm::report_row` is `test-harness`-only and this gate boots a release image, so
     // asserting `"nxterm: grid> …"` here could never have passed — which is how the first
     // version of this check failed.
+    // **And it got an environment.** M7 Part F's second claim: `nxterm` took no setup message
+    // and handed `nxsh` a `Record::default()`, so a terminal launched into a constructed
+    // namespace would give its shell no `$env.HOME` while every serial login's has one. The
+    // count is the only release-visible evidence — the shell's prompt shows it, and the grid
+    // that renders the prompt is `test-harness`-only.
+    if transcript.contains("nxterm: hosting a shell (env: 0 fields)") {
+        return Err("the launched terminal hosted a shell with an empty environment, so its \
+             `$env.HOME` is unset where a serial login's is. Either `desktop-shell` sent no \
+             setup message or `nxterm` did not forward what it received"
+            .into());
+    }
     if !transcript.contains("nxterm: hosting a shell") {
         return Err("the launched terminal never hosted a shell. `nxterm: no shell` means it \
              could not spawn one — most likely `/bin` is missing from the application \

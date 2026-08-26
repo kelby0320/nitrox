@@ -323,8 +323,22 @@ fn wait_two(a: u64, b: u64) {
 ///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxterm: up\n");
+
+    // **Its own setup message, so the shell it hosts gets a real environment.** `nxterm` took
+    // none until M7 Part F and handed `nxsh` a `Record::default()`, which was invisible while
+    // `init` spawned it with nothing either. Launched from `desktop-shell` it would otherwise
+    // be the one shell on the system with no `$env.HOME`.
+    //
+    // Absent is normal, not an error: a Tier-0 spawn has no setup message at all, which is
+    // what `bootstrap_arg0(false)` means and what `init` used to do. An empty `Record` then
+    // says exactly what it did before.
+    let env = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
+        Some(Ok(s)) => s.env,
+        Some(Err(_)) => libstream::wire::Record::default(),
+        None => libstream::wire::Record::default(),
+    };
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
@@ -408,11 +422,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // window that opened with nothing in it — which is exactly what a missing `/bin`
             // in an application namespace looks like, and what M7 Part F hit first. The grid
             // report that would otherwise show it is `test-harness`-only.
-            if unsafe { backend::spawn_shell(root_ns, terminal) } < 0 {
+            if unsafe { backend::spawn_shell(root_ns, terminal, &env) } < 0 {
                 kprint(b"nxterm: no shell\n");
-            } else {
-                kprint(b"nxterm: hosting a shell\n");
             }
+            // The success line is emitted by `spawn_shell` itself, beside the send that earns
+            // it — see the note there.
             Some(b)
         }
         None => {
