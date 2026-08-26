@@ -242,7 +242,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
 /// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
 /// that is its trigger.
-fn build_app_namespace(draw: u64) -> u64 {
+fn build_app_namespace(draw: u64, fs: u64, tty: u64, profile: u64) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
         kprint(b"desktop-shell: application ns_create FAIL\n");
@@ -272,16 +272,70 @@ fn build_app_namespace(draw: u64) -> u64 {
         return 0;
     }
 
-    // **No `/system/fonts` here yet, and the reason is a real gap rather than a choice.**
-    // Re-binding it needs the fs-server *endpoint*, and this process does not have one: its
-    // session namespace holds a `/system/fonts` **binding**, which resolves to a kernel
-    // registration and never back to the endpoint that would let it be bound elsewhere. The
-    // same asymmetry that stops an application re-binding `/bin` stops the shell here.
+    // `/system/fonts`, read-only, so an application can render text. The same subtree bind the
+    // session itself gets — an application that could not draw text would be a window of
+    // rectangles.
+    if fs != 0 {
+        let fpath = b"/system/fonts";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let fr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                fpath.as_ptr() as u64,
+                fpath.len() as u64,
+                fs,
+                fpath.as_ptr() as u64,
+                fpath.len() as u64,
+            )
+        };
+        if fr != 0 {
+            kprint(b"desktop-shell: application /system/fonts bind FAIL\n");
+        }
+    }
+
+    // **`/dev/tty`, which is `graphical-session.md` §6.1's first shape and Part F's answer.**
     //
-    // Nothing this part launches renders text, so it costs nothing today. Part F is where it
-    // bites — `nxterm` in an application namespace needs a font — and the fix is the trip the
-    // compositor's endpoint already makes: `desktop-session-mgr` hands the shell the fs
-    // endpoint at spawn.
+    // The path names the tty *server*, not a device: each resolve mints a **fresh terminal**
+    // (`tty-server`'s `open_tty`), exactly as `/dev/draw/new` mints a compositor session per
+    // caller. So two terminal emulators in two namespaces each get their own, attach their own
+    // backend, and share nothing — the binding does not need to be per-window because the
+    // minting already is.
+    //
+    // §6.1's *second* shape — absent from application namespaces, the terminal handed down —
+    // stays true one level in: `nxterm` resolves this to obtain a terminal, then hands **that
+    // handle** to the `nxsh` it hosts, because a binding cannot name a particular window. The
+    // emulator does not need to name one; it makes one.
+    if tty != 0 {
+        let tpath = b"/dev/tty";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let tr = unsafe {
+            syscall4(SYS_NS_BIND, ns, tpath.as_ptr() as u64, tpath.len() as u64, tty)
+        };
+        if tr != 0 {
+            kprint(b"desktop-shell: application /dev/tty bind FAIL\n");
+        }
+    }
+
+    // **`/bin`, because a terminal has to be able to host a shell.** `nxterm` spawns `nxsh`,
+    // and without this it launches, finds a font and a terminal, and then reports
+    // `/bin/nxsh not found` — a window that opens and immediately has nothing in it.
+    //
+    // **What an application namespace holds is the session's members minus the manager
+    // channel**, which is the narrowing M7 is about. *Which* applications get `/bin`, or
+    // `/home`, is a per-application policy and a later question: there is no manifest to read
+    // it from, and inventing one here would be guessing at what `ui-composition-model.md`
+    // wants before anything asks.
+    if profile != 0 {
+        let bpath = b"/bin";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let br = unsafe {
+            syscall4(SYS_NS_BIND, ns, bpath.as_ptr() as u64, bpath.len() as u64, profile)
+        };
+        if br != 0 {
+            kprint(b"desktop-shell: application /bin bind FAIL\n");
+        }
+    }
     ns
 }
 
@@ -444,12 +498,12 @@ static mut SPAWN_APP: SpawnArgs = SpawnArgs {
 /// open declines to launch. See [`verify_app_namespace`] for why that is behaviour rather than
 /// a test: an application that *can* reach `manage` never says so, and nothing downstream
 /// would notice.
-fn launch(session_ns: u64, draw: u64, program: &str) -> bool {
+fn launch(session_ns: u64, draw: u64, fs: u64, tty: u64, profile: u64, program: &str) -> bool {
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(draw);
+    let app_ns = build_app_namespace(draw, fs, tty, profile);
     if app_ns == 0 {
         return false;
     }
@@ -523,8 +577,17 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
     // never back to an endpoint, so the shell cannot re-bind what its own namespace holds.
     let _ = recv_message(setup);
     let draw_endpoint = recv_handle(setup);
+    let fs_endpoint = recv_handle(setup);
+    let tty_endpoint = recv_handle(setup);
+    let profile_endpoint = recv_handle(setup);
     if draw_endpoint == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
+    }
+    if fs_endpoint == 0 || tty_endpoint == 0 {
+        // Degraded rather than fatal, and specific: an application without fonts draws
+        // rectangles, and one without a tty cannot be a terminal. Both are worth naming,
+        // because the symptom is a launched program that exits without saying why.
+        kprint(b"desktop-shell: applications will have no fonts or no terminal\n");
     }
 
     // **Resolved from the session namespace, not from a root one.** This process has no root
@@ -594,7 +657,7 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
     // resolve gets an honest answer from a namespace that does not bind it.
     let mut may_launch = false;
     if draw_endpoint != 0 {
-        let app_ns = build_app_namespace(draw_endpoint);
+        let app_ns = build_app_namespace(draw_endpoint, fs_endpoint, tty_endpoint, profile_endpoint);
         if app_ns != 0 {
             may_launch = verify_app_namespace(app_ns);
             // SAFETY: closing the namespace; nothing has been launched into it yet.
@@ -710,7 +773,10 @@ pub extern "C" fn _start(_notif: u64, session_ns: u64, setup: u64, _arg0: u64) -
                             if !may_launch {
                                 kprint(b"desktop-shell: launching is disabled; ignoring\n");
                             } else if let Some(name) = filtered.first() {
-                                launch(session_ns, draw_endpoint, name);
+                                launch(
+                                    session_ns, draw_endpoint, fs_endpoint, tty_endpoint,
+                                    profile_endpoint, name,
+                                );
                                 // **Closed after launching, and this was the bug.** `modal`
                                 // was set once and never cleared, so the popup stayed on top
                                 // of whatever was launched and the top bar's click handler —

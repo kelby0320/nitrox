@@ -556,7 +556,7 @@ pub fn spawn_leader(
     notif: u64,
     program: &str,
     syscaps: u64,
-    extra_handle: u64,
+    extras: &[u64],
 ) -> i32 {
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
 
@@ -571,7 +571,15 @@ pub fn spawn_leader(
         Line::new().s(b"libsession: ").s(program.as_bytes()).s(b" image not found").end();
         return -1;
     }
-    let (setup_mgr, setup_shell) = match pipe(4) {
+    // **Sized from what is actually sent**, not a constant that used to be big enough. The
+    // channel carries the Tier-1 setup message plus one message per extra endpoint, and the
+    // sends are `NOBLOCK` — so a queue one short does not block, it *drops the last handle
+    // silently*. That is what happened the first time this carried four endpoints instead of
+    // one: `pipe(4)`, five messages, and the leader launched applications into namespaces with
+    // no `/bin`. The failure was a terminal that opened with nothing in it, two processes away
+    // (M7 Part F).
+    let depth = (1 + extras.len()) as u32;
+    let (setup_mgr, setup_shell) = match pipe(depth) {
         Ok(p) => p,
         Err(_) => {
             kprint(b"libsession: setup channel FAIL\n");
@@ -619,7 +627,14 @@ pub fn spawn_leader(
     //
     // Ordered after the setup message, so a leader reads `argv` and its environment first and
     // this second message is simply the next one on the same channel.
-    if sent.is_ok() && extra_handle != 0 {
+    // **One message per extra, in the order given.** Only `handles[0]` of a `SpawnArgs` reaches
+    // a child, so everything past the setup channel arrives *over* it — and a leader that binds
+    // resources into namespaces it constructs needs the endpoints themselves, because a
+    // *binding* resolves to a kernel registration and never back to one.
+    for &extra in extras {
+        if sent.is_err() || extra == 0 {
+            continue;
+        }
         // **Duplicated, because a handle on an IPC message is always a *move*.** `sys_channel_send`
         // closes the sender's handle on success, so sending `extra_handle` directly would leave
         // the caller's copy dead — and the caller reuses it for every later session. The symptom
@@ -627,7 +642,7 @@ pub fn spawn_leader(
         // review, finding 2).
         // SAFETY: duplicating a handle the caller owns, with the rights a re-bind needs.
         let moved = unsafe {
-            syscall2(SYS_HANDLE_DUPLICATE, extra_handle, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+            syscall2(SYS_HANDLE_DUPLICATE, extra, RIGHT_TRANSFER | RIGHT_DUPLICATE)
         };
         if moved < 0 {
             kprint(b"libsession: could not duplicate the leader's extra handle\n");

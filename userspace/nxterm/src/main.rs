@@ -403,8 +403,15 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         Some((terminal, b)) => {
             // SAFETY: `root_ns` is live and `terminal` is a channel this process owns until the
             // spawn moves it.
+            // **Said on success as well as failure.** This path only ever reported when it
+            // went wrong, so a release image could not tell a terminal hosting a shell from a
+            // window that opened with nothing in it — which is exactly what a missing `/bin`
+            // in an application namespace looks like, and what M7 Part F hit first. The grid
+            // report that would otherwise show it is `test-harness`-only.
             if unsafe { backend::spawn_shell(root_ns, terminal) } < 0 {
                 kprint(b"nxterm: no shell\n");
+            } else {
+                kprint(b"nxterm: hosting a shell\n");
             }
             Some(b)
         }
