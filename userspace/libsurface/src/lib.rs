@@ -670,6 +670,28 @@ impl<T: Transport> WindowRef<'_, T> {
         Ok(())
     }
 
+    /// Tell the compositor what to call this window.
+    ///
+    /// **The only client-facing use of `SetTitle`**, which shipped in M7 Part A with a
+    /// compositor that stores titles and a manager event that reports them — and no way for a
+    /// client to set one. So every title was empty, `WindowTitle` was never emitted, and M8
+    /// Part C's window list showed `window 6` for everything (PR #242 review, optional 7).
+    ///
+    /// Longer titles are truncated by the compositor at a character boundary, not refused —
+    /// see `docs/spec/rsproto-surface-ops.md`.
+    pub fn set_title(&mut self, title: &str) -> Result<(), UiError> {
+        let mut body = [0u8; 4 + librsproto::surface::MAX_TITLE];
+        let n = librsproto::surface::title::write(self.id(), title, &mut body)
+            .ok_or(UiError::Malformed)?;
+        self.session.transport.request(
+            librsproto::surface::OP_SET_TITLE,
+            &body[..n],
+            None,
+            &mut [],
+        )?;
+        Ok(())
+    }
+
     /// Destroy the window, and forget every descendant the compositor destroys with it.
     ///
     /// **Transitively**, because that is what the compositor does: a popup goes with its parent

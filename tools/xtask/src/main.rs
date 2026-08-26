@@ -1462,13 +1462,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // Holding the channel is also the other half of what closed `manage-ungated`: the shell's
     // session namespace binds the `/dev/draw` subtree and reaches `manage`, an application's
     // binds `/dev/draw/new` alone and does not.
-    session.expect("desktop-shell: manager channel held")?;
-    // **The bottom bar, and it exists only because a manager does** (M8 Part C). A `panel`'s
-    // dock edge tells the compositor how much space to reserve; it does not move the window, so
-    // a bottom bar that was never *placed* would sit at the origin under the top one. The top
-    // bar goes up before the manager attaches and this one after, which is the whole reason
-    // they are created in different places.
+    // **The bottom bar is created here, before the manager attaches** (M8 Part C). It has to be
+    // *placed*, and only a manager can place — but a `panel` is held for the manager exactly
+    // like a `normal` window, and `create` blocks until the first `Configure`. Creating it after
+    // `manage()` parked the shell inside `create`, unable to drain the channel and so unable to
+    // send the `Place` that would release it; only the 200 ms configure deadline broke the tie.
     session.expect("desktop-shell: bottom bar presented")?;
+    session.expect("desktop-shell: manager channel held")?;
+    // **And the position, asserted rather than inferred.** A dock edge reserves space; it does
+    // not move the window. Without this the bar's placement was only covered by proxy — the
+    // list click at (90, 788) landing on nothing — which says the bar is not *there* rather
+    // than where it is (PR #242 review, optional 9).
+    session.expect("desktop-shell: bottom bar placed at 0,776")?;
     session.expect("desktop-shell: /bin lists ")?;
     // After `/bin`, because the chord is registered on the loop's first pass and the programs
     // are read before the loop. `expect` scans forward, so asserting these out of order times
@@ -1551,12 +1556,21 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
     session.expect("desktop-shell: minimized window ")?;
-    // The list still holds it — minimizing is not closing, and a taskbar that dropped the entry
-    // would leave no way to get the window back.
+    // **The marker, not just a non-empty list.** The list still holds it — minimizing is not
+    // closing, and a taskbar that dropped the entry would leave no way to get the window back —
+    // and `_` is how the bar says so. Matching only `window list [` asserted the list existed
+    // and nothing about what it shows (PR #242 review, optional 9).
     session.expect("desktop-shell: window list [")?;
+    session.expect(":_ nxterm")?;
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
     session.expect("desktop-shell: raised window ")?;
+    // Restored and focused. Focus arrives one iteration after the raise, so this is the second
+    // list line the click produces, not the first.
+    // **And it is named**, which is the title arm of the list doing something: `nxterm` sets a
+    // title, the compositor reports it on `WindowTitle`, and the bar shows it instead of
+    // `window 6`. Nothing in the tree sent a title before this part.
+    session.expect(":> nxterm")?;
 
     // And the chord, which is the half a taskbar alone does not cover: putting a window away
     // without reaching for its entry. `Super+H`.
@@ -1659,6 +1673,20 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     // "lists 0 programs", and "modal open" says nothing about its contents — so a session
     // whose `/bin` failed to open would pass the whole gate. Asserted as an absence for the
     // same reason the concurrency check is: `expect` cannot say "a number greater than zero".
+    // **The configure deadline must not fire, and this is what would have caught the deadlock.**
+    // `no manager answer for window N; showing it` exists to name a wedged or absent manager —
+    // "a wedged or slow shell must delay a window, never lose it". Part C briefly created the
+    // bottom bar *after* taking the manager channel, so the shell parked inside `create` waiting
+    // for a `Configure` only it could release, and this line fired on every healthy boot. A
+    // signal that fires when nothing is wrong is not a signal (PR #242 review, blocking 1).
+    if transcript.contains("compositor: no manager answer for window") {
+        return Err("the compositor's configure deadline fired during a healthy session start: \
+             some window was held for the manager until the 200ms timeout. That timer exists for \
+             a wedged or absent manager, so a session that needs it has a shell blocking on \
+             something only the shell could answer — check what was created after \
+             `/dev/draw/manage` was taken"
+            .into());
+    }
     if transcript.contains("desktop-shell: /bin lists 0 programs") {
         return Err("the applications modal is empty: /bin projected no programs into the \
              session namespace. The modal opening is not evidence it has anything in it"

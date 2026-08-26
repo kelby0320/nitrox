@@ -2,22 +2,25 @@
 
 ## Status
 
-**Partly built, and checked 2026-08-25** — Milestone 7 Part E built the shell;
+**Partly built, and checked 2026-08-26** — Milestone 7 Part E built the shell and M8 Part C
+added its second bar;
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
 
 **This document outruns its code on purpose, so read it section by section.** What is built:
 the **top bar** (§3), the **applications modal** (§4) — `/bin` listed through the profile
 server, filtered as you type — **launching** (§6's spawn half), each application into a
-namespace the shell constructs, and **placement and window management** (§8), the shell driving
-`Place`/`Raise`/`SetFocus` as the compositor's attached manager. The toolkit question §5 settled
-is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
+namespace the shell constructs, **placement and window management** (§8), the shell driving
+`Place`/`Raise`/`SetFocus` as the compositor's attached manager, and — since M8 Part C — the
+**bottom bar** and its **window list** (§2, §7): one entry per `normal` window, click to raise,
+click the focused one to minimize, `Super+H` to minimize without the bar. The toolkit question
+§5 settled is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
 
-What is **not**: the **bottom bar** and its **window list** — §2's table calls it persistent
-and §§1, 7 and 8 describe it as present, but `desktop-shell` draws a top bar only; the
-**overview** (§6's zoomed-out half) and the **desktop indicator**, both Milestone 8, the shell
-today having one implicit desktop; and the **system tray** (§9), which is v2 and an
-inter-process protocol rather than a widget. Sections describing those describe intent,
+What is **not**: the **desktop indicator** at the bar's end (§7) and the **overview** (§6's
+zoomed-out half), both Milestone 8 Parts D and E, the shell today having one implicit desktop;
+and the **system tray** (§9), which is v2 and an inter-process protocol rather than a widget.
+The window list also does not yet *filter* by desktop, because nothing switches desktops until
+Part D. Sections describing those describe intent,
 not behaviour — the rule the rest of `architecture/` follows does not hold there.
 
 What a user actually sees and touches: the bars, the applications modal, the overview, and

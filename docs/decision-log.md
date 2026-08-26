@@ -18487,3 +18487,50 @@ Three controls, each run: placing the shell's own windows again (the bar lands u
 and the list click hits nothing), ignoring `WindowFocus` (nothing is ever marked focused, so
 clicking raises instead of minimizing), and dropping the `Hotkey` arm (the chord does nothing).
 Each fails exactly its own assertion.
+
+## 2026-08-26 — PR #242 review: a shell that waited on itself, and a title nothing ever set
+
+Nine findings. The blocking one is the most instructive thing in Part C.
+
+**The bottom bar deadlocked the shell against its own manager hold.** It was created *after*
+`manage()`, on the reasoning that it has to be placed and only a manager can place. But a `panel`
+is held for the manager exactly like a `normal` window — only a `popup` is exempt — and
+`Session::create` blocks until the first `Configure` arrives. So the shell parked inside `create`,
+unable to drain the manager channel and therefore unable to send the `Place` that would have
+released it. **Only the 200 ms configure deadline broke the tie**, and every session start paid
+it. `Place` works on an already-created window, so the create belongs beside the top bar where
+nothing is held; only the placement waits.
+
+**The second cost is the one worth remembering.** `no manager answer for window N; showing it`
+exists to name a wedged or absent manager — "a wedged or slow shell must delay a window, never
+lose it". It began firing on every healthy boot, so it stopped being a signal, and nothing
+asserted its absence. `check-login` now fails if it appears at all. A timer built for broken
+managers had acquired its first well-behaved client, and the only evidence was a line nobody was
+reading.
+
+**`SetTitle` shipped in M7 Part A with no way for a client to send one.** The compositor stored
+titles, `WindowTitle` reported them, the spec documented the truncation rule — and `libsurface`
+exposed no wrapper, so every title was empty, the event was never emitted, and Part C's window
+list read `window 6` for every entry. The shell's title arm was code no boot could reach.
+`Window::set_title` exists now and `nxterm` names itself, which makes the bar show `nxterm` and
+gives that arm its first gate. A capability with no consumer for a milestone and a half, found by
+someone asking what the list would actually display.
+
+**`WindowDestroyed`'s arm still has no gate**, and cannot get one cheaply: no gate closes a
+`normal` window inside a session, because the only way to close the launched terminal is through
+its shell, which draws into the grid — and the grid renders only under `test-harness`. Recorded
+rather than papered over.
+
+Also fixed: `Super+H` searched past `MAX_ENTRIES`, so a window the bar could not show could be
+minimized and never restored — the exact outcome that bound exists to prevent, with the chord
+invalidating the bound's own justification. The bar's repaint kept its own buffer index and
+advanced it even when the commit did not go out, which inverts the phase and thereafter writes
+into the buffer being displayed; it uses `acquire` now, as `present_modal` twelve lines below
+already did. Request bodies are sized from their types rather than hand-written lengths, and the
+hotkey path no longer skips both its success *and* its failure line when a body will not
+serialise. `place_new_windows`' 256-byte buffer was four bytes short of a maximum title, which
+silently truncated and left a stale label forever, since titles are re-sent only on change.
+`raise_window` returns whether it worked instead of logging success unconditionally, and sends
+`MgrWindowRef` — the shape `dispatch` actually parses — rather than one that matched only because
+a field happened to be zero. And the loop no longer blocks with manager events parked inside the
+transport after a request.

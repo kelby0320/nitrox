@@ -3,10 +3,13 @@
 //! **What M6 built for a manager has been exercised by a test client until now.** Placement,
 //! restacking, focus, the initial-configure hold and the five manager events all have gates,
 //! and every one of those gates is `ui-testclient` pretending. This is the process they were
-//! for.
+//! for. (Of the five events, four are now consumed here as well; `WindowDestroyed` has no gate
+//! that reaches it, because no gate closes a `normal` window in a session.)
 //!
-//! It draws a **top bar** across the screen, reserving space with a `panel` strut so ordinary
-//! windows do not sit under it.
+//! It draws a **top bar** across the screen and, since M8 Part C, a **bottom bar** carrying one
+//! entry per `normal` window — click to raise, click the focused one to minimize, `Super+H` to
+//! minimize without reaching for the bar. Both reserve space with a `panel` strut so ordinary
+//! windows do not sit under them.
 //!
 //! **It does not bind its own endpoint**, which is what reconciles a process that both serves
 //! and constructs with `syscaps.md` (`graphical-session.md` §3): it holds `BIND_NAMESPACE` to
@@ -871,6 +874,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     if w.commit(0, (0, 0, SCREEN_W, BAR_H)).is_err() {
         fail(b"desktop-shell: top bar Commit FAILED\n");
     }
+
     // **Build one application namespace and check it**, before anything is launched into it.
     // Part E's applications modal is what will call this per launch; doing it once here is
     // what makes the narrow bind observable — and the shell refusing to launch when the check
@@ -904,6 +908,61 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         .u(BAR_H as u64)
         .end();
 
+    // **The bottom bar is created here, beside the top one, and *placed* much later.**
+    //
+    // It sat after `manage()` in the first version of Part C, on the reasoning that it has to be
+    // placed and only a manager can place. That deadlocks the shell against its own manager
+    // hold: a `panel` is held for the manager exactly like a `normal` window — only a `popup` is
+    // exempt — and `Session::create` blocks until the first `Configure` arrives. So the shell
+    // parked inside `create`, unable to drain the manager channel and therefore unable to send
+    // the `Place` that would have released it, and only the 200 ms configure deadline broke the
+    // tie. Every session start paid it, and `no manager answer for window N` — a line that
+    // exists to name a wedged or absent manager — fired on every healthy boot (PR #242 review,
+    // blocking 1).
+    //
+    // `Place` works on an already-created window, so the create belongs here where no manager
+    // is attached and nothing is held; only the placement has to wait.
+    let mut entries: alloc::vec::Vec<WinEntry> = alloc::vec::Vec::new();
+    let mut list_dirty = true;
+    let mut bottom_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let bottom = match session.create(
+        &CreateWindowRequest::new(SCREEN_W, BAR_H, Role::Panel { dock: Edge::Bottom, reserve: BAR_H }),
+        BUFFERS,
+    ) {
+        Ok(id) => {
+            let mut ok = true;
+            for i in 0..BUFFERS {
+                let Some((handle, addr)) = shared_buffer(len) else {
+                    ok = false;
+                    break;
+                };
+                bottom_addrs[i] = addr;
+                let Some(mut w) = session.window(id) else {
+                    ok = false;
+                    break;
+                };
+                if w.attach(i as u32, SCREEN_W, BAR_H, BAR_PITCH as u32, handle).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                Line::new()
+                    .s(b"desktop-shell: bottom bar presented, window ")
+                    .u(id as u64)
+                    .end();
+                Some(id)
+            } else {
+                kprint(b"desktop-shell: bottom bar buffers FAILED; no window list\n");
+                None
+            }
+        }
+        Err(_) => {
+            kprint(b"desktop-shell: bottom bar CreateWindow FAILED; no window list\n");
+            None
+        }
+    };
+
     // **The manager channel, which makes this the compositor's first real manager.**
     //
     // Resolved from the session namespace, which binds the `/dev/draw` subtree unscoped and
@@ -932,71 +991,22 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     };
     let mut next_origin = BAR_H as i32;
 
-    // **The bottom bar, created after the manager is held rather than before it.** The top bar
-    // goes first precisely because a `panel` created while no manager exists is not held — but
-    // this one has to be *placed*, and only a manager can place. A panel's dock edge tells the
-    // compositor how much space to reserve; it does not move the window, so a bottom bar left
-    // unplaced sits at the origin under the top one.
-    let mut entries: alloc::vec::Vec<WinEntry> = alloc::vec::Vec::new();
-    let mut list_dirty = true;
-    let mut bottom_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    let mut bottom_buffer = 0u32;
     // Registered on the first pass of the loop, once the manager channel is known to exist.
     let mut hotkey_done = manager.is_none();
-    let bottom = if manager.is_some() {
-        match session.create(
-            &CreateWindowRequest::new(
-                SCREEN_W,
-                BAR_H,
-                Role::Panel { dock: Edge::Bottom, reserve: BAR_H },
-            ),
-            BUFFERS,
-        ) {
-            Ok(id) => {
-                let len = BAR_PITCH * BAR_H as usize;
-                let mut ok = true;
-                for i in 0..BUFFERS {
-                    let Some((handle, addr)) = shared_buffer(len) else {
-                        ok = false;
-                        break;
-                    };
-                    bottom_addrs[i] = addr;
-                    let Some(mut w) = session.window(id) else {
-                        ok = false;
-                        break;
-                    };
-                    if w.attach(i as u32, SCREEN_W, BAR_H, BAR_PITCH as u32, handle).is_err() {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    if let Some(m) = manager.as_mut() {
-                        place_window(m, id, 0, SCREEN_H - BAR_H as i32);
-                    }
-                    Line::new()
-                        .s(b"desktop-shell: bottom bar presented, window ")
-                        .u(id as u64)
-                        .s(b" at 0,")
-                        .i((SCREEN_H - BAR_H as i32) as i64)
-                        .end();
-                    Some(id)
-                } else {
-                    kprint(b"desktop-shell: bottom bar buffers FAILED; no window list\n");
-                    None
-                }
-            }
-            Err(_) => {
-                kprint(b"desktop-shell: bottom bar CreateWindow FAILED; no window list\n");
-                None
-            }
-        }
-    } else {
-        // No manager means nothing can be placed, and an unplaced bottom bar would sit on top
-        // of the top one. Said out loud rather than drawn wrong.
-        kprint(b"desktop-shell: no manager channel; no window list\n");
-        None
-    };
+
+    // **Placed now that a manager exists — created long before it.** A dock edge tells the
+    // compositor how much space to reserve; it does not move the window, so a bottom bar that
+    // is never placed sits at the origin under the top one.
+    if let Some(id) = bottom
+        && let Some(m) = manager.as_mut()
+    {
+        place_window(m, id, 0, SCREEN_H - BAR_H as i32);
+        Line::new()
+            .s(b"desktop-shell: bottom bar placed at 0,")
+            .i((SCREEN_H - BAR_H as i32) as i64)
+            .end();
+    }
+
 
     // The modal's entries, read once. `desktop-shell.md` §4: they are `/bin` programs, and
     // that falls out of decisions already made — they are ordinary files in the namespace, so
@@ -1015,9 +1025,19 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // queue non-empty, so the idle thread never runs and deferred reclamation stops for the
     // whole machine (the 2026-07-31 `logging-service` bug).
     let ev = session.wait_handle();
+    // Set whenever a manager request goes out; see the deadline below.
+    let mut sent_request = false;
     loop {
         // Both channels in one wait: the session's events and the manager's. Polling one
         // while blocked on the other would make a held window wait for a keystroke.
+        // **A zero deadline when a request has just been sent.** `sys_wait` knows only about
+        // the kernel queues; a manager event that arrived while a `Place`/`SetMinimized`/
+        // `RegisterHotkey` reply was being waited for is parked *inside* the transport, with
+        // nothing left in the kernel queue to wake this. Polling once after any request is the
+        // belt: the drain below sees the parked events and the next iteration blocks normally
+        // (PR #242 review, optional 10 — unverified there, and cheap enough to close).
+        let deadline = if sent_request { 0 } else { u64::MAX };
+        sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for two waiters.
         unsafe {
@@ -1033,7 +1053,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 (&raw const WAIT_HANDLES) as u64,
                 n,
                 (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
+                deadline,
             )
         };
         if let Some(m) = manager.as_mut() {
@@ -1045,10 +1065,20 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             list_dirty |=
                 place_new_windows(m, &mut next_origin, &mut entries, &ours, &mut fired);
             for id in fired {
+                // **Bounded exactly as the click is**, and the reason is `MAX_ENTRIES`' own:
+                // an entry past it is neither drawn nor clickable, so minimizing one would take
+                // the window off screen with no way to bring it back — "a window you cannot get
+                // back rather than a cosmetic problem", which is what that bound exists to
+                // prevent. Unbounded, the chord invalidated its own justification
+                // (PR #242 review, finding 3).
                 if id == HOTKEY_MINIMIZE
-                    && let Some(e) = entries.iter_mut().find(|e| e.focused && !e.minimized)
+                    && let Some(e) = entries
+                        .iter_mut()
+                        .take(MAX_ENTRIES)
+                        .find(|e| e.focused && !e.minimized)
                 {
                     let wid = e.id;
+                    sent_request = true;
                     if minimize_window(m, e) {
                         Line::new()
                             .s(b"desktop-shell: Super+H minimized window ")
@@ -1069,10 +1099,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             && let Some(m) = manager.as_mut()
         {
             hotkey_done = true;
+            sent_request = true;
             use librsproto::surface::{MOD_META, MgrHotkey, OP_MGR_REGISTER_HOTKEY};
             let hk = MgrHotkey { id: HOTKEY_MINIMIZE, mods: MOD_META, code: KEY_H };
-            let mut body = [0u8; 8];
-            if hk.write(&mut body).is_some() {
+            let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
+            if hk.write(&mut body).is_none() {
+                // **Said out loud.** The first version had no `else` at all, so a body that
+                // would not serialise skipped the success line *and* the refusal line, and the
+                // only evidence was a gate timing out on a line nobody printed.
+                kprint(b"desktop-shell: a RegisterHotkey body would not serialise\n");
+            } else {
                 let mut reply = [0u8; 64];
                 if m.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok() {
                     kprint(b"desktop-shell: Super+H minimizes the focused window\n");
@@ -1157,6 +1193,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     // anything else brings it forward, restoring it first if it was minimized.
                     let e = &mut entries[i];
                     if e.focused && !e.minimized {
+                        sent_request = true;
                         if minimize_window(m, e) {
                             Line::new()
                                 .s(b"desktop-shell: minimized window ")
@@ -1165,8 +1202,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         }
                     } else {
                         let id = e.id;
-                        raise_window(m, e);
-                        Line::new().s(b"desktop-shell: raised window ").u(id as u64).end();
+                        sent_request = true;
+                        if raise_window(m, e) {
+                            Line::new().s(b"desktop-shell: raised window ").u(id as u64).end();
+                        } else {
+                            Line::new()
+                                .s(b"desktop-shell: raising window ")
+                                .u(id as u64)
+                                .s(b" was refused")
+                                .end();
+                        }
                     }
                     list_dirty = true;
                 }
@@ -1181,22 +1226,26 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             log_window_list(&entries);
             let picture = render_window_bar(&font, &entries).into_bytes();
             let len = BAR_PITCH * BAR_H as usize;
-            if picture.len() == len && !bottom_addrs[bottom_buffer as usize].is_null() {
+            // **`acquire`, not an index this code keeps itself.** The first version alternated
+            // a counter and advanced it unconditionally while the commit's result was
+            // discarded — so any iteration where the commit did not go out inverted the phase,
+            // and every repaint after that wrote into the buffer the compositor was displaying.
+            // `acquire` blocks until one is genuinely free, which is the property being wanted,
+            // and it is already what `present_modal` twelve lines below does
+            // (PR #242 review, finding 4).
+            if picture.len() == len
+                && let Some(mut w) = session.window(id)
+                && let Ok(b) = w.acquire()
+                && !bottom_addrs[b as usize].is_null()
+            {
                 // SAFETY: the destination maps `len` writable bytes and `picture` holds exactly
                 // `len`; the two are distinct allocations.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        picture.as_ptr(),
-                        bottom_addrs[bottom_buffer as usize],
-                        len,
-                    )
+                    core::ptr::copy_nonoverlapping(picture.as_ptr(), bottom_addrs[b as usize], len)
                 };
-                if let Some(mut w) = session.window(id) {
-                    let _ = w.commit(bottom_buffer, (0, 0, SCREEN_W, BAR_H));
+                if w.commit(b, (0, 0, SCREEN_W, BAR_H)).is_err() {
+                    kprint(b"desktop-shell: bottom bar Commit failed\n");
                 }
-                // Alternate buffers: committing the one the compositor is still reading is
-                // what tears a bar mid-repaint.
-                bottom_buffer = (bottom_buffer + 1) % BUFFERS as u32;
             }
             list_dirty = false;
         }
@@ -1220,8 +1269,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 /// Ask the manager channel to put `window` at `(x, y)`.
 fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) {
     use librsproto::surface::{MgrPlace, OP_MGR_PLACE};
-    let mut body = [0u8; 12];
+    // **Sized from the type, not from the byte count the spec publishes.** `write` refuses a
+    // short buffer by returning `None`, so a hand-written length that stops matching after a
+    // field is added turns every request of that kind into a silent no-op — the defect
+    // `send_mgr_event` documents at length (PR #217 finding 5, restated by #242 finding 5).
+    let mut body = [0u8; core::mem::size_of::<MgrPlace>()];
     if (MgrPlace { window, x, y }).write(&mut body).is_none() {
+        kprint(b"desktop-shell: a Place body would not serialise\n");
         return;
     }
     let mut reply = [0u8; 64];
@@ -1233,8 +1287,9 @@ fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) {
 /// Send one `window`+`value` manager request.
 fn window_value(mgr: &mut ChannelTransport, op: u16, window: u32, value: u32) -> bool {
     use librsproto::surface::MgrWindowValue;
-    let mut body = [0u8; 8];
+    let mut body = [0u8; core::mem::size_of::<MgrWindowValue>()];
     if (MgrWindowValue { window, value }).write(&mut body).is_none() {
+        kprint(b"desktop-shell: a window-value body would not serialise\n");
         return false;
     }
     let mut reply = [0u8; 64];
@@ -1246,16 +1301,25 @@ fn window_value(mgr: &mut ChannelTransport, op: u16, window: u32, value: u32) ->
 /// **`Raise` *is* the focus change** — the compositor's focus candidate is the topmost
 /// focusable window, so there is no second request to make and no second piece of state to
 /// disagree with the stack about who has it.
-fn raise_window(mgr: &mut ChannelTransport, e: &mut WinEntry) {
-    use librsproto::surface::{OP_MGR_RAISE, OP_MGR_SET_MINIMIZED};
+fn raise_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_RAISE, OP_MGR_SET_MINIMIZED};
     if e.minimized {
         // Restore before raising: a minimized window is not a focus candidate, so raising it
         // first would reorder the stack and leave the keyboard where it was.
-        if window_value(mgr, OP_MGR_SET_MINIMIZED, e.id, 0) {
-            e.minimized = false;
+        if !window_value(mgr, OP_MGR_SET_MINIMIZED, e.id, 0) {
+            return false;
         }
+        e.minimized = false;
     }
-    window_value(mgr, OP_MGR_RAISE, e.id, 0);
+    // **`MgrWindowRef`, which is what `dispatch` parses this op as.** `MgrWindowValue` is
+    // byte-identical here only because the second field is zero, and a shape that is right by
+    // coincidence stops being right the moment either side grows (PR #242 review, finding 8).
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window: e.id, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    mgr.request(OP_MGR_RAISE, &body, None, &mut reply).is_ok()
 }
 
 /// Minimize `window`.
@@ -1308,7 +1372,13 @@ fn place_new_windows(
         OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
     };
     let mut dirty = false;
-    let mut buf = [0u8; 256];
+    // **Four bytes more than `MAX_TITLE`, which is what a title record actually is.** A
+    // `WindowTitle` body is `4 + title.len()` and the compositor stores up to `MAX_TITLE`, so a
+    // 256-byte buffer truncated the longest titles by four bytes — and a cut through a
+    // multi-byte character makes `title::read` return `None`, so the arm did nothing and the
+    // entry kept a stale label for the life of the window, since titles are re-sent only on
+    // change (PR #242 review, finding 6).
+    let mut buf = [0u8; 4 + librsproto::surface::MAX_TITLE];
     // Zero timeout: drain what is queued and return. The outer `sys_wait` is what blocks.
     while let Ok(Some((op, n))) = mgr.wait_event_timeout(&mut buf, 0) {
         // **The other three events, which this loop used to discard.** They are exactly the
