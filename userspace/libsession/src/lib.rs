@@ -555,6 +555,7 @@ pub fn spawn_leader(
     session_ns: u64,
     notif: u64,
     program: &str,
+    argv_rest: &[&str],
     syscaps: u64,
     extras: &[u64],
 ) -> i32 {
@@ -600,6 +601,14 @@ pub fn spawn_leader(
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
         Line::new().s(b"libsession: ").s(program.as_bytes()).s(b" spawn FAIL").end();
+        // The same leak `launch` had, in the function `launch` was modelled on — a failed spawn
+        // never took `handles[0]`, so both ends are still ours. `session-mgr` retries a login
+        // after this returns, so the leak repeats per attempt (PR #238 review, finding 7).
+        // SAFETY: closing a setup channel pair for a process that does not exist.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, setup_mgr);
+            syscall1(SYS_HANDLE_CLOSE, setup_shell);
+        }
         return -1;
     }
 
@@ -614,7 +623,17 @@ pub fn spawn_leader(
     // exist: `login()` was a different function and the whole `tty_*` layer was compiled
     // out. Those three assertions are now steps 5a–5c of `cargo xtask test-interactive`,
     // which drives the release image (`docs/planning/test-path-retrofit.md` Part B).
-    let argv: &[&str] = &[program];
+    // **`argv_rest` exists so a leader can be told something its namespace cannot show it.**
+    // `desktop-shell` needs the user's real home (`/home/alice`) to scope the `/home` it binds
+    // into each application namespace, and it cannot read that anywhere: its own `HOME` is
+    // `/home`, which is true *inside the session* precisely because `build_namespace` already
+    // scoped it, and a binding never resolves back to the base it was made with. Passing it as
+    // an argument is how a parent states a fact rather than delegating authority — the fs
+    // endpoint is what carries the authority, and the shell already has that.
+    let mut argv_buf: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + argv_rest.len());
+    argv_buf.push(program);
+    argv_buf.extend_from_slice(argv_rest);
+    let argv: &[&str] = &argv_buf;
 
     let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
     // **A second handle, after the setup message and only if there is one.**
@@ -632,21 +651,41 @@ pub fn spawn_leader(
     // resources into namespaces it constructs needs the endpoints themselves, because a
     // *binding* resolves to a kernel registration and never back to one.
     for &extra in extras {
-        if sent.is_err() || extra == 0 {
+        if sent.is_err() {
             continue;
         }
+        // **A missing endpoint sends an empty message, not nothing.** The leader reads these
+        // positionally, so skipping one shifts every later endpoint up a slot — `desktop-shell`
+        // would take the profile server's endpoint for the tty server's, bind `/dev/tty` to it
+        // in every application namespace, and bind no `/bin` at all. `nxterm` would then resolve
+        // `/dev/tty`, get a profile-server channel and fail at `AttachBackend`, while the shell's
+        // own "no fonts or no terminal" warning stayed quiet because it saw a non-zero handle.
+        //
+        // Reachable: `init`'s `bind_tty_server` failure is non-fatal and merely prints "sessions
+        // will have no /dev/tty", so a zero propagates all the way here. This is the rule
+        // `init::send_handle` and `service-mgr::send_handle` already state and implement; this
+        // loop was the level that broke it (PR #238 review, finding 2).
+        //
+        // A failed duplicate and a failed send take the same path, for the same reason: the
+        // leader must see a gap where an endpoint was, not a shorter list.
         // **Duplicated, because a handle on an IPC message is always a *move*.** `sys_channel_send`
         // closes the sender's handle on success, so sending `extra_handle` directly would leave
         // the caller's copy dead — and the caller reuses it for every later session. The symptom
         // was every graphical login after the first getting no `/dev/draw` at all (PR #237
         // review, finding 2).
         // SAFETY: duplicating a handle the caller owns, with the rights a re-bind needs.
-        let moved = unsafe {
-            syscall2(SYS_HANDLE_DUPLICATE, extra, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+        let moved = if extra == 0 {
+            0
+        } else {
+            // SAFETY: duplicating a handle the caller owns, with the rights a re-bind needs.
+            unsafe { syscall2(SYS_HANDLE_DUPLICATE, extra, RIGHT_TRANSFER | RIGHT_DUPLICATE) }
         };
         if moved < 0 {
             kprint(b"libsession: could not duplicate the leader's extra handle\n");
-        } else {
+        }
+        // Zero handles when there is nothing to send — the message still goes, holding the slot.
+        let count: u64 = if moved > 0 { 1 } else { 0 };
+        {
             // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
             let r = unsafe {
                 // **Scrub the payload first.** This buffer is the crate's, and `authenticate`
@@ -658,14 +697,14 @@ pub fn spawn_leader(
                 // pointless (PR #237 review, finding 1).
                 SEND_MSG[PAYLOAD_OFF..].fill(0);
                 SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
-                SEND_MSG[8] = 1;
-                SEND_HANDLES[0] = moved as u64;
+                SEND_MSG[8] = count as u8;
+                SEND_HANDLES[0] = if count == 1 { moved as u64 } else { 0 };
                 syscall5(
                     SYS_CHANNEL_SEND,
                     setup_mgr,
                     (&raw const SEND_MSG) as u64,
                     (&raw const SEND_HANDLES) as u64,
-                    1,
+                    count,
                     SENDMODE_NOBLOCK,
                 )
             };
@@ -674,8 +713,14 @@ pub fn spawn_leader(
             // normally while the leader had been given nothing.
             if r != 0 {
                 kprint(b"libsession: the leader's extra handle was not delivered\n");
-                // SAFETY: the send failed, so the duplicate is still ours.
-                unsafe { syscall1(SYS_HANDLE_CLOSE, moved as u64) };
+                if count == 1 {
+                    // SAFETY: the send failed, so the duplicate is still ours.
+                    unsafe { syscall1(SYS_HANDLE_CLOSE, moved as u64) };
+                }
+            } else if count == 0 {
+                // Said out loud, because the leader will read a live message holding nothing and
+                // has no other way to tell that apart from an endpoint that was never wanted.
+                kprint(b"libsession: an endpoint the leader expects is absent (placeholder sent)\n");
             }
         }
     }

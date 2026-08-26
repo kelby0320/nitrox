@@ -354,11 +354,18 @@ fn run_session(
     // terminal, and the profile server's so an application can spawn programs. Each is an
     // *endpoint* rather than the session's binding of it, because a binding resolves to a
     // kernel registration and never back to one.
+    // **The real home, as an argument.** The shell binds `/home` into every application
+    // namespace it constructs, and that bind needs the subtree base — which its own namespace
+    // cannot tell it, because there `/home` *is* the home and a binding does not resolve back
+    // to its base. Not authority: the fs endpoint above is the authority, and this only says
+    // which subtree of it an application should see (PR #238 review, finding 3).
+    let home_str = core::str::from_utf8(&home[..hl]).unwrap_or("");
     let code = spawn_leader(
         root_ns,
         session_ns,
         notif,
         "desktop-shell",
+        &[home_str],
         SYSCAP_BIND_NAMESPACE,
         &[draw, fs, tty, profile],
     );

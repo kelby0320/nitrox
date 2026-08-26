@@ -1786,10 +1786,12 @@ terminal opens.
       own and forwards the environment to `nxsh`; `desktop-shell` keeps the environment it
       receives and gives every application it launches a setup channel carrying `argv` + env.
       A launched terminal's shell now sees three environment fields, the same as a serial
-      login's. `check-login` asserts it from `nxterm: hosting a shell (env: N fields)`, logged
-      **beside the send** rather than where the environment arrived, so the two cannot drift —
-      and the assertion was negative-controlled by making `desktop-shell` send nothing, which
-      the gate caught. Original box: It currently spawns `nxsh` with
+      login's, and `build_app_namespace` binds the `/home` those fields name. `check-login`
+      asserts it from **`nxsh`'s own** `nxsh: up (env: N fields)` — two attempts to have the
+      *sender* report it were both blind to a broken forward, the second demonstrated in review
+      (finding 1). Three controls run: break either hop, or delete the line, and the gate fails.
+      `nxterm` still logs what it received, which is now diagnostic rather than the assertion —
+      it is what tells the two hops apart when the gate does fail. Original box: It currently spawns `nxsh` with
       `Record::default()` and takes no setup channel of its own, so a terminal launched into a
       constructed namespace would give its shell no `$env.HOME` — unlike every serial login. It
       needs to receive a setup message and forward it.

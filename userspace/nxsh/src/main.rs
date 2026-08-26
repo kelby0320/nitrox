@@ -1242,6 +1242,19 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Some(Ok(s)) => (s.argv, s.env, s.terminal),
         _ => (Vec::new(), libstream::wire::Record::default(), None),
     };
+    // **Reported from the receiving end, which is the only end that proves anything.** A
+    // shell with no environment has no `$env.HOME` and resolves every relative path against
+    // nothing, and the two ways to arrive here look identical from the outside: a parent that
+    // sent no setup message, or one that sent an empty environment. Whoever spawned this shell
+    // cannot testify to either — a log there reads the value it *has*, not the one it *sent*,
+    // which is how `check-login` came to assert a property it could not see (PR #238 review,
+    // finding 1). This goes to the debug console rather than the tty on purpose: a shell hosted
+    // by `nxterm` writes its tty into the grid, and the grid renders only under `test-harness`.
+    libkern::debug::Line::new()
+        .s(b"nxsh: up (env: ")
+        .u(env.values.len() as u64)
+        .s(b" fields)")
+        .end();
     exit(run(notif, ns, &argv, env, terminal))
 }
 

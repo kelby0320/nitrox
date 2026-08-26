@@ -13,9 +13,11 @@ namespace the shell constructs, and **placement and window management** (§8), t
 `Place`/`Raise`/`SetFocus` as the compositor's attached manager. The toolkit question §5 settled
 is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
 
-What is **not**: the **overview** (§6's zoomed-out half) and the **desktop indicator** are
-Milestone 8, and the shell today has one implicit desktop; the **system tray** (§9) is v2 and
-is an inter-process protocol rather than a widget. Sections describing those describe intent,
+What is **not**: the **bottom bar** and its **window list** — §2's table calls it persistent
+and §§1, 7 and 8 describe it as present, but `desktop-shell` draws a top bar only; the
+**overview** (§6's zoomed-out half) and the **desktop indicator**, both Milestone 8, the shell
+today having one implicit desktop; and the **system tray** (§9), which is v2 and an
+inter-process protocol rather than a widget. Sections describing those describe intent,
 not behaviour — the rule the rest of `architecture/` follows does not hold there.
 
 What a user actually sees and touches: the bars, the applications modal, the overview, and

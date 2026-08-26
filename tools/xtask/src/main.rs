@@ -1382,7 +1382,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
     // re-deriving it here keeps the check where the refusal is — a shell that found the gate
     // open declines to launch, which is behaviour rather than a test.
-    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
     // it does not have — and presents a `panel` top bar. Asserting the window rather than only
@@ -1430,7 +1430,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
-    session.expect("desktop-shell: application namespace grants new, withholds manage")?;
+    session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
     // shell closing the modal, so an `expect` between the two is a race between processes —
@@ -1500,16 +1500,34 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     // `nxterm::report_row` is `test-harness`-only and this gate boots a release image, so
     // asserting `"nxterm: grid> …"` here could never have passed — which is how the first
     // version of this check failed.
-    // **And it got an environment.** M7 Part F's second claim: `nxterm` took no setup message
-    // and handed `nxsh` a `Record::default()`, so a terminal launched into a constructed
-    // namespace would give its shell no `$env.HOME` while every serial login's has one. The
-    // count is the only release-visible evidence — the shell's prompt shows it, and the grid
-    // that renders the prompt is `test-harness`-only.
-    if transcript.contains("nxterm: hosting a shell (env: 0 fields)") {
-        return Err("the launched terminal hosted a shell with an empty environment, so its \
-             `$env.HOME` is unset where a serial login's is. Either `desktop-shell` sent no \
-             setup message or `nxterm` did not forward what it received"
+    // **And its shell got an environment — asserted from the shell, not from its parent.**
+    // M7 Part F's second claim: `nxterm` took no setup message and handed `nxsh` a
+    // `Record::default()`, so a terminal launched into a constructed namespace would give its
+    // shell no `$env.HOME` while every serial login's has one.
+    //
+    // **This reads `nxsh`'s own line, and the first version did not.** It read `nxterm:
+    // hosting a shell (env: N)`, which `nxterm` logs from the environment it *received* — so
+    // breaking the forward to `nxsh` and leaving the receipt intact kept the gate green. A
+    // parent cannot testify to what its child was given; only the child can. Demonstrated in
+    // review by doing exactly that (PR #238 review, finding 1).
+    //
+    // Two shells must report, because this gate runs two sessions: the terminal
+    // `desktop-shell` launched, and the serial login beside it. Counting them is what stops an
+    // absence-only check from passing when no shell started at all.
+    let shells = transcript.matches("nxsh: up (env: ").count();
+    if transcript.contains("nxsh: up (env: 0 fields)") {
+        return Err("a shell started with an empty environment, so its `$env.HOME` is unset. \
+             Somewhere between `desktop-session-mgr` and `nxsh` a setup message was not sent \
+             or not forwarded"
             .into());
+    }
+    if shells < 2 {
+        return Err(format!(
+            "expected two shells to report an environment (the launched terminal's and the \
+             serial login's); saw {shells}. A shell that never started cannot have an empty \
+             environment, which is why absence alone is not the check."
+        )
+        .into());
     }
     if !transcript.contains("nxterm: hosting a shell") {
         return Err("the launched terminal never hosted a shell. `nxterm: no shell` means it \

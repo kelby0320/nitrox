@@ -17985,16 +17985,63 @@ constructed namespace would have given its shell no `$env.HOME` while every seri
 one. It now receives a setup message and forwards it, and `desktop-shell` keeps the environment it
 receives and hands each launched application a setup channel carrying `argv` + env.
 
-The gate asserts this from `nxterm: hosting a shell (env: N fields)`. **Where that line is emitted
-was the actual decision.** The first version logged it in `_start`, from the environment as it
-*arrived* — which would have read a healthy `3` even if the forward had been changed back to
-`Record::default()`, an assertion that passes for the broken version. It is emitted inside
-`spawn_shell` instead, from the same binding `send_setup_full` consumes, two lines apart. There is
-no release-visible observation further down the chain: `nxsh`'s banner goes to its tty, which for
-a windowed terminal is the grid, and the grid renders only under `test-harness` — so this is the
-end of what a release image can show, and the gate's comment says so rather than implying more.
-Negative-controlled by making `desktop-shell` send nothing: the gate fails with the right verdict.
-The count is three, matching a serial login.
+**Only the receiver can testify to what it was given, and two attempts to have the sender do it
+both failed.** The gate first asserted on `nxterm: hosting a shell (env: N fields)` logged in
+`_start`, from the environment as it *arrived*; that obviously could not see a broken forward, so
+the line moved into `spawn_shell`, beside the `send_setup_full` call, on the reasoning that two
+lines apart they could not drift. **That reasoning was wrong, and review demonstrated it.** The
+log read `env` — the function *parameter* — while the call passed its own argument expression;
+replacing that argument with `Record::default()` left the log reading a healthy `3` and the gate
+green. Distance was never the variable. A parent reads the value it *has*, not the one it *sent*,
+at any distance (PR #238 review, finding 1).
+
+So the report belongs to `nxsh`, which is the only process that knows what it received: it prints
+`nxsh: up (env: N fields)` to the debug console — not to its tty, because a shell hosted by
+`nxterm` writes its tty into the grid and the grid renders only under `test-harness`. The gate
+now requires that **no** shell reports zero fields **and** that two shells report at all, the
+second clause because absence alone passes when nothing started. Three controls, each run:
+breaking the forward `nxterm → nxsh` fails it (the hop that used to be invisible), breaking
+`desktop-shell → nxterm` fails it, and deleting the log line itself fails it. The count is three,
+matching a serial login.
+
+**The general lesson, which is why this is recorded at length**: a verification claim about a
+message is only as good as the end it is observed from, and "the log sits next to the send" is
+not a proof — it is a proximity argument, and proximity is not identity.
+
+**A missing endpoint sends an empty message, not nothing.** `spawn_leader` couriers the
+leader's endpoints one message each and skipped the send when a handle was zero — but the leader
+reads them *positionally*, so a skip shifts every later endpoint up a slot. `init`'s
+`bind_tty_server` failure is non-fatal and only prints "sessions will have no /dev/tty", so a zero
+reaches here for real: `desktop-shell` would have taken the profile server's endpoint for the tty
+server's, bound `/dev/tty` to it in every application namespace and bound no `/bin`, and `nxterm`
+would have failed at `AttachBackend` while the shell's own "no terminal" warning stayed quiet
+because it saw a non-zero handle. This is the rule `init::send_handle` and
+`service-mgr::send_handle` both state and implement; `libsession` was the level that broke it
+(PR #238 review, finding 2). A failed duplicate and a failed send now take the same path, and the
+placeholder is announced rather than silent.
+
+**An application's `/home`, because otherwise its environment named something unreachable.**
+`session_env()` sets `HOME` and `PWD` to `/home` and `launch` forwards that record unchanged, but
+`build_app_namespace` bound no `/home` — so the terminal this milestone opens started its `nxsh`
+with `PWD=/home` in a namespace where `/home` resolved to nothing, and `list .`, `cd` and
+`open ./x` all failed in the graphical column while passing in the serial one. No gate saw it,
+because a terminal's output goes to the grid (PR #238 review, finding 3). The fields matched a
+serial login; two of the three named nothing.
+
+The shell now binds `/home` scoped to the user's subtree — the same six-argument bind
+`build_namespace` uses, so an application sees exactly that user's home and not the `/home` above
+it; binding the fs endpoint whole-tree would have handed every application every user's files.
+**The base had to be couriered**, and this is the part worth noting: the shell cannot read it
+anywhere. Its own `HOME` is `/home`, which is true *inside the session* precisely because
+`build_namespace` already scoped it, and a binding never resolves back to the base it was made
+with. So `spawn_leader` grew an `argv_rest`, and `desktop-session-mgr` passes the real home as
+`argv[1]`. That is a parent stating a fact, not delegating authority: the authority is the fs
+endpoint, which the shell already held.
+
+**And it is checked rather than assumed.** `verify_app_namespace` already refused to launch into a
+namespace that could reach `/dev/draw/manage`; it now also refuses one where `/home` does not
+resolve. Negative-controlled by removing the bind: the shell declines and the gate times out
+waiting for the line that says the namespace is sound.
 
 **`init` stops spawning graphical clients — done by retrofit C2, closed here.** The comment
 `init` carried from 2026-08-12, *"Until Milestone 7 there is nothing to launch `nxterm` from"*, is
