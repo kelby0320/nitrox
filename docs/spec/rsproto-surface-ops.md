@@ -626,7 +626,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0917`, `0x091D`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -701,6 +701,51 @@ rather than of a window. The block is not a category — see the note under
 [`Configure`](#configure-0x0915) — but the shape difference is real, and a reader who assumes
 "offset 0 is a window id" is right about every request in that range and would be wrong here.
 
+### `RegisterHotkey` (`0x091E`)
+
+Request, 8 bytes: `id` (u32), `mods` (u16), `code` (u16). Asks the compositor to route a key
+chord to the manager instead of to the focused window. `Malformed` if the body is short or `id`
+is zero; `Rejected` if `id` is already registered or the table is full (**16 entries**).
+
+**The manager picks the `id`**, the way a client picks a buffer id in
+[`AttachBuffer`](#attachbuffer-0x0901) — so the reply carries no body and the manager can name
+the chord in its own state before the answer arrives. Zero is reserved so a zeroed body cannot
+register anything.
+
+**`mods` must match exactly.** `Super+Shift+2` and `Super+2` are different chords, and a
+prefix match would make the first fire the second. A chord with `mods == 0` is a bare key.
+
+There is no unregister. A manager holds the channel for its whole life and the table dies with
+it; adding one is additive if a manager ever needs to rebind at runtime.
+
+**Why this is a manager request and not a client one.** Any application able to register `Super`
+could impersonate the launcher — take the chord that opens the applications modal and show its
+own window instead. The capability is holding `/dev/draw/manage`, which is one holder at a time
+and which an application's namespace does not bind.
+
+**A matched chord is consumed, not copied.** The focused window receives **no record of it at
+all**: not the press, not its release, and not the key repeat a held press would otherwise arm.
+Delivering any of them would make every hotkey also type into whatever has the keyboard —
+`Super+2` would switch desktops *and* put a `2` in the terminal.
+
+Three rules make that true, and each exists because a simpler version was wrong:
+
+- **The release is swallowed by keycode, not by re-matching.** A user who lets go of `Super`
+  before `2` releases a chord that no longer matches, so a compositor that re-tested the
+  modifiers on release would deliver a release for a press the window never saw.
+- **A key already down cannot begin a chord.** Pressing `2` alone and *then* holding `Super`
+  makes the repeat of `2` match — and that press was already delivered, so swallowing its
+  release would leave the window a press it never saw released. A chord fires on the transition
+  into it.
+- **A consumed press arms no key repeat.** Repeat is armed from the physical transition, so
+  without this a chord held past the repeat delay delivers its key to the focused window and
+  keeps doing so — bypassing routing entirely, since repeats are enqueued to the focused
+  session directly.
+
+**Every registered chord is forgotten when the manager channel closes.** The table is routing
+policy its holder asked for; left behind, chords would go on being consumed and delivered to
+nobody, and a replacement manager would inherit ids it did not choose.
+
 ### What is on screen
 
 A window is composited, focusable, and able to receive pointer events when **all** of:
@@ -738,7 +783,7 @@ the cursor is entered normally.
 A window that has been **destroyed** gets none of this: it is unreachable, so its id is simply
 forgotten. The suppression above still applies, because the sequence has still lost its owner.
 
-## Manager events (`0x0918`–`0x091C`)
+## Manager events (`0x0918`–`0x091C`, `0x091F`)
 
 Sent by the compositor **to** the manager channel, unsolicited. They are records, not
 requests: there is no reply, and the manager cannot refuse one.
@@ -770,6 +815,12 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's committed rectangle changed — place *or* commit |
 | `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
 | `0x091C` | `WindowTitle`    | window id + UTF-8   | A window's title changed — see *Titles* below  |
+| `0x091F` | `Hotkey`         | `MgrHotkey`         | A registered chord was **pressed** — see [`RegisterHotkey`](#registerhotkey-0x091e) |
+
+`Hotkey` is numbered after the block above because it was added later; it is a manager event
+like the rest. Its body is the same `MgrHotkey` the registration carried, echoed back — the
+manager already knows the chord by the id it chose, and echoing `mods` and `code` costs four
+bytes and lets a manager that lost track tell them apart.
 
 `WindowCreated` fires when the window is created, **before** its client has committed anything
 — that is what lets a manager place a window before it is first seen.

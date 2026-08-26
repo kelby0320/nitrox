@@ -845,6 +845,18 @@ pub const OP_MGR_SET_WINDOW_DESKTOP: u16 = 0x0916;
 /// on its desktop, restores there, and belongs in that desktop's window list, so folding the
 /// two would make restoring a guess.
 pub const OP_MGR_SET_MINIMIZED: u16 = 0x0917;
+/// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
+///
+/// A manager request rather than a client one because any application able to register `Super`
+/// could impersonate the launcher. The capability is holding `/dev/draw/manage`.
+pub const OP_MGR_REGISTER_HOTKEY: u16 = 0x091E;
+/// `Manage::Hotkey` — a registered chord was pressed. Compositor → manager.
+pub const OP_MGR_HOTKEY: u16 = 0x091F;
+/// How many chords one manager may register.
+///
+/// Bounded because everything else here is. Sixteen covers a launcher chord plus switching and
+/// moving across the single-digit desktops, which is what M8's shell binds.
+pub const MAX_HOTKEYS: usize = 16;
 /// `Manage::SetCurrentDesktop` — switch which desktop is composited.
 ///
 /// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every other manager
@@ -949,6 +961,45 @@ impl MgrWindowValue {
             return None;
         }
         Some(Self { window: get_u32(b, 0), value: get_u32(b, 4) })
+    }
+}
+
+/// A key chord — the body of both [`RegisterHotkey`](OP_MGR_REGISTER_HOTKEY) and the
+/// [`Hotkey`](OP_MGR_HOTKEY) event it produces.
+///
+/// **One type for the request and the event**, because the event's job is to say *which* chord
+/// fired and the manager already knows the chord by the id it chose. Echoing `mods` and `code`
+/// costs four bytes and means a manager that lost track can still tell them apart.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrHotkey {
+    /// Manager-chosen identity, the way a client chooses a buffer id. **Never zero** — that is
+    /// reserved so a zeroed body cannot register anything.
+    pub id: u32,
+    /// Modifiers that must be held, matched **exactly**: `Super+Shift+2` is not `Super+2`.
+    pub mods: u16,
+    /// The keycode, in the table `libkern::abi` mirrors.
+    pub code: u16,
+}
+
+impl MgrHotkey {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 8 {
+            return None;
+        }
+        put_u32(out, 0, self.id);
+        put_u16(out, 4, self.mods);
+        put_u16(out, 6, self.code);
+        Some(8)
+    }
+
+    /// Parse from the first 8 bytes of a body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(Self { id: get_u32(b, 0), mods: get_u16(b, 4), code: get_u16(b, 6) })
     }
 }
 

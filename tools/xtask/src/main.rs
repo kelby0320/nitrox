@@ -1221,6 +1221,53 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     qmp.send_key("b", false)?;
     session.expect("input-testclient: win key code=48 down=0")?;
 
+    // ---- A registered chord is consumed (M8 Part B) ----
+    //
+    // **Here, not at the end of the gate.** The first version ran this after
+    // `input-testclient: PASSED`, where the client has stopped logging window events — so a
+    // compositor that delivered the chord produced the same silence as one that consumed it,
+    // and the control (fire *and* deliver) passed. It has to run while the window that holds
+    // focus is still reporting what it receives.
+    //
+    // The compositor's own tests pin consumption over `route`, the function the binary routes
+    // with. What only a boot can show is that a chord injected on a real PS/2 wire, into a stack
+    // where a real client holds the keyboard, does not also type into it.
+    //
+    // **Twice, so the screen ends as it started.** `ui-testclient` toggles the desktop on each
+    // chord, and everything after this needs its window back on screen.
+    for want in ["desktop 2", "desktop 1"] {
+        qmp.send_key("meta_l", true)?;
+        qmp.send_key("f1", true)?;
+        // **Held past the repeat delay, which is the whole of what the first version missed.**
+        // Repeat is armed from the *physical* transition, so a consumed chord used to arm one
+        // anyway and deliver its key to the focused window 400 ms later, bypassing the router
+        // entirely. Injecting down-and-up back to back never reached that timer, so the gate was
+        // blind to it — `input-testclient` logs repeats like any other key, so holding the chord
+        // is all that was needed (PR #241 review, blocking 1). `REPEAT_DELAY_NS` is 400 ms.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        qmp.send_key("f1", false)?;
+        qmp.send_key("meta_l", false)?;
+        // **The positive half, and it is what makes the absence at the end mean anything.**
+        // Without it a chord that was never injected — a wrong qcode, a dropped QMP command —
+        // would produce the same silence as one correctly consumed.
+        session.expect(&format!("ui-testclient: hotkey fired -> {want}"))?;
+    }
+    // **And a chord whose action moves nothing, held past the repeat delay.** The two above
+    // switch desktops, which empties the current one — so `focus_candidate` becomes `None` and
+    // `fire_repeat` cancels itself, making this gate immune to a wrongly-armed repeat by
+    // coincidence of what the client does with the chord. `Super+Space` only prints, so focus
+    // stays where it is and a repeat that should not exist lands in the focused window's log.
+    qmp.send_key("meta_l", true)?;
+    qmp.send_key("spc", true)?;
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    qmp.send_key("spc", false)?;
+    qmp.send_key("meta_l", false)?;
+    session.expect("ui-testclient: quiet chord fired")?;
+
+    // No wait for focus here: the compositor announces it back **between** the two chords, so
+    // an expect placed after them scans forward past a line already emitted and times out. The
+    // click assertions below are what depend on the window being back, and they say so.
+
     // And a click, which is routed by hit-testing instead of focus. `buttons=1` is the mask
     // the record carries on every kind — the field that used to read zero here.
     qmp.send_button("left", true)?;
@@ -1254,7 +1301,29 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     session.expect("input-testclient: late key code=46")?;
 
     session.expect("input-testclient: PASSED")?;
+
+    let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
+
+    // `f1` is keycode 59. The window that had the keyboard must have seen neither the press nor
+    // its release — `win key` is the compositor's delivery and `widget key` is `libui`'s router
+    // one layer above it, so checking both says the chord stopped at the compositor rather than
+    // being dropped later by luck.
+    // 59 is F1, 57 is Space — the two chords this client registers.
+    for line in ["win key code=59", "widget key code=59", "win key code=57"] {
+        if transcript.contains(line) {
+            return Err(format!(
+                "input gate FAILED: a registered chord reached the focused window — the \
+                 transcript contains \"{line}\". `ui-testclient` registers `Super+F1` (59) and \
+                 `Super+Space` (57), so the compositor must consume each chord's press, its \
+                 release, and any repeat armed from it; delivering any of them makes every \
+                 hotkey also type into whatever has the keyboard"
+            )
+            .into());
+        }
+    }
+    println!("  ok: Super+F1 fired the manager's chord and reached no window");
+
     println!("\nxtask: input gate PASSED — an injected key and click reached userspace ✓");
     Ok(())
 }
@@ -1917,7 +1986,33 @@ fn check_service_attribution(transcript: &[u8]) -> R<()> {
 /// How many screendumps the display gate takes waiting for two in a row to match, and how
 /// long it waits between them. ~3s of budget, against a repaint measured in tens of ms.
 const SCREEN_SETTLE_TRIES: usize = 12;
+/// See [`SCREEN_SETTLE_TRIES`].
 const SCREEN_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Screendump until two consecutive captures are identical, and return the settled bytes.
+///
+/// **Two identical dumps, not a sleep.** A fixed delay is a guess that either wastes time or is
+/// too short on a loaded machine, and silently becomes too short again the next time the scene
+/// grows. This waits for the property a comparison actually needs — and it cannot pass a screen
+/// that is wrong but stable, because the comparison still runs afterwards.
+fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
+    let mut prev: Option<Vec<u8>> = None;
+    for _ in 0..SCREEN_SETTLE_TRIES {
+        qmp.screendump(shot)?;
+        let bytes =
+            fs::read(shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
+        if prev.as_deref() == Some(bytes.as_slice()) {
+            return Ok(bytes);
+        }
+        prev = Some(bytes);
+        std::thread::sleep(SCREEN_SETTLE_WAIT);
+    }
+    Err(format!(
+        "the guest's screen never stopped changing over {SCREEN_SETTLE_TRIES} captures \
+         {SCREEN_SETTLE_WAIT:?} apart — a compositor repainting continuously is itself the bug"
+    )
+    .into())
+}
 
 /// `cargo xtask check-display` — prove the pixels actually reach the screen.
 ///
@@ -2060,31 +2155,11 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // wastes time or is too short on a loaded machine, and silently becomes too short again
     // the next time the scene grows. This waits for the property the gate actually needs, and
     // it cannot pass a screen that is wrong but stable — the comparison below still runs.
-    let captured = {
-        let mut prev: Option<Vec<u8>> = None;
-        let mut settled = None;
-        for _ in 0..SCREEN_SETTLE_TRIES {
-            qmp.screendump(&shot)?;
-            let bytes =
-                fs::read(&shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
-            if prev.as_deref() == Some(bytes.as_slice()) {
-                settled = Some(bytes);
-                break;
-            }
-            prev = Some(bytes);
-            std::thread::sleep(SCREEN_SETTLE_WAIT);
-        }
-        match settled {
-            Some(b) => b,
-            None => {
-                let _ = session.child.kill();
-                return Err(format!(
-                    "the guest's screen never stopped changing over {SCREEN_SETTLE_TRIES} \
-                     captures {SCREEN_SETTLE_WAIT:?} apart — a compositor repainting \
-                     continuously is itself the bug"
-                )
-                .into());
-            }
+    let captured = match settle_and_capture(&mut qmp, &shot) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = session.child.kill();
+            return Err(e);
         }
     };
     let (w, h, pixels) = parse_ppm(&captured)?;
@@ -2224,6 +2299,23 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         }
     }
 
+    // **M8 Part B: the screendump Part A could not take.** Part A's gate box asked for a
+    // switched screen compared against a `libdraw` render, and could not have it: the guest had
+    // no way to be *told* to switch, because this client parked on `sys_wait` rather than
+    // reading anything. A registered chord is that channel — the host injects it over QMP, the
+    // guest acts on it, and the screen captured is one the host asked for.
+    //
+    // **Only when the static comparison already passed.** A switched screen means nothing if
+    // the unswitched one was wrong, and running it anyway would report the second failure while
+    // hiding the first.
+    if mismatches == 0 && term_mismatches == 0 && ui_mismatches == 0 {
+        if let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh) {
+            let _ = session.child.kill();
+            let _ = fs::remove_file(&qmp_sock);
+            return Err(e);
+        }
+    }
+
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
 
@@ -2280,6 +2372,123 @@ fn cmd_check_display(accel: Accel) -> R<()> {
          {tw}x{th} terminal and {ui_compared} pixels of the {uw}x{uh} toolkit window match \
          libdraw, libterm and libui pixel for pixel ✓"
     );
+    Ok(())
+}
+
+/// Inject the test client's chord, capture the switched screen, and switch back.
+///
+/// **What this proves that a host test cannot.** `compositor`'s own tests pin the desktop filter
+/// over `compose_into`, which is the function the binary composites with — so the *logic* is
+/// covered there. What only a screendump can show is the guest being consistent with itself and
+/// wrong: a filter that runs but composites into the wrong place, or a switch that leaves the
+/// previous frame on screen because nothing repainted. That is the class `check-display` exists
+/// for, and until a chord existed there was no way to ask the guest to enter the state.
+///
+/// The round trip is deliberately both ways. A one-way check passes for a compositor that
+/// filtered a window out permanently, or dropped its buffer on the way — the scene coming *back*
+/// with no further commit is what says a desktop switch is a filter changing its mind.
+fn desktop_round_trip(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    work: &Path,
+    screen_w: u32,
+    sw: u32,
+    sh: u32,
+) -> R<()> {
+    let shot = work.join("screendump-desktop.ppm");
+
+    // The client says when it is listening. Injecting before that is a race the guest would
+    // lose silently — the chord would be delivered to the focused window as an ordinary key.
+    session.expect("ui-testclient: hotkey registered, waiting")?;
+
+    // `Super+F1`. The modifier goes down first and comes up last, which is what a person does
+    // and what `libinput`'s modifier tracking expects.
+    let chord = |qmp: &mut Qmp| -> R<()> {
+        qmp.send_key("meta_l", true)?;
+        qmp.send_key("f1", true)?;
+        qmp.send_key("f1", false)?;
+        qmp.send_key("meta_l", false)?;
+        Ok(())
+    };
+
+    chord(qmp)?;
+    session.expect("ui-testclient: hotkey fired -> desktop 2")?;
+    let switched = settle_and_capture(qmp, &shot)?;
+    let (w2, _, px2) = parse_ppm(&switched)?;
+    if w2 != screen_w {
+        return Err(format!("the switched capture is {w2} wide, the first was {screen_w}").into());
+    }
+
+    // **Every pixel of the scene region is the background.** The reference windows are all on
+    // desktop 1, so desktop 2 shows nothing — and this region is where they were, so a filter
+    // that did not run leaves their content exactly here.
+    // The compositor clears to `libdraw::scene::BACKGROUND` — the same constant the reference
+    // render fills with, so host and guest cannot disagree about what "empty" looks like.
+    let bgc = libdraw::scene::BACKGROUND;
+    let bg = (bgc.r, bgc.g, bgc.b);
+    let mut lit = 0usize;
+    let mut first_lit = None;
+    for y in 0..sh {
+        for x in 0..sw {
+            let i = (y as usize * w2 as usize + x as usize) * 3;
+            let got = (px2[i], px2[i + 1], px2[i + 2]);
+            if got != bg {
+                lit += 1;
+                if first_lit.is_none() {
+                    first_lit = Some((x, y, got));
+                }
+            }
+        }
+    }
+    if lit > 0 {
+        let (x, y, got) = first_lit.expect("a lit pixel was counted");
+        return Err(format!(
+            "display gate FAILED: {lit} of {} pixels are still drawn after switching to an \
+             empty desktop.\n  first at ({x},{y}): screen {got:?}, expected the background \
+             {bg:?}\n  the capture is at {} — the compositor is compositing windows that are \
+             not on the current desktop, or switching did not repaint",
+            sw as usize * sh as usize,
+            shot.display()
+        )
+        .into());
+    }
+    println!("  ok: desktop 2 is empty — {} scene pixels are background", sw as usize * sh as usize);
+
+    // And back. No client commits anything in between, so the scene returning is the filter
+    // changing its mind rather than a redraw.
+    chord(qmp)?;
+    session.expect("ui-testclient: hotkey fired -> desktop 1")?;
+    let restored = settle_and_capture(qmp, &shot)?;
+    let (w3, _, px3) = parse_ppm(&restored)?;
+    use libdraw::framebuffer::Framebuffer;
+    let expected = libdraw::scene::render_reference();
+    let mut bad = 0usize;
+    let mut first_bad = None;
+    for y in 0..sh {
+        for x in 0..sw {
+            let want = Framebuffer::get_pixel(&expected, x, y).unwrap_or_default();
+            let i = (y as usize * w3 as usize + x as usize) * 3;
+            let got = (px3[i], px3[i + 1], px3[i + 2]);
+            if got != (want.r, want.g, want.b) {
+                bad += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((x, y, got, (want.r, want.g, want.b)));
+                }
+            }
+        }
+    }
+    if bad > 0 {
+        let (x, y, got, want) = first_bad.expect("a mismatch was counted");
+        return Err(format!(
+            "display gate FAILED: {bad} scene pixels differ after switching back.\n  \
+             first at ({x},{y}): screen {got:?}, expected {want:?}\n  the capture is at {} — \
+             the window came back changed, so a desktop switch is not the pure filter it is \
+             specified to be",
+            shot.display()
+        )
+        .into());
+    }
+    println!("  ok: switching back restored the scene pixel for pixel, with no client commit");
     Ok(())
 }
 

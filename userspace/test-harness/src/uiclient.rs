@@ -1397,6 +1397,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //
     // Outlives the block below deliberately; see where it is assigned.
     let mut probe_session: Option<alloc::boxed::Box<ChannelTransport>> = None;
+    // **The manager channel outlives the block below too**, since M8 Part B: the client keeps
+    // serving registered chords for the rest of its life, which is what lets a gate ask the
+    // guest to change what is on screen. Dropping it at the end of the block would close the
+    // channel and take the chord table with it.
+    let mut manager: Option<ChannelTransport> = None;
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     if let Ok(mut mgr) = unsafe { ChannelTransport::manage(root_ns) } {
         // **Before the placements below, not after.** This probe creates and destroys a
@@ -1443,6 +1448,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             Ok(_) => fail(b"ui-testclient: a second /dev/draw/manage was SERVED\n"),
             Err(_) => kprint(b"ui-testclient: a second /dev/draw/manage was refused\n"),
         }
+        manager = Some(mgr);
     } else {
         // Kept as a distinguishable line rather than a `fail`: the gate asserts the success
         // line above, so this path already fails the run — and it says *which* way it failed,
@@ -1457,8 +1463,23 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // session stays open for the life of the process.
     let _held_open = probe_session;
 
-    // Park. Exiting would close the channel, and the compositor would destroy this window
-    // and repaint — leaving the gate to capture an empty screen.
+    // **The client stops parking here, and that is M8 Part B's point.** Until now it waited on
+    // a notification nothing signals, so the screen it left behind was the only thing a gate
+    // could look at — which is why Part A could not take a screendump of a *switched* desktop:
+    // nothing host-side could tell the guest to switch. A registered chord is exactly that
+    // channel. The host injects it over QMP, this loop acts on it, and the screen the gate
+    // captures is one the host asked for.
+    match manager.as_mut() {
+        Some(mgr) => serve_hotkeys(mgr, notif),
+        // No manager channel: there is nothing to register a chord on, and the line above
+        // already says so. Park as this client did before Part B, so the scene stays up.
+        None => park(notif),
+    }
+}
+
+/// Wait forever on a notification nothing signals — what this client did before it served
+/// chords, kept for the path where there is no manager channel to serve them on.
+fn park(notif: u64) -> ! {
     loop {
         // SAFETY: waiting on this process's own notification handle, which nothing
         // signals; the deadline is infinite, so this parks rather than spins.
@@ -1474,6 +1495,103 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             )
         };
     }
+}
+
+/// Register a chord and act on it until the process is killed.
+///
+/// **Toggling, not one-way**, so a gate can capture the switched screen *and* prove the scene
+/// comes back — a compositor that filtered a window out permanently, or lost its buffer on the
+/// way, would pass a one-way check and fail this one.
+fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
+    use libkern::abi::{KEY_F1, KEY_SPACE};
+    use librsproto::surface::{MOD_META, MgrHotkey, OP_MGR_HOTKEY, OP_MGR_REGISTER_HOTKEY};
+    let _ = notif;
+
+    // `Super+F1`: `Super` alone is what a real shell binds for its launcher, so a chord with a
+    // second key stays out of the way of anything Part D will want. `F1` because it is the
+    // highest function key `libkern::abi` names, and this client must not need a keycode the
+    // ABI does not publish.
+    const HOTKEY_ID: u32 = 0x8001;
+    let hk = MgrHotkey { id: HOTKEY_ID, mods: MOD_META, code: KEY_F1 };
+    let mut body = [0u8; 8];
+    if hk.write(&mut body).is_none() {
+        fail(b"ui-testclient: could not encode a RegisterHotkey body\n");
+    }
+    let mut reply = [0u8; 8];
+    if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_err() {
+        fail(b"ui-testclient: RegisterHotkey was refused\n");
+    }
+    // **A second registration under the same id must be refused**, not silently replace the
+    // first — a manager holding two chords under one id would be told nothing and then wonder
+    // why one of them never fires. Checked here because this is the only caller there is.
+    let mut reply = [0u8; 8];
+    if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok() {
+        fail(b"ui-testclient: a duplicate hotkey id was ACCEPTED\n");
+    }
+    // **A second chord whose action moves nothing**, and it exists for one reason: key repeat.
+    // A consumed chord must not arm a repeat, and the only gate that can see that is one where
+    // the chord is *held* — but `Super+F1` empties the current desktop, so `focus_candidate`
+    // becomes `None` and `fire_repeat` cancels itself. The gate was immune by coincidence of
+    // what this client did with the chord, which is why the control passed against a compositor
+    // that did arm one (PR #241 review, blocking 1). This chord only prints, so focus is
+    // untouched and a wrongly-armed repeat reaches the focused window and is logged there.
+    const QUIET_ID: u32 = 0x8002;
+    let quiet = MgrHotkey { id: QUIET_ID, mods: MOD_META, code: KEY_SPACE };
+    let mut body = [0u8; 8];
+    if quiet.write(&mut body).is_none() {
+        fail(b"ui-testclient: could not encode the quiet chord\n");
+    }
+    let mut reply = [0u8; 8];
+    if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_err() {
+        fail(b"ui-testclient: registering the quiet chord was refused\n");
+    }
+    kprint(b"ui-testclient: hotkey registered, waiting\n");
+
+    let mut current: u32 = 1;
+    let mut buf = [0u8; 64];
+    loop {
+        match mgr.wait_event_timeout(&mut buf, MGR_EVENT_SLICE_NS) {
+            Ok(Some((op, n))) if op == OP_MGR_HOTKEY => {
+                let Some(got) = MgrHotkey::read(&buf[..n]) else {
+                    fail(b"ui-testclient: a Hotkey event did not decode\n");
+                };
+                if got.id == QUIET_ID {
+                    // Nothing is changed on purpose — see where it is registered.
+                    kprint(b"ui-testclient: quiet chord fired\n");
+                    continue;
+                }
+                if got.id != HOTKEY_ID {
+                    fail(b"ui-testclient: a Hotkey event named a chord we never registered\n");
+                }
+                // The event echoes the chord, so a compositor that matched the wrong one is
+                // caught here rather than looking like a missing event.
+                if got.mods != MOD_META || got.code != KEY_F1 {
+                    fail(b"ui-testclient: a Hotkey event carried the wrong chord\n");
+                }
+                current = if current == 1 { 2 } else { 1 };
+                if !set_current_desktop(mgr, current) {
+                    fail(b"ui-testclient: SetCurrentDesktop was refused\n");
+                }
+                Line::new()
+                    .s(b"ui-testclient: hotkey fired -> desktop ")
+                    .u(current as u64)
+                    .end();
+            }
+            Ok(_) => {}
+            Err(_) => fail(b"ui-testclient: manager channel error while waiting for a chord\n"),
+        }
+    }
+}
+
+/// Switch the compositor's current desktop. `false` if the request did not succeed.
+fn set_current_desktop(mgr: &mut ChannelTransport, desktop: u32) -> bool {
+    use librsproto::surface::{MgrDesktop, OP_MGR_SET_CURRENT_DESKTOP};
+    let mut body = [0u8; 4];
+    if (MgrDesktop { desktop }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 8];
+    mgr.request(OP_MGR_SET_CURRENT_DESKTOP, &body, None, &mut reply).is_ok()
 }
 
 #[panic_handler]

@@ -24,12 +24,42 @@ use alloc::vec::Vec;
 use libdraw::geom::{Point, Rect};
 use libinput::Logical;
 use librsproto::surface::{
-    KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_MOTION, POINTER_PRESSED,
-    PointerEvent,
+    KeyEvent, MAX_HOTKEYS, MgrHotkey, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE,
+    POINTER_MOTION, POINTER_PRESSED, PointerEvent,
 };
 
 use crate::WindowStack;
 use crate::outbox::Outbound;
+
+/// What routing one event did, beyond what it put in `out`.
+///
+/// **`consumed` exists because the caller cannot otherwise tell.** `route` used to answer only
+/// "did the stack restack", so a chord press and an ordinary keystroke were indistinguishable
+/// from outside — and the binary arms key repeat from the *physical* transition, deliberately,
+/// so a consumed chord went on to repeat its key into the focused window at 25/s. Holding
+/// `Super+1` while already on desktop 1 filled the terminal with `1`s: exactly the outcome
+/// consumption exists to prevent, by the one path consumption could not see (PR #241 review,
+/// blocking 1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Routed {
+    /// The stack was reordered, so the caller must recompose.
+    pub restacked: bool,
+    /// The event was taken by a registered chord and reached no window.
+    pub consumed: bool,
+}
+
+/// Why a chord could not be registered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HotkeyError {
+    /// `id` was zero, which is reserved so a zeroed body registers nothing.
+    ZeroId,
+    /// Another chord is already registered under that `id`.
+    DuplicateId,
+    /// That `mods`+`code` combination is already registered, under a different id.
+    DuplicateChord,
+    /// [`MAX_HOTKEYS`] chords are already registered.
+    TableFull,
+}
 
 /// Whether a window the router still names is usable, hidden, or gone.
 ///
@@ -85,6 +115,35 @@ pub struct InputRouter {
     /// Modifiers held, mirrored the same way — what makes shift-click and shift-drag
     /// expressible on the wire rather than only in `libinput`.
     modifiers: u16,
+    /// Keycodes whose press this router **delivered**, awaiting their release.
+    ///
+    /// **The other half of `consumed`, and it is what keeps presses and releases balanced.**
+    /// A key already down cannot begin a chord: pressing `2`, then holding `Super`, makes the
+    /// *repeat* of `2` match `Super+2` — so the chord would be recorded as consumed and the
+    /// physical release swallowed, leaving the window with a press it never saw released
+    /// (PR #241 review, finding 2). A press whose keycode is already here is a repeat of a
+    /// delivered press, and is delivered.
+    held: Vec<u16>,
+    /// Chords a manager asked to receive instead of the focused window.
+    ///
+    /// Held here rather than in [`WindowStack`] because this is input *routing* policy and the
+    /// stack is what the screen looks like. Bounded at [`MAX_HOTKEYS`].
+    hotkeys: Vec<MgrHotkey>,
+    /// Chords matched since the last [`take_hotkeys`](Self::take_hotkeys).
+    ///
+    /// **Drained by the caller rather than pushed into `out`.** `Outbound` is addressed to a
+    /// *window* — `Outbound::window()` is the one place delivery is decided — and a hotkey is
+    /// addressed to the manager, which is not a window and has its own queue. Threading a
+    /// second out-param through `route` would put it in the signature of every caller that
+    /// cannot produce one.
+    fired: Vec<MgrHotkey>,
+    /// Keycodes whose press was consumed as a hotkey, awaiting their release.
+    ///
+    /// **By keycode, not by re-matching the chord.** A user who lets go of `Super` before `2`
+    /// releases a chord that no longer matches, so re-testing the modifiers on release would
+    /// deliver a release for a press the focused window never saw — the same defect as handing
+    /// a broken pointer grab's release to the window underneath.
+    consumed: Vec<u16>,
 }
 
 impl InputRouter {
@@ -106,6 +165,10 @@ impl InputRouter {
             grab_broken: false,
             buttons: 0,
             modifiers: 0,
+            hotkeys: Vec::new(),
+            fired: Vec::new(),
+            consumed: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -143,7 +206,7 @@ impl InputRouter {
         ev: &Logical,
         stack: &mut WindowStack,
         out: &mut Vec<Outbound>,
-    ) -> bool {
+    ) -> Routed {
         // Mirror the interpreter's state before anything is emitted. Enter and leave are
         // generated *by* the router rather than arriving as events, so they have no state of
         // their own to read; taking it from the event that provoked them is what lets every
@@ -176,15 +239,26 @@ impl InputRouter {
 
         match *ev {
             Logical::Key { keycode, pressed, modifiers } => {
+                // **Before focus routing, and consuming rather than copying.** A chord that
+                // also reached the focused window would type into it — `Super+2` would switch
+                // desktops *and* put a `2` in the terminal.
+                if self.take_as_hotkey(keycode, pressed, modifiers) {
+                    return Routed { restacked: false, consumed: true };
+                }
                 let Some(window) = stack.focus_candidate() else {
                     // Nothing focusable. Dropping beats delivering to the pointer's window,
                     // which would make typing depend on where the cursor happens to rest.
-                    return false;
+                    return Routed::default();
                 };
+                // TODO(focus-change-key-balance): a key held across a focus change is delivered
+                // to one window and released to another, or to none. Harmless today because
+                // `KeyEvent` carries `modifiers` on every record, so no client accumulates
+                // them — but it is the same unbalanced-press shape the chord rules above exist
+                // to prevent, reached by a different route.
                 out.push(Outbound::Key {
                     event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers),
                 });
-                false
+                Routed::default()
             }
 
             Logical::Motion { dx, dy, .. } => {
@@ -193,7 +267,7 @@ impl InputRouter {
                 if let Some(window) = self.target(stack) {
                     self.emit(window, POINTER_MOTION, 0, 0, stack, out);
                 }
-                false
+                Routed::default()
             }
 
             Logical::Button { button, pressed, buttons, .. } => {
@@ -240,7 +314,7 @@ impl InputRouter {
                     self.grab_broken = false;
                     self.update_crossing(stack, out);
                 }
-                restacked
+                Routed { restacked, consumed: false }
             }
 
             Logical::Dropped => {
@@ -256,7 +330,15 @@ impl InputRouter {
                 if had {
                     self.update_crossing(stack, out);
                 }
-                false
+                // **Key beliefs go too.** `Dropped` says the held-key state is unknown, and
+                // `consumed` and `held` are both beliefs about held keys: a swallowed release
+                // would otherwise leave a keycode recorded forever, so the *next* ordinary
+                // press of it is delivered and its release swallowed — a window holding a key
+                // down for the rest of its life, which is the phantom-held-key bug `Dropped`
+                // exists one layer down to prevent (PR #241 review, finding 2).
+                self.consumed.clear();
+                self.held.clear();
+                Routed::default()
             }
         }
     }
@@ -339,6 +421,93 @@ impl InputRouter {
             x.clamp(self.screen.left(), self.screen.right() as i32 - 1),
             y.clamp(self.screen.top(), self.screen.bottom() as i32 - 1),
         );
+    }
+
+    /// Register a chord, to be delivered to the manager instead of the focused window.
+    ///
+    /// `Err` if `id` is zero, already registered, or the table is full — never a silent
+    /// replacement, because a manager that registered two chords under one id would be told
+    /// nothing and then wonder why one of them never fires.
+    pub fn register_hotkey(&mut self, hk: MgrHotkey) -> Result<(), HotkeyError> {
+        if hk.id == 0 {
+            return Err(HotkeyError::ZeroId);
+        }
+        if self.hotkeys.iter().any(|h| h.id == hk.id) {
+            return Err(HotkeyError::DuplicateId);
+        }
+        // **And a duplicate *chord*, for the reason a duplicate id is refused.** `find` returns
+        // the first match, so a second registration of the same `mods`+`code` would be
+        // permanently silent — the manager told nothing, then wondering why one of them never
+        // fires. That argument does not care which field collides (PR #241 review, finding 7).
+        if self.hotkeys.iter().any(|h| h.mods == hk.mods && h.code == hk.code) {
+            return Err(HotkeyError::DuplicateChord);
+        }
+        if self.hotkeys.len() >= MAX_HOTKEYS {
+            return Err(HotkeyError::TableFull);
+        }
+        self.hotkeys.push(hk);
+        Ok(())
+    }
+
+    /// Take the chords matched since this was last called.
+    pub fn take_hotkeys(&mut self) -> Vec<MgrHotkey> {
+        core::mem::take(&mut self.fired)
+    }
+
+    /// Consume a key transition if it belongs to a registered chord.
+    ///
+    /// Returns `true` when the key must **not** reach the focused window. A press matches on
+    /// `mods` **exactly** — a prefix match would make `Super+Shift+2` fire `Super+2` as well —
+    /// and its release is swallowed by keycode, whatever the modifiers say by then.
+    fn take_as_hotkey(&mut self, keycode: u16, pressed: bool, modifiers: u16) -> bool {
+        if !pressed {
+            // The release half. Removing the record here is what stops one press from
+            // swallowing every later release of the same key.
+            if let Some(i) = self.consumed.iter().position(|&k| k == keycode) {
+                self.consumed.swap_remove(i);
+                return true;
+            }
+            // A key this router delivered is no longer held; its release is delivered too.
+            if let Some(i) = self.held.iter().position(|&k| k == keycode) {
+                self.held.swap_remove(i);
+            }
+            return false;
+        }
+        // **A key already down cannot begin a chord.** Its press was delivered, so its release
+        // must be too — and a repeat arriving after a modifier went down would otherwise match
+        // and swallow it. A chord fires on the transition *into* the chord.
+        if self.held.contains(&keycode) {
+            return false;
+        }
+        let Some(hk) = self.hotkeys.iter().find(|h| h.code == keycode && h.mods == modifiers)
+        else {
+            if !self.held.contains(&keycode) {
+                self.held.push(keycode);
+            }
+            return false;
+        };
+        self.fired.push(*hk);
+        // Guarded against a repeat: an auto-repeating press would otherwise push the same
+        // keycode again and again, and only the first release would be swallowed.
+        if !self.consumed.contains(&keycode) {
+            self.consumed.push(keycode);
+        }
+        true
+    }
+
+    /// Forget every chord a manager registered.
+    ///
+    /// **Called when the manager channel closes.** Without it the table outlives its owner:
+    /// every registered chord keeps being consumed and delivered to nobody, so the key silently
+    /// reaches nothing for the life of the compositor — and a replacement manager inherits the
+    /// dead one's ids, so re-registering its own returns `DuplicateId` (PR #241 review,
+    /// finding 3). The same reasoning `close_manager` already applies to its queued events:
+    /// they describe a world the departed manager asked about.
+    pub fn clear_hotkeys(&mut self) {
+        self.hotkeys.clear();
+        // Anything mid-chord loses its owner with the table. Leaving `consumed` populated
+        // would swallow releases for presses nothing will ever act on.
+        self.consumed.clear();
     }
 
     /// The topmost window containing the cursor, whatever its role.
@@ -502,6 +671,203 @@ mod tests {
 
     fn key(keycode: u16, pressed: bool) -> Logical {
         Logical::Key { keycode, pressed, modifiers: 0 }
+    }
+
+    /// A key transition with modifiers held — what a chord looks like on the wire.
+    fn chord(keycode: u16, pressed: bool, modifiers: u16) -> Logical {
+        Logical::Key { keycode, pressed, modifiers }
+    }
+
+    /// The "Super" key is `MOD_SUPER` on the wire — the name the modifier bitmask uses.
+    const MOD_SUPER: u16 = librsproto::surface::MOD_META;
+    /// `2` in the keycode table `libkern::abi` mirrors.
+    const KEY_2: u16 = 3;
+
+    #[test]
+    fn a_registered_chord_goes_to_the_manager_and_not_to_the_focused_window() {
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 7, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+        assert_eq!(s.focus_candidate(), Some(w), "precondition: the window has the keyboard");
+
+        let out = go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        assert!(out.is_empty(), "a consumed chord types into nothing");
+        assert_eq!(
+            r.take_hotkeys(),
+            alloc::vec![MgrHotkey { id: 7, mods: MOD_SUPER, code: KEY_2 }],
+            "the manager is told which chord fired"
+        );
+        assert!(r.take_hotkeys().is_empty(), "and told once");
+
+        // **The release too.** Delivering it would hand the window a release for a press it
+        // never saw — the same defect as a broken pointer grab's tail going to whoever is
+        // underneath.
+        let out = go(&mut r, &mut s, chord(KEY_2, false, MOD_SUPER));
+        assert!(out.is_empty(), "the release is consumed with the press");
+    }
+
+    #[test]
+    fn a_chords_release_is_swallowed_by_keycode_even_after_the_modifiers_change() {
+        // Letting go of `Super` before `2` is the ordinary way to release a chord, and by then
+        // the modifiers no longer match. A compositor that re-tested them here would deliver
+        // the release alone.
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+
+        go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        let out = go(&mut r, &mut s, chord(KEY_2, false, 0));
+        assert!(out.is_empty(), "released after Super came up, and still swallowed");
+
+        // And only that one release: the next press of the same key, without the chord, is an
+        // ordinary keystroke again.
+        let out = go(&mut r, &mut s, key(KEY_2, true));
+        assert_eq!(out.len(), 1, "an unmodified press is delivered normally");
+    }
+
+    #[test]
+    fn modifiers_must_match_exactly() {
+        // A prefix match would make `Super+Shift+2` fire `Super+2` as well, so a shell binding
+        // both would switch desktops every time you asked it to move a window to one.
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+
+        let out = go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER | MOD_SHIFT));
+        assert_eq!(out.len(), 1, "Super+Shift+2 is not Super+2, so it reaches the window");
+        assert!(r.take_hotkeys().is_empty(), "and fires nothing");
+    }
+
+    #[test]
+    fn an_auto_repeating_chord_does_not_leave_a_release_owed_twice() {
+        // A held chord repeats presses. Recording the keycode once per press would leave two
+        // entries and swallow the *next* unrelated release of that key as well.
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+
+        go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        assert_eq!(r.take_hotkeys().len(), 3, "each press is a chord press");
+
+        assert!(go(&mut r, &mut s, chord(KEY_2, false, MOD_SUPER)).is_empty(), "one release owed");
+        let out = go(&mut r, &mut s, key(KEY_2, false));
+        assert_eq!(out.len(), 1, "and only one -- a later release is an ordinary keystroke");
+    }
+
+    #[test]
+    fn a_consumed_chord_tells_the_caller_so_it_does_not_arm_a_repeat() {
+        // **The one thing `route` could not say.** The binary arms key repeat from the physical
+        // transition — deliberately, so a key that reached no window still stops repeating when
+        // it comes up — and a consumed chord looked exactly like an ordinary keystroke from
+        // outside. So it armed, and 400 ms later delivered its key straight to the focused
+        // window's session, bypassing the router: holding `Super+1` while already on desktop 1
+        // filled the terminal with `1`s (PR #241 review, blocking 1).
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+
+        let mut out = Vec::new();
+        let routed = r.route(&chord(KEY_2, true, MOD_SUPER), &mut s, &mut out);
+        assert!(routed.consumed, "a chord press must report itself consumed");
+        out.clear();
+        let routed = r.route(&key(KEY_2, true), &mut s, &mut out);
+        assert!(!routed.consumed, "an ordinary press is not");
+    }
+
+    #[test]
+    fn a_key_already_down_cannot_begin_a_chord() {
+        // Press `2` alone — delivered — then hold `Super`. The hardware repeat of `2` now
+        // matches `Super+2`, so without this the chord would fire and the *physical* release
+        // would be swallowed, leaving the window a press it never saw released
+        // (PR #241 review, finding 2).
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+
+        assert_eq!(go(&mut r, &mut s, key(KEY_2, true)).len(), 1, "delivered while unmodified");
+        // The repeat, now with Super held.
+        let out = go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        assert_eq!(out.len(), 1, "a key already down is a repeat, not a new chord");
+        assert!(r.take_hotkeys().is_empty(), "and it fires nothing");
+        // The release balances the delivered press.
+        assert_eq!(go(&mut r, &mut s, key(KEY_2, false)).len(), 1, "its release is delivered");
+    }
+
+    #[test]
+    fn dropped_forgets_which_keys_were_consumed() {
+        // `Dropped` says the held-key state is unknown. A swallowed release would otherwise
+        // leave the keycode recorded forever: the next *ordinary* press of it is delivered and
+        // its release swallowed, so the window holds that key down for the rest of its life —
+        // the phantom-held-key bug `Dropped` exists one layer down to prevent.
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+
+        go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        go(&mut r, &mut s, Logical::Dropped);
+        // The release the chord was owed never arrives; the drop is what stands in for it.
+        assert_eq!(go(&mut r, &mut s, key(KEY_2, true)).len(), 1, "an ordinary press after");
+        assert_eq!(
+            go(&mut r, &mut s, key(KEY_2, false)).len(),
+            1,
+            "and its release is delivered rather than swallowed by a stale record"
+        );
+    }
+
+    #[test]
+    fn clearing_the_table_stops_chords_being_consumed_by_nobody() {
+        // The table used to outlive the manager that registered it: every chord kept being
+        // consumed and delivered to a channel that no longer existed, so the key silently
+        // reached nothing for the life of the compositor (PR #241 review, finding 3).
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+        assert!(go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER)).is_empty(), "consumed");
+        r.take_hotkeys();
+
+        r.clear_hotkeys();
+        let out = go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+        assert_eq!(out.len(), 1, "with no table the chord is an ordinary keystroke again");
+        // And the id is free for a replacement manager.
+        assert!(r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).is_ok());
+    }
+
+    #[test]
+    fn registration_refuses_zero_a_duplicate_and_a_full_table() {
+        let mut r = InputRouter::new(SCREEN);
+        assert_eq!(
+            r.register_hotkey(MgrHotkey { id: 0, mods: 0, code: 1 }),
+            Err(HotkeyError::ZeroId),
+            "zero is reserved so a zeroed body registers nothing"
+        );
+        r.register_hotkey(MgrHotkey { id: 1, mods: 0, code: 1 }).unwrap();
+        assert_eq!(
+            r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: 2 }),
+            Err(HotkeyError::DuplicateId),
+            "refused rather than silently replaced"
+        );
+        assert_eq!(
+            r.register_hotkey(MgrHotkey { id: 2, mods: 0, code: 1 }),
+            Err(HotkeyError::DuplicateChord),
+            "a second id for the same chord would be permanently silent"
+        );
+        for i in 2..=MAX_HOTKEYS as u32 {
+            r.register_hotkey(MgrHotkey { id: i, mods: 0, code: i as u16 }).unwrap();
+        }
+        assert_eq!(
+            r.register_hotkey(MgrHotkey { id: 99, mods: 0, code: 99 }),
+            Err(HotkeyError::TableFull)
+        );
     }
 
     fn button(pressed: bool) -> Logical {
@@ -826,8 +1192,8 @@ mod tests {
 
         warp(&mut r, &mut s, 50, 50);
         let mut out = Vec::new();
-        let restacked = r.route(&button(true), &mut s, &mut out);
-        assert!(restacked, "the caller must recompose");
+        let routed = r.route(&button(true), &mut s, &mut out);
+        assert!(routed.restacked, "the caller must recompose");
         assert_eq!(s.focus_candidate(), Some(lower), "the raise *is* the focus change");
     }
 
@@ -842,7 +1208,7 @@ mod tests {
         warp(&mut r, &mut s, 320, 50);
 
         let mut out = Vec::new();
-        assert!(!r.route(&button(true), &mut s, &mut out), "no restack");
+        assert!(!r.route(&button(true), &mut s, &mut out).restacked, "no restack");
         assert_eq!(s.windows().last().map(|w| w.id), Some(normal));
         assert_eq!(s.windows().first().map(|w| w.id), Some(panel));
     }

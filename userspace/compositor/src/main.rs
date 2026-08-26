@@ -68,7 +68,13 @@ const MSG_LEN: usize = 4096;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 /// The background the screen is cleared to where no window covers.
-const BACKGROUND: Rgb = Rgb::new(0x0E, 0x14, 0x1B);
+///
+/// **Taken from `libdraw::scene` rather than declared here**, which it was until M8 Part B. The
+/// two were the same literal, and the display gate has always depended on that: its reference
+/// render fills with `scene::BACKGROUND` and is compared against pixels this constant painted,
+/// so a change to either alone would have failed the gate with a colour mismatch rather than
+/// naming the duplicate. One constant cannot drift from itself.
+const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 
 /// Largest Surface request body.
 ///
@@ -790,8 +796,9 @@ fn unserialisable(what: &[u8]) -> bool {
 /// Send one queued manager event. `false` if the channel would not take it.
 fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     use librsproto::surface::{
-        MgrWindowCreated, MgrWindowRef, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE,
+        MgrHotkey, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY, OP_MGR_WINDOW_CREATED,
+        OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
+        OP_MGR_WINDOW_TITLE,
     };
     // Sized **from the types**, not from the byte counts the spec publishes — the same rule
     // `send_outbound` states and for the same reason: widening `PointerEvent` left a
@@ -800,6 +807,13 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     // sent. A queue whose purpose is that nothing is lost must not be one field away from
     // losing everything (PR #217 review, finding 5).
     match ev {
+        MgrEvent::Hotkey(hk) => {
+            let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
+            match hk.write(&mut body) {
+                Some(n) => send_input(ch, OP_MGR_HOTKEY, &body[..n]),
+                None => unserialisable(b"Hotkey"),
+            }
+        }
         MgrEvent::Created(c) => {
             let mut body = [0u8; core::mem::size_of::<MgrWindowCreated>()];
             match c.write(&mut body) {
@@ -964,7 +978,14 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let mut logical = [libinput::Logical::Dropped; libinput::MAX_PER_GROUP];
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
-                restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+                let routed = srv.router.route(l, &mut srv.stack, &mut out);
+                restacked |= routed.restacked;
+                // **Drained per event, not per batch.** A chord and the window events it
+                // causes have to reach the manager in the order they happened, and the
+                // manager acts on this batch before the next one is routed.
+                for hk in srv.router.take_hotkeys() {
+                    mgr_emit(srv, MgrEvent::Hotkey(hk));
+                }
                 // **Where a press landed, always — not through `log_route`.** That path is
                 // capped at `MAX_LOGGED_ROUTES` and only sees records that were *delivered*,
                 // so the two things a failing gate most needs are exactly the two it cannot
@@ -1018,7 +1039,16 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                 // Repeat follows the *physical* key, so it is armed from the interpreted
                 // transition rather than from what the router decided to do with it: a key
                 // that reached no window still stops repeating when it comes up.
-                if let libinput::Logical::Key { keycode, pressed, modifiers } = *l {
+                //
+                // **Except a key the router consumed**, which is the one case where "reached no
+                // window" is a decision rather than an accident. A registered chord that armed a
+                // repeat would deliver its key to the focused window 400 ms later and 25 times a
+                // second after that — bypassing the router entirely, since `fire_repeat` enqueues
+                // straight to the focused session. Holding `Super+1` while already on desktop 1
+                // filled the terminal with `1`s (PR #241 review, blocking 1).
+                if let libinput::Logical::Key { keycode, pressed, modifiers } = *l
+                    && !routed.consumed
+                {
                     srv.repeat = compositor::Repeat::after_key(
                         srv.repeat,
                         keycode,
@@ -1322,6 +1352,39 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             announce_focus(srv);
             reply_on_session(ch, op, request_id, &[]);
         }
+        MgrOutcome::RegisterHotkey(hk) => {
+            // **Applied here because the table is the router's**, and answered with the same
+            // empty body every other manager request gets: the manager chose the id, so there
+            // is nothing to tell it back. A refusal is a refusal — never a silent replacement,
+            // which would leave a manager holding two chords under one id and wondering why
+            // one of them never fires.
+            match srv.router.register_hotkey(hk) {
+                Ok(()) => {
+                    Line::new()
+                        .s(b"compositor: hotkey ")
+                        .u(hk.id as u64)
+                        .s(b" registered (mods ")
+                        .u(hk.mods as u64)
+                        .s(b", code ")
+                        .u(hk.code as u64)
+                        .s(b")")
+                        .end();
+                    reply_on_session(ch, op, request_id, &[]);
+                }
+                Err(_) => {
+                    // **`InvalidArgument` for all three, which is what the spec publishes and
+                    // what `surface_errno` maps `Rejected` to for every other request here.**
+                    // The first version answered a duplicate id and a full table with
+                    // `WouldBlock` — and this server uses `WouldBlock` for a genuinely
+                    // transient condition, a `manage` resolve arriving while another manager
+                    // holds the channel. There is no unregister, so a full table never empties:
+                    // a manager that read "busy, retry" would retry forever (PR #241 review,
+                    // finding 4).
+                    kprint(b"compositor: a hotkey registration was refused\n");
+                    reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
+                }
+            }
+        }
         MgrOutcome::Configure { window, width, height, origin } => {
             // Forwarded to the window's *client*, which is a third party: the manager asked,
             // the client is told. Nothing changes on screen until that client commits, so the
@@ -1403,6 +1466,12 @@ fn open_manager(serve_end: u64, request_id: u64) -> bool {
 /// windows that no longer exist — with no resync op to repair the picture.
 fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
     srv.mgr_outbox.clear();
+    // **The chord table goes with it**, for the reason the queued events do: it is routing
+    // policy the departed manager asked for. Left behind, every registered chord keeps being
+    // consumed and delivered to nobody — `mgr_emit` early-returns with no channel — so the key
+    // silently reaches nothing for the life of the compositor, and a replacement manager
+    // inherits the dead one's ids and is refused its own (PR #241 review, finding 3).
+    srv.router.clear_hotkeys();
     // **Every window it was going to place is shown now, not after the deadline.** The clients
     // holding those windows are blocked, and waiting out a timer for a manager that has
     // demonstrably gone is latency bought for nothing.
