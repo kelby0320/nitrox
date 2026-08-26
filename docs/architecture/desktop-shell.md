@@ -16,11 +16,16 @@ namespace the shell constructs, **placement and window management** (§8), the s
 click the focused one to minimize, `Super+H` to minimize without the bar. The toolkit question
 §5 settled is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
 
-What is **not**: the **desktop indicator** at the bar's end (§7) and the **overview** (§6's
-zoomed-out half), both Milestone 8 Parts D and E, the shell today having one implicit desktop;
-and the **system tray** (§9), which is v2 and an inter-process protocol rather than a widget.
-The window list also does not yet *filter* by desktop, because nothing switches desktops until
-Part D. Sections describing those describe intent,
+Since M8 Part D it also has **desktops** (§7): several of them, created on demand, switched with
+`Super+1..4` or by clicking the **indicator** at the bar's end, with the focused window moved
+between them by `Super+Shift+N`. The window list shows the current desktop's windows only.
+**Naming a desktop is what makes it persist** — an unnamed desktop disappears when its last
+window leaves, a named one stays, and the list always ends with one empty desktop to create
+into.
+
+What is **not**: the **overview** (§6's zoomed-out half), Milestone 8 Part E — so the indicator
+switches to the next desktop rather than opening it; and the **system tray** (§9), which is v2
+and an inter-process protocol rather than a widget. Sections describing those describe intent,
 not behaviour — the rule the rest of `architecture/` follows does not hold there.
 
 What a user actually sees and touches: the bars, the applications modal, the overview, and

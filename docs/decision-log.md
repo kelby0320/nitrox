@@ -18534,3 +18534,58 @@ silently truncated and left a stale label forever, since titles are re-sent only
 `MgrWindowRef` — the shape `dispatch` actually parses — rather than one that matched only because
 a field happened to be zero. And the loop no longer blocks with manager events parked inside the
 transport after a request.
+
+## 2026-08-26 — Milestone 8 Part D: desktops in the shell, and a rule that had to be gated by moving
+
+Several desktops, switched by `Super+1..4` or by clicking the indicator, with the focused window
+moved between them by `Super+Shift+N`. The compositor is told one thing — `SetCurrentDesktop` —
+and knows nothing else about them, which is `ui-composition-model.md` §6's split holding in code.
+
+**Naming pins a desktop, implemented in one function called after every change to either list.**
+The rule is about the *pair*: a window moving empties one desktop and fills another, and both
+halves have to be reconsidered, so `normalize_desktops` runs after the manager drain and after
+every switch or move rather than at the one site that seemed to need it.
+
+**The trailing scratch slot is exempt from removal, not from the rule.** It is empty and unnamed
+by definition, so a rule that did not except it would delete the very desktop it requires to
+exist and then re-create it, churning an id every time a window moved.
+
+**A removed current desktop lands on whatever took its slot, by position.** Moving the last
+window off desktop 1 removes it, and the desktop that was second becomes first — which is where
+the window went, so following it is what a person means. Falling back to the end of the list
+would strand them on the empty scratch slot immediately after an action whose whole point was
+that window.
+
+**Naming goes through the launcher's popup**, because a `panel` takes no keyboard focus and the
+bar could never read a typed name. Same modal, same text field, a flag saying which of the two
+things to do with what was typed.
+
+**Four desktops on chords, not nine.** `MAX_HOTKEYS` is sixteen and each desktop costs two — one
+to switch, one to move — so nine would leave no room for minimize, rename, or Part E's overview.
+Desktops past the fourth exist and hold windows; the indicator reaches them.
+
+**The gate for the lifecycle rule moves windows because it cannot close them.** The box asked for
+"open a window on a fresh desktop, close it, and show the desktop is gone" — and PR #242's review
+had already established that no gate can close a `normal` window inside a session: the only way
+to close the launched terminal is through its shell, which draws into the grid, and the grid
+renders under `test-harness` only. A desktop also empties when its last window is *moved away*,
+which is a gesture this part builds. So `check-login` names a desktop, moves the terminal off it
+and reads `window list on work of 3 (empty)` — named, empty, still there — then moves it back and
+reads the count drop to two, which is the removal half.
+
+**Three things went wrong on the way, and two of them were the gate rather than the code.**
+
+A stray press from an abandoned `click_at` attempt landed on the applications button at x=0 and
+opened the modal, so the aimed click found one already open and the shell — which opens no second
+modal — did nothing. The assertion waited for a line that would never come. Step 6 now presses
+Escape first, stating its precondition instead of assuming it.
+
+Typing the desktop name produced `wok`: a dropped PS/2 batch ate the `r`. Injection is relative
+and unacknowledged, which is exactly why `type_at_greeter` types one character at a time and
+waits for each redraw. The rename prompt now logs the name as it grows and the gate paces on
+that — a receipt per character, limited to renaming so the launcher's typing stays quiet.
+
+And the third was my expectation, not the code: after moving a window away the bar does not
+*follow* it, so the shell stays on the desktop it just emptied. That desktop is the trailing
+scratch slot, which the rule keeps — `desktop 2 of 2, empty`. The count is the claim; the label
+was never going to be `work`.

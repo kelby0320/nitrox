@@ -1528,13 +1528,21 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // loop iteration after the close, when its `WindowCreated` is drained.
     session.expect("desktop-shell: placed window ")?;
     // And it is listed, focused, because it has the keyboard.
-    session.expect("desktop-shell: window list [")?;
+    session.expect("desktop-shell: window list on ")?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
     //    so it stayed on top of whatever was launched and the bar's click handler — gated on
     //    there being no modal — was inert for the rest of the session: no second launch, no
     //    way back. Clicking again is the direct test; asserting the close alone would be a
     //    proxy for it (PR #237 review, finding 6).
+    // **Escape first, so this step's precondition is stated rather than assumed.** `click_at`
+    // retries a press that did not land where it was aimed, and an abandoned attempt still
+    // *pressed* somewhere — if that somewhere is the applications button (x < 120, and a
+    // mis-walked pointer parks at x=0) the modal is already open, the shell ignores the aimed
+    // click because it opens no second modal, and the assertion below waits for a line that
+    // will never come. Escape with no modal open reaches the focused terminal and does nothing.
+    press(&mut qmp, "esc")?;
+    session.skip_to_end()?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
 
@@ -1560,7 +1568,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // closing, and a taskbar that dropped the entry would leave no way to get the window back —
     // and `_` is how the bar says so. Matching only `window list [` asserted the list existed
     // and nothing about what it shows (PR #242 review, optional 9).
-    session.expect("desktop-shell: window list [")?;
+    session.expect("desktop-shell: window list on ")?;
     session.expect(":_ nxterm")?;
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
@@ -1579,6 +1587,84 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_key("h", false)?;
     qmp.send_key("meta_l", false)?;
     session.expect("desktop-shell: Super+H minimized window ")?;
+
+    // 6c. **The lifecycle rule, which is Part D's whole claim** (M8 Part D).
+    //
+    //     Governing decision 3: an **unnamed** empty desktop is removed, a **named** one is
+    //     kept, and the list always ends with one empty unnamed desktop to create into. The box
+    //     asked for this by *closing* a window — which no gate can do inside a session, since
+    //     the only way to close the launched terminal is through its shell and that draws into
+    //     the grid, which renders under `test-harness` only (PR #242 review, optional 7). A
+    //     desktop also empties when its last window is **moved away**, which is a gesture this
+    //     part builds, so the rule is exercised that way instead.
+    //
+    //     Sequence: name this desktop, move the terminal off it, and show the desktop survived
+    //     *because* it is named; then move the terminal back and show the desktop it vacated —
+    //     unnamed — is gone.
+    let chord = |qmp: &mut Qmp, shift: bool, code: &str| -> R<()> {
+        qmp.send_key("meta_l", true)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        qmp.send_key(code, true)?;
+        qmp.send_key(code, false)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+        qmp.send_key("meta_l", false)?;
+        Ok(())
+    };
+
+    // **Restore the terminal first: 6b left it minimized**, and a minimized window is not
+    // focused — so `Super+Shift+N`, which moves *the focused window*, would correctly find
+    // nothing to move and this block would assert against a gesture that did nothing. Clicking
+    // its list entry restores and raises it, which is the gesture Part C added for exactly this.
+    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    session.expect("desktop-shell: raised window ")?;
+    session.expect(":> nxterm")?;
+
+    // Name it. The prompt is the same popup the launcher uses — a `panel` takes no keyboard
+    // focus, so the bar itself could never read a typed name.
+    chord(&mut qmp, false, "r")?;
+    session.expect("desktop-shell: naming this desktop")?;
+    // **One character at a time, waiting for each**, the way `type_at_greeter` does. Injection
+    // is relative and unacknowledged: a dropped batch ate the `r` and produced a desktop named
+    // `wok`, which fails an assertion about naming while saying nothing about naming.
+    let mut typed = String::new();
+    for c in "work".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        typed.push(c);
+        session.expect(&format!("desktop-shell: name so far {typed}"))?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: named this desktop work")?;
+    session.expect("desktop-shell: window list on work of 2")?;
+
+    // Move the terminal to the second desktop. `work` is now empty — and **named**, so it
+    // stays; the desktop that received the window is no longer the scratch slot, so a new one
+    // is appended. Two facts in one line: the bar still says `work`, and there are three.
+    chord(&mut qmp, true, "2")?;
+    session.expect("desktop-shell: moved window ")?;
+    session.expect("desktop-shell: window list on work of 3 (empty)")?;
+
+    // Follow it, to prove the list filters by desktop rather than merely being emptied.
+    chord(&mut qmp, false, "2")?;
+    session.expect("desktop-shell: switched to ")?;
+    session.expect(":> nxterm")?;
+
+    // And back to `work`. The desktop just vacated is **unnamed** and empty, so it goes: the
+    // count drops from three to two, which is the removal half of the rule.
+    //
+    // **The bar does not follow the window, and that is the point of reading the count.** A
+    // move changes where a window is, not where you are — so the shell stays on the desktop it
+    // was on, which has just been emptied. That desktop is now the trailing scratch slot, which
+    // the rule keeps, so the reading is "desktop 2 of 2, empty": one desktop fewer than before,
+    // and the one that went was the unnamed one.
+    chord(&mut qmp, true, "1")?;
+    session.expect("desktop-shell: moved window ")?;
+    session.expect("desktop-shell: window list on desktop 2 of 2 (empty)")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
