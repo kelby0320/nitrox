@@ -222,6 +222,17 @@ pub struct Element<Msg> {
     /// pressing a button and sliding off it is how a user cancels, and a toolkit that fired
     /// on the press removes that.
     pub on_press: Option<Msg>,
+    /// A press going **down** on this element, before it is known whether it becomes a click.
+    ///
+    /// **For gestures that begin at the press**, which a click cannot express: dragging a
+    /// window by its title bar is decided the moment the button goes down, and a handler that
+    /// waited for the release would start the move after the user had finished making it.
+    ///
+    /// **A nearer [`on_press`](Self::on_press) shadows this**, which is the rule that lets a
+    /// title bar carry a drag and still hold buttons: a widget that handles clicks handles the
+    /// press that begins them, so pressing close does not also start a move. Dispatch is in
+    /// [`Router::pointer`](crate::route::Router::pointer).
+    pub on_press_down: Option<Msg>,
     /// Raw key events, while this element holds widget focus.
     ///
     /// The path the terminal grid uses: a `custom` widget that wants keycodes rather than a
@@ -250,6 +261,7 @@ impl<Msg> Element<Msg> {
             flex: 0,
             node,
             on_press: None,
+            on_press_down: None,
             on_key: None,
             on_pointer: None,
             focusable: false,
@@ -265,6 +277,13 @@ impl<Msg> Element<Msg> {
     /// Give this element a share of its parent's leftover space.
     pub fn flex(mut self, flex: u16) -> Self {
         self.flex = flex;
+        self
+    }
+
+    /// Send `msg` when a press goes **down** on this element, before it is known whether it
+    /// becomes a click — see [`Node::on_press_down`](crate::element::Element).
+    pub fn on_press_down(mut self, msg: Msg) -> Self {
+        self.on_press_down = Some(msg);
         self
     }
 

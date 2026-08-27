@@ -617,6 +617,45 @@ A client that waits for its parent's configure before opening a menu cannot reac
 has arrived; the first one is **not** delivered to the application as an event, because it is
 permission to draw rather than an opinion about a drawing. Later ones are.
 
+### `StartMove` (`0x090A`)
+
+Request, 4 bytes: `window` (u32). Asks the compositor to move this window with the pointer until
+the button that is holding it comes up. Empty reply body on success.
+
+**The only geometry a client may originate, and it is not a position.** Everything about where a
+window sits is the manager's — `Place` and `Configure` are manager ops — and a client asking to be
+moved *to* somewhere would be placing itself. This asks for something a client cannot compute: it
+does not know where it is on screen, and the answer changes with every pointer motion.
+
+**Refused with `NotFound` unless the caller's window holds the implicit pointer grab.** The grab
+is what makes "the user is dragging me" true. Without the check a client could move its window at
+any moment, from anywhere, with nobody touching it. `NotFound` rather than a distinct code for
+the same reason every other op here answers it: a window belonging to another connection and a
+window nobody is pressing are both "not yours to move", and a distinguishable answer is an oracle.
+
+**The offset is taken from where the press landed, not from where the pointer is when this
+arrives.** Those are different moments — a client learns of the press, routes it through its own
+toolkit, decides it landed on a title bar, and only then sends this — and the pointer keeps moving
+in between. The compositor records the pointer's position when it takes the grab, so a window
+follows the pointer from the point it was grabbed by however long the round trip took.
+
+A second `StartMove` while one is running **changes nothing** and reports the same success. It is
+not a fresh request: the recorded press has not moved but the window has, so rebuilding the drag
+from where the window is *now* would apply the distance already travelled a second time. One
+gesture holds one grab and is one drag; a second request names the drag that is already running.
+
+(This section said the two requests "compute the same offset", which was false in exactly that
+way — corrected 2026-08-27, PR #248 review.)
+
+**A window being moved is not being placed.** While a drag is in flight, `Place` for that window
+is refused with `WouldBlock` — not `InvalidArgument`, because the request is well-formed and will
+be answerable again in a moment. Refusing beats overriding: a `Place` that landed mid-drag would
+be undone by the next motion, so a manager racing the pointer would appear to work.
+
+The move produces **one** `WindowGeometry` event, when it ends. Not one per motion: that queue
+does not coalesce and discards its oldest when full, so a long drag would push a `WindowCreated`
+off the front of a manager's view of the world.
+
 ### `DestroyWindow` (`0x0904`)
 
 Request, 4 bytes: `window`. Destroys the window, its attached buffers, and **every popup or
@@ -641,6 +680,11 @@ coordinates. `NotFound` if no such window.
 and from other windows, so it always knows the answer in screen coordinates; a relative move
 would only serve an interactive drag, which needs a grab offset the compositor does not keep.
 It comes back with decorations, or not at all.
+
+**It came back with decorations** — as [`StartMove`](#startmove-0x090a), which is a *client*
+request rather than a relative `Place`, because the client is the one that knows the user grabbed
+its title bar and the compositor is the one that knows where the pointer is. `Place` is refused
+with `WouldBlock` for a window that is being dragged.
 
 ### `Raise` (`0x0911`), `Lower` (`0x0912`), `SetFocus` (`0x0914`)
 

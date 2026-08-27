@@ -32,6 +32,7 @@ use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use librsproto::surface::{KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent};
 use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, stack};
+use libui::widget::{TITLE_BAR_H, TitleButtons, title_bar};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
 /// The `custom` node the grid is drawn into.
@@ -58,9 +59,14 @@ pub const GRID_KEY: u64 = 2;
 pub const BAR_KEY: u64 = 3;
 /// The key on the scrollbar — see [`BAR_KEY`].
 pub const SCROLLBAR_KEY: u64 = 4;
+/// The key on the title bar — see [`BAR_KEY`].
+pub const TITLE_KEY: u64 = 5;
 
 /// Height of the menu bar, in pixels.
 pub const BAR_H: u32 = 24;
+
+/// The window's title, and what the bar and the shell's window list both show.
+pub const TITLE: &str = "nxterm";
 
 /// Width of the scrollbar, in pixels.
 pub const SCROLL_W: u32 = 12;
@@ -82,6 +88,11 @@ pub enum Msg {
     /// a scroll: the router delivers motion whether or not a button is held, and a bar that
     /// moved on hover would be unusable.
     Scroll(PointerEvent),
+    /// The title bar was pressed somewhere that moves the window.
+    ///
+    /// The answer is one request and no arithmetic: the compositor already holds the grab this
+    /// press opened and knows where the window is, and this terminal knows neither.
+    DragWindow,
 }
 
 /// Everything the terminal is.
@@ -93,6 +104,17 @@ pub struct App {
     parser: Parser,
     /// Whether the menu's popup is showing.
     pub menu_open: bool,
+    /// Whether this window holds the keyboard, which the title bar shows.
+    ///
+    /// **The compositor's answer, not a guess.** `FocusEvent` says so on every change; a title
+    /// bar that inferred focus from the last click would disagree with the compositor the first
+    /// time focus moved by a chord.
+    ///
+    /// **Starts `true`, matching `libui::Router`'s own `window_focused`** — which starts that
+    /// way deliberately, because starting `false` makes a client's first paint dim. Two pieces
+    /// of the same state disagreeing for one frame is worse than either answer (PR #248 review,
+    /// finding 7).
+    pub focused: bool,
     /// Where the menu item was laid out last frame, so the popup can go under it.
     ///
     /// **Last frame's**, which costs one frame of lag the very first time the menu opens and
@@ -111,6 +133,12 @@ pub struct App {
     /// the toolkit's messages — the application says what happened, the shell of a `main`
     /// performs it.
     outbox: Vec<u8>,
+    /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
+    ///
+    /// **An outbox of one**, for the reason `outbox` is one: `update` is a function of values
+    /// and "send a request on a channel" is a syscall. The application says what happened; the
+    /// `main` that owns the session performs it.
+    move_requested: bool,
     /// Where the viewport is, or `None` to follow the output.
     ///
     /// **`None` is not "line zero".** Following the bottom and being anchored at whatever the
@@ -137,10 +165,12 @@ impl App {
             grid: Grid::new(cols, rows),
             parser: Parser::new(),
             menu_open: false,
+            focused: true,
             menu_anchor: None,
             metrics,
             palette: Palette::default(),
             outbox: Vec::new(),
+            move_requested: false,
             view_top: None,
             view_moved: false,
         }
@@ -148,13 +178,15 @@ impl App {
 
     /// The window size this terminal wants: the grid, plus its chrome.
     pub fn window_size(&self) -> Size {
+        // The title bar is part of this window like every other pixel — client-side decorations
+        // mean the chrome is in the buffer, so the window is taller by exactly its height.
         let g = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
-        Size::new(g.w + SCROLL_W, g.h + BAR_H)
+        Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H)
     }
 
     /// Where the grid's top-left sits inside the window.
     pub fn grid_origin(&self) -> libdraw::geom::Point {
-        libdraw::geom::Point::new(0, BAR_H as i32)
+        libdraw::geom::Point::new(0, (BAR_H + TITLE_BAR_H) as i32)
     }
 
     /// Feed bytes from the program on the other end.
@@ -180,6 +212,11 @@ impl App {
         }
         self.snap_to_bottom();
         self.outbox.extend_from_slice(bytes);
+    }
+
+    /// Whether a `StartMove` is owed, clearing it.
+    pub fn take_move_request(&mut self) -> bool {
+        core::mem::take(&mut self.move_requested)
     }
 
     /// Take everything the user has typed since this was last called.
@@ -231,6 +268,9 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::ToggleMenu => self.menu_open = !self.menu_open,
+            // The compositor is the one holding the grab this press opened, so all this does is
+            // record that the binary owes it a request.
+            Msg::DragWindow => self.move_requested = true,
             Msg::Clear => {
                 // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
                 // one implementation of it rather than a menu-shaped second one.
@@ -326,8 +366,14 @@ impl App {
             BAR_H,
             &ui,
         );
+        // **The title bar is the terminal's own chrome** (M9 Part A). Its buttons are not drawn
+        // yet: minimise and maximise have nowhere to go until Part B gives a client a way to ask
+        // the shell for them, and a button that does nothing is worse than no button.
+        let title = title_bar(TITLE, self.focused, Msg::DragWindow, TitleButtons::default(), &ui)
+            .key(TITLE_KEY);
         let body = dock(
             vec![
+                docked(Edge::Top, title),
                 docked(Edge::Top, bar.key(BAR_KEY)),
                 docked(
                     Edge::Right,
@@ -573,8 +619,10 @@ mod tests {
         a.menu_anchor = Some(item);
         a.menu_open = true;
 
-        // The popup hangs from the item's left edge, immediately below it.
-        assert!(item.bottom() <= BAR_H as i64, "the item is inside the bar");
+        // The popup hangs from the item's left edge, immediately below it. The menu bar sits
+        // *under* the title bar since M9 Part A, so "inside the bar" is measured from there.
+        assert!(item.origin.y >= TITLE_BAR_H as i32, "the item is below the title bar");
+        assert!(item.bottom() <= (TITLE_BAR_H + BAR_H) as i64, "the item is inside the menu bar");
 
         // And the menu it will hold has a real size to be created at — measured, not guessed,
         // because a popup window needs its extent before it exists.
@@ -593,9 +641,27 @@ mod tests {
 
     #[test]
     fn the_window_is_the_grid_plus_its_chrome() {
+        // **Including the title bar, which is the whole of what client-side decorations means
+        // here**: the window grew by exactly its height, and the grid did not shrink. A client
+        // that added a title bar by taking the space out of its own content would have chrome
+        // that costs the user a row of text.
         let a = app();
         let g = a.metrics.pixel_size(20, 6);
-        assert_eq!(a.window_size(), Size::new(g.w + SCROLL_W, g.h + BAR_H));
+        assert_eq!(a.window_size(), Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H));
+        assert_eq!(a.grid_origin().y, (BAR_H + TITLE_BAR_H) as i32, "the grid starts below both");
+    }
+
+    #[test]
+    fn dragging_the_title_bar_asks_the_binary_for_a_move_and_asks_once() {
+        // `update` has no syscalls, so the request it produces is an outbox of one — the same
+        // shape as the typed bytes. Taking it clears it: a second `StartMove` for a gesture the
+        // compositor is already running would be answered, and would mean this client believes
+        // a drag it is not in.
+        let mut a = app();
+        assert!(!a.take_move_request(), "nothing is owed before the bar is touched");
+        a.update(Msg::DragWindow);
+        assert!(a.take_move_request(), "the press is owed to the compositor");
+        assert!(!a.take_move_request(), "and owed exactly once");
     }
 
     #[test]

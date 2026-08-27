@@ -692,6 +692,29 @@ impl<T: Transport> WindowRef<'_, T> {
         Ok(())
     }
 
+    /// Ask the compositor to move this window with the pointer — `Surface::StartMove`.
+    ///
+    /// **Call it from a press handler, and only from one.** The compositor refuses unless this
+    /// window holds the implicit pointer grab, which is what makes "the user is dragging me"
+    /// true; a client cannot move itself at an arbitrary moment, because that would be placing
+    /// itself and `Place` is a manager op.
+    ///
+    /// The move ends when the button comes up. There is nothing to end it from here, and
+    /// deliberately: the compositor is the one that knows when the button was released.
+    pub fn start_move(&mut self) -> Result<(), UiError> {
+        let mut body = [0u8; 4];
+        let n = librsproto::surface::StartMove { window: self.id() }
+            .write(&mut body)
+            .ok_or(UiError::Malformed)?;
+        self.session.transport.request(
+            librsproto::surface::OP_START_MOVE,
+            &body[..n],
+            None,
+            &mut [],
+        )?;
+        Ok(())
+    }
+
     /// Destroy the window, and forget every descendant the compositor destroys with it.
     ///
     /// **Transitively**, because that is what the compositor does: a popup goes with its parent

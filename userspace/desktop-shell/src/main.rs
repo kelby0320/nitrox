@@ -45,6 +45,16 @@ const KEY_ENTER: u16 = 28;
 /// (modifiers, the function row, the keypad) and not every letter. A shell binding a chord is
 /// the first thing that wants one.
 const KEY_H: u16 = 35;
+/// How many window-geometry lines have been printed. See [`MAX_LOGGED_GEOMETRY`].
+static mut GEOMETRY_LOGGED: u32 = 0;
+
+/// How many window-geometry lines to print before going quiet.
+///
+/// The event behind them is client-driven — a client committing buffers of changing size
+/// produces one each — so this is bounded the way the compositor bounds its own input
+/// diagnostics, and for the same reason.
+const MAX_LOGGED_GEOMETRY: u32 = 16;
+
 /// The shell's id for its minimize chord. Manager-chosen, and never zero.
 const HOTKEY_MINIMIZE: u32 = 1;
 /// `EV_KEY` code for `r`, the rename chord's key.
@@ -2861,6 +2871,36 @@ fn place_new_windows(
                     && let Some(e) = entries.iter_mut().find(|e| e.id == g.window)
                 {
                     e.size = (g.width, g.height);
+                    // **Where it ended up, said once per move and no more than sixteen times.**
+                    // A user-dragged window reports exactly one geometry event for the whole
+                    // gesture — the compositor does not log one per motion, because that queue
+                    // does not coalesce — so this is one line per move rather than one per
+                    // frame, and it is the only place a gate can read where a drag put a window.
+                    //
+                    // Bounded because the *event* is client-driven as well: a client committing
+                    // buffers of changing size produces one each, and the compositor caps its
+                    // own diagnostics for exactly that reason (PR #248 review, finding 5).
+                    // SAFETY: single-threaded process; this counter is touched only here, the
+                    // way the compositor's own diagnostic counters are.
+                    let seen = unsafe {
+                        GEOMETRY_LOGGED += 1;
+                        GEOMETRY_LOGGED
+                    };
+                    if seen > MAX_LOGGED_GEOMETRY {
+                        continue;
+                    }
+                    Line::new()
+                        .s(b"desktop-shell: window ")
+                        .u(g.window as u64)
+                        .s(b" geometry ")
+                        .i(g.x as i64)
+                        .s(b",")
+                        .i(g.y as i64)
+                        .s(b" ")
+                        .u(g.width as u64)
+                        .s(b"x")
+                        .u(g.height as u64)
+                        .end();
                 }
                 continue;
             }

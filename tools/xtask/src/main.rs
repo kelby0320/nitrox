@@ -1222,6 +1222,106 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     // spawn, the churn takes seconds, so this line always follows it.
     session.expect("ui-testclient: PASSED")?;
 
+    // ---- Motion survives a consumer that stops reading ----
+    //
+    // **The guard on the property PR #246 exists to keep**, and the accelerator cannot change
+    // what it means. A relative delta *is* the pointer's position: a batch `input-server` cannot
+    // deliver is movement no consumer can re-derive, unlike a key or a button, whose state
+    // `SYN_DROPPED` asks it to resynchronise. Discarding one leaves every consumer permanently
+    // offset from the device.
+    //
+    // **The overrun is caused by the client, not by the clock.** The first version of this guard
+    // lived in `check-login` and outran the compositor's repaint — which works under TCG and not
+    // under KVM, where the repaint is fast enough that the ring never fills, and `--kvm` is the
+    // only configuration CI runs (PR #246 review, blocking 1). Here the client announces that it
+    // has stopped reading and sleeps; the ring fills at any speed.
+    //
+    // **First, before anything else is injected**, because a sum cannot be delimited: with
+    // `--no-ps2-irq` input arrives on a 10 ms sweep and an earlier phase's flood is still
+    // trickling in when this one starts. Bracketing it with a button press and release was the
+    // first repair and failed for the right reason — a button in an overflowing ring is exactly
+    // what deferral cannot recover, so the delimiter was eaten by the overrun it measured.
+    //
+    // The assertion is arithmetic: relative deltas are additive, so whatever the batching,
+    // coalescing and deferral in between do, the consumer must end up with the total injected.
+    // **Started by a keystroke, not by the client's own clock.** This step sits between two
+    // independent clients' output and `ui-testclient` finishes on its own schedule, so a client
+    // that stalled at boot was racing whatever the harness was waiting for — and this step's
+    // expects then consumed the `PASSED` line the wait above needed (CI, 2026-08-27). `F2` is
+    // unbound: `ui-testclient` registers `Super+F1`.
+    press(&mut qmp, "f2")?;
+    session.expect("input-testclient: input stalled")?;
+    // **Thirty, not sixty.** The ring is sixteen messages and the client is asleep, so thirty
+    // overruns it by fourteen — the property is "it overran", not "by how much".
+    const BURST: i32 = 30;
+    const BDX: i32 = 7;
+    const BDY: i32 = 3;
+    // **Paced, and the pacing is not a workaround for the guest.** The overrun under test comes
+    // from a consumer that has stopped reading, not from how fast the harness injects — so
+    // slowing the injection costs the measurement nothing. What it avoids is *host*-side loss:
+    // with the i8042's interrupts off (`--no-ps2-irq`) nothing reads the controller until the
+    // 10 ms recovery sweep, and QEMU's own PS/2 queue is sixteen bytes — barely five packets —
+    // so a burst injected as fast as QMP accepts it overflows *that* and the deltas are gone
+    // before the guest ever sees them. Measured: one to five packets missing per run, with the
+    // guest announcing no loss at all, because nothing in the guest lost anything.
+    for _ in 0..BURST {
+        qmp.send_motion(BDX, BDY)?;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    // The sum, and the evidence that it was worth summing. `REL_Y` comes back with the sign the
+    // harness injected — the PS/2 wire reports positive-Y as up and the driver negates, which
+    // `check-input`'s earlier motion assertion pins.
+    session.expect("input-testclient: motion sum ")?;
+    let line = session.rest_of_line()?;
+    let field = |name: &str| -> Option<i64> {
+        line.split_whitespace()
+            .filter_map(|f| f.split_once('='))
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let (dx, dy) = (field("dx"), field("dy"));
+    let (announced, widest) = (field("announced"), field("widest"));
+    let want = (Some((BURST * BDX) as i64), Some((BURST * BDY) as i64));
+    if (dx, dy) != want {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: {BURST} motions of ({BDX}, {BDY}) injected while the consumer \
+             was not reading summed to {dx:?}, {dy:?} rather than {:?}, {:?}. A relative delta \
+             that does not arrive cannot be recovered — `input-server` must carry the motion of \
+             an undeliverable batch forward and re-emit it, not count it as a `SYN_DROPPED` gap. \
+             The line was: motion sum {line}",
+            want.0, want.1
+        )
+        .into());
+    }
+    if announced != Some(0) {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: a motion-only burst announced {announced:?} lost records. \
+             Nothing here is unrecoverable, so nothing should be announced: motion sum {line}"
+        )
+        .into());
+    }
+    // **The precondition, checked rather than assumed.** Recovery is invisible by design — the
+    // stream still adds up — so a run where the ring never filled satisfies the sum above while
+    // testing nothing. A folded group carries the total of the batches it stands for, so it is
+    // wider than any single injected delta; equal to it means no deferral happened and this gate
+    // proved nothing. That is not a pass.
+    if widest.is_none_or(|w| w <= BDX as i64) {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: the consumer's widest REL_X was {widest:?}, no more than the \
+             {BDX} injected — so no batch was ever deferred and this gate did not exercise the \
+             path it exists for. Raise BURST until the {}-slot consumer ring overruns, or check \
+             that the client really stopped reading: motion sum {line}",
+            "16"
+        )
+        .into());
+    }
+    println!("  ok: {BURST} motions across a stalled consumer arrived in full (widest fold {widest:?})");
+
+
+
     // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it
     // is in the identity range the decoder relies on, and because a wrong `E0` or release
     // bit shows up as a different code rather than as silence.
@@ -1375,81 +1475,6 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 
     session.expect("input-testclient: late key code=46")?;
 
-    // ---- Motion survives a consumer that stops reading ----
-    //
-    // **The guard on the property PR #246 exists to keep**, and the accelerator cannot change
-    // what it means. A relative delta *is* the pointer's position: a batch `input-server`
-    // cannot deliver is movement no consumer can re-derive, unlike a key or a button, whose
-    // state `SYN_DROPPED` asks it to resynchronise. Discarding one leaves every consumer
-    // permanently offset from the device.
-    //
-    // **The overrun is caused by the client, not by the clock.** The first version of this
-    // guard lived in `check-login` and outran the compositor's repaint — which works under TCG
-    // and not under KVM, where the repaint is fast enough that the ring never fills, and
-    // `--kvm` is the only configuration CI runs (PR #246 review, blocking 1). Here the client
-    // announces that it has stopped reading and sleeps; the ring fills at any speed.
-    //
-    // The assertion is arithmetic: relative deltas are additive, so whatever the batching,
-    // coalescing and deferral in between do, the consumer must end up with the total injected.
-    session.expect("input-testclient: input stalled")?;
-    const BURST: i32 = 60;
-    const BDX: i32 = 7;
-    const BDY: i32 = 3;
-    for _ in 0..BURST {
-        qmp.send_motion(BDX, BDY)?;
-    }
-    // The sum, and the evidence that it was worth summing. `REL_Y` comes back with the sign the
-    // harness injected — the PS/2 wire reports positive-Y as up and the driver negates, which
-    // `check-input`'s earlier motion assertion pins.
-    session.expect("input-testclient: motion sum ")?;
-    let line = session.rest_of_line()?;
-    let field = |name: &str| -> Option<i64> {
-        line.split_whitespace()
-            .filter_map(|f| f.split_once('='))
-            .find(|(k, _)| *k == name)
-            .and_then(|(_, v)| v.parse().ok())
-    };
-    let (dx, dy) = (field("dx"), field("dy"));
-    let (announced, widest) = (field("announced"), field("widest"));
-    let want = (Some((BURST * BDX) as i64), Some((BURST * BDY) as i64));
-    if (dx, dy) != want {
-        let _ = session.child.kill();
-        return Err(format!(
-            "input gate FAILED: {BURST} motions of ({BDX}, {BDY}) injected while the consumer \
-             was not reading summed to {dx:?}, {dy:?} rather than {:?}, {:?}. A relative delta \
-             that does not arrive cannot be recovered — `input-server` must carry the motion of \
-             an undeliverable batch forward and re-emit it, not count it as a `SYN_DROPPED` gap. \
-             The line was: motion sum {line}",
-            want.0, want.1
-        )
-        .into());
-    }
-    if announced != Some(0) {
-        let _ = session.child.kill();
-        return Err(format!(
-            "input gate FAILED: a motion-only burst announced {announced:?} lost records. \
-             Nothing here is unrecoverable, so nothing should be announced: motion sum {line}"
-        )
-        .into());
-    }
-    // **The precondition, checked rather than assumed.** Recovery is invisible by design — the
-    // stream still adds up — so a run where the ring never filled satisfies the sum above while
-    // testing nothing. A folded group carries the total of the batches it stands for, so it is
-    // wider than any single injected delta; equal to it means no deferral happened and this gate
-    // proved nothing. That is not a pass.
-    if widest.is_none_or(|w| w <= BDX as i64) {
-        let _ = session.child.kill();
-        return Err(format!(
-            "input gate FAILED: the consumer's widest REL_X was {widest:?}, no more than the \
-             {BDX} injected — so no batch was ever deferred and this gate did not exercise the \
-             path it exists for. Raise BURST until the {}-slot consumer ring overruns, or check \
-             that the client really stopped reading: motion sum {line}",
-            "16"
-        )
-        .into());
-    }
-    println!("  ok: {BURST} motions across a stalled consumer arrived in full (widest fold {widest:?})");
-
     session.expect("input-testclient: PASSED")?;
 
     let transcript = session.finish();
@@ -1476,6 +1501,17 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 
     println!("\nxtask: input gate PASSED — an injected key and click reached userspace ✓");
     Ok(())
+}
+
+/// Read `<id> at 0,<y>` — the tail of the shell's placement line. Returns `(id, y)`.
+fn parse_placement(rest: &str) -> Option<(u32, i32)> {
+    let mut it = rest.split_whitespace();
+    let id = it.next()?.parse().ok()?;
+    if it.next()? != "at" {
+        return None;
+    }
+    let (_, y) = it.next()?.split_once(',')?;
+    Some((id, y.parse().ok()?))
 }
 
 /// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxterm`'s menu-popup line.
@@ -1692,6 +1728,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // placement that could not have been load-bearing. The terminal's placement arrives one
     // loop iteration after the close, when its `WindowCreated` is drained.
     session.expect("desktop-shell: placed window ")?;
+    // **Remembered, because the drag below needs to know where it started.** The line reads
+    // `<id> at 0,<y>`; nothing moves this window between here and there — a desktop change and a
+    // minimise leave the origin alone — so this is its origin at that point.
+    let placed = session.rest_of_line()?;
+    let (term_id, term_y) = parse_placement(&placed)
+        .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // And it is listed, focused, because it has the keyboard.
     session.expect("desktop-shell: window list on ")?;
 
@@ -1999,7 +2041,63 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: overview raised window ")?;
     session.expect("desktop-shell: overview closed")?;
 
-    // 6g. **Movement is not lost while the compositor is busy** — the one property the whole
+    // 6g. **A window is dragged by its own title bar** (M9 Part A). Client-side decorations mean
+    //     the bar is pixels `nxterm` committed; what crosses the wire is one `StartMove`, and the
+    //     compositor — which is holding the grab the press opened — moves the window from there.
+    //
+    //     **The motion is injected before the request can arrive — probabilistically, and worth
+    //     saying so.** The two motions are *sent* before the wait below, but nothing proves the
+    //     compositor processed them before the client's request: they travel QMP → PS/2 →
+    //     `input-server` while the request travels compositor → client → compositor, and the
+    //     ordering is a race this gate wins by a wide margin rather than by construction. If
+    //     that ever stops being true the step still passes for the correct implementation and
+    //     stops distinguishing the late-measurement one — so the host test
+    //     `an_interactive_move_offsets_by_where_the_press_landed…` is the guard that cannot
+    //     drift, and this is the one that proves the whole path (PR #248 review, finding 9).
+    //
+    //     **The motion is injected before the request can arrive, and that is the assertion.**
+    //     `StartMove` is a full round trip after the press: the compositor delivers it, `libui`
+    //     routes it, `nxterm` decides it landed on the bar, and only then does the request go
+    //     out. A compositor that took its drag offset from the pointer *at the request* would
+    //     lose whatever the pointer did in between — the window jumps by that much and then
+    //     tracks correctly, which is exactly the defect `TODO(scroll-grab)` describes. Every
+    //     other step here waits for the guest between injections; this one deliberately does not,
+    //     because a stationary pointer across that round trip measures zero drift where a person
+    //     sees forty pixels (PR #247 review, finding 4).
+    const DRAG_STEPS: i32 = 4;
+    const DRAG_DX: i32 = 10;
+    const DRAG_DY: i32 = 5;
+    // The title bar is the top 26 px of the window; x=100 is clear of the buttons at its right.
+    let press_at = (100, term_y + 13);
+    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    qmp.pointer = Some(press_at);
+    qmp.send_button("left", true)?;
+    // **Half the motion before the request can possibly arrive**, which is the half a
+    // compositor reading the pointer at `StartMove` would lose.
+    for _ in 0..DRAG_STEPS / 2 {
+        qmp.send_motion(DRAG_DX, DRAG_DY)?;
+    }
+    // **And the button stays down until the drag is accepted.** A person holds it for a
+    // fraction of a second; this harness can press and release faster than the round trip to
+    // the client and back, and a release that lands first takes the grab away — the compositor
+    // then refuses a move for a window nobody is holding, which is correct and is not what this
+    // step is testing (found the expensive way: the first version released immediately).
+    session.expect("compositor: interactive move of window ")?;
+    for _ in 0..DRAG_STEPS / 2 {
+        qmp.send_motion(DRAG_DX, DRAG_DY)?;
+    }
+    qmp.send_button("left", false)?;
+    qmp.pointer = Some((press_at.0 + DRAG_STEPS * DRAG_DX, press_at.1 + DRAG_STEPS * DRAG_DY));
+    // The window ended up offset by exactly what was injected. One line for the gesture:
+    // the compositor reports no geometry change per motion, deliberately.
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} ",
+        DRAG_STEPS * DRAG_DX,
+        term_y + DRAG_STEPS * DRAG_DY
+    ))?;
+    println!("  ok: the terminal moved with its own title bar, offset by where it was grabbed");
+
+    // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
     //
     //     A relative pointer's deltas *are* its position: a batch the input server cannot

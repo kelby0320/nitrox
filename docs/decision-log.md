@@ -19180,3 +19180,141 @@ a time and would otherwise measure zero drift where a person sees forty pixels. 
 `RequestState` is the first client-rate-controlled producer of manager events: a request for a
 state the window is already in produces nothing, the same dedup `SetTitle` already has and for
 the same stated reason.
+
+## 2026-08-27 — M9 Part A: a window is dragged by chrome its own client drew
+
+The first part of client-side decorations. `libui` has a title bar, `nxterm` wears one, and a
+press on it hands the compositor an interactive move. Four things the plan did not know, and one
+it named and got right.
+
+**The toolkit needed a new handler, and the plan said it would not.** Part A's first box claimed
+a title bar costs no new mechanism — "an ordinary `Element` — `row`, `text`, `on_press`". But
+`on_press` is a *click*: a release inside the widget that took the press, deliberately, because
+pressing a button and sliding off it is how a person cancels. A drag begins at the press, so a bar
+built on `on_press` starts following the pointer at the moment the user lets go. `on_press_down`
+fires at the press, and **a nearer `on_press` shadows it** — which is the whole discrimination a
+title bar needs: its buttons handle clicks, so pressing close does not also move the window. The
+rule belongs to the toolkit rather than to the widget: a widget that handles clicks handles the
+press that begins them.
+
+**A button with nothing to call is not drawn.** `TitleButtons` takes an `Option` per button, and
+`nxterm` passes none of them in Part A: minimise and maximise have nowhere to go until Part B
+gives a client a way to ask the shell for them. This milestone's predecessor shipped three
+controls that looked live and were not, and the fix each time was the same sentence.
+
+**The refusal had to say so out loud.** `StartMove` is refused when the caller's window does not
+hold the pointer grab, and the first version logged nothing — so a drag that did not happen was
+indistinguishable from a request that never arrived, which is exactly the fork the first failing
+gate run needed and did not have.
+
+**The catch-up is applied when the drag starts, not at the next motion.** The pointer has already
+moved by the time the request lands — that round trip is why the press position is recorded at
+all — so a drag that waited for the next event would leave the window trailing, and would never
+move it at all for a gesture that ended in the meantime.
+
+**And the input path never drained stack events.** The manager and session paths both drain after
+dispatch; input, which is the third thing that mutates windows, did not — so the one
+`WindowGeometry` a drag produces sat in the log until some unrelated request flushed it. Latent
+before now because input's only stack mutation was a raise, which changes no geometry.
+
+**What the plan named and got right**: the offset must be recorded at the press. The gate injects
+motion *before* the client's request can arrive, and both controls the plan named fail it — a
+drag that reads the pointer at `StartMove` loses that motion, and one that puts the window at the
+pointer loses the grab offset. The gate needed one correction of its own: the button has to stay
+down until the drag is accepted, because this harness can press and release faster than the round
+trip to the client and back, and a release that lands first correctly leaves nothing to drag.
+
+### Same day — the input-loss gate was measuring the host as well as the guest
+
+CI failed Part A on `check-input --no-ps2-irq`, a variant nothing local had run: the burst gate
+reported eighteen *more* pixels than were injected. Locally the same commit reported fourteen
+*fewer*. Part A did not cause either — it perturbed the timing of a gate that had been measuring
+something it did not intend to.
+
+**Three repairs, and the first two were wrong in instructive ways.**
+
+*Delimiting the sum with a button press and release* — the mouse's own stream, so ordered with
+the motion it brackets — failed because **a button is exactly what deferral cannot recover**. A
+press that lands in an overflowing ring is announced as a gap and is gone, so the delimiter was
+eaten by the overrun it was there to measure. That is the property under test, applied to the
+instrument.
+
+*Draining to a longer quiet* failed because the window was never the problem. Four seconds of
+silence still reported a sum short by a packet or two.
+
+**What was actually happening: the loss was outside the guest.** With the i8042's interrupts off
+nothing reads the controller until the 10 ms recovery sweep, and QEMU's own PS/2 queue is
+sixteen bytes — barely five packets. A burst injected as fast as QMP accepts it overflows *that*,
+and the deltas are gone before the guest sees them. The tell was in the failure line all along:
+`announced=0`. Nothing in the guest lost anything, because nothing in the guest was ever given it.
+
+**The repair is to pace the injection**, and it costs the measurement nothing: the overrun under
+test comes from a consumer that has stopped reading, not from how fast the harness injects. Thirty
+motions at 25 ms apart still overrun a sixteen-message ring by fourteen. Three consecutive runs
+now report an identical fold width, which is what the absence of a timing dependence looks like.
+
+**And the phase runs first, before anything else is injected.** A device stream cannot be
+delimited from inside the guest, so the only way a sum means anything is for the stream to have
+carried nothing else — which also removed the stray records CI was seeing from an earlier phase's
+flood, still trickling in seconds later on the sweep path.
+
+**The lesson worth keeping is about where a gate's boundary is.** This one asserts a property of
+the guest's input path and was written as though injection were free and instantaneous. Under the
+one configuration that deliberately cripples delivery, the harness and the emulator are inside
+the measurement — and the gate reported the guest as broken. A gate that injects at a device
+should either pace itself to what that device can carry or say plainly which layer it is
+measuring.
+
+**And moving the phase cost two more rounds, both about a shared client.** `input-testclient` is
+in the image *every* display gate boots. Running the motion phase first put its output between
+two independent clients' lines, and its `expect`s consumed the `ui-testclient: PASSED` that the
+next step waited for — the ordering hazard this project has hit before, arriving through a new
+door. Starting the phase on a keystroke fixed that and created the opposite problem: a wait long
+enough for `check-input` to get to it, after `ui-testclient`'s churn, is a delay every other gate
+pays for a phase it does not want.
+
+It ended up **inside the phase-1 pump**, which is already running, already bounded by an idle
+deadline, and already sees every record. A gate that wants the phase presses `F2`; one that does
+not never mentions it and pays nothing. The rule that reads out of this: a test client shared by
+several gates should be driven by what a gate *does*, never by a clock, and never by anything a
+gate has to opt out of.
+
+### PR #248 review — a drag that could be started twice, and one that outlived its grab
+
+Two blocking findings, both about state that is derived from the pointer grab and was not tied to
+its lifetime.
+
+**A second `StartMove` in one gesture applied the offset again.** The recorded press does not
+move; the window's origin does — so rebuilding the drag from where the window is *now* adds the
+distance already travelled a second time. The spec said both requests "compute the same offset",
+which was false in exactly that way. It is user-reachable, and the route is the interesting part:
+`libui` fired `on_press_down` on **every** press while a capture was held, for the *captured*
+widget rather than the one under the cursor — so pressing a second button mid-drag re-fired the
+title bar's drag message, and the shadowing rule could not help because it walks the captured
+node's path, not the pointer's. Fixed at both ends: the toolkit fires a press-down only for the
+press that *opened* the capture, and `start_move` leaves an in-flight drag alone.
+
+**And a drag outlived the grab it was derived from.** `Logical::Dropped` and `reconcile_with`
+both clear the grab — the first because the button state has become unknown, the second because
+the window left the screen mid-gesture — and neither cleared the drag. The window went on
+following a pointer with nothing held, and every `Place` naming it was refused until the next
+click. The `Dropped` arm's own comment says a grab that outlives its button never ends; a drag is
+exactly such a belief, and it was the one thing the arm did not reset.
+
+It is now stated as an invariant rather than as two branches — **no grab, no drag**, checked in
+`route` right after the reconcile — because the next path that clears a grab will not know a drag
+exists either. The reviewer's two probes are two of the four new tests.
+
+**Two smaller ones with the same shape as things this milestone already fixed.** The catch-up
+move at the start of a drag discarded its damage, on the reasoning that the next `route` repaints
+— true only if a *motion* follows, and `Logical::Button` reports none, so a press-flick-release
+left the window painted where it used to be. And `end_drag` recorded a geometry change
+unconditionally, so an ordinary click on a title bar put a no-op event into the queue this design
+exists to protect and printed a manager line for a move that did not happen. `place` has always
+guarded that with `was != now`; the drag path did not.
+
+**One thing the review named that is worth keeping in view rather than fixing.** `desktop-shell`
+logs a refused `Place` and gives up — there is no retry — so the `WouldBlock` the spec describes
+as "answerable again in a moment" is a placement lost. Unreachable today: the shell's only
+`Place` is on `WindowCreated`, and a window cannot be dragged before it exists. It becomes real
+the first time the shell places a window it did not just create.
