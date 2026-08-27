@@ -97,7 +97,13 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     desktop lifecycle, sticky windows and windows-on-no-desktop settled. **M9 (new, 2026-08-26)
     is window decorations and interaction** — drag-to-move, maximize, snap to edge and corner —
     inserted ahead of applications because an interactive drag needs somebody to own a grab
-    region, so decorations are snap's prerequisite rather than polish after it. M10 is
+    region, so decorations are snap's prerequisite rather than polish after it.
+    **Detail-passed 2026-08-27**, six parts, with five governing decisions settled: decorations
+    are **client-side** in `libui` (server-side would make "the window's rectangle" stop meaning
+    "the client's committed buffer" everywhere geometry is computed), the compositor owns the
+    drag and the shell owns what a drag *means*, resize **commits on release** rather than per
+    motion, close asks the client and the shell can insist through a new `Manage::Close`, and
+    `nxterm`'s `Configure` brings **real scrollback reflow**. M10 is
     applications and drag-and-drop between them; M11 is themes and visual polish. (Desktops and
     the applications milestone — M8, and what is now M10 — were rescoped 2026-08-21 when durable
     window-to-window wiring was cut; the milestone numbered 9 on that date is today's M10. See

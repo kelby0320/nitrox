@@ -19082,3 +19082,53 @@ the servers deliberately left at depth 4, by a trigger ("a server-initiated push
 its consumer channels had already met. And recovered motion was stamped with the *newest*
 timestamp in the batch it was prepended to, so `time_ns` ran backwards inside one message —
 harmless today because nothing reads it, and the spec's Ordering section invites someone to.
+
+## 2026-08-27 — Milestone 9's details pass: decorations are the client's, the drag is the compositor's
+
+Five decisions, settled with the maintainer before anything is built.
+
+**1. Client-side decorations, drawn by `libui`.** The argument that decided it is geometry rather
+than taste. Under server-side decorations "the window's rectangle" stops meaning "the client's
+committed buffer", and that meaning is threaded through compositing, damage, hit-testing,
+placement, struts, `Capture` and the overview's thumbnails — `Window::bounds()` reads the
+committed buffer's geometry, and every one of those callers would have to learn the difference
+between an outer and an inner rect. Client-side decorations change none of it: the chrome is
+pixels the client committed, like every other pixel. Uniform chrome comes from the toolkit, which
+is the only way to draw here anyway.
+
+**2. The compositor owns the drag; the shell owns what a drag means.** `StartMove`/`StartResize`
+hand the compositor an interactive gesture — it keeps the implicit pointer grab, so it is the only
+participant that can follow a pointer without a round trip per motion. Snapping is policy and
+stays in `desktop-shell`. This is also where `TODO(scroll-grab)` is answered *for windows*: the
+press-relative offset lives in the compositor's drag state. The toolkit's scrollbar keeps the
+question — that deferral stays open, and M9 is not its second consumer either.
+
+**3. Resize commits on release.** An outline follows the pointer; one `Configure` when the button
+comes up. Live resize is a *client* cost rather than a protocol one — each `Configure` is a buffer
+allocation, a map, a re-layout and a repaint — and committing on release costs almost nothing on
+top of snap, which already needs a preview overlay and a single `Configure` to a rect.
+
+**The protocol needs nothing for this, and that is worth recording because it was nearly
+designed.** `Configure` is already *"a request, not a command"*: a client may commit whatever size
+it likes and the compositor composites what it is given. A terminal taking 79 whole cells instead
+of the 1003 pixels it was offered is a solved case, so no size-hint or increment mechanism appears
+anywhere in the milestone.
+
+**4. Close asks, and the shell can insist.** The title bar's close button is the client's own — it
+exits, nothing crosses the wire. For a client that has stopped answering, the shell's window list
+ends in a new `Manage::Close`, and the compositor destroys the window. This is the *only* answer
+available under decision 1, and it is what makes that decision affordable: a hung application must
+be removable from the desktop without a serial console.
+
+**5. Real reflow.** `nxterm` honouring `Configure` rewraps its scrollback rather than keeping the
+old breaks. The data model does not support it yet and the details pass says so: `scrollback` is a
+`VecDeque<Vec<Cell>>` of already-wrapped rows with nothing recording which were *soft* wraps, so a
+rewrap today would join paragraphs that were never one line. Lines need a `wrapped` flag, and
+`scrolled` — the absolute anchor that stops history moving under a reader — has to be re-derived,
+because a rewrap changes how many lines exist.
+
+**One framing corrected in the asking.** The scope question was first put as "resize, or defer it,
+because reflow", and the maintainer asked whether reflow was really the reason. It was not:
+reflow is about *content* when width changes and is equally absent for maximise and snap, which
+were inside the milestone. The real difference is how many `Configure`s a gesture produces, which
+is what produced decision 3 — a middle option that was not on the original list.
