@@ -2044,22 +2044,34 @@ also reach the focused window.
 
 ### Part D — desktops in the shell
 
-- [ ] **The desktop list, and the lifecycle rule.** Governing decision 3, implemented: create,
+- [x] **The desktop list, and the lifecycle rule** ✅ — one `normalize_desktops`, called
+      after every change to *either* list, because the rule is about the pair: a window moving
+      empties one desktop and fills another. Naming is done through the launcher's popup, since
+      a `panel` takes no keyboard focus and the bar could never read a typed name. Governing decision 3, implemented: create,
       switch, name, and the auto-removal with its two exceptions (named, or the trailing empty).
       The shell holds the list; the compositor is told only `SetCurrentDesktop`.
 
-- [ ] **The indicator** (desktop-shell §7) — the current desktop's name, or its number when
+- [x] **The indicator** ✅ (desktop-shell §7) — the current desktop's name, or its number when
       unnamed, at the end of the bottom bar. Clicking it opens the overview, which lands in
       Part E; until then it is the switch affordance itself.
 
-- [ ] **`Super+N` switches and `Super+Shift+N` moves the focused window**, both on Part B's
+- [x] **`Super+N` switches and `Super+Shift+N` moves the focused window** ✅ — for N up to
+      **four**, not nine: `MAX_HOTKEYS` is sixteen and each desktop costs two chords, so nine
+      would leave no room for the minimize and rename chords, let alone Part E's overview.
+      Desktops past the fourth exist and hold windows; they are reached by the indicator. both on Part B's
       hotkeys, both ending in one attribute write. The move is deliberately available without
       the overview open, which is the half of "Both" that the drag cannot cover.
 
-- [ ] **A gate over the lifecycle rule specifically**, because it is the part with a rule rather
-      than a mechanism: open a window on a fresh desktop, close it, and show the desktop is
-      gone; name one, close its last window, and show it is not. An unnamed desktop that
-      survives, or a named one that vanishes, must fail the gate.
+- [x] **A gate over the lifecycle rule specifically** ✅ — **by moving windows, not closing
+      them.** The box said "close it", and no gate can: the only way to close the launched
+      terminal is through its shell, which draws into the grid, and the grid renders under
+      `test-harness` only (PR #242 review, optional 7). A desktop also empties when its last
+      window is *moved away*, which is a gesture this part builds. `check-login` names a
+      desktop, moves the terminal off it and shows it survived **because** it is named, then
+      moves the terminal back and shows the desktop it vacated — unnamed — is gone, by the
+      desktop count dropping. Both halves independently controlled: make naming not pin, and
+      the first fails; remove nothing ever, and the second does. A third control unfilters the
+      window list, which fails the same assertion for the third reason.
 
 ### Part E — capture and the overview
 

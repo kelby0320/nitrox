@@ -18534,3 +18534,112 @@ silently truncated and left a stale label forever, since titles are re-sent only
 `MgrWindowRef` — the shape `dispatch` actually parses — rather than one that matched only because
 a field happened to be zero. And the loop no longer blocks with manager events parked inside the
 transport after a request.
+
+## 2026-08-26 — Milestone 8 Part D: desktops in the shell, and a rule that had to be gated by moving
+
+Several desktops, switched by `Super+1..4` or by clicking the indicator, with the focused window
+moved between them by `Super+Shift+N`. The compositor is told one thing — `SetCurrentDesktop` —
+and knows nothing else about them, which is `ui-composition-model.md` §6's split holding in code.
+
+**Naming pins a desktop, implemented in one function called after every change to either list.**
+The rule is about the *pair*: a window moving empties one desktop and fills another, and both
+halves have to be reconsidered, so `normalize_desktops` runs after the manager drain and after
+every switch or move rather than at the one site that seemed to need it.
+
+**The trailing scratch slot is exempt from removal, not from the rule.** It is empty and unnamed
+by definition, so a rule that did not except it would delete the very desktop it requires to
+exist and then re-create it, churning an id every time a window moved.
+
+**A removed current desktop lands on whatever took its slot, by position.** Moving the last
+window off desktop 1 removes it, and the desktop that was second becomes first — which is where
+the window went, so following it is what a person means. Falling back to the end of the list
+would strand them on the empty scratch slot immediately after an action whose whole point was
+that window.
+
+**Naming goes through the launcher's popup**, because a `panel` takes no keyboard focus and the
+bar could never read a typed name. Same modal, same text field, a flag saying which of the two
+things to do with what was typed.
+
+**Four desktops on chords, not nine.** `MAX_HOTKEYS` is sixteen and each desktop costs two — one
+to switch, one to move — so nine would leave no room for minimize, rename, or Part E's overview.
+Desktops past the fourth exist and hold windows; the indicator reaches them.
+
+**The gate for the lifecycle rule moves windows because it cannot close them.** The box asked for
+"open a window on a fresh desktop, close it, and show the desktop is gone" — and PR #242's review
+had already established that no gate can close a `normal` window inside a session: the only way
+to close the launched terminal is through its shell, which draws into the grid, and the grid
+renders under `test-harness` only. A desktop also empties when its last window is *moved away*,
+which is a gesture this part builds. So `check-login` names a desktop, moves the terminal off it
+and reads `window list on work of 3 (empty)` — named, empty, still there — then moves it back and
+reads the count drop to two, which is the removal half.
+
+**Three things went wrong on the way, and two of them were the gate rather than the code.**
+
+A stray press from an abandoned `click_at` attempt landed on the applications button at x=0 and
+opened the modal, so the aimed click found one already open and the shell — which opens no second
+modal — did nothing. The assertion waited for a line that would never come. Step 6 now presses
+Escape first, stating its precondition instead of assuming it.
+
+Typing the desktop name produced `wok`: a dropped PS/2 batch ate the `r`. Injection is relative
+and unacknowledged, which is exactly why `type_at_greeter` types one character at a time and
+waits for each redraw. The rename prompt now logs the name as it grows and the gate paces on
+that — a receipt per character, limited to renaming so the launcher's typing stays quiet.
+
+And the third was my expectation, not the code: after moving a window away the bar does not
+*follow* it, so the shell stays on the desktop it just emptied. That desktop is the trailing
+scratch slot, which the rule keeps — `desktop 2 of 2, empty`. The count is the claim; the label
+was never going to be `work`.
+
+## 2026-08-26 — PR #243 review: chrome that vanished, and a control that could not see what it tested
+
+Two blocking findings, four more, and one lesson about what a serial-log gate can and cannot
+observe.
+
+**Switching desktops made the shell's own bars disappear — from the screen and from
+hit-testing.** Both bars are `panel`s created at startup, and the compositor stamps every new
+window with its current desktop, so they lived on desktop 1. `Window::visible_on` is the single
+predicate behind compositing, focus *and* hit-testing — the consolidation Part A made — so from
+the first `Super+2` there was no window list, no applications button and no indicator, and the
+only way back to the chrome was a chord, because hotkeys are routed compositor-side and need no
+visible window. The fix is the reserved value Part A specified and nothing had used:
+`STICKY_DESKTOP`. Chrome belongs to the screen, not to a desktop.
+
+**The indicator's hit region was never where the indicator was drawn.** `INDICATOR_X` is
+`SCREEN_W - INDICATOR_W`, and the indicator was laid out as a `row` cell *after* the entries, so
+it was painted at `n * ENTRY_W`. The two coincided at exactly one window count. Everywhere else
+the indicator a user could see did nothing — and since the overview is Part E, it was the only
+pointer route between desktops. Worse, `MAX_ENTRIES` was computed from the full screen width, so
+at a full bar an entry was *painted* across the range hit-tested as the indicator: clicking that
+window switched desktops. A flexible spacer right-anchors the indicator, and `MAX_ENTRIES` now
+reserves its width.
+
+**The control for that one passed, and that is the finding worth keeping.** Removing the spacer
+did not fail the gate, because the hit region is a fixed coordinate: a click at x=1200 switches
+desktops whether or not the indicator is *drawn* there. A serial-log gate cannot see where
+something is painted, so the alignment half of this bug is not gate-observable at all — the shell
+does not run in `check-display`, which is the only gate that looks at pixels. What *is*
+checkable is the arithmetic half, and it is now a `const` assertion: no window entry may be
+painted under the indicator's hit region. It fails the image build on the exact constant this PR
+shipped with. The alignment itself rests on reading the layout, and this entry says so rather
+than implying otherwise.
+
+**`check-login` was flaky at 2 runs in 6, and the cause was injection volume.** Every `click_at`
+re-pinned the pointer to a corner with twenty over-driven motions before walking, and that burst
+overran the guest's input ring — `SYN_DROPPED`, then a press tens of pixels from where it was
+aimed. A confirmed press is a position report, so `Qmp` remembers it and consecutive clicks walk
+from there: two motions instead of thirty-four. Three runs, three passes, one recovered miss.
+
+**The deeper hazard is named rather than fixed**: since Part C a bar entry is a *toggle*, so a
+press that misses by less than an entry width lands on the same entry and performs the gesture,
+and the retry performs its inverse. `click_at`'s comment used to say retrying was safe because a
+missed press "lands on nothing or merely focuses a window". That stopped being true and now says
+so.
+
+Also: `rename` survived a failed `open_modal`, so one failed prompt would have made every later
+launcher Enter rename the desktop instead of launching; it is set from whether the prompt
+actually opened. `Super+H` was bounded by the first `MAX_ENTRIES` of the *global* list rather
+than of the visible one, so a focused, drawn, clickable window could be unreachable by the chord.
+`normalize_desktops` did not run at the switch and move sites its own doc claimed, so every move
+committed a full-width panel blit with a stale desktop count and then another with the right one.
+And `close_modal` now says which of its two prompts closed, since these gates read the serial log
+as the shell's only visible output.

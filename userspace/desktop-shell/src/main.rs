@@ -45,7 +45,26 @@ const KEY_ENTER: u16 = 28;
 const KEY_H: u16 = 35;
 /// The shell's id for its minimize chord. Manager-chosen, and never zero.
 const HOTKEY_MINIMIZE: u32 = 1;
-use librsproto::surface::{CreateWindowRequest, Edge, Role};
+/// `EV_KEY` code for `r`, the rename chord's key.
+const KEY_R: u16 = 19;
+/// The shell's id for its rename chord.
+const HOTKEY_RENAME: u32 = 2;
+/// How many desktops the number chords reach.
+///
+/// **Four, not nine.** `MAX_HOTKEYS` is sixteen and each desktop costs two chords — one to
+/// switch, one to move — so nine would leave no room for the minimize and rename chords here,
+/// let alone Part E's overview. Desktops past the fourth exist and hold windows; they are
+/// reached by the indicator rather than by a chord.
+const CHORD_DESKTOPS: u32 = 4;
+/// Ids `HOTKEY_SWITCH_BASE + n` switch to desktop `n`; `HOTKEY_MOVE_BASE + n` move to it.
+const HOTKEY_SWITCH_BASE: u32 = 10;
+/// See [`HOTKEY_SWITCH_BASE`].
+const HOTKEY_MOVE_BASE: u32 = 20;
+/// `EV_KEY` code for `1`. `2`, `3` and `4` follow it.
+const KEY_1: u16 = 2;
+use librsproto::surface::{
+    CreateWindowRequest, Edge, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
+};
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
@@ -129,10 +148,132 @@ struct WinEntry {
     focused: bool,
     /// Whether the shell has minimized it.
     minimized: bool,
+    /// Which desktop it is on — the shell's copy of the attribute it set.
+    ///
+    /// **Tracked here rather than read back from `/dev/draw/<id>/info`.** The shell is the only
+    /// thing that changes it, so a read-back would be asking the compositor to repeat what this
+    /// process just said; and the list has to filter on it every redraw, which is not a place
+    /// to be resolving a path per window.
+    desktop: u32,
+}
+
+/// One desktop. **The shell owns these; the compositor knows only a number.**
+///
+/// `ui-composition-model.md` §6: the compositor holds a `desktop` attribute per window and one
+/// `current` value, and no notion of a desktop *object* — no list, no names, no lifecycle. That
+/// is what keeps the two from being able to disagree, and it is why everything below is here.
+struct Desktop {
+    /// The id the compositor is told. Stable for the desktop's life and never reused, so a
+    /// window's attribute cannot come to mean a different desktop underneath it.
+    id: u32,
+    /// What a user called it, or empty. **Naming is what makes a desktop persist** — see
+    /// [`normalize_desktops`].
+    name: alloc::string::String,
+}
+
+/// Keep the desktop list to the lifecycle rule, and return whether it changed.
+///
+/// **Governing decision 3 — "naming pins a desktop" — implemented in one place.** An *unnamed*
+/// empty desktop is removed; a *named* one is kept; and the list always ends with exactly one
+/// empty unnamed desktop to create into. That makes `ui-composition-model.md` §6's "name it if
+/// it turns out to matter" the lifecycle rule itself rather than a second mechanism: a scratch
+/// desktop costs nothing and cleans itself up, a purposeful one survives its last window
+/// leaving, and a name a user deliberately set is never discarded — which was GNOME 3's
+/// surprise.
+///
+/// Called after **every** change to either list, because the rule is about the pair: a window
+/// moving empties one desktop and fills another, and both halves have to be reconsidered.
+fn normalize_desktops(
+    desktops: &mut alloc::vec::Vec<Desktop>,
+    entries: &[WinEntry],
+    current: &mut u32,
+    next_id: &mut u32,
+) -> bool {
+    let before: alloc::vec::Vec<u32> = desktops.iter().map(|d| d.id).collect();
+    let occupied = |id: u32| entries.iter().any(|e| e.desktop == id);
+    // Where the current desktop sits *now*, so that if it is about to be removed the shell can
+    // land on whatever takes its place rather than somewhere arbitrary.
+    let was_at = desktops.iter().position(|d| d.id == *current);
+
+    // **The trailing scratch slot is exempt from removal, not from the rule.** It is empty and
+    // unnamed by definition, so without this the rule would delete the very desktop it requires
+    // to exist and then re-create it, churning an id every time a window moved.
+    let last = desktops.last().map(|d| d.id).unwrap_or(0);
+    desktops.retain(|d| !d.name.is_empty() || occupied(d.id) || d.id == last);
+
+    // Always one empty unnamed desktop at the end to create into. Checked after the retain, so
+    // a scratch slot that has just been filled gets a successor in the same pass.
+    let needs_slot = desktops.last().is_none_or(|d| !d.name.is_empty() || occupied(d.id));
+    if needs_slot {
+        desktops.push(Desktop { id: *next_id, name: alloc::string::String::new() });
+        *next_id += 1;
+    }
+
+    // **A removed current desktop lands on whatever took its slot**, by position rather than
+    // by id. Moving the last window off desktop 1 removes it, and the desktop that was second
+    // becomes first — which is where the window went, so following it is what a person means.
+    // Falling back to the end of the list instead would strand them on the empty scratch slot
+    // holding nothing, immediately after an action whose whole point was that window.
+    if !desktops.iter().any(|d| d.id == *current) {
+        let i = was_at.unwrap_or(0).min(desktops.len().saturating_sub(1));
+        *current = desktops.get(i).map(|d| d.id).unwrap_or(1);
+    }
+
+    before != desktops.iter().map(|d| d.id).collect::<alloc::vec::Vec<u32>>()
+}
+
+/// What the indicator shows: the desktop's name, or its position when it has none.
+///
+/// **Its position, not its id.** Ids are stable and never reused, so after a few desktops have
+/// come and gone they stop matching what a person sees — and `Super+N` addresses the Nth
+/// desktop, which is how anyone thinks about them. `desktop-shell.md` §7 wants "something
+/// human"; a name is that, and a position is the honest fallback.
+fn desktop_label(desktops: &[Desktop], current: u32) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    let idx = desktops.iter().position(|d| d.id == current).unwrap_or(0);
+    match desktops.get(idx) {
+        Some(d) if !d.name.is_empty() => s.push_str(&d.name),
+        _ => {
+            s.push_str("desktop ");
+            let n = idx + 1;
+            if n >= 10 {
+                s.push((b'0' + (n / 10) as u8) as char);
+            }
+            s.push((b'0' + (n % 10) as u8) as char);
+        }
+    }
+    s
 }
 
 /// Width of one window-list entry, in pixels.
 const ENTRY_W: u32 = 180;
+
+/// Width of the desktop indicator at the bar's right-hand end.
+const INDICATOR_W: u32 = 160;
+
+/// Where the indicator starts, in bar-local x. Clicks at or past this belong to it.
+///
+/// **Anchored to the screen's right edge, and now actually drawn there.** The first version
+/// asserted this while laying the indicator out *after* the entries, so it was drawn at
+/// `n * ENTRY_W` and the two coincided at exactly one window count — everywhere else the
+/// indicator a user could see did nothing, and at a full bar the region hit-tested as the
+/// indicator was *painted* as the last window entry, so clicking that entry switched desktops
+/// (PR #243 review, blocking 2). A flexible spacer between the entries and the indicator is
+/// what makes the claim true, and `MAX_ENTRIES` reserves the width so the indicator is never
+/// squeezed into what is left.
+const INDICATOR_X: u32 = SCREEN_W - INDICATOR_W;
+
+/// **No window entry may be painted under the indicator's hit region.**
+///
+/// This is the half of the misalignment that is a *correctness* bug rather than a usability
+/// one: with `MAX_ENTRIES` computed from the full screen width, a full bar painted an entry
+/// across x∈[1120,1260) while the hit-test read that range as the indicator, so clicking the
+/// last window switched desktops instead of raising it (PR #243 review, blocking 2).
+///
+/// Tied here rather than left to the two constants agreeing by inspection, because they are
+/// derived in different places and only their *product* is the invariant. It is checked by the
+/// **image** build — `cargo xtask test` does not compile this binary.
+const _: () = assert!(MAX_ENTRIES as u32 * ENTRY_W + INDICATOR_W <= SCREEN_W);
 
 /// How many entries the bottom bar can show.
 ///
@@ -140,7 +281,7 @@ const ENTRY_W: u32 = 180;
 /// would be laid out off it, which is a window you cannot get back rather than a cosmetic
 /// problem. Entries past the limit are simply not shown — the window is still there, still
 /// raisable by clicking it.
-const MAX_ENTRIES: usize = (SCREEN_W / ENTRY_W) as usize;
+const MAX_ENTRIES: usize = ((SCREEN_W - INDICATOR_W) / ENTRY_W) as usize;
 
 /// The label an entry shows: its title, marked with what the shell knows about it.
 ///
@@ -183,10 +324,19 @@ fn entry_label(e: &WinEntry) -> alloc::string::String {
     s
 }
 
-/// The bottom bar's element tree: one button per window.
-fn window_bar_view(entries: &[WinEntry]) -> Element<()> {
+/// The windows the bar shows: on the current desktop, in creation order.
+///
+/// **The filter Part C could not write.** It listed every `normal` window because nothing
+/// switched desktops yet; now that something does, a bar showing another desktop's windows
+/// would be showing you what you just navigated away from.
+fn visible_entries(entries: &[WinEntry], current: u32) -> alloc::vec::Vec<&WinEntry> {
+    entries.iter().filter(|e| e.desktop == current).take(MAX_ENTRIES).collect()
+}
+
+/// The bottom bar's element tree: one button per window, then the desktop indicator.
+fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str) -> Element<()> {
     let mut cells: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
-    for e in entries.iter().take(MAX_ENTRIES) {
+    for e in shown {
         cells.push(sized(
             libdraw::geom::Size::new(ENTRY_W, 0),
             padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(entry_label(e))),
@@ -195,17 +345,35 @@ fn window_bar_view(entries: &[WinEntry]) -> Element<()> {
     if cells.is_empty() {
         // An empty row lays out to nothing and commits a blank bar, which reads as a broken
         // bar rather than an empty one.
-        cells.push(padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("no windows")));
+        cells.push(sized(
+            libdraw::geom::Size::new(ENTRY_W, 0),
+            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("no windows")),
+        ));
     }
+    // **A flexible gap, so the indicator is drawn where the hit-test looks for it.** `row`
+    // packs from the left; without this the indicator follows the last entry and moves every
+    // time a window opens or closes.
+    cells.push(sized(libdraw::geom::Size::new(0, 0), text("")).flex(1));
+    // **The indicator, at the end of the bar** (`desktop-shell.md` §7) — a compact readout of
+    // the current desktop rather than GNOME 2's switcher, which with *dynamic* desktops is a
+    // list that changes length and would be the churniest widget here.
+    cells.push(sized(
+        libdraw::geom::Size::new(INDICATOR_W, 0),
+        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(label)),
+    ));
     row(cells)
 }
 
-/// Render the bottom bar for `entries`.
-fn render_window_bar(font: &Font, entries: &[WinEntry]) -> MemFramebuffer {
+/// Render the bottom bar for the windows on `current`, with the desktop indicator.
+fn render_window_bar(
+    font: &Font,
+    shown: &[&WinEntry],
+    label: &str,
+) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .unwrap_or_else(|| fail(b"desktop-shell: bad bottom bar geometry\n"));
     let mut fb = MemFramebuffer::new(geometry);
-    let ui = window_bar_view(entries);
+    let ui = window_bar_view(shown, label);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
     let metrics = FontMetrics::new(font, FONT_PX);
     let l = layout(&ui, bounds, &metrics);
@@ -924,6 +1092,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // is attached and nothing is held; only the placement has to wait.
     let mut entries: alloc::vec::Vec<WinEntry> = alloc::vec::Vec::new();
     let mut list_dirty = true;
+    // **One desktop to start, which is also the scratch slot** — empty and unnamed, so the
+    // first window created lands on it and `normalize_desktops` appends its successor.
+    let mut desktops: alloc::vec::Vec<Desktop> =
+        alloc::vec![Desktop { id: 1, name: alloc::string::String::new() }];
+    let mut next_desktop_id: u32 = 2;
+    let mut current_desktop: u32 = 1;
     let mut bottom_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
     let bottom = match session.create(
         &CreateWindowRequest::new(SCREEN_W, BAR_H, Role::Panel { dock: Edge::Bottom, reserve: BAR_H }),
@@ -997,6 +1171,29 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // **Placed now that a manager exists — created long before it.** A dock edge tells the
     // compositor how much space to reserve; it does not move the window, so a bottom bar that
     // is never placed sits at the origin under the top one.
+    if let Some(m) = manager.as_mut() {
+        // **Both bars are made sticky, and without this they vanish on the first switch.**
+        // The compositor stamps every new window with its current desktop, so panels created
+        // at startup live on desktop 1 — and `visible_on` is the single predicate behind
+        // compositing, focus *and* hit-testing. From the moment `Super+2` succeeded there was
+        // no window list, no applications button and no indicator on screen, and the only way
+        // back to the chrome was a chord, because hotkeys are routed compositor-side and do not
+        // need a visible window (PR #243 review, blocking 1).
+        //
+        // `STICKY_DESKTOP` is the reserved value for exactly this, specified in Part A and
+        // unused until now: chrome belongs to the screen rather than to one desktop.
+        for bar in [Some(window), bottom].into_iter().flatten() {
+            if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, bar, STICKY_DESKTOP) {
+                Line::new().s(b"desktop-shell: bar ").u(bar as u64).s(b" is sticky").end();
+            } else {
+                Line::new()
+                    .s(b"desktop-shell: bar ")
+                    .u(bar as u64)
+                    .s(b" could not be made sticky; it will vanish on a desktop switch")
+                    .end();
+            }
+        }
+    }
     if let Some(id) = bottom
         && let Some(m) = manager.as_mut()
     {
@@ -1020,6 +1217,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let mut modal: Option<u32> = None;
     let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
     let mut query = TextFieldState::new();
+    // **The modal serves two purposes and has to know which.** It is the applications launcher
+    // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
+    // different thing to do with what was typed.
+    let mut rename = false;
 
     // Blocks on the compositor's event channel, never spins — a spinning leader keeps a run
     // queue non-empty, so the idle thread never runs and deferred reclamation stops for the
@@ -1062,8 +1263,22 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // that true if a future shell window is `normal`.
             let ours = [window, bottom.unwrap_or(0), modal.unwrap_or(0)];
             let mut fired = alloc::vec::Vec::new();
-            list_dirty |=
-                place_new_windows(m, &mut next_origin, &mut entries, &ours, &mut fired);
+            list_dirty |= place_new_windows(
+                m,
+                &mut next_origin,
+                &mut entries,
+                &ours,
+                &mut fired,
+                current_desktop,
+            );
+            // A window arriving or leaving can empty or fill a desktop, so the rule is
+            // reconsidered after every drain rather than only where a desktop is switched.
+            list_dirty |= normalize_desktops(
+                &mut desktops,
+                &entries,
+                &mut current_desktop,
+                &mut next_desktop_id,
+            );
             for id in fired {
                 // **Bounded exactly as the click is**, and the reason is `MAX_ENTRIES`' own:
                 // an entry past it is neither drawn nor clickable, so minimizing one would take
@@ -1071,11 +1286,95 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // back rather than a cosmetic problem", which is what that bound exists to
                 // prevent. Unbounded, the chord invalidated its own justification
                 // (PR #242 review, finding 3).
+                // **`Super+N`: switch.** The chord names the *Nth* desktop, not desktop id N —
+                // ids are stable and never reused, so after a few have come and gone they stop
+                // matching what a person sees on the indicator.
+                if (HOTKEY_SWITCH_BASE + 1..=HOTKEY_SWITCH_BASE + CHORD_DESKTOPS).contains(&id) {
+                    let n = (id - HOTKEY_SWITCH_BASE) as usize;
+                    if let Some(d) = desktops.get(n - 1) {
+                        let to = d.id;
+                        if switch_desktop(m, &desktops, &mut current_desktop, to) {
+                            sent_request = true;
+                            list_dirty = true;
+                            normalize_desktops(
+                                &mut desktops,
+                                &entries,
+                                &mut current_desktop,
+                                &mut next_desktop_id,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                // **`Super+Shift+N`: move the focused window there.** One attribute write, and
+                // then the rule is reconsidered — the move can empty the desktop it left and
+                // fill the one it joined, and both halves matter.
+                if (HOTKEY_MOVE_BASE + 1..=HOTKEY_MOVE_BASE + CHORD_DESKTOPS).contains(&id) {
+                    let n = (id - HOTKEY_MOVE_BASE) as usize;
+                    let Some(to) = desktops.get(n - 1).map(|d| d.id) else { continue };
+                    if let Some(e) = entries.iter_mut().find(|e| e.focused) {
+                        let wid = e.id;
+                        sent_request = true;
+                        if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, wid, to) {
+                            e.desktop = to;
+                            Line::new()
+                                .s(b"desktop-shell: moved window ")
+                                .u(wid as u64)
+                                .s(b" to ")
+                                .s(desktop_label(&desktops, to).as_bytes())
+                                .end();
+                            // **Here, which is where the doc always said it happens.** The
+                            // first version relied on the next iteration's drain to re-apply
+                            // the rule, so the bar was rendered from a `desktops` this move had
+                            // already invalidated — a full-width panel blit showing a stale
+                            // count, immediately followed by another with the right one
+                            // (PR #243 review, finding 6).
+                            normalize_desktops(
+                                &mut desktops,
+                                &entries,
+                                &mut current_desktop,
+                                &mut next_desktop_id,
+                            );
+                            list_dirty = true;
+                        } else {
+                            kprint(b"desktop-shell: SetWindowDesktop was refused\n");
+                        }
+                    }
+                    continue;
+                }
+                if id == HOTKEY_RENAME {
+                    // The rename prompt is a popup like the applications modal, and for the
+                    // same reason: a `panel` takes no keyboard focus, so the bar could never
+                    // read a typed name.
+                    if modal.is_none() {
+                        query.clear();
+                        modal = open_modal(
+                            &mut session, window, &font, &programs, &mut modal_addrs, &query,
+                        );
+                        // **Set from whether the prompt actually opened.** `open_modal` returns
+                        // `None` on three paths, and a `rename` left true with no modal sticks
+                        // for the session — the next launcher Enter would rename the desktop to
+                        // whatever was typed and never launch anything again
+                        // (PR #243 review, finding 4).
+                        rename = modal.is_some();
+                        if rename {
+                            kprint(b"desktop-shell: naming this desktop\n");
+                        }
+                    }
+                    continue;
+                }
+                // **Bounded by what the bar is *showing*, which since Part D is not the first
+                // `MAX_ENTRIES` of the global list but the first `MAX_ENTRIES` on the current
+                // desktop.** With seven windows on another desktop and one here, the one here
+                // is drawn, clickable and focused — and its index in `entries` is 7, so a bound
+                // over the global list never reached it and the chord silently did nothing for
+                // a window the bar was showing (PR #243 review, finding 5).
+                let shown_now: alloc::vec::Vec<u32> =
+                    visible_entries(&entries, current_desktop).iter().map(|e| e.id).collect();
                 if id == HOTKEY_MINIMIZE
                     && let Some(e) = entries
                         .iter_mut()
-                        .take(MAX_ENTRIES)
-                        .find(|e| e.focused && !e.minimized)
+                        .find(|e| shown_now.contains(&e.id) && e.focused && !e.minimized)
                 {
                     let wid = e.id;
                     sent_request = true;
@@ -1100,8 +1399,49 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         {
             hotkey_done = true;
             sent_request = true;
-            use librsproto::surface::{MOD_META, MgrHotkey, OP_MGR_REGISTER_HOTKEY};
+            use librsproto::surface::{MOD_META, MOD_SHIFT, MgrHotkey, OP_MGR_REGISTER_HOTKEY};
             let hk = MgrHotkey { id: HOTKEY_MINIMIZE, mods: MOD_META, code: KEY_H };
+            // **The desktop chords, registered in the same pass.** `Super+N` switches and
+            // `Super+Shift+N` moves the focused window — both ending in one attribute write,
+            // which is what makes the move available without the overview open.
+            for n in 1..=CHORD_DESKTOPS {
+                let code = KEY_1 + (n as u16 - 1);
+                for (base, mods) in
+                    [(HOTKEY_SWITCH_BASE, MOD_META), (HOTKEY_MOVE_BASE, MOD_META | MOD_SHIFT)]
+                {
+                    let chord = MgrHotkey { id: base + n, mods, code };
+                    let mut b = [0u8; core::mem::size_of::<MgrHotkey>()];
+                    if chord.write(&mut b).is_none() {
+                        kprint(b"desktop-shell: a desktop chord would not serialise\n");
+                        continue;
+                    }
+                    let mut reply = [0u8; 64];
+                    if m.request(OP_MGR_REGISTER_HOTKEY, &b, None, &mut reply).is_err() {
+                        Line::new()
+                            .s(b"desktop-shell: registering a desktop chord was refused (id ")
+                            .u((base + n) as u64)
+                            .s(b")")
+                            .end();
+                    }
+                }
+            }
+            // Named `rename_hk` so it does not shadow the `rename` *bool* that decides what
+            // the modal's Enter does — nothing in this block reads that bool today, which is
+            // exactly the shape where a later edit silently reads the wrong one.
+            let rename_hk = MgrHotkey { id: HOTKEY_RENAME, mods: MOD_META, code: KEY_R };
+            let mut rb = [0u8; core::mem::size_of::<MgrHotkey>()];
+            if rename_hk.write(&mut rb).is_some() {
+                let mut reply = [0u8; 64];
+                if m.request(OP_MGR_REGISTER_HOTKEY, &rb, None, &mut reply).is_err() {
+                    kprint(b"desktop-shell: registering Super+R was refused\n");
+                }
+            }
+            Line::new()
+                .s(b"desktop-shell: Super+1..")
+                .u(CHORD_DESKTOPS as u64)
+                .s(b" switches, Super+Shift+N moves, Super+R names")
+                .end();
+
             let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
             if hk.write(&mut body).is_none() {
                 // **Said out loud.** The first version had no `else` at all, so a body that
@@ -1132,7 +1472,34 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         if k.keycode == KEY_ESC {
                             // Dismissed without launching. The field declines Escape for
                             // exactly this — see `TextFieldState::apply`.
-                            close_modal(&mut session, &mut modal, &mut query);
+                            rename = false;
+                            close_modal(&mut session, &mut modal, &mut query, "applications modal");
+                        } else if k.keycode == KEY_ENTER && rename {
+                            // **Naming is what makes a desktop persist**, so this is the one
+                            // gesture that changes the lifecycle rather than the view.
+                            let name = query.text();
+                            if let Some(d) =
+                                desktops.iter_mut().find(|d| d.id == current_desktop)
+                            {
+                                d.name.clear();
+                                d.name.push_str(name);
+                            }
+                            Line::new()
+                                .s(b"desktop-shell: named this desktop ")
+                                .s(name.as_bytes())
+                                .end();
+                            rename = false;
+                            list_dirty = true;
+                            close_modal(&mut session, &mut modal, &mut query, "name prompt");
+                            // Naming changes which desktops survive, so the rule applies here
+                            // too — the one site that used to reach the next iteration by way
+                            // of the popup's own destroy event.
+                            normalize_desktops(
+                                &mut desktops,
+                                &entries,
+                                &mut current_desktop,
+                                &mut next_desktop_id,
+                            );
                         } else if k.keycode == KEY_ENTER {
                             // The filtered list's first entry is what Enter launches. A
                             // selection the user moved would come from `ListState`; nothing
@@ -1153,12 +1520,25 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 // session. There was no second launch and no way back, and
                                 // the gate clicks once so it passed (PR #237 review,
                                 // finding 6).
-                                close_modal(&mut session, &mut modal, &mut query);
+                                close_modal(&mut session, &mut modal, &mut query, "applications modal");
                             } else {
                                 kprint(b"desktop-shell: nothing matches; not launching\n");
                             }
                         } else if query.apply(k.keycode, k.modifiers) {
                             modal_dirty = true;
+                            // **A receipt per character, while naming.** Injection is relative
+                            // and unacknowledged, so a dropped PS/2 batch silently eats a
+                            // keystroke — a desktop named `wok` instead of `work`, which is a
+                            // gate failure that looks like a logic bug. The greeter solved this
+                            // by typing one character at a time and waiting for each redraw;
+                            // this is the same receipt, and it is limited to renaming so the
+                            // launcher's typing stays quiet.
+                            if rename {
+                                Line::new()
+                                    .s(b"desktop-shell: name so far ")
+                                    .s(query.text().as_bytes())
+                                    .end();
+                            }
                         }
                     }
                 }
@@ -1184,14 +1564,39 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 && p.flags & librsproto::surface::POINTER_PRESSED != 0
                 && p.x >= 0
             {
+                // **The indicator first**, because it owns the bar's right-hand end and the
+                // entry arithmetic below would otherwise claim that x as a window slot.
+                //
+                // Clicking it advances to the next desktop. `desktop-shell.md` §7 says it opens
+                // the overview, which is Part E — until then the indicator is the only pointer
+                // way to change desktops, and a control that does nothing until a later
+                // milestone is worse than one that does the obvious thing.
+                if p.x as u32 >= INDICATOR_X
+                    && let Some(m) = manager.as_mut()
+                {
+                    let idx = desktops.iter().position(|d| d.id == current_desktop).unwrap_or(0);
+                    let to = desktops[(idx + 1) % desktops.len()].id;
+                    sent_request = true;
+                    if switch_desktop(m, &desktops, &mut current_desktop, to) {
+                        list_dirty = true;
+                    }
+                    continue;
+                }
                 let i = (p.x as u32 / ENTRY_W) as usize;
-                if i < entries.len().min(MAX_ENTRIES)
+                let shown_ids: alloc::vec::Vec<u32> =
+                    visible_entries(&entries, current_desktop).iter().map(|e| e.id).collect();
+                if let Some(&wid) = shown_ids.get(i)
                     && let Some(m) = manager.as_mut()
                 {
                     // **Clicking the focused window puts it away**, which is what every
                     // taskbar does and the only gesture that needs no second control. Clicking
                     // anything else brings it forward, restoring it first if it was minimized.
-                    let e = &mut entries[i];
+                    //
+                    // **Indexed through the *visible* list**, which since Part D is not the
+                    // whole one: entries on other desktops are not drawn, so `entries[i]` would
+                    // name a different window than the one under the cursor as soon as a window
+                    // moved away.
+                    let Some(e) = entries.iter_mut().find(|e| e.id == wid) else { continue };
                     if e.focused && !e.minimized {
                         sent_request = true;
                         if minimize_window(m, e) {
@@ -1223,8 +1628,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if list_dirty
             && let Some(id) = bottom
         {
-            log_window_list(&entries);
-            let picture = render_window_bar(&font, &entries).into_bytes();
+            let shown = visible_entries(&entries, current_desktop);
+            let label = desktop_label(&desktops, current_desktop);
+            log_window_list(&shown, &label, desktops.len());
+            let picture = render_window_bar(&font, &shown, &label).into_bytes();
             let len = BAR_PITCH * BAR_H as usize;
             // **`acquire`, not an index this code keeps itself.** The first version alternated
             // a counter and advanced it unconditionally while the commit's result was
@@ -1333,19 +1740,53 @@ fn minimize_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
     false
 }
 
+/// Tell the compositor which desktop to composite, and say so.
+///
+/// **The only thing the compositor is told about desktops.** Which ones exist, what they are
+/// called and when they disappear never leaves this process — `ui-composition-model.md` §6's
+/// split, and the reason the two cannot come to disagree.
+fn switch_desktop(
+    mgr: &mut ChannelTransport,
+    desktops: &[Desktop],
+    current: &mut u32,
+    to: u32,
+) -> bool {
+    use librsproto::surface::{MgrDesktop, OP_MGR_SET_CURRENT_DESKTOP};
+    if to == *current || !desktops.iter().any(|d| d.id == to) {
+        return false;
+    }
+    let mut body = [0u8; core::mem::size_of::<MgrDesktop>()];
+    if (MgrDesktop { desktop: to }).write(&mut body).is_none() {
+        kprint(b"desktop-shell: a SetCurrentDesktop body would not serialise\n");
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_SET_CURRENT_DESKTOP, &body, None, &mut reply).is_err() {
+        kprint(b"desktop-shell: SetCurrentDesktop was refused\n");
+        return false;
+    }
+    *current = to;
+    Line::new()
+        .s(b"desktop-shell: switched to ")
+        .s(desktop_label(desktops, to).as_bytes())
+        .end();
+    true
+}
+
 /// Log the window list, so a gate can read what the bar is showing.
 ///
 /// **The bar's contents reach a gate this way and no other.** What it draws is pixels in a
 /// window on a release image, and the only gate that boots one is `check-login`, which reads
 /// the serial console. A line per change is what makes "the list has this window, focused"
 /// assertable at all.
-fn log_window_list(entries: &[WinEntry]) {
+fn log_window_list(shown: &[&WinEntry], label: &str, desktops: usize) {
     let mut l = Line::new();
-    l.s(b"desktop-shell: window list");
-    if entries.is_empty() {
+    l.s(b"desktop-shell: window list on ").s(label.as_bytes());
+    l.s(b" of ").u(desktops as u64);
+    if shown.is_empty() {
         l.s(b" (empty)");
     }
-    for e in entries.iter().take(MAX_ENTRIES) {
+    for e in shown {
         l.s(b" [").u(e.id as u64).s(b":");
         l.s(entry_label(e).as_bytes());
         l.s(b"]");
@@ -1365,6 +1806,7 @@ fn place_new_windows(
     entries: &mut alloc::vec::Vec<WinEntry>,
     ours: &[u32],
     fired: &mut alloc::vec::Vec<u32>,
+    current: u32,
 ) -> bool {
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
@@ -1452,6 +1894,9 @@ fn place_new_windows(
             title: alloc::string::String::new(),
             focused: false,
             minimized: false,
+            // The compositor creates a window onto *its* current desktop, and the shell is what
+            // set that — so this is not a guess, it is the same number read from the other side.
+            desktop: current,
         });
         dirty = true;
         let (x, y) = (0, *next_origin);
@@ -1520,13 +1965,27 @@ fn present_modal(
 ///
 /// The query is reset with it: a launcher that reopened still filtered by the last thing
 /// launched would be showing a stale answer to a question nobody asked.
-fn close_modal(session: &mut Session<ChannelTransport>, modal: &mut Option<u32>, query: &mut TextFieldState) {
+fn close_modal(
+    session: &mut Session<ChannelTransport>,
+    modal: &mut Option<u32>,
+    query: &mut TextFieldState,
+    what: &str,
+) {
     if let Some(id) = modal.take() {
         if let Some(w) = session.window(id) {
             let _ = w.destroy();
         }
         query.clear();
-        Line::new().s(b"desktop-shell: applications modal closed, window ").u(id as u64).end();
+        // **Named, because the same popup serves two purposes.** These gates read the serial
+        // log as the shell's only externally visible output, and a rename dismissal reading as
+        // a launcher dismissal is the kind of line a later gate would assert the wrong thing
+        // about (PR #243 review, optional 8).
+        Line::new()
+            .s(b"desktop-shell: ")
+            .s(what.as_bytes())
+            .s(b" closed, window ")
+            .u(id as u64)
+            .end();
     }
 }
 

@@ -1349,10 +1349,18 @@ fn parse_popup_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
 /// 9-bit signed delta, so one huge motion is a different movement rather than a big one — the
 /// steps are bounded, and the corner is reached by over-driving into the clamp.
 fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
-    for _ in 0..20 {
-        qmp.send_motion(100, 100)?; // pin to (1279, 799)
-    }
-    let (mut dx, mut dy) = (x - 1279, y - 799);
+    // **Pin only when the position is unknown.** The pin is twenty over-driven motions, and
+    // repeating it before every click is what floods the guest's input ring.
+    let from = match qmp.pointer {
+        Some(p) => p,
+        None => {
+            for _ in 0..20 {
+                qmp.send_motion(100, 100)?; // pin to (1279, 799)
+            }
+            (1279, 799)
+        }
+    };
+    let (mut dx, mut dy) = (x - from.0, y - from.1);
     while dx != 0 || dy != 0 {
         let sx = dx.clamp(-100, 100);
         let sy = dy.clamp(-100, 100);
@@ -1528,13 +1536,21 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // loop iteration after the close, when its `WindowCreated` is drained.
     session.expect("desktop-shell: placed window ")?;
     // And it is listed, focused, because it has the keyboard.
-    session.expect("desktop-shell: window list [")?;
+    session.expect("desktop-shell: window list on ")?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
     //    so it stayed on top of whatever was launched and the bar's click handler — gated on
     //    there being no modal — was inert for the rest of the session: no second launch, no
     //    way back. Clicking again is the direct test; asserting the close alone would be a
     //    proxy for it (PR #237 review, finding 6).
+    // **Escape first, so this step's precondition is stated rather than assumed.** `click_at`
+    // retries a press that did not land where it was aimed, and an abandoned attempt still
+    // *pressed* somewhere — if that somewhere is the applications button (x < 120, and a
+    // mis-walked pointer parks at x=0) the modal is already open, the shell ignores the aimed
+    // click because it opens no second modal, and the assertion below waits for a line that
+    // will never come. Escape with no modal open reaches the focused terminal and does nothing.
+    press(&mut qmp, "esc")?;
+    session.skip_to_end()?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
 
@@ -1560,7 +1576,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // closing, and a taskbar that dropped the entry would leave no way to get the window back —
     // and `_` is how the bar says so. Matching only `window list [` asserted the list existed
     // and nothing about what it shows (PR #242 review, optional 9).
-    session.expect("desktop-shell: window list [")?;
+    session.expect("desktop-shell: window list on ")?;
     session.expect(":_ nxterm")?;
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
@@ -1579,6 +1595,95 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_key("h", false)?;
     qmp.send_key("meta_l", false)?;
     session.expect("desktop-shell: Super+H minimized window ")?;
+
+    // 6c. **The lifecycle rule, which is Part D's whole claim** (M8 Part D).
+    //
+    //     Governing decision 3: an **unnamed** empty desktop is removed, a **named** one is
+    //     kept, and the list always ends with one empty unnamed desktop to create into. The box
+    //     asked for this by *closing* a window — which no gate can do inside a session, since
+    //     the only way to close the launched terminal is through its shell and that draws into
+    //     the grid, which renders under `test-harness` only (PR #242 review, optional 7). A
+    //     desktop also empties when its last window is **moved away**, which is a gesture this
+    //     part builds, so the rule is exercised that way instead.
+    //
+    //     Sequence: name this desktop, move the terminal off it, and show the desktop survived
+    //     *because* it is named; then move the terminal back and show the desktop it vacated —
+    //     unnamed — is gone.
+    let chord = |qmp: &mut Qmp, shift: bool, code: &str| -> R<()> {
+        qmp.send_key("meta_l", true)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        qmp.send_key(code, true)?;
+        qmp.send_key(code, false)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+        qmp.send_key("meta_l", false)?;
+        Ok(())
+    };
+
+    // **Restore the terminal first: 6b left it minimized**, and a minimized window is not
+    // focused — so `Super+Shift+N`, which moves *the focused window*, would correctly find
+    // nothing to move and this block would assert against a gesture that did nothing. Clicking
+    // its list entry restores and raises it, which is the gesture Part C added for exactly this.
+    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    session.expect("desktop-shell: raised window ")?;
+    session.expect(":> nxterm")?;
+
+    // Name it. The prompt is the same popup the launcher uses — a `panel` takes no keyboard
+    // focus, so the bar itself could never read a typed name.
+    chord(&mut qmp, false, "r")?;
+    session.expect("desktop-shell: naming this desktop")?;
+    // **One character at a time, waiting for each**, the way `type_at_greeter` does. Injection
+    // is relative and unacknowledged: a dropped batch ate the `r` and produced a desktop named
+    // `wok`, which fails an assertion about naming while saying nothing about naming.
+    let mut typed = String::new();
+    for c in "work".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        typed.push(c);
+        session.expect(&format!("desktop-shell: name so far {typed}"))?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: named this desktop work")?;
+    session.expect("desktop-shell: window list on work of 2")?;
+
+    // Move the terminal to the second desktop. `work` is now empty — and **named**, so it
+    // stays; the desktop that received the window is no longer the scratch slot, so a new one
+    // is appended. Two facts in one line: the bar still says `work`, and there are three.
+    chord(&mut qmp, true, "2")?;
+    session.expect("desktop-shell: moved window ")?;
+    session.expect("desktop-shell: window list on work of 3 (empty)")?;
+
+    // Follow it, to prove the list filters by desktop rather than merely being emptied.
+    chord(&mut qmp, false, "2")?;
+    session.expect("desktop-shell: switched to ")?;
+    session.expect(":> nxterm")?;
+
+    // And back to `work`. The desktop just vacated is **unnamed** and empty, so it goes: the
+    // count drops from three to two, which is the removal half of the rule.
+    //
+    // **The bar does not follow the window, and that is the point of reading the count.** A
+    // move changes where a window is, not where you are — so the shell stays on the desktop it
+    // was on, which has just been emptied. That desktop is now the trailing scratch slot, which
+    // the rule keeps, so the reading is "desktop 2 of 2, empty": one desktop fewer than before,
+    // and the one that went was the unnamed one.
+    chord(&mut qmp, true, "1")?;
+    session.expect("desktop-shell: moved window ")?;
+    session.expect("desktop-shell: window list on desktop 2 of 2 (empty)")?;
+
+    // **And the chrome is still there.** Both bars are `panel`s created at startup, so the
+    // compositor stamped them with the desktop that was current then — and `visible_on` is the
+    // single predicate behind compositing, focus *and* hit-testing, so from the first switch
+    // they were neither drawn nor clickable. The only way back to the applications button was a
+    // chord (PR #243 review, blocking 1). The shell marks them sticky; this is what says so.
+    //
+    // Asserted by the compositor naming the window a press landed on: on another desktop a
+    // non-sticky bar gives `win=none`, and no shell line follows because nothing was reached.
+    click_at(&mut qmp, &mut session, 1200, 788)?;
+    session.expect("desktop-shell: switched to ")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
@@ -1716,18 +1821,31 @@ fn check_two_sessions(transcript: &str) -> R<()> {
 /// was already emitting.
 ///
 /// Observed on the first full run of this gate: `input batch DROPPED (SYN_DROPPED)` and a
-/// press at (321, 312) with `win=none`. Retrying is safe here because a press that misses lands
-/// on nothing or merely focuses a window, and opening an already-open modal is guarded.
+/// press at (321, 312) with `win=none`.
+///
+/// **A retry is not inert, and since M8 Part C it can undo the thing it is retrying.** The
+/// bar's entries are *toggles* — a press that misses the aimed pixel by less than an entry
+/// width lands on the same entry and performs the gesture, and the retry then performs its
+/// inverse, so the gate waits forever for a transition that happened twice. That is not fixed
+/// here; what is fixed is the cause of the misses. Every click used to re-pin the pointer to a
+/// corner with twenty over-driven motions before walking, and that burst is what overran the
+/// guest's input ring. A confirmed press is a position report, so `Qmp::pointer` remembers it
+/// and consecutive clicks walk from there — two motions rather than thirty-four
+/// (PR #243 review, finding 3).
 fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
     const ATTEMPTS: u32 = 3;
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
     for attempt in 1..=ATTEMPTS {
+        // Unknown position means pin first; known means walk the difference.
         move_pointer_to(qmp, x, y)?;
         qmp.send_button("left", true)?;
         qmp.send_button("left", false)?;
         if session.expect_within(&format!("compositor: press at x={x} y={y}"), PER_ATTEMPT)? {
+            qmp.pointer = Some((x, y));
             return Ok(());
         }
+        // It did not land where it was aimed, so where it *is* is no longer known.
+        qmp.pointer = None;
         println!("  note: the press did not land at ({x}, {y}) on attempt {attempt}/{ATTEMPTS}");
         // The abandoned attempt's press must not satisfy the next one's wait.
         session.skip_to_end()?;
@@ -2625,6 +2743,16 @@ fn parse_ppm(data: &[u8]) -> R<(u32, u32, Vec<u8>)> {
 struct Qmp {
     stream: std::os::unix::net::UnixStream,
     buf: Vec<u8>,
+    /// Where the guest's pointer is, when a press receipt has confirmed it.
+    ///
+    /// **The pointer is relative and unacknowledged, so this is the only way to know.** Without
+    /// it every click re-pins to a corner with twenty over-driven motions before walking, and
+    /// that burst is what overruns the guest's input ring: `input batch DROPPED (SYN_DROPPED)`,
+    /// then a press tens of pixels from where it was aimed. A confirmed press *is* a position
+    /// report, so consecutive clicks cost two motions instead of thirty-four
+    /// (PR #243 review, finding 3). Cleared whenever an attempt does not land, because then it
+    /// is not known any more.
+    pointer: Option<(i32, i32)>,
 }
 
 impl Qmp {
@@ -2646,7 +2774,7 @@ impl Qmp {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("qmp read timeout: {e}"))?;
-        let mut q = Qmp { stream, buf: Vec::new() };
+        let mut q = Qmp { stream, buf: Vec::new(), pointer: None };
         // The greeting arrives unsolicited; then capabilities must be negotiated before
         // any other command is accepted.
         let greeting = q.read_line()?;
