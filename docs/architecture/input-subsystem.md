@@ -42,7 +42,7 @@ leans on does not currently honour it"), and there is no userspace-facing interr
 principles this elaborates — key events not bytes, scancode→keycode in the kernel,
 keycode→character in userspace, the compositor owns focus. Nothing there is reversed here;
 §5's `KeyEvent` turns out to describe a *different layer* than the device stream, and this
-document names both. [`ui-composition-model.md`](../design/ui-composition-model.md) owns what a window
+document names both. [`ui-composition-model.md`](ui-composition-model.md) owns what a window
 is; input routing terminates there.
 
 ## 1. Why this is a subsystem and not a driver

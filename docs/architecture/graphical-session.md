@@ -17,14 +17,14 @@ beside it.
 
 What is **not** built, and is named as such below: §6.3's session services (nothing exists that
 must outlive or precede the shell), and the multi-desktop model
-[`ui-composition-model.md`](../design/ui-composition-model.md) describes — the shell ships one
+[`ui-composition-model.md`](ui-composition-model.md) describes — the shell ships one
 implicit desktop, and the overview and desktop indicator are Milestone 8.
 
 Originally written 2026-08-12, from a gap found while planning Milestone 5 Part C: the plan had
 `session-mgr` spawning `nxterm`, and the maintainer's question — *"nxterm is a desktop app the
 way gnome-terminal is; should session-mgr really be spawning it?"* — turned out to have no
 answer anywhere in `docs/`. A grep for *display manager*, *graphical login*, *greeter* returns
-nothing. [`ui-composition-model.md`](../design/ui-composition-model.md) §6 assigns "spawning applications"
+nothing. [`ui-composition-model.md`](ui-composition-model.md) §6 assigns "spawning applications"
 to the desktop shell and §5a says the shell "holds a full-rights handle to every application's
 namespace because it *created* those namespaces at spawn" — but nothing says who authenticates
 a graphical user, or who spawns the shell. **The top of that column was empty.** This document
@@ -163,7 +163,7 @@ application needs a *constructed* namespace where a shell's child can inherit on
 ### The shell also serves, and that has to be reconciled
 
 `desktop-shell` is **both** a namespace constructor and a resource server:
-[`ui-composition-model.md`](../design/ui-composition-model.md) has `/dev/desktop/` "served by the desktop
+[`ui-composition-model.md`](ui-composition-model.md) has `/dev/desktop/` "served by the desktop
 shell", and `/dev/desktop/1/windows/` as a filtered view of the compositor's window set. That
 combination runs straight at two rules this document otherwise leans on, and an earlier draft cited
 them as support without noticing (PR #193 review, finding 4):
@@ -198,9 +198,13 @@ process already has and already exercises. It also removes a cost
 [`deferred-decisions.md`](../rationale/deferred-decisions.md) had named against this box: no
 `Meta::Ready` handshake, and no change to `spawn_leader` to wait for a ready before it reaps.
 
-**Status: not built.** Neither binding exists today —
-[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 8 Part F is where it lands,
-together with the consumer that proves the resolve works.
+**Built 2026-08-26** (Milestone 8 Part F). The shell serves `/dev/desktop` and binds it into
+every application namespace it constructs; nothing binds it into the session namespace, because
+nothing there would resolve it. The `desktop` command is the consumer that proves the binding is
+reachable — and it had to be, because **a process cannot verify a binding of itself by using
+it**: a resolve is forwarded to whoever serves the path, so the shell asking the kernel for its
+own endpoint blocks it waiting for its own answer. What the shell can check is that the bind
+succeeded; that something else can reach it is the command's job.
 
 **Two things follow, and both are consequences rather than free.** The trusted set widens — a
 `BIND_NAMESPACE` holder that also draws on screen and parses input is a larger, more exposed
@@ -329,7 +333,7 @@ Milestone 7 Part E.
 ## References
 
 - [`session-and-auth.md`](../architecture/session-and-auth.md) — the serial column, as built
-- [`ui-composition-model.md`](../design/ui-composition-model.md) — §5a/§6, the shell's namespace authority
+- [`ui-composition-model.md`](ui-composition-model.md) — §5a/§6, the shell's namespace authority
 - [`desktop-shell.md`](desktop-shell.md) — what the shell presents
 - [`display-substrate.md`](../design/display-substrate.md) — the mechanism beneath both
 - [`why-supervisor-registration.md`](../rationale/why-supervisor-registration.md) — why a leaf

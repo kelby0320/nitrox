@@ -12,7 +12,7 @@ interpreter, the coreutils, and the (minimal) REPL. Derived from the design docs
 against the implemented system:
 
 - **Design (semantics/grammar):** `docs/spec/shell-language.md`
-- **Design (UI composition, upstream where they touch):** `docs/design/ui-composition-model.md`
+- **Design (UI composition, upstream where they touch):** `docs/architecture/ui-composition-model.md`
 - **This plan** sequences the subproject's own work (language → coreutils → minimal REPL) and
   records the design gaps it must resolve as it goes.
 
@@ -1448,6 +1448,6 @@ Phase 4 *before* this subproject — check them off in [`phase-4-desktop.md`](ph
 If they are not done, that is the work to do first, not this plan.
 
 With the prereqs in, read, in order: this plan → `docs/spec/shell-language.md` →
-`docs/design/ui-composition-model.md` (for `form`/stdout only) → `docs/spec/typed-stream-format.md`
+`docs/architecture/ui-composition-model.md` (for `form`/stdout only) → `docs/spec/typed-stream-format.md`
 (TSM1 wire) → `docs/spec/rsproto-*.md` (the protocol the fs-server speaks). Then start at
 **Milestone 1 (`list` + `copy`)** — the first integrated proof that the substrate composes.

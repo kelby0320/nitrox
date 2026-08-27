@@ -18749,3 +18749,52 @@ Also: the spec said `Rejected` for a window that has committed nothing, and the 
 `WouldBlock` — which is the one answer here worth branching on, because it means *try again once
 it draws*. The spec now says so and explains why. And an assertion reading `window list on work
 of ` matched a list still holding the window as happily as one that had lost it.
+
+## 2026-08-26 — Milestone 8 Part F: `/dev/desktop`, its first consumer, and a shell that cannot resolve itself
+
+Desktops are a resource now: `desktop-shell` serves `/dev/desktop`, binds it into every
+application namespace it constructs, and a `desktop` command in `/bin` lists, switches and names
+them. `check-login` types it into a real terminal on a release image, which is the whole of what
+the `desktop-endpoint` deferral asked for.
+
+**A session channel, not the path-per-object namespace §2a sketches.** `new`, `current`,
+`N/info` and `N/windows/` are not served. The operations that matter here are *mutations* —
+switch, name — and a namespace resolve is a lookup rather than a call, so the bare path answers
+with a session the way `/dev/draw/new` and `/dev/tty` do. The per-object paths would duplicate
+what one `List` returns, for no consumer, which is the shape this milestone has now refused three
+times. The graduated document says so in its own Status line rather than leaving a reader to
+discover it.
+
+**Bound into application namespaces, not the session's** — PR #239's correction, built. The
+session namespace is the shell's own and nothing else runs in it, so a binding there would have
+had no consumer at all; a `/bin` command runs under the `nxsh` a terminal spawned, whose
+namespace is one the shell *constructs*. That also removed the `Meta::Ready` handshake the
+deferral had named as this box's second cost: it belonged to a binding that is not the one built.
+
+**A process cannot verify a binding of itself by using it**, and finding that out cost a boot.
+`verify_app_namespace` checks `/dev/draw/new` and `/home` by resolving them, so it tried to check
+`/dev/desktop` the same way — and a resolve is forwarded to whoever serves the path, so the shell
+asked the kernel for its own endpoint and blocked waiting for its own answer. The same
+self-deadlock as Part C's bottom bar, by a different route. What the shell can report is that the
+bind *succeeded*; that something else can reach it is exactly what the consumer is for, which is
+the strongest argument the deferral could have had for insisting the two ship together.
+
+**Diagnosing the consumer took five boots, and every one of them was the same blind spot.** A
+command run in a windowed terminal writes into that terminal's *grid*, and the grid renders under
+`test-harness` only — so on the release image `check-login` boots, a failure is completely
+silent. The command now says what it did on the debug console, and `nxsh` says when it cannot
+resolve a program, because "the command did nothing and nothing said why" is not a state a gate
+should be able to reach.
+
+**And under that was a real bug**: `nxsh` **reads** every character typed into a graphical
+terminal and then resolves a program name with the first one missing — `desktop` typed, `esktop`
+looked up. Not input loss; the byte reaches the shell and is consumed inside its own line
+handling. Serial logins never showed it, and `check-terminal` types into `nxterm` under
+`test-harness` where the first keystroke is an `F1` nobody was counting. Filed as
+`TODO(nxsh-first-byte)` and worked around in the gate with a leading bare Enter — deliberately in
+the gate rather than in the product, so that nothing else is protected from it and the next
+consumer trips over it too.
+
+**One ordering lesson, again.** The command's output and the shell's are two processes, and which
+lands first varied between runs. The shell's lines stay ordered `expect`s; the command's are
+checked against the whole transcript, where order does not matter — PR #227's rule, reapplied.

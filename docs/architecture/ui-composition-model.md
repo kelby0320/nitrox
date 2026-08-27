@@ -1,4 +1,4 @@
-# Nitrox: UI Composition Model — Design Notes (Revision 3)
+# Nitrox: UI Composition Model
 
 ## Status
 
@@ -6,11 +6,31 @@
 old §5 "Tier 2" and §7 "Templates". See "Changes in revision 3" below; the reasoning is worth
 reading before proposing anything shaped like it.
 
-**Not built.** This describes a subsystem with no code behind it; the build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/` when
-**desktops** land (Milestone 8), carrying a Status line that says §5a's ports are still unbuilt
-and unscheduled — the plan holds that graduation as a checkbox. Window management alone was
-Milestone 6 and is done; the desktop shell that spawns applications is Milestone 7.
+**Partly built, and checked 2026-08-26** — graduated from `design/` with Milestone 8, revision 3.
+
+**What is built: desktops (§6), and the split §6 rests on.** The compositor holds a `desktop`
+attribute per window and one `current` value and has **no notion of a desktop object** — no list,
+no names, no lifecycle — while [`desktop-shell`](../../userspace/desktop-shell) owns all of that.
+Membership is one attribute (§2a) and moving a window between desktops is one write. Ids are
+stable and never reused (§2b), and the human name lives beside them as metadata — which turned
+out to be load-bearing rather than decorative: **naming is what makes a desktop persist**.
+Desktops are reachable as a resource at `/dev/desktop`, with a `desktop` command as the proof.
+
+**What is not built: ports (§5a), and they are unscheduled** — `TODO(port-shape-rework)`. Naming,
+stream-versus-message, what happens when nothing is listening, and which server owns the path are
+all unsettled, and revision 3 cut the mechanism they were designed for. §5's window-to-window
+composition is therefore intent, not behaviour.
+
+**Nor is `/dev/desktop` the path-per-object namespace §2a sketches.** `new`, `current`,
+`N/info` and `N/windows/` are not served: the bare path resolves to a session channel, the way
+`/dev/draw/new` and `/dev/tty` do, because the operations that matter are *mutations* and a
+resolve is a lookup rather than a call. The per-object paths would duplicate what one `List`
+returns, for no consumer.
+
+**A caution the rest of `architecture/` does not need.** §§1–4 describe a model rather than code:
+TSM1's data-only rule and the resource-server framing are decisions this system is built on, but
+`form` (§3) has never been implemented and the widget-as-resource-server idea in §2 is realised
+only at the *window* seam, which §2b's scope note is careful about.
 
 This document revises the "User Interface and Shell" section of `os-design-v5.1.md`. That
 section was written early, before kernel/system design matured, and its central mechanism —

@@ -207,7 +207,7 @@ a role into a shipped protocol is the kind of change that touches every client.
   desktops live until closed. The two fight, and the argument that used to settle it — saved
   desktops pulling toward explicit lifecycle — went with templates in composition revision 3, so
   the question came back open on its own terms. The answer uses the naming that
-  [`ui-composition-model.md`](../design/ui-composition-model.md) §6 already had: an **unnamed**
+  [`ui-composition-model.md`](ui-composition-model.md) §6 already had: an **unnamed**
   empty desktop is removed, a **named** one is kept, and the list always ends with one empty
   unnamed desktop to create into. A scratch desktop costs nothing and cleans itself up; a
   purposeful one survives its last window closing; and a name a user deliberately set is never

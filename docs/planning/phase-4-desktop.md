@@ -541,7 +541,7 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).
 - Design docs: [`docs/spec/shell-language.md`](../spec/shell-language.md)
-  (language/grammar) and [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
+  (language/grammar) and [`docs/architecture/ui-composition-model.md`](../architecture/ui-composition-model.md)
   (windows/widgets as resource servers).
 - The **rich interactive REPL** (reverse-search, Shift-Enter key events, schema-aware completion —
   design §11) is split out and **deferred**, gated on the console/tty server + compositor terminal
@@ -552,7 +552,7 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 **Design: [`docs/design/display-substrate.md`](../design/display-substrate.md)**
 (framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
-[`docs/design/ui-composition-model.md`](../design/ui-composition-model.md) (windows, ports,
+[`docs/architecture/ui-composition-model.md`](../architecture/ui-composition-model.md) (windows, ports,
 desktops) and
 [`docs/architecture/input-subsystem.md`](../architecture/input-subsystem.md) (the path from an
 interrupt to a keystroke in a window: kernel drivers, the `input-server`, `libinput`) and

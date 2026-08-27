@@ -19,7 +19,7 @@
 //! (`desktop-shell.md` §6), and it is deterministic in integer arithmetic.
 
 use crate::format::{PixelFormat, Rgb};
-use crate::framebuffer::{Framebuffer, Geometry};
+use crate::framebuffer::Geometry;
 
 /// Average the `src` rectangle covering one destination pixel.
 ///

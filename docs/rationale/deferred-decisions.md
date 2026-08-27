@@ -362,7 +362,7 @@ would still admit a few enormous ones. Trigger: the first untrusted client, or a
 memory budget, whichever comes first — the second is the better answer and the reason not to
 guess a number now. Raised by the PR #222 review.
 
-**`/dev/desktop` is not bound yet — `TODO(desktop-endpoint)`.** M7 Part E's plan has
+~~**`/dev/desktop` is not bound yet — the `desktop-endpoint` deferral.**~~ M7 Part E's plan has
 `desktop-session-mgr` binding the shell's endpoint at `/dev/desktop` in the session namespace,
 "exactly as `init` binds the tty server's and `session-mgr` binds `/dev/tty`". The *architectural*
 half of that box is built and demonstrated: `desktop-shell` **does not bind its own endpoint**,
@@ -390,10 +390,24 @@ the wrong mechanism.
 
 Trigger: **the first process that resolves `/dev/desktop`** — an application talking to the shell,
 which is Part F's `nxterm` or the ports work in
-[`ui-composition-model.md`](../design/ui-composition-model.md). At that point the consumer and
+[`ui-composition-model.md`](../architecture/ui-composition-model.md). At that point the consumer and
 the binding land together and each can be checked against the other.
 
-**Trigger fired 2026-08-26, and the resolution is scheduled with its consumer attached.** M7 Part
+**Resolved 2026-08-26 (M8 Part F), with the consumer in the same commit.** `desktop-shell`
+serves `/dev/desktop` and binds it into every **application** namespace it constructs — not into
+the session namespace, which is its own and where nothing would resolve it. A `desktop` command
+in `/bin` lists, switches and names, and `check-login` types it into a real terminal on a release
+image, so the binding is proved reachable from where a caller actually stands.
+
+**Two things this entry did not anticipate.** The `Meta::Ready` cost it named is gone, because
+the binding it belonged to is not the one that was built. And a shell **cannot verify a binding
+of itself by using it**: a resolve is forwarded to whoever serves the path, so
+`verify_app_namespace` asking the kernel to resolve the shell's own endpoint blocked the shell
+waiting for its own answer. What it checks is that the bind succeeded; the consumer is what
+proves reachability — which is the strongest argument this entry could have had for insisting the
+two ship together.
+
+**Trigger fired 2026-08-26, and the resolution was scheduled with its consumer attached.** M7 Part
 F's `nxterm` did *not* fire it — a launched terminal resolves `/dev/tty`, `/bin` and `/home`, and
 never needs to talk to the shell. Milestone 8's details pass does: desktops give `/dev/desktop`
 something to serve (`new`, `current`, `N/info`, `N/windows/`), and the plan puts the binding and
@@ -781,6 +795,24 @@ synthesising releases for every key held across every focus change is a larger c
 focus means. Trigger: the first client that tracks held keys, or M9's decorations, where a drag
 that starts on a title bar will raise the same question for the keyboard. Identified in PR #241
 review, answer 4.
+
+**The first byte typed into a graphical terminal goes missing — `TODO(nxsh-first-byte)`.**
+Found in M8 Part F, diagnosing why a `desktop` command typed into `nxterm` did nothing: `nxsh`
+**reads** every character — verified with a probe on its `tty_read` — and then resolves a program
+name with the first one gone. `desktop` typed, `esktop` looked up. It is not input loss: the byte
+arrives at the shell and is consumed inside its own line handling.
+
+**Only the graphical path shows it.** `test-interactive` types at a serial prompt through
+`/dev/console` and has never lost a character; `check-terminal` types into `nxterm` under
+`test-harness`, where the first thing typed is a `F1` that opens a menu, so the eaten byte is one
+nobody was counting. It took a release-image gate typing a *command* to surface it.
+
+**Worked around in the gate rather than fixed**, because the fix is in `nxsh`'s line handling and
+Part F's subject is `/dev/desktop`: `type_at_terminal` sends a bare Enter first, and an empty line
+is the cheapest thing to feed something that is going to eat one. Trigger: any second consumer
+that types into a graphical terminal, and M9 at the latest — a terminal whose first keystroke is
+silently discarded is not a terminal anyone should ship, and the workaround is in a gate rather
+than in the product, so nothing else is protected.
 
 **A scrollbar's grab offset — `TODO(scroll-grab)`.** `ScrollState::offset_at` puts the thumb's
 *centre* under the cursor, so grabbing a thumb near either of its ends makes it jump by up to
