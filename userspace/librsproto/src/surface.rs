@@ -930,6 +930,19 @@ pub const OP_MGR_WINDOW_TITLE: u16 = 0x091C;
 /// and only the *client* knows.
 pub const OP_SET_TITLE: u16 = 0x0909;
 
+/// `Surface::StartMove` — hand the compositor an interactive move of this window.
+///
+/// **A client request, and the only kind of geometry change a client may originate.** Everything
+/// else about where a window sits is the manager's: `Place` and `Configure` are manager ops, and
+/// a client asking to be moved *to a position* would be asking to place itself. This asks for
+/// something different — that the window follow the pointer the user is already holding down on
+/// it — which is not a position the client knows or could compute (M9 Part A).
+///
+/// Refused unless the caller holds the pointer grab on that window: the grab is what makes
+/// "the user is dragging me" true, and without the check a client could move its window while
+/// nobody was touching it.
+pub const OP_START_MOVE: u16 = 0x090A;
+
 /// The longest window title accepted, in bytes.
 ///
 /// Bounded at the protocol edge for the reason [`MAX_STRUT_RESERVE`] is: it arrives off the wire
@@ -1084,6 +1097,33 @@ impl MgrDesktop {
             return None;
         }
         Some(Self { desktop: get_u32(b, 0) })
+    }
+}
+
+/// A client request naming one window — [`StartMove`](OP_START_MOVE).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StartMove {
+    /// The window to move. Must be one the caller owns and holds the pointer grab on.
+    pub window: u32,
+}
+
+impl StartMove {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 4 {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        Some(4)
+    }
+
+    /// Parse from the first 4 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(Self { window: get_u32(b, 0) })
     }
 }
 

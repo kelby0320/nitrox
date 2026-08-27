@@ -28,7 +28,7 @@ use librsproto::surface::{
     POINTER_MOTION, POINTER_PRESSED, PointerEvent,
 };
 
-use crate::{Damage, WindowStack};
+use crate::{Damage, StackError, WindowStack};
 use crate::outbox::Outbound;
 
 /// What routing one event did, beyond what it put in `out`.
@@ -50,8 +50,30 @@ pub struct Routed {
     /// emulation with no input read during it — so every click that raised a window threw away
     /// the mouse movement around it (2026-08-26).
     pub restacked: Option<Rect>,
+    /// The region an interactive move disturbed, or `None` if no window moved.
+    ///
+    /// Separate from [`restacked`](Self::restacked) because the two mean different things to the
+    /// caller: a restack also changes who is focused and has to be announced, and a move does
+    /// not. Both are repainted the same way.
+    pub moved: Option<Rect>,
     /// The event was taken by a registered chord and reached no window.
     pub consumed: bool,
+}
+
+/// An interactive move the compositor is running on a client's behalf.
+///
+/// **The window's origin is remembered, not recomputed.** Adding the pointer's delta to the
+/// *current* origin each time would accumulate rounding and drift against the clamp; taking it
+/// from where the window and the pointer both were when the grab was taken makes every motion an
+/// absolute answer that cannot drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Drag {
+    /// The window being moved.
+    window: u32,
+    /// Where the pointer was when the grab was taken.
+    from: Point,
+    /// Where the window's origin was then.
+    origin: Point,
 }
 
 /// Why a chord could not be registered.
@@ -96,6 +118,18 @@ pub struct InputRouter {
     inside: Option<u32>,
     /// The window holding the implicit grab, if a button is down.
     grab: Option<u32>,
+    /// Where the pointer was when [`grab`](Self::grab) was taken.
+    ///
+    /// **Recorded at the press, not read when somebody asks.** An interactive move is requested
+    /// by the client, which learns about the press, routes it through its own toolkit, decides
+    /// it landed on a title bar, and only then sends `StartMove` — a full round trip later, by
+    /// which time the pointer has moved, and by which time coalescing may have handed that
+    /// client a position older still. A drag whose offset is measured at the request jumps by
+    /// however far the pointer travelled in between, which is the same defect
+    /// `TODO(scroll-grab)` describes for a scrollbar thumb (PR #247 review, finding 4).
+    grab_at: Point,
+    /// The interactive move in progress, if any.
+    drag: Option<Drag>,
     /// Which button opened [`grab`](Self::grab) — the one a synthetic release names when the
     /// grab is taken away by something other than that button coming up.
     ///
@@ -167,6 +201,8 @@ impl InputRouter {
             screen,
             inside: None,
             grab: None,
+            grab_at: pointer,
+            drag: None,
             grab_button: 0,
             grab_broken: false,
             buttons: 0,
@@ -249,7 +285,7 @@ impl InputRouter {
                 // also reached the focused window would type into it — `Super+2` would switch
                 // desktops *and* put a `2` in the terminal.
                 if self.take_as_hotkey(keycode, pressed, modifiers) {
-                    return Routed { restacked: None, consumed: true };
+                    return Routed { restacked: None, moved: None, consumed: true };
                 }
                 let Some(window) = stack.focus_candidate() else {
                     // Nothing focusable. Dropping beats delivering to the pointer's window,
@@ -269,11 +305,16 @@ impl InputRouter {
 
             Logical::Motion { dx, dy, .. } => {
                 self.move_by(dx, dy);
+                // **The drag first, so what follows describes where the window now is.** The
+                // crossing pass and the motion record both read the stack, and a window that has
+                // moved under the pointer this instant is the state a client should be told
+                // about — not the one it was in a frame ago.
+                let moved = self.drag_to_pointer(stack);
                 self.update_crossing(stack, out);
                 if let Some(window) = self.target(stack) {
                     self.emit(window, POINTER_MOTION, 0, 0, stack, out);
                 }
-                Routed::default()
+                Routed { moved, ..Routed::default() }
             }
 
             Logical::Button { button, pressed, buttons, .. } => {
@@ -291,6 +332,10 @@ impl InputRouter {
                     // topmost window *containing the point*, and raising that window leaves
                     // it topmost there too, so re-testing afterwards cannot differ.
                     self.grab = self.hit(stack);
+                    // **Where it was pressed, kept with the grab it opened.** This is what an
+                    // interactive move offsets by; see the field's own doc for why reading the
+                    // pointer when `StartMove` arrives is a different, wrong number.
+                    self.grab_at = self.pointer;
                     // Remembered for the release the compositor owes this window if the grab
                     // ends any way other than this button coming up.
                     self.grab_button = button;
@@ -314,6 +359,11 @@ impl InputRouter {
                 }
 
                 if !pressed && buttons == 0 {
+                    // The drag ends with the grab that carries it, and the stack records the
+                    // one geometry change the whole gesture produced.
+                    if self.drag.take().is_some() {
+                        stack.end_drag();
+                    }
                     // Last button up: the grab ends, and the cursor may have been dragged
                     // somewhere else entirely while it was held, so re-derive the crossing.
                     //
@@ -324,7 +374,7 @@ impl InputRouter {
                     self.grab_broken = false;
                     self.update_crossing(stack, out);
                 }
-                Routed { restacked, consumed: false }
+                Routed { restacked, moved: None, consumed: false }
             }
 
             Logical::Dropped => {
@@ -431,6 +481,53 @@ impl InputRouter {
             x.clamp(self.screen.left(), self.screen.right() as i32 - 1),
             y.clamp(self.screen.top(), self.screen.bottom() as i32 - 1),
         );
+    }
+
+    /// Begin an interactive move of `window` on the client's behalf — `Surface::StartMove`.
+    ///
+    /// **The grab is the authority.** The request is refused unless the caller's window is the
+    /// one holding the implicit pointer grab, which is what makes "the user is dragging me"
+    /// true: without the check a client could move its window at any time, from anywhere, with
+    /// nobody touching it — a `Place` for itself by another name, and `Place` is deliberately a
+    /// manager op.
+    ///
+    /// A second `StartMove` while one is running is accepted and replaces it: the pointer holds
+    /// one grab, so the two requests name the same gesture, and the offsets they compute are
+    /// identical because both are taken from the same recorded press.
+    pub fn start_move(&mut self, window: u32, stack: &mut WindowStack) -> Result<(), StackError> {
+        if self.grab != Some(window) {
+            return Err(StackError::NoSuchWindow);
+        }
+        let origin = stack.window(window).ok_or(StackError::NoSuchWindow)?.origin;
+        stack.begin_drag(window)?;
+        self.drag = Some(Drag { window, from: self.grab_at, origin });
+        // **Applied at once, not at the next motion.** The pointer has already moved by the time
+        // this request arrives — that round trip is the reason the press position is recorded at
+        // all — so a drag that waited for the next event would leave the window trailing until
+        // one happened, and would never move it at all for a press-and-drag that ended in the
+        // meantime. The damage is returned to the caller through the next `route`, which is the
+        // one that repaints; catching up here is about *position*, not about pixels.
+        Ok(self.drag_to_pointer(stack).map(|_| ()).unwrap_or(()))
+    }
+
+    /// Move the dragged window so it keeps the same point under the pointer.
+    ///
+    /// `None` when no drag is in flight, or when the window has gone — a client that exits with
+    /// the button still down is ordinary, not an error.
+    fn drag_to_pointer(&mut self, stack: &mut WindowStack) -> Option<Rect> {
+        let d = self.drag?;
+        let origin = Point::new(
+            d.origin.x + (self.pointer.x - d.from.x),
+            d.origin.y + (self.pointer.y - d.from.y),
+        );
+        match stack.drag_to(d.window, origin) {
+            Ok(damage) => Some(damage.rect()),
+            Err(_) => {
+                self.drag = None;
+                stack.end_drag();
+                None
+            }
+        }
     }
 
     /// Register a chord, to be delivered to the manager instead of the focused window.
@@ -1218,6 +1315,106 @@ mod tests {
         assert_eq!(again.restacked, None);
         let again = r.route(&button(true), &mut s, &mut out);
         assert_eq!(again.restacked, None, "already topmost: nothing moved, nothing to paint");
+    }
+
+    #[test]
+    fn an_interactive_move_offsets_by_where_the_press_landed_not_by_where_the_request_arrived() {
+        // **The whole point of recording the press position.** `StartMove` arrives a round trip
+        // after the press — the client has to receive it, route it through its own toolkit and
+        // decide it landed on a title bar — and the pointer keeps moving meanwhile. A drag that
+        // takes its origin from the pointer *at the request* jumps by that distance and then
+        // tracks correctly, which is the defect `TODO(scroll-grab)` describes for a scrollbar.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+
+        // Press 20 px into the window, then move 40 px before the request is dispatched.
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        go(&mut r, &mut s, drag(40, 0));
+        r.start_move(w, &mut s).expect("the grab is on that window");
+
+        // One more motion. The window must sit where the *press* offset says, which is the
+        // pointer minus the 20 px into the window — not the pointer minus 60.
+        go(&mut r, &mut s, drag(10, 5));
+        let origin = s.window(w).expect("still there").origin;
+        assert_eq!(
+            origin,
+            Point::new(150, 105),
+            "the window jumped by the distance the pointer travelled before the request"
+        );
+    }
+
+    #[test]
+    fn a_move_needs_the_grab_on_that_window() {
+        // Without this a client could move its own window at any time from anywhere, which is
+        // `Place` for itself — and `Place` is a manager op deliberately.
+        let mut s = WindowStack::new();
+        let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
+        let b = win(&mut s, Role::Normal, 300, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+
+        assert!(r.start_move(a, &mut s).is_err(), "no button is down at all");
+
+        warp(&mut r, &mut s, 350, 50);
+        go(&mut r, &mut s, button(true));
+        assert!(r.start_move(a, &mut s).is_err(), "the grab is on the other window");
+        assert!(r.start_move(b, &mut s).is_ok(), "and this is the one being pressed");
+    }
+
+    #[test]
+    fn a_drag_refuses_a_place_and_releases_it_on_the_button_coming_up() {
+        // The rule a manager and a drag have to agree on. Refused rather than silently
+        // overridden: a `Place` that landed mid-drag would be undone by the next motion, so a
+        // manager racing the pointer would appear to work.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+
+        assert_eq!(s.place(w, Point::new(0, 0)), Err(StackError::Dragging));
+        go(&mut r, &mut s, button(false));
+        assert!(s.place(w, Point::new(0, 0)).is_ok(), "the drag ended with the button");
+    }
+
+    #[test]
+    fn a_drag_produces_one_geometry_record_however_far_it_moves() {
+        // **The bound that keeps this off the manager's queue.** That queue does not coalesce
+        // and evicts its oldest when full, so a geometry record per motion would push a
+        // `WindowCreated` off the front of a manager's view of the world (PR #247 review).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        let _ = s.take_geometry_changes();
+
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+        for _ in 0..25 {
+            go(&mut r, &mut s, drag(3, 2));
+        }
+        assert!(s.take_geometry_changes().is_empty(), "a drag in flight reports nothing");
+
+        go(&mut r, &mut s, button(false));
+        assert_eq!(s.take_geometry_changes(), vec![w], "and exactly one record when it ends");
+    }
+
+    #[test]
+    fn a_window_destroyed_mid_drag_ends_the_drag_rather_than_wedging_place() {
+        // A client exiting with the button held is ordinary. Left set, the flag would refuse a
+        // `Place` for that id for the compositor's life, since ids are never reused.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+
+        s.destroy(w).expect("in the stack");
+        assert_eq!(s.dragging(), None, "the drag went with the window");
+        go(&mut r, &mut s, drag(10, 10)); // must not panic, and nothing to move
     }
 
     #[test]

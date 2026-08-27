@@ -1,8 +1,10 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-08-25), and this document describes what
+**Status: built (2026-08-11, last checked 2026-08-27), and this document describes what
 exists.** M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
-the *text area* is still absent and a single line is not the same widget. Milestone 4 built
+the *text area* is still absent and a single line is not the same widget. M9 Part A added
+`title_bar` and, with it, `on_press_down` — the first handler in this toolkit that fires on the
+press rather than on the click. Milestone 4 built
 all of it: the retained tree and the declarative `view` (`userspace/libui/src/element.rs`),
 measure/arrange layout (`layout.rs`), the keyed diff that damage falls out of (`diff.rs`),
 per-buffer damage accumulation (`damage.rs`), event routing with implicit capture
@@ -331,6 +333,16 @@ in this toolkit was clickable, because every click landed on a label.
 and an ancestor that is `focusable` without an `on_key` — which `button` is — would take the
 keyboard from whatever had it and handle nothing. Clicking a menu bar killed typing until this
 was made an exception.
+
+**A press going down is a separate handler from a click, and a nearer click shadows it.**
+`on_press` is a *click* — a release inside the widget that took the press — because pressing a
+button and sliding off it is how a person cancels. That is the wrong moment for a gesture that
+*begins* at the press: a window dragged by its title bar has to start following the pointer when
+the button lands, not when it comes up, by which time the drag is over. `on_press_down` fires at
+the press, and is suppressed when a nearer ancestor of the hit node has an `on_press` — so a title
+bar can carry a drag and hold buttons, and pressing close does not also move the window. The
+shadowing rule is the toolkit's, not the widget's: a widget that handles clicks handles the press
+that begins them (M9 Part A).
 
 **A press captures.** Every pointer event up to the release of the last button goes to the
 widget the press landed on, even after the cursor leaves it. This is the same rule the

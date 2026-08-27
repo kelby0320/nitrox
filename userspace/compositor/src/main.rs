@@ -981,6 +981,12 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     }
 
     deliver(srv, &out);
+    // **What routing did to the stack, told to the manager.** Input is the third path that
+    // mutates windows — a click raises one, and since M9 Part A a drag moves one — and it was
+    // the only one that never drained: the manager and session paths both do it after their
+    // dispatch, so a geometry change made by the pointer sat in the log until some *other*
+    // request happened to flush it. The drag at the end of a gesture is exactly that case.
+    drain_stack_events(srv);
     // A click that raised a window moved focus with it.
     announce_focus(srv);
     // Erase the cursor where it was last drawn and draw it where it is now, along with anything
@@ -1031,6 +1037,11 @@ fn route_one_batch(
             for l in &logical[..n] {
                 let routed = srv.router.route(l, &mut srv.stack, out);
                 if let Some(r) = routed.restacked {
+                    damage.push(r);
+                }
+                // A dragged window disturbs the union of where it was and where it now is,
+                // which `drag_to` computed from state read before the move.
+                if let Some(r) = routed.moved {
                     damage.push(r);
                 }
                 // **Drained per event, not per batch.** A chord and the window events it
@@ -1744,6 +1755,11 @@ fn surface_errno(e: SurfaceError) -> KError {
         // remains the only place anything can be changed. Enumeration lives at the
         // namespace, deliberately; see `docs/spec/rsproto-surface-ops.md`.
         SurfaceError::NotFound => KError::NotFound,
+        // **`WouldBlock`, because it is true again in a moment.** A `Place` refused because the
+        // user is dragging that window is not a malformed request and not a permanent no: the
+        // manager asked for something reasonable at a moment when the pointer owns the window.
+        // `InvalidArgument` would tell it to fix its request, which is not the problem.
+        SurfaceError::Rejected(compositor::StackError::Dragging) => KError::WouldBlock,
         SurfaceError::Rejected(_) => KError::InvalidArgument,
     }
 }
@@ -1837,6 +1853,48 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
         (m.op, m.request_id, n, h)
     };
     let body = &body_buf[..body_len];
+
+    // **`StartMove` is answered here rather than in `dispatch`**, for the reason `Capture` is:
+    // it needs the router, which owns the pointer grab this request is checked against, and
+    // `dispatch` deliberately sees only a connection and the stack. Ownership is checked the same
+    // way every other op checks it — a window belonging to another connection answers `NotFound`,
+    // so a reply cannot be used to probe for other clients' ids.
+    if op == librsproto::surface::OP_START_MOVE {
+        if handle != 0 {
+            // SAFETY: closing a handle this process owns and will never interpret.
+            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        }
+        let err = match librsproto::surface::StartMove::read(body) {
+            None => Some(KError::InvalidArgument),
+            Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
+            Some(req) => match srv.router.start_move(req.window, &mut srv.stack) {
+                Ok(()) => {
+                    Line::new()
+                        .s(b"compositor: interactive move of window ")
+                        .u(req.window as u64)
+                        .end();
+                    None
+                }
+                // The caller does not hold the grab, or the window has gone. One answer for
+                // both, like every other ownership question here — but **said out loud**,
+                // because a refusal that logged nothing is a client whose drag silently does
+                // not happen, and the gate that found this could not tell "refused" from
+                // "never arrived".
+                Err(_) => {
+                    Line::new()
+                        .s(b"compositor: refused a move of window ")
+                        .u(req.window as u64)
+                        .s(b": the pointer is not holding it")
+                        .end();
+                    Some(KError::NotFound)
+                }
+            },
+        };
+        return match err {
+            Some(e) => reply_error_on_session(ch, op, request_id, e),
+            None => reply_on_session(ch, op, request_id, &[]),
+        };
+    }
 
     // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
     let outcome = unsafe {

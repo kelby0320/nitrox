@@ -556,6 +556,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // has sent comes in and goes through the parser. Done here rather than in the event
         // arm because output arrives unprompted — the shell prints when it likes, and a
         // terminal that only looked after a keystroke would show a prompt one keypress late.
+        // **The title bar was dragged.** Performed here rather than in `update`, which has no
+        // syscalls — and performed *before* the frame below, so the compositor is already moving
+        // the window while this client is still painting.
+        if app.take_move_request()
+            && let Some(mut w) = win.window(window_id)
+        {
+            match w.start_move() {
+                Ok(()) => kprint(b"nxterm: dragging its own title bar\n"),
+                // Refused when the grab is not this window's, which is a press that arrived
+                // through some path other than a real one. Not fatal, and not silent.
+                Err(_) => kprint(b"nxterm: the compositor refused the move\n"),
+            }
+        }
+
         if let Some(b) = &mut backend {
             let out = app.take_outbox();
             if !out.is_empty() && !b.typed(&out) {
@@ -716,6 +730,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     .u(u64::from(f))
                     .end();
                 router.set_window_focused(f);
+                // The title bar shows which window has the keyboard, so this is content as well
+                // as routing state.
+                app.focused = f;
             }
             // Everything accumulated about held keys is a guess now. This client keeps none —
             // modifiers arrive on each event — so there is nothing to discard, and saying so

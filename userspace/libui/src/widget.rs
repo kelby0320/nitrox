@@ -66,6 +66,14 @@ pub struct Palette {
     pub track: Rgb,
     /// A scrollbar's thumb.
     pub thumb: Rgb,
+    /// A title bar's face while its window holds the keyboard.
+    pub title_active: Rgb,
+    /// A title bar's face while it does not.
+    ///
+    /// **Two faces rather than one**, because a title bar is the only chrome that says which
+    /// window is focused. The compositor announces focus and the window list marks it, but a
+    /// person looking at two overlapping windows reads it here.
+    pub title_inactive: Rgb,
 }
 
 impl Default for Palette {
@@ -77,6 +85,8 @@ impl Default for Palette {
             focus_ring: Rgb::new(0x5A, 0x9F, 0xD4),
             track: Rgb::new(0x18, 0x1E, 0x26),
             thumb: Rgb::new(0x3A, 0x46, 0x54),
+            title_active: Rgb::new(0x2E, 0x3A, 0x4A),
+            title_inactive: Rgb::new(0x1C, 0x22, 0x2A),
         }
     }
 }
@@ -245,6 +255,105 @@ pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, palette:
     )
 }
 
+
+/// How tall a title bar is, in pixels.
+///
+/// One number rather than a measurement of the font, because a client sizes its window around
+/// it: a bar that grew with the theme would change every window's content area when the theme
+/// changed, and M11 is where a theme becomes changeable.
+pub const TITLE_BAR_H: u32 = 26;
+
+/// How wide each title-bar button is.
+pub const TITLE_BUTTON_W: u32 = 26;
+
+/// A window's title bar: its name, and the three things you can do to a window.
+///
+/// **This is what makes decorations client-side.** The compositor draws no chrome and knows no
+/// theme (M9 decision 1); a window's title bar is part of the pixels its own client commits,
+/// like every other pixel, so nothing about "the window's rectangle" has to mean two things.
+///
+/// The `drag` message is sent when a press goes **down** on the bar — not on the click, which is
+/// a release, and by then the user has finished the gesture. An application answers it by asking
+/// the compositor for an interactive move: the compositor already holds the pointer grab the
+/// press opened, so all the client contributes is "that press was on a part of me that moves the
+/// window". It cannot compute the move itself — it does not know where it is on screen, and
+/// `Place` is deliberately a manager op.
+///
+/// A press on one of the buttons does *not* drag, because a nearer `on_press` shadows the bar's
+/// `on_press_down`. That rule is the toolkit's, not this widget's.
+///
+/// **The buttons are ordinary buttons and the bar is an ordinary `stack`.** A title bar is
+/// chrome by convention rather than by mechanism, which is what lets any client draw one — and
+/// what would let a client draw something else entirely, which is a property of client-side
+/// decorations and not a defect in this widget.
+pub fn title_bar<Msg: Clone>(
+    title: impl Into<String>,
+    focused: bool,
+    drag: Msg,
+    buttons: TitleButtons<Msg>,
+    palette: &Palette,
+) -> Element<Msg> {
+    let face = if focused { palette.title_active } else { palette.title_inactive };
+    let btn = |label: &str, msg: Msg| {
+        sized(
+            Size::new(TITLE_BUTTON_W, TITLE_BAR_H),
+            stack(alloc::vec![padding(BUTTON_PAD, text(label))]).on_press(msg),
+        )
+    };
+    // **A button a caller has no message for is not drawn.** The alternative is a button that
+    // does nothing, and a control that looks live and is not is the defect this milestone's
+    // predecessor shipped three of (M8's overview). The buttons arrive with the parts that give
+    // them somewhere to go: minimise and maximise in Part B, close in Part C.
+    let mut controls = alloc::vec::Vec::with_capacity(4);
+    controls.push(padding(TITLE_PAD, text(title)).flex(1));
+    if let Some(m) = buttons.minimise {
+        controls.push(btn("_", m));
+    }
+    if let Some(m) = buttons.maximise {
+        controls.push(btn("[]", m));
+    }
+    if let Some(m) = buttons.close {
+        controls.push(btn("X", m));
+    }
+    // **The drag is on the bar itself, not on the face underneath the label.** Dispatch walks
+    // *up* from whatever was hit to the nearest handler, and the label spans the bar — so a
+    // handler on the face below it is never reached, and the first version of this widget
+    // produced nothing at all for a press in the middle of its own title. On the bar, a press
+    // that lands on the label or on empty space walks up to here, and one that lands on a button
+    // stops at the button, because that is where the walk finds a handler first.
+    sized(
+        Size::new(0, TITLE_BAR_H),
+        stack(alloc::vec![fill(face), row(controls)]).on_press_down(drag),
+    )
+}
+
+/// What a title bar's buttons do, for the ones their application has an answer for.
+///
+/// `None` is "do not draw it". See [`title_bar`] for why that is not the same as a button that
+/// does nothing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TitleButtons<Msg> {
+    /// Sent by the minimise button.
+    pub minimise: Option<Msg>,
+    /// Sent by the maximise button.
+    pub maximise: Option<Msg>,
+    /// Sent by the close button.
+    pub close: Option<Msg>,
+}
+
+/// No buttons at all — a bar that shows a title and can be dragged.
+///
+/// **Written out rather than derived.** `#[derive(Default)]` on a generic struct demands
+/// `Msg: Default`, which is a bound on the *application's* message type for no reason: every
+/// field here is an `Option` and its default is `None` whatever `Msg` is.
+impl<Msg> Default for TitleButtons<Msg> {
+    fn default() -> Self {
+        Self { minimise: None, maximise: None, close: None }
+    }
+}
+
+/// Space between a title bar's text and its edge.
+const TITLE_PAD: Insets = Insets { top: 5, right: 6, bottom: 5, left: 8 };
 
 /// Space between a text field's content and its edge.
 const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
@@ -1358,6 +1467,115 @@ mod tests {
         );
         assert_eq!(big, small, "a button's size must not depend on the room around it");
         assert!(big.h < 100, "a two-line-tall button: {big:?}");
+    }
+
+    #[test]
+    fn a_title_bars_buttons_sit_at_its_right_edge_and_the_drag_face_takes_the_rest() {
+        // **The layout property a person notices**, and the one that decides where a press
+        // lands: the buttons are at the right, the title runs from the left, and everything
+        // between them is draggable. A `flex(1)` label that measured to its text instead would
+        // leave the buttons floating next to the title in the middle of the bar.
+        #[derive(Clone, PartialEq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        let p = Palette::default();
+        let e = title_bar(
+            "a terminal",
+            true,
+            M::Drag,
+            TitleButtons {
+                minimise: Some(M::Min),
+                maximise: Some(M::Max),
+                close: Some(M::Close),
+            },
+            &p,
+        );
+        let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
+        // sized -> stack -> [face, row] ; row -> [label, min, max, close]
+        let stack = &l.children[0];
+        let face = stack.children[0].rect;
+        let row = &stack.children[1];
+        assert_eq!(face.size.h, TITLE_BAR_H, "the draggable face is the bar");
+        assert_eq!(face.size.w, 400, "and it spans it");
+
+        let close = row.children[3].rect;
+        assert_eq!(close.right(), 400, "the close button is at the right edge");
+        assert_eq!(close.size.w, TITLE_BUTTON_W);
+        let label = row.children[0].rect;
+        assert_eq!(label.origin.x, 0, "the title starts at the left");
+        assert!(
+            label.right() <= row.children[1].rect.origin.x as i64,
+            "the title overlaps the buttons: {label:?} vs {:?}",
+            row.children[1].rect
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_bars_face_is_a_drag_and_a_press_on_a_button_is_not() {
+        // The discrimination the whole widget exists for. The buttons sit *above* the face in
+        // the stack, so a press on one must produce its own message and not also a drag —
+        // otherwise every click on close would move the window a little first.
+        use crate::diff::Tree;
+        use crate::route::Router;
+        use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+
+        #[derive(Clone, PartialEq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        let p = Palette::default();
+        let e = title_bar(
+            "a terminal",
+            true,
+            M::Drag,
+            TitleButtons {
+                minimise: Some(M::Min),
+                maximise: Some(M::Max),
+                close: Some(M::Close),
+            },
+            &p,
+        );
+        let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
+        let mut tree = Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+
+        let at = |x: i32, pressed: bool| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: u16::from(pressed),
+            flags: if pressed { POINTER_PRESSED } else { 0 },
+            x,
+            y: 8,
+            ..Default::default()
+        };
+        // The press and the release, kept apart: a drag is decided by the first and a click by
+        // the second, and this widget carries one of each.
+        let mut down = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, true)).0;
+        let mut up = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, false)).0;
+
+        let mut r = Router::new();
+        assert_eq!(down(&mut r, 200), vec![M::Drag], "the bar moves the window on the press…");
+        assert_eq!(up(&mut r, 200), vec![], "…and the release adds nothing");
+
+        let mut r = Router::new();
+        assert_eq!(
+            down(&mut r, 390),
+            vec![],
+            "a press on close must not also drag: the window would move under the pointer while \
+             the user is aiming at a button"
+        );
+        assert_eq!(up(&mut r, 390), vec![M::Close], "and the click is the close");
+
+        let mut r = Router::new();
+        assert_eq!(down(&mut r, 364), vec![], "the same for maximise");
+        assert_eq!(up(&mut r, 364), vec![M::Max]);
     }
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");

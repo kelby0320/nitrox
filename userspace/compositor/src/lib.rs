@@ -200,6 +200,13 @@ pub enum StackError {
     TooManyWindows,
     /// [`STICKY_DESKTOP`] was given where a real desktop was required.
     StickyIsNotADesktop,
+    /// That window is being dragged by the user, so a manager may not place it.
+    ///
+    /// **Refused rather than silently overridden.** A `Place` that landed mid-drag would move the
+    /// window out from under the pointer and be undone by the next motion event a moment later,
+    /// so a manager that raced a drag would appear to work and fight the pointer. Refusing gives
+    /// it an answer it can act on (M9 Part A).
+    Dragging,
 }
 
 /// How many windows one connection may hold at once.
@@ -430,6 +437,12 @@ pub struct WindowStack {
     geometry_log: Vec<u32>,
     /// Which desktop is composited. Never [`STICKY_DESKTOP`] — see [`Self::set_current_desktop`].
     current_desktop: u32,
+    /// The window the user is interactively dragging, if any.
+    ///
+    /// **Here rather than in the router, because two paths need it.** The router runs the drag;
+    /// the *manager* path has to refuse a `Place` for a window being dragged, and it never sees
+    /// the router. The stack is what both of them already hold.
+    dragging: Option<u32>,
 }
 
 impl Default for WindowStack {
@@ -456,6 +469,7 @@ impl WindowStack {
             // desktop was the sticky value would composite only sticky windows and make every
             // window it created afterwards sticky too, by the create-onto-current rule.
             current_desktop: 1,
+            dragging: None,
         }
     }
 
@@ -614,12 +628,61 @@ impl WindowStack {
     /// Returns [`Damage`] rather than a bare `Rect` so that forgetting it is a warning: see that
     /// type for why `#[must_use]` on this function would not have been enough.
     pub fn place(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
+        if self.dragging == Some(id) {
+            return Err(StackError::Dragging);
+        }
+        self.move_to(id, origin, true)
+    }
+
+    /// The window the user is interactively dragging, if any.
+    pub fn dragging(&self) -> Option<u32> {
+        self.dragging
+    }
+
+    /// Begin an interactive drag of `id`, which makes [`place`](Self::place) refuse it.
+    ///
+    /// `NoSuchWindow` if it is not in the stack. Beginning a second drag replaces the first: the
+    /// pointer has one grab, so two drags cannot be in flight, and the arithmetic that would
+    /// decide which to keep is arithmetic about a state that cannot happen.
+    pub fn begin_drag(&mut self, id: u32) -> Result<(), StackError> {
+        if self.window(id).is_none() {
+            return Err(StackError::NoSuchWindow);
+        }
+        self.dragging = Some(id);
+        Ok(())
+    }
+
+    /// End the drag, and record the one geometry change it produced.
+    ///
+    /// **One record for the whole gesture, not one per motion.** [`drag_to`](Self::drag_to) does
+    /// not log, because the manager's queue does not coalesce and evicts its oldest when full —
+    /// a five-second drag at 100 Hz would push a `WindowCreated` off the front and leave the
+    /// manager with a window it will never place and never hear about again (PR #247 review).
+    /// What a manager needs is where the window ended up, which is one record.
+    pub fn end_drag(&mut self) {
+        if let Some(id) = self.dragging.take()
+            && self.window(id).is_some()
+        {
+            self.geometry_log.push(id);
+        }
+    }
+
+    /// Move a window the user is dragging, without logging a geometry change.
+    ///
+    /// Returns `NoSuchWindow` if it has gone, which is the ordinary end of a drag whose client
+    /// exited while the button was down.
+    pub fn drag_to(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
+        self.move_to(id, origin, false)
+    }
+
+    /// The body of [`place`](Self::place) and [`drag_to`](Self::drag_to).
+    fn move_to(&mut self, id: u32, origin: Point, log: bool) -> Result<Damage, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         let uncommitted = w.committed.is_none();
         let was = w.bounds();
         w.origin = origin;
         let now = w.bounds();
-        if was != now {
+        if log && was != now {
             self.geometry_log.push(id);
         }
         if uncommitted {
@@ -744,6 +807,12 @@ impl WindowStack {
             if self.windows.len() == before {
                 break;
             }
+        }
+        // **A drag cannot outlive its window**, and a client exiting with the button held is the
+        // ordinary way that happens. Left set, the flag would refuse a `Place` for an id that no
+        // longer exists — for the life of the compositor, since ids are never reused.
+        if self.dragging.is_some_and(|d| self.window(d).is_none()) {
+            self.dragging = None;
         }
         Ok(())
     }

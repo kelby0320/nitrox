@@ -1478,6 +1478,17 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
+/// Read `<id> at 0,<y>` — the tail of the shell's placement line. Returns `(id, y)`.
+fn parse_placement(rest: &str) -> Option<(u32, i32)> {
+    let mut it = rest.split_whitespace();
+    let id = it.next()?.parse().ok()?;
+    if it.next()? != "at" {
+        return None;
+    }
+    let (_, y) = it.next()?.split_once(',')?;
+    Some((id, y.parse().ok()?))
+}
+
 /// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxterm`'s menu-popup line.
 ///
 /// Hand-parsed for the same reason the QMP reply is: xtask carries no regex dependency, and the
@@ -1692,6 +1703,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // placement that could not have been load-bearing. The terminal's placement arrives one
     // loop iteration after the close, when its `WindowCreated` is drained.
     session.expect("desktop-shell: placed window ")?;
+    // **Remembered, because the drag below needs to know where it started.** The line reads
+    // `<id> at 0,<y>`; nothing moves this window between here and there — a desktop change and a
+    // minimise leave the origin alone — so this is its origin at that point.
+    let placed = session.rest_of_line()?;
+    let (term_id, term_y) = parse_placement(&placed)
+        .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // And it is listed, focused, because it has the keyboard.
     session.expect("desktop-shell: window list on ")?;
 
@@ -1999,7 +2016,53 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: overview raised window ")?;
     session.expect("desktop-shell: overview closed")?;
 
-    // 6g. **Movement is not lost while the compositor is busy** — the one property the whole
+    // 6g. **A window is dragged by its own title bar** (M9 Part A). Client-side decorations mean
+    //     the bar is pixels `nxterm` committed; what crosses the wire is one `StartMove`, and the
+    //     compositor — which is holding the grab the press opened — moves the window from there.
+    //
+    //     **The motion is injected before the request can arrive, and that is the assertion.**
+    //     `StartMove` is a full round trip after the press: the compositor delivers it, `libui`
+    //     routes it, `nxterm` decides it landed on the bar, and only then does the request go
+    //     out. A compositor that took its drag offset from the pointer *at the request* would
+    //     lose whatever the pointer did in between — the window jumps by that much and then
+    //     tracks correctly, which is exactly the defect `TODO(scroll-grab)` describes. Every
+    //     other step here waits for the guest between injections; this one deliberately does not,
+    //     because a stationary pointer across that round trip measures zero drift where a person
+    //     sees forty pixels (PR #247 review, finding 4).
+    const DRAG_STEPS: i32 = 4;
+    const DRAG_DX: i32 = 10;
+    const DRAG_DY: i32 = 5;
+    // The title bar is the top 26 px of the window; x=100 is clear of the buttons at its right.
+    let press_at = (100, term_y + 13);
+    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    qmp.pointer = Some(press_at);
+    qmp.send_button("left", true)?;
+    // **Half the motion before the request can possibly arrive**, which is the half a
+    // compositor reading the pointer at `StartMove` would lose.
+    for _ in 0..DRAG_STEPS / 2 {
+        qmp.send_motion(DRAG_DX, DRAG_DY)?;
+    }
+    // **And the button stays down until the drag is accepted.** A person holds it for a
+    // fraction of a second; this harness can press and release faster than the round trip to
+    // the client and back, and a release that lands first takes the grab away — the compositor
+    // then refuses a move for a window nobody is holding, which is correct and is not what this
+    // step is testing (found the expensive way: the first version released immediately).
+    session.expect("compositor: interactive move of window ")?;
+    for _ in 0..DRAG_STEPS / 2 {
+        qmp.send_motion(DRAG_DX, DRAG_DY)?;
+    }
+    qmp.send_button("left", false)?;
+    qmp.pointer = Some((press_at.0 + DRAG_STEPS * DRAG_DX, press_at.1 + DRAG_STEPS * DRAG_DY));
+    // The window ended up offset by exactly what was injected. One line for the gesture:
+    // the compositor reports no geometry change per motion, deliberately.
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} ",
+        DRAG_STEPS * DRAG_DX,
+        term_y + DRAG_STEPS * DRAG_DY
+    ))?;
+    println!("  ok: the terminal moved with its own title bar, offset by where it was grabbed");
+
+    // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
     //
     //     A relative pointer's deltas *are* its position: a batch the input server cannot

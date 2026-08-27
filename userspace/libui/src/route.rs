@@ -329,6 +329,26 @@ impl Router {
             {
                 out.push(f(localise(event, l.rect)));
             }
+
+            // **A press going down, for gestures decided before the release.** A drag is the
+            // motivating one: a window follows the pointer from the moment the button lands on
+            // its title bar, and `on_press` — a *click*, which is a release inside the widget
+            // that took the press — would start the move after the user had finished making it.
+            //
+            // **A nearer `on_press` shadows it**, and that rule is the whole discrimination a
+            // title bar needs: its buttons handle clicks, so pressing close does not also drag
+            // the window. `nearest` walks from the deepest element outwards, so a larger index
+            // is the nearer handler.
+            if pressed
+                && let Some((n_down, e_down)) = nearest(&|e: &Element<Msg>| e.on_press_down.is_some())
+                && let Some(msg) = e_down.on_press_down.clone()
+            {
+                let shadowed = nearest(&|e: &Element<Msg>| e.on_press.is_some())
+                    .is_some_and(|(n_click, _)| n_click > n_down);
+                if !shadowed {
+                    out.push(msg);
+                }
+            }
             let e = match element_at(element, &path) {
                 Some(e) => e,
                 None => return (out, target),

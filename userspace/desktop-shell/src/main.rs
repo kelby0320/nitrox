@@ -2861,6 +2861,23 @@ fn place_new_windows(
                     && let Some(e) = entries.iter_mut().find(|e| e.id == g.window)
                 {
                     e.size = (g.width, g.height);
+                    // **Where it ended up, said once.** A user-dragged window reports exactly
+                    // one of these for the whole gesture — the compositor does not log a
+                    // geometry change per motion, because this queue does not coalesce — so
+                    // this line is one per move rather than one per frame, and it is the only
+                    // place a gate can read where a drag put a window.
+                    Line::new()
+                        .s(b"desktop-shell: window ")
+                        .u(g.window as u64)
+                        .s(b" geometry ")
+                        .i(g.x as i64)
+                        .s(b",")
+                        .i(g.y as i64)
+                        .s(b" ")
+                        .u(g.width as u64)
+                        .s(b"x")
+                        .u(g.height as u64)
+                        .end();
                 }
                 continue;
             }

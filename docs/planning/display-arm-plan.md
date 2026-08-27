@@ -2300,37 +2300,59 @@ and Part D is the milestone where something can.
 
 ### Part A — the title bar, and a window that can be dragged by it
 
-- [ ] **`libui` gains a title bar.** A widget: the window's title, a focus state, and three
-      buttons (minimise, maximise, close) laid out at the top of a client's tree. It is an
-      ordinary `Element` — `row`, `text`, `on_press` — so it costs the toolkit no new mechanism,
-      and `Theme` is where its colours come from, which is the seam M11 will ask about.
+- [x] **`libui` gains a title bar** ✅. A widget: the window's title, a focus state, and up to
+      three buttons at the top of a client's tree. **It did cost the toolkit one new mechanism**,
+      which this box said it would not: `on_press` is a *click* — a release inside the widget
+      that took the press — and a drag begins at the press, so the bar would have started
+      following the pointer at the moment the user let go. `on_press_down` fires at the press,
+      and a nearer `on_press` shadows it, which is what lets one bar carry a drag and hold
+      buttons that do not drag. A button the caller has no message for is **not drawn**, so the
+      minimise and maximise buttons arrive with Part B rather than sitting there dead.
 
-- [ ] **`nxterm` adopts it**, above the menu bar it already draws. That makes the only
-      application there is the first consumer, rather than a demo client nobody runs.
+- [x] **`nxterm` adopts it** ✅, above the menu bar it already draws — the only application
+      there is, rather than a demo client nobody runs. Its window grew by the bar's height and
+      its grid did not shrink: chrome that costs the user a row of text is chrome charged to the
+      wrong account.
 
-- [ ] **The router records where a press landed**, alongside the grab it already takes
-      (`InputRouter` keeps `pointer`, `grab`, `grab_button`, `buttons`, `modifiers` — and not
-      this). Everything below depends on it: a drag offset measured when `StartMove` *arrives* is
-      measured a round trip late, and the window jumps by however far the pointer travelled while
-      the client was deciding the press was on its title bar.
+- [x] **The router records where a press landed** ✅, alongside the grab it already takes.
+      Everything else depends on it: a drag offset measured when `StartMove` *arrives* is measured
+      a round trip late, and the window jumps by however far the pointer travelled while the
+      client was deciding the press was on its title bar.
 
-- [ ] **`Surface::StartMove(window)`** — a client request meaning "the user has grabbed a part of
-      me that moves the window". The compositor moves the window with the pointer, offset by the
-      recorded press position, and ends on button-up. Refused when the caller holds no pointer
-      grab, so a client cannot move its window while nobody is touching it.
+- [x] **`Surface::StartMove(window)`** ✅ — "the user has grabbed a part of me that moves the
+      window". The compositor moves the window with the pointer, offset by the recorded press
+      position, and ends on button-up. Refused when the caller's window holds no pointer grab, so
+      a client cannot move its window while nobody is touching it — and the refusal **says so on
+      the console**, because a drag that silently does not happen is indistinguishable from one
+      whose request never arrived, which cost a boot to find out.
 
-- [ ] **The rule a manager and a drag must agree on**: a window being interactively moved is not
-      being `Place`d at the same time. The compositor is the arbiter — `Place` during a drag is
-      refused rather than silently overridden, because a manager that lost a race would otherwise
-      appear to work and fight the pointer.
+      **The catch-up is applied when the drag starts**, not at the next motion: the pointer has
+      already moved by the time the request lands, so a drag that waited would leave the window
+      trailing — and would never move it at all for a gesture that ended in the meantime.
 
-- [ ] **Gate**: `check-login` presses on `nxterm`'s title bar, **moves the pointer before the
-      client's `StartMove` can arrive**, and then asserts the origin. The injected motion is the
-      whole point: the harness sends one QMP event at a time and waits, so a gate that presses
-      and drags without it leaves the pointer stationary across the round trip and measures zero
-      drift where a person sees forty pixels. Two controls, because two different implementations
-      pass a naive assertion — a drag that centres the window on the pointer (loses the offset),
-      and a drag that reads the pointer at `StartMove` (measures it late).
+- [x] **The rule a manager and a drag must agree on** ✅: a window being interactively moved is
+      not being `Place`d at the same time. `Place` during a drag is refused with `WouldBlock` —
+      well-formed, and answerable again in a moment — rather than silently overridden, because a
+      manager that lost the race would otherwise appear to work and fight the pointer. The flag
+      lives on the *stack* rather than in the router, because the manager path never sees the
+      router, and it goes with the window if the client exits mid-drag.
+
+      **One `WindowGeometry` for the gesture, at its end.** Per motion it would be a manager event
+      per pointer event, into the queue that does not coalesce and evicts its oldest — the failure
+      PR #247's review named. Draining it needed a fix of its own: the *input* path never drained
+      stack events at all, so a geometry change made by the pointer waited for some unrelated
+      request to flush it.
+
+- [x] **Gate** ✅: `check-login` presses on `nxterm`'s title bar, moves the pointer **before the
+      client's `StartMove` can arrive**, and asserts the origin the shell reports. Both named
+      controls fail it: a drag that reads the pointer at the request loses the motion injected
+      before it, and one that puts the window at the pointer loses the grab offset.
+
+      **And the button has to stay down until the drag is accepted**, which the first version got
+      wrong: this harness can press and release faster than the round trip to the client and back,
+      and a release that lands first takes the grab away — so the compositor correctly refused a
+      move for a window nobody was holding. A person holds a button for a fraction of a second;
+      a gate has to be told to.
 
 ### Part B — what the shell needs to answer a button, and the buttons that ask
 

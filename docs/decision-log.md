@@ -19180,3 +19180,46 @@ a time and would otherwise measure zero drift where a person sees forty pixels. 
 `RequestState` is the first client-rate-controlled producer of manager events: a request for a
 state the window is already in produces nothing, the same dedup `SetTitle` already has and for
 the same stated reason.
+
+## 2026-08-27 — M9 Part A: a window is dragged by chrome its own client drew
+
+The first part of client-side decorations. `libui` has a title bar, `nxterm` wears one, and a
+press on it hands the compositor an interactive move. Four things the plan did not know, and one
+it named and got right.
+
+**The toolkit needed a new handler, and the plan said it would not.** Part A's first box claimed
+a title bar costs no new mechanism — "an ordinary `Element` — `row`, `text`, `on_press`". But
+`on_press` is a *click*: a release inside the widget that took the press, deliberately, because
+pressing a button and sliding off it is how a person cancels. A drag begins at the press, so a bar
+built on `on_press` starts following the pointer at the moment the user lets go. `on_press_down`
+fires at the press, and **a nearer `on_press` shadows it** — which is the whole discrimination a
+title bar needs: its buttons handle clicks, so pressing close does not also move the window. The
+rule belongs to the toolkit rather than to the widget: a widget that handles clicks handles the
+press that begins them.
+
+**A button with nothing to call is not drawn.** `TitleButtons` takes an `Option` per button, and
+`nxterm` passes none of them in Part A: minimise and maximise have nowhere to go until Part B
+gives a client a way to ask the shell for them. This milestone's predecessor shipped three
+controls that looked live and were not, and the fix each time was the same sentence.
+
+**The refusal had to say so out loud.** `StartMove` is refused when the caller's window does not
+hold the pointer grab, and the first version logged nothing — so a drag that did not happen was
+indistinguishable from a request that never arrived, which is exactly the fork the first failing
+gate run needed and did not have.
+
+**The catch-up is applied when the drag starts, not at the next motion.** The pointer has already
+moved by the time the request lands — that round trip is why the press position is recorded at
+all — so a drag that waited for the next event would leave the window trailing, and would never
+move it at all for a gesture that ended in the meantime.
+
+**And the input path never drained stack events.** The manager and session paths both drain after
+dispatch; input, which is the third thing that mutates windows, did not — so the one
+`WindowGeometry` a drag produces sat in the log until some unrelated request flushed it. Latent
+before now because input's only stack mutation was a raise, which changes no geometry.
+
+**What the plan named and got right**: the offset must be recorded at the press. The gate injects
+motion *before* the client's request can arrive, and both controls the plan named fail it — a
+drag that reads the pointer at `StartMove` loses that motion, and one that puts the window at the
+pointer loses the grab offset. The gate needed one correction of its own: the button has to stay
+down until the drag is accepted, because this harness can press and release faster than the round
+trip to the client and back, and a release that lands first correctly leaves nothing to drag.
