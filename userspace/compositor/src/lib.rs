@@ -749,11 +749,31 @@ impl WindowStack {
     }
 
     /// Raise a window to the top of the stack.
-    pub fn raise(&mut self, id: u32) -> Result<(), StackError> {
+    ///
+    /// **The damage is the window's own rectangle, and that is exact.** Moving one window within
+    /// the order changes the relative order of no other pair, so every pixel outside this
+    /// window's bounds is composed from the same windows in the same order as before — only the
+    /// pixels it covers can differ. This used to answer "repaint everything", on the reasoning
+    /// that which pixels change "depends on every overlap in the stack"; that is true of *which*
+    /// of them change and irrelevant to *where* they are.
+    ///
+    /// It is not a micro-optimisation. A full recompose of a 1280×800 screen takes ~100 ms under
+    /// emulation, during which the compositor reads no input, and the input server's ring holds
+    /// a fraction of a second of a moving mouse — so a click that raised a window used to cost a
+    /// visible chunk of the movement around it (2026-08-26).
+    ///
+    /// A window that is already topmost is left alone and reports **empty** damage: the stack
+    /// did not change, so nothing needs repainting. Click-to-focus raises on every press,
+    /// including the tenth press on the same window.
+    pub fn raise(&mut self, id: u32) -> Result<Damage, StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
+        if i + 1 == self.windows.len() {
+            return Ok(Damage(Rect::new(0, 0, 0, 0)));
+        }
         let w = self.windows.remove(i);
+        let rect = w.bounds();
         self.windows.push(w);
-        Ok(())
+        Ok(Damage(rect))
     }
 
     /// Send a window to the bottom of the stack.
@@ -761,11 +781,15 @@ impl WindowStack {
     /// No caller until the shell (M7): click-to-focus only ever raises. It lands here with
     /// [`raise_above`](Self::raise_above) because the three are one ordering rule, and a stack
     /// that can only ever push in one direction is one nobody can write alt-tab against.
-    pub fn lower(&mut self, id: u32) -> Result<(), StackError> {
+    pub fn lower(&mut self, id: u32) -> Result<Damage, StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
+        if i == 0 {
+            return Ok(Damage(Rect::new(0, 0, 0, 0)));
+        }
         let w = self.windows.remove(i);
+        let rect = w.bounds();
         self.windows.insert(0, w);
-        Ok(())
+        Ok(Damage(rect))
     }
 
     /// Put `id` directly above `other` in the stack.
@@ -777,21 +801,25 @@ impl WindowStack {
     /// `id == other` is a no-op rather than an error: it is the degenerate case of a request
     /// that is otherwise well-formed, and a shell iterating a window list should not have to
     /// special-case the window it is already above.
-    pub fn raise_above(&mut self, id: u32, other: u32) -> Result<(), StackError> {
+    pub fn raise_above(&mut self, id: u32, other: u32) -> Result<Damage, StackError> {
         if self.window(id).is_none() || self.window(other).is_none() {
             return Err(StackError::NoSuchWindow);
         }
         if id == other {
-            return Ok(());
+            return Ok(Damage(Rect::new(0, 0, 0, 0)));
         }
         let i = self.windows.iter().position(|w| w.id == id).expect("checked above");
         let w = self.windows.remove(i);
+        let rect = w.bounds();
         // Recomputed *after* the removal: taking `id` out shifts everything above it down by
         // one, so an index captured before would place the window one slot too high whenever
         // `id` sat below `other`.
         let j = self.windows.iter().position(|w| w.id == other).expect("checked above");
         self.windows.insert(j + 1, w);
-        Ok(())
+        // Empty when it landed where it already was, for the reason [`raise`](Self::raise)
+        // gives: the order is unchanged, so nothing on screen is.
+        let moved = j + 1 != i;
+        Ok(Damage(if moved { rect } else { Rect::new(0, 0, 0, 0) }))
     }
 
     /// The area left for `normal` windows after every panel's reservation.
@@ -1188,6 +1216,91 @@ mod tests {
     /// 32×16, so a sprite anywhere but the top-left corner falls off it.
     fn big_screen() -> MemFramebuffer {
         MemFramebuffer::new(Geometry::with_pitch(96, 96, 400, PixelFormat::XRGB8888).unwrap())
+    }
+
+    /// Two overlapping windows and a screen already showing them, for the restack tests.
+    ///
+    /// Returns the stack, the pixel source, and `(bottom, top)`.
+    fn overlapping_pair() -> (WindowStack, MapSource, (u32, u32)) {
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let bottom = shown(&mut s, &CreateWindowRequest::new(20, 10, Role::Normal));
+        let top = shown(&mut s, &CreateWindowRequest::new(20, 10, Role::Normal));
+        for (id, colour) in [(bottom, Rgb::new(0xFF, 0, 0)), (top, Rgb::new(0, 0xFF, 0))] {
+            s.attach(&attach(id, 0, 20, 10)).unwrap();
+            src.put(id, 0, geom(20, 10), colour);
+            s.commit(&commit(id, 0)).unwrap();
+        }
+        // Overlapping by half, so a reorder changes pixels rather than merely the order.
+        let _ = s.place(bottom, Point::new(0, 0)).unwrap();
+        let _ = s.place(top, Point::new(10, 3)).unwrap();
+        (s, src, (bottom, top))
+    }
+
+    #[test]
+    fn the_region_a_raise_reports_is_the_whole_of_what_it_changed() {
+        // **The guard on narrowing a restack's repaint from the whole screen to one rectangle.**
+        // The claim is that reordering one window can only change pixels inside that window's
+        // own bounds, because every other pair keeps its relative order. If that is wrong
+        // anywhere, painting only the reported region leaves stale pixels — so this paints the
+        // reported region into one screen, recomposes the whole of another, and compares every
+        // byte.
+        let (mut s, src, (bottom, _top)) = overlapping_pair();
+        let mut painted = screen();
+        let full = Rect::new(0, 0, 32, 16);
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+
+        let d = s.raise(bottom).expect("in the stack");
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100));
+
+        let mut reference = screen();
+        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        assert_eq!(
+            painted.bytes(),
+            reference.bytes(),
+            "repainting only the raised window's rectangle must leave the screen identical to a \
+             full recompose"
+        );
+    }
+
+    #[test]
+    fn the_region_a_lower_reports_is_the_whole_of_what_it_changed() {
+        // The same claim in the other direction: what a lowered window uncovers is inside its
+        // own rectangle too.
+        let (mut s, src, (_bottom, top)) = overlapping_pair();
+        let mut painted = screen();
+        let full = Rect::new(0, 0, 32, 16);
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+
+        let d = s.lower(top).expect("in the stack");
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100));
+
+        let mut reference = screen();
+        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        assert_eq!(painted.bytes(), reference.bytes(), "a lower's region must cover its own");
+    }
+
+    #[test]
+    fn a_restack_that_changes_no_order_reports_no_region() {
+        // Click-to-focus raises on every press, including on the window already on top, and a
+        // manager's window list does the same. Reporting a region for those made every one of
+        // them a repaint.
+        let (mut s, _src, (bottom, top)) = overlapping_pair();
+        assert!(s.raise(top).expect("in the stack").is_empty(), "already topmost");
+        assert!(s.lower(bottom).expect("in the stack").is_empty(), "already bottom-most");
+        assert!(s.raise_above(top, bottom).expect("both exist").is_empty(), "already above it");
+        assert_eq!(
+            s.windows().iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![bottom, top],
+            "and none of them reordered anything"
+        );
+    }
+
+    #[test]
+    fn a_raise_that_does_reorder_reports_the_window_it_moved() {
+        let (mut s, _src, (bottom, _top)) = overlapping_pair();
+        let want = s.window(bottom).expect("in the stack").bounds();
+        assert_eq!(s.raise(bottom).expect("in the stack").rect(), want);
     }
 
     #[test]

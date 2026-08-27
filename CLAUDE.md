@@ -47,6 +47,7 @@ Standard development loop:
 cargo xtask build          # build the kernel ELF
 cargo xtask image          # build + assemble the UEFI-bootable disk image
 cargo xtask qemu           # build, assemble the image, and launch under QEMU
+cargo xtask qemu --grab    # …with the window holding the pointer and keyboard
 cargo xtask qemu --selftest # …with the boot self-tests / demos compiled in
 cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
 cargo xtask test           # host-side unit tests
@@ -58,6 +59,22 @@ cargo xtask check-input    # inject a key + a click over QMP; check they reach a
 cargo xtask check-images   # test vs release initramfs: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
 ```
+
+**Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
+**relative** pointing device and no absolute one — a PS/2 mouse reports movement, and there is no
+USB or virtio input driver for a tablet device to talk to — so nothing ever tells it where the
+host's pointer is. Ungrabbed, the guest's cursor and yours are two independent cursors whose
+offset is permanent and *cannot* be corrected by pushing into a corner: your pointer leaves the
+window, and stops producing motion, before the guest's cursor reaches the edge. Every chord is
+`Super`-something, and GNOME, KDE and COSMIC all bind `Super` at the host compositor, so those
+keystrokes are your desktop's rather than the guest's. `--grab` confines the pointer and takes
+the keyboard (Ctrl-Alt-G releases it); on a Wayland session it also runs the window through
+XWayland, because a grab is an X operation. `Super` alone is deliberately unbound in the guest —
+the chords are `Super+H`, `Super+1..4`, `Super+Shift+1..4`, `Super+R`.
+
+When a chord seems dead, the debug console says which half is at fault: the compositor logs
+`Super down` / `Super up` per transition (the modifier only — never the key beside it, which at a
+password prompt would be the password). No line means the keystroke never left your desktop.
 
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
 headless and adjudicates the whole boot (kernel → init → mount → userspace demos)

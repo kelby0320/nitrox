@@ -31,14 +31,14 @@
 #![no_std]
 #![no_main]
 
-use input_server::{BATCH_MAX, Consumer, PER_DEVICE, merge};
+use input_server::{BATCH_MAX, Consumer, FRAME_MAX, PER_DEVICE, merge};
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::error::KError;
 use libkern::{
-    IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, SENDMODE_NOBLOCK,
-    SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
-    syscall5,
+    CLOCK_MONOTONIC, IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
+    SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT,
+    exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -67,6 +67,41 @@ const MOUSE: usize = 1;
 /// One is the compositor; the rest leave room for a hotkey daemon or a diagnostic reader
 /// without making the wait set interesting.
 const MAX_CONSUMERS: usize = 4;
+
+/// Messages a consumer's ring holds before a send starts failing.
+///
+/// **Sized against a repaint, not against the mouse.** One group is one message, so a 100 Hz
+/// mouse fills four slots in 40 ms — less than a single full-screen recompose takes the
+/// compositor under emulation. Deferral (see [`Consumer`]) is what makes the *cursor* immune to
+/// that, but a key or a button in an overflowing batch is still a real gap, and a gap resets the
+/// consumer's modifier and grab state. Sixteen covers a repaint at TCG speeds; each slot is a
+/// 4 KiB kernel message, so this is 64 KiB per consumer and worth it.
+const CONSUMER_QUEUE_DEPTH: u64 = 16;
+
+/// Messages the control ring holds. Requests here are rare and answered immediately.
+const CONTROL_QUEUE_DEPTH: u64 = 4;
+
+/// How long to wait before retrying a consumer that is holding deferred motion.
+///
+/// Short enough that a person cannot see the catch-up, long enough that a stalled consumer costs
+/// a handful of wakeups rather than a spin: the compositor's worst recompose is ~100 ms under
+/// emulation, so this is about twenty attempts across one, each of which is a `sys_wait` return
+/// and one non-blocking send.
+const FLUSH_INTERVAL_NS: u64 = 5_000_000;
+
+/// Scratch for [`now_ns`].
+static mut CLOCK_BUF: u64 = 0;
+
+/// The monotonic clock, in nanoseconds.
+///
+/// Only the flush path needs this: every event the devices produce already carries the time its
+/// interrupt fired.
+fn now_ns() -> u64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: on success the kernel wrote the ns count.
+    unsafe { (&raw const CLOCK_BUF).read() }
+}
 
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
@@ -245,11 +280,18 @@ fn po_completion(po: u64) -> (i32, u64) {
     }
 }
 
-/// Create a connected channel pair. Returns `(kernel_end, serve_end)`.
-fn make_channel() -> Option<(u64, u64)> {
+/// Create a connected channel pair with a `depth`-message ring each. Returns `(kernel_end,
+/// serve_end)`.
+fn make_channel(depth: u64) -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0)
+        syscall4(
+            SYS_CHANNEL_CREATE,
+            (&raw mut CTRL_OUT0) as u64,
+            (&raw mut CTRL_OUT1) as u64,
+            depth,
+            0,
+        )
     };
     if cr != 0 {
         return None;
@@ -344,7 +386,9 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
 
 /// Send one `Input::Events` batch to a consumer. Returns whether it went.
 fn send_events(channel: u64, events: &[InputEvent]) -> bool {
-    let mut body = [0u8; BATCH_MAX * INPUT_EVENT_LEN];
+    // `FRAME_MAX`, not `BATCH_MAX`: what goes on the wire is a *framed* batch, which can carry
+    // a loss marker and a recovered motion group in front of it.
+    let mut body = [0u8; FRAME_MAX * INPUT_EVENT_LEN];
     let n = events.len() * INPUT_EVENT_LEN;
     if n > body.len() {
         return false;
@@ -391,7 +435,7 @@ fn open_consumer(serve_end: u64, request_id: u64, srv: &mut Server) {
         reply_resolve_error(serve_end, request_id, KError::OutOfHandles);
         return;
     };
-    let Some((consumer_end, server_end)) = make_channel() else {
+    let Some((consumer_end, server_end)) = make_channel(CONSUMER_QUEUE_DEPTH) else {
         reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
         return;
     };
@@ -411,22 +455,32 @@ fn open_consumer(serve_end: u64, request_id: u64, srv: &mut Server) {
 
 /// Forward one merged batch to every consumer.
 ///
-/// A send that fails is **not** retried: the batch is dropped and the consumer's loss
-/// counter incremented, so the next batch it does receive is preceded by `SYN_DROPPED`.
-/// That is the protocol's answer to a slow reader (`rsproto-input-ops.md` § Loss) and the
-/// reason this server needs no flow control — a consumer that falls behind resynchronises
-/// instead of stalling everyone else.
+/// A send that fails is **not** retried here and now: the records are handed back to the
+/// consumer, which carries the relative motion among them forward and counts the rest as a gap
+/// to announce with `SYN_DROPPED` (`rsproto-input-ops.md` § Loss). That is what lets this server
+/// have no flow control — a consumer that falls behind is caught up on the next send rather than
+/// stalling everyone else — and it is why the cursor cannot drift: **the motion is deferred, not
+/// dropped**.
+///
+/// `batch` may be empty, which is the flush pass: a consumer that owes deferred motion is sent it
+/// on the next wakeup rather than on the next thing the user happens to do.
 fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
-    let mut framed = [InputEvent::default(); BATCH_MAX];
+    let mut framed = [InputEvent::default(); FRAME_MAX];
     for i in 0..MAX_CONSUMERS {
         if srv.channels[i] == 0 {
             continue;
         }
         match srv.consumers[i].frame(batch, now_ns, &mut framed) {
+            // Nothing new and nothing owed: an empty message would wake the consumer to read
+            // no events, which on a flush pass is every consumer that was already up to date.
+            Some(0) => {}
             Some(n) if send_events(srv.channels[i], &framed[..n]) => {}
-            // The batch's own length, so the announcement counts *records* — the unit the
-            // kernel's ring uses and the one the spec publishes.
-            Some(_) | None => srv.consumers[i].record_loss(batch.len()),
+            // **What was framed, not the batch it came from.** `frame` clears both debts as it
+            // writes them, so handing back the batch would forget the marker and the recovered
+            // motion that had just been prepended to it.
+            Some(n) => srv.consumers[i].defer(&framed[..n]),
+            // It did not fit, so nothing was cleared and the batch itself is the whole debt.
+            None => srv.consumers[i].defer(batch),
         }
     }
 }
@@ -511,17 +565,32 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                     n += 1;
                 }
             }
+            // **Bounded while anything is owed.** A consumer that could not be sent to is
+            // holding movement the user already made; waiting indefinitely would hold it until
+            // the next event, so the cursor would stop short and then jump when the mouse was
+            // next touched. With nothing owed this is still an indefinite sleep, not a poll.
+            let deadline = if srv.consumers.iter().any(Consumer::owes_send) {
+                now_ns().saturating_add(FLUSH_INTERVAL_NS)
+            } else {
+                u64::MAX
+            };
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
                 n as u64,
                 (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
+                deadline,
             )
         };
         if waited < 1 {
-            // With an infinite deadline a successful wait returns at least one record, so
-            // this is the error path — and retrying it silently spins the loop at 100% with
+            // **A timeout is the flush pass**, not an error: the deadline above is set only
+            // when a consumer owes deferred motion, so waking with no handle ready means it is
+            // time to try that consumer again.
+            if waited == KError::TimedOut.as_i32() as i64 {
+                forward(srv, &[], now_ns());
+                continue;
+            }
+            // Otherwise the error path — retrying it silently spins the loop at 100% with
             // nothing to show for it.
             kprint(b"input-server: sys_wait FAILED\n");
             continue;
@@ -587,11 +656,15 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
         if kbd_n > 0 || mouse_n > 0 {
             let n = merge(&kbd_buf[..kbd_n], &mouse_buf[..mouse_n], &mut batch);
             if n > 0 {
-                // The stamp on the loss marker only: every real event already carries the
-                // time its interrupt fired, which is the whole point of `time_ns`.
+                // The stamp on the loss marker and on recovered motion only: every real event
+                // already carries the time its interrupt fired, which is the point of `time_ns`.
                 let now = batch[n - 1].time_ns;
                 forward(srv, &batch[..n], now);
             }
+        } else if srv.consumers.iter().any(Consumer::owes_send) {
+            // Woken by something else — a resolve, a consumer's message — with motion still
+            // owed. Sending it now costs one message and saves a whole flush interval.
+            forward(srv, &[], now_ns());
         }
         if forward_pending && !serve_forward(serve_end, srv) {
             kprint(b"input-server: forwarding endpoint closed\n");
@@ -625,7 +698,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         consumers: [Consumer::new(); MAX_CONSUMERS],
     };
 
-    let Some((kernel_end, serve_end)) = make_channel() else {
+    let Some((kernel_end, serve_end)) = make_channel(CONTROL_QUEUE_DEPTH) else {
         kprint(b"input-server: channel create FAIL\n");
         exit(1);
     };

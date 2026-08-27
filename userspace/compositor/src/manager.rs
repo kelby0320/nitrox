@@ -122,10 +122,16 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 _ => stack.raise(req.window),
             };
             match r {
-                // **A restack repaints everything.** Which pixels change depends on every
-                // overlap in the stack; deriving the exact region would be a second compositor,
-                // and a restack is a user-scale event rather than a per-frame one.
-                Ok(()) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
+                // **A restack repaints the window that moved, and nothing else.** Reordering one
+                // window leaves every other pair in the same relative order, so only the pixels
+                // it covers can differ — the argument is in [`WindowStack::raise`]. This said
+                // `dirty: None` (repaint everything) until 2026-08-26, and a full recompose is
+                // ~100 ms under emulation with no input read in it, which is how a window-list
+                // click cost the mouse movement around it.
+                //
+                // Empty damage means the stack did not change — raising what was already on top
+                // — and the caller repaints nothing at all.
+                Ok(d) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(d.rect()) },
                 Err(e) => refused(e),
             }
         }
@@ -259,18 +265,42 @@ mod tests {
     }
 
     #[test]
-    fn a_restack_repaints_everything_rather_than_guessing() {
-        // Which pixels a restack changes depends on every overlap in the stack. `None` is this
-        // crate's "I cannot name what changed", and deriving the exact region would be a second
-        // compositor for a user-scale event.
+    fn a_restack_repaints_the_window_that_moved_and_nothing_else() {
+        // **This asserted the opposite until 2026-08-26**, on the reasoning that which pixels a
+        // restack changes "depends on every overlap in the stack". It does — and every one of
+        // them is inside the moved window's own rectangle, because reordering one window leaves
+        // every other pair in the same relative order. `None` here means "repaint the screen",
+        // which under emulation is ~100 ms with no input read in it: the cost landed on the
+        // mouse movement around every window-list click.
         let (mut s, ids) = stack_with(3);
-        for (op, body) in [
-            (OP_MGR_RAISE, ref_body(ids[0], 0)),
-            (OP_MGR_LOWER, ref_body(ids[0], 0)),
-            (OP_MGR_SET_FOCUS, ref_body(ids[1], 0)),
+        for (op, body, id) in [
+            (OP_MGR_RAISE, ref_body(ids[0], 0), ids[0]),
+            (OP_MGR_LOWER, ref_body(ids[0], 0), ids[0]),
+            (OP_MGR_SET_FOCUS, ref_body(ids[1], 0), ids[1]),
         ] {
-            assert!(matches!(dispatch(&mut s, op, &body), MgrOutcome::Applied { dirty: None, .. }));
+            let want = s.window(id).expect("in the stack").bounds();
+            let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, op, &body) else {
+                panic!("expected Applied")
+            };
+            assert_eq!(dirty, Some(want), "op {op:#06x} must name the window it moved");
         }
+    }
+
+    #[test]
+    fn a_restack_that_moves_nothing_reports_nothing_to_repaint() {
+        // Raising what is already topmost is the common case, not a corner: click-to-focus
+        // raises on every press, and a shell that raises from a window list does the same. An
+        // empty region is this crate's "nothing changed" — distinct from `None`, which is
+        // "repaint everything" — so the caller paints neither.
+        let (mut s, ids) = stack_with(3);
+        let top = *ids.last().expect("three windows");
+        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_RAISE, &ref_body(top, 0))
+        else {
+            panic!("expected Applied")
+        };
+        let d = dirty.expect("named, not `everything`");
+        assert!(d.size.w == 0 || d.size.h == 0, "already on top, so nothing moved: {d:?}");
+        assert_eq!(order(&s), ids, "and the order is untouched");
     }
 
     #[test]

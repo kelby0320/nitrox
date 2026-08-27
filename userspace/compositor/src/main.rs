@@ -932,29 +932,79 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     Some(ch.into_raw().0)
 }
 
-/// Drain one `Input::Events` batch and route it. Returns `false` if the channel died.
+/// Batches to take from the input channel in one pass.
+///
+/// **A bound, not a target.** The loop drains what is queued and stops; this only keeps a
+/// continuously-moving mouse from starving the client and manager channels in the same wait set.
+/// One batch is one group, so this is about a second of a 100 Hz mouse.
+const INPUT_DRAIN_MAX: usize = 128;
+
+/// Drain every queued `Input::Events` batch, route them, and repaint once. `false` if the
+/// channel died.
+///
+/// **Once for the whole drain, not once per batch.** Each repaint is a compose plus a write to
+/// the framebuffer, and it happens with no input being read; doing it per message made the
+/// compositor's throughput the ceiling on how fast a mouse could move, and everything past that
+/// ceiling piled up in a queue the input server had to give up on (2026-08-26). Coalescing costs
+/// nothing visually: the cursor is drawn at one place at a time, so painting the intermediate
+/// positions of a movement already finished is work whose result is immediately overwritten.
 fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
-    // SAFETY: valid recv out-params (an events batch carries no transferred handles).
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            srv.input_ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        // Anything but `PeerClosed` is transient — a spurious signal with nothing queued —
-        // and retrying next time round is right. `PeerClosed` means the input server is
-        // gone and the handle must leave the wait set, or the loop spins on it forever.
-        return rr != KError::PeerClosed.as_i32() as i64;
+    let mut out = alloc::vec::Vec::new();
+    // The regions a restack disturbed this pass, plus the cursor's old and new positions. The
+    // cursor's *old* position is where it was last painted, which is where this pass starts —
+    // intermediate positions were never drawn, so they need no erasing.
+    let mut damage: alloc::vec::Vec<Rect> = alloc::vec::Vec::new();
+    let cursor_was = srv.router.pointer();
+    let mut alive = true;
+    let mut drained = 0;
+    while drained < INPUT_DRAIN_MAX {
+        // SAFETY: valid recv out-params (an events batch carries no transferred handles).
+        let rr = unsafe {
+            syscall4(
+                SYS_CHANNEL_RECV,
+                srv.input_ch,
+                (&raw mut RECV_MSG) as u64,
+                (&raw mut RECV_HANDLES) as u64,
+                (&raw mut RECV_COUNT) as u64,
+            )
+        };
+        if rr != 0 {
+            // The ordinary end of the drain: nothing more is queued. `PeerClosed` means the
+            // input server is gone and the handle must leave the wait set, or the loop spins on
+            // it forever; anything else is a spurious signal with nothing behind it.
+            alive = rr != KError::PeerClosed.as_i32() as i64;
+            break;
+        }
+        drained += 1;
+        let now = now_ns();
+        route_one_batch(srv, &mut out, &mut damage, now);
     }
 
-    let mut out = alloc::vec::Vec::new();
-    let mut restacked = false;
-    let now = now_ns();
-    let cursor_was = srv.router.pointer();
+    deliver(srv, &out);
+    // A click that raised a window moved focus with it.
+    announce_focus(srv);
+    // Erase the cursor where it was last drawn and draw it where it is now, along with anything
+    // a restack disturbed. One `present_into` for the lot: overlapping rectangles compose the
+    // same pixels twice, which is cheap, while a second call would be a second traversal.
+    let cursor_now = srv.router.pointer();
+    if cursor_now != cursor_was {
+        damage.push(compositor::cursor_rect(cursor_was));
+        damage.push(compositor::cursor_rect(cursor_now));
+    }
+    if !damage.is_empty() {
+        srv.stack.present_into(fb, BACKGROUND, srv, &damage, cursor_now);
+    }
+    alive
+}
+
+/// Route the batch sitting in `RECV_MSG`, appending client records to `out` and repaint regions
+/// to `damage`.
+fn route_one_batch(
+    srv: &mut Server,
+    out: &mut alloc::vec::Vec<Outbound>,
+    damage: &mut alloc::vec::Vec<Rect>,
+    now: u64,
+) {
     // SAFETY: bounded read of the payload the kernel just wrote.
     unsafe {
         let payload_len =
@@ -964,10 +1014,10 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
         let Ok(m) = decode(msg) else {
-            return true;
+            return;
         };
         if m.op != librsproto::OP_INPUT_EVENTS {
-            return true;
+            return;
         }
         // A trailing partial record is dropped rather than guessed at. `chunks_exact`
         // says so at the type level; `chunks` would hand `read` a short slice and get
@@ -979,8 +1029,10 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let mut logical = [libinput::Logical::Dropped; libinput::MAX_PER_GROUP];
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
-                let routed = srv.router.route(l, &mut srv.stack, &mut out);
-                restacked |= routed.restacked;
+                let routed = srv.router.route(l, &mut srv.stack, out);
+                if let Some(r) = routed.restacked {
+                    damage.push(r);
+                }
                 // **Drained per event, not per batch.** A chord and the window events it
                 // causes have to reach the manager in the order they happened, and the
                 // manager acts on this batch before the next one is routed.
@@ -1003,11 +1055,30 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                 // the fork a recurrence needs. Per-consumer accounting also means
                 // `input-testclient` cannot cover it: a loss on the compositor's slot never
                 // reaches the client's event dump.
-                let diag = match *l {
-                    libinput::Logical::Button { pressed: true, .. } => true,
-                    libinput::Logical::Dropped => true,
-                    _ => false,
+                // **And `Super` arriving at all, which is the third question a stuck session
+                // asks.** Every chord this system binds is `Super`-something, and a host desktop
+                // binds `Super` too — so "the Super key does nothing" has two entirely different
+                // causes (the host kept the keystroke; the guest got it and matched no chord)
+                // and no way to tell them apart from outside. One line per transition says which.
+                //
+                // **The modifier only, never the keycode beside it.** A log of what was typed is
+                // a log of the password typed at the greeter; a log of whether the meta key went
+                // down is not, and it is the whole of what this question needs.
+                let meta_change = match *l {
+                    libinput::Logical::Key { keycode, pressed, .. }
+                        if keycode == libkern::abi::KEY_LEFTMETA
+                            || keycode == libkern::abi::KEY_RIGHTMETA =>
+                    {
+                        Some(pressed)
+                    }
+                    _ => None,
                 };
+                let diag = meta_change.is_some()
+                    || match *l {
+                        libinput::Logical::Button { pressed: true, .. } => true,
+                        libinput::Logical::Dropped => true,
+                        _ => false,
+                    };
                 // Already inside the enclosing `unsafe` block, so no inner one: the
                 // justification is that this is a single-threaded server and the counter is
                 // touched only from the serve loop, as `ROUTES_LOGGED` is.
@@ -1016,6 +1087,12 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                     INPUT_DIAGS_LOGGED = logged + 1;
                     let mut pl = Line::new();
                     match *l {
+                        _ if meta_change == Some(true) => {
+                            pl.s(b"compositor: Super down");
+                        }
+                        _ if meta_change == Some(false) => {
+                            pl.s(b"compositor: Super up");
+                        }
                         libinput::Logical::Dropped => {
                             pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
                         }
@@ -1068,19 +1145,6 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         }
     }
 
-    deliver(srv, &out);
-    // A click that raised a window moved focus with it.
-    announce_focus(srv);
-    // Erase the cursor's old position and draw it at the new one. Skipped when a restack is
-    // about to repaint everything anyway — which also draws the cursor, because `repaint`
-    // is the only thing here that touches the screen.
-    if restacked {
-        // A click raised a window, so what is on screen no longer matches the stack.
-        repaint(srv, fb);
-    } else {
-        repaint_cursor_move(srv, fb, cursor_was, srv.router.pointer());
-    }
-    true
 }
 
 /// What a forwarded resolve under `/dev/draw` is asking for.
@@ -1662,20 +1726,6 @@ fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
 /// that could cover it, and hit-testing that would have to skip it.
 fn repaint_region(srv: &Server, fb: &mut RawFramebuffer, region: Rect) {
     srv.stack.present_into(fb, BACKGROUND, srv, &[region], srv.router.pointer());
-}
-
-/// Repaint what the pointer moving from `was` to `now` disturbed.
-///
-/// **Both rectangles**, because the cursor is drawn rather than composited: the pixels it
-/// covered are still on screen after it moves, and only recomposing where it *is* leaves a
-/// trail of arrows behind it. The same rule the toolkit's diff follows for a widget that
-/// moved, one layer up.
-fn repaint_cursor_move(srv: &Server, fb: &mut RawFramebuffer, was: Point, now: Point) {
-    if was == now {
-        return;
-    }
-    repaint_region(srv, fb, compositor::cursor_rect(was));
-    repaint_region(srv, fb, compositor::cursor_rect(now));
 }
 
 /// The wire error a rejected request reports.

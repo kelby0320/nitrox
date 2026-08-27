@@ -18857,3 +18857,186 @@ serves, but it can *enumerate* its own namespace: `SYS_NS_ENUMERATE` is local an
 IPC. `verify_app_namespace` checks the binding that way, so the shell's claim that
 `/dev/desktop` is bound is now read back from the namespace rather than asserted from the bind
 call's return.
+
+## 2026-08-26 — The cursor that could not reach the left edge: motion is deferred, not dropped
+
+Reported from an ordinary QEMU session: the pointer could not be driven to the left or top of
+the screen — the host pointer left the window while the guest's cursor was still short of the
+edge, as if an offset had been applied to one of them.
+
+**No offset existed.** Driven over QMP, the guest reaches `(0, 0)` and `(1279, 799)` exactly,
+applies deltas one for one, and a screendump diff puts the cursor sprite at its logical position
+with its hotspot at the top-left. What was wrong was subtraction: **movement was being thrown
+away**, and a relative pointer has no way to notice.
+
+**The chain, measured.** The compositor recomposed the **whole screen** for a restack, which is
+97–102 ms under TCG (a cursor-move repaint is 61 µs — the ratio is 1600×). It does that inside
+its input-serving loop, so for the duration it reads no input. `input-server` found the
+consumer's four-message ring full and took the documented path: *"a send that fails is not
+retried: the batch is dropped"*. Instrumented, the drops arrive in runs of fifteen and every run
+spans a full repaint. The kernel's per-device ring never lost a record.
+
+**And a dropped batch of relative motion is unrecoverable.** `SYN_DROPPED` means *discard your
+accumulated state and resynchronise* — which works for which keys are held and which buttons are
+down, and is meaningless for a `REL_X` of −7, because the delta **is** the state. Nothing later
+says how far the mouse moved. So each drop moved the cursor permanently away from the host
+pointer, in whichever direction the user had last swept, until an edge became unreachable.
+
+**Fix 1 — `input-server` defers rather than discards.** An undeliverable batch is split per
+record: relative axes are summed into the consumer and re-emitted as one group in front of the
+next batch that goes out; keys, buttons and an upstream `SYN_DROPPED`'s own count go on to the
+announcement. Summing is lossless rather than approximate — addition is what the consumer was
+going to do with those deltas anyway, and doing it a layer earlier changes only where the sum is
+taken. What is not preserved is timing *within* a deferred run, which arrives as one fast sample
+instead of several slow ones; that is deliberate, against losing the distance altogether.
+Deferred motion is flushed on the next wakeup and within 5 ms regardless, so a cursor never
+stops short waiting for the user to move the mouse again.
+
+The sharp edge is in the send path, and it has its own test: `frame` clears both debts as it
+writes them, so a send that then fails must hand back **what was framed**, not the batch it came
+from — otherwise the marker and the recovered motion just prepended to it are forgotten.
+
+**Fix 2 — a restack repaints the window that moved.** Moving one window within the order leaves
+every other pair in the same relative order, so only the pixels that window covers can differ.
+`raise`/`lower`/`raise_above` now return that rectangle as `Damage`, and an empty one when the
+order did not change — click-to-focus raises on every press, including the tenth press on the
+same window, and each of those used to cost a full-screen recompose. The old comment called
+deriving the region "a second compositor"; what depends on every overlap in the stack is *which*
+of those pixels change, not *where* they are. A host test pins it the only way that means
+anything: paint the reported region into one screen, recompose another entirely, compare every
+byte.
+
+The compositor also drains every queued input batch before painting once, instead of painting
+per message. Coalescing costs nothing visually — the cursor is drawn one place at a time, so
+painting the intermediate positions of a movement that has already finished is work whose result
+is immediately overwritten.
+
+**Fix 3 — a consumer's ring is sixteen messages, not four.** Deferral makes the *cursor* immune
+at any depth; a button in an overflowing batch is still a click that never happens, and at depth
+four one duly went missing in testing. Sixteen covers a full repaint at TCG speeds and costs
+64 KiB of kernel message slots per consumer.
+
+**The gate is in `check-login`, and its first two versions were decoration.** It pins the pointer
+by over-driving into a corner (a clamp needs no acknowledgement), switches desktop — the one
+repaint that legitimately costs the whole screen — and injects 120 motions as fast as QMP
+accepts them, then requires the press that follows to land on the pixel the arithmetic names.
+Version one clicked to confirm the pin, which opened the overview, because the corner *is* the
+desktop indicator. Version two waited for the shell to acknowledge the switch before injecting —
+and the shell acknowledges after the compositor has answered, which put the whole burst *after*
+the stall: it passed against an `input-server` that discards motion, which is the bug it exists
+to catch. The burst now goes in behind the chord and ahead of the acknowledgement, and reverting
+the deferral fails it by 600 pixels.
+
+**What is still true and still a limit.** The kernel's per-device ring drops whole records under
+overflow, motion included, and the same argument applies to it — but it overflows only if
+`input-server` itself stalls, which nothing observed across any run here. Left as it is rather
+than propagated into the ISR path on speculation.
+
+**Under KVM none of this reproduces**, which is worth stating because it is how a hardware-only
+symptom hides: the repaint is fast enough that the ring never fills. Every measurement above is
+TCG, which is what `cargo xtask qemu` gives by default and what a person actually runs.
+
+### Same day — and the reported symptom was in the *host's* input path, not the guest's
+
+The fix above is real and gated, and it was **not what the reporter was seeing**: the cursor
+still could not reach the left edge afterwards, under TCG and KVM alike, and `Super` did nothing
+at all. Both are the same host-side fact, and neither is reachable from inside the guest.
+
+**A relative pointing device has no shared origin with the host's pointer.** The PS/2 mouse
+reports movement; there is no USB or virtio input driver here for an absolute (tablet) device to
+talk to, so nothing ever tells the guest where the host's pointer *is*. The compositor's cursor
+starts at the centre of the screen and the host's starts wherever it was, and that offset is
+permanent — it cannot even be corrected by driving into a corner, because the host pointer
+leaves the window, and stops producing motion, before the guest's cursor arrives. A person sees
+two cursors that never line up and a screen edge they cannot reach, which is exactly the report.
+Scaling the window makes it arbitrarily worse: relative deltas are host pixels, unscaled.
+
+**And `Super` belongs to the host desktop.** Every chord the shell binds is `Super`-something,
+and GNOME, KDE and COSMIC all bind `Super` at the compositor. Ungrabbed, those keystrokes never
+reach QEMU. The guest's own path is fine and gated — `check-input` injects `meta_l` over QMP and
+`check-login` drives four chords through it — which is precisely why this could not be found by
+running the gates harder.
+
+`cargo xtask qemu --grab` confines the pointer to the window and takes the keyboard. On a Wayland
+session it also runs the window through XWayland (`GDK_BACKEND=x11`), because a grab is an X
+server operation: under Wayland a client can only *ask* the compositor to inhibit shortcuts, and
+the compositor may decline. Without the flag the launch now says the pointer is not grabbed
+rather than leaving it to be discovered.
+
+**A `Super down` / `Super up` line on the debug console**, bounded by the same cap as the other
+input diagnostics, is what makes the two causes distinguishable from a serial log: no line means
+the host kept the keystroke, a line with nothing after it means the guest got it and matched no
+chord. **The modifier only, never the keycode beside it** — a log of what was typed is a log of
+the password typed at the greeter, and the modifier is the whole of what this question needs.
+
+**The methodological point, since it cost a day.** Every measurement that found the deferral bug
+was made with QMP injection, which *is* the guest's input path and *is not* the user's: it
+bypasses the host pointer, the window, the grab and the desktop's key bindings entirely. A gate
+built on injection can therefore be exhaustive about the guest and say nothing about what a
+person experiences — and a real defect found along the way (motion silently discarded, which
+would have bitten a real mouse too) read as confirmation. The check that would have separated
+them on day one is the one now written into `CLAUDE.md`: ask what the *host* does with the input
+before measuring what the guest does with it.
+
+### Same day — the overview's clicks, and a popup stranded on the desktop it was opened on
+
+Reported from the same session, once the grab made the pointer usable: the overview lists the
+desktops and clicking one does nothing, while `Super+2` works; and an overview opened on desktop
+1 is "still there" when you come back to desktop 1.
+
+**Two bugs, and the second is why the first could not have been noticed from inside.**
+
+**Only the drag was ever built.** `desktop-shell.md` §6 says "you can switch desktops from inside
+it", and the code had one gesture: a press picks up a thumbnail, a release over a sidebar row
+moves that window there. A press on a *row* picked nothing up and its release matched no arm; a
+press-and-release on a thumbnail was discarded as "a drag abandoned". So the two most obvious
+gestures in an overview — go to that desktop, go to that window — did nothing at all.
+
+The discrimination that was missing is not "was something picked up" — a press over a thumbnail
+always picks it up, because it cannot know yet whether the pointer is about to move. It is
+*where the release lands*: over a row holding a thumbnail is a move, over the **same** thumbnail
+it started on is a click on a window, over a row holding nothing is a click on a desktop.
+
+**And every popup the shell opens was stamped with the desktop it was opened on.** The compositor
+assigns each new window the current desktop, and `visible_on` is the single predicate behind
+compositing, focus *and* hit-testing — so an overview opened on desktop 1 is invisible and
+unclickable on desktop 2 while the shell still holds it and still believes it is open. This is
+exactly the defect PR #243's review found in the bars, one layer along and unfixed because the
+fix was applied to the instance rather than to the class. The overview, the applications modal
+and the rename prompt are now sticky like the bars: chrome belongs to the screen, not to one
+desktop. For the overview it is load-bearing rather than cosmetic — switching desktops from
+inside it is meaningless if it does not survive the switch.
+
+An open overview now **re-captures and re-presents** when the current desktop changes, by either
+route, which is what §6 means by "switching desktops inside the overview is trivial: it fetches a
+different set of images". Leaving it showing the desktop you just left is a lie on screen.
+
+**The gate lesson, again and sharper.** `check-login` drove the drag and passed. It could not
+have caught either bug, because a gate that drives only the gesture it was written for cannot
+distinguish "unimplemented" from "untested" — and the drag was the gesture the part that built
+the overview happened to be about. All three gestures are now gated, each with the control that
+fails without it, and so is stickiness: with `stick` removed the sidebar press lands on
+`win=none` and the gate says so.
+
+### Same day — an overview you could not get out of
+
+Reported immediately after the above: switch to an empty desktop from the sidebar and there is no
+way back. The overview stays open (correctly — it follows the switch), the desktop has no
+windows, and clicking a window was the only way out that a person would find. Escape works and is
+not discoverable.
+
+Two dismissals, both of them the gesture a person already tries: **clicking the desktop row you
+are already on** — "go there" and then "and I am done" — and **clicking the overview's own
+background**, the way clicking outside a menu works everywhere else. The second makes the
+indicator a toggle for free: the overview covers the bar, so a second click where the indicator
+is lands on background.
+
+An abandoned *drag* released over background deliberately does not dismiss. It is a different
+gesture, and closing on it would mean a mis-aimed drop loses the overview.
+
+**The gate's setup click had nowhere left to land**, which is a good sign rather than a
+nuisance. `check-login`'s drag step needed a verified pointer position before pressing, and used
+a `click_at` somewhere inert: first the thumbnail (while a pick-up-and-abandon changed nothing),
+then the background (while that did nothing either). Both became live in the same day. It now
+starts the drag from the position the *indicator* click already verified — opening the overview
+does not move the pointer — which is one fewer injected click and no inert place required.
