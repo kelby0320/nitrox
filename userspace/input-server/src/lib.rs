@@ -11,7 +11,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
 
-use libkern::abi::{EV_SYN, InputEvent, SYN_DROPPED, SYN_REPORT};
+use libkern::abi::{EV_REL, EV_SYN, InputEvent, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT};
 
 /// Events buffered from one device per wakeup.
 ///
@@ -21,6 +21,30 @@ pub const PER_DEVICE: usize = 32;
 
 /// Events in one merged batch — both devices' worth.
 pub const BATCH_MAX: usize = PER_DEVICE * 2 + 1;
+
+/// The relative axes a deferred batch carries forward, in the order they are re-emitted.
+///
+/// **Relative axes are the state, so they cannot be resynchronised.** A key or a button has a
+/// current value the consumer can be told to re-derive, which is what `SYN_DROPPED` asks for; a
+/// `REL_X` of −7 *is* the movement, and a consumer that misses it has no way to learn what it
+/// missed. Summing the deltas of a batch that could not be sent and re-emitting them later is
+/// therefore lossless, not approximate: addition is what the consumer was going to do with them
+/// anyway (2026-08-26, the cursor that could not reach the left edge).
+pub const DEFERRED_AXES: [u16; 3] = [REL_X, REL_Y, REL_WHEEL];
+
+/// Records one recovered group needs: one per axis that moved, plus its `SYN_REPORT`.
+pub const DEFERRED_MAX: usize = DEFERRED_AXES.len() + 1;
+
+/// Records [`Consumer::frame`] can write: the batch, an announcement, and a recovered group.
+pub const FRAME_MAX: usize = BATCH_MAX + 1 + DEFERRED_MAX;
+
+/// Which entry of [`DEFERRED_AXES`] this record accumulates into, if any.
+fn axis_of(e: &InputEvent) -> Option<usize> {
+    if e.kind != EV_REL {
+        return None;
+    }
+    DEFERRED_AXES.iter().position(|&code| code == e.code)
+}
 
 /// Merge two devices' event streams into one batch, ordered by `time_ns`.
 ///
@@ -90,13 +114,24 @@ fn group_at(events: &[InputEvent], from: usize) -> Option<(usize, usize)> {
     Some((from, end))
 }
 
-/// What a consumer is owed: the events to send, and whether a loss must be announced first.
+/// What a consumer is owed: motion it has not been given, and a loss to announce first.
 ///
-/// The server discards a batch it cannot deliver and records how many events went; the next
-/// batch that does go out is preceded by `SYN_DROPPED` carrying that count. Same contract as
-/// the kernel's per-device ring, **including the unit**, which is why input needs no
-/// back-pressure design — a consumer that falls behind degrades to one that resynchronises,
-/// and does not need to know which producer told it so.
+/// A batch that cannot be delivered is **deferred, not discarded**, and the two halves of it
+/// are owed differently:
+///
+/// - **Relative motion is carried forward.** Its deltas are summed into this consumer and
+///   re-emitted as one group in front of the next batch that does go out. Nothing is lost, so
+///   nothing about it is announced.
+/// - **Everything else is announced.** Keys, buttons and an upstream `SYN_DROPPED`'s own count
+///   go into `lost`, and the next batch is preceded by a `SYN_DROPPED` carrying it — the same
+///   contract as the kernel's per-device ring, **including the unit** (whole records), which is
+///   why a consumer never has to know which producer told it.
+///
+/// **The split is the correction of 2026-08-26.** This discarded whole batches, on the reasoning
+/// that a consumer which falls behind "degrades to one that resynchronises". That is true of
+/// state a consumer can re-derive and false of a relative axis, where the delta *is* the state:
+/// the compositor's cursor ended up permanently offset from the host pointer, by exactly the
+/// motion thrown away while it was busy repainting, and no `SYN_DROPPED` could tell it how far.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Consumer {
     /// **Records** discarded since the last successful send — not batches.
@@ -107,25 +142,55 @@ pub struct Consumer {
     /// marker — so counting batches here would have made the same field mean two things and
     /// left a stalled consumer under-reporting by the batch size (PR #179 review, blocking 1).
     lost: u32,
+    /// Relative movement summed from batches that could not be sent, by [`DEFERRED_AXES`] index.
+    pending: [i32; DEFERRED_AXES.len()],
 }
 
 impl Consumer {
     /// A consumer that is up to date.
     pub const fn new() -> Self {
-        Self { lost: 0 }
+        Self { lost: 0, pending: [0; DEFERRED_AXES.len()] }
     }
 
-    /// Record that a batch of `records` events could not be delivered.
+    /// Take back records that could not be delivered.
     ///
-    /// Takes the count rather than incrementing by one, so the announcement is in the same
-    /// unit the kernel's ring uses.
-    pub fn record_loss(&mut self, records: usize) {
-        self.lost = self.lost.saturating_add(records as u32);
+    /// Relative motion is summed into `pending` and owed as movement; everything else is
+    /// counted into `lost` and owed as an announcement. A `SYN_REPORT` is neither — it delimits
+    /// a group, and the records it delimited are accounted for individually — and an upstream
+    /// `SYN_DROPPED` contributes **its own count** rather than one record, so a gap does not
+    /// shrink each time it is re-deferred.
+    ///
+    /// **Pass what was framed, not the batch it came from.** [`frame`](Self::frame) clears both
+    /// debts as it writes them, so a send that then fails must hand the framed records back
+    /// here; deferring the original batch instead would forget the marker and the motion that
+    /// were prepended to it.
+    pub fn defer(&mut self, records: &[InputEvent]) {
+        let mut announce = 0u32;
+        for e in records {
+            match axis_of(e) {
+                Some(i) => self.pending[i] = self.pending[i].saturating_add(e.value),
+                None if e.kind == EV_SYN && e.code == SYN_REPORT => {}
+                None if e.kind == EV_SYN && e.code == SYN_DROPPED => {
+                    announce = announce.saturating_add(e.value.max(0) as u32);
+                }
+                None => announce = announce.saturating_add(1),
+            }
+        }
+        self.lost = self.lost.saturating_add(announce);
     }
 
     /// Whether a loss is waiting to be announced.
     pub fn owes_announcement(&self) -> bool {
         self.lost > 0
+    }
+
+    /// Whether anything is owed — an announcement, deferred motion, or both.
+    ///
+    /// The server uses this to send to a consumer that has no new events: deferred motion is
+    /// movement the user already made, and holding it until the next thing happens would leave
+    /// the cursor short of where the mouse actually is until it is moved again.
+    pub fn owes_send(&self) -> bool {
+        self.lost > 0 || self.pending.iter().any(|&v| v != 0)
     }
 
     /// Build the records to send for `batch`, prepending `SYN_DROPPED` if one is owed.
@@ -134,10 +199,12 @@ impl Consumer {
     /// caller must not send a partial batch, because a truncated group is exactly what the
     /// protocol promises never to deliver.
     ///
-    /// Clears the owed announcement, so the caller must treat a failed send as a fresh loss
-    /// (that is what `record_loss` is for).
+    /// **Clears both debts as it writes them**, so a caller whose send then fails must hand the
+    /// framed records back to [`defer`](Self::defer) — not the batch they came from, which no
+    /// longer carries the marker and the recovered motion prepended to it here.
     pub fn frame(&mut self, batch: &[InputEvent], now_ns: u64, out: &mut [InputEvent]) -> Option<usize> {
-        let extra = usize::from(self.lost > 0);
+        let moved = self.pending.iter().filter(|&&v| v != 0).count();
+        let extra = usize::from(self.lost > 0) + if moved > 0 { moved + 1 } else { 0 };
         if batch.len() + extra > out.len() {
             return None;
         }
@@ -151,6 +218,32 @@ impl Consumer {
             };
             n = 1;
             self.lost = 0;
+        }
+        // **The recovered motion goes after the marker and before the batch**, which is where it
+        // happened. `libinput` resets what it has accumulated when it sees `SYN_DROPPED`, so
+        // motion placed in front of the marker would be reset away; motion placed after the
+        // batch would arrive out of order with movement that came later.
+        //
+        // Stamped with `now_ns` rather than with the time it was first seen: the batch it
+        // belonged to is gone, and a timestamp older than records already delivered would break
+        // the ordering the merge exists to provide. What it carries is the movement, not when it
+        // happened.
+        //
+        // **The caller passes the *oldest* timestamp in the batch being framed**, not the
+        // newest, so that these prepended records do not carry a time later than the records
+        // they precede. `rsproto-input-ops.md` § Ordering invites a consumer to sort by
+        // `time_ns`, and a sort that moved the recovered motion after the batch would undo the
+        // placement this comment is about (PR #246 review, optional 8).
+        if moved > 0 {
+            for (i, &code) in DEFERRED_AXES.iter().enumerate() {
+                if self.pending[i] != 0 {
+                    out[n] = InputEvent { kind: EV_REL, code, value: self.pending[i], time_ns: now_ns };
+                    n += 1;
+                }
+            }
+            out[n] = InputEvent { kind: EV_SYN, code: SYN_REPORT, value: 0, time_ns: now_ns };
+            n += 1;
+            self.pending = [0; DEFERRED_AXES.len()];
         }
         out[n..n + batch.len()].copy_from_slice(batch);
         Some(n + batch.len())
@@ -277,11 +370,13 @@ mod tests {
     #[test]
     fn a_loss_is_announced_before_the_next_batch_and_only_once() {
         let mut c = Consumer::new();
-        // Two discarded batches of 20 and 6 records: the marker must say 26, not 2. The unit
-        // is the kernel ring's — whole records — because a consumer cannot tell which
-        // producer sent a `SYN_DROPPED` and must not have to.
-        c.record_loss(20);
-        c.record_loss(6);
+        // Two deferred batches of 20 and 6 unrecoverable records: the marker must say 26, not
+        // 2. The unit is the kernel ring's — whole records — because a consumer cannot tell
+        // which producer sent a `SYN_DROPPED` and must not have to.
+        let first: Vec<InputEvent> = (0..20).map(|i| key(30, i)).collect();
+        let second: Vec<InputEvent> = (0..6).map(|i| key(31, i)).collect();
+        c.defer(&first);
+        c.defer(&second);
         assert!(c.owes_announcement());
 
         let batch = [key(30, 10), syn(10)];
@@ -304,10 +399,124 @@ mod tests {
         // Sending half a batch would deliver a partial group, which is the one thing the
         // protocol promises never to do.
         let mut c = Consumer::new();
-        c.record_loss(2);
+        c.defer(&[key(30, 1), key(31, 1)]);
         let batch = [key(30, 10), syn(10)];
         let mut out = [InputEvent::default(); 2]; // room for the batch but not the marker
         assert_eq!(c.frame(&batch, 99, &mut out), None);
         assert!(c.owes_announcement(), "and the loss is still owed afterwards");
+    }
+
+    fn rel_code(code: u16, v: i32, t: u64) -> InputEvent {
+        InputEvent { kind: EV_REL, code, value: v, time_ns: t }
+    }
+
+    #[test]
+    fn motion_that_could_not_be_sent_is_carried_forward_rather_than_announced() {
+        // The whole point. A dropped motion batch used to become a `SYN_DROPPED` and nothing
+        // else, and the consumer had no way to recover the pixels: the compositor's cursor
+        // stayed offset from the host pointer by exactly this much, for the life of the
+        // session.
+        let mut c = Consumer::new();
+        c.defer(&[rel_code(REL_X, -6, 10), rel_code(REL_Y, -3, 10), syn(10)]);
+        assert!(c.owes_send(), "movement is owed");
+        assert!(!c.owes_announcement(), "but nothing was lost, so nothing is announced");
+
+        let batch = [rel_code(REL_X, -1, 20), syn(20)];
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        let n = c.frame(&batch, 99, &mut out).expect("fits");
+        assert_eq!(n, 5, "two axes, their SYN, and the batch");
+        assert_eq!((out[0].kind, out[0].code, out[0].value), (EV_REL, REL_X, -6));
+        assert_eq!((out[1].kind, out[1].code, out[1].value), (EV_REL, REL_Y, -3));
+        assert_eq!((out[2].kind, out[2].code), (EV_SYN, SYN_REPORT), "a whole group");
+        assert_eq!(&out[3..n], &batch, "and then what actually arrived");
+        assert!(!c.owes_send(), "the debt is cleared by framing it");
+    }
+
+    #[test]
+    fn deferred_motion_sums_across_batches_and_axes() {
+        let mut c = Consumer::new();
+        c.defer(&[rel_code(REL_X, -6, 10), rel_code(REL_Y, -3, 10), syn(10)]);
+        c.defer(&[rel_code(REL_X, -4, 20), rel_code(REL_WHEEL, 1, 20), syn(20)]);
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        let n = c.frame(&[], 99, &mut out).expect("fits");
+        assert_eq!(n, 4, "three axes moved, plus the SYN");
+        assert_eq!(out[0].value, -10, "the two X deltas add");
+        assert_eq!((out[1].code, out[1].value), (REL_Y, -3));
+        assert_eq!((out[2].code, out[2].value), (REL_WHEEL, 1), "the wheel is relative too");
+    }
+
+    #[test]
+    fn a_key_in_a_deferred_batch_is_announced_while_its_motion_survives() {
+        // The mixed case, and the reason the split is per record rather than per batch: the
+        // key press is genuinely gone and must be announced, and the motion beside it is not.
+        let mut c = Consumer::new();
+        c.defer(&[key(30, 10), rel_code(REL_X, -5, 10), syn(10)]);
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        let n = c.frame(&[], 99, &mut out).expect("fits");
+        assert_eq!(n, 3);
+        assert_eq!(out[0].code, SYN_DROPPED, "the marker leads");
+        assert_eq!(out[0].value, 1, "one record lost — the key, not the motion or its SYN");
+        assert_eq!((out[1].code, out[1].value), (REL_X, -5), "after the marker, never before");
+        assert_eq!(out[2].code, SYN_REPORT);
+    }
+
+    #[test]
+    fn framed_records_handed_back_keep_both_debts() {
+        // `frame` clears as it writes, so a send that fails afterwards must return what was
+        // framed. Deferring the *batch* instead would drop the marker and the recovered motion
+        // that had just been prepended to it — the send path's one sharp edge.
+        let mut c = Consumer::new();
+        c.defer(&[key(30, 5), rel_code(REL_X, -7, 5), syn(5)]);
+        let batch = [rel_code(REL_Y, -2, 10), syn(10)];
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        let n = c.frame(&batch, 99, &mut out).expect("fits");
+
+        c.defer(&out[..n]); // the send failed
+        let n2 = c.frame(&[], 100, &mut out).expect("fits");
+        assert_eq!(out[0].code, SYN_DROPPED);
+        assert_eq!(out[0].value, 1, "still one lost record, not zero and not two");
+        let x = out[1..n2].iter().find(|e| e.code == REL_X && e.kind == EV_REL).expect("X");
+        let y = out[1..n2].iter().find(|e| e.code == REL_Y && e.kind == EV_REL).expect("Y");
+        assert_eq!((x.value, y.value), (-7, -2), "both the recovered and the batch's motion");
+    }
+
+    #[test]
+    fn an_upstream_gap_keeps_its_own_count_when_deferred() {
+        // A `SYN_DROPPED` from the kernel's ring counts what *it* lost. Counting it as one
+        // record would shrink the gap every time the batch carrying it was re-deferred.
+        let mut c = Consumer::new();
+        c.defer(&[InputEvent { kind: EV_SYN, code: SYN_DROPPED, value: 7, time_ns: 1 }]);
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        let n = c.frame(&[], 99, &mut out).expect("fits");
+        assert_eq!(n, 1);
+        assert_eq!(out[0].value, 7, "the gap it announced, not the one record carrying it");
+    }
+
+    #[test]
+    fn a_consumer_owing_nothing_frames_an_empty_batch_as_nothing() {
+        // The server sends only when this is non-zero: an empty message would wake every
+        // consumer for no reason.
+        let mut c = Consumer::new();
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        assert_eq!(c.frame(&[], 99, &mut out), Some(0));
+        assert!(!c.owes_send());
+    }
+
+    #[test]
+    fn the_frame_buffer_is_big_enough_for_the_worst_case() {
+        // `FRAME_MAX` is what `main.rs` sizes its buffer with, and a `frame` that does not fit
+        // is deferred again — so an undersized buffer is not a truncation but a consumer that
+        // never receives anything again.
+        let mut c = Consumer::new();
+        c.defer(&[
+            key(30, 1),
+            rel_code(REL_X, 1, 1),
+            rel_code(REL_Y, 1, 1),
+            rel_code(REL_WHEEL, 1, 1),
+            syn(1),
+        ]);
+        let batch = [InputEvent::default(); BATCH_MAX];
+        let mut out = [InputEvent::default(); FRAME_MAX];
+        assert_eq!(c.frame(&batch, 99, &mut out), Some(FRAME_MAX));
     }
 }

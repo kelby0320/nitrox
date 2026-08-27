@@ -28,7 +28,7 @@ use librsproto::surface::{
     POINTER_MOTION, POINTER_PRESSED, PointerEvent,
 };
 
-use crate::WindowStack;
+use crate::{Damage, WindowStack};
 use crate::outbox::Outbound;
 
 /// What routing one event did, beyond what it put in `out`.
@@ -42,8 +42,14 @@ use crate::outbox::Outbound;
 /// blocking 1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Routed {
-    /// The stack was reordered, so the caller must recompose.
-    pub restacked: bool,
+    /// The region a restack disturbed, or `None` if the stack was not reordered.
+    ///
+    /// **The rectangle rather than a flag**, because the flag made the caller repaint the
+    /// screen. A raise changes only the pixels the raised window covers (the argument is on
+    /// [`WindowStack::raise`](crate::WindowStack::raise)), and a full recompose is ~100 ms under
+    /// emulation with no input read during it — so every click that raised a window threw away
+    /// the mouse movement around it (2026-08-26).
+    pub restacked: Option<Rect>,
     /// The event was taken by a registered chord and reached no window.
     pub consumed: bool,
 }
@@ -199,8 +205,8 @@ impl InputRouter {
 
     /// Route one logical event, appending what to send to `out`.
     ///
-    /// Returns `true` if the stack was restacked — a press raises the window it lands on,
-    /// and the caller has to recompose when that happens.
+    /// The [`Routed`] it returns names the region a restack disturbed — a press raises the window
+    /// it lands on, and the caller has to recompose exactly that much when it does.
     pub fn route(
         &mut self,
         ev: &Logical,
@@ -243,7 +249,7 @@ impl InputRouter {
                 // also reached the focused window would type into it — `Super+2` would switch
                 // desktops *and* put a `2` in the terminal.
                 if self.take_as_hotkey(keycode, pressed, modifiers) {
-                    return Routed { restacked: false, consumed: true };
+                    return Routed { restacked: None, consumed: true };
                 }
                 let Some(window) = stack.focus_candidate() else {
                     // Nothing focusable. Dropping beats delivering to the pointer's window,
@@ -271,7 +277,7 @@ impl InputRouter {
             }
 
             Logical::Button { button, pressed, buttons, .. } => {
-                let mut restacked = false;
+                let mut restacked = None;
                 if pressed && self.grab.is_none() {
                     // **Before the grab**, or the first click after boot is delivered to a
                     // window that was never entered: nothing has moved the cursor, `inside`
@@ -294,7 +300,11 @@ impl InputRouter {
                         // Click to focus. `focus_candidate` is topmost-focusable, so the
                         // raise *is* the focus change — no second piece of state to
                         // disagree with the stack about who has focus.
-                        restacked = stack.raise(window).is_ok();
+                        //
+                        // Empty damage is the press that changed nothing — the window was
+                        // already on top — and reports no restack at all, so the caller neither
+                        // recomposes nor announces a focus change that did not happen.
+                        restacked = stack.raise(window).ok().filter(|d| !d.is_empty()).map(Damage::rect);
                     }
                 }
 
@@ -1193,8 +1203,21 @@ mod tests {
         warp(&mut r, &mut s, 50, 50);
         let mut out = Vec::new();
         let routed = r.route(&button(true), &mut s, &mut out);
-        assert!(routed.restacked, "the caller must recompose");
+        assert_eq!(
+            routed.restacked,
+            Some(Rect::new(0, 0, 100, 100)),
+            "the caller must recompose, and only where the raised window is"
+        );
         assert_eq!(s.focus_candidate(), Some(lower), "the raise *is* the focus change");
+
+        // **And the second click on the same window recomposes nothing.** Click-to-focus
+        // raises on every press; a raise that changes no order changes no pixels, and
+        // answering "recompose" to it is what made every click on the focused window cost a
+        // full-screen repaint — ~100 ms under emulation, with no input read during it.
+        let again = r.route(&button(false), &mut s, &mut out);
+        assert_eq!(again.restacked, None);
+        let again = r.route(&button(true), &mut s, &mut out);
+        assert_eq!(again.restacked, None, "already topmost: nothing moved, nothing to paint");
     }
 
     #[test]
@@ -1208,7 +1231,7 @@ mod tests {
         warp(&mut r, &mut s, 320, 50);
 
         let mut out = Vec::new();
-        assert!(!r.route(&button(true), &mut s, &mut out).restacked, "no restack");
+        assert_eq!(r.route(&button(true), &mut s, &mut out).restacked, None, "no restack");
         assert_eq!(s.windows().last().map(|w| w.id), Some(normal));
         assert_eq!(s.windows().first().map(|w| w.id), Some(panel));
     }

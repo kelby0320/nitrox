@@ -130,12 +130,23 @@ fn main() -> ExitCode {
     // `--no-ps2-irq` (check-input only) boots a kernel whose i8042 never asserts its IRQs, so
     // the tick-driven recovery sweep is the only path input can take. See `cmd_check_input`.
     let no_ps2_irq = rest.iter().any(|a| a == "--no-ps2-irq");
+    // `--grab` (interactive `qemu` only) makes the QEMU window take the host's pointer and
+    // keyboard. See `cmd_qemu`: without a grab the guest cursor and the host pointer are two
+    // different cursors, and the host desktop keeps `Super` for itself.
+    let grab = rest.iter().any(|a| a == "--grab");
     // **Rejected before dispatch, not in a match arm.** A flag that exists to make an
     // invisible path visible must not be silently ignored: someone reproducing a sweep bug
     // interactively would otherwise get a boot with the i8042's IRQs *on* and nothing said
     // about it. (`--selftest` is tolerated on commands that do not read it — a pre-existing
     // looseness that costs less, because it cannot make a boot quietly unlike the one asked
     // for.) Checked here because a guard arm placed after the per-command arms never runs.
+    if grab && !matches!(cmd.as_deref(), Some("qemu") | Some("qemu-debug")) {
+        eprintln!(
+            "xtask: `--grab` is only meaningful for `qemu`/`qemu-debug` — it is about a person \
+             using the window, and every other command drives the guest over QMP"
+        );
+        return ExitCode::FAILURE;
+    }
     if no_ps2_irq && cmd.as_deref() != Some("check-input") {
         eprintln!(
             "xtask: `--no-ps2-irq` is only meaningful for `check-input` — it boots a kernel \
@@ -151,7 +162,9 @@ fn main() -> ExitCode {
     };
     let qargs: Vec<String> = rest
         .iter()
-        .filter(|a| *a != "--selftest" && *a != "--kvm" && *a != "--no-ps2-irq")
+        .filter(|a| {
+            *a != "--selftest" && *a != "--kvm" && *a != "--no-ps2-irq" && *a != "--grab"
+        })
         .cloned()
         .collect();
     let mode = if selftest {
@@ -163,8 +176,8 @@ fn main() -> ExitCode {
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
         Some("image") => cmd_image(mode),
-        Some("qemu") => cmd_qemu(false, mode, accel, &qargs),
-        Some("qemu-debug") => cmd_qemu(true, mode, accel, &qargs),
+        Some("qemu") => cmd_qemu(false, mode, accel, grab, &qargs),
+        Some("qemu-debug") => cmd_qemu(true, mode, accel, grab, &qargs),
         Some("test") => cmd_test(),
         Some("test-qemu") => cmd_test_qemu(accel),
         Some("test-interactive") => cmd_test_interactive(accel),
@@ -230,6 +243,10 @@ fn print_help() {
          \n\
          `--selftest` (build/image/qemu) compiles + runs the boot self-tests / demos;\n         \
          without it the build boots straight to userspace.\n         \
+         `--grab` (qemu/qemu-debug) hands the window the pointer and keyboard. The\n         \
+         guest has a relative mouse and no absolute one, so ungrabbed its cursor and\n         \
+         yours are two independent cursors that never line up, and every `Super`\n         \
+         chord belongs to your desktop instead. Ctrl-Alt-G releases the grab.\n         \
          `--kvm` (any command that boots a guest) runs under hardware virtualisation\n         \
          instead of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG\n         \
          emulates x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
@@ -650,7 +667,39 @@ fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel) -> R<()> {
     Ok(())
 }
 
-fn cmd_qemu(debug: bool, mode: BuildMode, accel: Accel, extra_args: &[String]) -> R<()> {
+/// `cargo xtask qemu` — boot the image in a window, for a person rather than a gate.
+///
+/// ## `--grab`, and why an interactive session needs it
+///
+/// **The guest has a relative pointing device and no absolute one.** A PS/2 mouse reports
+/// *movement*, not position, and there is no USB or virtio input driver here for a tablet
+/// device to talk to — so nothing ever tells the guest where the host's pointer is. The two
+/// cursors are independent: the compositor's starts at the centre of the screen, the host's
+/// starts whereever it was, and the offset between them is permanent. Worse, it cannot be
+/// corrected by pushing into a corner, because the host pointer leaves the window — and stops
+/// generating motion — before the guest's cursor reaches the edge. A person sees "I cannot
+/// reach the left side of the screen", and a scaled window makes it arbitrarily worse.
+///
+/// **And the host desktop keeps `Super` for itself.** Every chord this system binds is
+/// `Super`-something (`Super+H`, `Super+1`, `Super+Shift+1`, `Super+R`), and GNOME, KDE and
+/// COSMIC all bind `Super` at the compositor. Ungrabbed, those keystrokes are the *host's*,
+/// and the guest is never told they happened.
+///
+/// A grab fixes both: the pointer is confined to the window, so movement keeps arriving and
+/// any edge is reachable, and the keyboard goes to the guest including its modifiers. QEMU's
+/// own binding is `Ctrl-Alt-G`; this flag asks for the grab up front instead.
+///
+/// **On Wayland it also asks GTK for an X11 backend.** A grab is an X server operation, and
+/// under a Wayland session QEMU's GTK window cannot take one — it can only ask the compositor
+/// to inhibit shortcuts, which the compositor may decline. Running the window through XWayland
+/// (`GDK_BACKEND=x11`) gives it the real thing. Nothing else about the guest changes.
+fn cmd_qemu(
+    debug: bool,
+    mode: BuildMode,
+    accel: Accel,
+    grab: bool,
+    extra_args: &[String],
+) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(mode)?;
     let ovmf = locate_ovmf()?;
@@ -662,6 +711,30 @@ fn cmd_qemu(debug: bool, mode: BuildMode, accel: Accel, extra_args: &[String]) -
         .arg("stdio")
         .arg("-no-reboot")
         .arg("-no-shutdown");
+    if grab {
+        qemu.arg("-display").arg("gtk,grab-on-hover=on");
+        // Only on a Wayland session, and only if XWayland is actually there to talk to: forcing
+        // an X11 backend with no `DISPLAY` would fail to open a window at all.
+        let wayland = env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false);
+        if wayland && env::var("DISPLAY").is_ok() {
+            qemu.env("GDK_BACKEND", "x11");
+            println!(
+                "xtask: Wayland session — running the QEMU window through XWayland so it can \
+                 take a real grab"
+            );
+        }
+        println!(
+            "xtask: input grabbed on hover — the pointer is confined to the window and `Super` \
+             reaches the guest. Ctrl-Alt-G releases it."
+        );
+    } else {
+        println!(
+            "xtask: the pointer is NOT grabbed. The guest has a relative mouse and no absolute \
+             one, so its cursor and yours are two independent cursors — press Ctrl-Alt-G in the \
+             window (or start with `--grab`) before expecting them to line up, or before \
+             pressing a `Super` chord, which your desktop otherwise keeps."
+        );
+    }
     if debug {
         qemu.arg("-S").arg("-s");
         println!("xtask: QEMU paused on entry; attach gdb to localhost:1234");
@@ -1302,6 +1375,81 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 
     session.expect("input-testclient: late key code=46")?;
 
+    // ---- Motion survives a consumer that stops reading ----
+    //
+    // **The guard on the property PR #246 exists to keep**, and the accelerator cannot change
+    // what it means. A relative delta *is* the pointer's position: a batch `input-server`
+    // cannot deliver is movement no consumer can re-derive, unlike a key or a button, whose
+    // state `SYN_DROPPED` asks it to resynchronise. Discarding one leaves every consumer
+    // permanently offset from the device.
+    //
+    // **The overrun is caused by the client, not by the clock.** The first version of this
+    // guard lived in `check-login` and outran the compositor's repaint — which works under TCG
+    // and not under KVM, where the repaint is fast enough that the ring never fills, and
+    // `--kvm` is the only configuration CI runs (PR #246 review, blocking 1). Here the client
+    // announces that it has stopped reading and sleeps; the ring fills at any speed.
+    //
+    // The assertion is arithmetic: relative deltas are additive, so whatever the batching,
+    // coalescing and deferral in between do, the consumer must end up with the total injected.
+    session.expect("input-testclient: input stalled")?;
+    const BURST: i32 = 60;
+    const BDX: i32 = 7;
+    const BDY: i32 = 3;
+    for _ in 0..BURST {
+        qmp.send_motion(BDX, BDY)?;
+    }
+    // The sum, and the evidence that it was worth summing. `REL_Y` comes back with the sign the
+    // harness injected — the PS/2 wire reports positive-Y as up and the driver negates, which
+    // `check-input`'s earlier motion assertion pins.
+    session.expect("input-testclient: motion sum ")?;
+    let line = session.rest_of_line()?;
+    let field = |name: &str| -> Option<i64> {
+        line.split_whitespace()
+            .filter_map(|f| f.split_once('='))
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let (dx, dy) = (field("dx"), field("dy"));
+    let (announced, widest) = (field("announced"), field("widest"));
+    let want = (Some((BURST * BDX) as i64), Some((BURST * BDY) as i64));
+    if (dx, dy) != want {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: {BURST} motions of ({BDX}, {BDY}) injected while the consumer \
+             was not reading summed to {dx:?}, {dy:?} rather than {:?}, {:?}. A relative delta \
+             that does not arrive cannot be recovered — `input-server` must carry the motion of \
+             an undeliverable batch forward and re-emit it, not count it as a `SYN_DROPPED` gap. \
+             The line was: motion sum {line}",
+            want.0, want.1
+        )
+        .into());
+    }
+    if announced != Some(0) {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: a motion-only burst announced {announced:?} lost records. \
+             Nothing here is unrecoverable, so nothing should be announced: motion sum {line}"
+        )
+        .into());
+    }
+    // **The precondition, checked rather than assumed.** Recovery is invisible by design — the
+    // stream still adds up — so a run where the ring never filled satisfies the sum above while
+    // testing nothing. A folded group carries the total of the batches it stands for, so it is
+    // wider than any single injected delta; equal to it means no deferral happened and this gate
+    // proved nothing. That is not a pass.
+    if widest.is_none_or(|w| w <= BDX as i64) {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: the consumer's widest REL_X was {widest:?}, no more than the \
+             {BDX} injected — so no batch was ever deferred and this gate did not exercise the \
+             path it exists for. Raise BURST until the {}-slot consumer ring overruns, or check \
+             that the client really stopped reading: motion sum {line}",
+            "16"
+        )
+        .into());
+    }
+    println!("  ok: {BURST} motions across a stalled consumer arrived in full (widest fold {widest:?})");
+
     session.expect("input-testclient: PASSED")?;
 
     let transcript = session.finish();
@@ -1711,13 +1859,19 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // release over the second sidebar row, which is desktop 2.
     const THUMB: (i32, i32) = (100, 100);
     let side_row = |i: i32| (1180, 24 + i * 40 + 20);
-    // **A verified click first, then the drag from where it left the pointer.** A drag cannot
-    // check its own start — there is no press receipt until the button goes down, and by then
-    // it has begun. `click_at` presses *and* releases at a confirmed position: over a thumbnail
-    // that is a pick-up immediately abandoned, which changes nothing, and it leaves the pointer
-    // somewhere this gate knows rather than somewhere it computed.
-    click_at(&mut qmp, &mut session, THUMB.0, THUMB.1)?;
-    session.expect("desktop-shell: dragging window ")?;
+    // **The drag starts from a position already verified — by the click that opened this.** A
+    // drag cannot check its own start: there is no press receipt until the button goes down, and
+    // by then it has begun. `click_at(1200, 788)` above asserted where it landed and left the
+    // pointer there, and opening the overview does not move it, so the walk to the thumbnail is
+    // the same arithmetic every other step here does.
+    //
+    // **This used to be a second `click_at`, and there is nowhere left to aim one.** It was on
+    // the thumbnail while a pick-up-and-abandon changed nothing, then on empty background while
+    // that did nothing either. As of 2026-08-26 a click on a thumbnail raises its window and a
+    // click on the background dismisses — which is the point of those changes, and leaves a
+    // verifying click with no inert place to land.
+    move_pointer_to(&mut qmp, THUMB.0, THUMB.1)?;
+    qmp.pointer = Some(THUMB);
     qmp.send_button("left", true)?;
     session.expect("desktop-shell: dragging window ")?;
     let (dx, dy) = side_row(1);
@@ -1796,6 +1950,78 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: overview open, window ")?;
     press(&mut qmp, "esc")?;
     session.expect("desktop-shell: overview closed")?;
+
+    // 6f. **The overview's clicks, which were dead until 2026-08-26.** `desktop-shell.md` §6
+    //     says "you can switch desktops from inside it"; a press on a sidebar row set no drag
+    //     and its release matched no arm, and a press-and-release on a thumbnail was discarded
+    //     as an abandoned drag. So the two obvious gestures — go to that desktop, go to that
+    //     window — did nothing, and only the *drag* the gate above exercises was ever wired up.
+    //     Reported from a real session, which is the part worth keeping: the drag was gated and
+    //     the click was not, and a gate that drives only the gesture it was written for cannot
+    //     tell the difference between "unimplemented" and "untested".
+    click_at(&mut qmp, &mut session, 1200, 788)?;
+    session.expect("desktop-shell: overview open, window ")?;
+
+    // The chord path first: an overview left showing the desktop you just switched away from is
+    // showing thumbnails of windows that are no longer there. It follows instead of closing,
+    // which is what §6 means by "it fetches a different set of images".
+    chord(&mut qmp, false, "1")?;
+    session.expect("desktop-shell: switched to work")?;
+    session.expect("desktop-shell: overview now showing 0 on work")?;
+
+    // Then the sidebar click, with no drag in flight. Row 1 is the second desktop — `cli`,
+    // which is where the terminal is — so the refresh must find it again.
+    let side_row = |i: i32| (1180, 24 + i * 40 + 20);
+    let (sx, sy) = side_row(1);
+    click_at(&mut qmp, &mut session, sx, sy)?;
+    session.expect("desktop-shell: switched to cli")?;
+    session.expect("desktop-shell: overview now showing 1 on cli")?;
+
+    // **Clicking the row you are already on dismisses**, which is the way out of an overview on
+    // a desktop with no windows — where clicking a window, the other way out, does not exist.
+    // Reported as being stuck there with Escape the only escape, and Escape is not discoverable.
+    click_at(&mut qmp, &mut session, sx, sy)?;
+    session.expect("desktop-shell: overview closed")?;
+
+    // **And a click on its background dismisses**, the way clicking outside a menu does. That
+    // also makes the indicator a toggle: the overview covers the bar, so a second click where
+    // the indicator is lands on background.
+    click_at(&mut qmp, &mut session, 1200, 788)?;
+    session.expect("desktop-shell: overview open, window ")?;
+    click_at(&mut qmp, &mut session, 600, 700)?;
+    session.expect("desktop-shell: overview closed")?;
+
+    // And a click on a thumbnail activates its window, which is the third way out and the one
+    // that takes you somewhere. `raise_window` is the same call the window list's entries make.
+    click_at(&mut qmp, &mut session, 1200, 788)?;
+    session.expect("desktop-shell: overview open, window ")?;
+    click_at(&mut qmp, &mut session, 100, 100)?;
+    session.expect("desktop-shell: overview raised window ")?;
+    session.expect("desktop-shell: overview closed")?;
+
+    // 6g. **Movement is not lost while the compositor is busy** — the one property the whole
+    //     input path exists to keep, and the one nothing here checked.
+    //
+    //     A relative pointer's deltas *are* its position: a batch the input server cannot
+    //     deliver is movement no consumer can ever re-derive, unlike a key or a button, whose
+    //     state `SYN_DROPPED` asks the consumer to resynchronise. Dropping one therefore leaves
+    //     the guest's cursor permanently offset from the host's pointer — which is what a
+    //     person sees as "I cannot reach the left edge any more", because the host pointer
+    //     leaves the window before the guest's cursor arrives (2026-08-26).
+    //
+    //     Injected **against a desktop switch**, which is the one repaint that legitimately
+    //     costs the whole screen — ~100 ms under TCG, during which the compositor reads no input
+    //     and the consumer's ring fills.
+    //
+    //     **Under TCG only, and that is why this is not the guard.** The overrun here depends on
+    //     out-injecting a repaint, and under KVM the repaint is fast enough that 120 QMP-paced
+    //     motions never fill the ring — so this step passes whether or not motion is deferred,
+    //     which is what it did when it *was* the guard (PR #246 review, blocking 1). CI runs
+    //     `--kvm` everywhere. The property is gated in `check-input`, where the stall is a
+    //     consumer that stops reading and therefore means the same thing at any speed; what
+    //     this step still buys is the whole path — a real manager, a real desktop switch, a
+    //     real cursor — on the accelerator a person actually runs locally.
+    burst_holds_its_position(&mut qmp, &mut session, &chord)?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
@@ -1985,9 +2211,99 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
     }
     Err(format!(
         "the pointer never reached ({x}, {y}) in {ATTEMPTS} attempts. Injection is relative and \
-         unacknowledged, so a dropped PS/2 packet leaves a permanent offset — look for \
-         `input batch DROPPED (SYN_DROPPED)` in the transcript, and at the guest's input path \
-         rather than at this gate if it persists"
+         unacknowledged, so anything that eats a delta leaves a permanent offset. Since \
+         2026-08-26 `input-server` carries the motion of an undeliverable batch forward instead \
+         of discarding it, and `burst_holds_its_position` gates that — so a failure here is \
+         more likely a mis-aimed click than lost movement. Check that gate's verdict first, \
+         then look for `input batch DROPPED (SYN_DROPPED)` in the transcript"
+    )
+    .into())
+}
+
+/// Inject a burst of motion across a full-screen repaint and check that none of it was lost.
+///
+/// **The assertion is arithmetic, not a screenshot.** Every injected delta is known, the start
+/// is pinned by over-driving into a corner, and the compositor reports where a press landed — so
+/// the expected position is exact and any difference is movement that did not arrive. There is
+/// no rounding, no scaling and no acknowledgement anywhere on this path: a PS/2 delta is applied
+/// as an integer and clamped only at the screen edge, which this route stays well inside.
+///
+/// **The burst must be faster than the guest can drain**, or it proves nothing: paced injection
+/// is what every other step here does, and a consumer that is never overrun is a consumer whose
+/// loss path is untested. It is sent as fast as QMP accepts it, immediately after a desktop
+/// switch, which is the compositor's one legitimately whole-screen recompose.
+fn burst_holds_its_position(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    chord: &dyn Fn(&mut Qmp, bool, &str) -> R<()>,
+) -> R<()> {
+    // Start pinned, and **without a click to confirm it**: over-driving into a corner is the one
+    // position injection can establish with no acknowledgement, because the clamp is what makes
+    // it certain — 2000 px of travel into an edge lands on the edge whether or not some of it
+    // arrives. A confirming click would be worse than redundant here: the bottom-right corner is
+    // the desktop indicator's hit region, so it opens the overview, which then takes the chord
+    // below instead of the shell.
+    for _ in 0..20 {
+        qmp.send_motion(100, 100)?;
+    }
+    qmp.pointer = Some((1279, 799));
+    // Let that drain before anything else is injected. **The chord below is a key, and a key is
+    // exactly what this fix does not recover**: `SYN_DROPPED` asks a consumer to resynchronise
+    // state it can re-derive, and motion is the half it cannot. Flooding the ring and then
+    // relying on a keystroke to survive it would be a gate that failed for the one reason the
+    // system is entitled to.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Up and to the left, staying inside the screen the whole way: a burst that ran into a
+    // clamp would hide exactly the loss this is looking for.
+    const K: i32 = 120;
+    const DX: i32 = -6;
+    const DY: i32 = -3;
+    let want = (1279 + K * DX, 799 + K * DY);
+
+    // **To desktop 1, because the session is on desktop 2 by now** and switching to the desktop
+    // already showing is a no-op the shell correctly says nothing about — the first version of
+    // this waited 45 s for an acknowledgement that was never coming.
+    //
+    // **The motion goes in immediately after the chord, not after the acknowledgement.** The
+    // shell logs the switch once the compositor has answered, and the compositor answers when
+    // the recompose is done — so waiting for that line puts the burst entirely *after* the stall
+    // it is supposed to land in. Verified the expensive way: with the burst placed after the
+    // acknowledgement, this gate passed against an `input-server` that discards motion, which is
+    // the bug it exists to catch.
+    //
+    // Injecting behind the chord is safe for the chord: its keys are already queued ahead of
+    // this motion, and an overflowing ring refuses what arrives last.
+    chord(qmp, false, "1")?;
+    for _ in 0..K {
+        qmp.send_motion(DX, DY)?;
+    }
+    session.expect("desktop-shell: switched to ")?;
+
+    // Settle before reading: deferred motion is re-sent on the next wakeup or within a few
+    // milliseconds, and the click that reads the position is a *button* — droppable like any
+    // other, so it is injected once the guest is idle rather than into the same stall.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Where it actually ended up. Not `click_at`, which re-pins and retries — the retry exists
+    // to survive precisely the loss under test, and using it here would report a pass after
+    // correcting for the bug.
+    qmp.send_button("left", true)?;
+    qmp.send_button("left", false)?;
+    let want_line = format!("compositor: press at x={} y={}", want.0, want.1);
+    if session.expect_within(&want_line, std::time::Duration::from_secs(20))? {
+        qmp.pointer = Some(want);
+        println!("  ok: {K} motions across a full-screen repaint arrived to the pixel");
+        return Ok(());
+    }
+    qmp.pointer = None;
+    Err(format!(
+        "input gate FAILED: {K} injected motions of ({DX}, {DY}) from (1279, 799) did not put \
+         the cursor at ({}, {}). A relative delta that does not arrive cannot be recovered — \
+         `input-server` must carry the motion of an undeliverable batch forward and re-emit it, \
+         rather than counting it as a `SYN_DROPPED` gap. Look for `input batch DROPPED` in the \
+         transcript: a gap here means the compositor was busy and the deferral did not cover it",
+        want.0, want.1
     )
     .into())
 }

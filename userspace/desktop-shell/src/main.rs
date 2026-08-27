@@ -1345,6 +1345,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let mut over_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
     let mut shots: alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
     let mut dragging: Option<u32> = None;
+    // The overview is showing a desktop that has changed under it — by a click on its own
+    // sidebar, or by a chord while it was open. It re-captures and re-presents rather than
+    // closing: `desktop-shell.md` §6 is explicit that switching desktops inside the overview
+    // "fetches a different set of images", and that is the whole of what it costs.
+    let mut overview_dirty = false;
 
     // Blocks on the compositor's event channel, never spins — a spinning leader keeps a run
     // queue non-empty, so the idle thread never runs and deferred reclamation stops for the
@@ -1460,6 +1465,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 &mut current_desktop,
                                 &mut next_desktop_id,
                             );
+                            // **An open overview follows the switch.** A chord works while it
+                            // is up — it is a popup, not a modal grab — and leaving it showing
+                            // the desktop you just left is a lie on screen rather than a
+                            // missing feature.
+                            overview_dirty = overview.is_some();
                         }
                     }
                     continue;
@@ -1509,6 +1519,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         modal = open_modal(
                             &mut session, window, &font, &programs, &mut modal_addrs, &query,
                         );
+                        if let Some(id) = modal {
+                            stick(m, id, b"the rename prompt");
+                        }
                         // **Set from whether the prompt actually opened.** `open_modal` returns
                         // `None` on three paths, and a `rename` left true with no modal sticks
                         // for the session — the next launcher Enter would rename the desktop to
@@ -1743,34 +1756,95 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 .u(id as u64)
                                 .end();
                         }
-                    } else if let Some(wid) = dragging.take() {
-                        // Dropped. A release over a sidebar row moves the window there;
-                        // anywhere else is a drag abandoned, which is not an error.
-                        if let Some(i) = side_row_at(p.x, p.y, desktops.len())
-                            && let Some(m) = manager.as_mut()
-                        {
-                            let to = desktops[i].id;
-                            sent_request = true;
-                            if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, wid, to) {
-                                if let Some(e) = entries.iter_mut().find(|e| e.id == wid) {
-                                    e.desktop = to;
+                    } else {
+                        // **Release: which of three gestures this was.** A press over a
+                        // thumbnail always picks it up — it cannot know yet whether the pointer
+                        // is about to move — so "was something picked up" does not separate a
+                        // click from a drag. Where the release lands does:
+                        //
+                        // - over a sidebar row, holding a thumbnail → move that window there;
+                        // - over the **same** thumbnail it started on → no movement, so it was
+                        //   a click on a window: activate it;
+                        // - over a sidebar row, holding nothing → a click on a desktop: go
+                        //   there.
+                        //
+                        // The last two were dead until 2026-08-26: a press on a row set no drag
+                        // and its release matched no arm, and a press-and-release on a thumbnail
+                        // was discarded as "a drag abandoned". So the two most obvious gestures
+                        // in an overview did nothing, while `desktop-shell.md` §6 said in as
+                        // many words that "you can switch desktops from inside it". Only the
+                        // drag was wired up, and only the drag was gated — which is how an
+                        // unimplemented affordance passed for a tested one.
+                        let picked = dragging.take();
+                        let row = side_row_at(p.x, p.y, desktops.len());
+                        let under = thumb_at(p.x, p.y, shots.len()).map(|i| shots[i].0);
+                        match (picked, row) {
+                            (Some(wid), Some(i)) => {
+                                if let Some(m) = manager.as_mut() {
+                                    let to = desktops[i].id;
+                                    sent_request = true;
+                                    if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, wid, to) {
+                                        if let Some(e) = entries.iter_mut().find(|e| e.id == wid) {
+                                            e.desktop = to;
+                                        }
+                                        Line::new()
+                                            .s(b"desktop-shell: dropped window ")
+                                            .u(wid as u64)
+                                            .s(b" on ")
+                                            .s(desktop_label(&desktops, to).as_bytes())
+                                            .end();
+                                        normalize_desktops(
+                                            &mut desktops,
+                                            &entries,
+                                            &mut current_desktop,
+                                            &mut next_desktop_id,
+                                        );
+                                        list_dirty = true;
+                                        // The overview is a snapshot of a desktop that has just
+                                        // changed, so it is closed rather than left showing a
+                                        // window that is no longer here.
+                                        close_overview(
+                                            &mut session,
+                                            &mut overview,
+                                            &mut shots,
+                                            &mut dragging,
+                                            &mut over_addrs,
+                                        );
+                                    }
                                 }
-                                Line::new()
-                                    .s(b"desktop-shell: dropped window ")
-                                    .u(wid as u64)
-                                    .s(b" on ")
-                                    .s(desktop_label(&desktops, to).as_bytes())
-                                    .end();
-                                normalize_desktops(
-                                    &mut desktops,
-                                    &entries,
-                                    &mut current_desktop,
-                                    &mut next_desktop_id,
-                                );
-                                list_dirty = true;
-                                // The overview is a snapshot of a desktop that has just
-                                // changed, so it is closed rather than left showing a window
-                                // that is no longer here.
+                            }
+                            (Some(wid), None) if under == Some(wid) => {
+                                // **A window, so the overview has done its job.**
+                                // `raise_window` is what a window-list entry does, and focus
+                                // follows the raise — `focus_candidate` is topmost-focusable,
+                                // so there is no second request and no second piece of state.
+                                if let Some(m) = manager.as_mut()
+                                    && let Some(e) = entries.iter_mut().find(|e| e.id == wid)
+                                {
+                                    sent_request = true;
+                                    if raise_window(m, e) {
+                                        list_dirty = true;
+                                        Line::new()
+                                            .s(b"desktop-shell: overview raised window ")
+                                            .u(wid as u64)
+                                            .end();
+                                        close_overview(
+                                            &mut session,
+                                            &mut overview,
+                                            &mut shots,
+                                            &mut dragging,
+                                            &mut over_addrs,
+                                        );
+                                    }
+                                }
+                            }
+                            // **The row you are already on dismisses.** Clicking a desktop is
+                            // "go there"; clicking it again, now that you are there, is the
+                            // natural way to say "and I am done" — and without it an empty
+                            // desktop is a dead end, because the way out of an overview was to
+                            // click a window and there are none. Escape works and is not
+                            // discoverable (reported from a real session, 2026-08-26).
+                            (None, Some(i)) if desktops[i].id == current_desktop => {
                                 close_overview(
                                     &mut session,
                                     &mut overview,
@@ -1779,6 +1853,40 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                     &mut over_addrs,
                                 );
                             }
+                            (None, Some(i)) => {
+                                if let Some(m) = manager.as_mut() {
+                                    let to = desktops[i].id;
+                                    sent_request = true;
+                                    if switch_desktop(m, &desktops, &mut current_desktop, to) {
+                                        list_dirty = true;
+                                        normalize_desktops(
+                                            &mut desktops,
+                                            &entries,
+                                            &mut current_desktop,
+                                            &mut next_desktop_id,
+                                        );
+                                        // Stays open, showing the desktop just switched to.
+                                        overview_dirty = true;
+                                    }
+                                }
+                            }
+                            // **A click on the overview's own background dismisses it**, which
+                            // is what clicking outside a menu does everywhere else. It also
+                            // makes the indicator a toggle for free: the overview covers the
+                            // bar, so a second click where the indicator is lands here.
+                            (None, None) => {
+                                close_overview(
+                                    &mut session,
+                                    &mut overview,
+                                    &mut shots,
+                                    &mut dragging,
+                                    &mut over_addrs,
+                                );
+                            }
+                            // A drag let go over nothing, which is not an error — abandoning a
+                            // drag is not the same gesture as clicking the background, and
+                            // dismissing on it would make a mis-aimed drop close the overview.
+                            _ => {}
                         }
                     }
                 }
@@ -1793,6 +1901,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         && (p.x as u32) < APPS_BUTTON_W
                     {
                         modal = open_modal(&mut session, window, &font, &programs, &mut modal_addrs, &query);
+                        if let Some((m, id)) = manager.as_mut().zip(modal) {
+                            stick(m, id, b"the applications modal");
+                        }
                     }
                 }
             }
@@ -1820,27 +1931,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         && let Some(m) = manager.as_mut()
                     {
                         sent_request = true;
-                        shots.clear();
-                        for e in visible_entries(&entries, current_desktop) {
-                            // **Minimized windows are not in the overview.** `set_minimized`
-                            // flips a flag without touching the committed buffer, so a
-                            // minimized window captures perfectly and would be drawn in the
-                            // grid exactly like one that is on screen — an overview of "what is
-                            // on this desktop" showing something that deliberately is not
-                            // (PR #244 review, optional 7). The bar is where a minimized window
-                            // is restored from, and it marks them.
-                            if e.minimized {
-                                continue;
-                            }
-                            if let Some((w, h, px)) = capture_window(m, e.id, e.size) {
-                                shots.push((e.id, w, h, px));
-                            }
-                        }
+                        recapture(m, &entries, current_desktop, &mut shots);
                         overview = open_overview(
                             &mut session, window, &font, &shots, &desktops, current_desktop,
                             &mut over_addrs,
                         );
                         if let Some(id) = overview {
+                            stick(m, id, b"the overview");
                             Line::new()
                                 .s(b"desktop-shell: overview open, window ")
                                 .u(id as u64)
@@ -1929,6 +2026,29 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             list_dirty = false;
         }
 
+        // **Re-render an open overview whose desktop changed.** Its thumbnails are of one
+        // desktop, so a switch — from its own sidebar, or from a chord while it is up — makes
+        // every one of them stale. `desktop-shell.md` §6 chose this over closing: "switching
+        // desktops inside the overview is trivial, it fetches a different set of images".
+        if overview_dirty {
+            overview_dirty = false;
+            if let Some(id) = overview
+                && let Some(m) = manager.as_mut()
+            {
+                sent_request = true;
+                recapture(m, &entries, current_desktop, &mut shots);
+                present_overview(
+                    &mut session, id, &font, &shots, &desktops, current_desktop, &over_addrs,
+                );
+                Line::new()
+                    .s(b"desktop-shell: overview now showing ")
+                    .u(shots.len() as u64)
+                    .s(b" on ")
+                    .s(desktop_label(&desktops, current_desktop).as_bytes())
+                    .end();
+            }
+        }
+
         // Redraw the modal when the query changed, so the filter is visible. A filter you
         // cannot see is not a filter.
         if modal_dirty {
@@ -1973,6 +2093,29 @@ fn window_value(mgr: &mut ChannelTransport, op: u16, window: u32, value: u32) ->
     }
     let mut reply = [0u8; 64];
     mgr.request(op, &body, None, &mut reply).is_ok()
+}
+
+/// Make one of the shell's own popups sticky, so a desktop switch does not strand it.
+///
+/// **The same defect the bars had, one layer along.** The compositor stamps every new window
+/// with the desktop that is current when it is created, and `visible_on` is the single predicate
+/// behind compositing, focus *and* hit-testing — so an overview opened on desktop 1 is invisible
+/// and unclickable on desktop 2, while the shell still holds it and still believes it is open.
+/// A person sees a menu that "stays there" when they come back and does nothing while they are
+/// away; the gate saw a press land on `win=none`.
+///
+/// Chrome belongs to the screen rather than to one desktop, and that is as true of a launcher
+/// and an overview as it is of a bar. It is *load-bearing* for the overview:
+/// `desktop-shell.md` §6 says you switch desktops from inside it, which is only meaningful if it
+/// survives the switch.
+fn stick(mgr: &mut ChannelTransport, id: u32, what: &[u8]) {
+    if !window_value(mgr, OP_MGR_SET_WINDOW_DESKTOP, id, STICKY_DESKTOP) {
+        Line::new()
+            .s(b"desktop-shell: ")
+            .s(what)
+            .s(b" could not be made sticky; it will strand on a desktop switch")
+            .end();
+    }
 }
 
 /// Raise `window` and give it the keyboard, restoring it first if it was minimized.
@@ -2079,6 +2222,34 @@ fn render_overview(
         }
     }
     fb
+}
+
+/// Capture a thumbnail of every window on `current`, replacing whatever `shots` held.
+///
+/// **Minimized windows are not in the overview.** `set_minimized` flips a flag without touching
+/// the committed buffer, so a minimized window captures perfectly and would be drawn in the grid
+/// exactly like one that is on screen — an overview of "what is on this desktop" showing
+/// something that deliberately is not (PR #244 review, optional 7). The bar is where a minimized
+/// window is restored from, and it marks them.
+///
+/// **One function because opening and refreshing must agree.** They were the same loop written
+/// once when only opening existed; a refresh that captured a different set would show a desktop
+/// nobody could reach by opening it.
+fn recapture(
+    mgr: &mut ChannelTransport,
+    entries: &[WinEntry],
+    current: u32,
+    shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
+) {
+    shots.clear();
+    for e in visible_entries(entries, current) {
+        if e.minimized {
+            continue;
+        }
+        if let Some((w, h, px)) = capture_window(mgr, e.id, e.size) {
+            shots.push((e.id, w, h, px));
+        }
+    }
 }
 
 /// Create the overview window and present it. `None` if any step fails.

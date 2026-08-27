@@ -30,6 +30,18 @@ thumbnail on it. The thumbnails are snapshots — `Manage::Capture` scales a win
 the shell allocated — so a window drawn after the overview opens shows its state at the moment it
 opened, which §6 accepts deliberately.
 
+**Its gestures all work as of 2026-08-26, and most of them did not before**: a thumbnail
+*dragged* onto a sidebar row moves that window to that desktop (M8 Part E), a thumbnail
+*clicked* raises its window and closes the overview, and a sidebar row *clicked* switches to that
+desktop — which is what §6 always claimed. It is dismissed by clicking the desktop row you are
+already on, by clicking its background (which makes the indicator a toggle, since the overview
+covers the bar), by clicking a window, or by Escape — four ways, because with none of the first
+three an overview on a desktop with no windows was a dead end. The overview is **sticky** like the bars, so it
+survives the switch and re-captures for the desktop arrived at, whether that switch came from its
+own sidebar or from a chord; the applications modal and the rename prompt are sticky for the same
+reason. Reported from a real session: only the drag had ever been built, and only the drag had
+ever been gated.
+
 What is **not**: the **system tray** (§9), which is v2 and an inter-process protocol rather than
 a widget; and **live thumbnails**, an optimisation §9 gives a trigger rather than a v1 goal. Sections describing those describe intent,
 not behaviour — the rule the rest of `architecture/` follows does not hold there.

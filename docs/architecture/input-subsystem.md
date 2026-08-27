@@ -1,7 +1,8 @@
 # Nitrox: Input Subsystem
 
-**Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11) —
-and this document describes what exists.** The whole path from an interrupt to a keystroke
+**Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11),
+loss reworked so relative motion survives a slow consumer (2026-08-26) — and this document
+describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
@@ -16,7 +17,9 @@ arriving in a widget runs on every boot:
 | Delivery to a widget | `userspace/libui/src/route.rs` |
 
 `cargo xtask check-input` injects a keystroke and a click over QMP and asserts both reach a
-widget, so the path is gated end to end rather than assumed.
+widget, so the path is gated end to end rather than assumed. `cargo xtask check-login` adds the
+property that paced injection cannot test: a burst of motion delivered *while* the compositor is
+recomposing the whole screen must still put the cursor exactly where the arithmetic says (§7).
 
 **What is specified here and not built:** USB HID (§1 — the seams are placed for it and
 nothing is written), and anything above one keyboard and one mouse — touchpads, gestures,
@@ -205,8 +208,15 @@ takes both:
 2. **A drop is announced.** The driver sets a flag and the next group the consumer receives
    is preceded by `EV_SYN`/`SYN_DROPPED`, evdev's marker meaning *discard your accumulated
    state and resynchronise from the next `SYN_REPORT`* — because after a loss the consumer's
-   idea of which keys are held and where the pointer is are both stale, and silently carrying
-   on is how a phantom held modifier survives for the rest of a session.
+   idea of which keys are held is stale, and silently carrying on is how a phantom held
+   modifier survives for the rest of a session.
+
+   **What resynchronising cannot do is recover motion**, and this paragraph used to imply
+   otherwise by listing "where the pointer is" among the things a consumer re-derives. It has
+   nowhere to re-derive it from: a relative delta *is* the position, so a lost `REL_X` is a
+   distance no later record mentions. The driver's ring is not where that bites — it drops the
+   oldest records under a flood the server is always draining — but the server→consumer
+   direction is, and §7 says what happens there now.
 
 §7's overflow question covers the server→consumer channel. This is the harder half —
 driver→server — and it is settled here rather than deferred, because it is a property of the
@@ -313,11 +323,26 @@ because "why is it like this" is what a reader arrives with.
 
 - ~~**Batch size and overflow.**~~ **Answered, in two places.** The `input-server` merges both
   devices into one batch ordered by `time_ns`, never splits a group across batches, and on
-  overflow discards a batch and precedes the next successful one with `SYN_DROPPED` carrying
-  the count of *records* lost — the same contract as the driver's ring (§3a), so a consumer
-  has one rule rather than two. Downstream, the compositor's session queue went from 4 to
-  **16** with a retry timer and motion coalescing rather than a deeper queue alone; that is
-  the back-pressure entry in [`deferred-decisions.md`](../rationale/deferred-decisions.md).
+  overflow **defers** the batch rather than discarding it: relative motion is summed and
+  re-emitted in front of the next batch that goes out, and the records that cannot be recovered
+  that way — keys, buttons — are announced with `SYN_DROPPED` carrying the count of *records*
+  lost, the same contract as the driver's ring (§3a). A consumer therefore has one rule for
+  gaps, and no rule at all for movement, which simply arrives late.
+
+  **This discarded whole batches until 2026-08-26**, and the cost was a cursor that drifted
+  from the host pointer by the movement thrown away while the compositor was repainting — until
+  edges of the screen could not be reached at all. The reasoning that a slow consumer "degrades
+  to a resynchronising one" is true only of state a consumer can re-derive.
+  [`rsproto-input-ops.md`](../spec/rsproto-input-ops.md) § Loss is the normative version, and
+  `check-login` gates it by injecting a burst across a full-screen recompose and requiring the
+  cursor to land on the pixel the arithmetic names.
+
+  A consumer's ring is **sixteen** messages (`CONSUMER_QUEUE_DEPTH`), sized against a repaint
+  rather than against the mouse: deferral is what makes motion safe at any depth, but a button
+  in an overflowing batch is a click that never happens. Downstream, the compositor's session
+  queue went from 4 to **16** with a retry timer and motion coalescing rather than a deeper
+  queue alone; that is the back-pressure entry in
+  [`deferred-decisions.md`](../rationale/deferred-decisions.md).
 
   **The half that is still open** is not batch size: the Surface protocol has no loss marker,
   so where `libinput` is *told* about a gap, a client is not. Filed, with a trigger.

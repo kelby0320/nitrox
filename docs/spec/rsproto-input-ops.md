@@ -66,7 +66,7 @@ All fields little-endian. The numbering is Linux's `evdev`, deliberately:
 
 | `kind` | Meaning | `code` | `value` |
 |---|---|---|---|
-| `0x00` `EV_SYN` | group separator | `0` `SYN_REPORT`, `3` `SYN_DROPPED` | **whole records** lost, for `SYN_DROPPED` — the same unit whichever producer sent it |
+| `0x00` `EV_SYN` | group separator | `0` `SYN_REPORT`, `3` `SYN_DROPPED` | **whole records** lost, for `SYN_DROPPED` — the same unit whichever producer sent it, and never counting relative motion, which is carried forward instead (see [Loss](#loss)) |
 | `0x01` `EV_KEY` | key or button | a keycode, or `0x110+` for buttons | `0` release, `1` press, `2` repeat |
 | `0x02` `EV_REL` | relative axis | `0x00` `REL_X`, `0x01` `REL_Y`, `0x08` `REL_WHEEL` | signed delta |
 | `0x03` `EV_ABS` | absolute axis | reserved | device-space position |
@@ -109,27 +109,48 @@ Consumers that genuinely need a total order over a long window have `time_ns` an
 
 ## Loss
 
-**A consumer that falls behind is told, using the mechanism the record format already has.**
+**A consumer that falls behind keeps its movement and is told about the rest.**
 
-Channels are finite (four messages), and input is high-rate; a consumer that stops reading
-will eventually have nowhere to put the next batch. When a send would fail, the server
-discards the batch and adds **its record count** to a running total; the next batch that
-*does* go out is preceded by an `EV_SYN`/`SYN_DROPPED` carrying that total.
+Channels are finite (sixteen messages to a consumer), and input is high-rate; a consumer that
+stops reading will eventually have nowhere to put the next batch. When a send fails, the server
+takes the batch back and splits it:
+
+- **Relative axes** (`REL_X`, `REL_Y`, `REL_WHEEL`) are **summed and carried forward**, then
+  re-emitted as one group in front of the next batch that does go out, stamped with the time it
+  is sent. Nothing is lost, so nothing is announced about them.
+- **Everything else** — keys, buttons, and an upstream `SYN_DROPPED`'s own count — is added to a
+  running total, and the next batch that goes out is preceded by an `EV_SYN`/`SYN_DROPPED`
+  carrying that total.
 
 The unit is load-bearing: a consumer cannot tell which producer sent a given `SYN_DROPPED`,
 so the kernel's per-device ring and the server must count the same thing. Both count whole
 records. Counting batches here would have made one field mean two things and left a stalled
 consumer under-reporting by the batch size.
 
-That is the same contract the kernel's per-device ring uses (`input-subsystem.md` §3a), and
-it means input needs no separate back-pressure design: **discard plus announce** is already
-the protocol's answer to loss, so a slow consumer degrades to a resynchronising one rather
-than stalling the server or wedging the machine.
+**Why the split, in the past tense since 2026-08-26.** This section used to say the server
+discards the whole batch, on the reasoning that "a slow consumer degrades to a resynchronising
+one". That holds for state a consumer can re-derive — which keys are down, which buttons are
+held — and does not hold for a relative axis, where **the delta is the state**. A consumer told
+"three records went missing" can reset its modifiers; nothing tells it how far the mouse moved
+while it was not listening, and no later event ever will. The compositor's cursor drifted
+permanently from the host pointer by exactly the motion discarded while it was repainting, and
+the visible symptom was a screen edge that could no longer be reached.
 
-It is worth being explicit that this is *not* the resolution of the Surface protocol's
-back-pressure question (`deferred-decisions.md`), which is a different problem: there, a
-dropped `Release` is unrecoverable because nothing tells the client its buffer is free again.
-Input is recoverable because a `SYN_DROPPED` tells the consumer exactly what to do.
+Summing deferred deltas is lossless rather than approximate: addition is what the consumer was
+going to do with them, and doing it one layer earlier changes only where the sum is taken. What
+is not preserved is the *timing* within a deferred run — the movement arrives as one group
+carrying its total, so a consumer that measures velocity sees one fast sample rather than
+several slow ones. That is a deliberate trade against losing the distance entirely.
+
+Deferred motion is flushed on the next wakeup, and within `5 ms` if nothing else happens: it is
+movement the user has already made, and holding it until the next event would leave a cursor
+short of the mouse until the mouse was moved again.
+
+It follows that input still needs no back-pressure design — a consumer that falls behind is
+caught up rather than stalling the server — and that this is still *not* the resolution of the
+Surface protocol's back-pressure question (`deferred-decisions.md`): a dropped `Release` is
+unrecoverable because nothing tells the client its buffer is free again, whereas a deferred
+delta is recoverable because the server still holds it.
 
 ## See also
 
