@@ -75,10 +75,24 @@ const STALL_NS: u64 = 1_500_000_000;
 /// was dropped while the ring was full.
 const LATE_CODE: u16 = 46;
 
-/// How long phase 4 refuses to drain the **device** stream, in nanoseconds.
+/// How long the motion phase refuses to drain the **device** stream, in nanoseconds.
 ///
-/// Long enough for the harness to see `input stalled` and inject its burst over QMP.
+/// Long enough for the harness to see `input stalled` and inject its paced burst over QMP.
 const INPUT_STALL_NS: u64 = 3_000_000_000;
+
+/// The key the harness presses to ask for the motion phase.
+///
+/// **The phase begins on a record rather than at boot, and is noticed by the phase-1 pump
+/// rather than by a wait of its own.** Two things forced that. It cannot start on its own clock:
+/// the harness has other clients to attend to first — `ui-testclient`'s window churn — and a
+/// client that stalled at boot was racing whatever `check-input` was waiting for, which cost the
+/// `PASSED` line the next step needed. And it cannot have its own wait either: this client is in
+/// the image *every* display gate boots, and most of them want the phases below instead, so a
+/// wait long enough for one gate is a delay every other gate pays. The pump is already running,
+/// already bounded, and already sees every record.
+///
+/// `F2` is unbound everywhere — `ui-testclient` registers `Super+F1`.
+const START_CODE: u16 = 60;
 
 /// How long a drain waits with nothing arriving before calling the stream quiet.
 ///
@@ -184,6 +198,8 @@ struct Stream {
     msg: [u8; 4096],
     handles: [u64; 8],
     count: u64,
+    /// The harness pressed [`START_CODE`], asking for the motion phase.
+    start_requested: bool,
     /// The idle deadline passed rather than the channel failing. The two are
     /// indistinguishable from `sys_wait`'s return, and they mean opposite things: one is
     /// "nobody is driving this run", the other is a real fault the gate must not pass.
@@ -194,7 +210,14 @@ impl Stream {
     /// Resolve `/dev/input/new`, which mints a per-consumer channel.
     fn open(root_ns: u64) -> Option<Self> {
         let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
-        Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, timed_out: false })
+        Some(Self {
+            channel,
+            msg: [0; 4096],
+            handles: [0; 8],
+            count: 0,
+            start_requested: false,
+            timed_out: false,
+        })
     }
 
     /// Sum the relative motion **between a button press and its release**.
@@ -345,6 +368,11 @@ impl Stream {
                 if ev.kind == libkern::abi::EV_KEY && ev.code == DONE_CODE && ev.value == 1 {
                     done = true;
                 }
+                // The harness asking for the motion phase. Recorded rather than acted on here:
+                // this is inside a loop over one batch, and the phase stops draining.
+                if ev.kind == libkern::abi::EV_KEY && ev.code == START_CODE && ev.value == 1 {
+                    self.start_requested = true;
+                }
                 Line::new()
                     .s(b"input-testclient: ev")
                     .s(b" kind=")
@@ -377,44 +405,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // channel exists is one the server has nowhere to send.
     kprint(b"input-testclient: listening\n");
 
-    // ---- Phase 0: stop draining the device stream, and prove no motion is lost ----
-    //
-    // This covers server→consumer, where a relative delta can be *destroyed* rather than
-    // delayed: `input-server` cannot send to a consumer whose ring is full, and a discarded
-    // batch of `REL_*` is movement no consumer can ever re-derive — unlike a key or a button,
-    // whose state `SYN_DROPPED` asks it to resynchronise. That is the drift the whole of
-    // PR #246 is about. (Phase 3 below covers the compositor→client direction, which is a
-    // different queue with a different answer.)
-    //
-    // **The stall is this client refusing to read, which is what makes the gate mean the same
-    // thing under every accelerator.** The first version of this guard lived in `check-login`
-    // and overran the ring by injecting faster than the compositor could repaint — true under
-    // TCG and false under KVM, which is the only configuration CI runs (PR #246 review,
-    // blocking 1). A consumer that does not read overruns at any speed.
-    //
-    // **And it runs first, before anything else has been injected, which is the only way the
-    // sum means anything.** A device stream cannot be delimited from inside the guest: with the
-    // i8042's interrupts off input arrives on a 10 ms recovery sweep, so another phase's flood
-    // is still trickling in long after it was injected. Every window drawn around this
-    // measurement either swallowed those strays or gave up before this burst's own tail — six
-    // records too many in CI and two missing locally, on the same commit. Delimiting with a
-    // button press and release failed for a better reason: a button is exactly what deferral
-    // cannot recover, so the delimiter was eaten by the overrun it was there to measure.
-    kprint(b"input-testclient: input stalled\n");
-    sleep_ns(notif, INPUT_STALL_NS);
-    let (dx, dy, announced, widest) = stream.sum_motion();
-    Line::new()
-        .s(b"input-testclient: motion sum dx=")
-        .i(dx)
-        .s(b" dy=")
-        .i(dy)
-        .s(b" announced=")
-        .u(announced)
-        .s(b" widest=")
-        .i(widest)
-        .end();
-
-
     // Pump until the button press arrives — the last injection. Message boundaries are
     // timing, not protocol: the server batches whatever is ready, so how the nine records
     // split across messages varies run to run and neither the client nor the harness should
@@ -422,7 +412,46 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     loop {
         match stream.pump() {
             Some(true) => break,
-            Some(false) => {}
+            Some(false) => {
+                // ---- The motion phase, asked for by a keystroke ----
+                //
+                // This covers server→consumer, where a relative delta can be *destroyed* rather
+                // than delayed: `input-server` cannot send to a consumer whose ring is full, and
+                // a discarded batch of `REL_*` is movement no consumer can ever re-derive —
+                // unlike a key or a button, whose state `SYN_DROPPED` asks it to resynchronise.
+                // That is the drift the whole of PR #246 is about. (Phase 3 below covers the
+                // compositor→client direction, which is a different queue with a different
+                // answer.)
+                //
+                // **The stall is this client refusing to read**, which is what makes the gate
+                // mean the same thing under every accelerator: the first version lived in
+                // `check-login` and overran the ring by injecting faster than the compositor
+                // could repaint — true under TCG, false under KVM, and `--kvm` is the only
+                // configuration CI runs (PR #246 review, blocking 1).
+                //
+                // **Run from inside the pump, on a key.** It cannot start on its own clock: the
+                // harness has `ui-testclient`'s churn to wait out first, and a client that
+                // stalled at boot raced it — consuming the `PASSED` line the next step needed.
+                // It cannot have a wait of its own either: every display gate boots this client
+                // and most want the phases below, so a wait long enough for `check-input` is a
+                // delay all of them pay. The pump is already running and already sees every
+                // record.
+                if core::mem::take(&mut stream.start_requested) {
+                    kprint(b"input-testclient: input stalled\n");
+                    sleep_ns(notif, INPUT_STALL_NS);
+                    let (dx, dy, announced, widest) = stream.sum_motion();
+                    Line::new()
+                        .s(b"input-testclient: motion sum dx=")
+                        .i(dx)
+                        .s(b" dy=")
+                        .i(dy)
+                        .s(b" announced=")
+                        .u(announced)
+                        .s(b" widest=")
+                        .i(widest)
+                        .end();
+                }
+            }
             None if stream.timed_out => {
                 // Nothing is driving this run. Exiting *before* the window phase is what
                 // keeps this client out of every other gate's way — see `IDLE_LIMIT_NS`.

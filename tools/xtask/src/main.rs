@@ -1211,6 +1211,17 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 
     session.expect("input-testclient: listening")?;
 
+    // **Wait for `ui-testclient` to finish before injecting anything.** Its leak probe churns
+    // 128 windows, and every one of them is a `Normal` window that becomes, for its brief
+    // life, the topmost window that takes focus — so a keystroke injected while it runs is
+    // routed to a window that is about to be destroyed. That is the compositor behaving
+    // correctly; it is the *gate* that was assuming a quiet stack. Diagnosed from the
+    // compositor's own routing log: `key win=9` while the client had announced `id=8`.
+    //
+    // Safe to wait for here rather than later: `listening` is printed milliseconds after
+    // spawn, the churn takes seconds, so this line always follows it.
+    session.expect("ui-testclient: PASSED")?;
+
     // ---- Motion survives a consumer that stops reading ----
     //
     // **The guard on the property PR #246 exists to keep**, and the accelerator cannot change
@@ -1233,6 +1244,12 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     //
     // The assertion is arithmetic: relative deltas are additive, so whatever the batching,
     // coalescing and deferral in between do, the consumer must end up with the total injected.
+    // **Started by a keystroke, not by the client's own clock.** This step sits between two
+    // independent clients' output and `ui-testclient` finishes on its own schedule, so a client
+    // that stalled at boot was racing whatever the harness was waiting for — and this step's
+    // expects then consumed the `PASSED` line the wait above needed (CI, 2026-08-27). `F2` is
+    // unbound: `ui-testclient` registers `Super+F1`.
+    press(&mut qmp, "f2")?;
     session.expect("input-testclient: input stalled")?;
     // **Thirty, not sixty.** The ring is sixteen messages and the client is asleep, so thirty
     // overruns it by fourteen — the property is "it overran", not "by how much".
@@ -1304,17 +1321,6 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     println!("  ok: {BURST} motions across a stalled consumer arrived in full (widest fold {widest:?})");
 
 
-
-    // **Wait for `ui-testclient` to finish before injecting anything.** Its leak probe churns
-    // 128 windows, and every one of them is a `Normal` window that becomes, for its brief
-    // life, the topmost window that takes focus — so a keystroke injected while it runs is
-    // routed to a window that is about to be destroyed. That is the compositor behaving
-    // correctly; it is the *gate* that was assuming a quiet stack. Diagnosed from the
-    // compositor's own routing log: `key win=9` while the client had announced `id=8`.
-    //
-    // Safe to wait for here rather than later: `listening` is printed milliseconds after
-    // spawn, the churn takes seconds, so this line always follows it.
-    session.expect("ui-testclient: PASSED")?;
 
     // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it
     // is in the identity range the decoder relies on, and because a wrong `E0` or release

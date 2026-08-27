@@ -19264,3 +19264,17 @@ one configuration that deliberately cripples delivery, the harness and the emula
 the measurement — and the gate reported the guest as broken. A gate that injects at a device
 should either pace itself to what that device can carry or say plainly which layer it is
 measuring.
+
+**And moving the phase cost two more rounds, both about a shared client.** `input-testclient` is
+in the image *every* display gate boots. Running the motion phase first put its output between
+two independent clients' lines, and its `expect`s consumed the `ui-testclient: PASSED` that the
+next step waited for — the ordering hazard this project has hit before, arriving through a new
+door. Starting the phase on a keystroke fixed that and created the opposite problem: a wait long
+enough for `check-input` to get to it, after `ui-testclient`'s churn, is a delay every other gate
+pays for a phase it does not want.
+
+It ended up **inside the phase-1 pump**, which is already running, already bounded by an idle
+deadline, and already sees every record. A gate that wants the phase presses `F2`; one that does
+not never mentions it and pays nothing. The rule that reads out of this: a test client shared by
+several gates should be driven by what a gate *does*, never by a clock, and never by anything a
+gate has to opt out of.
