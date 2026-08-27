@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod auth;
+pub mod desktop;
 pub mod error;
 pub mod file;
 pub mod log;

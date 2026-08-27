@@ -50,7 +50,7 @@ the source of truth for *the order*.
 
 - **Mechanism:** [`docs/design/display-substrate.md`](../design/display-substrate.md)
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
-- **Semantics:** [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
+- **Semantics:** [`docs/architecture/ui-composition-model.md`](../architecture/ui-composition-model.md)
   — windows, ports, desktops.
 - **The shell itself:** [`docs/architecture/desktop-shell.md`](../architecture/desktop-shell.md)
   — bars, applications modal, overview, and the operations it demands of the compositor.
@@ -1865,7 +1865,7 @@ exists. Six parts, in dependency order; the shape follows Milestone 7's, where e
 gated before the next begins.
 
 **Rescoped 2026-08-21**, when durable window-to-window wiring was cut
-([`ui-composition-model.md`](../design/ui-composition-model.md) revision 3). Ports-as-wiring, the
+([`ui-composition-model.md`](../architecture/ui-composition-model.md) revision 3). Ports-as-wiring, the
 default-handler fallback and templates went with it; desktops never depended on any of them.
 
 ### Governing decisions
@@ -2114,10 +2114,14 @@ also reach the focused window.
 
 ### Part F — `/dev/desktop`, its first consumer, and the graduations
 
-- [ ] **The shell serves `/dev/desktop`** — `new`, `current`, and `N/info` + `N/windows/` as
-      composition §2a specifies.
+- [x] **The shell serves `/dev/desktop`** ✅ — **as a session channel, not the path-per-object
+      namespace §2a sketches.** `new`, `current`, `N/info` and `N/windows/` are not served: the
+      operations that matter are *mutations*, and a resolve is a lookup rather than a call, so
+      the bare path answers with a session the way `/dev/draw/new` and `/dev/tty` do. The
+      per-object paths would duplicate what one `List` returns, for no consumer. The graduated
+      document says so in its Status line. Original box:
 
-- [ ] **It is bound into *application* namespaces, not into the session namespace** — corrected
+- [x] **It is bound into *application* namespaces, not into the session namespace** ✅ — corrected
       2026-08-26 (PR #239 review, finding 1), and the correction is the whole of what makes the
       next box work. The first draft had `desktop-session-mgr` binding it into the session
       namespace, following [`graphical-session.md`](../architecture/graphical-session.md) §3. But
@@ -2135,7 +2139,12 @@ also reach the focused window.
       before reaping. §3's substance survives — the shell does not register *itself* with its
       supervisor — and only its mechanism sentence changes; see the box below.
 
-- [ ] **Settle what an application may do with it, because binding it grants that.** Every
+- [x] **Settled: the subtree is granted** ✅ — and `verify_app_namespace` **cannot check it the
+      way it checks the others.** A resolve is forwarded to whoever serves the path, so the shell
+      asking the kernel for its own endpoint blocks it waiting for its own answer: *a process
+      cannot verify a binding of itself by using it.* What it reports is that the bind succeeded;
+      the consumer is what proves reachability — the strongest argument the deferral could have
+      had for insisting the two ship together. Original box: Every
       application in the session reaches `new`, `current` and switching — strictly more than
       applications have today, since one cannot even raise its own window. The narrow-bind
       mechanism that withholds `/dev/draw/manage` while granting `/dev/draw/new` is available
@@ -2145,7 +2154,7 @@ also reach the focused window.
       an escape hatch. `verify_app_namespace` gains `/dev/desktop` as a positive check, beside
       `new` granted and `manage` withheld.
 
-- [ ] **Ship it with a consumer, in the same part.** That deferral exists because this milestone
+- [x] **Shipped with a consumer, in the same part** ✅. That deferral exists because this milestone
       has been caught three times shipping a specified, tested, unreachable capability (PRs #233,
       #236, #237), and a bound endpoint nothing resolves is exactly that shape. A small `desktop`
       command — `desktop list`, `desktop switch N`, `desktop name N <label>` — is the consumer,
@@ -2154,19 +2163,19 @@ also reach the focused window.
       terminal**, because that is the only way to prove the resolve works from where a user is —
       the same lesson as `check-login` asserting from `nxsh` rather than from its parent.
 
-- [ ] **Re-check [`graphical-session.md`](../architecture/graphical-session.md) §3 against what
+- [x] **Re-checked [`graphical-session.md`](../architecture/graphical-session.md) §3 against what
       shipped.** Its block was amended when this part was planned — the shell does not
       self-register, and binds its endpoint into the namespaces it *constructs* rather than into
       the session namespace — and it carries a "not built" status until this part lands. Clear
       that status, and confirm the prose matches the code rather than the plan.
 
-- [ ] **Graduate [`ui-composition-model.md`](../design/ui-composition-model.md)** to
+- [x] **Graduated [`ui-composition-model.md`](../architecture/ui-composition-model.md)** ✅ to
       `docs/architecture/` with a Status line saying what is built. **Ports stay unbuilt**
       (`TODO(port-shape-rework)`), so the graduation follows `desktop-shell.md`'s pattern: name
       the sections that describe behaviour and the sections that describe intent, rather than
       moving a document that outruns its code.
 
-- [ ] **Close the questions this milestone answered** — composition §7's sticky/no-desktop item
+- [x] **Closed the questions this milestone answered** ✅ — composition §7's sticky/no-desktop item
       and `desktop-shell.md` §9's lifecycle item both resolve here, and `design/` drops to
       **two** documents — `display-substrate.md` and `fault-survival.md`, the latter not a
       display document and not graduating with this arm.

@@ -41,7 +41,7 @@ edge, are a protocol addition and are not built.
 The compositor is a **userspace resource server bound at `/dev/draw` with a subtree
 base** — the same binding kind `/home` uses. Window paths are therefore *forwarded
 resolves*, not bindings: nobody calls `sys_ns_bind` when a window opens and no supervisor
-is in the loop (`docs/design/ui-composition-model.md` §2a).
+is in the loop (`docs/architecture/ui-composition-model.md` §2a).
 
 **Authority is the binding.** A process can create windows if and only if `/dev/draw` is
 in its namespace. There is no display capability bit and no registration call.
@@ -921,6 +921,6 @@ frame would otherwise push older events out of it.
 
 - [rsproto wire format](rsproto-wire-format.md) — the envelope every category shares
 - [display substrate](../design/display-substrate.md) §4 — why surfaces are shaped this way
-- [UI composition model](../design/ui-composition-model.md) §2a — the namespace shape
+- [UI composition model](../architecture/ui-composition-model.md) §2a — the namespace shape
 - `userspace/librsproto/src/surface.rs` — the encoder/decoder
 - `userspace/compositor/src/lib.rs` — the server-side window model

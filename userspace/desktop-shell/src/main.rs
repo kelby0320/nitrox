@@ -15,9 +15,11 @@
 //! and constructs with `syscaps.md` (`graphical-session.md` §3): it holds `BIND_NAMESPACE` to
 //! construct *application* namespaces continuously, not to register itself once.
 //!
-//! The `/dev/desktop` binding that would let an application talk back is `TODO(desktop-endpoint)`
-//! — deferred until something resolves it, because an endpoint with no consumer is the shape
-//! this milestone has already shipped three times.
+//! Since M8 Part F it **serves `/dev/desktop`** and binds it into every application namespace
+//! it constructs — not into the session namespace, which is its own and where nothing would
+//! resolve it. A `desktop` command in `/bin` is the consumer that proves the binding is
+//! reachable, which had to exist because a process cannot verify a binding of *itself* by
+//! using it: a resolve is forwarded to whoever serves the path.
 //!
 //! `#![no_std]` + `#![no_main]`, with `alloc` — the toolkit builds an element tree per frame.
 
@@ -546,7 +548,14 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
 /// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
 /// that is its trigger.
-fn build_app_namespace(draw: u64, fs: u64, tty: u64, profile: u64, home: &str) -> u64 {
+fn build_app_namespace(
+    draw: u64,
+    fs: u64,
+    tty: u64,
+    profile: u64,
+    home: &str,
+    desktop: u64,
+) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
         kprint(b"desktop-shell: application ns_create FAIL\n");
@@ -643,6 +652,30 @@ fn build_app_namespace(draw: u64, fs: u64, tty: u64, profile: u64, home: &str) -
         }
     }
 
+    // **`/dev/desktop`, and binding it is a capability decision** — every application in this
+    // session can then create, switch and name desktops, which is strictly more than one has
+    // otherwise, since it cannot even raise its own window. Granted deliberately for v1: the
+    // narrow-bind that withholds `/dev/draw/manage` while granting `new` is available here too,
+    // but withholding mutation would leave `desktop switch` with no way to work, and a binding
+    // whose only consumer is disarmed is the shape the `desktop-endpoint` deferral existed to refuse.
+    //
+    // **Bound here rather than into the session namespace.** The session namespace is the
+    // shell's own and nothing else runs in it, so a binding there would have no consumer at
+    // all — while a `/bin` command runs under the `nxsh` a terminal spawned, whose namespace is
+    // this one (PR #239 review, finding 1).
+    if desktop != 0 {
+        let dpath = b"/dev/desktop";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let dr = unsafe {
+            syscall4(SYS_NS_BIND, ns, dpath.as_ptr() as u64, dpath.len() as u64, desktop)
+        };
+        if dr != 0 {
+            kprint(b"desktop-shell: application /dev/desktop bind FAIL\n");
+        } else {
+            kprint(b"desktop-shell: application /dev/desktop bound\n");
+        }
+    }
+
     // **`/home`, scoped to the user's subtree — because otherwise the environment lies.**
     // `session_env()` sets `HOME` and `PWD` to `/home`, and `launch` forwards that record
     // unchanged, so a terminal opened here started its `nxsh` with `PWD=/home` in a namespace
@@ -687,7 +720,7 @@ fn build_app_namespace(draw: u64, fs: u64, tty: u64, profile: u64, home: &str) -
 /// application that *can* reach `manage` simply never says so.
 ///
 /// Returns `false` if the namespace is not what it should be; the caller declines to launch.
-fn verify_app_namespace(ns: u64, expect_home: bool) -> bool {
+fn verify_app_namespace(ns: u64, expect_home: bool, expect_desktop: bool) -> bool {
     let (new_st, new_h) = ns_lookup(ns, b"/dev/draw/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if new_h != 0 {
         // SAFETY: closing a session this check minted; the application will make its own.
@@ -744,8 +777,50 @@ fn verify_app_namespace(ns: u64, expect_home: bool) -> bool {
             return false;
         }
     }
+    // **`/dev/desktop` is checked by *enumerating* the namespace, not by resolving it.**
+    //
+    // The shell serves that path, and a resolve is forwarded to whoever serves it — so asking
+    // the kernel to resolve its own endpoint blocks this process inside `ns_lookup` waiting for
+    // an answer only it could send. That is real, and it is the same self-deadlock the bottom
+    // bar hit in Part C by another route.
+    //
+    // **But "cannot resolve it" is not "cannot check it", which is where the first version of
+    // this stopped.** `SYS_NS_ENUMERATE` walks the caller's *own* namespace and copies out one
+    // entry per call: local, no IPC, nothing forwarded — `nxsh`'s `binding_at_or_under` uses the
+    // same idiom. So the binding gets a check on the same footing as `new` granted and `manage`
+    // withheld, rather than the bind call's return value standing in for one, which was a proxy
+    // where a real check was available (PR #245 review, finding 3).
+    if expect_desktop && !bound_in(ns, "/dev/desktop") {
+        kprint(b"desktop-shell: application namespace has no /dev/desktop -- refusing\n");
+        return false;
+    }
     kprint(b"desktop-shell: application namespace grants new + /home, withholds manage\n");
     true
+}
+
+/// Whether `path` is bound in `ns` — asked of the namespace itself, not of whoever serves it.
+///
+/// **Local and cheap**: the kernel walks the caller's own namespace and copies out one entry per
+/// call, with no forwarding anywhere in it. That is what makes it usable on a path this process
+/// *serves*, where a resolve would deadlock.
+fn bound_in(ns: u64, path: &str) -> bool {
+    let mut entry = libkern::abi::NsEntry::zeroed();
+    for index in 0u64.. {
+        // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
+        let r =
+            unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut _ as u64) };
+        if r != 0 {
+            return false; // NotFound ends the walk
+        }
+        let len = (entry.path_len as usize).min(libkern::abi::NS_ENTRY_PATH_MAX);
+        // SAFETY: the kernel wrote the binding path; `len` is clamped to the buffer.
+        let bound =
+            unsafe { core::slice::from_raw_parts((&raw const entry.path) as *const u8, len) };
+        if bound == path.as_bytes() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve `path` in `ns`, returning `(status, handle)`.
@@ -867,16 +942,17 @@ fn launch(
     program: &str,
     env: &libstream::wire::Record,
     home: &str,
+    desktop: u64,
 ) -> bool {
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(draw, fs, tty, profile, home);
+    let app_ns = build_app_namespace(draw, fs, tty, profile, home, desktop);
     if app_ns == 0 {
         return false;
     }
-    if !verify_app_namespace(app_ns, !home.is_empty()) {
+    if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         kprint(b"desktop-shell: application namespace is not gated; refusing to launch\n");
@@ -969,7 +1045,7 @@ fn launch(
 const CASCADE_STEP: i32 = 24;
 
 /// Wait set: the compositor's event channel, and the manager channel.
-static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+static mut WAIT_HANDLES: [u64; 2 + 1 + MAX_DESKTOP_SESSIONS] = [0; 3 + MAX_DESKTOP_SESSIONS];
 /// One 24-byte `IoResult`.
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 
@@ -1078,12 +1154,30 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     //
     // It runs here, *before* the manager channel is taken, which is the only moment a `manage`
     // resolve gets an honest answer from a namespace that does not bind it.
+    // **The desktop endpoint, created before the first application namespace is built.**
+    // `build_app_namespace` binds it, and the startup check below verifies it — so it has to
+    // exist by then or the check would be verifying its absence.
+    let desktop_endpoint = match make_channel() {
+        Some((client_end, serve_end)) => {
+            // SAFETY: storing our own serve end.
+            unsafe { DESKTOP_SERVE = serve_end };
+            kprint(b"desktop-shell: serving /dev/desktop\n");
+            client_end
+        }
+        None => {
+            kprint(b"desktop-shell: could not create the /dev/desktop endpoint\n");
+            0
+        }
+    };
+
     let mut may_launch = false;
     if draw_endpoint != 0 {
         let app_ns =
-            build_app_namespace(draw_endpoint, fs_endpoint, tty_endpoint, profile_endpoint, home);
+            build_app_namespace(
+                draw_endpoint, fs_endpoint, tty_endpoint, profile_endpoint, home, desktop_endpoint,
+            );
         if app_ns != 0 {
-            may_launch = verify_app_namespace(app_ns, !home.is_empty());
+            may_launch = verify_app_namespace(app_ns, !home.is_empty(), desktop_endpoint != 0);
             // SAFETY: closing the namespace; nothing has been launched into it yet.
             unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };
         }
@@ -1270,15 +1364,28 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         let deadline = if sent_request { 0 } else { u64::MAX };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for two waiters.
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
         unsafe {
             WAIT_HANDLES[0] = ev;
-            let n = if mgr_h != 0 {
-                WAIT_HANDLES[1] = mgr_h;
-                2
-            } else {
-                1
-            };
+            let mut n = 1u64;
+            if mgr_h != 0 {
+                WAIT_HANDLES[n as usize] = mgr_h;
+                n += 1;
+            }
+            // **The desktop endpoint and its sessions wait alongside the rest.** Polling them
+            // between compositor events would make a `desktop list` wait on a keystroke, and
+            // blocking on them separately would make the shell stop drawing while a command
+            // thought about it.
+            if DESKTOP_SERVE != 0 {
+                WAIT_HANDLES[n as usize] = DESKTOP_SERVE;
+                n += 1;
+            }
+            for i in 0..MAX_DESKTOP_SESSIONS {
+                if DESKTOP_SESSIONS[i] != 0 {
+                    WAIT_HANDLES[n as usize] = DESKTOP_SESSIONS[i];
+                    n += 1;
+                }
+            }
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
@@ -1287,6 +1394,27 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 deadline,
             )
         };
+        // **Drained before the compositor's events**, so a `Switch` that changes what the bar
+        // shows is reflected by the same iteration's redraw rather than the next one's.
+        // SAFETY: reading our own endpoint and session table.
+        unsafe {
+            if DESKTOP_SERVE != 0 {
+                serve_desktop_endpoint();
+            }
+            for i in 0..MAX_DESKTOP_SESSIONS {
+                let ch = DESKTOP_SESSIONS[i];
+                if ch != 0 {
+                    list_dirty |= serve_desktop_session(
+                        ch,
+                        manager.as_mut(),
+                        &mut desktops,
+                        &entries,
+                        &mut current_desktop,
+                        &mut next_desktop_id,
+                    );
+                }
+            }
+        }
         if let Some(m) = manager.as_mut() {
             // The shell's own windows are never listed: a bar is a `panel` and the modal a
             // `popup`, so the role filter already covers them, but naming them is what keeps
@@ -1507,7 +1635,20 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         } else if k.keycode == KEY_ENTER && rename {
                             // **Naming is what makes a desktop persist**, so this is the one
                             // gesture that changes the lifecycle rather than the view.
-                            let name = query.text();
+                            // **Capped at what the wire can carry.** `write_list` refuses a
+                            // whole `List` reply rather than truncating a name, which is right
+                            // — but the text field has no cap of its own, so a 33-character
+                            // label typed here made every later `List` fail for *all* desktops,
+                            // permanently, since the name persists. The `desktop name` path
+                            // already checked this bound; this one did not
+                            // (PR #245 review, finding 4).
+                            let full = query.text();
+                            let name = &full[..full
+                                .char_indices()
+                                .map(|(i, c)| i + c.len_utf8())
+                                .take_while(|&e| e <= librsproto::desktop::MAX_DESKTOP_NAME)
+                                .last()
+                                .unwrap_or(0)];
                             if let Some(d) =
                                 desktops.iter_mut().find(|d| d.id == current_desktop)
                             {
@@ -1541,7 +1682,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             } else if let Some(name) = filtered.first() {
                                 launch(
                                     session_ns, draw_endpoint, fs_endpoint, tty_endpoint,
-                                    profile_endpoint, name, &env, home,
+                                    profile_endpoint, name, &env, home, desktop_endpoint,
                                 );
                                 // **Closed after launching, and this was the bug.** `modal`
                                 // was set once and never cleared, so the popup stayed on top
@@ -2152,6 +2293,284 @@ fn capture_window(
         .s(b" painted pixels")
         .end();
     Some((w, h, px))
+}
+
+/// Serve one request on an open `/dev/desktop` session. Returns whether the shell must redraw.
+///
+/// **The one place another process changes the desktop model**, and it goes through exactly the
+/// operations the shell's own chords do — `switch_desktop` and the name field — rather than
+/// touching the lists directly. A second path into the same state is a second place for the
+/// lifecycle rule to be forgotten.
+fn serve_desktop_session(
+    ch: u64,
+    mgr: Option<&mut ChannelTransport>,
+    desktops: &mut alloc::vec::Vec<Desktop>,
+    entries: &[WinEntry],
+    current: &mut u32,
+    next_id: &mut u32,
+) -> bool {
+    use librsproto::decode;
+    use librsproto::desktop::{
+        DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, OP_DESKTOP_LIST,
+        OP_DESKTOP_NAME, OP_DESKTOP_SWITCH, write_list,
+    };
+    // SAFETY: valid recv out-params, sized from `IPC_HANDLE_MAX`.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut DS_MSG) as u64,
+            (&raw mut DS_HANDLES) as u64,
+            (&raw mut DS_COUNT) as u64,
+        )
+    };
+    // **Close whatever came with it.** No desktop op takes a handle, but that is a property of
+    // the *peer* rather than of this server — and a SAFETY comment that assumes it was the other
+    // half of blocking 2. The kernel installs whatever the sender attached into this process's
+    // table whether or not anything here looks at it, so left alone they pin slots in the global
+    // handle table for the shell's life. `serve_manager` in the compositor states the same rule.
+    // SAFETY: closing handles the kernel just installed for us.
+    unsafe {
+        let n = ((&raw const DS_COUNT).read()).min(libkern::abi::IPC_HANDLE_MAX);
+        for i in 0..n {
+            syscall1(SYS_HANDLE_CLOSE, DS_HANDLES[i]);
+        }
+    }
+    if rr != 0 {
+        if rr == KError::PeerClosed.as_i32() as i64 {
+            // SAFETY: the peer is gone; free the slot and close our end.
+            unsafe {
+                for i in 0..MAX_DESKTOP_SESSIONS {
+                    if DESKTOP_SESSIONS[i] == ch {
+                        DESKTOP_SESSIONS[i] = 0;
+                    }
+                }
+                syscall1(SYS_HANDLE_CLOSE, ch);
+            }
+        }
+        return false;
+    }
+    // SAFETY: bounded read-only slice over the message just received.
+    let (op, request_id, body) = unsafe {
+        let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const DS_MSG) as *const u8).add(24),
+            payload_len.min(4096 - 24),
+        );
+        match decode(req) {
+            Ok(m) => (m.op, m.request_id, m.body.to_vec()),
+            Err(_) => return false,
+        }
+    };
+    let bad = |code: KError| {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&code.as_i32().to_le_bytes());
+        ds_reply(ch, op, request_id, &b, 0, true);
+        false
+    };
+    match op {
+        OP_DESKTOP_LIST => {
+            let cur = desktops.iter().position(|d| d.id == *current).map(|i| i + 1).unwrap_or(0);
+            let listed: alloc::vec::Vec<DesktopEntry<'_>> = desktops
+                .iter()
+                .take(MAX_LISTED)
+                .map(|d| DesktopEntry { id: d.id, name: d.name.as_str() })
+                .collect();
+            let mut out = [0u8; 1024];
+            let Some(n) =
+                write_list(&mut out, cur as u32, &listed, desktops.len() > MAX_LISTED)
+            else {
+                // Server-side data this server cannot encode — not a kernel fault, which is
+                // what `KernelError` claims and what a caller would chase.
+                kprint(b"desktop-shell: a desktop list would not serialise\n");
+                return bad(KError::InvalidArgument);
+            };
+            ds_reply(ch, op, request_id, &out[..n], 0, false);
+            Line::new().s(b"desktop-shell: served List of ").u(desktops.len() as u64).end();
+            false
+        }
+        OP_DESKTOP_SWITCH => {
+            let Some(req) = DesktopIndex::read(&body) else { return bad(KError::InvalidArgument) };
+            let Some(d) = (req.index as usize).checked_sub(1).and_then(|i| desktops.get(i)) else {
+                return bad(KError::NotFound);
+            };
+            let to = d.id;
+            let Some(m) = mgr else { return bad(KError::Unsupported) };
+            if !switch_desktop(m, desktops, current, to) {
+                return bad(KError::InvalidArgument);
+            }
+            normalize_desktops(desktops, entries, current, next_id);
+            ds_reply(ch, op, request_id, &[], 0, false);
+            kprint(b"desktop-shell: served Switch\n");
+            true
+        }
+        OP_DESKTOP_NAME => {
+            let Some(req) = DesktopIndex::read(&body) else { return bad(KError::InvalidArgument) };
+            let Ok(name) = core::str::from_utf8(&body[4..]) else {
+                return bad(KError::InvalidArgument);
+            };
+            if name.len() > MAX_DESKTOP_NAME {
+                return bad(KError::InvalidArgument);
+            }
+            let Some(d) = (req.index as usize).checked_sub(1).and_then(|i| desktops.get_mut(i))
+            else {
+                return bad(KError::NotFound);
+            };
+            d.name.clear();
+            d.name.push_str(name);
+            normalize_desktops(desktops, entries, current, next_id);
+            ds_reply(ch, op, request_id, &[], 0, false);
+            Line::new().s(b"desktop-shell: served Name ").s(name.as_bytes()).end();
+            true
+        }
+        _ => bad(KError::Unsupported),
+    }
+}
+
+/// Answer one message on the desktop endpoint's serve end — a resolve, minting a session.
+///
+/// **The shell is a resource server here, which is the thing `graphical-session.md` §3 had to
+/// reconcile.** It does not *register* itself: nothing binds this endpoint into a namespace a
+/// supervisor owns. It binds it into the namespaces it **constructs** for the applications it
+/// launches, which is the constructor role it already holds `BIND_NAMESPACE` for.
+fn serve_desktop_endpoint() {
+    use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
+    use librsproto::{OP_NS_RESOLVE, decode};
+    // SAFETY: reading our own serve end into valid out-params.
+    let serve = unsafe { DESKTOP_SERVE };
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            serve,
+            (&raw mut DS_MSG) as u64,
+            (&raw mut DS_HANDLES) as u64,
+            (&raw mut DS_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        return;
+    }
+    // SAFETY: bounded read-only slice over the message just received.
+    let (op, request_id, bare) = unsafe {
+        let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const DS_MSG) as *const u8).add(24),
+            payload_len.min(4096 - 24),
+        );
+        match decode(req) {
+            // **An empty suffix only.** `/dev/desktop` is the resource itself; a suffix names
+            // something beneath it, and the per-object paths composition §2a sketches are not
+            // built — so answering one would invent a second level this server does not have.
+            Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
+                Some(r) if r.suffix.is_empty() => (m.op, m.request_id, true),
+                _ => (m.op, m.request_id, false),
+            },
+            Ok(m) => (m.op, m.request_id, false),
+            Err(_) => return,
+        }
+    };
+    if !bare {
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&KError::NotFound.as_i32().to_le_bytes());
+        ds_reply(serve, op, request_id, &b[..4], 0, true);
+        return;
+    }
+    // SAFETY: single-threaded scan of our own session table.
+    let slot = unsafe { (0..MAX_DESKTOP_SESSIONS).find(|&i| DESKTOP_SESSIONS[i] == 0) };
+    let Some(slot) = slot else {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&KError::WouldBlock.as_i32().to_le_bytes());
+        ds_reply(serve, op, request_id, &b, 0, true);
+        return;
+    };
+    let Some((client_end, session_end)) = make_channel() else {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&KError::KernelError.as_i32().to_le_bytes());
+        ds_reply(serve, op, request_id, &b, 0, true);
+        return;
+    };
+    // Bound before replying, so a fast client's first request cannot arrive before the slot is
+    // live — the same ordering `auth-service` states.
+    // SAFETY: `slot` is free.
+    unsafe { DESKTOP_SESSIONS[slot] = session_end };
+    let mut body = [0u8; 32];
+    let n = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0).unwrap_or(0);
+    if !ds_reply(serve, op, request_id, &body[..n], client_end, false) {
+        // SAFETY: the transfer failed, so both ends are still ours.
+        unsafe {
+            DESKTOP_SESSIONS[slot] = 0;
+            syscall1(SYS_HANDLE_CLOSE, session_end);
+            syscall1(SYS_HANDLE_CLOSE, client_end);
+        }
+        return;
+    }
+    kprint(b"desktop-shell: /dev/desktop session opened\n");
+}
+
+/// How many clients may hold a `/dev/desktop` session at once.
+///
+/// Small on purpose: the only consumer is a short-lived command, and every slot costs a waiter
+/// in a set the compositor session and the manager channel are also in.
+const MAX_DESKTOP_SESSIONS: usize = 4;
+
+/// The desktop endpoint's serve end, and its open sessions.
+static mut DESKTOP_SERVE: u64 = 0;
+/// See [`DESKTOP_SERVE`].
+static mut DESKTOP_SESSIONS: [u64; MAX_DESKTOP_SESSIONS] = [0; MAX_DESKTOP_SESSIONS];
+static mut DS_MSG: [u8; 4096] = [0; 4096];
+/// Sized from the **ABI**, not from what this server expects to receive.
+///
+/// `sys_channel_recv` passes no receiver-side capacity: the kernel copies out `n * 8` bytes
+/// where `n` is the *sender's* stamped count, bounded only by `IPC_HANDLE_MAX`. At four this
+/// was a 32-byte static the kernel would write 64 bytes into — and `/dev/desktop` is bound into
+/// **every** application namespace this shell constructs, so any client sending a request with
+/// eight handles attached smashes whatever `.bss` follows. No bug in the client is needed; a
+/// careless one does it (PR #245 review, blocking 2). Every other server in the tree sizes this
+/// `[u64; IPC_HANDLE_MAX]` for exactly this reason.
+static mut DS_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
+static mut DS_COUNT: usize = 0;
+static mut DS_REPLY: [u8; 4096] = [0; 4096];
+static mut DS_REPLY_HANDLES: [u64; 4] = [0; 4];
+static mut CH_OUT0: u64 = 0;
+static mut CH_OUT1: u64 = 0;
+
+/// Create a channel pair. `(client_end, server_end)`.
+fn make_channel() -> Option<(u64, u64)> {
+    // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return None;
+    }
+    // SAFETY: on success the kernel wrote both endpoint handles.
+    Some(unsafe { ((&raw const CH_OUT0).read(), (&raw const CH_OUT1).read()) })
+}
+
+/// Send a reply on `ch` for `request_id`, optionally transferring `handle`.
+fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bool) -> bool {
+    use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY};
+    let flags = if err { RS_FLAG_REPLY | RS_FLAG_ERROR } else { RS_FLAG_REPLY };
+    let hcount = u64::from(handle != 0);
+    // SAFETY: DS_REPLY/DS_REPLY_HANDLES are valid buffers owned by this process.
+    unsafe {
+        let Some(rs_len) =
+            librsproto::encode(&mut DS_REPLY[24..], op, request_id, flags, body, hcount as u16)
+        else {
+            return false;
+        };
+        DS_REPLY[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        DS_REPLY[8] = hcount as u8;
+        DS_REPLY_HANDLES[0] = handle;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ch,
+            (&raw const DS_REPLY) as u64,
+            (&raw const DS_REPLY_HANDLES) as u64,
+            hcount,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    }
 }
 
 /// Tell the compositor which desktop to composite, and say so.

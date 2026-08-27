@@ -140,7 +140,23 @@ impl Host for NitroxHost {
         // its stages spawned.
         let mut images = Vec::with_capacity(stages.len());
         for s in stages {
-            images.push(self.resolve_program(&s.program)?);
+            match self.resolve_program(&s.program) {
+                Ok(img) => images.push(img),
+                Err(e) => {
+                    // **Said on the debug console as well as returned.** A shell hosted by
+                    // `nxterm` writes its errors into that terminal's grid, and the grid
+                    // renders under `test-harness` only — so on a release image a command that
+                    // could not be found fails completely silently, which cost several boots to
+                    // diagnose during M8 Part F. One line, only on the path where a program was
+                    // named and not found.
+                    libkern::debug::Line::new()
+                        .s(b"nxsh: could not resolve `")
+                        .s(s.program.as_bytes())
+                        .s(b"`")
+                        .end();
+                    return Err(e);
+                }
+            }
         }
 
         let mut upstream: Option<u64> = None;

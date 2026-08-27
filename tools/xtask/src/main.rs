@@ -280,6 +280,8 @@ fn limine_conf() -> PathBuf {
 /// packaged into the store from this single list — see [`profile_programs`].
 const COREUTILS: &[&str] = &[
     "list", "copy", "mkdir", "remove", "rename", "move", "touch", "date", "sleep", "whoami",
+    // The graphical session's desktops, and `/dev/desktop`'s first consumer — see M8 Part F.
+    "desktop",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -1459,6 +1461,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
     // re-deriving it here keeps the check where the refusal is — a shell that found the gate
     // open declines to launch, which is behaviour rather than a test.
+    // **The endpoint is bound into application namespaces, not into the session's.** The shell
+    // cannot check this by resolving it — a resolve is forwarded to whoever serves the path, so
+    // asking the kernel for its own endpoint would block it waiting for its own answer. The
+    // bind's success is what it can report; the `desktop` command below is what proves the
+    // binding is reachable (M8 Part F).
+    session.expect("desktop-shell: serving /dev/desktop")?;
+    session.expect("desktop-shell: application /dev/desktop bound")?;
     session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
     // **And it draws.** M7 Part E makes the shell a real compositor client: it resolves
     // `/dev/draw` from the namespace `desktop-session-mgr` built — not from a root one, which
@@ -1726,6 +1735,50 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: switched to ")?;
     session.expect(":> nxterm")?;
 
+    // 6e. **`/dev/desktop` and its first consumer** (M8 Part F).
+    //
+    //     the `desktop-endpoint` deferral refused to bind an endpoint nothing resolved, because this
+    //     milestone had three times shipped a capability that was specified, tested in isolation
+    //     and unreachable on the path a caller uses. So the binding and something that reaches
+    //     it land together — and *this* is the assertion that says so: a `/bin` command, run by
+    //     the shell that `nxterm` spawned, resolving a path bound into a namespace
+    //     `desktop-shell` constructed.
+    //
+    //     Typed at the terminal, which is the only way a program in this session is started.
+    //     Its stdout goes into the terminal's grid, which renders under `test-harness` only —
+    //     so the command also says what it did on the debug console, which is where every gate
+    //     reads a release image.
+    //
+    //     The terminal has the keyboard: it was raised and focused above, and the overview is
+    //     closed.
+    // **Click inside the terminal first, which is the two-focus rule.** Raising it from the bar
+    // gives the *window* the keyboard; the grid *widget* inside it is focused by `libui`'s
+    // router, and that happens on a press. Without this the keys arrive at `nxterm` — verified,
+    // 28 of them — and its router has nowhere to send them, so nothing reaches the shell and
+    // the command simply never runs. `check-terminal` has always clicked into the terminal
+    // before typing; this gate had not needed to until now.
+    click_at(&mut qmp, &mut session, 200, 200)?;
+    type_at_terminal(&mut qmp, "desktop")?;
+    // **The shell answering, and the command reporting** — both halves, because either alone
+    // is satisfiable without the other. A shell that served a list nobody received would print
+    // the first; a command that invented an answer would print the second.
+    // **Only the shell's own lines are ordered here.** The command runs in its own process, so
+    // whether its output lands before or after the shell's next line is a race between two
+    // processes — one run put `desktop: named` before the bar's redraw and the next put it
+    // after. What the command said is checked against the whole transcript below, where order
+    // does not matter; this is the same rule PR #227's review established for `nxterm`.
+    session.expect("desktop-shell: served List of ")?;
+
+    // And a mutation, which is the half a read-only op cannot prove: the command changes the
+    // shell's model, and the shell's own bar says so.
+    // **The desktop showing, which is the second one** — the drop moved the terminal there and
+    // `Super+2` followed it. Naming the *first* would change a desktop the bar is not showing,
+    // and the assertion below reads the bar.
+    type_at_terminal(&mut qmp, "desktop name 2 cli")?;
+    session.expect("desktop-shell: served Name cli")?;
+    // The bar is the shell's own readout, so this is the model changing rather than a reply.
+    session.expect("desktop-shell: window list on cli of ")?;
+
     // **And the chrome is still there.** Both bars are `panel`s created at startup, so the
     // compositor stamped them with the desktop that was current then — and `visible_on` is the
     // single predicate behind compositing, focus *and* hit-testing, so from the first switch
@@ -1837,6 +1890,27 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     // "lists 0 programs", and "modal open" says nothing about its contents — so a session
     // whose `/bin` failed to open would pass the whole gate. Asserted as an absence for the
     // same reason the concurrency check is: `expect` cannot say "a number greater than zero".
+    // **What the `desktop` command itself reported** — order-independent, because it is a
+    // different process from the shell whose lines are asserted above. Both halves matter:
+    // without the shell's lines a command could have invented these, and without these a shell
+    // could have served a reply nobody received.
+    // **`(table)` rather than a bare "listed"**: the listing is the one data product here, and
+    // it goes to stdout as TSM1 like every other coreutil's. It went to *stderr* until PR #245's
+    // review — where `desktop | sort name` produced nothing and the rows interleaved with every
+    // stage's diagnostics on the shared sink — and a gate reading a release image can see the
+    // bytes nowhere, so the command names the branch it took. Match the name, not just the count.
+    for line in ["desktop: running", "desktop: listed 3 desktops (table)", "desktop: named 2 cli"] {
+        if !transcript.contains(line) {
+            return Err(format!(
+                "the `desktop` command did not report \"{line}\". It resolves /dev/desktop from \
+                 the namespace `desktop-shell` built for the terminal that ran it, so a missing \
+                 line means either the bind or the resolve — check for \"nxsh: could not \
+                 resolve\", which is what a command that never started looks like"
+            )
+            .into());
+        }
+    }
+
     // **The configure deadline must not fire, and this is what would have caught the deadlock.**
     // `no manager answer for window N; showing it` exists to name a wedged or absent manager —
     // "a wedged or slow shell must delay a window, never lose it". Part C briefly created the
@@ -1916,6 +1990,52 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
          rather than at this gate if it persists"
     )
     .into())
+}
+
+/// Type a line into a windowed terminal, then Enter.
+///
+/// **Paced by a delay rather than by a receipt, which is the exception here.** Every other
+/// typing loop in these gates waits for something the guest says — the greeter's redraw, the
+/// shell's `name so far`, a prompt on serial. A terminal's echo goes into its *grid*, and the
+/// grid renders under `test-harness` only, so a gate booting a release image has nothing to
+/// wait on per character. Injection is relative and unacknowledged, and a dropped PS/2 batch
+/// eats a keystroke — which here means the command line reads `desktp` and nothing runs.
+///
+/// The delay is the smallest thing that removes the drops rather than a guess at a safe number:
+/// the whole line is a handful of characters and the guest's input ring is drained per event.
+fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
+    const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
+    // **A bare Enter first, because this gate has pressed Escape at a terminal.** `ESC` is the
+    // **meta prefix**: the discipline consumes the byte after a bare one, exactly as readline
+    // does — `ESC d` is M-d, and an unbound pair is discarded rather than inserted. This gate
+    // presses Escape to dismiss the modal and the overview, and when no popup is open that
+    // Escape reaches whatever holds the keyboard, which by then is the terminal. So the next
+    // character typed is eaten: `desktop` becomes `esktop`.
+    //
+    // Measured rather than assumed, after it was briefly taken for a bug in `nxsh`: typing one
+    // command three times in a session loses one character, and injecting an Escape between two
+    // of them loses a second — the loss follows the Escape. An empty line is the cheapest thing
+    // to feed a prefix that is going to take one.
+    std::thread::sleep(PER_KEY);
+    press(qmp, "ret")?;
+    // **The wait comes *before* each key, including the first**, and that is not cosmetic.
+    // Typing here follows a click that raises the window, focuses a widget and repaints; the
+    // first character injected straight after it was swallowed, and the shell read `esktop`,
+    // which resolves to nothing. Sleeping only *between* keys leaves exactly that one gap.
+    for c in line.chars() {
+        std::thread::sleep(PER_KEY);
+        match c {
+            ' ' => press(qmp, "spc")?,
+            _ => {
+                let mut qcode = String::new();
+                qcode.push(c);
+                press(qmp, &qcode)?;
+            }
+        }
+    }
+    std::thread::sleep(PER_KEY);
+    press(qmp, "ret")?;
+    Ok(())
 }
 
 /// Inject one key by qcode, press and release.

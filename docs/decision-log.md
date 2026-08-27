@@ -18749,3 +18749,111 @@ Also: the spec said `Rejected` for a window that has committed nothing, and the 
 `WouldBlock` — which is the one answer here worth branching on, because it means *try again once
 it draws*. The spec now says so and explains why. And an assertion reading `window list on work
 of ` matched a list still holding the window as happily as one that had lost it.
+
+## 2026-08-26 — Milestone 8 Part F: `/dev/desktop`, its first consumer, and a shell that cannot resolve itself
+
+Desktops are a resource now: `desktop-shell` serves `/dev/desktop`, binds it into every
+application namespace it constructs, and a `desktop` command in `/bin` lists, switches and names
+them. `check-login` types it into a real terminal on a release image, which is the whole of what
+the `desktop-endpoint` deferral asked for.
+
+**A session channel, not the path-per-object namespace §2a sketches.** `new`, `current`,
+`N/info` and `N/windows/` are not served. The operations that matter here are *mutations* —
+switch, name — and a namespace resolve is a lookup rather than a call, so the bare path answers
+with a session the way `/dev/draw/new` and `/dev/tty` do. The per-object paths would duplicate
+what one `List` returns, for no consumer, which is the shape this milestone has now refused three
+times. The graduated document says so in its own Status line rather than leaving a reader to
+discover it.
+
+**Bound into application namespaces, not the session's** — PR #239's correction, built. The
+session namespace is the shell's own and nothing else runs in it, so a binding there would have
+had no consumer at all; a `/bin` command runs under the `nxsh` a terminal spawned, whose
+namespace is one the shell *constructs*. That also removed the `Meta::Ready` handshake the
+deferral had named as this box's second cost: it belonged to a binding that is not the one built.
+
+**A process cannot verify a binding of itself by using it**, and finding that out cost a boot.
+`verify_app_namespace` checks `/dev/draw/new` and `/home` by resolving them, so it tried to check
+`/dev/desktop` the same way — and a resolve is forwarded to whoever serves the path, so the shell
+asked the kernel for its own endpoint and blocked waiting for its own answer. The same
+self-deadlock as Part C's bottom bar, by a different route. What the shell can report is that the
+bind *succeeded*; that something else can reach it is exactly what the consumer is for, which is
+the strongest argument the deferral could have had for insisting the two ship together.
+
+**Diagnosing the consumer took five boots, and every one of them was the same blind spot.** A
+command run in a windowed terminal writes into that terminal's *grid*, and the grid renders under
+`test-harness` only — so on the release image `check-login` boots, a failure is completely
+silent. The command now says what it did on the debug console, and `nxsh` says when it cannot
+resolve a program, because "the command did nothing and nothing said why" is not a state a gate
+should be able to reach.
+
+**And under that was not a bug at all, which took two corrections to establish.** Typing
+`desktop` at the terminal gave the shell `esktop`, and it was filed as a lost first byte in
+`nxsh`. Measuring it moved the diagnosis twice. First: typing the same command three times in one
+session loses **one** character, not three, and injecting an `ESC` between two of them loses a
+**second** — so the loss follows the Escape rather than the terminal or the line. Second, and
+decisive: `ESC` is the **meta prefix**, and `tty_server::Discipline` consuming the byte after a
+bare one is exactly what readline does. `ESC d` is M-d; an unbound pair is discarded rather than
+inserted.
+
+The discipline's own test says so, deliberately — PR #191's review renamed it from
+`a_bare_escape_does_not_eat_the_next_character` to `a_bare_escape_consumes_exactly_two_bytes`
+precisely because the old name promised the opposite of what it asserts. A previous reviewer had
+already adjudicated this question, and the rename is what stopped a second person shipping the
+"fix". **The change was written, ran against that test, and was reverted.**
+
+What actually happens is that this *gate* presses Escape to dismiss the modal and the overview,
+and when no popup is open that Escape reaches whoever holds the keyboard — the terminal. The
+leading bare Enter in `type_at_terminal` is not a workaround for a defect; it is feeding a prefix
+that is going to take a byte. The comment there says so now.
+
+**One ordering lesson, again.** The command's output and the shell's are two processes, and which
+lands first varied between runs. The shell's lines stay ordered `expect`s; the command's are
+checked against the whole transcript, where order does not matter — PR #227's rule, reapplied.
+
+### PR #245 review — the reply buffer, the spec row, and the one command whose product went to stderr
+
+**A 32-byte handle array the kernel would write 64 bytes into.** `serve_desktop_session`'s
+`DS_HANDLES` was `[u64; 4]`, and `sys_channel_recv` copies out the *sender's* handle count,
+bounded by `IPC_HANDLE_MAX` (8) and by nothing else. The `SAFETY` comment above it said "a
+desktop request carries no transferred handles" — which is a property of the *peer*, not of this
+process, and `/dev/desktop` is bound into every application namespace, so the peer is any program
+the session runs. Sized from the ABI now, in both the server and the command, and surplus handles
+are closed after each recv rather than leaked. The rule this restates: **a buffer whose size is
+argued from what the sender is expected to send is not bounded at all.**
+
+**`Desktop` was absent from the wire format's category table**, which is the document that
+allocates the 16-bit op space — so the next category to be added could have been given `0x0C`
+with nothing to say otherwise. The row is there, the reserved range moved to `0x0D`–`0xFE`, and
+`rsproto-desktop-ops.md` gives the three ops their bodies and errors like every other category.
+
+**The listing is a `Table` on stdout.** It went to `stage.diag` — stderr, which
+`pipeline-stdio.md` calls a *shared diagnostic sink, not a per-adjacency pipe* — so `desktop |
+sort name` produced nothing, and the rows interleaved with every other stage's diagnostics. It is
+the one command in `/bin` whose primary output is a table and which did not emit one. It now
+emits `Table<{position, id, name, current}>` and keeps the text rendering for when there is no
+stdout, which is what `list` and `whoami` both do.
+
+**The gate could not have told the difference**, which is the part worth keeping. A release image
+renders no grid, so the table's bytes are invisible from the host, and both branches printed the
+same console line — an assertion that would have passed just as well for the stderr version. The
+command names the sink it used (`listed 3 desktops (table)`), and `check-login` matches the name.
+
+**`ReqError` instead of `Option`.** Transport failure, a dead channel and an `RS_FLAG_ERROR`
+reply all collapsed into `None`, so `switch` and `name` printed *no such desktop* for a channel
+that had gone away — a diagnosis of the operand for a fault that had nothing to do with it. The
+shell's `bad()` sends its `KError` as four bytes; `InvalidArgument` is the one that means the
+operand, and anything else prints its code rather than a guess.
+
+**And two smaller ones.** The Super+R rename was uncapped, so a name longer than
+`MAX_DESKTOP_NAME` broke every subsequent `List` permanently — the encoder refuses and the reply
+never comes; the shell now answers `InvalidArgument` for an unencodable listing rather than
+`KernelError`, which is what a caller would chase. The reader's `rest.len() < 8 + len` guard had
+no test: the entry-count test stops on `rest.len() < 8`, so removing the length check left every
+test green while a body declaring a longer name than it carries panicked. Both now have the
+control that fails without them.
+
+**The "cannot verify" conclusion above was too strong.** A process cannot *resolve* a path it
+serves, but it can *enumerate* its own namespace: `SYS_NS_ENUMERATE` is local and involves no
+IPC. `verify_app_namespace` checks the binding that way, so the shell's claim that
+`/dev/desktop` is bound is now read back from the namespace rather than asserted from the bind
+call's return.

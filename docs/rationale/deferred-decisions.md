@@ -362,7 +362,7 @@ would still admit a few enormous ones. Trigger: the first untrusted client, or a
 memory budget, whichever comes first — the second is the better answer and the reason not to
 guess a number now. Raised by the PR #222 review.
 
-**`/dev/desktop` is not bound yet — `TODO(desktop-endpoint)`.** M7 Part E's plan has
+~~**`/dev/desktop` is not bound yet — the `desktop-endpoint` deferral.**~~ M7 Part E's plan has
 `desktop-session-mgr` binding the shell's endpoint at `/dev/desktop` in the session namespace,
 "exactly as `init` binds the tty server's and `session-mgr` binds `/dev/tty`". The *architectural*
 half of that box is built and demonstrated: `desktop-shell` **does not bind its own endpoint**,
@@ -390,10 +390,24 @@ the wrong mechanism.
 
 Trigger: **the first process that resolves `/dev/desktop`** — an application talking to the shell,
 which is Part F's `nxterm` or the ports work in
-[`ui-composition-model.md`](../design/ui-composition-model.md). At that point the consumer and
+[`ui-composition-model.md`](../architecture/ui-composition-model.md). At that point the consumer and
 the binding land together and each can be checked against the other.
 
-**Trigger fired 2026-08-26, and the resolution is scheduled with its consumer attached.** M7 Part
+**Resolved 2026-08-26 (M8 Part F), with the consumer in the same commit.** `desktop-shell`
+serves `/dev/desktop` and binds it into every **application** namespace it constructs — not into
+the session namespace, which is its own and where nothing would resolve it. A `desktop` command
+in `/bin` lists, switches and names, and `check-login` types it into a real terminal on a release
+image, so the binding is proved reachable from where a caller actually stands.
+
+**Two things this entry did not anticipate.** The `Meta::Ready` cost it named is gone, because
+the binding it belonged to is not the one that was built. And a shell **cannot verify a binding
+of itself by using it**: a resolve is forwarded to whoever serves the path, so
+`verify_app_namespace` asking the kernel to resolve the shell's own endpoint blocked the shell
+waiting for its own answer. What it checks is that the bind succeeded; the consumer is what
+proves reachability — which is the strongest argument this entry could have had for insisting the
+two ship together.
+
+**Trigger fired 2026-08-26, and the resolution was scheduled with its consumer attached.** M7 Part
 F's `nxterm` did *not* fire it — a launched terminal resolves `/dev/tty`, `/bin` and `/home`, and
 never needs to talk to the shell. Milestone 8's details pass does: desktops give `/dev/desktop`
 something to serve (`new`, `current`, `N/info`, `N/windows/`), and the plan puts the binding and

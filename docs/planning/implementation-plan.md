@@ -104,7 +104,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     the decision log.)
     Design in
     [docs/design/display-substrate.md](../design/display-substrate.md) +
-    [docs/design/ui-composition-model.md](../design/ui-composition-model.md);
+    [docs/architecture/ui-composition-model.md](../architecture/ui-composition-model.md);
     build order in [display-arm-plan.md](display-arm-plan.md). Milestone 1 is the test
     gate: the compositor composites a known scene and host and guest agree on the hash.
   - **Now: pre-CLI substrate hardening** (the deferral audit, 2026-07-24) — four slices

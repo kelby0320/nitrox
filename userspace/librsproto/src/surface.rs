@@ -4,7 +4,7 @@
 //! The compositor is a resource server bound at `/dev/draw` with a subtree base, the
 //! same binding kind `/home` uses, so window paths are forwarded resolves and nobody
 //! calls `sys_ns_bind` when a window opens
-//! (`docs/design/ui-composition-model.md` §2a).
+//! (`docs/architecture/ui-composition-model.md` §2a).
 //!
 //! **This category adds no kernel surface.** A client creates a `MemoryObject`, maps it,
 //! draws, and transfers the handle **once** — not per frame. Thereafter it sends

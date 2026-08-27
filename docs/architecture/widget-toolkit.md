@@ -41,7 +41,7 @@ a parenthetical says otherwise.
 
 **Companion documents.** [`display-substrate.md`](../design/display-substrate.md) states the
 principles this rests on — client-side rendering, damage-rectangle commits, the compositor
-owning window focus. [`ui-composition-model.md`](../design/ui-composition-model.md) owns what a window
+owning window focus. [`ui-composition-model.md`](ui-composition-model.md) owns what a window
 *is*; this document owns what is inside one.
 [`input-subsystem.md`](input-subsystem.md) owns everything up to a `KeyEvent` arriving at a
 window; routing it to a widget starts here.
