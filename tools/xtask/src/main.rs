@@ -1719,8 +1719,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: overview closed")?;
 
     // And it really moved: `work` is empty again, and the window is on the desktop it was
-    // dropped on.
-    session.expect("desktop-shell: window list on work of ")?;
+    // dropped on. **`(empty)` rather than the bare prefix**, which matched a list still holding
+    // the window just as happily as one that had lost it (PR #244 review, optional 6).
+    session.expect("desktop-shell: window list on work of 3 (empty)")?;
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
     session.expect(":> nxterm")?;

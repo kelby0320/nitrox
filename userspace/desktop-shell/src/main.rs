@@ -477,6 +477,25 @@ fn render_bar(font: &Font) -> MemFramebuffer {
     fb
 }
 
+/// Unmap a buffer this process mapped with [`shared_buffer`], and forget the pointer.
+///
+/// **The shell had no unmap call at all until M8 Part E's review.** `shared_buffer` maps
+/// outside the heap, so nothing reclaims it on drop: every overview open leaked two 4 MB
+/// mappings and up to six thumbnails, ~9 MB a cycle against a 256 MB guest — about
+/// twenty-eight opens to exhaust the machine, and the landing spot for that is a `create` that
+/// fails after the window exists (PR #244 review, finding 4). The modal has the same shape at
+/// 614 KB, which is why it had not bitten; it is fixed here too rather than left as the next
+/// instance of the same bug.
+fn release_buffer(addr: &mut *mut u8, len: usize) {
+    if addr.is_null() {
+        return;
+    }
+    // SAFETY: unmapping exactly what `shared_buffer` mapped, at the same length. The object
+    // itself goes when its last reference does — the handle was moved away at `attach`.
+    unsafe { syscall4(SYS_MEMORY_UNMAP, *addr as u64, len as u64, 0, 0) };
+    *addr = core::ptr::null_mut();
+}
+
 /// Allocate a shared memory object of `len` bytes and map it writable.
 fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     // SAFETY: a plain anonymous object of `len` bytes.
@@ -1484,7 +1503,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // Dismissed without launching. The field declines Escape for
                             // exactly this — see `TextFieldState::apply`.
                             rename = false;
-                            close_modal(&mut session, &mut modal, &mut query, "applications modal");
+                            close_modal(&mut session, &mut modal, &mut query, "applications modal", &mut modal_addrs);
                         } else if k.keycode == KEY_ENTER && rename {
                             // **Naming is what makes a desktop persist**, so this is the one
                             // gesture that changes the lifecycle rather than the view.
@@ -1501,7 +1520,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 .end();
                             rename = false;
                             list_dirty = true;
-                            close_modal(&mut session, &mut modal, &mut query, "name prompt");
+                            close_modal(&mut session, &mut modal, &mut query, "name prompt", &mut modal_addrs);
                             // Naming changes which desktops survive, so the rule applies here
                             // too — the one site that used to reach the next iteration by way
                             // of the popup's own destroy event.
@@ -1531,7 +1550,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 // session. There was no second launch and no way back, and
                                 // the gate clicks once so it passed (PR #237 review,
                                 // finding 6).
-                                close_modal(&mut session, &mut modal, &mut query, "applications modal");
+                                close_modal(&mut session, &mut modal, &mut query, "applications modal", &mut modal_addrs);
                             } else {
                                 kprint(b"desktop-shell: nothing matches; not launching\n");
                             }
@@ -1561,7 +1580,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     && k.pressed != 0
                     && k.keycode == KEY_ESC
                 {
-                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging);
+                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_addrs);
                     continue;
                 }
                 if let libsurface::WindowEvent::Pointer(p) = event
@@ -1612,7 +1631,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 // changed, so it is closed rather than left showing a window
                                 // that is no longer here.
                                 close_overview(
-                                    &mut session, &mut overview, &mut shots, &mut dragging,
+                                    &mut session,
+                                    &mut overview,
+                                    &mut shots,
+                                    &mut dragging,
+                                    &mut over_addrs,
                                 );
                             }
                         }
@@ -1658,6 +1681,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         sent_request = true;
                         shots.clear();
                         for e in visible_entries(&entries, current_desktop) {
+                            // **Minimized windows are not in the overview.** `set_minimized`
+                            // flips a flag without touching the committed buffer, so a
+                            // minimized window captures perfectly and would be drawn in the
+                            // grid exactly like one that is on screen — an overview of "what is
+                            // on this desktop" showing something that deliberately is not
+                            // (PR #244 review, optional 7). The bar is where a minimized window
+                            // is restored from, and it marks them.
+                            if e.minimized {
+                                continue;
+                            }
                             if let Some((w, h, px)) = capture_window(m, e.id, e.size) {
                                 shots.push((e.id, w, h, px));
                             }
@@ -1929,11 +1962,37 @@ fn open_overview(
             BUFFERS,
         )
         .ok()?;
+    // **Every failure past `create` destroys the window**, which `open_modal` below has said
+    // since PR #237 and this function did not. Returning `None` without it leaves the
+    // compositor holding a popup whose id this process has forgotten — never closable, never
+    // committable to — while `addrs` keeps a live mapping of an orphaned object that the next
+    // present would write through. Repeat past `MAX_WINDOWS_PER_CONNECTION` and the modal stops
+    // opening too, because they share the connection (PR #244 review, blocking 3).
+    let mut ok = true;
     for i in 0..BUFFERS {
-        let (handle, addr) = shared_buffer(len)?;
+        let Some((handle, addr)) = shared_buffer(len) else {
+            ok = false;
+            break;
+        };
         addrs[i] = addr;
-        let mut w = session.window(id)?;
-        w.attach(i as u32, SCREEN_W, SCREEN_H as u32, OVER_PITCH as u32, handle).ok()?;
+        let Some(mut w) = session.window(id) else {
+            ok = false;
+            break;
+        };
+        if w.attach(i as u32, SCREEN_W, SCREEN_H as u32, OVER_PITCH as u32, handle).is_err() {
+            ok = false;
+            break;
+        }
+    }
+    if !ok {
+        for a in addrs.iter_mut() {
+            release_buffer(a, len);
+        }
+        if let Some(w) = session.window(id) {
+            let _ = w.destroy();
+        }
+        kprint(b"desktop-shell: overview buffers FAILED\n");
+        return None;
     }
     present_overview(session, id, font, shots, desktops, current, addrs);
     Some(id)
@@ -1972,10 +2031,16 @@ fn close_overview(
     overview: &mut Option<u32>,
     shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
     dragging: &mut Option<u32>,
+    addrs: &mut [*mut u8; BUFFERS],
 ) {
     if let Some(id) = overview.take() {
         if let Some(w) = session.window(id) {
             let _ = w.destroy();
+        }
+        // **Unmapped, not merely forgotten.** Destroying the window drops the compositor's
+        // side; this process's two 4 MB mappings would otherwise stay for the session's life.
+        for a in addrs.iter_mut() {
+            release_buffer(a, OVER_PITCH * SCREEN_H as usize);
         }
         shots.clear();
         *dragging = None;
@@ -2066,6 +2131,10 @@ fn capture_window(
     // `shared_buffer` hands back zeroed memory, so "some pixel is non-zero" is exactly the
     // question, and only the process holding the buffer can ask it (PR #216's rule, and the
     // control that caught this one writing nothing).
+    // The copy is taken, so the mapping has done its job. Six of these per overview open at up
+    // to 144 KB each, and nothing else would ever reclaim them.
+    let mut addr = addr;
+    release_buffer(&mut addr, len);
     let lit = px.chunks_exact(4).filter(|c| c != &[0, 0, 0, 0]).count();
     if lit == 0 {
         Line::new()
@@ -2328,12 +2397,18 @@ fn close_modal(
     modal: &mut Option<u32>,
     query: &mut TextFieldState,
     what: &str,
+    modal_addrs: &mut [*mut u8; BUFFERS],
 ) {
     if let Some(id) = modal.take() {
         if let Some(w) = session.window(id) {
             let _ = w.destroy();
         }
         query.clear();
+        // The modal's buffers go the same way the overview's do — 614 KB a time rather than
+        // 8 MB, which is why this had not bitten, but it is the same bug.
+        for a in modal_addrs.iter_mut() {
+            release_buffer(a, MODAL_PITCH * MODAL_H as usize);
+        }
         // **Named, because the same popup serves two purposes.** These gates read the serial
         // log as the shell's only externally visible output, and a rename dismissal reading as
         // a launcher dismissal is the kind of line a later gate would assert the wrong thing

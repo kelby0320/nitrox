@@ -753,9 +753,15 @@ handle**: a writable memory object the *manager* allocated, at least `pitch * he
 compositor box-downscales the window's committed buffer into it and replies with an empty body.
 
 `NotFound` if no such window. `Malformed` if the body is short, no handle came with it, or a
-dimension is zero. `Rejected` if the window has committed nothing yet, if the object is smaller
-than `pitch * height`, or if the requested size is **larger** than the window in either axis —
-this scales down, and a caller asking to scale up has misunderstood what it is for.
+dimension is zero. `Rejected` if the object is smaller than `pitch * height`, or if the requested
+size is **larger** than the window in either axis — this scales down, and a caller asking to
+scale up has misunderstood what it is for.
+
+**A window that has committed nothing yet is `WouldBlock`, not `Rejected`**, and it is the one
+answer here worth branching on: it means *try again once it draws*, where every other refusal
+means the request was wrong. A freshly launched application has no thumbnail until its first
+commit, and a caller that could not tell that from a malformed body would have no reason to
+retry.
 
 **The manager allocates, which is the mirror of [`AttachBuffer`](#attachbuffer-0x0901).** There
 a client allocates and the compositor reads; here the manager allocates and the compositor
@@ -769,8 +775,11 @@ the buffer should contain. Destination pixel `(dx, dy)` is the mean of the sourc
 span at least one pixel wide, with integer division truncating. Bands are derived from edges
 rather than from a step so that **every source pixel belongs to exactly one band** — with a step
 it is the last rows that fall outside, which in a terminal is where the most recent output is.
-`libdraw::scale::box_downscale` is that function, and both the compositor and the host-side gate
-call it rather than each having their own.
+`libdraw::scale::box_downscale` is that function. **The compositor calls it; nothing on the host
+does yet** — the shell's buffer never leaves the guest, and the only gate that compares pixels
+boots an image with no shell in it. The arithmetic is published here so that a gate which *can*
+see a thumbnail links this rather than writing its own, and until then the scale is pinned by
+`libdraw`'s unit tests.
 
 **Capture is a snapshot, and the thumbnail does not update.** A window drawn after a capture
 shows its state at the moment it was taken. That is deliberate — `desktop-shell.md` §6 accepts

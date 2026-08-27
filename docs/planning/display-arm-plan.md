@@ -2076,8 +2076,12 @@ also reach the focused window.
 ### Part E — capture and the overview
 
 - [x] **`Capture(window, buffer, width, height)`** ✅ — governing decision 4. The scale is
-      `libdraw::scale::box_downscale`, **linked by both ends** so a comparison is not two
-      roundings agreeing, and it is fully specified in the spec down to the band edges. The compositor
+      `libdraw::scale::box_downscale`, fully specified down to the band edges so that a gate
+      which can see a thumbnail links it rather than writing its own. **No such gate exists**:
+      the shell's buffer never leaves the guest. The scale is pinned by unit tests written
+      against inputs where averaging and sampling disagree — the first version re-derived the
+      band arithmetic inside the test and passed against both a nearest-neighbour scale and one
+      that dropped the last source row (PR #244 review, blocking 1). The compositor
       area-averages the window's current contents into the shell's buffer. Deterministic, so a
       gate can compare a thumbnail against a `libdraw` downscale of the same source.
 
@@ -2100,11 +2104,13 @@ also reach the focused window.
       by switching to that desktop — **by reading the window list rather than comparing the
       screen**, for the reason Part C established: `desktop-shell` runs only in a session, and
       the only gate that compares pixels boots a `--selftest` image that never logs in.
-      What a screen comparison would have caught is covered instead by the shell checking the
-      buffer *it* owns: `box_downscale` is host-tested, and the guest asserts the thumbnail came
-      back with painted pixels — because the compositor logs a successful capture whether or not
-      the scale wrote anything, and a black thumbnail reads like a dark window on a serial
-      console. That control passed until the check existed.
+      What a screen comparison would have caught is covered in two halves, neither of them a
+      comparison: `box_downscale`'s output is pinned by unit tests on inputs where averaging and
+      sampling disagree, and the guest asserts the thumbnail came back with painted pixels —
+      because the compositor logs a successful capture whether or not the scale wrote anything,
+      and a black thumbnail reads like a dark window on a serial console. That control passed
+      until the check existed. **What is still not covered is whether the thumbnail resembles
+      the window**, which needs an end that can see both.
 
 ### Part F — `/dev/desktop`, its first consumer, and the graduations
 

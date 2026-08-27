@@ -1,9 +1,16 @@
 //! Downscaling, for window thumbnails.
 //!
-//! **One implementation, linked by both ends.** The compositor scales a window into the shell's
-//! buffer; a gate on the host has to be able to say what that buffer should contain. If each
-//! side had its own downscale the comparison would be checking that two roundings agree, which
-//! is a weaker claim than it looks and fails for reasons nobody can act on.
+//! **One implementation, and it is specified so that a second end can be built against it.**
+//! The compositor scales a window into the shell's buffer. A host-side gate that wanted to say
+//! what that buffer should contain would link this rather than write its own — because a
+//! comparison between two independent downscales is checking that two roundings agree, which is
+//! a weaker claim than it looks and fails for reasons nobody can act on.
+//!
+//! **No such gate exists today, and the first version of this doc said one did.** Nothing under
+//! `tools/` links this module: the shell's buffer never leaves the guest, and the only gate that
+//! compares pixels boots an image with no shell in it. What pins the output is the unit tests
+//! below, which is why they are written against inputs where averaging and sampling disagree
+//! rather than against a re-derivation of the arithmetic (PR #244 review, blocking 1 and 2).
 //!
 //! **Box average, not nearest.** A thumbnail is where a terminal's text becomes a texture, and
 //! dropping seven pixels in eight turns that into aliasing noise that changes with sub-pixel
@@ -77,26 +84,6 @@ pub fn box_downscale(src: &[u8], src_geom: Geometry, dst: &mut [u8], dst_geom: G
     true
 }
 
-/// Box-downscale a [`Framebuffer`] into a fresh byte buffer with `dst_geom`.
-///
-/// The convenience the host end wants: a gate has a rendered reference, not a raw slice.
-pub fn downscale_framebuffer<F: Framebuffer + ?Sized>(
-    src: &F,
-    dst_geom: Geometry,
-) -> Option<alloc::vec::Vec<u8>> {
-    let src_geom = src.geometry();
-    let mut packed = alloc::vec![0u8; src_geom.byte_len()];
-    for y in 0..src_geom.height {
-        for x in 0..src_geom.width {
-            let c = src.get_pixel(x, y).unwrap_or_default();
-            let off = y as usize * src_geom.pitch + x as usize * 4;
-            packed[off..off + 4].copy_from_slice(&src_geom.format.encode(c).to_le_bytes());
-        }
-    }
-    let mut dst = alloc::vec![0u8; dst_geom.byte_len()];
-    box_downscale(&packed, src_geom, &mut dst, dst_geom).then_some(dst)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,29 +115,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_source_pixel_belongs_to_exactly_one_band() {
-        // **The reason the bands are computed from edges rather than from a step.** A source
-        // row that no destination row covers is a row of the window that is simply not in the
-        // thumbnail — and with a step it is the *last* rows that vanish, which is where a
-        // terminal's most recent output is.
-        let (sw, sh) = (7u32, 5u32);
-        let (dw, dh) = (3u32, 2u32);
-        let mut covered = alloc::vec![0u32; (sw * sh) as usize];
-        for dy in 0..dh {
-            let y0 = dy * sh / dh;
-            let y1 = ((dy + 1) * sh / dh).max(y0 + 1);
-            for dx in 0..dw {
-                let x0 = dx * sw / dw;
-                let x1 = ((dx + 1) * sw / dw).max(x0 + 1);
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        covered[(y * sw + x) as usize] += 1;
-                    }
-                }
+    /// Fill `g` from a per-pixel closure, and return the packed bytes.
+    fn packed(g: Geometry, f: impl Fn(u32, u32) -> Rgb) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec![0u8; g.byte_len()];
+        for y in 0..g.height {
+            for x in 0..g.width {
+                let off = y as usize * g.pitch + x as usize * 4;
+                v[off..off + 4].copy_from_slice(&g.format.encode(f(x, y)).to_le_bytes());
             }
         }
-        assert!(covered.iter().all(|&n| n == 1), "coverage was {covered:?}");
+        v
+    }
+
+    /// Read destination pixel `(x, y)`.
+    fn at(dst: &[u8], g: Geometry, x: u32, y: u32) -> Rgb {
+        let off = y as usize * g.pitch + x as usize * 4;
+        g.format.decode(u32::from_le_bytes([dst[off], dst[off + 1], dst[off + 2], dst[off + 3]]))
+    }
+
+    #[test]
+    fn it_averages_rather_than_sampling() {
+        // **Chosen so the two answers differ.** Three source pixels — black, black, white —
+        // into one: the mean is 85 and any form of point sampling gives 0 or 255. A uniform
+        // source cannot tell these apart, which is why the first version of this suite could
+        // not: averaging equal pixels and picking one of them are the same answer.
+        let sg = geom(3, 1);
+        let src = packed(sg, |x, _| if x == 2 { Rgb::new(255, 255, 255) } else { Rgb::new(0, 0, 0) });
+        let dg = geom(1, 1);
+        let mut dst = alloc::vec![0u8; dg.byte_len()];
+        assert!(box_downscale(&src, sg, &mut dst, dg));
+        assert_eq!(at(&dst, dg, 0, 0), Rgb::new(85, 85, 85), "nearest-neighbour would give 0 or 255");
+    }
+
+    #[test]
+    fn the_last_source_row_reaches_the_thumbnail() {
+        // **The bands are derived from edges, not from a step**, and this is what that buys.
+        // With a step of `sh / dh` the last rows fall outside every band — in a terminal, the
+        // most recent output. Five rows into two does not divide, so a step would cover rows
+        // 0..1 and 2..3 and drop row 4 entirely.
+        //
+        // The source is black except for its **last** row, which is white. If the last row is
+        // dropped the bottom destination pixel is pure black; averaged, it is not.
+        let sg = geom(4, 5);
+        let src = packed(sg, |_, y| if y == 4 { Rgb::new(255, 255, 255) } else { Rgb::new(0, 0, 0) });
+        let dg = geom(2, 2);
+        let mut dst = alloc::vec![0u8; dg.byte_len()];
+        assert!(box_downscale(&src, sg, &mut dst, dg));
+        let bottom = at(&dst, dg, 0, 1);
+        assert_ne!(bottom, Rgb::new(0, 0, 0), "the last source row never reached the thumbnail");
+        // Rows 2,3,4 average to (0 + 0 + 255) / 3 = 85.
+        assert_eq!(bottom, Rgb::new(85, 85, 85));
+        assert_eq!(at(&dst, dg, 0, 0), Rgb::new(0, 0, 0), "and the top band is all black");
+    }
+
+    #[test]
+    fn an_uneven_split_covers_every_column_too() {
+        // The same claim on the other axis, and with a width that does not divide: seven
+        // columns into three. Column 6 is the one a step would drop.
+        let sg = geom(7, 1);
+        let src = packed(sg, |x, _| if x == 6 { Rgb::new(0, 0, 240) } else { Rgb::new(0, 0, 0) });
+        let dg = geom(3, 1);
+        let mut dst = alloc::vec![0u8; dg.byte_len()];
+        assert!(box_downscale(&src, sg, &mut dst, dg));
+        assert_ne!(at(&dst, dg, 2, 0), Rgb::new(0, 0, 0), "the last source column was dropped");
     }
 
     #[test]
@@ -171,23 +198,4 @@ mod tests {
         assert!(!box_downscale(&src, g, &mut dst, dg));
     }
 
-    #[test]
-    fn a_framebuffer_downscales_through_the_same_path() {
-        // What the host end uses. Half of it one colour and half another, so the result cannot
-        // be right by accident.
-        let mut fb = MemFramebuffer::new(geom(4, 2));
-        for x in 0..4 {
-            fb.put_pixel(x, 0, Rgb::new(255, 0, 0));
-            fb.put_pixel(x, 1, Rgb::new(0, 0, 255));
-        }
-        let dg = geom(2, 2);
-        let out = downscale_framebuffer(&fb, dg).expect("downscale");
-        let px = |i: usize| {
-            let off = (i / 2) * dg.pitch + (i % 2) * 4;
-            let w = u32::from_le_bytes([out[off], out[off + 1], out[off + 2], out[off + 3]]);
-            dg.format.decode(w)
-        };
-        assert_eq!(px(0), Rgb::new(255, 0, 0), "the top row is the red one");
-        assert_eq!(px(2), Rgb::new(0, 0, 255), "and the bottom the blue");
-    }
 }
