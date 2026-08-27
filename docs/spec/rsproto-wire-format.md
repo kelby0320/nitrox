@@ -70,7 +70,8 @@ The 16-bit `op` field decomposes:
 | `Surface` | `0x09xx` | Windows, shared buffers, commit/release. See [Surface operations spec](rsproto-surface-ops.md). |
 | `Input` | `0x0Axx` | Merged input events from the `input-server`. See [Input operations spec](rsproto-input-ops.md). |
 | `Tty` | `0x0Bxx` | Terminal read/write/mode, served by `tty-server` at `/dev/tty`. See [`console-and-tty.md`](../architecture/console-and-tty.md). |
-| (reserved) | `0x0Cxx` – `0xFExx` | Future categories |
+| `Desktop` | `0x0Cxx` | The graphical session's desktops, served by `desktop-shell` at `/dev/desktop`. See [Desktop operations spec](rsproto-desktop-ops.md). |
+| (reserved) | `0x0Dxx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 **This table is the allocation, and every category in it must be distinct.** That sounds

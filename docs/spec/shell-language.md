@@ -13,7 +13,8 @@ matching, literals/ranges/modules), coreutils scope, and REPL/interactive behavi
 covered for a first pass. Remaining gaps are listed in §12 — none block implementation of the core
 language and shell. Update in place as the design progresses; don't treat this as final.
 Companion document: `docs/architecture/ui-composition-model.md` (windows/widgets as resource servers,
-window-to-window composition) — present in `docs/design/`, upstream of this one where they touch
+window-to-window composition) — graduated to `docs/architecture/` with Milestone 8, upstream of
+this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
 
 ### Changes in v1.2 (2026-08-04, language-completeness pass)

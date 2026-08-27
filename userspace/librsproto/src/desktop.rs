@@ -200,6 +200,24 @@ mod tests {
     }
 
     #[test]
+    fn a_name_length_past_the_end_of_the_body_is_refused() {
+        // **The `8 + len` half of the walk's guard, which nothing reached.** The entry-count
+        // test above stops on `rest.len() < 8` — after one entry `rest` is empty — so removing
+        // the length check left every test green while a body declaring a longer name than it
+        // carries panicked on the slice (PR #245 review, finding 7).
+        //
+        // count=1, current=1, truncated=0; entry id=1, len=9, then two bytes only.
+        let mut b = [0u8; 22];
+        for (i, v) in [1u32, 1, 0, 1, 9].iter().enumerate() {
+            put_u32(&mut b, i * 4, *v);
+        }
+        b[20] = b'a';
+        b[21] = b'b';
+        let list = DesktopList::read(&b).unwrap();
+        assert_eq!(list.entries().count(), 0, "a name running past the body was accepted");
+    }
+
+    #[test]
     fn an_index_round_trips_and_refuses_a_short_body() {
         let mut b = [0u8; 4];
         DesktopIndex { index: 3 }.write(&mut b).unwrap();

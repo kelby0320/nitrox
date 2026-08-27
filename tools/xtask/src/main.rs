@@ -1894,7 +1894,12 @@ fn check_two_sessions(transcript: &str) -> R<()> {
     // different process from the shell whose lines are asserted above. Both halves matter:
     // without the shell's lines a command could have invented these, and without these a shell
     // could have served a reply nobody received.
-    for line in ["desktop: running", "desktop: listed ", "desktop: named 2 cli"] {
+    // **`(table)` rather than a bare "listed"**: the listing is the one data product here, and
+    // it goes to stdout as TSM1 like every other coreutil's. It went to *stderr* until PR #245's
+    // review — where `desktop | sort name` produced nothing and the rows interleaved with every
+    // stage's diagnostics on the shared sink — and a gate reading a release image can see the
+    // bytes nowhere, so the command names the branch it took. Match the name, not just the count.
+    for line in ["desktop: running", "desktop: listed 3 desktops (table)", "desktop: named 2 cli"] {
         if !transcript.contains(line) {
             return Err(format!(
                 "the `desktop` command did not report \"{line}\". It resolves /dev/desktop from \

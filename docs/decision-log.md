@@ -18809,3 +18809,51 @@ that is going to take a byte. The comment there says so now.
 **One ordering lesson, again.** The command's output and the shell's are two processes, and which
 lands first varied between runs. The shell's lines stay ordered `expect`s; the command's are
 checked against the whole transcript, where order does not matter — PR #227's rule, reapplied.
+
+### PR #245 review — the reply buffer, the spec row, and the one command whose product went to stderr
+
+**A 32-byte handle array the kernel would write 64 bytes into.** `serve_desktop_session`'s
+`DS_HANDLES` was `[u64; 4]`, and `sys_channel_recv` copies out the *sender's* handle count,
+bounded by `IPC_HANDLE_MAX` (8) and by nothing else. The `SAFETY` comment above it said "a
+desktop request carries no transferred handles" — which is a property of the *peer*, not of this
+process, and `/dev/desktop` is bound into every application namespace, so the peer is any program
+the session runs. Sized from the ABI now, in both the server and the command, and surplus handles
+are closed after each recv rather than leaked. The rule this restates: **a buffer whose size is
+argued from what the sender is expected to send is not bounded at all.**
+
+**`Desktop` was absent from the wire format's category table**, which is the document that
+allocates the 16-bit op space — so the next category to be added could have been given `0x0C`
+with nothing to say otherwise. The row is there, the reserved range moved to `0x0D`–`0xFE`, and
+`rsproto-desktop-ops.md` gives the three ops their bodies and errors like every other category.
+
+**The listing is a `Table` on stdout.** It went to `stage.diag` — stderr, which
+`pipeline-stdio.md` calls a *shared diagnostic sink, not a per-adjacency pipe* — so `desktop |
+sort name` produced nothing, and the rows interleaved with every other stage's diagnostics. It is
+the one command in `/bin` whose primary output is a table and which did not emit one. It now
+emits `Table<{position, id, name, current}>` and keeps the text rendering for when there is no
+stdout, which is what `list` and `whoami` both do.
+
+**The gate could not have told the difference**, which is the part worth keeping. A release image
+renders no grid, so the table's bytes are invisible from the host, and both branches printed the
+same console line — an assertion that would have passed just as well for the stderr version. The
+command names the sink it used (`listed 3 desktops (table)`), and `check-login` matches the name.
+
+**`ReqError` instead of `Option`.** Transport failure, a dead channel and an `RS_FLAG_ERROR`
+reply all collapsed into `None`, so `switch` and `name` printed *no such desktop* for a channel
+that had gone away — a diagnosis of the operand for a fault that had nothing to do with it. The
+shell's `bad()` sends its `KError` as four bytes; `InvalidArgument` is the one that means the
+operand, and anything else prints its code rather than a guess.
+
+**And two smaller ones.** The Super+R rename was uncapped, so a name longer than
+`MAX_DESKTOP_NAME` broke every subsequent `List` permanently — the encoder refuses and the reply
+never comes; the shell now answers `InvalidArgument` for an unencodable listing rather than
+`KernelError`, which is what a caller would chase. The reader's `rest.len() < 8 + len` guard had
+no test: the entry-count test stops on `rest.len() < 8`, so removing the length check left every
+test green while a body declaring a longer name than it carries panicked. Both now have the
+control that fails without them.
+
+**The "cannot verify" conclusion above was too strong.** A process cannot *resolve* a path it
+serves, but it can *enumerate* its own namespace: `SYS_NS_ENUMERATE` is local and involves no
+IPC. `verify_app_namespace` checks the binding that way, so the shell's claim that
+`/dev/desktop` is bound is now read back from the namespace rather than asserted from the bind
+call's return.

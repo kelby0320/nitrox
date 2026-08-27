@@ -777,18 +777,50 @@ fn verify_app_namespace(ns: u64, expect_home: bool, expect_desktop: bool) -> boo
             return false;
         }
     }
-    // **`/dev/desktop` is deliberately *not* resolved here, and finding out why cost a boot.**
-    // The shell serves that path. A resolve is forwarded to whoever serves it, so this process
-    // asking the kernel to resolve its own endpoint blocks inside `ns_lookup` waiting for an
-    // answer only it could send — the same self-deadlock the bottom bar hit in Part C, by a
-    // different route. **A process cannot verify a binding of itself by using it.**
+    // **`/dev/desktop` is checked by *enumerating* the namespace, not by resolving it.**
     //
-    // What can be checked is that the bind *succeeded*, which `build_app_namespace` reports,
-    // and that something else can actually reach it — which is the `desktop` command's job, and
-    // exactly why the `desktop-endpoint` deferral insisted the consumer ship in the same part.
-    let _ = expect_desktop;
+    // The shell serves that path, and a resolve is forwarded to whoever serves it — so asking
+    // the kernel to resolve its own endpoint blocks this process inside `ns_lookup` waiting for
+    // an answer only it could send. That is real, and it is the same self-deadlock the bottom
+    // bar hit in Part C by another route.
+    //
+    // **But "cannot resolve it" is not "cannot check it", which is where the first version of
+    // this stopped.** `SYS_NS_ENUMERATE` walks the caller's *own* namespace and copies out one
+    // entry per call: local, no IPC, nothing forwarded — `nxsh`'s `binding_at_or_under` uses the
+    // same idiom. So the binding gets a check on the same footing as `new` granted and `manage`
+    // withheld, rather than the bind call's return value standing in for one, which was a proxy
+    // where a real check was available (PR #245 review, finding 3).
+    if expect_desktop && !bound_in(ns, "/dev/desktop") {
+        kprint(b"desktop-shell: application namespace has no /dev/desktop -- refusing\n");
+        return false;
+    }
     kprint(b"desktop-shell: application namespace grants new + /home, withholds manage\n");
     true
+}
+
+/// Whether `path` is bound in `ns` — asked of the namespace itself, not of whoever serves it.
+///
+/// **Local and cheap**: the kernel walks the caller's own namespace and copies out one entry per
+/// call, with no forwarding anywhere in it. That is what makes it usable on a path this process
+/// *serves*, where a resolve would deadlock.
+fn bound_in(ns: u64, path: &str) -> bool {
+    let mut entry = libkern::abi::NsEntry::zeroed();
+    for index in 0u64.. {
+        // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
+        let r =
+            unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut _ as u64) };
+        if r != 0 {
+            return false; // NotFound ends the walk
+        }
+        let len = (entry.path_len as usize).min(libkern::abi::NS_ENTRY_PATH_MAX);
+        // SAFETY: the kernel wrote the binding path; `len` is clamped to the buffer.
+        let bound =
+            unsafe { core::slice::from_raw_parts((&raw const entry.path) as *const u8, len) };
+        if bound == path.as_bytes() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve `path` in `ns`, returning `(status, handle)`.
@@ -1603,7 +1635,20 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         } else if k.keycode == KEY_ENTER && rename {
                             // **Naming is what makes a desktop persist**, so this is the one
                             // gesture that changes the lifecycle rather than the view.
-                            let name = query.text();
+                            // **Capped at what the wire can carry.** `write_list` refuses a
+                            // whole `List` reply rather than truncating a name, which is right
+                            // — but the text field has no cap of its own, so a 33-character
+                            // label typed here made every later `List` fail for *all* desktops,
+                            // permanently, since the name persists. The `desktop name` path
+                            // already checked this bound; this one did not
+                            // (PR #245 review, finding 4).
+                            let full = query.text();
+                            let name = &full[..full
+                                .char_indices()
+                                .map(|(i, c)| i + c.len_utf8())
+                                .take_while(|&e| e <= librsproto::desktop::MAX_DESKTOP_NAME)
+                                .last()
+                                .unwrap_or(0)];
                             if let Some(d) =
                                 desktops.iter_mut().find(|d| d.id == current_desktop)
                             {
@@ -2269,7 +2314,7 @@ fn serve_desktop_session(
         DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, OP_DESKTOP_LIST,
         OP_DESKTOP_NAME, OP_DESKTOP_SWITCH, write_list,
     };
-    // SAFETY: valid recv out-params; a desktop request carries no transferred handles.
+    // SAFETY: valid recv out-params, sized from `IPC_HANDLE_MAX`.
     let rr = unsafe {
         syscall4(
             SYS_CHANNEL_RECV,
@@ -2279,6 +2324,18 @@ fn serve_desktop_session(
             (&raw mut DS_COUNT) as u64,
         )
     };
+    // **Close whatever came with it.** No desktop op takes a handle, but that is a property of
+    // the *peer* rather than of this server — and a SAFETY comment that assumes it was the other
+    // half of blocking 2. The kernel installs whatever the sender attached into this process's
+    // table whether or not anything here looks at it, so left alone they pin slots in the global
+    // handle table for the shell's life. `serve_manager` in the compositor states the same rule.
+    // SAFETY: closing handles the kernel just installed for us.
+    unsafe {
+        let n = ((&raw const DS_COUNT).read()).min(libkern::abi::IPC_HANDLE_MAX);
+        for i in 0..n {
+            syscall1(SYS_HANDLE_CLOSE, DS_HANDLES[i]);
+        }
+    }
     if rr != 0 {
         if rr == KError::PeerClosed.as_i32() as i64 {
             // SAFETY: the peer is gone; free the slot and close our end.
@@ -2323,7 +2380,10 @@ fn serve_desktop_session(
             let Some(n) =
                 write_list(&mut out, cur as u32, &listed, desktops.len() > MAX_LISTED)
             else {
-                return bad(KError::KernelError);
+                // Server-side data this server cannot encode — not a kernel fault, which is
+                // what `KernelError` claims and what a caller would chase.
+                kprint(b"desktop-shell: a desktop list would not serialise\n");
+                return bad(KError::InvalidArgument);
             };
             ds_reply(ch, op, request_id, &out[..n], 0, false);
             Line::new().s(b"desktop-shell: served List of ").u(desktops.len() as u64).end();
@@ -2458,7 +2518,16 @@ static mut DESKTOP_SERVE: u64 = 0;
 /// See [`DESKTOP_SERVE`].
 static mut DESKTOP_SESSIONS: [u64; MAX_DESKTOP_SESSIONS] = [0; MAX_DESKTOP_SESSIONS];
 static mut DS_MSG: [u8; 4096] = [0; 4096];
-static mut DS_HANDLES: [u64; 4] = [0; 4];
+/// Sized from the **ABI**, not from what this server expects to receive.
+///
+/// `sys_channel_recv` passes no receiver-side capacity: the kernel copies out `n * 8` bytes
+/// where `n` is the *sender's* stamped count, bounded only by `IPC_HANDLE_MAX`. At four this
+/// was a 32-byte static the kernel would write 64 bytes into — and `/dev/desktop` is bound into
+/// **every** application namespace this shell constructs, so any client sending a request with
+/// eight handles attached smashes whatever `.bss` follows. No bug in the client is needed; a
+/// careless one does it (PR #245 review, blocking 2). Every other server in the tree sizes this
+/// `[u64; IPC_HANDLE_MAX]` for exactly this reason.
+static mut DS_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut DS_COUNT: usize = 0;
 static mut DS_REPLY: [u8; 4096] = [0; 4096];
 static mut DS_REPLY_HANDLES: [u64; 4] = [0; 4];
