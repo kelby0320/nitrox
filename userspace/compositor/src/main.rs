@@ -255,6 +255,13 @@ struct Server {
     /// here may be dropped without sending one — see [`release_configure`] and
     /// [`CONFIGURE_DEADLINE_NS`].
     pending_configure: alloc::vec::Vec<(u32, u64)>,
+    /// The screen, as the framebuffer reports it. Fixed for this process's life.
+    ///
+    /// Kept here so that the work area — which every path that changes a strut has to be able to
+    /// re-answer — does not need the framebuffer threaded through it.
+    screen: Rect,
+    /// The layout last announced to the manager, so a change can be told from a repeat.
+    last_layout: Option<librsproto::surface::MgrLayout>,
     /// The window last told it has the keyboard, if any.
     ///
     /// Kept so a focus change can be *detected* rather than re-announced: `focus_candidate`
@@ -673,6 +680,11 @@ fn flush_outboxes(srv: &mut Server) -> bool {
 /// op it just handled. Draining unconditionally also keeps the stack's logs from growing while
 /// no manager is attached, because they are emptied either way.
 fn drain_stack_events(srv: &mut Server) {
+    // **Here, because every path that can change a strut ends here.** A panel is created,
+    // destroyed, re-placed or committed at a different size through four different requests, and
+    // all four drain their stack events — so one comparison in the one place they meet is what
+    // keeps a manager's work area current without hunting for the causes (M9 Part B).
+    announce_layout(srv);
     for window in srv.stack.take_geometry_changes() {
         // Gone already — destroyed in the same batch that moved it. Its removal is announced
         // just below; a rectangle for a window that no longer exists is not.
@@ -835,6 +847,22 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
             match g.write(&mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_GEOMETRY, &body[..n]),
                 None => unserialisable(b"WindowGeometry"),
+            }
+        }
+        MgrEvent::LayoutChanged(l) => {
+            let mut body = [0u8; core::mem::size_of::<librsproto::surface::MgrLayout>()];
+            match l.write(&mut body) {
+                Some(n) => send_input(ch, librsproto::surface::OP_MGR_LAYOUT_CHANGED, &body[..n]),
+                None => unserialisable(b"LayoutChanged"),
+            }
+        }
+        MgrEvent::StateRequest(s) => {
+            let mut body = [0u8; core::mem::size_of::<librsproto::surface::WindowState>()];
+            match s.write(&mut body) {
+                Some(n) => {
+                    send_input(ch, librsproto::surface::OP_MGR_WINDOW_STATE_REQUEST, &body[..n])
+                }
+                None => unserialisable(b"WindowStateRequest"),
             }
         }
         MgrEvent::Title { window, title } => {
@@ -1499,6 +1527,16 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         }
         return ok;
     }
+    if op == librsproto::surface::OP_MGR_QUERY_LAYOUT {
+        // Handled here for the reason `Capture` is: `manager::dispatch` sees a `WindowStack` and
+        // nothing else, and this answer needs the *screen*, which is the framebuffer's.
+        let layout = current_layout(srv);
+        let mut body = [0u8; core::mem::size_of::<librsproto::surface::MgrLayout>()];
+        return match layout.write(&mut body) {
+            Some(n) => reply_on_session(ch, op, request_id, &body[..n]),
+            None => reply_error_on_session(ch, op, request_id, KError::InvalidArgument),
+        };
+    }
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
     drain_stack_events(srv);
     match mgr_outcome {
@@ -1764,6 +1802,39 @@ fn surface_errno(e: SurfaceError) -> KError {
     }
 }
 
+/// The screen and the work area, as they are now.
+///
+/// **The work area is the compositor's to compute** — every `panel` declares a strut and only
+/// this process sees all of them. A manager that subtracted its own bars would be right only for
+/// as long as it owned every panel.
+fn current_layout(srv: &Server) -> librsproto::surface::MgrLayout {
+    let screen = srv.screen;
+    let work = srv.stack.work_area(screen);
+    librsproto::surface::MgrLayout {
+        screen_w: screen.size.w,
+        screen_h: screen.size.h,
+        work_x: work.origin.x,
+        work_y: work.origin.y,
+        work_w: work.size.w,
+        work_h: work.size.h,
+    }
+}
+
+/// Tell the manager when the work area is not what it was.
+///
+/// **Compared rather than triggered.** A strut changes for several reasons — a panel created,
+/// destroyed, resized, or re-placed — and reporting each of those causes separately would mean
+/// finding every one of them and being wrong about the next. What a manager needs to know is
+/// that the answer changed, which is one comparison against the last answer given.
+fn announce_layout(srv: &mut Server) {
+    let now = current_layout(srv);
+    if srv.last_layout == Some(now) {
+        return;
+    }
+    srv.last_layout = Some(now);
+    mgr_emit(srv, MgrEvent::LayoutChanged(now));
+}
+
 /// Send an error reply on a session channel.
 fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -> bool {
     let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
@@ -1898,6 +1969,44 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                     Some(KError::NotFound)
                 }
             },
+        };
+        return match err {
+            Some(e) => reply_error_on_session(ch, op, request_id, e),
+            None => reply_on_session(ch, op, request_id, &[]),
+        };
+    }
+
+    // **`RequestState` is forwarded, not applied.** Minimising is `Manage::SetMinimized` and
+    // maximising is a `Configure` to a rectangle computed from the work area; both are manager
+    // operations, and a client that could reach either could put another client's window away or
+    // place itself. So the compositor's whole part is to check the caller owns the window and
+    // hand the manager the question (M9 Part B).
+    if op == librsproto::surface::OP_REQUEST_STATE {
+        if handle != 0 {
+            // SAFETY: closing a handle this process owns and will never interpret.
+            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        }
+        let err = match librsproto::surface::WindowState::read(body) {
+            None => Some(KError::InvalidArgument),
+            Some(req) if req.state > librsproto::surface::WINDOW_STATE_MAXIMIZED => {
+                Some(KError::InvalidArgument)
+            }
+            Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
+            Some(req) => {
+                // **Repeats produce nothing**, which is the bound this event needs: it is the
+                // only manager event a client's own rate drives, and the manager's queue does
+                // not coalesce and discards its oldest — so a client looping on one state would
+                // otherwise push a `WindowCreated` off the front of the shell's view of the
+                // world. The same argument `SetTitle` already makes for an unchanged title.
+                //
+                // What it cannot dedup is *alternation*, and that is correct rather than a gap:
+                // a window asked to maximise and then to restore has changed state twice, and a
+                // manager that missed either would be wrong about where the window belongs.
+                if srv.stack.note_state_request(req.window, req.state) {
+                    mgr_emit(srv, MgrEvent::StateRequest(req));
+                }
+                None
+            }
         };
         return match err {
             Some(e) => reply_error_on_session(ch, op, request_id, e),
@@ -2323,6 +2432,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         repeat: None,
         pending_configure: alloc::vec::Vec::new(),
         announced_focus: None,
+        screen: fb.geometry().bounds(),
+        last_layout: None,
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
         mgr_outbox: MgrOutbox::new(),
         interp: Interpreter::new(),

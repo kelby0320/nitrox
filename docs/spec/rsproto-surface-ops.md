@@ -656,6 +656,37 @@ The move produces **one** `WindowGeometry` event, when it ends. Not one per moti
 does not coalesce and discards its oldest when full, so a long drag would push a `WindowCreated`
 off the front of a manager's view of the world.
 
+### `RequestState` (`0x090B`)
+
+Request, 8 bytes: `window` (u32), `state` (u32 — `0` normal, `1` minimised, `2` maximised).
+Asks the *manager* to put this window in that state. Empty reply body on success.
+
+**A client cannot do any of these itself, and must not be able to.** Minimising is
+[`SetMinimized`](#setminimized-0x0917) and maximising is a [`Configure`](#configure-0x0915) to a
+rectangle computed from the work area; both are manager operations, and a client holding either
+could put another client's window away or place itself. So this asks, the compositor forwards it
+as [`WindowStateRequest`](#manager-events-0x09180x091c-0x091f-0x09220x0923), and the manager
+answers with the request it would have sent anyway.
+
+`NotFound` for a window the caller does not own; `InvalidArgument` for a short body or a state
+above `2`.
+
+**The reply says the compositor accepted and forwarded it**, not that anything happened. What a
+manager does with the question is the manager's — a shell that declines to maximise a window is
+behaving correctly, and a client that is told nothing further learns the answer the way it learns
+any other geometry, through `Configure`.
+
+**A repeat produces no event.** The compositor remembers the state each window last *asked* for
+and drops a request for the same one. This is the only manager event a client's own rate drives,
+and the manager's queue does not coalesce and discards its oldest — so a client looping on one
+state would otherwise push a `WindowCreated` off the front of a manager's view of the world, the
+same argument [`SetTitle`](#titles-and-the-one-variable-length-body) makes for an unchanged
+title. Alternation is *not* deduplicated, and should not be: a window asked to maximise and then
+to restore has changed state twice.
+
+The compositor keeps no notion of a window *being* maximised — that is a rectangle the manager
+restores from, and a second copy here could disagree with it.
+
 ### `DestroyWindow` (`0x0904`)
 
 Request, 4 bytes: `window`. Destroys the window, its attached buffers, and **every popup or
@@ -665,7 +696,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`, `0x0921`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -790,6 +821,20 @@ Three rules make that true, and each exists because a simpler version was wrong:
 policy its holder asked for; left behind, chords would go on being consumed and delivered to
 nobody, and a replacement manager would inherit ids it did not choose.
 
+### `QueryLayout` (`0x0921`)
+
+Empty request body. Reply, 24 bytes: `screen_w`, `screen_h` (u32), `work_x`, `work_y` (i32),
+`work_w`, `work_h` (u32).
+
+**The first thing a manager needs that it cannot compute.** Every `panel` declares a strut (see
+[Struts](#struts)) and only the compositor sees all of them, so a shell subtracting its own bars
+is right exactly until some other client declares one — and then maximised windows sit under it
+with nothing able to notice. `Place`'s own note has always said "a manager computes positions
+from the work area", which was not something a manager could do until this existed.
+
+The work area is the screen minus every visible panel's reservation, clamped rather than allowed
+to invert: panels claiming more than the screen leave an empty rectangle, not a negative one.
+
 ### `Capture` (`0x0920`)
 
 Request, 16 bytes — `window` (u32), `width` (u32), `height` (u32), `pitch` (u32) — **and one
@@ -870,7 +915,7 @@ the cursor is entered normally.
 A window that has been **destroyed** gets none of this: it is unreachable, so its id is simply
 forgotten. The suppression above still applies, because the sequence has still lost its owner.
 
-## Manager events (`0x0918`–`0x091C`, `0x091F`)
+## Manager events (`0x0918`–`0x091C`, `0x091F`, `0x0922`–`0x0923`)
 
 Sent by the compositor **to** the manager channel, unsolicited. They are records, not
 requests: there is no reply, and the manager cannot refuse one.
@@ -903,6 +948,14 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
 | `0x091C` | `WindowTitle`    | window id + UTF-8   | A window's title changed — see *Titles* below  |
 | `0x091F` | `Hotkey`         | `MgrHotkey`         | A registered chord was **pressed** — see [`RegisterHotkey`](#registerhotkey-0x091e) |
+| `0x0922` | `LayoutChanged`  | `MgrLayout`         | The work area is not what it was — see [`QueryLayout`](#querylayout-0x0921) |
+| `0x0923` | `WindowStateRequest` | `WindowState`   | A client asked to be minimised or maximised — see [`RequestState`](#requeststate-0x090b) |
+
+`LayoutChanged` is sent when the work area *differs* from the one last announced, rather than
+when a strut is touched: a panel is created, destroyed, re-placed or committed at a new size
+through four different requests, and comparing the answer covers all of them and whatever comes
+next. A manager that maximised a window against stale numbers would leave it under a panel, and
+nothing else would report it.
 
 `Hotkey` is numbered after the block above because it was added later; it is a manager event
 like the rest. Its body is the same `MgrHotkey` the registration carried, echoed back — the

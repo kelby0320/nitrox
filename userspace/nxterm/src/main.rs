@@ -570,6 +570,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
+        // **A title-bar button.** Asked for, not done: minimising and maximising are the
+        // manager's, and the reply says the compositor forwarded the question rather than that
+        // anything happened — a shell may decide otherwise, and this terminal will find out the
+        // way it finds out about any other geometry, through `Configure`.
+        if let Some(state) = app.take_state_request()
+            && let Some(mut w) = win.window(window_id)
+        {
+            match w.request_state(state) {
+                Ok(()) => {
+                    libkern::debug::Line::new()
+                        .s(b"nxterm: asked the shell for window state ")
+                        .u(state as u64)
+                        .end();
+                }
+                Err(_) => kprint(b"nxterm: the state request was refused\n"),
+            }
+        }
+
         if let Some(b) = &mut backend {
             let out = app.take_outbox();
             if !out.is_empty() && !b.typed(&out) {

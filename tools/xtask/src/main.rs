@@ -1503,6 +1503,35 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
+/// Read `<x>,<y> <w>x<h>` — the tail of the shell's window-geometry line. Returns the width.
+fn parse_geometry(rest: &str) -> Option<u32> {
+    let mut it = rest.split_whitespace();
+    let _origin = it.next()?;
+    let (w, _h) = it.next()?.split_once('x')?;
+    w.parse().ok()
+}
+
+/// Read `<x>,<y> <w>x<h> of <sw>x<sh>` — the tail of the shell's work-area line.
+///
+/// Returns `(x, y, w, h, screen_w, screen_h)`.
+fn parse_work_area(rest: &str) -> Option<(i32, i32, u32, u32, u32, u32)> {
+    let mut it = rest.split_whitespace();
+    let (x, y) = it.next()?.split_once(',')?;
+    let (w, h) = it.next()?.split_once('x')?;
+    if it.next()? != "of" {
+        return None;
+    }
+    let (sw, sh) = it.next()?.split_once('x')?;
+    Some((
+        x.parse().ok()?,
+        y.parse().ok()?,
+        w.parse().ok()?,
+        h.parse().ok()?,
+        sw.parse().ok()?,
+        sh.parse().ok()?,
+    ))
+}
+
 /// Read `<id> at 0,<y>` — the tail of the shell's placement line. Returns `(id, y)`.
 fn parse_placement(rest: &str) -> Option<(u32, i32)> {
     let mut it = rest.split_whitespace();
@@ -1670,6 +1699,25 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // send the `Place` that would release it; only the 200 ms configure deadline broke the tie.
     session.expect("desktop-shell: bottom bar presented")?;
     session.expect("desktop-shell: manager channel held")?;
+
+    // **The work area, and that it is not the screen** (M9 Part B). The shell asks the
+    // compositor rather than subtracting its own bars, because any `panel`-role client declares
+    // a strut and only the compositor sees them all. If this ever equals the screen, the struts
+    // are not being counted and every maximised window will sit under the bars.
+    session.expect("desktop-shell: work area ")?;
+    let work_line = session.rest_of_line()?;
+    let work = parse_work_area(&work_line)
+        .ok_or_else(|| format!("could not read the work area from {work_line:?}"))?;
+    if work.3 >= work.5 {
+        return Err(format!(
+            "the work area is as tall as the screen ({work_line}) — the shell's bars declare \
+             struts, so a work area that ignores them would put every maximised window under \
+             them"
+        )
+        .into());
+    }
+    println!("  ok: the work area is {}x{} of a {}x{} screen", work.2, work.3, work.4, work.5);
+
     // **And the position, asserted rather than inferred.** A dock edge reserves space; it does
     // not move the window. Without this the bar's placement was only covered by proxy — the
     // list click at (90, 788) landing on nothing — which says the bar is not *there* rather
@@ -1734,8 +1782,54 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let placed = session.rest_of_line()?;
     let (term_id, term_y) = parse_placement(&placed)
         .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
+    // Its width, which the title bar's buttons are measured from — **before the window-list
+    // line**, which follows it: an `expect` scans forward, so asserting the list first would
+    // consume past the geometry this needs.
+    session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
+    let geom_line = session.rest_of_line()?;
+    let term_w = parse_geometry(&geom_line)
+        .ok_or_else(|| format!("could not read the terminal's geometry from {geom_line:?}"))?;
+
     // And it is listed, focused, because it has the keyboard.
     session.expect("desktop-shell: window list on ")?;
+
+    // Where a window-list entry sits: the first slot on the bottom bar.
+    const LIST_CLICK: (i32, i32) = (90, 788);
+
+    // 6a2. **The title bar's buttons ask, and the shell disposes** (M9 Part B). A client cannot
+    //      minimise or maximise itself — both are manager operations — so the button sends
+    //      `Surface::RequestState`, the compositor forwards it, and the shell decides. The
+    //      buttons sit at the bar's right end: maximise is last, minimise beside it.
+    let button_y = term_y + 13;
+    let maximise_at = (term_w as i32 - 13, button_y);
+    let minimise_at = (term_w as i32 - 39, button_y);
+
+    // **Maximise is asserted as far as the request, and no further.** `nxterm` declines every
+    // `Configure` until Part D, so the window does not change size yet — what this step proves
+    // is that the ask reached the shell and that the shell answered with the *work area* rather
+    // than the screen. Part D's gate is where the window itself is asserted.
+    click_at(&mut qmp, &mut session, maximise_at.0, maximise_at.1)?;
+    session.expect(&format!("nxterm: asked the shell for window state 2"))?;
+    session.expect(&format!(
+        "desktop-shell: maximize window {term_id} to {},{} {}x{}",
+        work.0, work.1, work.2, work.3
+    ))?;
+    println!("  ok: maximise asked for the work area, not the screen");
+
+    // **And minimise, end to end**, because nothing in it depends on a client honouring
+    // anything: the window leaves the screen and the bar marks it with `_`.
+    click_at(&mut qmp, &mut session, minimise_at.0, minimise_at.1)?;
+    session.expect("nxterm: asked the shell for window state 1")?;
+    session.expect(&format!("desktop-shell: client asked to minimize window {term_id}"))?;
+    // `_` is the bar's mark for a minimized window. The desktop count is not asserted: the
+    // lifecycle rule appends an empty desktop as soon as one has a window, so it is 2 here and
+    // says nothing about minimising.
+    session.expect(&format!("desktop-shell: window list on desktop 1 of 2 [{term_id}:_ "))?;
+
+    // Restore it from the list, which is where a minimized window comes back from, so the steps
+    // below have a window to work with.
+    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    session.expect("desktop-shell: raised window ")?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
     //    so it stayed on top of whatever was launched and the bar's click handler — gated on
@@ -1763,7 +1857,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //
     //     The bar is the bottom 24 rows of an 800-high screen, and entries are 180px wide from
     //     the left — so (90, 788) is inside the first one.
-    const LIST_CLICK: (i32, i32) = (90, 788);
+
     // Close the modal first: it is a popup on top, and a press meant for the bar would land in
     // it. Escape is what the modal itself declines to type.
     press(&mut qmp, "esc")?;

@@ -2356,7 +2356,7 @@ and Part D is the milestone where something can.
 
 ### Part B — what the shell needs to answer a button, and the buttons that ask
 
-- [ ] **A manager op for the work area, because nothing can ask for it today.** `work_area()`
+- [x] **A manager op for the work area, because nothing could ask for it** ✅. `work_area()`
       exists in the compositor and has **zero production callers** — every reference is in a
       `#[cfg(test)]` module — and there is no op that exposes it. `desktop-shell` hardcodes
       `SCREEN_W`/`SCREEN_H` and says so in a comment: "the compositor has no 'what size is the
@@ -2365,28 +2365,35 @@ and Part D is the milestone where something can.
       screen and the work area, plus an event when a strut changes, so a second panel-role client
       cannot leave maximised windows sitting under it with nothing able to notice (PR #247
       review, blocking 3). It also makes `Place`'s spec note — "a manager computes positions from
-      the work area" — true, which it is not today.
+      the work area" — true, which it was not.
 
-- [ ] **A client-initiated request needs a manager decision.** A client cannot call
+      `QueryLayout` answers with the screen *and* the work area, and `LayoutChanged` reports the
+      work area **differing from the one last announced** rather than any particular cause: a
+      strut moves through four different requests, and comparing the answer covers all of them
+      and whatever comes next. The shell logs what it got, and `check-login` asserts it is
+      smaller than the screen — an equal one would mean the struts were not counted.
+
+- [x] **A client-initiated request needs a manager decision** ✅. A client cannot call
       `SetMinimized` — that is a manager op, and giving clients manager rights is the thing the
       capability model exists to prevent. So the button sends `Surface::RequestState(window,
       state)` to the compositor, which forwards it to the manager as an event; the shell decides
       and answers with the `SetMinimized` / `Configure` it would have sent anyway. **The client
       asks, the shell disposes** — the same shape as supervisor registration.
 
-- [ ] **And it is the first client-rate-controlled producer of manager events**, which the
+- [x] **And it is the first client-rate-controlled producer of manager events** ✅, which the
       queue's bound was not sized for: every existing producer is compositor lifecycle or
       `SetTitle`, and `SetTitle` is already deduped "because that queue is bounded". A request
       for a state the window is already in produces **no event**, by the same argument and for
       the same reason — otherwise an unprivileged client in a loop evicts `Created` records off
       the front of the shell's queue and corrupts its window list (PR #247 review, finding 5).
 
-- [ ] **Maximise is `Configure` to the work area**, plus restore-to-previous-geometry. The
+- [x] **Maximise is `Configure` to the work area** ✅, plus restore-to-previous-geometry. The
       previous geometry is the *shell's* to remember: the compositor has no notion of a window
       being maximised, and a `maximized` flag there would be a second source of truth about a
-      rectangle.
+      rectangle. The shell keeps the origin as well as the size for exactly this, which it was
+      not doing — `WindowGeometry` carries both and only the size was being read.
 
-- [ ] **Gate, and it stops at the layer this part builds.** Minimise is asserted end to end — the
+- [x] **Gate, and it stops at the layer this part builds** ✅. Minimise is asserted end to end — the
       window leaves the screen and the bottom bar marks it — because nothing in it depends on a
       client honouring anything. **Maximise is asserted as far as the request**: the shell logs
       the rect it asked for, and the assertion is that the rect is the *work area* rather than
@@ -2394,6 +2401,12 @@ and Part D is the milestone where something can.
       `Configure` until Part D — the plan says so itself, and the first version of this gate
       would have failed for that reason (PR #247 review, blocking 2). Part D's gate is where this
       one is completed.
+
+      **The first version of that assertion passed against a shell maximising to the screen**,
+      because the shell logged the work area it had computed while the request carried something
+      else — the defect PR #238's review found in a different assertion, arriving by the same
+      route. `configure_window` prints the arguments it is about to send, inside the function
+      that sends them, so the two cannot disagree.
 
 ### Part C — close, and closing something that will not close itself
 
