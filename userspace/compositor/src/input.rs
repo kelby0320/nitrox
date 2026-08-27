@@ -278,6 +278,14 @@ impl InputRouter {
         // that ended a shift-drag produced a leave saying shift was still down beside a button
         // record saying it was not (PR #240 review, blocking 1c).
         self.reconcile_with(stack, out);
+        // **A drag implies a grab, enforced here rather than trusted.** `reconcile_with` breaks
+        // the grab of a window that has left the screen — minimized, or moved to another desktop
+        // mid-gesture — and it takes the stack immutably, so the drag is torn down on its way
+        // out instead. Stating it as an invariant rather than as a branch also covers the next
+        // path that clears a grab without knowing a drag exists (PR #248 review, blocking 2).
+        if self.grab.is_none() {
+            self.stop_drag(stack);
+        }
 
         match *ev {
             Logical::Key { keycode, pressed, modifiers } => {
@@ -361,9 +369,7 @@ impl InputRouter {
                 if !pressed && buttons == 0 {
                     // The drag ends with the grab that carries it, and the stack records the
                     // one geometry change the whole gesture produced.
-                    if self.drag.take().is_some() {
-                        stack.end_drag();
-                    }
+                    self.stop_drag(stack);
                     // Last button up: the grab ends, and the cursor may have been dragged
                     // somewhere else entirely while it was held, so re-derive the crossing.
                     //
@@ -387,6 +393,9 @@ impl InputRouter {
                 // input for the life of the process.
                 let had = self.grab.take().is_some() || self.grab_broken;
                 self.grab_broken = false;
+                // And the drag derived from it — a window still tracking a pointer with nothing
+                // held is the same phantom this arm exists to clear, one layer up.
+                self.stop_drag(stack);
                 if had {
                     self.update_crossing(stack, out);
                 }
@@ -491,12 +500,24 @@ impl InputRouter {
     /// nobody touching it — a `Place` for itself by another name, and `Place` is deliberately a
     /// manager op.
     ///
-    /// A second `StartMove` while one is running is accepted and replaces it: the pointer holds
-    /// one grab, so the two requests name the same gesture, and the offsets they compute are
-    /// identical because both are taken from the same recorded press.
-    pub fn start_move(&mut self, window: u32, stack: &mut WindowStack) -> Result<(), StackError> {
+    /// A second `StartMove` while one is running **changes nothing** and reports the same
+    /// success. It cannot be treated as a fresh request: `from` is the press, which has not
+    /// moved, but the window's origin has — so rebuilding the drag from where the window is
+    /// *now* applies the distance already travelled a second time, and the window jumps by it.
+    /// One gesture holds one grab and is one drag; the second request names the drag that is
+    /// already running (PR #248 review, blocking 1).
+    ///
+    /// Returns the region the catch-up disturbed, which the caller must repaint.
+    pub fn start_move(
+        &mut self,
+        window: u32,
+        stack: &mut WindowStack,
+    ) -> Result<Option<Rect>, StackError> {
         if self.grab != Some(window) {
             return Err(StackError::NoSuchWindow);
+        }
+        if self.drag.is_some_and(|d| d.window == window) {
+            return Ok(None);
         }
         let origin = stack.window(window).ok_or(StackError::NoSuchWindow)?.origin;
         stack.begin_drag(window)?;
@@ -505,9 +526,25 @@ impl InputRouter {
         // this request arrives — that round trip is the reason the press position is recorded at
         // all — so a drag that waited for the next event would leave the window trailing until
         // one happened, and would never move it at all for a press-and-drag that ended in the
-        // meantime. The damage is returned to the caller through the next `route`, which is the
-        // one that repaints; catching up here is about *position*, not about pixels.
-        Ok(self.drag_to_pointer(stack).map(|_| ()).unwrap_or(()))
+        // meantime. **And its damage is returned rather than dropped**: `Logical::Button` reports
+        // no movement, so a press-flick-release with no motion event in between left the window
+        // painted where it used to be until something unrelated repainted (PR #248 review,
+        // finding 3).
+        Ok(self.drag_to_pointer(stack))
+    }
+
+    /// End an interactive move, if one is running.
+    ///
+    /// **Called wherever the grab ends, not only where a button comes up.** A drag is a belief
+    /// derived from the grab — `Logical::Dropped` says the button state is unknown, and
+    /// `reconcile_with` breaks a grab whose window left the screen — and a belief that outlives
+    /// what it was derived from is the defect those two arms already exist to prevent. Left
+    /// behind, the window went on following a pointer with nothing held, and every `Place`
+    /// naming it was refused until the next click (PR #248 review, blocking 2).
+    fn stop_drag(&mut self, stack: &mut WindowStack) {
+        if self.drag.take().is_some() {
+            stack.end_drag();
+        }
     }
 
     /// Move the dragged window so it keeps the same point under the pointer.
@@ -523,8 +560,7 @@ impl InputRouter {
         match stack.drag_to(d.window, origin) {
             Ok(damage) => Some(damage.rect()),
             Err(_) => {
-                self.drag = None;
-                stack.end_drag();
+                self.stop_drag(stack);
                 None
             }
         }
@@ -1343,6 +1379,103 @@ mod tests {
             Point::new(150, 105),
             "the window jumped by the distance the pointer travelled before the request"
         );
+    }
+
+    #[test]
+    fn a_second_start_move_in_one_gesture_changes_nothing() {
+        // **The offsets are not the same, which the spec used to claim.** `from` is the press
+        // and does not move; the window's origin does — so rebuilding the drag from where the
+        // window is *now* applies the distance already travelled a second time. Reachable by
+        // pressing a second button mid-drag, which used to re-fire the toolkit's press handler
+        // (PR #248 review, blocking 1).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+        go(&mut r, &mut s, drag(40, 20));
+        let after_first = s.window(w).expect("there").origin;
+
+        r.start_move(w, &mut s).expect("still grabbed");
+        assert_eq!(
+            s.window(w).expect("there").origin,
+            after_first,
+            "the second request moved the window again"
+        );
+    }
+
+    #[test]
+    fn a_drag_ends_when_a_dropped_batch_takes_its_grab_away() {
+        // `Dropped` says the button state is unknown, so the grab is cleared — and a drag is a
+        // belief derived from that grab. Left behind, the window follows a pointer with nothing
+        // held and `Place` for it stays refused until the next click.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+
+        go(&mut r, &mut s, Logical::Dropped);
+        let at = s.window(w).expect("there").origin;
+        assert_eq!(s.dragging(), None, "the drag went with the grab");
+        go(&mut r, &mut s, motion(30, 30));
+        assert_eq!(s.window(w).expect("there").origin, at, "and the window stopped following");
+        assert!(s.place(w, Point::new(0, 0)).is_ok(), "and a manager may place it again");
+    }
+
+    #[test]
+    fn a_drag_ends_when_its_window_leaves_the_screen() {
+        // Minimizing or moving a dragged window to another desktop breaks the grab —
+        // `reconcile_with` emits the release the client is owed. A window that went on tracking
+        // the pointer would contradict that release, invisibly.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+
+        s.set_minimized(w, true).expect("minimize");
+        go(&mut r, &mut s, drag(30, 30));
+        assert_eq!(s.dragging(), None, "the drag went with the grab");
+        let at = s.window(w).expect("there").origin;
+        go(&mut r, &mut s, drag(30, 30));
+        assert_eq!(s.window(w).expect("there").origin, at, "and it stopped following");
+    }
+
+    #[test]
+    fn a_drag_that_moved_nothing_reports_no_geometry_change() {
+        // An ordinary click on a title bar is a drag of zero pixels. Recording one puts a no-op
+        // event into the manager's queue — the one that does not coalesce and evicts its oldest.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        let _ = s.take_geometry_changes();
+
+        go(&mut r, &mut s, button(true));
+        r.start_move(w, &mut s).expect("grabbed");
+        go(&mut r, &mut s, button(false));
+        assert!(s.take_geometry_changes().is_empty(), "the window never moved");
+    }
+
+    #[test]
+    fn the_catch_up_at_the_start_of_a_drag_reports_its_damage() {
+        // The pointer has already moved by the time `StartMove` arrives, so the window moves the
+        // instant the drag begins — and `Logical::Button` reports no movement, so if this damage
+        // were dropped a press-flick-release would leave the window drawn where it used to be.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 120, 110);
+        go(&mut r, &mut s, button(true));
+        go(&mut r, &mut s, drag(40, 0));
+
+        let damage = r.start_move(w, &mut s).expect("grabbed").expect("it moved, so it damaged");
+        assert!(!damage.is_empty(), "a catch-up that moved the window damaged nothing: {damage:?}");
+        assert_eq!(s.window(w).expect("there").origin, Point::new(140, 100));
     }
 
     #[test]

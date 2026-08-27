@@ -109,6 +109,11 @@ pub struct App {
     /// **The compositor's answer, not a guess.** `FocusEvent` says so on every change; a title
     /// bar that inferred focus from the last click would disagree with the compositor the first
     /// time focus moved by a chord.
+    ///
+    /// **Starts `true`, matching `libui::Router`'s own `window_focused`** — which starts that
+    /// way deliberately, because starting `false` makes a client's first paint dim. Two pieces
+    /// of the same state disagreeing for one frame is worse than either answer (PR #248 review,
+    /// finding 7).
     pub focused: bool,
     /// Where the menu item was laid out last frame, so the popup can go under it.
     ///
@@ -160,7 +165,7 @@ impl App {
             grid: Grid::new(cols, rows),
             parser: Parser::new(),
             menu_open: false,
-            focused: false,
+            focused: true,
             menu_anchor: None,
             metrics,
             palette: Palette::default(),

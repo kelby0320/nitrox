@@ -268,7 +268,11 @@ impl Router {
 
         // **The press decides the capture, from where the cursor is.** Anything else and a
         // drag that leaves the widget stops being that widget's drag.
-        if pressed && self.capture.is_none() {
+        //
+        // Whether *this* press is the one that opened it is read before the assignment, and is
+        // what `on_press_down` fires on — see the dispatch below.
+        let opens_capture = pressed && self.capture.is_none();
+        if opens_capture {
             self.capture = hit_test(tree.root(), layout, at);
             self.capture_button = Some(event.button);
         }
@@ -339,7 +343,13 @@ impl Router {
             // title bar needs: its buttons handle clicks, so pressing close does not also drag
             // the window. `nearest` walks from the deepest element outwards, so a larger index
             // is the nearer handler.
-            if pressed
+            // **Only the press that opened the capture**, not every press while it is held.
+            // While a capture is in force `target` is the *captured* widget rather than the one
+            // under the cursor, so a second button pressed mid-gesture re-fired this for a
+            // widget the pointer may not even be over — a right-click during a window drag sent
+            // a second `Drag`, and the shadowing rule cannot help, because it walks the captured
+            // node's path rather than the pointer's (PR #248 review, blocking 1).
+            if opens_capture
                 && let Some((n_down, e_down)) = nearest(&|e: &Element<Msg>| e.on_press_down.is_some())
                 && let Some(msg) = e_down.on_press_down.clone()
             {

@@ -370,7 +370,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // tree ever sent one — so M8 Part C's window list read `window 6` for every entry, and the
     // shell's title arm was code no boot could reach (PR #242 review, optional 7).
     if let Some(mut w) = win.window(window_id)
-        && w.set_title("nxterm").is_err()
+        && w.set_title(nxterm::TITLE).is_err()
     {
         kprint(b"nxterm: SetTitle refused\n");
     }

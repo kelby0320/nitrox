@@ -639,8 +639,13 @@ toolkit, decides it landed on a title bar, and only then sends this — and the 
 in between. The compositor records the pointer's position when it takes the grab, so a window
 follows the pointer from the point it was grabbed by however long the round trip took.
 
-A second `StartMove` while one is running replaces it. The pointer holds one grab, so both
-requests name the same gesture and compute the same offset.
+A second `StartMove` while one is running **changes nothing** and reports the same success. It is
+not a fresh request: the recorded press has not moved but the window has, so rebuilding the drag
+from where the window is *now* would apply the distance already travelled a second time. One
+gesture holds one grab and is one drag; a second request names the drag that is already running.
+
+(This section said the two requests "compute the same offset", which was false in exactly that
+way — corrected 2026-08-27, PR #248 review.)
 
 **A window being moved is not being placed.** While a drag is in flight, `Place` for that window
 is refused with `WouldBlock` — not `InvalidArgument`, because the request is well-formed and will

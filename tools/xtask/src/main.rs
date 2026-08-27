@@ -2045,6 +2045,16 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     the bar is pixels `nxterm` committed; what crosses the wire is one `StartMove`, and the
     //     compositor — which is holding the grab the press opened — moves the window from there.
     //
+    //     **The motion is injected before the request can arrive — probabilistically, and worth
+    //     saying so.** The two motions are *sent* before the wait below, but nothing proves the
+    //     compositor processed them before the client's request: they travel QMP → PS/2 →
+    //     `input-server` while the request travels compositor → client → compositor, and the
+    //     ordering is a race this gate wins by a wide margin rather than by construction. If
+    //     that ever stops being true the step still passes for the correct implementation and
+    //     stops distinguishing the late-measurement one — so the host test
+    //     `an_interactive_move_offsets_by_where_the_press_landed…` is the guard that cannot
+    //     drift, and this is the one that proves the whole path (PR #248 review, finding 9).
+    //
     //     **The motion is injected before the request can arrive, and that is the assertion.**
     //     `StartMove` is a full round trip after the press: the compositor delivers it, `libui`
     //     routes it, `nxterm` decides it landed on the bar, and only then does the request go

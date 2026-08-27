@@ -437,12 +437,15 @@ pub struct WindowStack {
     geometry_log: Vec<u32>,
     /// Which desktop is composited. Never [`STICKY_DESKTOP`] — see [`Self::set_current_desktop`].
     current_desktop: u32,
-    /// The window the user is interactively dragging, if any.
+    /// The window the user is interactively dragging, and where it was when the drag began.
     ///
     /// **Here rather than in the router, because two paths need it.** The router runs the drag;
     /// the *manager* path has to refuse a `Place` for a window being dragged, and it never sees
     /// the router. The stack is what both of them already hold.
-    dragging: Option<u32>,
+    ///
+    /// The origin is kept so that [`end_drag`](Self::end_drag) can tell a gesture that moved the
+    /// window from one that did not.
+    dragging: Option<(u32, Point)>,
 }
 
 impl Default for WindowStack {
@@ -628,7 +631,7 @@ impl WindowStack {
     /// Returns [`Damage`] rather than a bare `Rect` so that forgetting it is a warning: see that
     /// type for why `#[must_use]` on this function would not have been enough.
     pub fn place(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
-        if self.dragging == Some(id) {
+        if self.dragging.is_some_and(|(d, _)| d == id) {
             return Err(StackError::Dragging);
         }
         self.move_to(id, origin, true)
@@ -636,7 +639,7 @@ impl WindowStack {
 
     /// The window the user is interactively dragging, if any.
     pub fn dragging(&self) -> Option<u32> {
-        self.dragging
+        self.dragging.map(|(id, _)| id)
     }
 
     /// Begin an interactive drag of `id`, which makes [`place`](Self::place) refuse it.
@@ -645,10 +648,8 @@ impl WindowStack {
     /// pointer has one grab, so two drags cannot be in flight, and the arithmetic that would
     /// decide which to keep is arithmetic about a state that cannot happen.
     pub fn begin_drag(&mut self, id: u32) -> Result<(), StackError> {
-        if self.window(id).is_none() {
-            return Err(StackError::NoSuchWindow);
-        }
-        self.dragging = Some(id);
+        let origin = self.window(id).ok_or(StackError::NoSuchWindow)?.origin;
+        self.dragging = Some((id, origin));
         Ok(())
     }
 
@@ -660,8 +661,13 @@ impl WindowStack {
     /// manager with a window it will never place and never hear about again (PR #247 review).
     /// What a manager needs is where the window ended up, which is one record.
     pub fn end_drag(&mut self) {
-        if let Some(id) = self.dragging.take()
-            && self.window(id).is_some()
+        // **Only if it actually moved**, which `place` has always checked and this did not: an
+        // ordinary click on a title bar is a drag of zero pixels, and it was putting a no-op
+        // record into the queue this whole design exists to protect — the one that does not
+        // coalesce and evicts its oldest — and printing a manager line for a move that did not
+        // happen (PR #248 review, finding 4).
+        if let Some((id, was)) = self.dragging.take()
+            && self.window(id).is_some_and(|w| w.origin != was)
         {
             self.geometry_log.push(id);
         }
@@ -811,7 +817,7 @@ impl WindowStack {
         // **A drag cannot outlive its window**, and a client exiting with the button held is the
         // ordinary way that happens. Left set, the flag would refuse a `Place` for an id that no
         // longer exists — for the life of the compositor, since ids are never reused.
-        if self.dragging.is_some_and(|d| self.window(d).is_none()) {
+        if self.dragging.is_some_and(|(d, _)| self.window(d).is_none()) {
             self.dragging = None;
         }
         Ok(())

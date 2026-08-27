@@ -1868,7 +1868,16 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             None => Some(KError::InvalidArgument),
             Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
             Some(req) => match srv.router.start_move(req.window, &mut srv.stack) {
-                Ok(()) => {
+                Ok(damage) => {
+                    // **The catch-up is painted here.** The pointer has already moved by the
+                    // time this request lands, so the window is somewhere new the instant the
+                    // drag begins — and `Logical::Button` reports no movement, so a
+                    // press-flick-release with no motion event after it would leave the window
+                    // drawn where it used to be until something unrelated repainted
+                    // (PR #248 review, finding 3).
+                    if let Some(r) = damage.filter(|r| !r.is_empty()) {
+                        repaint_region(srv, fb, r);
+                    }
                     Line::new()
                         .s(b"compositor: interactive move of window ")
                         .u(req.window as u64)

@@ -19278,3 +19278,43 @@ deadline, and already sees every record. A gate that wants the phase presses `F2
 not never mentions it and pays nothing. The rule that reads out of this: a test client shared by
 several gates should be driven by what a gate *does*, never by a clock, and never by anything a
 gate has to opt out of.
+
+### PR #248 review — a drag that could be started twice, and one that outlived its grab
+
+Two blocking findings, both about state that is derived from the pointer grab and was not tied to
+its lifetime.
+
+**A second `StartMove` in one gesture applied the offset again.** The recorded press does not
+move; the window's origin does — so rebuilding the drag from where the window is *now* adds the
+distance already travelled a second time. The spec said both requests "compute the same offset",
+which was false in exactly that way. It is user-reachable, and the route is the interesting part:
+`libui` fired `on_press_down` on **every** press while a capture was held, for the *captured*
+widget rather than the one under the cursor — so pressing a second button mid-drag re-fired the
+title bar's drag message, and the shadowing rule could not help because it walks the captured
+node's path, not the pointer's. Fixed at both ends: the toolkit fires a press-down only for the
+press that *opened* the capture, and `start_move` leaves an in-flight drag alone.
+
+**And a drag outlived the grab it was derived from.** `Logical::Dropped` and `reconcile_with`
+both clear the grab — the first because the button state has become unknown, the second because
+the window left the screen mid-gesture — and neither cleared the drag. The window went on
+following a pointer with nothing held, and every `Place` naming it was refused until the next
+click. The `Dropped` arm's own comment says a grab that outlives its button never ends; a drag is
+exactly such a belief, and it was the one thing the arm did not reset.
+
+It is now stated as an invariant rather than as two branches — **no grab, no drag**, checked in
+`route` right after the reconcile — because the next path that clears a grab will not know a drag
+exists either. The reviewer's two probes are two of the four new tests.
+
+**Two smaller ones with the same shape as things this milestone already fixed.** The catch-up
+move at the start of a drag discarded its damage, on the reasoning that the next `route` repaints
+— true only if a *motion* follows, and `Logical::Button` reports none, so a press-flick-release
+left the window painted where it used to be. And `end_drag` recorded a geometry change
+unconditionally, so an ordinary click on a title bar put a no-op event into the queue this design
+exists to protect and printed a manager line for a move that did not happen. `place` has always
+guarded that with `was != now`; the drag path did not.
+
+**One thing the review named that is worth keeping in view rather than fixing.** `desktop-shell`
+logs a refused `Place` and gives up — there is no retry — so the `WouldBlock` the spec describes
+as "answerable again in a moment" is a placement lost. Unreachable today: the shell's only
+`Place` is on `WindowCreated`, and a window cannot be dragged before it exists. It becomes real
+the first time the shell places a window it did not just create.

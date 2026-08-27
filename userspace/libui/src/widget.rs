@@ -1576,6 +1576,34 @@ mod tests {
         let mut r = Router::new();
         assert_eq!(down(&mut r, 364), vec![], "the same for maximise");
         assert_eq!(up(&mut r, 364), vec![M::Max]);
+
+        // **And a second button pressed mid-drag is not a second drag.** While a capture is held
+        // the router routes to the *captured* widget, so every later press was reaching the bar
+        // — including one over a button, where the shadowing rule cannot help because it walks
+        // the captured node's path rather than the pointer's. A window jumped by the drag's
+        // accumulated distance on each extra click (PR #248 review, blocking 1).
+        let mut r = Router::new();
+        assert_eq!(down(&mut r, 200), vec![M::Drag], "the left press starts the drag");
+        let other = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x111,
+            buttons: 3,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x: 200,
+            y: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            r.pointer(&tree, &e, &l, other).0,
+            vec![],
+            "a second button while the first is held must not start a second drag"
+        );
+        let over_close = librsproto::surface::PointerEvent { x: 390, ..other };
+        assert_eq!(
+            r.pointer(&tree, &e, &l, over_close).0,
+            vec![],
+            "nor one pressed over a button, where the capture is still the bar"
+        );
     }
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
