@@ -19223,3 +19223,44 @@ drag that reads the pointer at `StartMove` loses that motion, and one that puts 
 pointer loses the grab offset. The gate needed one correction of its own: the button has to stay
 down until the drag is accepted, because this harness can press and release faster than the round
 trip to the client and back, and a release that lands first correctly leaves nothing to drag.
+
+### Same day — the input-loss gate was measuring the host as well as the guest
+
+CI failed Part A on `check-input --no-ps2-irq`, a variant nothing local had run: the burst gate
+reported eighteen *more* pixels than were injected. Locally the same commit reported fourteen
+*fewer*. Part A did not cause either — it perturbed the timing of a gate that had been measuring
+something it did not intend to.
+
+**Three repairs, and the first two were wrong in instructive ways.**
+
+*Delimiting the sum with a button press and release* — the mouse's own stream, so ordered with
+the motion it brackets — failed because **a button is exactly what deferral cannot recover**. A
+press that lands in an overflowing ring is announced as a gap and is gone, so the delimiter was
+eaten by the overrun it was there to measure. That is the property under test, applied to the
+instrument.
+
+*Draining to a longer quiet* failed because the window was never the problem. Four seconds of
+silence still reported a sum short by a packet or two.
+
+**What was actually happening: the loss was outside the guest.** With the i8042's interrupts off
+nothing reads the controller until the 10 ms recovery sweep, and QEMU's own PS/2 queue is
+sixteen bytes — barely five packets. A burst injected as fast as QMP accepts it overflows *that*,
+and the deltas are gone before the guest sees them. The tell was in the failure line all along:
+`announced=0`. Nothing in the guest lost anything, because nothing in the guest was ever given it.
+
+**The repair is to pace the injection**, and it costs the measurement nothing: the overrun under
+test comes from a consumer that has stopped reading, not from how fast the harness injects. Thirty
+motions at 25 ms apart still overrun a sixteen-message ring by fourteen. Three consecutive runs
+now report an identical fold width, which is what the absence of a timing dependence looks like.
+
+**And the phase runs first, before anything else is injected.** A device stream cannot be
+delimited from inside the guest, so the only way a sum means anything is for the stream to have
+carried nothing else — which also removed the stray records CI was seeing from an earlier phase's
+flood, still trickling in seconds later on the sweep path.
+
+**The lesson worth keeping is about where a gate's boundary is.** This one asserts a property of
+the guest's input path and was written as though injection were free and instantaneous. Under the
+one configuration that deliberately cripples delivery, the harness and the emulator are inside
+the measurement — and the gate reported the guest as broken. A gate that injects at a device
+should either pace itself to what that device can carry or say plainly which layer it is
+measuring.

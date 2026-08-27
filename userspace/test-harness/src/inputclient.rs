@@ -78,13 +78,20 @@ const LATE_CODE: u16 = 46;
 /// How long phase 4 refuses to drain the **device** stream, in nanoseconds.
 ///
 /// Long enough for the harness to see `input stalled` and inject its burst over QMP.
-const INPUT_STALL_NS: u64 = 2_000_000_000;
+const INPUT_STALL_NS: u64 = 3_000_000_000;
 
 /// How long a drain waits with nothing arriving before calling the stream quiet.
 ///
-/// Covers `input-server`'s 5 ms flush retry with three orders of magnitude to spare, so a
-/// short answer means the motion is not coming rather than that this gave up early.
-const QUIET_NS: u64 = 500_000_000;
+/// **Sized against the slowest way input can reach this guest, not against the flush.**
+/// `input-server` retries a deferred send after 5 ms, which 500 ms covers with room to spare —
+/// and 500 ms, then 1.5 s, were both too short. With the i8042's interrupts off
+/// (`check-input --no-ps2-irq`) nothing reads the controller until the 10 ms recovery sweep, so
+/// a burst injected in a few milliseconds is delivered to the guest over *seconds*, and a drain
+/// that gives up mid-trickle reports a sum that is short by whatever was still on its way.
+///
+/// Four seconds is not a measurement of that rate; it is far enough above it that the difference
+/// stops mattering. A drain only ever waits this long once, at the end.
+const QUIET_NS: u64 = 4_000_000_000;
 
 /// The one widget this client builds: a `custom` node filling the window, which is the shape
 /// Milestone 5's terminal grid takes.
@@ -190,10 +197,23 @@ impl Stream {
         Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, timed_out: false })
     }
 
-    /// Drain until nothing has arrived for [`QUIET_NS`], summing the relative motion.
+    /// Sum the relative motion **between a button press and its release**.
     ///
     /// Returns `(dx, dy, announced, widest)` — the sums of `REL_X` and `REL_Y`, the record
     /// count carried by any `SYN_DROPPED` seen, and the largest single `REL_X` value.
+    ///
+    /// **Correct only because nothing else has been injected yet**, which is why the phase that
+    /// uses it runs first. Summing a device stream cannot be delimited from inside the guest:
+    /// with the i8042's interrupts off — `check-input --no-ps2-irq`, which CI runs — input
+    /// arrives on a 10 ms recovery sweep, so another phase's flood is still trickling in long
+    /// after it was injected, and any window drawn around this one either includes it or gives
+    /// up before this burst's own tail. Both were observed on one commit: six stray records too
+    /// many in CI, two of the burst's own missing locally.
+    ///
+    /// Delimiting it with a button press and release was the first repair, and it fails for a
+    /// reason worth keeping: **a button is exactly what deferral cannot recover**. A press that
+    /// lands in an overflowing ring is announced as a gap and is gone — which is the property
+    /// this phase exists to demonstrate, applied to its own delimiter.
     ///
     /// **`widest` is how a consumer can tell that a deferral happened**, and it is the only way
     /// available to it: recovery is deliberately invisible — the point of carrying motion
@@ -356,6 +376,44 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // The harness waits for this before injecting: an event delivered before the consumer
     // channel exists is one the server has nowhere to send.
     kprint(b"input-testclient: listening\n");
+
+    // ---- Phase 0: stop draining the device stream, and prove no motion is lost ----
+    //
+    // This covers server→consumer, where a relative delta can be *destroyed* rather than
+    // delayed: `input-server` cannot send to a consumer whose ring is full, and a discarded
+    // batch of `REL_*` is movement no consumer can ever re-derive — unlike a key or a button,
+    // whose state `SYN_DROPPED` asks it to resynchronise. That is the drift the whole of
+    // PR #246 is about. (Phase 3 below covers the compositor→client direction, which is a
+    // different queue with a different answer.)
+    //
+    // **The stall is this client refusing to read, which is what makes the gate mean the same
+    // thing under every accelerator.** The first version of this guard lived in `check-login`
+    // and overran the ring by injecting faster than the compositor could repaint — true under
+    // TCG and false under KVM, which is the only configuration CI runs (PR #246 review,
+    // blocking 1). A consumer that does not read overruns at any speed.
+    //
+    // **And it runs first, before anything else has been injected, which is the only way the
+    // sum means anything.** A device stream cannot be delimited from inside the guest: with the
+    // i8042's interrupts off input arrives on a 10 ms recovery sweep, so another phase's flood
+    // is still trickling in long after it was injected. Every window drawn around this
+    // measurement either swallowed those strays or gave up before this burst's own tail — six
+    // records too many in CI and two missing locally, on the same commit. Delimiting with a
+    // button press and release failed for a better reason: a button is exactly what deferral
+    // cannot recover, so the delimiter was eaten by the overrun it was there to measure.
+    kprint(b"input-testclient: input stalled\n");
+    sleep_ns(notif, INPUT_STALL_NS);
+    let (dx, dy, announced, widest) = stream.sum_motion();
+    Line::new()
+        .s(b"input-testclient: motion sum dx=")
+        .i(dx)
+        .s(b" dy=")
+        .i(dy)
+        .s(b" announced=")
+        .u(announced)
+        .s(b" widest=")
+        .i(widest)
+        .end();
+
 
     // Pump until the button press arrives — the last injection. Message boundaries are
     // timing, not protocol: the server batches whatever is ready, so how the nine records
@@ -612,38 +670,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             WindowEvent::Configure { .. } => {}
         }
     }
-
-    // ---- Phase 4: stop draining the *device* stream, and prove no motion is lost ----
-    //
-    // Phase 3 covers the compositor→client direction. This covers server→consumer, which is
-    // where a relative delta can be destroyed rather than delayed: `input-server` cannot send
-    // to a consumer whose ring is full, and a discarded batch of `REL_*` is movement no
-    // consumer can ever re-derive — unlike a key or a button, whose state `SYN_DROPPED` asks it
-    // to resynchronise. That is the drift the whole of PR #246 is about.
-    //
-    // **The stall is this client refusing to read, which is what makes the gate mean the same
-    // thing under every accelerator.** The first version of this guard lived in `check-login`
-    // and overran the ring by injecting faster than the compositor could repaint — true under
-    // TCG and false under KVM, which is the only configuration CI runs (PR #246 review,
-    // blocking 1). A consumer that does not read overruns at any speed.
-    //
-    // Drained to quiet first, so the sum below starts from nothing owed: the phases above
-    // leave whatever they injected queued here, and `input-server` may still be holding motion
-    // deferred from them.
-    let _ = stream.sum_motion();
-    kprint(b"input-testclient: input stalled\n");
-    sleep_ns(notif, INPUT_STALL_NS);
-    let (dx, dy, announced, widest) = stream.sum_motion();
-    Line::new()
-        .s(b"input-testclient: motion sum dx=")
-        .i(dx)
-        .s(b" dy=")
-        .i(dy)
-        .s(b" announced=")
-        .u(announced)
-        .s(b" widest=")
-        .i(widest)
-        .end();
 
     kprint(b"input-testclient: PASSED\n");
     exit(0);
