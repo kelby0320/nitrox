@@ -2208,60 +2208,274 @@ also reach the focused window.
 
 ## Milestone 9 — window decorations and interaction
 
-Sketched 2026-08-26, and **inserted here rather than after applications** because this document
-already said where it belongs: `Place`'s spec note explains there is no relative `Move` because
-one "would only serve an interactive drag, which needs a grab offset the compositor does not
-keep — **it comes back with decorations, or not at all**". Drag-to-move needs somebody to own a
-grab region, and a title bar is also where minimize and maximize buttons live. So decorations are
-the *prerequisite* for snap-to-edge, not polish that follows it. The polish half — colours,
-fonts, styling — is Milestone 11.
+**Details pass 2026-08-27.** Six parts in dependency order, gated one at a time, the shape
+Milestones 7 and 8 used.
 
-**The central question, for this milestone's details pass: client-side or server-side
-decorations?** Today Nitrox is implicitly CSD — `nxterm` draws its own chrome, and the compositor
-draws nothing but what clients commit. The two shapes differ in where the drag is observed:
+**Inserted ahead of applications** because this document already said where it belongs:
+`Place`'s spec note explains there is no relative `Move` because one "would only serve an
+interactive drag, which needs a grab offset the compositor does not keep — **it comes back with
+decorations, or not at all**". Drag-to-move needs somebody to own a grab, and a title bar is
+where minimise and maximise live. Decorations are the *prerequisite* for snap, not polish that
+follows it. The polish half — colours, fonts, styling — is Milestone 11.
 
-- **CSD with a move request** (the Wayland shape, and the current inclination): clients keep
-  drawing their chrome and gain `StartMove` / `StartResize`, handing the compositor an
-  interactive drag it then owns. The compositor learns pointer-grab semantics it mostly has
-  already (`input.rs` keeps an implicit grab), and gains no rendering.
-- **SSD**: the compositor draws title bars and owns the drag outright. It already has the one
-  input it would need — `SetTitle` landed in M7 Part A for the window list — but it gains a
-  renderer, a theme, and hit-testing for buttons, against "the compositor stays small".
+### Governing decisions
 
-Whichever wins, **snap needs the compositor to know a drag is in progress and where the pointer
-is**, which is the thing neither `Place` nor `Configure` can express today.
+Settled with the maintainer 2026-08-27, so the parts below can be built rather than re-argued.
 
-- [ ] **The decorations decision, and its details pass.** CSD-plus-move-request or SSD, settled
-      before anything below is built, because every item below reads on it.
+**1. Decorations are client-side, drawn by `libui`.** Clients keep drawing their whole window;
+`libui` gains a title-bar widget every application puts at the top of its tree. The compositor
+gains the *interactions* — `StartMove`, `StartResize` — and no renderer, no font and no theme.
 
-- [ ] **Interactive move and resize.** The request, the grab, and the release — and the rule that
-      a window being interactively moved is not being `Place`d by the manager at the same time.
+The argument that decided it is geometry, not taste. Under server-side decorations "the window's
+rectangle" stops meaning "the client's committed buffer", and that meaning is threaded through
+compositing, damage, hit-testing, placement, struts, `Capture` and the overview's thumbnails —
+`Window::bounds()` reads the committed buffer's geometry today, and every one of those callers
+would need to learn the difference between an outer and an inner rect. Client-side decorations
+change none of it: the chrome is pixels the client committed, like every other pixel.
 
-- [ ] **Title bars with buttons**: close, minimize (the attribute M8 built), maximize.
+The counter-argument is real and is answered in decision 4 rather than dismissed: a close button
+the client draws cannot close a client that has stopped answering.
 
-- [ ] **`nxterm` honours `Configure`.** The blocker for everything sized: it declines resizes
-      today, deliberately — "resizing `libterm`'s grid and reflowing its scrollback is a
-      different problem, not a parameter of this one" (M5). A first version may resize the grid
-      *without* reflowing scrollback, which is what several real terminals did for years and is a
-      far smaller problem than full reflow. Until this lands, maximize and snap are no-ops on the
-      only application there is.
+**2. The compositor owns the drag, and exactly two messages cross the wire during one.**
+`StartMove` and `StartResize` are client requests that hand the compositor an interactive
+gesture — it already keeps the implicit pointer grab, so it is the only participant that can
+follow a pointer without a round trip per motion.
 
-- [ ] **Maximize**, to the work area — the struts already exist, so this is `Configure` to a rect
-      the shell computes, plus restore-to-previous-geometry.
+**What that means for the outline and the snap preview, spelled out because the first version of
+this section quietly broke it.** An outline that follows the pointer and an edge-proximity test
+both need the drag state *per motion*. Reporting that to the shell would put back exactly the
+round trip this decision exists to avoid — and into the one queue that cannot take it: the
+manager outbox does not coalesce ("there is no manager-side equivalent of pointer motion",
+`outbox.rs`), and when it is full it evicts the **oldest**, so a five-second drag at 100 Hz would
+push a `Created` off the front and leave the shell with a window it will never place and never
+hear about again (PR #247 review, blocking 1). So:
 
-- [ ] **Snap to edge and corner** — drag to an edge for half the screen, a corner for a quarter,
-      with a preview overlay while the pointer is held there. The same mechanism as maximize
-      (`Configure` to a rect) with a different rect and a gesture, which is why it costs little
-      once the drag is owned.
+- **The compositor draws the outline** — a rectangle, four thin edges, no font and no theme. This
+  does not reopen decision 1: what that decision refuses is chrome the compositor has to *lay
+  out and style*, and what makes it refuse is that chrome changes what a window's rectangle
+  means. An outline is neither. It is the cursor sprite's neighbour: a fixed shape the compositor
+  draws over the composed stack and damages like any other rect.
+- **Snap targets are a registered table, the way chords already are.** The shell computes its
+  zones from the work area and registers them (`RegisterSnapZone`, trigger rect → target rect);
+  the compositor tests the pointer against that table during a drag and draws the outline at the
+  matching target. The policy — which region means which rect, and how close counts — is entirely
+  in the table's contents, which the shell owns and re-registers when the work area changes. The
+  compositor evaluates a lookup, exactly as `RegisterHotkey` made it match chords without knowing
+  what any of them mean.
+- **The manager hears two events per gesture**, not per motion: one when a drag begins, one when
+  it ends carrying the final rect and which zone (if any) it ended in. The shell answers the
+  second with the `Configure` it would have sent anyway. **The compositor never resizes a
+  client** — that stays the manager's, so there is one path to a window's geometry rather than
+  two that can disagree.
+
+This is also where **`TODO(scroll-grab)`** is answered for windows: the press-relative offset
+lives in the compositor's drag state. It is recorded when the **grab is taken**, at the press —
+not read when `StartMove` arrives, which is a full round trip later through the client's own
+router, by which time the pointer has moved and coalescing may have handed that client a stale
+position (PR #247 review, finding 4). The toolkit's scrollbar keeps its own copy of the question:
+that deferral stays open, and this milestone is its **third** named consumer without being its
+first answer.
+
+**3. Resize commits on release.** Dragging an edge moves an *outline*; one `Configure` goes out
+when the button comes up. Live resize — a `Configure` per pointer motion — is a client cost, not
+a protocol one: each one makes the client allocate new shared buffers, map them, re-lay-out and
+repaint, which under TCG is the expensive path. Committing on release costs almost nothing on top
+of snap, because snap already needs a preview overlay and a single `Configure` to a rect.
+
+The protocol needs nothing for this: `Configure` is *"a request, not a command"* — a client may
+commit whatever size it likes, and the compositor composites the geometry it is given. A terminal
+that takes 79 whole cells instead of the 1003 pixels it was offered is an already-solved case,
+which is why no size-hint or increment mechanism appears anywhere below.
+
+**4. Close asks, and the shell can insist.** The title bar's close button is the client's own: it
+sends nothing, it exits. For a client that has stopped answering, the shell's window list gains a
+close that ends in a new manager request, `Manage::Close`, and the compositor destroys the window
+— which is the *only* answer available under decision 1, and the reason that decision is
+affordable. A hung application must be removable from the desktop without a serial console.
+
+**5. Reflow is real reflow.** When `nxterm` honours `Configure` it rewraps its scrollback to the
+new width rather than keeping the old breaks. This is the largest single item here and it is
+deliberately not deferred: M5 called it "a different problem" when nothing could resize a window,
+and Part D is the milestone where something can.
+
+### Part A — the title bar, and a window that can be dragged by it
+
+- [ ] **`libui` gains a title bar.** A widget: the window's title, a focus state, and three
+      buttons (minimise, maximise, close) laid out at the top of a client's tree. It is an
+      ordinary `Element` — `row`, `text`, `on_press` — so it costs the toolkit no new mechanism,
+      and `Theme` is where its colours come from, which is the seam M11 will ask about.
+
+- [ ] **`nxterm` adopts it**, above the menu bar it already draws. That makes the only
+      application there is the first consumer, rather than a demo client nobody runs.
+
+- [ ] **The router records where a press landed**, alongside the grab it already takes
+      (`InputRouter` keeps `pointer`, `grab`, `grab_button`, `buttons`, `modifiers` — and not
+      this). Everything below depends on it: a drag offset measured when `StartMove` *arrives* is
+      measured a round trip late, and the window jumps by however far the pointer travelled while
+      the client was deciding the press was on its title bar.
+
+- [ ] **`Surface::StartMove(window)`** — a client request meaning "the user has grabbed a part of
+      me that moves the window". The compositor moves the window with the pointer, offset by the
+      recorded press position, and ends on button-up. Refused when the caller holds no pointer
+      grab, so a client cannot move its window while nobody is touching it.
+
+- [ ] **The rule a manager and a drag must agree on**: a window being interactively moved is not
+      being `Place`d at the same time. The compositor is the arbiter — `Place` during a drag is
+      refused rather than silently overridden, because a manager that lost a race would otherwise
+      appear to work and fight the pointer.
+
+- [ ] **Gate**: `check-login` presses on `nxterm`'s title bar, **moves the pointer before the
+      client's `StartMove` can arrive**, and then asserts the origin. The injected motion is the
+      whole point: the harness sends one QMP event at a time and waits, so a gate that presses
+      and drags without it leaves the pointer stationary across the round trip and measures zero
+      drift where a person sees forty pixels. Two controls, because two different implementations
+      pass a naive assertion — a drag that centres the window on the pointer (loses the offset),
+      and a drag that reads the pointer at `StartMove` (measures it late).
+
+### Part B — what the shell needs to answer a button, and the buttons that ask
+
+- [ ] **A manager op for the work area, because nothing can ask for it today.** `work_area()`
+      exists in the compositor and has **zero production callers** — every reference is in a
+      `#[cfg(test)]` module — and there is no op that exposes it. `desktop-shell` hardcodes
+      `SCREEN_W`/`SCREEN_H` and says so in a comment: "the compositor has no 'what size is the
+      screen' op, and adding one to draw a bar would be a protocol change made for a stub's
+      convenience". Maximise is that convenience arriving: a `Manage::QueryLayout` returning the
+      screen and the work area, plus an event when a strut changes, so a second panel-role client
+      cannot leave maximised windows sitting under it with nothing able to notice (PR #247
+      review, blocking 3). It also makes `Place`'s spec note — "a manager computes positions from
+      the work area" — true, which it is not today.
+
+- [ ] **A client-initiated request needs a manager decision.** A client cannot call
+      `SetMinimized` — that is a manager op, and giving clients manager rights is the thing the
+      capability model exists to prevent. So the button sends `Surface::RequestState(window,
+      state)` to the compositor, which forwards it to the manager as an event; the shell decides
+      and answers with the `SetMinimized` / `Configure` it would have sent anyway. **The client
+      asks, the shell disposes** — the same shape as supervisor registration.
+
+- [ ] **And it is the first client-rate-controlled producer of manager events**, which the
+      queue's bound was not sized for: every existing producer is compositor lifecycle or
+      `SetTitle`, and `SetTitle` is already deduped "because that queue is bounded". A request
+      for a state the window is already in produces **no event**, by the same argument and for
+      the same reason — otherwise an unprivileged client in a loop evicts `Created` records off
+      the front of the shell's queue and corrupts its window list (PR #247 review, finding 5).
+
+- [ ] **Maximise is `Configure` to the work area**, plus restore-to-previous-geometry. The
+      previous geometry is the *shell's* to remember: the compositor has no notion of a window
+      being maximised, and a `maximized` flag there would be a second source of truth about a
+      rectangle.
+
+- [ ] **Gate, and it stops at the layer this part builds.** Minimise is asserted end to end — the
+      window leaves the screen and the bottom bar marks it — because nothing in it depends on a
+      client honouring anything. **Maximise is asserted as far as the request**: the shell logs
+      the rect it asked for, and the assertion is that the rect is the *work area* rather than
+      the screen. It cannot yet be asserted on the window, because `nxterm` declines every
+      `Configure` until Part D — the plan says so itself, and the first version of this gate
+      would have failed for that reason (PR #247 review, blocking 2). Part D's gate is where this
+      one is completed.
+
+### Part C — close, and closing something that will not close itself
+
+- [ ] **The button is the client's own.** `nxterm`'s close button exits; nothing new crosses the
+      wire for the ordinary case.
+
+- [ ] **`Manage::Close(window)`** — the manager asks the compositor to destroy a window whose
+      client is not answering. Distinct from `DestroyWindow`, which is the client's own request
+      on its own session: this one names a window the caller does not own, which is exactly what
+      the manager channel is for.
+
+- [ ] **The shell offers it** from the window list, and says what it did on the console.
+
+- [ ] **Gate**: a test client that stops answering, closed from the window list, and its window
+      gone from the stack. The control is a *live* client: closing it must reach the client's own
+      path rather than destroying a window out from under a process that was fine.
+
+### Part D — `nxterm` honours `Configure`, and `libterm` reflows
+
+The blocker for everything sized: until this lands, maximise, snap and resize are no-ops on the
+only application there is. **Its gate is Part B's, completed** — maximise is the trigger, so no
+test-only path is invented to drive a resize, and the two parts are honest about being one
+dependency cut in two rather than two independent things.
+
+- [ ] **Resizing is a client-side mechanism, not an `nxterm` one.** New buffers at the new size,
+      attached, committed, and the old ones released — every application will need exactly this,
+      so it belongs in `libsurface`/`libui` where the next one inherits it rather than copies it.
+
+- [ ] **`Grid::resize(cols, rows)`** — the screen rows re-laid out, the cursor clamped, damage
+      taken for the whole grid. `COLS`' own doc still says the fixed size is fine because "M6
+      owns move and resize"; M6 shipped without either, and this is where the constant stops
+      being one.
+
+- [ ] **Scrollback rewrap, and the data model it needs.** `scrollback` is a
+      `VecDeque<Vec<Cell>>` of *already-wrapped* rows with **nothing recording which were soft
+      wraps**, so a rewrap today would join paragraphs that were never one line. Lines need a
+      `wrapped` flag set as they scroll off; the rewrap then joins logical lines and re-splits at
+      the new width.
+
+- [ ] **And the scroll anchor has to survive it.** `scrolled` is an absolute line number
+      precisely so that output arriving while you read history does not move the text under you
+      — and a rewrap changes how many lines exist. The anchor is re-derived so the visible region
+      shows the same *text* after a resize, which is the property a person notices.
+
+- [ ] **Gate**: maximise `nxterm`, and assert the **committed** geometry is the work area and the
+      grid grew — which completes Part B. Then the reflow, and its control is what the assertion
+      is built around: put a line long enough to wrap *and* **two deliberately short adjacent
+      lines** in the scrollback before widening. A rewrap that ignores the `wrapped` flag joins
+      the short pair into one row, and "the long line is now on one row" holds for that
+      implementation too — so the assertion that separates them is that the short pair is
+      **still two rows** (PR #247 review, optional 6).
+
+### Part E — resize by an edge, committing on release
+
+- [ ] **`Surface::StartResize(window, edges)`** — the same shape as `StartMove` with a direction,
+      and the same recorded press position.
+
+- [ ] **The compositor tracks the rect and draws its outline**, per decision 2 — no manager
+      traffic during the drag. On button-up it emits one event carrying the final rect, and the
+      shell sends the `Configure`. One `Configure` per gesture, and the compositor still never
+      resizes a client.
+
+- [ ] **Gate**: drag `nxterm`'s bottom-right corner and assert the committed size — the
+      *committed* one, since a client may take less than it was offered and the compositor
+      composites what it is given. The control is an outline that tracks but a release that does
+      not commit: the window is unchanged and only the final assertion catches it.
+
+### Part F — snap to edge and corner
+
+- [ ] **`Manage::RegisterSnapZone`** — the shell computes eight zones from the work area (four
+      edges, four corners), registers them, and re-registers when the work area changes. A table
+      the compositor matches against, exactly as `RegisterHotkey` gave it chords it does not
+      understand.
+
+- [ ] **The gesture**: a move-drag whose pointer enters a zone shows that zone's target as the
+      outline; a release inside one ends the drag with that zone named, and the shell sends the
+      `Configure`. Half the work area for an edge, a quarter for a corner — which is policy, and
+      lives entirely in the numbers the shell put in the table.
+
+- [ ] **Gate**: drag to the left edge, release, and assert the committed geometry equals the left
+      half of the **work area** — the assertion that fails if the zones were computed against the
+      screen and the window covers the bars. The control is a drag that passes *through* a zone
+      without releasing in it: it must snap nothing.
 
 ### Out of scope, deliberately
 
-- **A snap-layouts dropdown** (the Windows 11 affordance: drag to the top edge and pick from
-  several layouts). Maintainer's call 2026-08-26, and it costs nothing to defer — it is an
-  *affordance* over the identical mechanism, a menu that ends in the same `Configure`-to-a-rect,
-  so nothing about adding it later has to be undone. Trigger: wanting a layout that the edge and
-  corner gestures cannot express.
+- **Live resize** — a `Configure` per pointer motion. Decision 3 explains the cost and where it
+  falls; the trigger is a client whose repaint is cheap enough for it to be worth having, or a
+  person complaining that an outline is not enough.
+- **A grid resize that does not reflow.** Decision 5 rejects it *as the destination*, and this
+  is the escape hatch if Part D's reflow turns out to be as large as its own description says —
+  earlier drafts offered it as the first version ("what several real terminals did for years")
+  and then dropped it entirely, which left the fallback unwritten with no trigger against it
+  (PR #247 review, optional 7). Trigger: Part D's rewrap not landing inside the milestone, in
+  which case the resize half ships without it and the rewrap becomes its own item rather than
+  blocking maximise and snap indefinitely.
+- **A snap-layouts dropdown** (the Windows 11 affordance: drag to the top edge and pick a
+  layout). Maintainer's call 2026-08-26, and it costs nothing to defer — it is an *affordance*
+  over the identical mechanism, a menu that ends in the same `Configure`-to-a-rect. Trigger:
+  wanting a layout the edge and corner gestures cannot express.
 - **Themes and visual styling** — Milestone 11.
+- **Server-side decorations.** Decision 1 rejects them for this system, not in general; the
+  reasoning is geometry, and it would be worth revisiting if a client ever needed chrome it
+  could not draw.
 
 ## Milestone 10 — applications, and drag-and-drop between them
 

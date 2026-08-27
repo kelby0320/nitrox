@@ -21,10 +21,14 @@ use alloc::vec::Vec;
 use crate::cell::{Attributes, Cell, Colour, Flags};
 use crate::parse::{Erase, Op, Sgr};
 
-/// Columns in the milestone's fixed grid.
+/// Columns in the default grid.
 ///
-/// Fixed because M6 owns move and resize, and reflowing scrollback on resize is the hard part
-/// of that — a resizable grid is a different problem, not a parameter of this one.
+/// **Fixed, and M9 Part D is where it stops being.** This said "fixed because M6 owns move and
+/// resize"; M6 shipped with neither, and nothing since could resize a window at all — `nxterm`
+/// declines every `Configure` on purpose. The reasoning underneath it still holds and is the
+/// reason that part is the milestone's largest: reflowing scrollback is a different problem, not
+/// a parameter of this one, and the scrollback does not yet record which of its rows were soft
+/// wraps.
 pub const COLS: usize = 80;
 /// Rows in the milestone's fixed grid.
 pub const ROWS: usize = 24;
