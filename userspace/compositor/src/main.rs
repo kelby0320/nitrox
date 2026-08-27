@@ -45,15 +45,16 @@ use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::abi::CLOCK_MONOTONIC;
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
-    SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall2,
+    SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint,
+    syscall2,
     syscall4, syscall5,
 };
 use libkern::debug::Line;
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
-    ConfigureEvent, FocusEvent, KeyEvent, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_FOCUS_EVENT,
-    OP_KEY_EVENT,
+    ConfigureEvent, FocusEvent, KeyEvent, MgrCapture, OP_ATTACH_BUFFER, OP_CONFIGURE,
+    OP_FOCUS_EVENT, OP_KEY_EVENT, OP_MGR_CAPTURE,
     OP_POINTER_EVENT,
     OP_RELEASE, PointerEvent,
 };
@@ -1282,6 +1283,76 @@ fn configure_window(
     true
 }
 
+/// Scale a window into the manager's buffer and answer. `false` if the manager is gone.
+///
+/// **The compositor gains an operation and no allocation policy.** The manager allocated the
+/// object and sent it; this maps it, writes, unmaps and forgets it — the mirror of a client
+/// allocating a buffer the compositor reads.
+fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64) -> bool {
+    let Some(req) = MgrCapture::read(body) else {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    };
+    if obj == 0 || req.width == 0 || req.height == 0 || req.pitch == 0 {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    }
+    let Some(w) = srv.stack.window(req.window) else {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::NotFound);
+    };
+    // What is on screen for this window, which is its *committed* buffer — the same thing
+    // compositing reads, so a thumbnail cannot show a frame the screen never did.
+    let (Some(buffer_id), id) = (w.committed, w.id) else {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::WouldBlock);
+    };
+    let Some(b) = w.buffers.iter().find(|b| b.id == buffer_id).map(|b| b.geometry) else {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::WouldBlock);
+    };
+    let dst_geom = match libdraw::framebuffer::Geometry::with_pitch(
+        req.width,
+        req.height,
+        req.pitch as usize,
+        libdraw::format::PixelFormat::XRGB8888,
+    ) {
+        Some(g) => g,
+        None => {
+            return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+        }
+    };
+    let len = dst_geom.byte_len();
+    // SAFETY: mapping an object the manager sent, writable, for exactly its own length.
+    let addr = unsafe {
+        syscall4(
+            SYS_MEMORY_MAP,
+            obj,
+            0,
+            len as u64,
+            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
+        )
+    };
+    if addr <= 0 {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    }
+    // SAFETY: `addr` maps `len` writable bytes, which is what `box_downscale` writes.
+    let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) };
+    let ok = match srv.pixels(id, buffer_id) {
+        Some(src) => libdraw::scale::box_downscale(src, b, dst, dst_geom),
+        None => false,
+    };
+    // SAFETY: unmapping what was just mapped, at the same length.
+    unsafe { syscall4(SYS_MEMORY_UNMAP, addr as u64, len as u64, 0, 0) };
+    if !ok {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    }
+    Line::new()
+        .s(b"compositor: captured window ")
+        .u(id as u64)
+        .s(b" into ")
+        .u(req.width as u64)
+        .s(b"x")
+        .u(req.height as u64)
+        .end();
+    reply_on_session(ch, OP_MGR_CAPTURE, request_id, &[])
+}
+
 /// Handle one request on the manager channel. Returns `false` if the manager is gone.
 fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     // SAFETY: reading our own manager slot and valid recv out-params.
@@ -1300,8 +1371,8 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         return rr != KError::PeerClosed.as_i32() as i64;
     }
     // SAFETY: bounded read-only slice over the just-received message.
-    let (op, request_id, body) = unsafe {
-        // **Close every transfer this message carried.** No manager op takes a handle, but
+    let (op, request_id, body, carried) = unsafe {
+        // **Close every transfer this message carried, except the one `Capture` needs.**
         // `sys_channel_recv` takes no capacity argument and the kernel installs whatever the
         // sender attached into this process's table whether or not anything here looks at it.
         // Left alone they pin a slot in the *global* handle table for the compositor's life,
@@ -1312,20 +1383,47 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         // manager would not
         // do that" is not a bound.
         let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
-        for i in 0..hcount {
-            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
-        }
         let payload_len =
             u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
-        match decode(req) {
-            Ok(m) => (m.op, m.request_id, m.body.to_vec()),
-            Err(_) => return true,
+        let decoded = decode(req);
+        // **The first handle survives only for the op that takes one**, and every other is
+        // closed here as before. Keeping them all would pin a slot in the *global* handle
+        // table for the compositor's life, and a `MemoryObject` would pin the sender's frames
+        // with it (PR #175 review finding 2, PR #216 review finding 3).
+        let takes_handle = matches!(&decoded, Ok(m) if m.op == OP_MGR_CAPTURE);
+        let mut carried = 0u64;
+        for i in 0..hcount {
+            if i == 0 && takes_handle {
+                carried = RECV_HANDLES[0];
+                continue;
+            }
+            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
+        }
+        match decoded {
+            Ok(m) => (m.op, m.request_id, m.body.to_vec(), carried),
+            Err(_) => {
+                if carried != 0 {
+                    syscall4(SYS_HANDLE_CLOSE, carried, 0, 0, 0);
+                }
+                return true;
+            }
         }
     };
+    if op == OP_MGR_CAPTURE {
+        // Handled here rather than in `manager::dispatch`, which is given a `WindowStack` and
+        // nothing else: this needs the handle, the pixel source, and syscalls to map with.
+        let ok = do_capture(srv, ch, request_id, &body, carried);
+        // SAFETY: the object was installed in this process's table by the recv above; the
+        // capture has finished with it either way.
+        if carried != 0 {
+            unsafe { syscall4(SYS_HANDLE_CLOSE, carried, 0, 0, 0) };
+        }
+        return ok;
+    }
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
     drain_stack_events(srv);
     match mgr_outcome {

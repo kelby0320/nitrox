@@ -24,9 +24,14 @@ between them by `Super+Shift+N`. The window list shows the current desktop's win
 window leaves, a named one stays, and the list always ends with one empty desktop to create
 into.
 
-What is **not**: the **overview** (§6's zoomed-out half), Milestone 8 Part E — so the indicator
-switches to the next desktop rather than opening it; and the **system tray** (§9), which is v2
-and an inter-process protocol rather than a widget. Sections describing those describe intent,
+Since M8 Part E the indicator opens the **overview** (§6): frozen thumbnails of the current
+desktop's windows, a sidebar of the others, and a window moved to another desktop by dropping its
+thumbnail on it. The thumbnails are snapshots — `Manage::Capture` scales a window into a buffer
+the shell allocated — so a window drawn after the overview opens shows its state at the moment it
+opened, which §6 accepts deliberately.
+
+What is **not**: the **system tray** (§9), which is v2 and an inter-process protocol rather than
+a widget; and **live thumbnails**, an optimisation §9 gives a trigger rather than a v1 goal. Sections describing those describe intent,
 not behaviour — the rule the rest of `architecture/` follows does not hold there.
 
 What a user actually sees and touches: the bars, the applications modal, the overview, and

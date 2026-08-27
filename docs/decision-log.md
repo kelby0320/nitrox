@@ -18643,3 +18643,109 @@ than of the visible one, so a focused, drawn, clickable window could be unreacha
 committed a full-width panel blit with a stale desktop count and then another with the right one.
 And `close_modal` now says which of its two prompts closed, since these gates read the serial log
 as the shell's only visible output.
+
+## 2026-08-26 — Milestone 8 Part E: capture and the overview
+
+The indicator opens an overview of frozen thumbnails with a sidebar of the other desktops, and a
+window moves by dropping its thumbnail on one. `desktop-shell.md` §6's argument holds up in
+practice: real windows never move, and the compositor gained **one operation** rather than a
+scale-transform pipeline with geometry save and restore.
+
+**The scale is one implementation, published so a second end can be built against it.**
+`libdraw::scale::box_downscale` is what the compositor calls, and the spec gives its band
+arithmetic exactly so that a gate which can see a thumbnail links it rather than writing its own
+— a comparison between two independent downscales checks that two roundings agree, which is a
+weaker claim than it looks. **No such gate exists**: the shell's buffer never leaves the guest.
+This entry said otherwise in the version this PR first proposed, and so did the spec and the
+plan; corrected in place before merge (PR #244 review, blocking 2). A `downscale_framebuffer`
+written "for the host end" had no callers at all and is gone rather than kept as a seam nothing
+uses.
+
+Bands are computed from edges rather than from a step so every source pixel belongs to exactly
+one, which matters most at the bottom of a terminal, where a step drops the most recent output.
+
+**The manager allocates and the compositor writes** — the mirror of `AttachBuffer`. That is the
+whole of governing decision 4, and it keeps allocation policy out of the compositor.
+
+**And the unit tests that were supposed to pin all that did not.** The first suite contained a
+test named for the band rule that **re-implemented the arithmetic in its own body and never
+called `box_downscale`** — so the function could be changed to anything and it could not notice.
+Review demonstrated both failure modes the module doc names by hand passing green: a
+nearest-neighbour scale, and a step-based one dropping the last source rows. The other tests
+could not catch either, because a uniform source makes averaging and sampling the same answer
+and a 4×2 → 2×2 case has bands that align exactly. Rewritten against inputs where the two
+disagree — three pixels black, black, white into one is 85 by average and 0 or 255 by sampling —
+and against sizes that do not divide, so a dropped tail changes a pixel. Both of the review's
+probes now fail.
+
+**That test was load-bearing rather than cosmetic**, because the plan traded the screen
+comparison away *citing* it.
+
+**A reply is not an effect, and here the difference was invisible.** The control that made
+`Capture` answer `Ok` and write nothing **passed the gate**: the compositor logs a successful
+capture either way, and a black thumbnail reads exactly like a dark window on a serial console.
+Only the process holding the buffer can ask whether anything was written, so the shell counts
+painted pixels and says so — `shared_buffer` hands back zeroed memory, which makes "some pixel is
+non-zero" precisely the question. With the check in place the control fails as it should. This is
+PR #216's rule reaching a third subsystem, and the third time a gate has looked like coverage and
+not been.
+
+**`TODO(scroll-grab)` is re-deferred rather than answered**, and the reason is that this drag does
+not need it. The overview names a *drop target*: a thumbnail is picked up, the cursor moves, a
+release over a sidebar row moves the window — and the thumbnail never follows the cursor, so
+there is no press-relative offset for a grab to get wrong. The question is about something drawn
+under the cursor while dragged, and the first of those is M9's drag-to-move. The deferral now has
+a milestone against it rather than "the first time someone complains".
+
+**A drag cannot verify its own start, so the gate clicks first.** There is no press receipt until
+the button goes down, and by then the drag has begun — so an unverified walk to the thumbnail
+left the pointer somewhere the gate had computed rather than somewhere it knew, and the press
+landed nowhere. `click_at` presses *and* releases at a confirmed position, which over a thumbnail
+is a pick-up immediately abandoned: it changes nothing and leaves the pointer somewhere known.
+The drag then starts from there.
+
+**The indicator now opens the overview**, which is what `desktop-shell.md` §7 always specified —
+Part D made it advance to the next desktop only because there was nothing to open. Part D's
+assertion about it had to change with the behaviour, which is the ordinary cost of a placeholder
+and worth naming as one.
+
+## 2026-08-26 — PR #244 review: a test that tested itself, and 9 MB an open
+
+**The one test written for the band rule never called the function it was about.** It
+re-implemented the arithmetic in its own body and asserted on that, so `box_downscale` could
+have been anything. Review demonstrated the two failure modes the module doc names by hand —
+nearest-neighbour sampling, and step-based bands that drop the last source rows — passing green.
+The rest of the suite could not catch either: a uniform source makes averaging and sampling the
+same answer, and a 4×2 → 2×2 case has bands that align exactly. This is the sharpest form of the
+pattern this milestone keeps hitting, because the test *looked* like it was about the rule.
+
+**And the docs described an end that was not built.** The spec, the plan, this log and the
+module's own doc all said the host-side gate links `box_downscale`. Nothing under `tools/` links
+it; the shell's buffer never leaves the guest, and the only pixel-comparing gate boots an image
+with no shell in it. `downscale_framebuffer`, written "for the host end", had zero callers —
+deleted rather than kept as a seam nothing uses, which is the same rule
+`TODO(desktop-endpoint)` states. The claims are corrected: the arithmetic is published so a gate
+that *can* see a thumbnail links it, and until then unit tests are what pin the output.
+
+**The shell had no `unmap` call anywhere.** `shared_buffer` maps outside the heap, so every
+overview open leaked two 4 MB mappings plus up to six thumbnails — about 9 MB a cycle against a
+256 MB guest, roughly twenty-eight opens to exhaustion. The modal has the same shape at 614 KB,
+which is why it had never bitten; both are fixed, because the next instance of a bug is not a
+different bug.
+
+**And the landing spot for running out of memory was a window leak.** `open_overview` had three
+`?` after `create`, none of which destroyed the window — PR #237's finding 7 verbatim, with
+`open_modal` carrying the fix and the comment explaining it eight lines below. Worse here,
+because `addrs[i]` is assigned before the failure points that follow it, so the shell kept a live
+mapping of an orphaned object. Past `MAX_WINDOWS_PER_CONNECTION` the modal would have stopped
+opening too, since they share a connection.
+
+**A minimized window captured perfectly.** `set_minimized` flips a flag without touching the
+committed buffer, so the overview drew one exactly like a window that is on screen — an overview
+of "what is on this desktop" showing something that deliberately is not. They are excluded now;
+the bar is where a minimized window is restored from, and it marks them.
+
+Also: the spec said `Rejected` for a window that has committed nothing, and the code says
+`WouldBlock` — which is the one answer here worth branching on, because it means *try again once
+it draws*. The spec now says so and explains why. And an assertion reading `window list on work
+of ` matched a list still holding the window as happily as one that had lost it.

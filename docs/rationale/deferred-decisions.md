@@ -790,7 +790,16 @@ pointer events, and `widget-toolkit.md` §3 reserves retained widget state for t
 application has no opinion about. This qualifies, so it is a question of where it lives rather
 than whether it is allowed. Trigger: the first time someone drags a scrollbar and complains, or
 M6's window management, which needs press-relative dragging for window moves anyway and will
-have to answer the same question. Landed 2026-08-12 with M5 Part B (`userspace/libui/src/widget.rs`).
+have to answer the same question.
+
+**M8 Part E was that second consumer, and it did not need the answer — re-deferred 2026-08-26.**
+The overview's drag names a *drop target*, not a position: a thumbnail is picked up, the cursor
+moves, and a release over a sidebar row moves the window. The thumbnail never follows the cursor,
+so there is no offset for a grab to get wrong. The question is specifically about a thing that is
+*drawn* under the cursor while being dragged, and the first such thing is still M9's
+drag-to-move — where a window really does follow the pointer and a half-thumb jump at the start
+is exactly the defect this entry describes. Trigger unchanged, and now with a milestone against
+it rather than a "the first time someone complains". Landed 2026-08-12 with M5 Part B (`userspace/libui/src/widget.rs`).
 
 ~~**Antialiasing is deferred, and it is a `libdraw` item rather than a font one.**~~
 **Resolved 2026-08-12, in M5 Part A.** `libdraw` composited opaque XRGB8888 and could not

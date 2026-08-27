@@ -46,6 +46,7 @@ pub mod framebuffer;
 pub mod geom;
 pub mod hash;
 pub mod ppm;
+pub mod scale;
 pub mod scene;
 pub mod text;
 

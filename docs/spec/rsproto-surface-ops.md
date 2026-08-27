@@ -626,7 +626,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -745,6 +745,49 @@ Three rules make that true, and each exists because a simpler version was wrong:
 **Every registered chord is forgotten when the manager channel closes.** The table is routing
 policy its holder asked for; left behind, chords would go on being consumed and delivered to
 nobody, and a replacement manager would inherit ids it did not choose.
+
+### `Capture` (`0x0920`)
+
+Request, 16 bytes — `window` (u32), `width` (u32), `height` (u32), `pitch` (u32) — **and one
+handle**: a writable memory object the *manager* allocated, at least `pitch * height` bytes. The
+compositor box-downscales the window's committed buffer into it and replies with an empty body.
+
+`NotFound` if no such window. `Malformed` if the body is short, no handle came with it, or a
+dimension is zero. `Rejected` if the object is smaller than `pitch * height`, or if the requested
+size is **larger** than the window in either axis — this scales down, and a caller asking to
+scale up has misunderstood what it is for.
+
+**A window that has committed nothing yet is `WouldBlock`, not `Rejected`**, and it is the one
+answer here worth branching on: it means *try again once it draws*, where every other refusal
+means the request was wrong. A freshly launched application has no thumbnail until its first
+commit, and a caller that could not tell that from a malformed body would have no reason to
+retry.
+
+**The manager allocates, which is the mirror of [`AttachBuffer`](#attachbuffer-0x0901).** There
+a client allocates and the compositor reads; here the manager allocates and the compositor
+writes. Either way the compositor gains an operation and no allocation policy, which is the same
+argument that rejected a scale-transform pipeline for the overview
+([`desktop-shell.md`](../architecture/desktop-shell.md) §6).
+
+**The scale is a box average and is fully specified**, because a gate has to be able to say what
+the buffer should contain. Destination pixel `(dx, dy)` is the mean of the source rectangle
+`[dx·sw/dw, (dx+1)·sw/dw) × [dy·sh/dh, (dy+1)·sh/dh)`, each edge computed independently and each
+span at least one pixel wide, with integer division truncating. Bands are derived from edges
+rather than from a step so that **every source pixel belongs to exactly one band** — with a step
+it is the last rows that fall outside, which in a terminal is where the most recent output is.
+`libdraw::scale::box_downscale` is that function. **The compositor calls it; nothing on the host
+does yet** — the shell's buffer never leaves the guest, and the only gate that compares pixels
+boots an image with no shell in it. The arithmetic is published here so that a gate which *can*
+see a thumbnail links this rather than writing its own, and until then the scale is pinned by
+`libdraw`'s unit tests.
+
+**Capture is a snapshot, and the thumbnail does not update.** A window drawn after a capture
+shows its state at the moment it was taken. That is deliberate — `desktop-shell.md` §6 accepts
+it, and live thumbnails are an optimisation with a trigger rather than a v1 goal.
+
+**Capability-gated by being a manager request.** Handing a client another window's pixels is
+exactly the leak per-application namespaces exist to prevent, and the manager channel is one
+holder at a time.
 
 ### What is on screen
 

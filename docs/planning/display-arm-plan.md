@@ -2075,23 +2075,42 @@ also reach the focused window.
 
 ### Part E — capture and the overview
 
-- [ ] **`Capture(window, buffer, width, height)`** — governing decision 4. The compositor
+- [x] **`Capture(window, buffer, width, height)`** ✅ — governing decision 4. The scale is
+      `libdraw::scale::box_downscale`, fully specified down to the band edges so that a gate
+      which can see a thumbnail links it rather than writing its own. **No such gate exists**:
+      the shell's buffer never leaves the guest. The scale is pinned by unit tests written
+      against inputs where averaging and sampling disagree — the first version re-derived the
+      band arithmetic inside the test and passed against both a nearest-neighbour scale and one
+      that dropped the last source row (PR #244 review, blocking 1). The compositor
       area-averages the window's current contents into the shell's buffer. Deterministic, so a
       gate can compare a thumbnail against a `libdraw` downscale of the same source.
 
-- [ ] **The overview**: a fullscreen window the shell creates, fills with the current desktop's
+- [x] **The overview** ✅: a fullscreen window the shell creates, fills with the current desktop's
       frozen thumbnails, and destroys on close — the applications modal's lifecycle, which
       already works. A sidebar previews the other desktops and switches between them, which
       costs only a different set of captures.
 
-- [ ] **Drag a thumbnail onto a sidebar desktop to move its window.** Shell-internal drag: press,
+- [x] **Drag a thumbnail onto a sidebar desktop to move its window** ✅ — and
+      `TODO(scroll-grab)` is **re-deferred**, not answered, with a reason: this drag names a
+      *drop target* rather than a position, so the thumbnail never follows the cursor and there
+      is no offset for a grab to get wrong. The first consumer that needs it is M9's
+      drag-to-move, where a window really does follow the pointer. Shell-internal drag: press,
       motion and release on the shell's own window, ending in `SetWindowDesktop`. This is *not*
       M10's structural drag-and-drop, which is between applications and needs protocol.
       `TODO(scroll-grab)`'s press-relative offset question is the same one, and this is the
       second consumer that deferral named — so it is answered here or explicitly re-deferred.
 
-- [ ] **A gate that opens the overview and drops a window on another desktop**, then verifies
-      by switching to that desktop and comparing the screen.
+- [x] **A gate that opens the overview and drops a window on another desktop** ✅, then verifies
+      by switching to that desktop — **by reading the window list rather than comparing the
+      screen**, for the reason Part C established: `desktop-shell` runs only in a session, and
+      the only gate that compares pixels boots a `--selftest` image that never logs in.
+      What a screen comparison would have caught is covered in two halves, neither of them a
+      comparison: `box_downscale`'s output is pinned by unit tests on inputs where averaging and
+      sampling disagree, and the guest asserts the thumbnail came back with painted pixels —
+      because the compositor logs a successful capture whether or not the scale wrote anything,
+      and a black thumbnail reads like a dark window on a serial console. That control passed
+      until the check existed. **What is still not covered is whether the thumbnail resembles
+      the window**, which needs an end that can see both.
 
 ### Part F — `/dev/desktop`, its first consumer, and the graduations
 
