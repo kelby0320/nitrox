@@ -19132,3 +19132,51 @@ because reflow", and the maintainer asked whether reflow was really the reason. 
 reflow is about *content* when width changes and is equally absent for maximise and snap, which
 were inside the milestone. The real difference is how many `Configure`s a gesture produces, which
 is what produced decision 3 — a middle option that was not on the original list.
+
+### PR #247 review — the decisions held, the parts under them did not
+
+Three blocking findings, all the same shape: each part inherited a mechanism whose current state
+it assumed was further along than it is.
+
+**The drag reports would have corrupted the window list.** Parts E and F had the compositor
+report the drag "and the pointer" to the shell so it could paint an outline and test edge
+proximity — which is a manager event *per pointer motion*, into the one queue built on the
+premise that no such thing exists: the manager outbox does not coalesce ("there is no
+manager-side equivalent of pointer motion") and evicts the **oldest** when full, so a five-second
+drag at 100 Hz would push a `Created` off the front and leave the shell holding a window it will
+never place and never hear about again. It also contradicted decision 2's own rationale, which is
+that the compositor owns the drag *because* it can follow a pointer without a round trip.
+
+The fix keeps decision 1 intact by being precise about what it refuses. **The compositor draws
+the outline** — four thin edges, no font, no theme. What decision 1 refuses is chrome the
+compositor must lay out and style, and it refuses it because chrome changes what a window's
+rectangle *means*; an outline is neither. **Snap targets become a registered table**, the way
+chords already are: the shell computes zones from the work area and registers them, the
+compositor matches the pointer against the table and draws the matching target, and the manager
+hears **two events per gesture** — begin, and end carrying the final rect. The shell still sends
+every `Configure`, so there is one path to a window's geometry rather than two that can disagree.
+
+**Part B's gate could not pass at Part B**, and the plan said so itself two parts later:
+`nxterm` declines every `Configure` until Part D. The knot is real — B's maximise needs D's
+client, and D's gate needs something to trigger a resize, which is B's maximise. It is cut by
+splitting the *assertion* rather than the parts: B asserts minimise end to end and maximise as
+far as the **request** (the shell logged the work-area rect it asked for), and D's gate completes
+it on the window. No test-only path is invented to drive a resize.
+
+**And nothing could tell the shell what the work area is.** `work_area()` has zero production
+callers — every reference is in a `#[cfg(test)]` module — and no op exposes it; `desktop-shell`
+hardcodes the screen size and its comment says why ("adding one to draw a bar would be a protocol
+change made for a stub's convenience"). Maximise is that convenience arriving, so Part B now
+opens with a `Manage::QueryLayout` and a strut-change event. It also makes `Place`'s spec note —
+"a manager computes positions from the work area" — true, which it was not.
+
+**Two smaller ones worth keeping.** `StartMove` was to take "the current pointer position" as the
+grab origin, which is a full round trip after the press: the router keeps the grab but not *where
+the press landed*, so the window would jump by however far the pointer travelled while the client
+decided the press was on its title bar — the "half-thumb jump" `TODO(scroll-grab)` describes, in
+the milestone claiming to answer it. The router records the press position now, and Part A's gate
+**moves the pointer between the press and the request**, because the harness injects one event at
+a time and would otherwise measure zero drift where a person sees forty pixels. And
+`RequestState` is the first client-rate-controlled producer of manager events: a request for a
+state the window is already in produces nothing, the same dedup `SetTitle` already has and for
+the same stated reason.
