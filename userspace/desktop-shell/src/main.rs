@@ -148,6 +148,12 @@ struct WinEntry {
     focused: bool,
     /// Whether the shell has minimized it.
     minimized: bool,
+    /// The window's committed size, from `WindowCreated` and kept current by `WindowGeometry`.
+    ///
+    /// **Needed because a capture may not scale up.** A thumbnail is a fixed size in the
+    /// overview's grid, and a window smaller than that in either axis has to be captured at its
+    /// own size and drawn smaller, rather than the request being refused.
+    size: (u32, u32),
     /// Which desktop it is on — the shell's copy of the attribute it set.
     ///
     /// **Tracked here rather than read back from `/dev/draw/<id>/info`.** The shell is the only
@@ -1221,6 +1227,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
     // different thing to do with what was typed.
     let mut rename = false;
+    // The overview: its window, the thumbnails it is showing, and which one is being dragged.
+    let mut overview: Option<u32> = None;
+    let mut over_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let mut shots: alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+    let mut dragging: Option<u32> = None;
 
     // Blocks on the compositor's event channel, never spins — a spinning leader keeps a run
     // queue non-empty, so the idle thread never runs and deferred reclamation stops for the
@@ -1543,6 +1554,72 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                 }
             }
+            // **The overview's own input**: Escape closes it, a press picks a thumbnail up, a
+            // release over a sidebar row drops it there.
+            if Some(w) == overview {
+                if let libsurface::WindowEvent::Key(k) = event
+                    && k.pressed != 0
+                    && k.keycode == KEY_ESC
+                {
+                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging);
+                    continue;
+                }
+                if let libsurface::WindowEvent::Pointer(p) = event
+                    && p.kind == librsproto::surface::POINTER_BUTTON
+                {
+                    let pressed = p.flags & librsproto::surface::POINTER_PRESSED != 0;
+                    if pressed {
+                        // **Picked up by which thumbnail, not by where inside it.** The
+                        // press-relative offset `TODO(scroll-grab)` is about matters when the
+                        // thing being dragged is *drawn* following the cursor; here the
+                        // thumbnail stays put and only the drop target is read, so the offset
+                        // has nothing to be wrong about. That deferral named this as its second
+                        // consumer; it is re-deferred rather than answered, and the reason is
+                        // that this drag does not need what it is about.
+                        dragging = thumb_at(p.x, p.y, shots.len()).map(|i| shots[i].0);
+                        if let Some(id) = dragging {
+                            Line::new()
+                                .s(b"desktop-shell: dragging window ")
+                                .u(id as u64)
+                                .end();
+                        }
+                    } else if let Some(wid) = dragging.take() {
+                        // Dropped. A release over a sidebar row moves the window there;
+                        // anywhere else is a drag abandoned, which is not an error.
+                        if let Some(i) = side_row_at(p.x, p.y, desktops.len())
+                            && let Some(m) = manager.as_mut()
+                        {
+                            let to = desktops[i].id;
+                            sent_request = true;
+                            if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, wid, to) {
+                                if let Some(e) = entries.iter_mut().find(|e| e.id == wid) {
+                                    e.desktop = to;
+                                }
+                                Line::new()
+                                    .s(b"desktop-shell: dropped window ")
+                                    .u(wid as u64)
+                                    .s(b" on ")
+                                    .s(desktop_label(&desktops, to).as_bytes())
+                                    .end();
+                                normalize_desktops(
+                                    &mut desktops,
+                                    &entries,
+                                    &mut current_desktop,
+                                    &mut next_desktop_id,
+                                );
+                                list_dirty = true;
+                                // The overview is a snapshot of a desktop that has just
+                                // changed, so it is closed rather than left showing a window
+                                // that is no longer here.
+                                close_overview(
+                                    &mut session, &mut overview, &mut shots, &mut dragging,
+                                );
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             if w == window && modal.is_none() {
                 if let libsurface::WindowEvent::Pointer(p) = event {
 
@@ -1571,14 +1648,35 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // the overview, which is Part E — until then the indicator is the only pointer
                 // way to change desktops, and a control that does nothing until a later
                 // milestone is worse than one that does the obvious thing.
-                if p.x as u32 >= INDICATOR_X
-                    && let Some(m) = manager.as_mut()
-                {
-                    let idx = desktops.iter().position(|d| d.id == current_desktop).unwrap_or(0);
-                    let to = desktops[(idx + 1) % desktops.len()].id;
-                    sent_request = true;
-                    if switch_desktop(m, &desktops, &mut current_desktop, to) {
-                        list_dirty = true;
+                if p.x as u32 >= INDICATOR_X {
+                    // **Clicking the indicator opens the overview** (`desktop-shell.md` §7),
+                    // which is what it was always specified to do — Part D made it advance to
+                    // the next desktop only because there was no overview to open yet.
+                    if overview.is_none()
+                        && let Some(m) = manager.as_mut()
+                    {
+                        sent_request = true;
+                        shots.clear();
+                        for e in visible_entries(&entries, current_desktop) {
+                            if let Some((w, h, px)) = capture_window(m, e.id, e.size) {
+                                shots.push((e.id, w, h, px));
+                            }
+                        }
+                        overview = open_overview(
+                            &mut session, window, &font, &shots, &desktops, current_desktop,
+                            &mut over_addrs,
+                        );
+                        if let Some(id) = overview {
+                            Line::new()
+                                .s(b"desktop-shell: overview open, window ")
+                                .u(id as u64)
+                                .s(b" showing ")
+                                .u(shots.len() as u64)
+                                .s(b" of ")
+                                .u(desktops.len() as u64)
+                                .s(b" desktops")
+                                .end();
+                        }
                     }
                     continue;
                 }
@@ -1740,6 +1838,253 @@ fn minimize_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
     false
 }
 
+/// Paint the overview: frozen thumbnails of the current desktop, and a sidebar of desktops.
+///
+/// **Frozen, and that is what makes this affordable.** `desktop-shell.md` §6 rejected
+/// compositing live windows with a scale transform — which needs scale as a window attribute,
+/// geometry save and restore, and windows physically relocating — in favour of asking the
+/// compositor for a snapshot. Real windows never move; the compositor gained one operation
+/// instead of a transform pipeline. A window drawn *after* the capture shows its state at the
+/// moment the overview opened, which is accepted deliberately.
+
+fn render_overview(
+    font: &Font,
+    shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
+    desktops: &[Desktop],
+    current: u32,
+) -> MemFramebuffer {
+    let geometry =
+        Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::XRGB8888)
+            .unwrap_or_else(|| fail(b"desktop-shell: bad overview geometry\n"));
+    use libdraw::framebuffer::Framebuffer as _;
+    let mut fb = MemFramebuffer::new(geometry);
+    // A ground to draw on, so a thumbnail that fails to capture reads as a gap rather than as
+    // whatever the allocation happened to hold.
+    for y in 0..SCREEN_H as u32 {
+        for x in 0..SCREEN_W {
+            fb.put_pixel(x, y, libdraw::scene::BACKGROUND);
+        }
+    }
+    // The sidebar's rows, drawn through the toolkit so they look like the rest of the shell.
+    let mut rows: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
+    for d in desktops {
+        let mut label = alloc::string::String::new();
+        label.push_str(if d.id == current { "> " } else { "  " });
+        label.push_str(&desktop_label(desktops, d.id));
+        rows.push(sized(
+            libdraw::geom::Size::new(SIDE_W, SIDE_ROW_H),
+            padding(Insets { top: 8, right: 8, bottom: 8, left: 8 }, text(label)),
+        ));
+    }
+    let side = column(rows);
+    let bounds = Rect::new(
+        (SCREEN_W - SIDE_W) as i32,
+        BAR_H as i32,
+        SIDE_W,
+        SCREEN_H as u32 - BAR_H,
+    );
+    let metrics = FontMetrics::new(font, FONT_PX);
+    let l = layout(&side, bounds, &metrics);
+    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+    paint(&mut fb, font, &theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+
+    // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
+    // toolkit to lay out and a element per pixel would be absurd.
+    for (i, (_, w, h, px)) in shots.iter().enumerate() {
+        let (tx, ty, _, _) = thumb_rect(i);
+        let pitch = (*w as usize) * 4;
+        for y in 0..*h {
+            for x in 0..*w {
+                let off = y as usize * pitch + x as usize * 4;
+                if off + 4 > px.len() {
+                    continue;
+                }
+                let word = u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
+                fb.put_pixel(tx + x, ty + y, PixelFormat::XRGB8888.decode(word));
+            }
+        }
+    }
+    fb
+}
+
+/// Create the overview window and present it. `None` if any step fails.
+///
+/// **A `popup`, like the applications modal, and for two reasons.** A popup is placed by its
+/// creator and is *not* held for the manager — which is what a shell creating a window while
+/// holding its own manager channel needs, as Part C learned the hard way. And a popup takes
+/// keyboard focus, so Escape closes it; a `panel` never could.
+fn open_overview(
+    session: &mut Session<ChannelTransport>,
+    parent: u32,
+    font: &Font,
+    shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
+    desktops: &[Desktop],
+    current: u32,
+    addrs: &mut [*mut u8; BUFFERS],
+) -> Option<u32> {
+    let len = OVER_PITCH * SCREEN_H as usize;
+    let id = session
+        .create(
+            &CreateWindowRequest::new(SCREEN_W, SCREEN_H as u32, Role::Popup { parent }),
+            BUFFERS,
+        )
+        .ok()?;
+    for i in 0..BUFFERS {
+        let (handle, addr) = shared_buffer(len)?;
+        addrs[i] = addr;
+        let mut w = session.window(id)?;
+        w.attach(i as u32, SCREEN_W, SCREEN_H as u32, OVER_PITCH as u32, handle).ok()?;
+    }
+    present_overview(session, id, font, shots, desktops, current, addrs);
+    Some(id)
+}
+
+/// Render the overview into a free buffer and commit it.
+fn present_overview(
+    session: &mut Session<ChannelTransport>,
+    id: u32,
+    font: &Font,
+    shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
+    desktops: &[Desktop],
+    current: u32,
+    addrs: &[*mut u8; BUFFERS],
+) {
+    let len = OVER_PITCH * SCREEN_H as usize;
+    let bytes = render_overview(font, shots, desktops, current).into_bytes();
+    if bytes.len() != len {
+        return;
+    }
+    let Some(mut w) = session.window(id) else { return };
+    let Ok(slot) = w.acquire() else { return };
+    let addr = addrs[slot as usize % BUFFERS];
+    if addr.is_null() {
+        return;
+    }
+    // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
+    // allocations, so they cannot overlap.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
+    let _ = w.commit(slot, (0, 0, SCREEN_W, SCREEN_H as u32));
+}
+
+/// Destroy the overview and forget what it was showing.
+fn close_overview(
+    session: &mut Session<ChannelTransport>,
+    overview: &mut Option<u32>,
+    shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
+    dragging: &mut Option<u32>,
+) {
+    if let Some(id) = overview.take() {
+        if let Some(w) = session.window(id) {
+            let _ = w.destroy();
+        }
+        shots.clear();
+        *dragging = None;
+        Line::new().s(b"desktop-shell: overview closed, window ").u(id as u64).end();
+    }
+}
+
+/// The overview's sidebar width, at the right-hand edge.
+const SIDE_W: u32 = 200;
+/// One desktop row in the sidebar.
+const SIDE_ROW_H: u32 = 40;
+/// A thumbnail's size in the overview's grid.
+const THUMB_W: u32 = 240;
+/// See [`THUMB_W`].
+const THUMB_H: u32 = 150;
+/// Space around each thumbnail.
+const THUMB_PAD: u32 = 16;
+/// How many thumbnails fit across the grid.
+const THUMB_COLS: u32 = (SCREEN_W - SIDE_W) / (THUMB_W + THUMB_PAD);
+/// Bytes per row of the overview's own buffer.
+const OVER_PITCH: usize = (SCREEN_W as usize) * 4;
+
+/// Where thumbnail `i` sits in the overview, in overview-local pixels.
+///
+/// **One function for drawing and for hit-testing**, which is the lesson the bottom bar's
+/// indicator taught: a hit region computed separately from the layout is right at one window
+/// count and wrong everywhere else (PR #243 review, blocking 2).
+fn thumb_rect(i: usize) -> (u32, u32, u32, u32) {
+    let col = (i as u32) % THUMB_COLS;
+    let row = (i as u32) / THUMB_COLS;
+    let x = THUMB_PAD + col * (THUMB_W + THUMB_PAD);
+    let y = BAR_H + THUMB_PAD + row * (THUMB_H + THUMB_PAD);
+    (x, y, THUMB_W, THUMB_H)
+}
+
+/// Which sidebar row a point is in, if any.
+fn side_row_at(x: i32, y: i32, rows: usize) -> Option<usize> {
+    if x < (SCREEN_W - SIDE_W) as i32 || y < BAR_H as i32 {
+        return None;
+    }
+    let i = ((y as u32 - BAR_H) / SIDE_ROW_H) as usize;
+    (i < rows).then_some(i)
+}
+
+/// Which thumbnail a point is in, if any.
+fn thumb_at(x: i32, y: i32, n: usize) -> Option<usize> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    (0..n).find(|&i| {
+        let (tx, ty, tw, th) = thumb_rect(i);
+        x >= tx as i32 && x < (tx + tw) as i32 && y >= ty as i32 && y < (ty + th) as i32
+    })
+}
+
+/// Ask the compositor to scale `window` into a fresh buffer, and return the pixels.
+///
+/// **The manager allocates**, which is the mirror of a client attaching a buffer the compositor
+/// reads. Clamped to the window's own size, because a capture may not scale *up*: a window
+/// smaller than the grid cell is captured at its own size and drawn smaller.
+fn capture_window(
+    mgr: &mut ChannelTransport,
+    window: u32,
+    size: (u32, u32),
+) -> Option<(u32, u32, alloc::vec::Vec<u8>)> {
+    use librsproto::surface::{MgrCapture, OP_MGR_CAPTURE};
+    let w = THUMB_W.min(size.0.max(1));
+    let h = THUMB_H.min(size.1.max(1));
+    let pitch = (w as usize) * 4;
+    let len = pitch * h as usize;
+    let (handle, addr) = shared_buffer(len)?;
+    let req = MgrCapture { window, width: w, height: h, pitch: pitch as u32 };
+    let mut body = [0u8; core::mem::size_of::<MgrCapture>()];
+    if req.write(&mut body).is_none() {
+        return None;
+    }
+    let mut reply = [0u8; 64];
+    let ok = mgr.request(OP_MGR_CAPTURE, &body, Some(handle), &mut reply).is_ok();
+    if !ok {
+        Line::new().s(b"desktop-shell: Capture refused for window ").u(window as u64).end();
+        return None;
+    }
+    // SAFETY: `addr` maps `len` readable bytes the compositor has just written.
+    let px = unsafe { core::slice::from_raw_parts(addr, len) }.to_vec();
+    // **A reply is not an effect, and here the difference is invisible from outside.** The
+    // compositor logs a successful capture whether or not the scale wrote anything, and the
+    // overview would show a black rectangle that no serial gate could tell from a dark window.
+    // `shared_buffer` hands back zeroed memory, so "some pixel is non-zero" is exactly the
+    // question, and only the process holding the buffer can ask it (PR #216's rule, and the
+    // control that caught this one writing nothing).
+    let lit = px.chunks_exact(4).filter(|c| c != &[0, 0, 0, 0]).count();
+    if lit == 0 {
+        Line::new()
+            .s(b"desktop-shell: capture of window ")
+            .u(window as u64)
+            .s(b" came back blank")
+            .end();
+        return None;
+    }
+    Line::new()
+        .s(b"desktop-shell: thumbnail of window ")
+        .u(window as u64)
+        .s(b" has ")
+        .u(lit as u64)
+        .s(b" painted pixels")
+        .end();
+    Some((w, h, px))
+}
+
 /// Tell the compositor which desktop to composite, and say so.
 ///
 /// **The only thing the compositor is told about desktops.** Which ones exist, what they are
@@ -1811,7 +2156,7 @@ fn place_new_windows(
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
         OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS,
-        OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
+        OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
     };
     let mut dirty = false;
     // **Four bytes more than `MAX_TITLE`, which is what a title record actually is.** A
@@ -1845,6 +2190,18 @@ fn place_new_windows(
                         e.focused = has && e.id == f.window;
                         dirty |= was != e.focused;
                     }
+                }
+                continue;
+            }
+            OP_MGR_WINDOW_GEOMETRY => {
+                // A window's rectangle changes for more than one reason — a manager `Place`,
+                // and a client committing a buffer of a different size — and this event
+                // promises to report it for any of them. The overview needs the current size
+                // to clamp a capture that may not scale up.
+                if let Some(g) = librsproto::surface::ConfigureEvent::read(&buf[..n])
+                    && let Some(e) = entries.iter_mut().find(|e| e.id == g.window)
+                {
+                    e.size = (g.width, g.height);
                 }
                 continue;
             }
@@ -1894,6 +2251,7 @@ fn place_new_windows(
             title: alloc::string::String::new(),
             focused: false,
             minimized: false,
+            size: (created.width, created.height),
             // The compositor creates a window onto *its* current desktop, and the shell is what
             // set that — so this is not a guess, it is the same number read from the other side.
             desktop: current,

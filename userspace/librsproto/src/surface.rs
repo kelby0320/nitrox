@@ -845,6 +845,13 @@ pub const OP_MGR_SET_WINDOW_DESKTOP: u16 = 0x0916;
 /// on its desktop, restores there, and belongs in that desktop's window list, so folding the
 /// two would make restoring a guess.
 pub const OP_MGR_SET_MINIMIZED: u16 = 0x0917;
+/// `Manage::Capture` — scale a window's current contents into a buffer the manager allocated.
+///
+/// The mirror of [`AttachBuffer`](OP_ATTACH_BUFFER): there a client allocates and the compositor
+/// reads, here the manager allocates and the compositor writes. Capability-gated by being a
+/// manager request — handing a client another window's pixels is the leak per-application
+/// namespaces exist to prevent.
+pub const OP_MGR_CAPTURE: u16 = 0x0920;
 /// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
 ///
 /// A manager request rather than a client one because any application able to register `Super`
@@ -961,6 +968,50 @@ impl MgrWindowValue {
             return None;
         }
         Some(Self { window: get_u32(b, 0), value: get_u32(b, 4) })
+    }
+}
+
+/// A capture request: which window, and the geometry of the buffer travelling with it.
+///
+/// The handle is sent alongside rather than named here, the way every other handle on this
+/// protocol travels — a body cannot carry one.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrCapture {
+    /// The window to scale.
+    pub window: u32,
+    /// Destination width, never larger than the window's.
+    pub width: u32,
+    /// Destination height, never larger than the window's.
+    pub height: u32,
+    /// Destination bytes per row; the object must hold `pitch * height`.
+    pub pitch: u32,
+}
+
+impl MgrCapture {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 16 {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.width);
+        put_u32(out, 8, self.height);
+        put_u32(out, 12, self.pitch);
+        Some(16)
+    }
+
+    /// Parse from the first 16 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 16 {
+            return None;
+        }
+        Some(Self {
+            window: get_u32(b, 0),
+            width: get_u32(b, 4),
+            height: get_u32(b, 8),
+            pitch: get_u32(b, 12),
+        })
     }
 }
 

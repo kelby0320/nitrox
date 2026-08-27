@@ -18643,3 +18643,48 @@ than of the visible one, so a focused, drawn, clickable window could be unreacha
 committed a full-width panel blit with a stale desktop count and then another with the right one.
 And `close_modal` now says which of its two prompts closed, since these gates read the serial log
 as the shell's only visible output.
+
+## 2026-08-26 — Milestone 8 Part E: capture and the overview
+
+The indicator opens an overview of frozen thumbnails with a sidebar of the other desktops, and a
+window moves by dropping its thumbnail on one. `desktop-shell.md` §6's argument holds up in
+practice: real windows never move, and the compositor gained **one operation** rather than a
+scale-transform pipeline with geometry save and restore.
+
+**The scale is shared code, not a shared description.** `libdraw::scale::box_downscale` is linked
+by the compositor and by the host-side gate, because a comparison between two independent
+downscales is checking that two roundings agree — a weaker claim than it looks, and one that
+fails for reasons nobody can act on. Bands are computed from edges rather than from a step so
+every source pixel belongs to exactly one, which matters most at the bottom of a terminal, where
+a step would drop the most recent output.
+
+**The manager allocates and the compositor writes** — the mirror of `AttachBuffer`. That is the
+whole of governing decision 4, and it keeps allocation policy out of the compositor.
+
+**A reply is not an effect, and here the difference was invisible.** The control that made
+`Capture` answer `Ok` and write nothing **passed the gate**: the compositor logs a successful
+capture either way, and a black thumbnail reads exactly like a dark window on a serial console.
+Only the process holding the buffer can ask whether anything was written, so the shell counts
+painted pixels and says so — `shared_buffer` hands back zeroed memory, which makes "some pixel is
+non-zero" precisely the question. With the check in place the control fails as it should. This is
+PR #216's rule reaching a third subsystem, and the third time a gate has looked like coverage and
+not been.
+
+**`TODO(scroll-grab)` is re-deferred rather than answered**, and the reason is that this drag does
+not need it. The overview names a *drop target*: a thumbnail is picked up, the cursor moves, a
+release over a sidebar row moves the window — and the thumbnail never follows the cursor, so
+there is no press-relative offset for a grab to get wrong. The question is about something drawn
+under the cursor while dragged, and the first of those is M9's drag-to-move. The deferral now has
+a milestone against it rather than "the first time someone complains".
+
+**A drag cannot verify its own start, so the gate clicks first.** There is no press receipt until
+the button goes down, and by then the drag has begun — so an unverified walk to the thumbnail
+left the pointer somewhere the gate had computed rather than somewhere it knew, and the press
+landed nowhere. `click_at` presses *and* releases at a confirmed position, which over a thumbnail
+is a pick-up immediately abandoned: it changes nothing and leaves the pointer somewhere known.
+The drag then starts from there.
+
+**The indicator now opens the overview**, which is what `desktop-shell.md` §7 always specified —
+Part D made it advance to the next desktop only because there was nothing to open. Part D's
+assertion about it had to change with the behaviour, which is the ordinary cost of a placeholder
+and worth naming as one.

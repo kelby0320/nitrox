@@ -1674,6 +1674,57 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: moved window ")?;
     session.expect("desktop-shell: window list on desktop 2 of 2 (empty)")?;
 
+    // 6d. **The overview** (M8 Part E): frozen thumbnails of this desktop, a sidebar of the
+    //     others, and a window moved by dropping its thumbnail on one.
+    //
+    //     Opened from the indicator, which `desktop-shell.md` §7 always said it does — Part D
+    //     made it advance to the next desktop only because there was no overview to open.
+    //
+    //     Bring the terminal back to this desktop first: `work` is empty after 6c, and an
+    //     overview of nothing has no thumbnail to drag.
+    chord(&mut qmp, false, "1")?;
+    session.expect("desktop-shell: switched to work")?;
+    click_at(&mut qmp, &mut session, 1200, 788)?;
+    // **The compositor's own line first, and it comes first in the guest too**: the shell
+    // captures every visible window *before* it creates the overview to show them in. Asserted
+    // rather than inferred, because an overview that opened with no thumbnails would satisfy
+    // every assertion below about windows moving — the drag is by coordinate.
+    session.expect("compositor: captured window ")?;
+    // **And it wrote pixels.** The compositor logs a successful capture whether or not the
+    // scale put anything in the buffer, and a black thumbnail is indistinguishable from a dark
+    // window on a serial console — so the shell checks the buffer it owns and says what it
+    // found. Without this the gate passed against a compositor that answered `Ok` and wrote
+    // nothing at all.
+    session.expect("desktop-shell: thumbnail of window ")?;
+    session.expect("desktop-shell: overview open, window ")?;
+
+    // The first thumbnail sits at (16, 40) and is 240x150 — see `thumb_rect`. Press inside it,
+    // release over the second sidebar row, which is desktop 2.
+    const THUMB: (i32, i32) = (100, 100);
+    let side_row = |i: i32| (1180, 24 + i * 40 + 20);
+    // **A verified click first, then the drag from where it left the pointer.** A drag cannot
+    // check its own start — there is no press receipt until the button goes down, and by then
+    // it has begun. `click_at` presses *and* releases at a confirmed position: over a thumbnail
+    // that is a pick-up immediately abandoned, which changes nothing, and it leaves the pointer
+    // somewhere this gate knows rather than somewhere it computed.
+    click_at(&mut qmp, &mut session, THUMB.0, THUMB.1)?;
+    session.expect("desktop-shell: dragging window ")?;
+    qmp.send_button("left", true)?;
+    session.expect("desktop-shell: dragging window ")?;
+    let (dx, dy) = side_row(1);
+    move_pointer_to(&mut qmp, dx, dy)?;
+    qmp.pointer = Some((dx, dy));
+    qmp.send_button("left", false)?;
+    session.expect("desktop-shell: dropped window ")?;
+    session.expect("desktop-shell: overview closed")?;
+
+    // And it really moved: `work` is empty again, and the window is on the desktop it was
+    // dropped on.
+    session.expect("desktop-shell: window list on work of ")?;
+    chord(&mut qmp, false, "2")?;
+    session.expect("desktop-shell: switched to ")?;
+    session.expect(":> nxterm")?;
+
     // **And the chrome is still there.** Both bars are `panel`s created at startup, so the
     // compositor stamped them with the desktop that was current then — and `visible_on` is the
     // single predicate behind compositing, focus *and* hit-testing, so from the first switch
@@ -1682,8 +1733,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //
     // Asserted by the compositor naming the window a press landed on: on another desktop a
     // non-sticky bar gives `win=none`, and no shell line follows because nothing was reached.
+    //
+    // **The indicator opens the overview since Part E**, which is what `desktop-shell.md` §7
+    // always specified — Part D made it advance to the next desktop only because there was no
+    // overview to open. Escape closes it again so the serial login below is not typing at a
+    // popup that holds the keyboard.
     click_at(&mut qmp, &mut session, 1200, 788)?;
-    session.expect("desktop-shell: switched to ")?;
+    session.expect("desktop-shell: overview open, window ")?;
+    press(&mut qmp, "esc")?;
+    session.expect("desktop-shell: overview closed")?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader

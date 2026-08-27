@@ -2075,23 +2075,36 @@ also reach the focused window.
 
 ### Part E — capture and the overview
 
-- [ ] **`Capture(window, buffer, width, height)`** — governing decision 4. The compositor
+- [x] **`Capture(window, buffer, width, height)`** ✅ — governing decision 4. The scale is
+      `libdraw::scale::box_downscale`, **linked by both ends** so a comparison is not two
+      roundings agreeing, and it is fully specified in the spec down to the band edges. The compositor
       area-averages the window's current contents into the shell's buffer. Deterministic, so a
       gate can compare a thumbnail against a `libdraw` downscale of the same source.
 
-- [ ] **The overview**: a fullscreen window the shell creates, fills with the current desktop's
+- [x] **The overview** ✅: a fullscreen window the shell creates, fills with the current desktop's
       frozen thumbnails, and destroys on close — the applications modal's lifecycle, which
       already works. A sidebar previews the other desktops and switches between them, which
       costs only a different set of captures.
 
-- [ ] **Drag a thumbnail onto a sidebar desktop to move its window.** Shell-internal drag: press,
+- [x] **Drag a thumbnail onto a sidebar desktop to move its window** ✅ — and
+      `TODO(scroll-grab)` is **re-deferred**, not answered, with a reason: this drag names a
+      *drop target* rather than a position, so the thumbnail never follows the cursor and there
+      is no offset for a grab to get wrong. The first consumer that needs it is M9's
+      drag-to-move, where a window really does follow the pointer. Shell-internal drag: press,
       motion and release on the shell's own window, ending in `SetWindowDesktop`. This is *not*
       M10's structural drag-and-drop, which is between applications and needs protocol.
       `TODO(scroll-grab)`'s press-relative offset question is the same one, and this is the
       second consumer that deferral named — so it is answered here or explicitly re-deferred.
 
-- [ ] **A gate that opens the overview and drops a window on another desktop**, then verifies
-      by switching to that desktop and comparing the screen.
+- [x] **A gate that opens the overview and drops a window on another desktop** ✅, then verifies
+      by switching to that desktop — **by reading the window list rather than comparing the
+      screen**, for the reason Part C established: `desktop-shell` runs only in a session, and
+      the only gate that compares pixels boots a `--selftest` image that never logs in.
+      What a screen comparison would have caught is covered instead by the shell checking the
+      buffer *it* owns: `box_downscale` is host-tested, and the guest asserts the thumbnail came
+      back with painted pixels — because the compositor logs a successful capture whether or not
+      the scale wrote anything, and a black thumbnail reads like a dark window on a serial
+      console. That control passed until the check existed.
 
 ### Part F — `/dev/desktop`, its first consumer, and the graduations
 
