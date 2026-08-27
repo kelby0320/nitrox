@@ -2000,12 +2000,17 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
 /// the whole line is a handful of characters and the guest's input ring is drained per event.
 fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
     const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
-    // **A bare Enter first, to absorb the byte that goes missing.** `nxsh` *reads* every
-    // character typed — verified with a probe on its `tty_read` — and then resolves a program
-    // name with the first one gone: `desktop` typed, `esktop` looked up. So the byte is
-    // consumed inside the shell's own line handling rather than lost in transit, and a line
-    // that is empty anyway is the cheapest thing to feed it. Tracked as
-    // `TODO(nxsh-first-byte)`; this gate should stop needing it.
+    // **A bare Enter first, because this gate has pressed Escape at a terminal.** `ESC` is the
+    // **meta prefix**: the discipline consumes the byte after a bare one, exactly as readline
+    // does — `ESC d` is M-d, and an unbound pair is discarded rather than inserted. This gate
+    // presses Escape to dismiss the modal and the overview, and when no popup is open that
+    // Escape reaches whatever holds the keyboard, which by then is the terminal. So the next
+    // character typed is eaten: `desktop` becomes `esktop`.
+    //
+    // Measured rather than assumed, after it was briefly taken for a bug in `nxsh`: typing one
+    // command three times in a session loses one character, and injecting an Escape between two
+    // of them loses a second — the loss follows the Escape. An empty line is the cheapest thing
+    // to feed a prefix that is going to take one.
     std::thread::sleep(PER_KEY);
     press(qmp, "ret")?;
     // **The wait comes *before* each key, including the first**, and that is not cosmetic.

@@ -135,6 +135,14 @@ impl Discipline {
         // Mid-escape bytes are never text: a `[` after ESC is not a bracket the user typed.
         match self.esc {
             EscState::Ground => {}
+            // **`ESC` is the meta prefix, so the byte after a bare one is consumed.** That is
+            // what readline does — `ESC d` is M-d, and an `ESC` pair with no binding is
+            // discarded rather than inserted — and it is why the test below is named for what
+            // it asserts rather than for what a reader might hope. M8 Part F briefly took this
+            // for a bug, on the evidence that typing `desktop` at a terminal an Escape had
+            // reached gave the shell `esktop`. It does; that is the meta prefix working, and
+            // the Escape came from a *gate* dismissing a popup while the terminal held the
+            // keyboard, not from the discipline losing input.
             EscState::Esc => {
                 self.esc = if b == b'[' { EscState::Csi } else { EscState::Ground };
                 return Step::None;

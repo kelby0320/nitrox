@@ -796,24 +796,6 @@ focus means. Trigger: the first client that tracks held keys, or M9's decoration
 that starts on a title bar will raise the same question for the keyboard. Identified in PR #241
 review, answer 4.
 
-**The first byte typed into a graphical terminal goes missing — `TODO(nxsh-first-byte)`.**
-Found in M8 Part F, diagnosing why a `desktop` command typed into `nxterm` did nothing: `nxsh`
-**reads** every character — verified with a probe on its `tty_read` — and then resolves a program
-name with the first one gone. `desktop` typed, `esktop` looked up. It is not input loss: the byte
-arrives at the shell and is consumed inside its own line handling.
-
-**Only the graphical path shows it.** `test-interactive` types at a serial prompt through
-`/dev/console` and has never lost a character; `check-terminal` types into `nxterm` under
-`test-harness`, where the first thing typed is a `F1` that opens a menu, so the eaten byte is one
-nobody was counting. It took a release-image gate typing a *command* to surface it.
-
-**Worked around in the gate rather than fixed**, because the fix is in `nxsh`'s line handling and
-Part F's subject is `/dev/desktop`: `type_at_terminal` sends a bare Enter first, and an empty line
-is the cheapest thing to feed something that is going to eat one. Trigger: any second consumer
-that types into a graphical terminal, and M9 at the latest — a terminal whose first keystroke is
-silently discarded is not a terminal anyone should ship, and the workaround is in a gate rather
-than in the product, so nothing else is protected.
-
 **A scrollbar's grab offset — `TODO(scroll-grab)`.** `ScrollState::offset_at` puts the thumb's
 *centre* under the cursor, so grabbing a thumb near either of its ends makes it jump by up to
 half its length before the drag begins. Every toolkit that avoids this remembers where within

@@ -139,9 +139,6 @@ impl Host for NitroxHost {
         // Resolve every image first: a chain that cannot run at all must not leave half
         // its stages spawned.
         let mut images = Vec::with_capacity(stages.len());
-        // TODO(nxsh-first-byte): the first character typed into a freshly focused *graphical*
-        // terminal reaches this shell — `tty_read` returns it — and is then missing from the
-        // parsed command: `desktop` typed, `esktop` resolved. Serial logins do not show it.
         for s in stages {
             match self.resolve_program(&s.program) {
                 Ok(img) => images.push(img),

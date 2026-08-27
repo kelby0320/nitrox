@@ -18786,14 +18786,25 @@ silent. The command now says what it did on the debug console, and `nxsh` says w
 resolve a program, because "the command did nothing and nothing said why" is not a state a gate
 should be able to reach.
 
-**And under that was a real bug**: `nxsh` **reads** every character typed into a graphical
-terminal and then resolves a program name with the first one missing — `desktop` typed, `esktop`
-looked up. Not input loss; the byte reaches the shell and is consumed inside its own line
-handling. Serial logins never showed it, and `check-terminal` types into `nxterm` under
-`test-harness` where the first keystroke is an `F1` nobody was counting. Filed as
-`TODO(nxsh-first-byte)` and worked around in the gate with a leading bare Enter — deliberately in
-the gate rather than in the product, so that nothing else is protected from it and the next
-consumer trips over it too.
+**And under that was not a bug at all, which took two corrections to establish.** Typing
+`desktop` at the terminal gave the shell `esktop`, and it was filed as a lost first byte in
+`nxsh`. Measuring it moved the diagnosis twice. First: typing the same command three times in one
+session loses **one** character, not three, and injecting an `ESC` between two of them loses a
+**second** — so the loss follows the Escape rather than the terminal or the line. Second, and
+decisive: `ESC` is the **meta prefix**, and `tty_server::Discipline` consuming the byte after a
+bare one is exactly what readline does. `ESC d` is M-d; an unbound pair is discarded rather than
+inserted.
+
+The discipline's own test says so, deliberately — PR #191's review renamed it from
+`a_bare_escape_does_not_eat_the_next_character` to `a_bare_escape_consumes_exactly_two_bytes`
+precisely because the old name promised the opposite of what it asserts. A previous reviewer had
+already adjudicated this question, and the rename is what stopped a second person shipping the
+"fix". **The change was written, ran against that test, and was reverted.**
+
+What actually happens is that this *gate* presses Escape to dismiss the modal and the overview,
+and when no popup is open that Escape reaches whoever holds the keyboard — the terminal. The
+leading bare Enter in `type_at_terminal` is not a workaround for a defect; it is feeding a prefix
+that is going to take a byte. The comment there says so now.
 
 **One ordering lesson, again.** The command's output and the shell's are two processes, and which
 lands first varied between runs. The shell's lines stay ordered `expect`s; the command's are
