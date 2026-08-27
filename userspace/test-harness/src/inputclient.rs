@@ -75,6 +75,17 @@ const STALL_NS: u64 = 1_500_000_000;
 /// was dropped while the ring was full.
 const LATE_CODE: u16 = 46;
 
+/// How long phase 4 refuses to drain the **device** stream, in nanoseconds.
+///
+/// Long enough for the harness to see `input stalled` and inject its burst over QMP.
+const INPUT_STALL_NS: u64 = 2_000_000_000;
+
+/// How long a drain waits with nothing arriving before calling the stream quiet.
+///
+/// Covers `input-server`'s 5 ms flush retry with three orders of magnitude to spare, so a
+/// short answer means the motion is not coming rather than that this gave up early.
+const QUIET_NS: u64 = 500_000_000;
+
 /// The one widget this client builds: a `custom` node filling the window, which is the shape
 /// Milestone 5's terminal grid takes.
 const GRID: u32 = 1;
@@ -177,6 +188,83 @@ impl Stream {
     fn open(root_ns: u64) -> Option<Self> {
         let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
         Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, timed_out: false })
+    }
+
+    /// Drain until nothing has arrived for [`QUIET_NS`], summing the relative motion.
+    ///
+    /// Returns `(dx, dy, announced, widest)` — the sums of `REL_X` and `REL_Y`, the record
+    /// count carried by any `SYN_DROPPED` seen, and the largest single `REL_X` value.
+    ///
+    /// **`widest` is how a consumer can tell that a deferral happened**, and it is the only way
+    /// available to it: recovery is deliberately invisible — the point of carrying motion
+    /// forward is that the stream still adds up — so nothing else distinguishes "the ring
+    /// overran and the server folded the motion" from "the ring never filled". A folded group
+    /// carries the *sum* of the batches it stands for, so it is wider than any delta the harness
+    /// injects. A gate that did not check this would pass on a run that never overran, which is
+    /// exactly how the first version of this guard passed under KVM (PR #246 review, blocking 1).
+    ///
+    /// **Summing rather than listing.** A burst is tens of records and a per-record line would
+    /// bury the transcript; more to the point, the property under test *is* the sum. Relative
+    /// deltas are additive, so what a consumer must end up with is the total the harness
+    /// injected, whatever the batching, coalescing and deferral in between did with it.
+    fn sum_motion(&mut self) -> (i64, i64, u64, i64) {
+        let (mut dx, mut dy, mut announced, mut widest) = (0i64, 0i64, 0u64, 0i64);
+        loop {
+            let deadline = deadline_ns(QUIET_NS);
+            // SAFETY: waiting on this process's own channel handle.
+            let waited = unsafe {
+                WAIT_HANDLES[0] = self.channel;
+                syscall4(
+                    SYS_WAIT,
+                    (&raw const WAIT_HANDLES) as u64,
+                    1,
+                    (&raw mut WAIT_RESULTS) as u64,
+                    deadline,
+                )
+            };
+            if waited != 1 {
+                return (dx, dy, announced, widest); // quiet for long enough
+            }
+            // SAFETY: valid recv out-params on a live endpoint.
+            let rr = unsafe {
+                syscall4(
+                    SYS_CHANNEL_RECV,
+                    self.channel,
+                    (&raw mut self.msg) as u64,
+                    (&raw mut self.handles) as u64,
+                    (&raw mut self.count) as u64,
+                )
+            };
+            if rr == libkern::error::KError::WouldBlock.as_i32() as i64 {
+                continue;
+            }
+            if rr != 0 {
+                return (dx, dy, announced, widest);
+            }
+            let payload_len =
+                u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
+            let req = &self.msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(4096 - PAYLOAD_OFF)];
+            let Ok(m) = librsproto::decode(req) else { return (dx, dy, announced, widest) };
+            if m.op != librsproto::OP_INPUT_EVENTS {
+                continue;
+            }
+            for i in 0..(m.body.len() / EVENT_LEN) {
+                let Some(ev) = InputEvent::read(&m.body[i * EVENT_LEN..(i + 1) * EVENT_LEN]) else {
+                    continue;
+                };
+                match (ev.kind, ev.code) {
+                    (libkern::abi::EV_REL, libkern::abi::REL_X) => {
+                        dx += ev.value as i64;
+                        widest = widest.max((ev.value as i64).abs());
+                    }
+                    (libkern::abi::EV_REL, libkern::abi::REL_Y) => dy += ev.value as i64,
+                    (libkern::abi::EV_SYN, libkern::abi::SYN_DROPPED) => {
+                        announced += ev.value.max(0) as u64;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Block for one `Input::Events` message and print every record it carries.
@@ -524,6 +612,38 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             WindowEvent::Configure { .. } => {}
         }
     }
+
+    // ---- Phase 4: stop draining the *device* stream, and prove no motion is lost ----
+    //
+    // Phase 3 covers the compositor→client direction. This covers server→consumer, which is
+    // where a relative delta can be destroyed rather than delayed: `input-server` cannot send
+    // to a consumer whose ring is full, and a discarded batch of `REL_*` is movement no
+    // consumer can ever re-derive — unlike a key or a button, whose state `SYN_DROPPED` asks it
+    // to resynchronise. That is the drift the whole of PR #246 is about.
+    //
+    // **The stall is this client refusing to read, which is what makes the gate mean the same
+    // thing under every accelerator.** The first version of this guard lived in `check-login`
+    // and overran the ring by injecting faster than the compositor could repaint — true under
+    // TCG and false under KVM, which is the only configuration CI runs (PR #246 review,
+    // blocking 1). A consumer that does not read overruns at any speed.
+    //
+    // Drained to quiet first, so the sum below starts from nothing owed: the phases above
+    // leave whatever they injected queued here, and `input-server` may still be holding motion
+    // deferred from them.
+    let _ = stream.sum_motion();
+    kprint(b"input-testclient: input stalled\n");
+    sleep_ns(notif, INPUT_STALL_NS);
+    let (dx, dy, announced, widest) = stream.sum_motion();
+    Line::new()
+        .s(b"input-testclient: motion sum dx=")
+        .i(dx)
+        .s(b" dy=")
+        .i(dy)
+        .s(b" announced=")
+        .u(announced)
+        .s(b" widest=")
+        .i(widest)
+        .end();
 
     kprint(b"input-testclient: PASSED\n");
     exit(0);

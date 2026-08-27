@@ -205,8 +205,8 @@ impl InputRouter {
 
     /// Route one logical event, appending what to send to `out`.
     ///
-    /// Returns `true` if the stack was restacked — a press raises the window it lands on,
-    /// and the caller has to recompose when that happens.
+    /// The [`Routed`] it returns names the region a restack disturbed — a press raises the window
+    /// it lands on, and the caller has to recompose exactly that much when it does.
     pub fn route(
         &mut self,
         ev: &Logical,

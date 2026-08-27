@@ -1375,6 +1375,81 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 
     session.expect("input-testclient: late key code=46")?;
 
+    // ---- Motion survives a consumer that stops reading ----
+    //
+    // **The guard on the property PR #246 exists to keep**, and the accelerator cannot change
+    // what it means. A relative delta *is* the pointer's position: a batch `input-server`
+    // cannot deliver is movement no consumer can re-derive, unlike a key or a button, whose
+    // state `SYN_DROPPED` asks it to resynchronise. Discarding one leaves every consumer
+    // permanently offset from the device.
+    //
+    // **The overrun is caused by the client, not by the clock.** The first version of this
+    // guard lived in `check-login` and outran the compositor's repaint — which works under TCG
+    // and not under KVM, where the repaint is fast enough that the ring never fills, and
+    // `--kvm` is the only configuration CI runs (PR #246 review, blocking 1). Here the client
+    // announces that it has stopped reading and sleeps; the ring fills at any speed.
+    //
+    // The assertion is arithmetic: relative deltas are additive, so whatever the batching,
+    // coalescing and deferral in between do, the consumer must end up with the total injected.
+    session.expect("input-testclient: input stalled")?;
+    const BURST: i32 = 60;
+    const BDX: i32 = 7;
+    const BDY: i32 = 3;
+    for _ in 0..BURST {
+        qmp.send_motion(BDX, BDY)?;
+    }
+    // The sum, and the evidence that it was worth summing. `REL_Y` comes back with the sign the
+    // harness injected — the PS/2 wire reports positive-Y as up and the driver negates, which
+    // `check-input`'s earlier motion assertion pins.
+    session.expect("input-testclient: motion sum ")?;
+    let line = session.rest_of_line()?;
+    let field = |name: &str| -> Option<i64> {
+        line.split_whitespace()
+            .filter_map(|f| f.split_once('='))
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let (dx, dy) = (field("dx"), field("dy"));
+    let (announced, widest) = (field("announced"), field("widest"));
+    let want = (Some((BURST * BDX) as i64), Some((BURST * BDY) as i64));
+    if (dx, dy) != want {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: {BURST} motions of ({BDX}, {BDY}) injected while the consumer \
+             was not reading summed to {dx:?}, {dy:?} rather than {:?}, {:?}. A relative delta \
+             that does not arrive cannot be recovered — `input-server` must carry the motion of \
+             an undeliverable batch forward and re-emit it, not count it as a `SYN_DROPPED` gap. \
+             The line was: motion sum {line}",
+            want.0, want.1
+        )
+        .into());
+    }
+    if announced != Some(0) {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: a motion-only burst announced {announced:?} lost records. \
+             Nothing here is unrecoverable, so nothing should be announced: motion sum {line}"
+        )
+        .into());
+    }
+    // **The precondition, checked rather than assumed.** Recovery is invisible by design — the
+    // stream still adds up — so a run where the ring never filled satisfies the sum above while
+    // testing nothing. A folded group carries the total of the batches it stands for, so it is
+    // wider than any single injected delta; equal to it means no deferral happened and this gate
+    // proved nothing. That is not a pass.
+    if widest.is_none_or(|w| w <= BDX as i64) {
+        let _ = session.child.kill();
+        return Err(format!(
+            "input gate FAILED: the consumer's widest REL_X was {widest:?}, no more than the \
+             {BDX} injected — so no batch was ever deferred and this gate did not exercise the \
+             path it exists for. Raise BURST until the {}-slot consumer ring overruns, or check \
+             that the client really stopped reading: motion sum {line}",
+            "16"
+        )
+        .into());
+    }
+    println!("  ok: {BURST} motions across a stalled consumer arrived in full (widest fold {widest:?})");
+
     session.expect("input-testclient: PASSED")?;
 
     let transcript = session.finish();
@@ -1935,10 +2010,17 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     leaves the window before the guest's cursor arrives (2026-08-26).
     //
     //     Injected **against a desktop switch**, which is the one repaint that legitimately
-    //     costs the whole screen — ~100 ms under TCG, during which the compositor reads no
-    //     input and the consumer's ring fills. That makes the overrun deterministic rather than
-    //     a matter of luck: the gate does not have to hope the guest is busy, it makes it busy.
-    //     Everything else here paces itself against the guest; this step deliberately does not.
+    //     costs the whole screen — ~100 ms under TCG, during which the compositor reads no input
+    //     and the consumer's ring fills.
+    //
+    //     **Under TCG only, and that is why this is not the guard.** The overrun here depends on
+    //     out-injecting a repaint, and under KVM the repaint is fast enough that 120 QMP-paced
+    //     motions never fill the ring — so this step passes whether or not motion is deferred,
+    //     which is what it did when it *was* the guard (PR #246 review, blocking 1). CI runs
+    //     `--kvm` everywhere. The property is gated in `check-input`, where the stall is a
+    //     consumer that stops reading and therefore means the same thing at any speed; what
+    //     this step still buys is the whole path — a real manager, a real desktop switch, a
+    //     real cursor — on the accelerator a person actually runs locally.
     burst_holds_its_position(&mut qmp, &mut session, &chord)?;
 
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily

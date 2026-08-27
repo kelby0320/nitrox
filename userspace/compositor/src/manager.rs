@@ -34,9 +34,17 @@ pub enum MgrOutcome {
     /// Applied. `dirty` is the region to repaint, in screen coordinates.
     ///
     /// **`None` means "everything"** — the same convention `server::Outcome` uses, and the answer
-    /// anything that cannot name its region must give. A restack is the case that needs it: which
-    /// pixels change depends on every overlap in the stack, and computing that exactly would be a
-    /// second compositor.
+    /// anything that cannot name its region must give. Since 2026-08-26 the only request that
+    /// gives it is `SetCurrentDesktop`, where it is the literal truth: every window on screen is
+    /// replaced by a different set.
+    ///
+    /// **A restack is no longer one of them**, and this doc said it was: "which pixels change
+    /// depends on every overlap in the stack" is true of *which* of them change and irrelevant to
+    /// *where* they are — reordering one window leaves every other pair in the same relative
+    /// order, so the change is confined to that window's own rectangle. The argument, and the
+    /// test that pins it by comparing against a full recompose, are on
+    /// [`WindowStack::raise`](crate::WindowStack::raise). A full recompose is ~100 ms under
+    /// emulation with no input read during it, which is what that cost bought.
     Applied {
         /// The window the request named, or `None` for a request that names none.
         ///

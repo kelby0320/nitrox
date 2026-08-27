@@ -931,10 +931,19 @@ own queue overflowing, so the client-side vocabulary exists; what is missing is 
 Trigger: the first observed outbox overflow that is not a deliberately wedged test client, or
 the toolkit (M4) needing to resynchronise held-key state after one. Raised 2026-08-10.
 
-**The `4` in the other resource servers** (`auth-service`, `fs-server-ext4`, `hello`,
-`input-server`) is left alone deliberately: those channels carry request/reply traffic, where
-the sender is waiting for an answer and cannot outrun the receiver. They are undersized
-rather than wrong. Trigger: any of them growing a server-initiated push stream.
+**The `4` in the other resource servers** (`auth-service`, `fs-server-ext4`, `hello`) is left
+alone deliberately: those channels carry request/reply traffic, where the sender is waiting for
+an answer and cannot outrun the receiver. They are undersized rather than wrong. Trigger: any of
+them growing a server-initiated push stream.
+
+**`input-server` left that list on 2026-08-26, by the trigger this entry named.** Its consumer
+channels *are* a server-initiated push stream — that was true when this was written and the
+entry did not notice — and they are **16** now (`CONSUMER_QUEUE_DEPTH`); only its control
+channel, which is request/reply, is still 4. The depth is not what made input safe, and the
+distinction matters for anyone reading this to size a channel: **motion is deferred rather than
+dropped**, so the cursor is correct at any depth, and the sixteen buys the *other* half — a key
+or a button in an overflowing batch is unrecoverable, and at 4 a real click went missing under a
+full-screen repaint. See `rsproto-input-ops.md` § Loss and the decision log for that day.
 
 ~~**`KeyEvent` and `PointerEvent` do not say which window they are for.**~~ — **done 2026-08-20,
 M6 C3.** Both records carry a `window` at offset 0, as `Release`, `FocusEvent` and `Configure`

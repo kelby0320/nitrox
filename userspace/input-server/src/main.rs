@@ -81,6 +81,15 @@ const CONSUMER_QUEUE_DEPTH: u64 = 16;
 /// Messages the control ring holds. Requests here are rare and answered immediately.
 const CONTROL_QUEUE_DEPTH: u64 = 4;
 
+/// How many overruns to report before going quiet.
+///
+/// A bound rather than a rate limit: the interesting fact is *that* a consumer overran, and a
+/// consumer that has stopped reading for good would otherwise print one of these every 5 ms.
+const MAX_LOGGED_OVERRUNS: u32 = 16;
+
+/// How many overruns have been reported. See [`MAX_LOGGED_OVERRUNS`].
+static mut OVERRUNS_LOGGED: u32 = 0;
+
 /// How long to wait before retrying a consumer that is holding deferred motion.
 ///
 /// Short enough that a person cannot see the catch-up, long enough that a stalled consumer costs
@@ -92,15 +101,24 @@ const FLUSH_INTERVAL_NS: u64 = 5_000_000;
 /// Scratch for [`now_ns`].
 static mut CLOCK_BUF: u64 = 0;
 
-/// The monotonic clock, in nanoseconds.
+/// The monotonic clock in nanoseconds, or `None` if the read failed.
 ///
 /// Only the flush path needs this: every event the devices produce already carries the time its
 /// interrupt fired.
-fn now_ns() -> u64 {
+///
+/// **The return is checked, and the second `SAFETY` used to assert what it did not check.**
+/// `CLOCK_MONOTONIC` with a valid out-pointer cannot fail today, so this is defensive — but the
+/// failure it defends against is not benign: `CLOCK_BUF` would keep a stale value, the flush
+/// deadline would land in the past on every iteration, and the 5 ms retry would become a spin
+/// (PR #246 review, optional 9). Callers turn `None` into "wait indefinitely" instead.
+fn now_ns() -> Option<u64> {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: on success the kernel wrote the ns count.
-    unsafe { (&raw const CLOCK_BUF).read() }
+    let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    if r != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so the kernel wrote the ns count.
+    Some(unsafe { (&raw const CLOCK_BUF).read() })
 }
 
 static mut CTRL_OUT0: u64 = 0;
@@ -453,6 +471,18 @@ fn open_consumer(serve_end: u64, request_id: u64, srv: &mut Server) {
     }
 }
 
+/// Whether any **live** consumer is owed a send.
+///
+/// **Live, which is the whole of the fix.** `forward` skips a slot whose channel is zero, so a
+/// debt recorded against a consumer that then disconnected can never be cleared — and the two
+/// callers of this decide whether to arm a 5 ms retry. Scanning `consumers` alone made a
+/// graphical session that ended mid-debt into a permanent 200 Hz wakeup loop for the rest of the
+/// boot, doing nothing on each pass (PR #246 review, finding 2). The reap also clears the debt;
+/// this makes the question un-askable wrongly rather than merely answered right once.
+fn owes_send(srv: &Server) -> bool {
+    (0..MAX_CONSUMERS).any(|i| srv.channels[i] != 0 && srv.consumers[i].owes_send())
+}
+
 /// Forward one merged batch to every consumer.
 ///
 /// A send that fails is **not** retried here and now: the records are handed back to the
@@ -478,7 +508,28 @@ fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
             // **What was framed, not the batch it came from.** `frame` clears both debts as it
             // writes them, so handing back the batch would forget the marker and the recovered
             // motion that had just been prepended to it.
-            Some(n) => srv.consumers[i].defer(&framed[..n]),
+            Some(n) => {
+                // **Said out loud, bounded.** An overrun is invisible from outside — the whole
+                // point of deferral is that the consumer cannot tell — so a gate asserting that
+                // motion survived one has no way to know an overrun happened, and would pass
+                // just as well against a run where the ring never filled. That is exactly how
+                // the first version of this guard passed under KVM (PR #246 review, blocking 1).
+                // This line is its precondition.
+                // SAFETY: single-threaded server; the counter is touched only from this loop.
+                unsafe {
+                    if OVERRUNS_LOGGED < MAX_LOGGED_OVERRUNS {
+                        OVERRUNS_LOGGED += 1;
+                        libkern::debug::Line::new()
+                            .s(b"input-server: consumer ")
+                            .u(i as u64)
+                            .s(b" overran; ")
+                            .u(n as u64)
+                            .s(b" records deferred")
+                            .end();
+                    }
+                }
+                srv.consumers[i].defer(&framed[..n])
+            }
             // It did not fit, so nothing was cleared and the batch itself is the whole debt.
             None => srv.consumers[i].defer(batch),
         }
@@ -569,10 +620,11 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             // holding movement the user already made; waiting indefinitely would hold it until
             // the next event, so the cursor would stop short and then jump when the mouse was
             // next touched. With nothing owed this is still an indefinite sleep, not a poll.
-            let deadline = if srv.consumers.iter().any(Consumer::owes_send) {
-                now_ns().saturating_add(FLUSH_INTERVAL_NS)
-            } else {
-                u64::MAX
+            // A clock that will not answer means no deadline rather than one in the past: an
+            // expired deadline is a spin, and waiting for the next event is a delay.
+            let deadline = match owes_send(srv).then(now_ns).flatten() {
+                Some(t) => t.saturating_add(FLUSH_INTERVAL_NS),
+                None => u64::MAX,
             };
             syscall4(
                 SYS_WAIT,
@@ -587,7 +639,10 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             // when a consumer owes deferred motion, so waking with no handle ready means it is
             // time to try that consumer again.
             if waited == KError::TimedOut.as_i32() as i64 {
-                forward(srv, &[], now_ns());
+                // The stamp only reaches records this server synthesises — a loss marker and a
+                // recovered motion group — and nothing reads it today, so a clock that will not
+                // answer costs a zero rather than a dropped flush.
+                forward(srv, &[], now_ns().unwrap_or(0));
                 continue;
             }
             // Otherwise the error path — retrying it silently spins the loop at 100% with
@@ -644,6 +699,10 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                     // SAFETY: closing our end of a channel whose peer is gone.
                     unsafe { syscall4(SYS_HANDLE_CLOSE, srv.channels[slot], 0, 0, 0) };
                     srv.channels[slot] = 0;
+                    // **And what it was owed goes with it.** A debt outlives its consumer
+                    // otherwise: nothing can deliver it, and `owes_send` would keep arming the
+                    // flush deadline over it forever.
+                    srv.consumers[slot] = Consumer::new();
                 } else if rr == 0 {
                     // A message from a consumer. This category has no consumer→server op
                     // yet, so drain and ignore rather than guess — but say so, because a
@@ -658,13 +717,21 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             if n > 0 {
                 // The stamp on the loss marker and on recovered motion only: every real event
                 // already carries the time its interrupt fired, which is the point of `time_ns`.
-                let now = batch[n - 1].time_ns;
-                forward(srv, &batch[..n], now);
+                //
+                // **The batch's *first* timestamp, because both are written in front of it.**
+                // Stamping them with the last one made `time_ns` run backwards inside a single
+                // framed message, and `rsproto-input-ops.md` § Ordering invites a consumer to
+                // sort by it for a total order — which would move the recovered motion after the
+                // batch, the one placement `frame` documents as wrong. Nothing reads `time_ns`
+                // today; that is a reason to fix it cheaply, not to leave it (PR #246 review,
+                // optional 8).
+                let stamp = batch[0].time_ns;
+                forward(srv, &batch[..n], stamp);
             }
-        } else if srv.consumers.iter().any(Consumer::owes_send) {
+        } else if owes_send(srv) {
             // Woken by something else — a resolve, a consumer's message — with motion still
             // owed. Sending it now costs one message and saves a whole flush interval.
-            forward(srv, &[], now_ns());
+            forward(srv, &[], now_ns().unwrap_or(0));
         }
         if forward_pending && !serve_forward(serve_end, srv) {
             kprint(b"input-server: forwarding endpoint closed\n");

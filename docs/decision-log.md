@@ -19040,3 +19040,45 @@ a `click_at` somewhere inert: first the thumbnail (while a pick-up-and-abandon c
 then the background (while that did nothing either). Both became live in the same day. It now
 starts the drag from the position the *indicator* click already verified — opening the overview
 does not move the pointer — which is one fewer injected click and no inert place required.
+
+### PR #246 review — a guard that could not fail where CI runs it
+
+**The burst gate was accelerator-dependent, and CI is `--kvm` everywhere.** `check-login`
+overran the consumer's ring by injecting faster than the compositor could repaint the screen.
+That works under TCG, where a full recompose is ~100 ms; under KVM the repaint is fast enough
+that 120 QMP-paced motions never fill a 16-deep ring, so the gate passed with the deferral
+reverted — demonstrated by the reviewer, who ran the same tree both ways and got PASS then FAIL.
+Every CI job would have stayed green while the drift came back.
+
+**The fix is to stop making the guest busy and make the consumer stop reading.** `input-testclient`
+gains a phase that announces it has stopped draining `/dev/input/new` and sleeps; the harness
+injects a burst; the client then drains and reports the *sums* of `REL_X`/`REL_Y`. A ring fills
+at any speed when nobody is emptying it, so the gate now means the same thing under both
+accelerators — verified by running it under each, and by reverting the deferral and watching it
+fail identically under each.
+
+Summing is the right assertion for the same reason deferral is the right fix: relative deltas are
+additive, so whatever the batching, coalescing and folding in between did with them, the consumer
+must end up with the total that was injected.
+
+**And the gate checks its own precondition, which is the part that was missing twice before.**
+Recovery is invisible to a consumer by design — the stream still adds up — so a run where the
+ring never filled satisfies the sum while testing nothing. A folded group carries the total of
+the batches it stands for, so it is *wider* than any single injected delta: the client reports
+the widest `REL_X` it saw, and a value no larger than what was injected fails the gate with "this
+proved nothing" rather than passing. That is the third version of this guard; the first two
+passed against the bug they exist to catch.
+
+`input-server` also says when a consumer overran, bounded at sixteen lines a boot. It cannot be a
+gate's precondition — the earlier phases spend the budget — but it is what a person reads when a
+session feels wrong.
+
+**Four smaller corrections.** A consumer that disconnected mid-debt left `input-server` waking
+every 5 ms forever, because the flush scan looked at `consumers` without consulting `channels`;
+the scan is now a predicate that consults both, and the reap clears the debt. `MgrOutcome`'s own
+doc still argued that a restack cannot name its region — the reasoning this PR overturned, left
+in the one place a reader looks first. `deferred-decisions.md` still listed `input-server` among
+the servers deliberately left at depth 4, by a trigger ("a server-initiated push stream") that
+its consumer channels had already met. And recovered motion was stamped with the *newest*
+timestamp in the batch it was prepended to, so `time_ns` ran backwards inside one message —
+harmless today because nothing reads it, and the spec's Ordering section invites someone to.

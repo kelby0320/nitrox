@@ -199,8 +199,9 @@ impl Consumer {
     /// caller must not send a partial batch, because a truncated group is exactly what the
     /// protocol promises never to deliver.
     ///
-    /// Clears the owed announcement, so the caller must treat a failed send as a fresh loss
-    /// (that is what `record_loss` is for).
+    /// **Clears both debts as it writes them**, so a caller whose send then fails must hand the
+    /// framed records back to [`defer`](Self::defer) — not the batch they came from, which no
+    /// longer carries the marker and the recovered motion prepended to it here.
     pub fn frame(&mut self, batch: &[InputEvent], now_ns: u64, out: &mut [InputEvent]) -> Option<usize> {
         let moved = self.pending.iter().filter(|&&v| v != 0).count();
         let extra = usize::from(self.lost > 0) + if moved > 0 { moved + 1 } else { 0 };
@@ -223,9 +224,16 @@ impl Consumer {
         // motion placed in front of the marker would be reset away; motion placed after the
         // batch would arrive out of order with movement that came later.
         //
-        // Stamped `now_ns` rather than with the time it was first seen: the batch it belongs to
-        // is gone, and a timestamp older than records already delivered would break the ordering
-        // the merge exists to provide. What it carries is the movement, not when it happened.
+        // Stamped with `now_ns` rather than with the time it was first seen: the batch it
+        // belonged to is gone, and a timestamp older than records already delivered would break
+        // the ordering the merge exists to provide. What it carries is the movement, not when it
+        // happened.
+        //
+        // **The caller passes the *oldest* timestamp in the batch being framed**, not the
+        // newest, so that these prepended records do not carry a time later than the records
+        // they precede. `rsproto-input-ops.md` § Ordering invites a consumer to sort by
+        // `time_ns`, and a sort that moved the recovered motion after the batch would undo the
+        // placement this comment is about (PR #246 review, optional 8).
         if moved > 0 {
             for (i, &code) in DEFERRED_AXES.iter().enumerate() {
                 if self.pending[i] != 0 {

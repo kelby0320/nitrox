@@ -1870,9 +1870,10 @@ mod tests {
 
     #[test]
     fn presenting_draws_the_pointer_into_every_damage_rectangle() {
-        // `repaint_cursor_move` passes the old and new cursor rectangles; a `present_into`
-        // that drew into only the first would leave the pointer erased at its destination
-        // whenever the two rectangles do not overlap.
+        // `serve_input` passes the cursor's old and new rectangles in one damage list — with
+        // whatever a restack disturbed alongside them — and a `present_into` that drew into only
+        // the first would leave the pointer erased at its destination whenever the two
+        // rectangles do not overlap.
         let s = WindowStack::new();
         let src = MapSource::default();
         let pointer = Point::new(40, 40);
