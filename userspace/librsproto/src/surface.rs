@@ -852,6 +852,28 @@ pub const OP_MGR_SET_MINIMIZED: u16 = 0x0917;
 /// manager request — handing a client another window's pixels is the leak per-application
 /// namespaces exist to prevent.
 pub const OP_MGR_CAPTURE: u16 = 0x0920;
+
+/// `Manage::QueryLayout` — the screen, and the work area every panel's strut leaves.
+///
+/// Empty request body; the reply is a [`MgrLayout`]. **The first thing a manager needs that it
+/// cannot compute**: struts are declared by every `panel`, and only the compositor sees them all.
+/// `Place`'s own note has always said "a manager computes positions from the work area", which
+/// was not something it could do until this existed (M9 Part B).
+pub const OP_MGR_QUERY_LAYOUT: u16 = 0x0921;
+
+/// `Manage::LayoutChanged` — a manager event: the work area is not what it was.
+///
+/// Body: [`MgrLayout`]. Sent when a strut appears, disappears or moves — a panel created,
+/// destroyed, resized or re-placed. A manager that maximised a window against the old numbers
+/// would be leaving it under a panel, and nothing else would report it.
+pub const OP_MGR_LAYOUT_CHANGED: u16 = 0x0922;
+
+/// `Manage::WindowStateRequest` — a manager event: a client asked to be minimised or maximised.
+///
+/// Body: [`WindowState`]. The client's [`RequestState`](OP_REQUEST_STATE), forwarded. **The
+/// manager decides**; the compositor neither applies it nor remembers it, because a window being
+/// maximised is a rectangle the manager restores from and a second copy here could disagree.
+pub const OP_MGR_WINDOW_STATE_REQUEST: u16 = 0x0923;
 /// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
 ///
 /// A manager request rather than a client one because any application able to register `Super`
@@ -942,6 +964,28 @@ pub const OP_SET_TITLE: u16 = 0x0909;
 /// "the user is dragging me" true, and without the check a client could move its window while
 /// nobody was touching it.
 pub const OP_START_MOVE: u16 = 0x090A;
+
+/// `Surface::RequestState` — ask to be minimised, maximised, or returned to normal.
+///
+/// **A client cannot do any of these itself, and must not be able to.** Minimising is
+/// `Manage::SetMinimized` and maximising is `Manage::Configure` to a rectangle computed from the
+/// work area; both are manager operations, and a client holding either could put another
+/// client's window away or place itself. So this asks, the compositor forwards it to the manager
+/// as [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST), and the manager answers with the
+/// request it would have sent anyway — the same shape as a resource server asking a supervisor
+/// to bind it (M9 Part B).
+///
+/// The reply says the compositor accepted and forwarded it, **not** that anything happened: what
+/// a manager does with it is the manager's, and a shell that decided a window may not be
+/// maximised is behaving correctly.
+pub const OP_REQUEST_STATE: u16 = 0x090B;
+
+/// [`RequestState`](OP_REQUEST_STATE): the window is neither minimised nor maximised.
+pub const WINDOW_STATE_NORMAL: u32 = 0;
+/// [`RequestState`](OP_REQUEST_STATE): put the window away, off screen but in the window list.
+pub const WINDOW_STATE_MINIMIZED: u32 = 1;
+/// [`RequestState`](OP_REQUEST_STATE): fill the work area.
+pub const WINDOW_STATE_MAXIMIZED: u32 = 2;
 
 /// The longest window title accepted, in bytes.
 ///
@@ -1097,6 +1141,90 @@ impl MgrDesktop {
             return None;
         }
         Some(Self { desktop: get_u32(b, 0) })
+    }
+}
+
+/// A window and a state it is asked to be in — [`RequestState`](OP_REQUEST_STATE), and the
+/// [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST) event that forwards it.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WindowState {
+    /// Which window.
+    pub window: u32,
+    /// One of [`WINDOW_STATE_NORMAL`], [`WINDOW_STATE_MINIMIZED`], [`WINDOW_STATE_MAXIMIZED`].
+    pub state: u32,
+}
+
+impl WindowState {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 8 {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.state);
+        Some(8)
+    }
+
+    /// Parse from the first 8 bytes of a body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(Self { window: get_u32(b, 0), state: get_u32(b, 4) })
+    }
+}
+
+/// The screen, and the part of it a maximised window may have — [`QueryLayout`](OP_MGR_QUERY_LAYOUT).
+///
+/// **The work area is not derivable by the manager.** Every `panel` reserves an edge, and the
+/// compositor is what knows all of them: a shell that subtracted only its *own* bars would put a
+/// maximised window under any other panel-role client, with nothing able to notice.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrLayout {
+    /// Screen width in pixels.
+    pub screen_w: u32,
+    /// Screen height in pixels.
+    pub screen_h: u32,
+    /// Work area origin — left.
+    pub work_x: i32,
+    /// Work area origin — top.
+    pub work_y: i32,
+    /// Work area width.
+    pub work_w: u32,
+    /// Work area height.
+    pub work_h: u32,
+}
+
+impl MgrLayout {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 24 {
+            return None;
+        }
+        put_u32(out, 0, self.screen_w);
+        put_u32(out, 4, self.screen_h);
+        put_u32(out, 8, self.work_x as u32);
+        put_u32(out, 12, self.work_y as u32);
+        put_u32(out, 16, self.work_w);
+        put_u32(out, 20, self.work_h);
+        Some(24)
+    }
+
+    /// Parse from the first 24 bytes of a body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 24 {
+            return None;
+        }
+        Some(Self {
+            screen_w: get_u32(b, 0),
+            screen_h: get_u32(b, 4),
+            work_x: get_u32(b, 8) as i32,
+            work_y: get_u32(b, 12) as i32,
+            work_w: get_u32(b, 16),
+            work_h: get_u32(b, 20),
+        })
     }
 }
 

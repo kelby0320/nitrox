@@ -75,7 +75,8 @@ const HOTKEY_MOVE_BASE: u32 = 20;
 /// `EV_KEY` code for `1`. `2`, `3` and `4` follow it.
 const KEY_1: u16 = 2;
 use librsproto::surface::{
-    CreateWindowRequest, Edge, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
+    CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role,
+    STICKY_DESKTOP,
 };
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
@@ -160,6 +161,12 @@ struct WinEntry {
     focused: bool,
     /// Whether the shell has minimized it.
     minimized: bool,
+    /// Where the window is, kept current by `WindowGeometry`.
+    ///
+    /// **Needed because a maximised window has to come back.** The rectangle it returns to is
+    /// the shell's to remember — the compositor keeps no `maximized` flag, deliberately — and
+    /// "where it was" is a position as well as a size.
+    origin: (i32, i32),
     /// The window's committed size, from `WindowCreated` and kept current by `WindowGeometry`.
     ///
     /// **Needed because a capture may not scale up.** A thumbnail is a fixed size in the
@@ -1292,6 +1299,31 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             None
         }
     };
+    // **The work area, from the compositor rather than from arithmetic here.** The shell's own
+    // two bars are not the only struts a session can have — any `panel`-role client declares
+    // one — and a maximised window computed from `SCREEN_H - BAR_H * 2` would sit under the next
+    // one with nothing able to notice. Kept current by `LayoutChanged` below (M9 Part B).
+    let mut layout = manager.as_mut().and_then(query_layout).unwrap_or(default_layout());
+    Line::new()
+        .s(b"desktop-shell: work area ")
+        .i(layout.work_x as i64)
+        .s(b",")
+        .i(layout.work_y as i64)
+        .s(b" ")
+        .u(layout.work_w as u64)
+        .s(b"x")
+        .u(layout.work_h as u64)
+        .s(b" of ")
+        .u(layout.screen_w as u64)
+        .s(b"x")
+        .u(layout.screen_h as u64)
+        .end();
+    /// Where a maximised window came from, so restoring it has somewhere to go.
+    ///
+    /// **The shell's, not the compositor's.** A `maximized` flag there would be a second source
+    /// of truth about a rectangle, and the rectangle a window returns to is a decision — this is
+    /// the process that made it.
+    let mut restore: alloc::vec::Vec<(u32, (i32, i32, u32, u32))> = alloc::vec::Vec::new();
     let mut next_origin = BAR_H as i32;
 
     // Registered on the first pass of the loop, once the manager channel is known to exist.
@@ -1436,14 +1468,80 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // that true if a future shell window is `normal`.
             let ours = [window, bottom.unwrap_or(0), modal.unwrap_or(0)];
             let mut fired = alloc::vec::Vec::new();
+            let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
+                alloc::vec::Vec::new();
             list_dirty |= place_new_windows(
                 m,
                 &mut next_origin,
                 &mut entries,
                 &ours,
                 &mut fired,
+                &mut layout,
+                &mut states,
                 current_desktop,
             );
+            // **What a client asked to be, decided here.** The compositor forwarded the
+            // question and applied nothing: minimising is a manager request and maximising is a
+            // `Configure` to a rectangle only this process can compute, because only this
+            // process knows what a maximised window should return to.
+            for s in states {
+                use librsproto::surface::{
+                    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
+                };
+                let Some(e) = entries.iter_mut().find(|e| e.id == s.window) else { continue };
+                match s.state {
+                    WINDOW_STATE_MINIMIZED => {
+                        if minimize_window(m, e) {
+                            sent_request = true;
+                            list_dirty = true;
+                            Line::new()
+                                .s(b"desktop-shell: client asked to minimize window ")
+                                .u(s.window as u64)
+                                .end();
+                        }
+                    }
+                    WINDOW_STATE_MAXIMIZED => {
+                        // Remembered before it moves, and only the first time: maximising an
+                        // already-maximised window must not overwrite where it came from with
+                        // the work area itself, which is a restore that does nothing.
+                        if !restore.iter().any(|(id, _)| *id == s.window) {
+                            restore.push((
+                                s.window,
+                                (e.origin.0, e.origin.1, e.size.0, e.size.1),
+                            ));
+                        }
+                        sent_request = true;
+                        // **What was asked for, not what happened.** A `Configure` is a request
+                        // the client may decline — `nxterm` declines every one until M9 Part D —
+                        // so the line `configure_window` prints is the shell's decision, and the
+                        // window's own geometry event is what says whether it took it.
+                        configure_window(
+                            m,
+                            s.window,
+                            layout.work_x,
+                            layout.work_y,
+                            layout.work_w,
+                            layout.work_h,
+                            b"maximize",
+                        );
+                    }
+                    WINDOW_STATE_NORMAL => {
+                        if e.minimized {
+                            if raise_window(m, e) {
+                                sent_request = true;
+                                list_dirty = true;
+                            }
+                        }
+                        if let Some(i) = restore.iter().position(|(id, _)| *id == s.window) {
+                            let (_, (x, y, w, h)) = restore.remove(i);
+                            sent_request = true;
+                            configure_window(m, s.window, x, y, w, h, b"restore");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // A window arriving or leaving can empty or fill a desktop, so the rule is
             // reconsidered after every drain rather than only where a desktop is switched.
             list_dirty |= normalize_desktops(
@@ -2072,6 +2170,75 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 present_modal(&mut session, id, &font, &query, &rows, &modal_addrs);
             }
         }
+    }
+}
+
+/// Ask a window's client to adopt a geometry — `Manage::Configure`.
+///
+/// **A request, and the reply says only that the compositor forwarded it.** Whether the client
+/// adopts the size is the client's: declining is legal and stays legal, and a window that
+/// declines simply goes on committing what it has.
+fn configure_window(
+    mgr: &mut ChannelTransport,
+    window: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    why: &[u8],
+) {
+    use librsproto::surface::{ConfigureEvent, OP_MGR_CONFIGURE};
+    let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
+    let ev = ConfigureEvent { window, width: w, height: h, x, y };
+    if ev.write(&mut body).is_none() {
+        kprint(b"desktop-shell: a Configure body would not serialise\n");
+        return;
+    }
+    // **Logged from the request's own arguments, inside the function that sends it.** The first
+    // version logged the rectangle the *caller* had computed, beside the call — and a control
+    // that changed what was sent while leaving the log alone passed the gate, which is the
+    // defect PR #238's review found in a different assertion. One value, read once, by the code
+    // that puts it on the wire.
+    Line::new()
+        .s(b"desktop-shell: ")
+        .s(why)
+        .s(b" window ")
+        .u(window as u64)
+        .s(b" to ")
+        .i(x as i64)
+        .s(b",")
+        .i(y as i64)
+        .s(b" ")
+        .u(w as u64)
+        .s(b"x")
+        .u(h as u64)
+        .end();
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_CONFIGURE, &body, None, &mut reply).is_err() {
+        Line::new().s(b"desktop-shell: Configure refused for window ").u(window as u64).end();
+    }
+}
+
+/// Ask the compositor for the screen and the work area.
+fn query_layout(mgr: &mut ChannelTransport) -> Option<MgrLayout> {
+    let mut reply = [0u8; 64];
+    let n = mgr.request(OP_MGR_QUERY_LAYOUT, &[], None, &mut reply).ok()??;
+    MgrLayout::read(&reply[..n])
+}
+
+/// What to assume when the compositor cannot be asked.
+///
+/// **A shell with no manager channel draws bars and launches things** — see where the channel is
+/// taken — so it still needs numbers, and these are the ones it used everywhere before there was
+/// an op to ask with. Named rather than inlined so the fallback is visible as a fallback.
+fn default_layout() -> MgrLayout {
+    MgrLayout {
+        screen_w: SCREEN_W,
+        screen_h: SCREEN_H as u32,
+        work_x: 0,
+        work_y: BAR_H as i32,
+        work_w: SCREEN_W,
+        work_h: (SCREEN_H as u32).saturating_sub(BAR_H * 2),
     }
 }
 
@@ -2820,12 +2987,15 @@ fn place_new_windows(
     entries: &mut alloc::vec::Vec<WinEntry>,
     ours: &[u32],
     fired: &mut alloc::vec::Vec<u32>,
+    layout: &mut MgrLayout,
+    states: &mut alloc::vec::Vec<librsproto::surface::WindowState>,
     current: u32,
 ) -> bool {
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
-        OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS,
-        OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
+        OP_MGR_LAYOUT_CHANGED, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
+        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_STATE_REQUEST,
+        OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
     };
     let mut dirty = false;
     // **Four bytes more than `MAX_TITLE`, which is what a title record actually is.** A
@@ -2846,6 +3016,35 @@ fn place_new_windows(
                     let before = entries.len();
                     entries.retain(|e| e.id != r.window);
                     dirty |= entries.len() != before;
+                }
+                continue;
+            }
+            OP_MGR_LAYOUT_CHANGED => {
+                // A strut appeared, went away or moved. Nothing is re-laid out here: what this
+                // changes is where the *next* maximise puts a window, and a shell that resized
+                // every maximised window under the user would be making a decision the user did
+                // not ask for.
+                if let Some(l) = MgrLayout::read(&buf[..n]) {
+                    *layout = l;
+                    Line::new()
+                        .s(b"desktop-shell: work area now ")
+                        .i(l.work_x as i64)
+                        .s(b",")
+                        .i(l.work_y as i64)
+                        .s(b" ")
+                        .u(l.work_w as u64)
+                        .s(b"x")
+                        .u(l.work_h as u64)
+                        .end();
+                }
+                continue;
+            }
+            OP_MGR_WINDOW_STATE_REQUEST => {
+                // **Collected, not acted on here**, the way a hotkey is: acting means sending
+                // manager requests and remembering a rectangle to restore to, and both belong
+                // where the shell's own state lives rather than inside a drain.
+                if let Some(s) = librsproto::surface::WindowState::read(&buf[..n]) {
+                    states.push(s);
                 }
                 continue;
             }
@@ -2871,6 +3070,7 @@ fn place_new_windows(
                     && let Some(e) = entries.iter_mut().find(|e| e.id == g.window)
                 {
                     e.size = (g.width, g.height);
+                    e.origin = (g.x, g.y);
                     // **Where it ended up, said once per move and no more than sixteen times.**
                     // A user-dragged window reports exactly one geometry event for the whole
                     // gesture — the compositor does not log one per motion, because that queue
@@ -2950,6 +3150,8 @@ fn place_new_windows(
             title: alloc::string::String::new(),
             focused: false,
             minimized: false,
+            // Placed below, and reported back by the geometry event that placement produces.
+            origin: (0, 0),
             size: (created.width, created.height),
             // The compositor creates a window onto *its* current desktop, and the shell is what
             // set that — so this is not a guess, it is the same number read from the other side.

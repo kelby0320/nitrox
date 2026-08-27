@@ -715,6 +715,30 @@ impl<T: Transport> WindowRef<'_, T> {
         Ok(())
     }
 
+    /// Ask the manager to minimise, maximise or restore this window — `Surface::RequestState`.
+    ///
+    /// **An ask, not a change.** A client cannot minimise or maximise itself: both are manager
+    /// operations, and one a client could reach would let it put another window away or place
+    /// itself. The compositor forwards this to whoever holds the manager channel, and what
+    /// happens next is that manager's decision — a shell may refuse, and a window that is not
+    /// resizable will decline the `Configure` that arrives anyway.
+    ///
+    /// Repeating the state last asked for produces no manager event, so a button held down or a
+    /// view rebuilt every frame costs nothing.
+    pub fn request_state(&mut self, state: u32) -> Result<(), UiError> {
+        let mut body = [0u8; 8];
+        let n = librsproto::surface::WindowState { window: self.id(), state }
+            .write(&mut body)
+            .ok_or(UiError::Malformed)?;
+        self.session.transport.request(
+            librsproto::surface::OP_REQUEST_STATE,
+            &body[..n],
+            None,
+            &mut [],
+        )?;
+        Ok(())
+    }
+
     /// Destroy the window, and forget every descendant the compositor destroys with it.
     ///
     /// **Transitively**, because that is what the compositor does: a popup goes with its parent

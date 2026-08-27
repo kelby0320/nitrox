@@ -394,6 +394,16 @@ pub enum MgrEvent {
         /// Whether it now has the keyboard.
         focused: bool,
     },
+    /// The work area changed — a panel's strut appeared, went away or moved.
+    LayoutChanged(librsproto::surface::MgrLayout),
+    /// A client asked to be minimised, maximised or restored.
+    ///
+    /// **The one manager event a client's own rate drives**, which is why the compositor drops a
+    /// request for the state a window was last asked to be in: this queue does not coalesce and
+    /// discards its oldest, so an unprivileged client in a loop would otherwise push a
+    /// `Created` off the front of the manager's view of the world. The same argument `SetTitle`
+    /// already makes for unchanged titles (M9 Part B).
+    StateRequest(librsproto::surface::WindowState),
 }
 
 /// How many manager events queue before the oldest are discarded.

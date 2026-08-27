@@ -149,6 +149,13 @@ pub struct Window {
     /// window is still *on* its desktop: it restores there and it belongs in that desktop's
     /// window list. Folding the two would make restoring a guess about where it came from.
     pub minimized: bool,
+    /// The last state this window's client asked the manager for.
+    ///
+    /// **Only to tell a repeat from a change.** The compositor does not act on a state request
+    /// and does not know whether a window is maximised — that is a rectangle the manager
+    /// restores from, and a second copy here could disagree with it. What it does know is what
+    /// was last *asked*, which is enough to keep a looping client off a bounded queue.
+    pub state_requested: Option<u32>,
 }
 
 impl Window {
@@ -543,6 +550,7 @@ impl WindowStack {
             // but-is-unassigned moment for anything to have to render.
             desktop: self.current_desktop,
             minimized: false,
+            state_requested: None,
         });
         Ok(id)
     }
@@ -671,6 +679,21 @@ impl WindowStack {
         {
             self.geometry_log.push(id);
         }
+    }
+
+    /// Record a state request, and report whether it differs from the last one.
+    ///
+    /// `false` for a window that does not exist — there is nobody to tell about it — and for a
+    /// repeat of the state last asked for.
+    pub fn note_state_request(&mut self, id: u32, state: u32) -> bool {
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        if w.state_requested == Some(state) {
+            return false;
+        }
+        w.state_requested = Some(state);
+        true
     }
 
     /// Move a window the user is dragging, without logging a geometry change.
@@ -1376,6 +1399,40 @@ mod tests {
         let (mut s, _src, (bottom, _top)) = overlapping_pair();
         let want = s.window(bottom).expect("in the stack").bounds();
         assert_eq!(s.raise(bottom).expect("in the stack").rect(), want);
+    }
+
+    #[test]
+    fn a_repeated_state_request_is_not_a_second_event() {
+        // **The bound this event needs.** It is the only manager event a client's own rate
+        // drives, and the manager's queue does not coalesce and discards its oldest — so a
+        // client looping on one state would push a `WindowCreated` off the front of a shell's
+        // view of the world. `SetTitle` makes the same argument for an unchanged title.
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert!(s.note_state_request(w, 2), "the first ask is news");
+        assert!(!s.note_state_request(w, 2), "the same ask again is not");
+        assert!(s.note_state_request(w, 0), "and a different one is");
+        assert!(!s.note_state_request(w, 0));
+        assert!(
+            !s.note_state_request(w + 100, 1),
+            "a window that does not exist has nobody to tell about it"
+        );
+    }
+
+    #[test]
+    fn the_work_area_shrinks_by_every_panels_strut_not_only_the_first() {
+        // What `QueryLayout` answers with, and the reason a manager cannot compute it: a shell
+        // subtracting only its own bars is right until some other client declares a strut.
+        let mut s = WindowStack::new();
+        let screen = Rect::new(0, 0, 100, 100);
+        assert_eq!(s.work_area(screen), screen, "no panels, no reservation");
+        let _ = shown(&mut s, &CreateWindowRequest::new(100, 10, Role::Panel { dock: Edge::Top, reserve: 10 }));
+        let _ = shown(&mut s, &CreateWindowRequest::new(100, 8, Role::Panel { dock: Edge::Bottom, reserve: 8 }));
+        assert_eq!(
+            s.work_area(screen),
+            Rect::new(0, 10, 100, 82),
+            "both struts, not just the first"
+        );
     }
 
     #[test]

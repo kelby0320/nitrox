@@ -32,6 +32,7 @@ use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use librsproto::surface::{KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent};
 use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, stack};
+use librsproto::surface::{WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED};
 use libui::widget::{TITLE_BAR_H, TitleButtons, title_bar};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
@@ -93,6 +94,12 @@ pub enum Msg {
     /// The answer is one request and no arithmetic: the compositor already holds the grab this
     /// press opened and knows where the window is, and this terminal knows neither.
     DragWindow,
+    /// A title-bar button asking the manager for a window state.
+    ///
+    /// **Carries the state rather than being three messages**, because the terminal does nothing
+    /// with it but pass it on: which of them a button means is the *bar's* business, and this
+    /// crate would only be re-deciding it.
+    RequestState(u32),
 }
 
 /// Everything the terminal is.
@@ -133,6 +140,12 @@ pub struct App {
     /// the toolkit's messages — the application says what happened, the shell of a `main`
     /// performs it.
     outbox: Vec<u8>,
+    /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
+    ///
+    /// **The last one wins, and there is only ever one.** The buttons are mutually exclusive
+    /// answers to "what should this window be", so a frame that saw two presses has had the
+    /// second one supersede the first.
+    state_requested: Option<u32>,
     /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
     ///
     /// **An outbox of one**, for the reason `outbox` is one: `update` is a function of values
@@ -171,6 +184,7 @@ impl App {
             palette: Palette::default(),
             outbox: Vec::new(),
             move_requested: false,
+            state_requested: None,
             view_top: None,
             view_moved: false,
         }
@@ -217,6 +231,11 @@ impl App {
     /// Whether a `StartMove` is owed, clearing it.
     pub fn take_move_request(&mut self) -> bool {
         core::mem::take(&mut self.move_requested)
+    }
+
+    /// The window state a button asked for, clearing it.
+    pub fn take_state_request(&mut self) -> Option<u32> {
+        self.state_requested.take()
     }
 
     /// Take everything the user has typed since this was last called.
@@ -271,6 +290,8 @@ impl App {
             // The compositor is the one holding the grab this press opened, so all this does is
             // record that the binary owes it a request.
             Msg::DragWindow => self.move_requested = true,
+            // Likewise: minimising and maximising are the manager's, and this records the ask.
+            Msg::RequestState(s) => self.state_requested = Some(s),
             Msg::Clear => {
                 // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
                 // one implementation of it rather than a menu-shaped second one.
@@ -366,11 +387,21 @@ impl App {
             BAR_H,
             &ui,
         );
-        // **The title bar is the terminal's own chrome** (M9 Part A). Its buttons are not drawn
-        // yet: minimise and maximise have nowhere to go until Part B gives a client a way to ask
-        // the shell for them, and a button that does nothing is worse than no button.
-        let title = title_bar(TITLE, self.focused, Msg::DragWindow, TitleButtons::default(), &ui)
-            .key(TITLE_KEY);
+        // **The title bar is the terminal's own chrome** (M9 Part A), and since Part B two of
+        // its buttons have somewhere to go. Close is still absent: a button that does nothing is
+        // worse than no button, and closing is Part C.
+        let title = title_bar(
+            TITLE,
+            self.focused,
+            Msg::DragWindow,
+            TitleButtons {
+                minimise: Some(Msg::RequestState(WINDOW_STATE_MINIMIZED)),
+                maximise: Some(Msg::RequestState(WINDOW_STATE_MAXIMIZED)),
+                close: None,
+            },
+            &ui,
+        )
+        .key(TITLE_KEY);
         let body = dock(
             vec![
                 docked(Edge::Top, title),

@@ -19318,3 +19318,42 @@ logs a refused `Place` and gives up — there is no retry — so the `WouldBlock
 as "answerable again in a moment" is a placement lost. Unreachable today: the shell's only
 `Place` is on `WindowCreated`, and a window cannot be dragged before it exists. It becomes real
 the first time the shell places a window it did not just create.
+
+## 2026-08-27 — M9 Part B: the client asks, the shell disposes
+
+Minimise and maximise arrive as buttons on a client's own title bar, which is the awkward half of
+client-side decorations: a client cannot *do* either. Minimising is a manager request and
+maximising is a `Configure` to a rectangle only the manager can compute, and a client able to
+reach either could put another window away or place itself. So `Surface::RequestState` asks, the
+compositor forwards it as a manager event, and the shell answers with the request it would have
+sent anyway — the shape supervisor registration already uses, applied to window state.
+
+**`QueryLayout` is the first thing a manager needed that it could not compute.** `work_area()`
+had zero production callers and no op exposed it; `desktop-shell` hardcoded the screen and said
+so in a comment — "the compositor has no 'what size is the screen' op, and adding one to draw a
+bar would be a protocol change made for a stub's convenience". Maximise is that convenience
+arriving. It also makes `Place`'s own spec note true: "a manager computes positions from the work
+area" was not something a manager could do.
+
+`LayoutChanged` reports the work area **differing from the one last announced**, not any
+particular cause. A strut changes through four different requests — a panel created, destroyed,
+re-placed, or committed at a new size — and comparing the answer covers all four and whatever
+arrives next, in the one place they already meet.
+
+**The dedup is on repeats, not on alternation, and the difference is the point.** This is the
+only manager event a client's own rate drives, and that queue does not coalesce and discards its
+oldest, so a client looping on one state would push a `WindowCreated` off the front of the
+shell's view of the world. A repeat of the state last *asked* for produces nothing; alternation
+produces an event each way, because a window asked to maximise and then to restore has changed
+state twice and a manager that missed either would be wrong about where it belongs. The
+compositor remembers what was asked and not what is true: whether a window *is* maximised is a
+rectangle the shell restores from, and a second copy would disagree with it.
+
+**A gate that passed against the bug it was written for, again — the fourth in this milestone.**
+The maximise assertion reads the shell's log line, and the shell logged the work area it had
+computed while the `Configure` carried whatever the caller passed. Changing only the request left
+the log saying the right thing, so a shell maximising to the *screen* passed. `configure_window`
+now prints the arguments it is about to send, inside the function that sends them: one value,
+read once, by the code that puts it on the wire. This is PR #238's finding — "the log sits beside
+the send" is a proximity argument, and proximity is not identity — reached by a different route,
+which is worth recording because the route will come again.
