@@ -17,7 +17,8 @@ click the focused one to minimize, `Super+H` to minimize without the bar. The to
 §5 settled is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
 
 Since M8 Part D it also has **desktops** (§7): several of them, created on demand, switched with
-`Super+1..4` or by clicking the **indicator** at the bar's end, with the focused window moved
+`Super+1..4` or by clicking the **indicator** at the bar's end — the bars are *sticky*, so they
+are on every desktop rather than on the one they were created on — with the focused window moved
 between them by `Super+Shift+N`. The window list shows the current desktop's windows only.
 **Naming a desktop is what makes it persist** — an unnamed desktop disappears when its last
 window leaves, a named one stays, and the list always ends with one empty desktop to create

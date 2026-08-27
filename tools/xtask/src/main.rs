@@ -1349,10 +1349,18 @@ fn parse_popup_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
 /// 9-bit signed delta, so one huge motion is a different movement rather than a big one — the
 /// steps are bounded, and the corner is reached by over-driving into the clamp.
 fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
-    for _ in 0..20 {
-        qmp.send_motion(100, 100)?; // pin to (1279, 799)
-    }
-    let (mut dx, mut dy) = (x - 1279, y - 799);
+    // **Pin only when the position is unknown.** The pin is twenty over-driven motions, and
+    // repeating it before every click is what floods the guest's input ring.
+    let from = match qmp.pointer {
+        Some(p) => p,
+        None => {
+            for _ in 0..20 {
+                qmp.send_motion(100, 100)?; // pin to (1279, 799)
+            }
+            (1279, 799)
+        }
+    };
+    let (mut dx, mut dy) = (x - from.0, y - from.1);
     while dx != 0 || dy != 0 {
         let sx = dx.clamp(-100, 100);
         let sy = dy.clamp(-100, 100);
@@ -1666,6 +1674,17 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: moved window ")?;
     session.expect("desktop-shell: window list on desktop 2 of 2 (empty)")?;
 
+    // **And the chrome is still there.** Both bars are `panel`s created at startup, so the
+    // compositor stamped them with the desktop that was current then — and `visible_on` is the
+    // single predicate behind compositing, focus *and* hit-testing, so from the first switch
+    // they were neither drawn nor clickable. The only way back to the applications button was a
+    // chord (PR #243 review, blocking 1). The shell marks them sticky; this is what says so.
+    //
+    // Asserted by the compositor naming the window a press landed on: on another desktop a
+    // non-sticky bar gives `win=none`, and no shell line follows because nothing was reached.
+    click_at(&mut qmp, &mut session, 1200, 788)?;
+    session.expect("desktop-shell: switched to ")?;
+
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
     //    blocks, so it does not end on its own — and the serial column's prompt has been live
@@ -1802,18 +1821,31 @@ fn check_two_sessions(transcript: &str) -> R<()> {
 /// was already emitting.
 ///
 /// Observed on the first full run of this gate: `input batch DROPPED (SYN_DROPPED)` and a
-/// press at (321, 312) with `win=none`. Retrying is safe here because a press that misses lands
-/// on nothing or merely focuses a window, and opening an already-open modal is guarded.
+/// press at (321, 312) with `win=none`.
+///
+/// **A retry is not inert, and since M8 Part C it can undo the thing it is retrying.** The
+/// bar's entries are *toggles* — a press that misses the aimed pixel by less than an entry
+/// width lands on the same entry and performs the gesture, and the retry then performs its
+/// inverse, so the gate waits forever for a transition that happened twice. That is not fixed
+/// here; what is fixed is the cause of the misses. Every click used to re-pin the pointer to a
+/// corner with twenty over-driven motions before walking, and that burst is what overran the
+/// guest's input ring. A confirmed press is a position report, so `Qmp::pointer` remembers it
+/// and consecutive clicks walk from there — two motions rather than thirty-four
+/// (PR #243 review, finding 3).
 fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
     const ATTEMPTS: u32 = 3;
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
     for attempt in 1..=ATTEMPTS {
+        // Unknown position means pin first; known means walk the difference.
         move_pointer_to(qmp, x, y)?;
         qmp.send_button("left", true)?;
         qmp.send_button("left", false)?;
         if session.expect_within(&format!("compositor: press at x={x} y={y}"), PER_ATTEMPT)? {
+            qmp.pointer = Some((x, y));
             return Ok(());
         }
+        // It did not land where it was aimed, so where it *is* is no longer known.
+        qmp.pointer = None;
         println!("  note: the press did not land at ({x}, {y}) on attempt {attempt}/{ATTEMPTS}");
         // The abandoned attempt's press must not satisfy the next one's wait.
         session.skip_to_end()?;
@@ -2711,6 +2743,16 @@ fn parse_ppm(data: &[u8]) -> R<(u32, u32, Vec<u8>)> {
 struct Qmp {
     stream: std::os::unix::net::UnixStream,
     buf: Vec<u8>,
+    /// Where the guest's pointer is, when a press receipt has confirmed it.
+    ///
+    /// **The pointer is relative and unacknowledged, so this is the only way to know.** Without
+    /// it every click re-pins to a corner with twenty over-driven motions before walking, and
+    /// that burst is what overruns the guest's input ring: `input batch DROPPED (SYN_DROPPED)`,
+    /// then a press tens of pixels from where it was aimed. A confirmed press *is* a position
+    /// report, so consecutive clicks cost two motions instead of thirty-four
+    /// (PR #243 review, finding 3). Cleared whenever an attempt does not land, because then it
+    /// is not known any more.
+    pointer: Option<(i32, i32)>,
 }
 
 impl Qmp {
@@ -2732,7 +2774,7 @@ impl Qmp {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("qmp read timeout: {e}"))?;
-        let mut q = Qmp { stream, buf: Vec::new() };
+        let mut q = Qmp { stream, buf: Vec::new(), pointer: None };
         // The greeting arrives unsolicited; then capabilities must be negotiated before
         // any other command is accepted.
         let greeting = q.read_line()?;
