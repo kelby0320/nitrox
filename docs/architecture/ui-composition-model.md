@@ -378,9 +378,13 @@ Still open, from this document:
 
 Answered or made moot by revision 3:
 
-- ~~Where port names come from~~ — **`QueryCaps`, asked of the live window.** The alternative, an
-  application manifest read at spawn, existed to wire a program that had not started yet. Nothing
-  pre-wires anything now, so the question resolves itself.
+- ~~Where port names come from~~ — **a client declares them**, once, as *named acceptors*
+  (`open-file` accepts `file`). Revision 3 answered this with "`QueryCaps`, asked of the live
+  window"; Milestone 10's details pass (2026-08-30) replaced that for the reason §5 now gives —
+  a live query per drag is per-gesture traffic, which is what M9 spent three parts learning to
+  avoid. The alternative revision 3 was rejecting, an application manifest read at spawn, is
+  still rejected and for its original reason: it existed to wire a program that had not started
+  yet, and nothing pre-wires anything now. What a client declares at runtime is neither.
 - ~~A namespace name for the default handler~~ — moot. The default handler was the fallback for an
   unwired port.
 - ~~Template parameters~~ — moot with templates.

@@ -1,18 +1,28 @@
-# Nitrox: Display Substrate — Design Notes (v1)
+# Nitrox: Display Substrate
 
 ## Status
 
-**Partly built.** Milestones 1–2 have landed: `libdraw`, the `/dev/framebuffer` binding,
-the compositor serving `/dev/draw`, and `libsurface` (named `libui` until M4 Part A).
-**Input (§5) landed in M3 and text (§6) in M4–M5**; thumbnail capture (§4b) and global hotkeys
-(§5a) have **no code** and are scheduled into M8 (Parts E and B). The build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
-when its **subsystem** is built, not when the first milestone touching it lands — the plan
-carries that checkbox at **Milestone 9**, because the last substrate piece is the pointer-grab
-semantics an interactive move needs, which is §5 and which M9 builds. It is *not* M10: the
-applications milestone adds nothing to the substrate. (Milestone 7 in the numbering before the
-2026-08-12 re-scope; briefly Milestone 10 in this plan's first draft, corrected by PR #239
-review, finding 4.)
+**Built, and checked 2026-08-30** — this document describes what exists. Every section below is
+running code: the compositor owning the framebuffer and serving `/dev/draw` (§2, §3), surfaces and
+their buffer lifecycle (§4), window roles and struts (§4a), thumbnail capture (§4b), input from a
+PS/2 driver through `libinput` to a routed client (§5), global hotkeys (§5a), TrueType text (§6),
+and the four-part test gate (§8) — `check-display`, `check-input`, `check-terminal` and
+`check-login`, all of which run in CI.
+
+**Graduated from `design/` on 2026-08-30, one milestone late, and how it was late is the useful
+part.** The rule is that the milestone which builds a subsystem carries the graduation as a
+checkbox, precisely because nobody remembers otherwise. This document's own Status named
+**Milestone 9** and the plan's table agreed — and M9 shipped six parts, closed, and carried no
+such box in any of them. It was then proposed again as Milestone 10 Part F, which is where the
+disagreement became visible: the plan's table said M9, this Status said "not M10", and a new Part
+said M10. Three statements, one subsystem. (Recorded at length in `decision-log.md`, 2026-08-30 —
+the rule that exists to prevent this had already caught the same failure twice, and caught it a
+third time by review rather than by the checkbox.)
+
+**Milestone 10 extends it and that is ordinary.** `Surface::DeclareAcceptor`, `StartDrag` and
+`Dropped` are substrate additions to a substrate that is built; an `architecture/` document
+absorbing new mechanism as it lands is what these documents are for, and is not a reason to keep
+one in `design/`.
 
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
@@ -28,9 +38,11 @@ roles, struts, capture and global hotkeys were all absent from the first draft o
 Milestones 1–2 of this are built (see the Status above); everything from input onward is
 not. The build order is `docs/planning/display-arm-plan.md`.
 
-## 1. What exists today
+## 1. What existed when this was written (2026-08-04)
 
-Worth stating, because three of these are load-bearing for decisions below:
+**Kept as the state this design was drawn against**, not as a description of the system — every
+item below has since been answered by the milestones this document specified. Three of them are
+load-bearing for the decisions further down, which is why they are still here:
 
 - **`kernel/src/framebuffer.rs`** draws the boot screen into Limine's linear framebuffer —
   base pointer, width, height, pitch, and channel shifts — and is then **idle**. Nothing owns
@@ -331,8 +343,9 @@ nothing.
 
 ## 9. Open questions carried forward
 
-- **Buffer release semantics** (§4) — the protocol shape is settled, the exact release
-  signal is not. Trigger: the first client that double-buffers.
+- ~~**Buffer release semantics** (§4)~~ — **settled**: `Release` (`0x0903`) names the buffer that
+  *left* the screen, and `libsurface`'s `acquire` blocks on it. The trigger fired as expected —
+  every real client double-buffers, and `nxterm` was the first.
 - ~~**Mouse events** (§5)~~ — **settled 2026-08-06**, earlier than the trigger expected. The
   guess was that window movement would force it; what actually forced it was M3 Part C's
   deliverable, a client receiving a click. `PointerEvent` carries window-local signed
@@ -340,11 +353,17 @@ nothing.
   `rsproto-surface-ops.md`.
 - **USB HID** (§5) — PS/2 is what QEMU gives us. Real hardware is later, and the key-event
   boundary is chosen so that the driver changes and nothing above it does.
-- **A font rasterizer, and with it the first external crate in userspace** (§6). Trigger:
-  text at more than one size.
+- ~~**A font rasterizer, and with it the first external crate in userspace** (§6)~~ —
+  **settled 2026-08-11**: `ab_glyph`, chosen over `fontdue` because its per-pixel `draw` callback
+  is the right shape for a damage-driven blitter. The first external crate in userspace, and the
+  rule it established is in `userspace/CLAUDE.md`.
 - **Multiple outputs** (§2) — the module seam exists for it; nothing is designed.
 - **Live thumbnails** (§4b) — frozen is the v1 answer. Trigger: the frozen ones being visibly
   wrong in use.
-- **What a `panel` does on a multi-desktop system** (§4a) — bars are always visible, which is
-  simple; a panel that belonged to one desktop would need a rule nothing has yet.
-- **Reference-scene contents** (§8e).
+- ~~**What a `panel` does on a multi-desktop system** (§4a)~~ — **settled in M8**: panels are
+  *sticky*, present on every desktop rather than belonging to one. So are the overview, the
+  applications modal and the rename prompt, for the same reason — a surface that is about the
+  session rather than about a desktop.
+- ~~**Reference-scene contents** (§8e)~~ — **settled**: a 64×32 scene, a 180×96 `libterm` render
+  and a 320×260 `libui` render, each compared against a host render pixel for pixel by
+  `check-display`.

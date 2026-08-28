@@ -112,12 +112,11 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     protocol, the match is **declared rather than queried** (superseding the composition model's
     live `QueryCaps`), and both applications ship **thin**, with M12 named to hold the rest. M11
     is themes and visual polish; **M12 is applications, deepened** — tabs, undo, find, file
-    operations. (Desktops and
-    the applications milestone — M8, and what is now M10 — were rescoped 2026-08-21 when durable
-    window-to-window wiring was cut; the milestone numbered 9 on that date is today's M10. See
-    the decision log.)
+    operations. (Desktops and the applications milestone — M8, and what is now M10 — were
+    rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
+    that date is today's M10. See the decision log.)
     Design in
-    [docs/design/display-substrate.md](../design/display-substrate.md) +
+    [docs/architecture/display-substrate.md](../architecture/display-substrate.md) +
     [docs/architecture/ui-composition-model.md](../architecture/ui-composition-model.md);
     build order in [display-arm-plan.md](display-arm-plan.md). Milestone 1 is the test
     gate: the compositor composites a known scene and host and guest agree on the hash.

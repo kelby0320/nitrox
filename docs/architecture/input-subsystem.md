@@ -41,7 +41,7 @@ absence still stand and were re-checked rather than assumed: `session-mgr` does 
 leans on does not currently honour it"), and there is no userspace-facing interrupt syscall
 (§6).
 
-**Companion documents.** [`display-substrate.md`](../design/display-substrate.md) §5 states the
+**Companion documents.** [`display-substrate.md`](display-substrate.md) §5 states the
 principles this elaborates — key events not bytes, scancode→keycode in the kernel,
 keycode→character in userspace, the compositor owns focus. Nothing there is reversed here;
 §5's `KeyEvent` turns out to describe a *different layer* than the device stream, and this

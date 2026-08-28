@@ -550,7 +550,7 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 ### Display + input
 
-**Design: [`docs/design/display-substrate.md`](../design/display-substrate.md)**
+**Design: [`docs/architecture/display-substrate.md`](../architecture/display-substrate.md)**
 (framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
 [`docs/architecture/ui-composition-model.md`](../architecture/ui-composition-model.md) (windows, ports,
 desktops) and

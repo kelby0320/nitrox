@@ -41,7 +41,7 @@ runtime existed which does not — while claiming to be verified. Design settled
 maintainer 2026-08-10; the reasoning below is unchanged from that pass except where a banner or
 a parenthetical says otherwise.
 
-**Companion documents.** [`display-substrate.md`](../design/display-substrate.md) states the
+**Companion documents.** [`display-substrate.md`](display-substrate.md) states the
 principles this rests on — client-side rendering, damage-rectangle commits, the compositor
 owning window focus. [`ui-composition-model.md`](ui-composition-model.md) owns what a window
 *is*; this document owns what is inside one.

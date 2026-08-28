@@ -86,7 +86,7 @@ symmetric answer.
 **This category adds no kernel surface.** Everything it needs already exists:
 `sys_memory_create`, `sys_memory_map`, handle transfer on an IPC message, and
 notifications. That is the strongest argument for this shape over the alternatives
-(`docs/design/display-substrate.md` §4).
+(`docs/architecture/display-substrate.md` §4).
 
 ## How a client obtains a connection
 
@@ -249,7 +249,7 @@ Destroying a window destroys everything descended from it, transitively.
 A panel declares the space it reserves as `dock: Edge` plus `reserve: u32`, **separately
 from its geometry**. The compositor subtracts the total per edge from the area it offers
 `normal` windows, which is what "a maximised window must not cover the bars" means
-concretely (`docs/design/display-substrate.md` §4a).
+concretely (`docs/architecture/display-substrate.md` §4a).
 
 Declared rather than derived, because the two genuinely differ: a **fullscreen** window
 covers a panel's pixels while the panel still reserves that space for *maximised* windows.
@@ -1195,7 +1195,7 @@ frame would otherwise push older events out of it.
 ## See also
 
 - [rsproto wire format](rsproto-wire-format.md) — the envelope every category shares
-- [display substrate](../design/display-substrate.md) §4 — why surfaces are shaped this way
+- [display substrate](../architecture/display-substrate.md) §4 — why surfaces are shaped this way
 - [UI composition model](../architecture/ui-composition-model.md) §2a — the namespace shape
 - `userspace/librsproto/src/surface.rs` — the encoder/decoder
 - `userspace/compositor/src/lib.rs` — the server-side window model

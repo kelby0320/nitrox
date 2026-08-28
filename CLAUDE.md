@@ -170,13 +170,13 @@ wrong about how something works:
   same change.
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
-  is what a subsystem *will* be. Today it holds exactly two documents: `display-substrate.md`
-  (the parts of the display system above the compositor) and `fault-survival.md` (added
-  2026-08-19), which is not a display document at all — it is where the kernel's fault-survival
-  intent is written down. What is built has moved out —
+  is what a subsystem *will* be. Today it holds exactly one document: `fault-survival.md`
+  (added 2026-08-19), which is not a display document at all — it is where the kernel's
+  fault-survival intent is written down. What is built has moved out —
   `input-subsystem.md` and `widget-toolkit.md` graduated on 2026-08-12, `desktop-shell.md` and
-  `graphical-session.md` on 2026-08-25 with Milestone 7, and `ui-composition-model.md` on
-  2026-08-26 with Milestone 8 — so the rule to apply is simply "`design/` means not built".
+  `graphical-session.md` on 2026-08-25 with Milestone 7, `ui-composition-model.md` on
+  2026-08-26 with Milestone 8, and `display-substrate.md` on 2026-08-30 (owed by Milestone 9 and
+  paid a milestone late) — so the rule to apply is simply "`design/` means not built".
   **Two docs graduated while still outrunning their code** — `desktop-shell.md` (its tray is
   v2) and `ui-composition-model.md` (its ports are unscheduled) — and each says in its Status
   line which sections are behaviour and which are intent. That is the pattern to copy when a

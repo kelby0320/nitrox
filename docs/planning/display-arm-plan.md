@@ -48,7 +48,7 @@ The build sequence for Phase 4's display arm: framebuffer to compositor to GUI t
 the composition layer above it. The design docs are the source of truth for *what*; this plan is
 the source of truth for *the order*.
 
-- **Mechanism:** [`docs/design/display-substrate.md`](../design/display-substrate.md)
+- **Mechanism:** [`docs/architecture/display-substrate.md`](../architecture/display-substrate.md)
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
 - **Semantics:** [`docs/architecture/ui-composition-model.md`](../architecture/ui-composition-model.md)
   — windows, ports, desktops.
@@ -146,7 +146,7 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 **On graduating the design docs.** Root `CLAUDE.md` requires the milestone that builds a
 `design/` doc to carry its move to `architecture/` as a checkbox. That move is **not** M2's:
 the four documents describe subsystems that are only partly built — `display-substrate.md`
-still specifies input, text, capture and hotkeys with no code; `ui-composition-model.md`
+still specified input, text, capture and hotkeys with no code when this was written; `ui-composition-model.md`
 specifies ports and desktops (M8); `desktop-shell.md` has nothing built at all. Moving a
 document to `architecture/` while most of it describes the future is precisely the confusion
 that directory split exists to prevent. Each carries an accurate Status line meanwhile, and
@@ -161,7 +161,7 @@ graduates with the milestone that finishes its subsystem.
 | `graphical-session.md` | **M7** | the milestone that builds the graphical login |
 | `desktop-shell.md` | **M7** | the milestone the shell lands in |
 | `ui-composition-model.md` | **M8** | ports and desktops, which M8 builds |
-| `display-substrate.md` | **M9** | the last substrate piece is M9's, not M10's — see below |
+| `display-substrate.md` | **M9** ✅ | done 2026-08-30 — **one milestone late**, and by review rather than by the box; see below |
 
 Added 2026-08-10 once there were five of these rather than three, because
 `input-subsystem.md`'s subsystem finished with M3 and its box was simply never written — the
@@ -2178,7 +2178,8 @@ also reach the focused window.
 - [x] **Closed the questions this milestone answered** ✅ — composition §7's sticky/no-desktop item
       and `desktop-shell.md` §9's lifecycle item both resolve here, and `design/` drops to
       **two** documents — `display-substrate.md` and `fault-survival.md`, the latter not a
-      display document and not graduating with this arm.
+      display document and not graduating with this arm. (`display-substrate.md` graduated
+      2026-08-30, one milestone after it should have; `design/` now holds one document.)
 
 ### What "done" means
 
@@ -2724,11 +2725,20 @@ The simpler of the two applications and the one that needs no new widget: `list_
 its second designed consumer was always a list of things on disk.
 
 - [ ] **List a directory**, one row per entry, directories marked and sorted before files. Reads
-      through `libfs`; `$env.HOME` is where it starts, which is the binding `build_app_namespace`
-      gives it.
+      through `libfs`, starting at `HOME` from its Tier-1 environment record — `/home`, which
+      `build_app_namespace` binds to the user's subtree. (Not `$env.HOME`: that is the shell's
+      notation and `nxfiles` is not the shell.)
 
 - [ ] **Navigate** — into a directory on a row press, up on a control in the chrome. A path
       strip showing where you are, which is also the affordance the address bar becomes later.
+
+      **`widget-toolkit.md` §8 names "the file browser" as the trigger for scrolling containers**,
+      and this part expects not to fire it: `list_view` carries its own scroll, and a browser whose
+      whole content is one list needs no container that scrolls. If a chrome element forces one —
+      a path strip that must stay put while the list moves — that is the trigger firing, and it
+      becomes a part rather than a quiet addition. Said here because M10 is otherwise careful about
+      honouring §8's *other* trigger, the text area, and a sibling passed over in silence reads as
+      an oversight.
 
 - [ ] **Open a file** by launching the editor on it, through the shell's launcher — which is the
       *other* half of what makes this milestone's applications composable, and it is not
@@ -2774,9 +2784,12 @@ them, which is the trigger §8 named.
       an editor that loses your work quietly is the one thing an editor must never be.
 
 - [ ] **Gate**: `check-login` opens a file, types, saves, and the assertion is made **from
-      outside the editor** — the serial session `cat`s the file back and the gate matches on what
-      the shell prints. A gate that asked the editor what it had saved would be asking the
-      accused.
+      outside the editor** — the serial session reads the file back with `nxsh`'s `open` (there is
+      no `cat`; the coreutils are `list`, `copy`, `move`, `remove`, `rename`, `touch` and friends)
+      and the gate matches on what the shell prints. A gate that asked the editor what it had
+      saved would be asking the accused. The two halves see the same bytes because
+      `libsession::build_namespace` and `desktop-shell::build_app_namespace` bind `/home` to the
+      same subtree — which is decision 1's assumption, load-bearing a second time.
 
 ### Part E — drag-and-drop between them
 
@@ -2801,18 +2814,24 @@ Everything above exists so that this part has two honest consumers rather than a
       without the protocol knowing.
 
 - [ ] **Gate**: `check-login` drags a file from `nxfiles` onto `nxedit` and asserts the editor
-      opened it — read back the way Part D's is, from outside. **Two controls**, and they are the
+      opened it — read back the way Part D's is, from outside, with `open`. **Two controls**, and they are the
       two halves of "structural": a `dir` dragged onto an editor that declares only `file` must
       highlight nothing and deliver nothing, and a drop released over a window with **no**
       acceptor must do the same. A mechanism that highlighted everything would pass the positive
       assertion alone.
 
-### Part F — graduate `display-substrate.md`
+### Not a part: graduating `display-substrate.md`
 
-- [ ] **Move it to `docs/architecture/`** with a Status line naming what is built. By the end of
-      this milestone the substrate is fully built, which is the condition the root `CLAUDE.md`
-      sets for a `design/` document graduating — and the milestone that builds a thing carries
-      the move as a checkbox precisely because nobody remembers otherwise.
+**It was M9's, it did not happen, and it is done now** (2026-08-30) rather than being reassigned
+here. This details pass proposed it as a Part F, which put three statements in disagreement — the
+table above said M9, the document's own Status said "not M10", and the new part said M10 — and
+that disagreement is what made the missed checkbox visible at all. M9 built the last substrate
+piece and shipped six parts without the box; reassigning the debt to a later milestone would have
+been the third repetition of a failure the paragraph above already exists to prevent. See
+`decision-log.md`, 2026-08-30.
+
+That M10 Part E *adds* to the substrate is not a reason to have kept it in `design/`: an
+`architecture/` document absorbing new mechanism as it lands is what those documents are for.
 
 ### Out of scope, deliberately
 
@@ -2828,6 +2847,20 @@ Everything above exists so that this part has two honest consumers rather than a
   the whole of the feedback. Filed with per-client cursors, which the substrate doc already
   defers.
 
+## Milestone 11 — themes and visual polish
+
+Sketched 2026-08-26, and named rather than left implicit. The shell is deliberately plain: M7
+and M8 build what a desktop *does*, and M9 gives windows the chrome they are interacted through.
+This is where how it *looks* becomes the work — a theme the shell, the toolkit and the
+decorations share, rather than three sets of hardcoded colours.
+
+**Its trigger is that there is something to polish.** Polishing earlier means restyling surfaces
+that are about to change shape, and a theme abstracted from one consumer is a guess; `libui`
+already carries a `Theme` and a `Palette`, so the question this milestone answers is whether
+those are the right seam once decorations and the bars are also consumers of them.
+
+Deliberately unscheduled beyond that: it gates nothing, and nothing gates it.
+
 ## Milestone 12 — applications, deepened
 
 Named 2026-08-30 as part of M10's details pass, so that "the editor should have tabs" has
@@ -2842,20 +2875,6 @@ omission.
 **Its trigger is M10 landing**, and its ordering against M11 (themes and visual polish) is open —
 polish wants something finished to polish, and these are the two applications that will most show
 it.
-
-## Milestone 11 — themes and visual polish
-
-Sketched 2026-08-26, and named rather than left implicit. The shell is deliberately plain: M7
-and M8 build what a desktop *does*, and M9 gives windows the chrome they are interacted through.
-This is where how it *looks* becomes the work — a theme the shell, the toolkit and the
-decorations share, rather than three sets of hardcoded colours.
-
-**Its trigger is that there is something to polish.** Polishing earlier means restyling surfaces
-that are about to change shape, and a theme abstracted from one consumer is a guess; `libui`
-already carries a `Theme` and a `Palette`, so the question this milestone answers is whether
-those are the right seam once decorations and the bars are also consumers of them.
-
-Deliberately unscheduled beyond that: it gates nothing, and nothing gates it.
 
 ## What this unblocks
 

@@ -19874,3 +19874,49 @@ rather than quietly rewritten.
 file operations and in-window drag-and-drop are all wanted and none is here. Naming the milestone
 now is what keeps M10's line a line rather than an omission — the maintainer's own framing, and
 the same move that kept M9's snap layouts and live resize out of M9.
+
+---
+
+## 2026-08-30 — M10's review: three statements, one subsystem, and the checkbox that was never written
+
+The details pass proposed graduating `display-substrate.md` at Milestone 10. The review found
+that the same plan file already assigned it to **M9**, and the document's own Status said, in as
+many words, *"It is not M10: the applications milestone adds nothing to the substrate."* Three
+statements about one subsystem, disagreeing.
+
+**The interesting part is not the contradiction; it is that M9 shipped without the box.** Six
+parts, a decision-log entry per part, and no graduation anywhere. The plan has a paragraph whose
+entire purpose is to prevent this — added after `input-subsystem.md`'s box "was simply never
+written" — and it has now failed three times: PR #193 finding 2, PR #239 finding 4, and this one.
+**A rule written down in the document it governs is not a mechanism.** What caught it each time
+was a reviewer reading two statements side by side, which is not a thing that scales with the
+number of documents.
+
+So it is graduated now, one milestone late, rather than reassigned to M10 — reassigning would
+have made the debt look discharged while moving it further from the milestone that incurred it.
+The move is recorded in the document's Status with *how* it was late, because a graduation note
+saying only "graduated 2026-08-30" would erase the one useful thing this produced.
+
+**That M10 adds to the substrate is not an argument for keeping it in `design/`.**
+`Surface::DeclareAcceptor`, `StartDrag` and `Dropped` are new mechanism landing in a built
+subsystem, and an `architecture/` document absorbing that as it lands is what those documents are
+for. The earlier reasoning — "M10 adds nothing to the substrate" — was wrong on the facts as of
+this details pass, and would have been the wrong reason to delay even if right.
+
+**Four smaller corrections, all the same kind: a decision recorded in one place and contradicted
+in another.**
+
+- The composition model's §5 was corrected to say the match is declared rather than queried, and
+  **§7 three sections down still gave `QueryCaps` as the answer to where port names come from** —
+  which is precisely the mechanism decision 4 rejects, in the same file.
+- Both application gates said the serial session would `cat` the file back. **There is no `cat`**;
+  reading a file at a prompt is `nxsh`'s `open`. Naming a POSIX command in a system that rejects
+  POSIX would have sent the implementing session looking for something that does not exist.
+- `widget-toolkit.md` §8 names "the file browser" as the trigger for **scrolling containers**, and
+  the pass was careful to honour §8's *other* trigger (the text area) while passing over that one
+  in silence. It now says why it expects not to fire, and what would mean it had.
+- Milestone 12's heading was inserted before Milestone 11's.
+
+The pattern across all four is worth naming, because it is the same one the graduation shows at a
+larger scale: **a details pass changes what is true, and the places that recorded the old truth do
+not update themselves.** `check-docs` verifies that links resolve and paths exist; it cannot read.
