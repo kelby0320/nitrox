@@ -1217,6 +1217,100 @@ mod tests {
     }
 
     #[test]
+    fn an_outlines_edges_are_four_strips_that_cover_its_border_and_nothing_inside() {
+        // **The arithmetic the whole gesture's damage rests on.** These strips are what gets
+        // repainted per pointer motion, and they are also what *erases* the outline — so a
+        // strip short of an edge leaves a line of it behind, and a strip that covered the middle
+        // would put the full recompose back that this exists to avoid.
+        let r = Rect::new(10, 20, 100, 60);
+        let e = outline_edges(r);
+        for strip in e {
+            assert!(strip.intersect(&r).is_some(), "a strip outside the rectangle: {strip:?}");
+        }
+        // Every border pixel is in some strip, and no interior pixel is in any.
+        for y in r.origin.y..r.bottom() as i32 {
+            for x in r.origin.x..r.right() as i32 {
+                let on_border = x < r.origin.x + OUTLINE_W as i32
+                    || x >= r.right() as i32 - OUTLINE_W as i32
+                    || y < r.origin.y + OUTLINE_W as i32
+                    || y >= r.bottom() as i32 - OUTLINE_W as i32;
+                let covered = e.iter().any(|s| s.contains(x, y));
+                assert_eq!(covered, on_border, "({x},{y}) border={on_border} covered={covered}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_degenerate_outline_stays_inside_itself() {
+        // A rectangle thinner than the outline is what a resize clamped to its floor produces
+        // in one axis; the strips must not reach outside it, or the damage names pixels the
+        // repaint will not restore.
+        for r in [Rect::new(5, 5, 1, 40), Rect::new(5, 5, 40, 1), Rect::new(5, 5, 0, 0)] {
+            for strip in outline_edges(r) {
+                assert!(
+                    strip.is_empty() || strip.intersect(&r) == Some(strip),
+                    "{strip:?} leaves {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_outline_draws_only_inside_its_clip() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Geometry, MemFramebuffer};
+        let mut fb = MemFramebuffer::new(Geometry::packed(60, 60, PixelFormat::XRGB8888));
+        let bg = Rgb::new(0x11, 0x22, 0x33);
+        for y in 0..60 {
+            for x in 0..60 {
+                fb.put_pixel(x, y, bg);
+            }
+        }
+        // **The clip is on the outline's corner, not inside it.** A clip in the middle of a
+        // large outline intersects no strip at all — the first version of this test used one,
+        // and its "something was drawn" assertion was what caught that rather than the clip.
+        let clip = Rect::new(8, 8, 4, 4);
+        draw_outline(&mut fb, Rect::new(8, 8, 40, 40), clip);
+        let mut ink = 0;
+        for y in 0..60u32 {
+            for x in 0..60u32 {
+                if fb.get_pixel(x, y) != Some(bg) {
+                    ink += 1;
+                    assert!(clip.contains(x as i32, y as i32), "ink at ({x},{y}) outside the clip");
+                }
+            }
+        }
+        assert!(ink > 0, "the clip covers the outline's corner, so something must be drawn");
+    }
+
+    #[test]
+    fn presenting_draws_the_outline_over_the_stack_and_into_every_damage_rectangle() {
+        // The same rule the cursor has, and for the same reason: `serve_input` hands one damage
+        // list holding where the outline *was* and where it is, and a `present_into` that drew
+        // into only the first would leave it erased at its destination.
+        let s = WindowStack::new();
+        let src = MapSource::default();
+        let mut fb = big_screen();
+        let outline = Rect::new(20, 20, 60, 40);
+        let corners = [Rect::new(20, 20, 4, 4), Rect::new(76, 56, 4, 4)];
+        s.present_into(
+            &mut fb,
+            Rgb::BLACK,
+            &src,
+            &corners,
+            Point::new(200, 200),
+            Some(outline),
+        );
+        for c in corners {
+            let painted = (c.origin.y..c.bottom() as i32)
+                .flat_map(|y| (c.origin.x..c.right() as i32).map(move |x| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x as u32, *y as u32) == Some(OUTLINE_COLOUR))
+                .count();
+            assert!(painted > 0, "the outline was not drawn into {c:?}");
+        }
+    }
+
+    #[test]
     fn the_cursor_draws_only_inside_its_clip() {
         use libdraw::format::PixelFormat;
         use libdraw::framebuffer::{Geometry, MemFramebuffer};

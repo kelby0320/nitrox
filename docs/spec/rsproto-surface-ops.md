@@ -714,11 +714,17 @@ A second `StartResize` while one is running changes nothing and reports success,
 second `StartMove` does. A `StartResize` while a *move* is running is refused: one grab is one
 gesture. While either is in flight, `Place` for that window is refused with `WouldBlock`.
 
-**A gesture the user did not finish reports nothing.** If the window leaves the screen mid-drag —
-minimised, or sent to another desktop — the outline is taken down and no `ResizeEnded` is sent:
-the rectangle the user was steering by is no longer visible, and resizing a window somebody just
-put away to a size they were half-way through choosing is not what they asked for. Nor is
-anything sent for a gesture that ended where it started, which is an ordinary click on a grip.
+**A gesture the user did not finish reports nothing**, and only the button coming up counts as
+finishing. This is where a resize stops resembling a move: a move has *applied* every step as it
+went, so ending it however it ends merely stops something already on screen, while a resize has
+applied nothing — reporting *initiates* a change, and initiating one from an unfinished gesture is
+a window jumping to a half-chosen size while the user is still holding the button.
+
+So no `ResizeEnded` is sent when the window leaves the screen mid-drag (minimised, or sent to
+another desktop): the rectangle the user was steering by is no longer visible. None is sent when
+the input stream reports a loss — the pointer position is then a guess, which is the last thing to
+derive a new window rectangle from. And none for a gesture that ended where it started, which is
+an ordinary click on a grip. In every case the outline is taken down.
 
 ### `RequestState` (`0x090B`)
 
@@ -1059,6 +1065,7 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x091F` | `Hotkey`         | `MgrHotkey`         | A registered chord was **pressed** — see [`RegisterHotkey`](#registerhotkey-0x091e) |
 | `0x0922` | `LayoutChanged`  | `MgrLayout`         | The work area is not what it was — see [`QueryLayout`](#querylayout-0x0921) |
 | `0x0923` | `WindowStateRequest` | `WindowState`   | A client asked to be minimised or maximised — see [`RequestState`](#requeststate-0x090b) |
+| `0x0926` | `ResizeEnded`    | `ConfigureEvent`    | An interactive resize ended at this rectangle — see [`StartResize`](#startresize-0x090d) |
 
 `LayoutChanged` is sent when the work area *differs* from the one last announced, rather than on
 any particular cause. Today the only causes are a panel appearing and a panel going away — a

@@ -356,10 +356,12 @@ impl InputRouter {
         if self.grab.is_none() {
             self.stop_drag(stack);
             // A resize goes with its grab for the same reason — and an outline left on screen
-            // with nothing driving it is the visible version of that phantom. What it reports
-            // depends on why the grab went: `stop_resize` asks nothing of the manager for a
-            // window that is no longer on screen, which is the case `reconcile_with` produces.
-            (ended, outline_gone) = self.stop_resize(stack);
+            // with nothing driving it is the visible version of that phantom. **`finished` is
+            // false**: a grab taken away is not a gesture the user completed, so the outline
+            // comes down and the shell is asked for nothing. (Twice over, in fact: this path is
+            // reached when `reconcile_with` breaks a grab, which it does only for a window that
+            // has left the screen — the other condition `stop_resize` requires.)
+            (ended, outline_gone) = self.stop_resize(stack, false);
         }
 
         match *ev {
@@ -456,7 +458,7 @@ impl InputRouter {
                     // **And this is where a resize becomes a request.** The whole gesture has
                     // moved an outline; the manager hears one event, now, carrying the
                     // rectangle the user let go at.
-                    let (r, gone) = self.stop_resize(stack);
+                    let (r, gone) = self.stop_resize(stack, true);
                     ended = ended.or(r);
                     outline_gone = outline_gone.or(gone);
                     // Last button up: the grab ends, and the cursor may have been dragged
@@ -486,7 +488,7 @@ impl InputRouter {
                 // held is the same phantom this arm exists to clear, one layer up. An outline
                 // left on screen with nothing driving it is the visible version of it.
                 self.stop_drag(stack);
-                let (r, gone) = self.stop_resize(stack);
+                let (r, gone) = self.stop_resize(stack, false);
                 ended = ended.or(r);
                 outline_gone = outline_gone.or(gone);
                 if had {
@@ -593,6 +595,17 @@ impl InputRouter {
     /// nobody touching it — a `Place` for itself by another name, and `Place` is deliberately a
     /// manager op.
     ///
+    /// **Refused while a resize is running**, which is the other half of a rule that was
+    /// enforced in one direction only until the Part E review found it. Both gestures would
+    /// run: the window would follow the pointer *and* the outline would follow the pointer,
+    /// and the release would hand the shell a rectangle built from the window's origin at the
+    /// *resize* press — an origin the move has since changed. The window jumps back by
+    /// however far it was dragged, and the compositor's own move record and the `ResizeEnded`
+    /// disagree about the origin in the same release. That is precisely the "two paths to a
+    /// window's geometry that can disagree" this part exists to prevent, arriving through the
+    /// one door left open. A client is not required to have good manners; the grab is the
+    /// compositor's trust boundary.
+    ///
     /// A second `StartMove` while one is running **changes nothing** and reports the same
     /// success. It cannot be treated as a fresh request: `from` is the press, which has not
     /// moved, but the window's origin has — so rebuilding the drag from where the window is
@@ -606,7 +619,7 @@ impl InputRouter {
         window: u32,
         stack: &mut WindowStack,
     ) -> Result<Option<Rect>, StackError> {
-        if self.grab != Some(window) {
+        if self.grab != Some(window) || self.resize.is_some() {
             return Err(StackError::NoSuchWindow);
         }
         if self.drag.is_some_and(|d| d.window == window) {
@@ -699,7 +712,11 @@ impl InputRouter {
         if r.edges & RESIZE_BOTTOM != 0 {
             h = (h + dy as i64).max(min);
         }
-        Rect::new(x, y, w.max(min) as u32, h.max(min) as u32)
+        // **Clamped per edge, not per rectangle.** The floor belongs to the axes the gesture is
+        // actually dragging; running it over both makes a window narrower than `MIN_RESIZE`,
+        // resized by its bottom edge alone, report a rectangle wider than it was — a
+        // `Configure` widening an axis the user never touched (PR #253 review, optional 8).
+        Rect::new(x, y, w.max(0) as u32, h.max(0) as u32)
     }
 
     /// Move the outline to follow the pointer, reporting where it was and where it is.
@@ -714,32 +731,49 @@ impl InputRouter {
         Some(Outline { was, now: Some(now) })
     }
 
-    /// End an interactive resize, if one is running, and report the rectangle it ended at.
+    /// End an interactive resize, if one is running. Reports a rectangle only if `finished`.
     ///
     /// **Called wherever the grab ends**, like [`stop_drag`](Self::stop_drag) and for the same
     /// reason: a gesture is a belief derived from the grab, and one that outlives it leaves an
     /// outline on the screen with nothing driving it.
-    fn stop_resize(&mut self, stack: &mut WindowStack) -> (Option<(u32, Rect)>, Option<Outline>) {
+    ///
+    /// **`finished` is true only for the button coming up**, and that distinction is where a
+    /// resize stops being modelled on a move. A move has *applied* every step as it went, so
+    /// ending it however it ends merely stops something already on screen. A resize has applied
+    /// nothing — so reporting *initiates* a change, and initiating one from a gesture the user
+    /// has not finished is a window jumping to a half-chosen size while they are still holding
+    /// the button. `Logical::Dropped` is the clearest case: it means events were lost upstream
+    /// and the pointer position is a guess, which is exactly the state not to derive a new
+    /// window rectangle from (PR #253 review, finding 5).
+    fn stop_resize(
+        &mut self,
+        stack: &mut WindowStack,
+        finished: bool,
+    ) -> (Option<(u32, Rect)>, Option<Outline>) {
         // **Read before the state is taken**, because that is what it is derived from.
         let Some(r) = self.resize else { return (None, None) };
         let final_rect = self.outline_now();
         self.resize = None;
         stack.end_drag();
         let gone = self.outline.take().map(|was| Outline { was: Some(was), now: None });
-        // **Nothing is reported unless the window is still on screen at the end**, which rules
-        // out two cases with one test. A client that exits mid-gesture is ordinary and there is
-        // nobody to configure. A window *put away* mid-gesture — minimized, or sent to another
-        // desktop — is a gesture the user interrupted rather than finished: the outline they
-        // were steering by is gone from the screen, and resizing a window somebody just put
-        // away to a rectangle they were half-way through choosing is not what they asked for.
+        // **Three things have to be true to ask the shell for anything.**
         //
-        // And nothing for a gesture that ended where it started, which is an ordinary click on
-        // the grip. The manager's queue does not coalesce, and a `Configure` to the size a
-        // window already has is a round trip through the client for no change.
+        // The gesture was *finished* — the button came up — rather than ended by something
+        // else; see this function's own doc for why that is the whole difference from a move.
+        //
+        // The window is still on screen. A client that exits mid-gesture is ordinary and there
+        // is nobody to configure; a window *put away* mid-gesture is a gesture the user
+        // interrupted, and resizing a window somebody just put away to a rectangle they were
+        // half-way through choosing is not what they asked for.
+        //
+        // And the rectangle actually changed. A gesture that ended where it started is an
+        // ordinary click on the grip: the manager's queue does not coalesce, and a `Configure`
+        // to the size a window already has is a round trip through the client for no change.
         let on_screen = stack
             .window(r.window)
             .is_some_and(|w| w.visible_on(stack.current_desktop()));
-        let rect = (final_rect != r.rect && on_screen).then_some((r.window, final_rect));
+        let rect =
+            (finished && final_rect != r.rect && on_screen).then_some((r.window, final_rect));
         (rect, gone)
     }
 
@@ -1808,6 +1842,20 @@ mod tests {
     }
 
     #[test]
+    fn the_floor_holds_only_the_axis_being_dragged() {
+        // A window already narrower than the floor, dragged by its bottom edge alone: its width
+        // is nobody's business here, and a rectangle-wide clamp would widen it to `MIN_RESIZE`
+        // and hand the shell a `Configure` for an axis the user never touched.
+        let narrow = MIN_RESIZE / 2;
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 10, 10, narrow, 200);
+        let mut r = InputRouter::new(SCREEN);
+        grip(&mut r, &mut s, w, 10 + narrow as i32 - 1, 209, RESIZE_BOTTOM);
+        let o = go_routed(&mut r, &mut s, drag(0, -20)).outline.expect("moved");
+        assert_eq!(o.now, Some(Rect::new(10, 10, narrow, 180)), "the width is untouched");
+    }
+
+    #[test]
     fn the_release_reports_the_rectangle_once_and_takes_the_outline_with_it() {
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
@@ -1854,6 +1902,22 @@ mod tests {
         r.start_move(w, &mut s).expect("the move takes the grab");
         assert!(r.start_resize(w, RESIZE_RIGHT, &mut s).is_err(), "one gesture per grab");
 
+        // **And the other way round, which was enforced in one direction only.** With both
+        // running the window follows the pointer *and* the outline does, and the release
+        // reports a rectangle built from the origin the window had before the move — so it
+        // jumps back by however far it was dragged (PR #253 review, blocking 1).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        grip(&mut r, &mut s, w, 299, 199, RESIZE_RIGHT | RESIZE_BOTTOM);
+        assert!(r.start_move(w, &mut s).is_err(), "one gesture per grab, either order");
+        go(&mut r, &mut s, drag(40, 30));
+        assert_eq!(
+            s.window(w).unwrap().origin,
+            Point::new(100, 100),
+            "and the window did not move while its outline did"
+        );
+
         // And a second `StartResize` during a resize is the same gesture, not a new one:
         // rebuilding from where things are now would apply the travel so far a second time.
         let mut s = WindowStack::new();
@@ -1870,11 +1934,18 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_refuses_a_place_and_a_dropped_batch_ends_it() {
+    fn a_resize_refuses_a_place_and_a_dropped_batch_ends_it_without_committing() {
         // A resize marks the window as being dragged for the reason a move does: a `Place` that
         // landed mid-gesture would fight the pointer. And a gesture is a belief derived from the
         // grab — `Dropped` says the button state is unknown, so an outline left on screen with
         // nothing driving it is the visible version of the phantom that arm exists to clear.
+        //
+        // **But it reports nothing**, which is where a resize stops being modelled on a move. A
+        // move has applied every step already; a resize has applied none, so reporting here
+        // would *initiate* a change from a pointer position this arm has just declared a guess,
+        // while the button is still down — the window jumping to a half-chosen size mid-drag.
+        // The failure `Dropped` stands for is a ring overflow under a heavy recompose, which is
+        // the one this milestone keeps meeting (PR #253 review, finding 5).
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -1883,30 +1954,62 @@ mod tests {
         go(&mut r, &mut s, drag(40, 30));
 
         let routed = go_routed(&mut r, &mut s, Logical::Dropped);
-        assert_eq!(routed.resized, Some((w, Rect::new(100, 100, 240, 130))), "it ended where it stood");
+        assert_eq!(routed.resized, None, "a gesture the user did not finish asks for nothing");
         assert_eq!(routed.outline.expect("taken down").now, None);
         assert!(s.place(w, Point::new(0, 0)).is_ok(), "and the window is a manager's again");
     }
 
     #[test]
-    fn a_window_put_away_mid_resize_ends_the_gesture_on_whatever_event_notices() {
+    fn a_window_put_away_mid_resize_ends_the_gesture_on_whichever_key_arm_notices() {
         // **`reconcile_with` breaks a grab on *any* event**, so the path that ends a gesture is
-        // not always a pointer one: a chord that minimizes the window being resized ends it on
-        // a keystroke. A `Routed::default()` on that arm would leave the outline on screen with
-        // nothing driving it and the shell never told the gesture finished.
-        let mut s = WindowStack::new();
-        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
-        let mut r = InputRouter::new(SCREEN);
-        grip(&mut r, &mut s, w, 299, 199, RESIZE_RIGHT | RESIZE_BOTTOM);
-        go(&mut r, &mut s, drag(40, 30));
+        // not always a pointer one: a chord that puts the window being resized away ends it on a
+        // keystroke. A `Routed::default()` on such an arm leaves `srv.outline` set in the
+        // compositor, and `repaint_region` then redraws it on every subsequent repaint — an
+        // outline stranded on a desktop with nothing driving it.
+        //
+        // **All three key arms**, because the first version of this test reached exactly one:
+        // it had a single window, so minimizing it left `focus_candidate` empty and every run
+        // took the nothing-focusable early return. Breaking either of the other two failed
+        // nothing in the crate (PR #253 review, finding 3).
+        //
+        // The reachable one is the *hotkey* arm: the user holds the grip and presses a chord.
+        // It is consumed at the press, while the window is still on screen, so nothing is torn
+        // down; the release comes back after the chord has put the window away, is swallowed by
+        // keycode, and returns through that arm — which is the event on which the grab breaks.
+        for arm in ["nothing focusable", "delivered", "hotkey"] {
+            let mut s = WindowStack::new();
+            let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+            // A second window for the arms that need somebody to deliver to, and none for the
+            // arm that needs nobody.
+            if arm != "nothing focusable" {
+                win(&mut s, Role::Normal, 400, 0, 100, 100);
+            }
+            let mut r = InputRouter::new(SCREEN);
+            r.register_hotkey(MgrHotkey { id: 9, mods: MOD_SUPER, code: KEY_2 }).unwrap();
+            grip(&mut r, &mut s, w, 299, 199, RESIZE_RIGHT | RESIZE_BOTTOM);
+            go(&mut r, &mut s, drag(40, 30));
+            if arm == "hotkey" {
+                // Consumed while the window is still on screen: the gesture survives this.
+                let held = go_routed(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
+                assert!(held.consumed && held.outline.is_none(), "{arm}: nothing torn down yet");
+            }
 
-        s.set_minimized(w, true).expect("put away under the pointer");
-        let routed = go_routed(&mut r, &mut s, key(30, true));
-        assert_eq!(routed.outline.expect("the outline is taken down").now, None);
-        assert!(
-            routed.resized.is_none(),
-            "and nothing is asked of the shell for a window that is not on screen"
-        );
+            s.set_minimized(w, true).expect("put away under the pointer");
+            let ev = match arm {
+                "hotkey" => chord(KEY_2, false, MOD_SUPER),
+                _ => key(30, true),
+            };
+            let routed = go_routed(&mut r, &mut s, ev);
+            assert_eq!(
+                routed.outline.expect("the outline is taken down").now,
+                None,
+                "{arm}: the outline outlived the gesture"
+            );
+            assert!(
+                routed.resized.is_none(),
+                "{arm}: nothing is asked of the shell for a window that is not on screen"
+            );
+        }
     }
 
     #[test]

@@ -2542,6 +2542,12 @@ dependency cut in two rather than two independent things.
       that does not commit … only the final assertion catches it" — and the last assertion is
       still the only one that reads the *committed* rect, which is what a client may decline.
 
+- [x] **Only the button coming up finishes a gesture** ✅ — a lost input batch or a window put
+      away mid-drag takes the outline down and asks the shell for nothing. A move has applied
+      every step already, so ending it stops something on screen; a resize has applied none, so
+      reporting *initiates* a change — from a pointer position a `SYN_DROPPED` has just declared
+      a guess, with the button still down (PR #253 review, finding 5).
+
 - [x] **Two deviations from decision 2, both "do not build what nothing uses"** ✅, and both
       worth a reviewer's disagreement. Decision 2 says the manager hears an event when a drag
       *begins* as well as when it ends: nothing in Part E or Part F has anything to do with one,

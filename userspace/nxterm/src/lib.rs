@@ -34,7 +34,7 @@ use librsproto::surface::{
     KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
-use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, stack};
+use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
 use libui::widget::{GRIP_W, TITLE_BAR_H, TitleButtons, resize_grip, title_bar};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
@@ -65,7 +65,12 @@ pub const SCROLLBAR_KEY: u64 = 4;
 /// The key on the title bar — see [`BAR_KEY`].
 pub const TITLE_KEY: u64 = 5;
 
-/// The resize grip's key, so a test can find it without walking the tree.
+/// The resize grip's key.
+///
+/// Read by `the_grip_does_not_cover_any_part_of_the_scrollbar` and
+/// `pressing_the_corner_produces_the_resize_and_not_a_move`, which find it with
+/// [`locate`](libui::layout::locate) rather than by walking the tree — the same reason the
+/// scrollbar and the menu item carry keys.
 pub const GRIP_KEY: u64 = 6;
 
 /// Height of the menu bar, in pixels.
@@ -496,7 +501,14 @@ impl App {
         // whole cells that fit inside it. Sizing the thumb against the grid instead would make
         // it a fraction of a cell short in a maximised window, and the error would grow with
         // the leftover.
-        self.window.h.saturating_sub(BAR_H + TITLE_BAR_H)
+        //
+        // **Less the grip's square, which the bar must stop above** (PR #253 review, finding 4).
+        // `GRIP_W` is wider than `SCROLL_W`, the grip is the topmost layer, and hit-testing
+        // takes the topmost — so any part of the track under it is a part of the track that
+        // cannot be pressed. That is not hypothetical: `MIN_THUMB` is 16 and a following view
+        // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
+        // its thumb *entirely* under the grip.
+        self.window.h.saturating_sub(BAR_H + TITLE_BAR_H + GRIP_W)
     }
 
     /// The element tree for the current state.
@@ -541,9 +553,18 @@ impl App {
                 docked(Edge::Top, bar.key(BAR_KEY)),
                 docked(
                     Edge::Right,
-                    scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui)
-                        .on_pointer(Msg::Scroll)
-                        .key(SCROLLBAR_KEY),
+                    // **Sized, so the bar ends where the grip begins.** The dock's right slot
+                    // is the full remaining height; without this the scrollbar is laid out
+                    // under the grip and the bottom `GRIP_W` of its track is unpressable — see
+                    // [`track_h`](Self::track_h).
+                    // The key goes on the wrapper, because the diff requires a container's
+                    // children to be all keyed or all unkeyed and this one's siblings are keyed.
+                    sized(
+                        Size::new(SCROLL_W, self.track_h()),
+                        scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui)
+                            .on_pointer(Msg::Scroll),
+                    )
+                    .key(SCROLLBAR_KEY),
                 ),
             ],
             custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
@@ -623,6 +644,71 @@ mod tests {
     fn app() -> App {
         let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
         App::new(20, 6, Metrics::new(&f, 16.0))
+    }
+
+    #[test]
+    fn the_grip_does_not_cover_any_part_of_the_scrollbar() {
+        // **A control that cannot be pressed is worse than one that is absent.** The grip is the
+        // topmost layer and hit-testing takes the topmost, so any part of the track under it is
+        // a part of the track that does nothing — and `MIN_THUMB` is 16 while a following view
+        // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
+        // its thumb *entirely* underneath (PR #253 review, finding 4).
+        let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
+        let mut a = App::new(80, 24, Metrics::new(&f, 16.0));
+        for i in 0..1200 {
+            a.feed(alloc::format!("line{i}\r\n").as_bytes());
+        }
+        assert!(a.scroll().scrollable(), "precondition: there is a thumb to press");
+
+        let e = a.view();
+        let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
+        let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
+        let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar is keyed");
+        let grip = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
+        assert!(
+            bar.intersect(&grip).is_none(),
+            "the grip {grip:?} overlaps the scrollbar {bar:?}"
+        );
+        assert_eq!(grip.bottom(), bounds.bottom(), "and the grip is still in the corner");
+        assert_eq!(grip.right(), bounds.right());
+    }
+
+    #[test]
+    fn the_grip_asks_the_binary_for_a_resize_and_asks_once() {
+        // The same shape as the title bar's drag: `update` has no syscalls, so what a press
+        // produces is an outbox of one. Taking it clears it — a second `StartResize` for a
+        // gesture the compositor is already running would mean this client believes in a drag
+        // it is not in.
+        let mut a = app();
+        assert_eq!(a.take_resize_request(), None, "nothing owed before the corner is touched");
+        a.update(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM));
+        assert_eq!(a.take_resize_request(), Some(RESIZE_RIGHT | RESIZE_BOTTOM));
+        assert_eq!(a.take_resize_request(), None, "and owed exactly once");
+    }
+
+    #[test]
+    fn pressing_the_corner_produces_the_resize_and_not_a_move() {
+        // **Through the router, at the grip's own laid-out rectangle.** The message is carried
+        // by an `on_press_down` inside a `Stack` layer over the window's body; a press there
+        // must reach the grip rather than the title bar's drag or the grid's keys.
+        let mut a = app();
+        let (t, l, mut r) = window(&a);
+        let e = a.view();
+        let g = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
+        let p = PointerEvent {
+            window: 1,
+            kind: librsproto::surface::POINTER_BUTTON,
+            x: g.origin.x + g.size.w as i32 / 2,
+            y: g.origin.y + g.size.h as i32 / 2,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            ..Default::default()
+        };
+        for m in r.pointer(&t, &e, &l, p).0 {
+            a.update(m);
+        }
+        assert_eq!(a.take_resize_request(), Some(RESIZE_RIGHT | RESIZE_BOTTOM));
+        assert!(!a.take_move_request(), "and the press did not also start a move");
     }
 
     #[test]

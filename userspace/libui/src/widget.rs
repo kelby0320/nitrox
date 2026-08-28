@@ -1555,6 +1555,43 @@ mod tests {
     }
 
     #[test]
+    fn a_grip_is_a_square_that_reports_its_press_rather_than_its_click() {
+        // **At the press, like the title bar's drag**, because a resize is a gesture that
+        // *begins* there: a grip that waited for the click would hand the compositor a drag
+        // whose button was already up. And it measures its own square, so a caller placing it
+        // in a corner has a number to place it by.
+        use crate::diff::Tree;
+        use crate::layout::{Constraints, measure};
+        use crate::route::Router;
+        use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+
+        #[derive(Clone, PartialEq, Debug)]
+        struct Resize;
+        let p = Palette::default();
+        let e = resize_grip(Resize, &p);
+        assert_eq!(
+            measure(&e, Constraints::loose(Size::new(400, 400)), &CELL),
+            Size::new(GRIP_W, GRIP_W)
+        );
+
+        let l = layout(&e, Rect::new(0, 0, 400, 400), &CELL);
+        let mut tree = Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        let mut r = Router::new();
+        let at = |pressed: bool| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: u16::from(pressed),
+            flags: if pressed { POINTER_PRESSED } else { 0 },
+            x: GRIP_W as i32 / 2,
+            y: GRIP_W as i32 / 2,
+            ..Default::default()
+        };
+        assert_eq!(r.pointer(&tree, &e, &l, at(true)).0, alloc::vec![Resize], "at the press");
+        assert!(r.pointer(&tree, &e, &l, at(false)).0.is_empty(), "and not again at the click");
+    }
+
+    #[test]
     fn a_press_on_the_bars_face_is_a_drag_and_a_press_on_a_button_is_not() {
         // The discrimination the whole widget exists for. The buttons sit *above* the face in
         // the stack, so a press on one must produce its own message and not also a drag —

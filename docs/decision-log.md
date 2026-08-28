@@ -19670,3 +19670,54 @@ carrying weight rather than being satisfied by the ends.
 **And a knock-on worth recording**: a window resized by hand is no longer the window that was
 maximised, so the shell drops its restore rectangle. Keeping it would make the next restore put
 the window somewhere it had never been.
+
+---
+
+## 2026-08-29 — Part E's review: the door left open, and a control that could not be pressed
+
+Five findings, and the two that matter most are the same kind of mistake: a rule stated in a doc
+and enforced on one side of a symmetry.
+
+**`StartMove` was refused during a resize by nobody.** `start_resize` checks for a running move;
+`start_move` did not check for a running resize, while the field's own doc said "**Never both**:
+`start_move` and `start_resize` each refuse while the other is running" and the test named for the
+rule asserted one direction. Both gestures then run: the window follows the pointer *and* the
+outline follows the pointer, and the release hands the shell a rectangle built from the window's
+origin at the *resize* press — an origin the move has since changed, so the window jumps back by
+however far it was dragged. The compositor's own move record and the `ResizeEnded` disagree about
+the origin in the same release, which is exactly the "two paths to a window's geometry that can
+disagree" this part exists to prevent, arriving through the one door left open. A client is not
+required to have good manners; the grab is the compositor's trust boundary, and a boundary
+enforced in one direction is not one.
+
+**A lost input batch was committing a gesture the user was still holding.** `Logical::Dropped`
+means events were lost upstream and the pointer position is a guess — and the arm ended the resize
+*and reported it*, so the shell configured the window to a rectangle derived from that guess while
+the button was still down. The rule was inherited from the move it was modelled on, and does not
+transfer: **a move has applied every step as it went, so ending it merely stops something already
+on screen; a resize has applied nothing, so reporting initiates a change.** Only the button coming
+up finishes a gesture now. What makes this worth more than its size is which failure `Dropped`
+stands for — a ring overflow under a heavy recompose, the one this milestone keeps meeting.
+
+**The resize grip covered the scrollbar's thumb, entirely.** `GRIP_W` is 16 and `SCROLL_W` is 12,
+the grip is the topmost layer, and hit-testing takes the topmost — so the bottom 16 pixels of the
+track did nothing. `MIN_THUMB` is 16 and a *following* view puts the thumb at the very bottom, so
+a default 24-row terminal with a full scrollback had its thumb completely unreachable: pressing it
+started a resize. The scrollbar is now laid out short of the grip, and the test that pins it
+compares the two laid-out rectangles rather than reasoning about the thumb — which is the general
+statement, and it is what makes the fix hold for any window size.
+
+**A test that reached one of the three arms it was named for.** The gesture's ending is carried out
+of `route` through every arm, because `reconcile_with` can break a grab on any event. The test had
+*one* window, so minimizing it left nothing focusable and every run took the same early return;
+breaking either of the other two arms failed nothing in the crate. The reachable one is the hotkey
+arm — hold the grip, press a chord, and the chord's *release* is the event on which the grab
+breaks — and dropping the carry there strands the outline on screen, redrawn by every later
+repaint. Three arms, three controls, run separately.
+
+**And the outline had no pixel coverage at all**, in the crate whose `present_into` doc exists
+because "the cursor survives a recompose" once had no test it could fail. The strips' arithmetic,
+the clipping and the draw-into-every-damage-rectangle rule now have the cursor's three analogues.
+Writing them found a fourth thing: the first version of the clip test used a clip *inside* a large
+outline, which intersects no strip, so it asserted nothing — caught by its own "something must
+have been drawn" line rather than by a control.
