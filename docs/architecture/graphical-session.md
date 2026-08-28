@@ -335,7 +335,7 @@ Milestone 7 Part E.
 - [`session-and-auth.md`](../architecture/session-and-auth.md) — the serial column, as built
 - [`ui-composition-model.md`](ui-composition-model.md) — §5a/§6, the shell's namespace authority
 - [`desktop-shell.md`](desktop-shell.md) — what the shell presents
-- [`display-substrate.md`](../design/display-substrate.md) — the mechanism beneath both
+- [`display-substrate.md`](display-substrate.md) — the mechanism beneath both
 - [`why-supervisor-registration.md`](../rationale/why-supervisor-registration.md) — why a leaf
   never constructs its own authority
 - [`display-arm-plan.md`](../planning/display-arm-plan.md) — the build order

@@ -293,6 +293,15 @@ everything-is-a-resource claim applied to windows, and it wants a path, since th
 `QueryCaps` alone to hand a shell. The pressures are not the same ones §5a was drawn against, so
 the design is carried forward as an open question rather than as a decision.
 
+**Milestone 10's details pass (2026-08-30) hands this a name and a type without settling it.** A
+window declares *named acceptors* — `open-file` accepts `file` — and a drop is delivered as "this
+record, for acceptor `open-file`". A port at `/dev/draw/<N>/ports/in/open-file` would then be a
+second *carrier* for the same record to the same handler, rather than a second feature. That
+removes the reason this entry was hardest to answer — ports were drawn for a mechanism that was
+cut and nothing had needed one since — and leaves the smaller questions: stream versus message,
+what a resolve does when nothing is listening, and which server owns a path an application
+defines.
+
 The marker sits on the compositor's forwarded-resolve arm, which is where such a path would be
 served and where `/dev/draw/<N>/ports/…` is currently declined. Trigger: the first client that
 wants to address a window from outside it — most likely a coreutil, which is also the case that
