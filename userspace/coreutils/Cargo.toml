@@ -16,6 +16,7 @@ edition = "2024"
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 librsproto = { path = "../librsproto", features = ["io"] }
+libfs = { path = "../libfs" }
 libstream = { path = "../libstream", features = ["io"] }
 
 [lib]

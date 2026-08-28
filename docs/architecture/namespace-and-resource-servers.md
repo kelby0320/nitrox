@@ -245,7 +245,7 @@ This is why `/` genuinely needs both (the root filesystem's own entries *plus* `
 bindings is an ordinary kernel-served directory, not a failure.
 
 A caller that asks only one source gets a confidently wrong answer rather than an error,
-which is why the coreutils merge both and why `coreutils::fs::children` — used by the
+which is why the coreutils merge both and why `libfs`'s private `children` — used by the
 recursive tree walks — deliberately uses **filesystem entries only**: descending into a
 binding would walk out of the tree being copied or removed.
 

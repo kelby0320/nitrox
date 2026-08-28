@@ -122,7 +122,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Resolve `/session/user` and read the name out of it, or `None` if it is not bound.
 fn read_session_user(stage: &Stage) -> Option<String> {
-    let (st, handle) = coreutils::fs::lookup_wait(stage.namespace, SESSION_USER, RIGHT_MAP_READ);
+    let (st, handle) = libfs::lookup_wait(stage.namespace, SESSION_USER, RIGHT_MAP_READ);
     if st != 0 || handle == 0 {
         return None;
     }

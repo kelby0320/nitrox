@@ -60,6 +60,8 @@ The userspace runtime is layered. Don't reach below your layer:
 ```
 Application                              ← user code
   ↓
+libfs                                    ← whole-file + path helpers (no protocol of its own)
+  ↓
 libstream  librsproto                    ← typed I/O, RS protocol
   ↓
 libos                                    ← typed Handle<T, M>, async executor, block_on
@@ -68,6 +70,13 @@ libkern    libheap                       ← raw syscall wrappers; the #[global_
   ↓
 syscall instruction
 ```
+
+`libfs` is above `librsproto` because it *uses* it — `session::Dir` is the directory half —
+while owning no wire format itself: a file resolves to a page-cache object the process maps, so
+its operations are namespace and memory syscalls. It was `coreutils::fs` until M10 Part A and
+moved down when a second consumer arrived, which is the rule to apply generally: **a helper with
+one consumer belongs to that consumer; a helper with two belongs below both.** An application
+reaching into another application's crate to borrow one is the shape that rule exists to catch.
 
 A crate can depend on anything below it but not above. `libstream` can use `libos`; `libos` cannot use `libstream`. Cyclic dependencies are not allowed and are caught by Cargo. `libheap` (the freeing heap that backs `alloc`) is a foundation alongside `libkern`: it depends only on `libkern` + `core`, and the top-level binary registers it as the `#[global_allocator]`.
 
@@ -118,6 +127,9 @@ Each crate has its own `CLAUDE.md` for crate-specific guidance:
 - `userspace/auth-service/CLAUDE.md` — credential oracle (auth + session-mgr)
 - `userspace/session-mgr/CLAUDE.md` — session supervisor (login, per-user namespaces)
 - `userspace/nxsh/CLAUDE.md` — the Nitrox shell; the login leaf since 2026-07-31
+
+`libfs` has no `CLAUDE.md`: it is one module of plain functions with its rules in its own crate
+doc, and a rules file that repeated them would be the thing that outlives the rule.
 
 Read the crate-specific `CLAUDE.md` before significant work in any of these.
 

@@ -2708,16 +2708,37 @@ is *shell-program* infrastructure: the Tier-1 stage prologue, GNU-style argument
 stdout plumbing. A GUI application wants the filesystem half and none of the rest, and depending
 on `coreutils` to get it would make one application depend on another's crate.
 
-- [ ] **`libfs`**, below the applications and above `libos`: the path and directory helpers,
-      moved rather than copied, with `coreutils` depending on it. The move is the point — a second
-      consumer is exactly this project's rule for when something goes down a layer, and it is the
-      same argument that put `BufferPool` in `libsurface` in M9 Part D rather than leaving the
-      ordering rule in `nxterm`.
+- [x] **`libfs`** ✅ — above `librsproto` (it uses `session::Dir`) and below the programs that
+      call it: the whole-file and path helpers, **moved rather than copied**, with `coreutils`
+      depending on it. Not one line of behaviour changed, which is the point: a second consumer
+      is this project's rule for when something goes down a layer, and it is the argument that
+      put `BufferPool` in `libsurface` in M9 Part D rather than leaving the ordering rule in
+      `nxterm`. The rule is now written in `userspace/CLAUDE.md` generally — *a helper with one
+      consumer belongs to that consumer; a helper with two belongs below both.*
 
-- [ ] **Gate**: `cargo xtask test` — these are host-testable except where they touch a namespace,
-      and `coreutils`' existing behaviour is the regression test. `test-interactive` already
-      drives `list`, `copy`, `rename` and `remove` at a real prompt, so a move that broke one
-      would fail there rather than nowhere.
+      **The move was clean because `fs.rs` had no `crate::` references at all** — it used only
+      `alloc`, `libkern` and `librsproto`. A module that reaches into its siblings is a module
+      that has to be untangled before it can move; this one had already been written as if it
+      might leave.
+
+- [x] **Gate** ✅ — `cargo xtask test` (the three host tests moved with the code, so the count is
+      unchanged at 1908), plus the two guest gates that already drive this code: **`test-qemu`**
+      runs `copy`, `move`, `rename` and `remove` against a real filesystem through
+      `test-harness`'s demos, and **`test-interactive`** types `list` at a real prompt. Nothing
+      new is asserted, deliberately — a refactor's gate is the *existing* one still passing, and
+      a new test written alongside a move proves only that the new copy works.
+
+      **Naming the wrong gate is its own defect**, and this part shipped one for a day: the
+      first version credited `test-interactive` with all four programs, and it types none of the
+      other three. A false statement about *which* gate covers a thing is worse than no
+      statement, because it is the one somebody acts on — they run it, it passes, and the gate
+      that would have caught them was never started (PR #256 review, blocking 1).
+
+      **One thing the move did surface**: `cargo test -p libfs` alone failed where the workspace
+      build passed, because `librsproto`'s `io` feature was reaching `libfs` through
+      `coreutils`. Feature unification had been hiding a dependency the crate did not declare —
+      exactly the shape that breaks the moment a second consumer arrives without that feature,
+      which is the situation this part exists to create.
 
 ### Part B — `nxfiles`, the file browser
 
