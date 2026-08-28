@@ -530,15 +530,18 @@ wire change, which is the same reason the device layer's extensibility lives in 
 | 12 | 4 | `x` — top-left in screen coordinates, signed |
 | 16 | 4 | `y` — top-left in screen coordinates, signed |
 
-**A request, not a command.** The compositor cannot resize a client's buffer, because the client
-allocates it. A client answers by attaching and committing a buffer of that size, or **declines**
+**The size is a request; the origin is applied.** The compositor cannot resize a client's buffer,
+because the client allocates it. A client answers by attaching and committing a buffer of that size, or **declines**
 by committing whatever it likes — and declining is legal and stays legal: a fixed-size window is
 an ordinary thing, and a protocol that required compliance would make every client implement
 reflow before it could exist. The compositor composites whatever geometry it is given.
 
 It carries an **origin as well as a size** because a manager's answer to "where does this go" is a
 placement, and a client that learned its position through a separate message would be reconciling
-two mechanisms that can disagree.
+two mechanisms that can disagree. The manager-side [`Configure`](#configure-0x0915) therefore
+*places* the window as `Place` would — the origin is not a suggestion — and only the size is left
+for the client to accept or decline. A `Configure` for a window the user is dragging is refused
+with `WouldBlock`, exactly as `Place` is.
 
 The `window` field matters because one connection can hold several windows on one channel — the
 same reason `FocusEvent` carries one.
@@ -738,6 +741,12 @@ Request: the same body as the client-facing [`Configure`](#configure-0x0908) —
 `width`, `height`, `x`, `y`. Asks the window's **client** to adopt that geometry; it is the
 manager's half of the handshake a client completes on create.
 
+**The origin takes effect when the compositor accepts it; the size when the client commits it.**
+That asymmetry is not a wart: position is the compositor's to decide and size is the client's to
+allocate. A manager setting both should use this rather than `Place` followed by `Configure` —
+and, before M9 Part B, a manager that did so set only the size, because nothing applied the
+origin.
+
 The reply says the compositor accepted the request, **not** that the client has adopted it: the
 `Configure` is forwarded to a third party, and whether it arrives is a property of that client's
 receive ring. `NotFound` if no such window.
@@ -832,8 +841,11 @@ is right exactly until some other client declares one — and then maximised win
 with nothing able to notice. `Place`'s own note has always said "a manager computes positions
 from the work area", which was not something a manager could do until this existed.
 
-The work area is the screen minus every visible panel's reservation, clamped rather than allowed
-to invert: panels claiming more than the screen leave an empty rectangle, not a negative one.
+The work area is the screen minus **every** panel's reservation — including one that is
+minimised, on another desktop, or has never committed a buffer. A strut is a declaration about
+space rather than a consequence of being drawn, and a work area that grew and shrank as panels
+came and went would move every maximised window with it. Clamped rather than allowed to invert:
+panels claiming more than the screen leave an empty rectangle, not a negative one.
 
 ### `Capture` (`0x0920`)
 
@@ -951,11 +963,12 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x0922` | `LayoutChanged`  | `MgrLayout`         | The work area is not what it was — see [`QueryLayout`](#querylayout-0x0921) |
 | `0x0923` | `WindowStateRequest` | `WindowState`   | A client asked to be minimised or maximised — see [`RequestState`](#requeststate-0x090b) |
 
-`LayoutChanged` is sent when the work area *differs* from the one last announced, rather than
-when a strut is touched: a panel is created, destroyed, re-placed or committed at a new size
-through four different requests, and comparing the answer covers all of them and whatever comes
-next. A manager that maximised a window against stale numbers would leave it under a panel, and
-nothing else would report it.
+`LayoutChanged` is sent when the work area *differs* from the one last announced, rather than on
+any particular cause. Today the only causes are a panel appearing and a panel going away — a
+window's role, and therefore its strut, is fixed when it is created — so a cause-driven version
+would have exactly two triggers and would quietly grow a third the day a strut becomes settable.
+A manager that maximised a window against stale numbers would leave it under a panel, and nothing
+else would report it.
 
 `Hotkey` is numbered after the block above because it was added later; it is a manager event
 like the rest. Its body is the same `MgrHotkey` the registration carried, echoed back — the

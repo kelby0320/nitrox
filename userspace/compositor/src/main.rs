@@ -1538,6 +1538,19 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         };
     }
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
+    // **A manager acting on a window invalidates what that window last *asked* to be.** The
+    // dedup on `RequestState` compares against a value only client requests were writing, and
+    // the manager changes a window's state by four other routes — a taskbar click, a chord, the
+    // overview. After one of those the shadow was stale, and the *next* identical request was
+    // dropped as a repeat: a minimise button that worked once and then never again, with the
+    // client told it had succeeded (PR #249 review, blocking 1).
+    //
+    // Cleared here rather than in each op, so the next manager op added cannot forget to.
+    if let MgrOutcome::Applied { window: Some(w), .. } | MgrOutcome::Configure { window: w, .. } =
+        mgr_outcome
+    {
+        srv.stack.clear_state_request(w);
+    }
     drain_stack_events(srv);
     match mgr_outcome {
         MgrOutcome::Applied { window, dirty } => {
@@ -1613,7 +1626,33 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let was_held = srv.pending_configure.iter().any(|&(w, _)| w == window);
             srv.pending_configure.retain(|&(w, _)| w != window);
             let became_visible = srv.stack.mark_configured(window);
+            // **The origin is applied, not merely forwarded.** The comment above has always said
+            // this op answers "where does this go" as well as "how big", and told managers to use
+            // it rather than `Place` followed by `Configure` — while nothing here wrote the
+            // origin, so a manager that followed that advice set only the size. Part B is the
+            // first production caller, so it was never exercised: maximise would have resized a
+            // window it could not move, leaving it hanging off the screen from wherever it was
+            // dragged (PR #249 review, blocking 2).
+            //
+            // Through `place`, so the same rules apply as to any other placement — including the
+            // refusal for a window the user is dragging, which a manager must not fight.
+            let moved = match srv.stack.place(window, origin) {
+                Ok(d) => Some(d.rect()),
+                Err(compositor::StackError::Dragging) => {
+                    return reply_error_on_session(ch, op, request_id, KError::WouldBlock);
+                }
+                Err(_) => None,
+            };
+            // **Drained again, because this arm mutates after the drain above.** Every other
+            // manager op does its work inside `dispatch`, which is why one drain immediately
+            // after it has always been enough; this one places from out here, so the geometry
+            // change it produces would otherwise wait for the next unrelated request — the same
+            // gap the input path had in Part A.
+            drain_stack_events(srv);
             if configure_window(srv, window, width, height, origin) {
+                if let Some(r) = moved.filter(|r| !r.is_empty()) {
+                    repaint_region(srv, fb, r);
+                }
                 if became_visible || was_held {
                     // Newly drawable, and newly a focus candidate — see `release_configure`.
                     let r = srv.stack.window(window).map(|w| w.bounds());
@@ -1822,10 +1861,11 @@ fn current_layout(srv: &Server) -> librsproto::surface::MgrLayout {
 
 /// Tell the manager when the work area is not what it was.
 ///
-/// **Compared rather than triggered.** A strut changes for several reasons — a panel created,
-/// destroyed, resized, or re-placed — and reporting each of those causes separately would mean
-/// finding every one of them and being wrong about the next. What a manager needs to know is
-/// that the answer changed, which is one comparison against the last answer given.
+/// **Compared rather than triggered**, and the comparison is the whole design: what a manager
+/// needs to know is that the answer changed, not why. Today only a panel appearing or going away
+/// can change it — a window's role, and so its strut, is written once at creation — so a
+/// cause-driven version would have exactly two triggers and would silently grow a third the day
+/// a strut becomes settable.
 fn announce_layout(srv: &mut Server) {
     let now = current_layout(srv);
     if srv.last_layout == Some(now) {

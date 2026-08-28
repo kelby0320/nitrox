@@ -394,7 +394,7 @@ pub enum MgrEvent {
         /// Whether it now has the keyboard.
         focused: bool,
     },
-    /// The work area changed — a panel's strut appeared, went away or moved.
+    /// The work area is not what it was last announced to be.
     LayoutChanged(librsproto::surface::MgrLayout),
     /// A client asked to be minimised, maximised or restored.
     ///

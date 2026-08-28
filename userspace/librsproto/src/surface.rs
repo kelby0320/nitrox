@@ -863,9 +863,14 @@ pub const OP_MGR_QUERY_LAYOUT: u16 = 0x0921;
 
 /// `Manage::LayoutChanged` — a manager event: the work area is not what it was.
 ///
-/// Body: [`MgrLayout`]. Sent when a strut appears, disappears or moves — a panel created,
-/// destroyed, resized or re-placed. A manager that maximised a window against the old numbers
-/// would be leaving it under a panel, and nothing else would report it.
+/// Body: [`MgrLayout`]. Sent when the work area **differs from the one last announced**, not on
+/// any particular cause. A manager that maximised a window against the old numbers would be
+/// leaving it under a panel, and nothing else would report it.
+///
+/// Today only a panel appearing or going away can change the answer — a window's role, and so
+/// its strut, is fixed at creation — but the comparison is deliberately blind to that: it stays
+/// correct if a strut ever becomes settable, which is the kind of change that otherwise quietly
+/// stops an event firing.
 pub const OP_MGR_LAYOUT_CHANGED: u16 = 0x0922;
 
 /// `Manage::WindowStateRequest` — a manager event: a client asked to be minimised or maximised.

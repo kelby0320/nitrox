@@ -574,6 +574,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // manager's, and the reply says the compositor forwarded the question rather than that
         // anything happened — a shell may decide otherwise, and this terminal will find out the
         // way it finds out about any other geometry, through `Configure`.
+        // **Taken before the window is looked up, deliberately** — the same shape as the move
+        // request above. A request for a window that has gone is dropped rather than retried:
+        // there is nothing to ask about, and holding it would mean asking on behalf of a window
+        // whose id the compositor may have moved past.
         if let Some(state) = app.take_state_request()
             && let Some(mut w) = win.window(window_id)
         {

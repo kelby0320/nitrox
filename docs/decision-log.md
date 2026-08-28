@@ -19357,3 +19357,42 @@ now prints the arguments it is about to send, inside the function that sends the
 read once, by the code that puts it on the wire. This is PR #238's finding — "the log sits beside
 the send" is a proximity argument, and proximity is not identity — reached by a different route,
 which is worth recording because the route will come again.
+
+### PR #249 review — a dedup that only one of two writers updated, and a `Configure` that never placed
+
+**The minimise button worked once.** `RequestState` drops a repeat of the state a window last
+*asked* for, which bounds a looping client — and the compositor was the only writer of that
+shadow, while the *manager* changes a window's state by four other routes: a taskbar click, a
+chord, the overview, a `Configure`. After any of those the shadow was stale, so the next
+identical request was dropped as a repeat, the client was told it had succeeded, and nothing
+anywhere reported the loss. `check-login` performed steps one and two of that sequence and
+stopped, so it could not see it.
+
+The shadow is cleared wherever a manager op names a window — one place, after `dispatch`, so the
+next manager op added cannot forget to — and the gate now presses minimise a *second* time after
+restoring from the taskbar. Removing the clear fails it.
+
+**And `Manage::Configure` never applied its origin, while two places said it did.** The op carries
+`x`/`y` "because a manager's answer to *where does this go* is a placement", and the compositor's
+own comment told managers to use it rather than `Place` followed by `Configure` — but the only
+writers of a window's origin were `Place` and the drag path, so the position reached the client as
+information and was never applied to the stack. Part B is the first production caller: maximise
+would have resized a window it could not move, leaving it hanging off the screen from wherever it
+had been dragged. Invisible in the gate because the terminal was already at the work-area origin.
+
+It places now, through `place` — so a `Configure` for a window the user is dragging is refused
+with `WouldBlock` exactly as `Place` is — and the spec says which half is a request and which is
+applied: **the origin takes effect when the compositor accepts it, the size when the client
+commits it.** Position is the compositor's to decide and size is the client's to allocate.
+
+**That arm also needed its own drain**, which is the same latent gap Part A found in the input
+path: every other manager op mutates inside `dispatch`, so the one drain after it has always
+sufficed; this one places from outside, and the geometry change waited for an unrelated request.
+
+**A correction to something this milestone wrote down twice.** `LayoutChanged`'s doc named four
+causes — a panel created, destroyed, re-placed or resized. A window's role, and therefore its
+strut, is written once at creation, so two of those four cannot occur. The compare-the-answer
+design is right and is *why* the enumeration was wrong to write: it invited a reader to trust a
+list the code never consulted. The spec now says the work area is the screen minus **every**
+panel's reservation — including a minimised or uncommitted one — because a strut is a declaration
+about space rather than a consequence of being drawn.

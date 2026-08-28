@@ -1809,7 +1809,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // is that the ask reached the shell and that the shell answered with the *work area* rather
     // than the screen. Part D's gate is where the window itself is asserted.
     click_at(&mut qmp, &mut session, maximise_at.0, maximise_at.1)?;
-    session.expect(&format!("nxterm: asked the shell for window state 2"))?;
+    session.expect("nxterm: asked the shell for window state 2")?;
     session.expect(&format!(
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
         work.0, work.1, work.2, work.3
@@ -1828,6 +1828,19 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     // Restore it from the list, which is where a minimized window comes back from, so the steps
     // below have a window to work with.
+    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    session.expect("desktop-shell: raised window ")?;
+
+    // **And minimise it a second time**, which is the step that was missing. The compositor drops
+    // a request for the state a window last *asked* to be in, to keep a looping client off a
+    // bounded queue — and the taskbar restore above is a `SetMinimized` from the *manager*, which
+    // does not go through that path. With the shadow left stale, this second press was dropped as
+    // a repeat, the client was told it had succeeded, and the button stayed dead until some other
+    // state was asked for first (PR #249 review, blocking 1).
+    click_at(&mut qmp, &mut session, minimise_at.0, minimise_at.1)?;
+    session.expect("nxterm: asked the shell for window state 1")?;
+    session.expect(&format!("desktop-shell: client asked to minimize window {term_id}"))?;
+    println!("  ok: the minimise button still works after the taskbar restored the window");
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
     session.expect("desktop-shell: raised window ")?;
 
@@ -2190,6 +2203,29 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         term_y + DRAG_STEPS * DRAG_DY
     ))?;
     println!("  ok: the terminal moved with its own title bar, offset by where it was grabbed");
+
+    // **And maximising it now *moves* it, which is the half a `Configure` was not applying.**
+    // The window is at (40, …) after the drag, so a maximise that only carried a size would
+    // resize it in place and leave it hanging off the screen. The compositor applies the origin
+    // as `Place` would — the size is still the client's to decline, and `nxterm` does until
+    // Part D, so this asserts the *origin* the geometry event reports (PR #249 review,
+    // blocking 2).
+    //
+    // The button is at the window's top-right, and the window has moved: its origin is
+    // `DRAG_STEPS * DRAG_DX` across and `term_y + DRAG_STEPS * DRAG_DY` down.
+    let moved_x = DRAG_STEPS * DRAG_DX;
+    let moved_y = term_y + DRAG_STEPS * DRAG_DY;
+    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 13, moved_y + 13)?;
+    session.expect("nxterm: asked the shell for window state 2")?;
+    session.expect(&format!(
+        "desktop-shell: maximize window {term_id} to {},{} {}x{}",
+        work.0, work.1, work.2, work.3
+    ))?;
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} ",
+        work.0, work.1
+    ))?;
+    println!("  ok: maximise moved the window to the work area's origin, not only resized it");
 
     // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
