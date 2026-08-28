@@ -21,7 +21,7 @@ use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
     MgrDesktop, MgrHotkey, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE,
     OP_MGR_CLOSE, OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE,
-    OP_MGR_REGISTER_HOTKEY,
+    OP_MGR_REGISTER_HOTKEY, OP_MGR_REGISTER_SNAP_ZONE,
     OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED,
     OP_MGR_SET_WINDOW_DESKTOP,
 };
@@ -72,6 +72,13 @@ pub enum MgrOutcome {
     /// separate from a direct call because the table is the router's — this module is given a
     /// `WindowStack` and nothing else, which is what keeps it host-testable.
     RegisterHotkey(MgrHotkey),
+    /// A snap zone the caller must give to the input router.
+    ///
+    /// Separate from `RegisterHotkey` because the two tables answer different questions and are
+    /// kept apart on purpose — one matches keystrokes, the other matches a pointer during a
+    /// drag — and because registering a zone id that already exists *replaces* it, where a
+    /// duplicate chord id is refused. See `RegisterSnapZone` (M9 Part F).
+    RegisterZone(librsproto::surface::MgrSnapZone),
     /// A `Configure` the caller must forward to the window's client.
     ///
     /// Not performed here because it is a message to a *third* party — the manager asked, the
@@ -247,6 +254,14 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
             // router, which this module holds no reference to — the same reason `Configure` is
             // handed back: it is not the stack's to change.
             MgrOutcome::RegisterHotkey(hk)
+        }
+        OP_MGR_REGISTER_SNAP_ZONE => {
+            let Some(z) = librsproto::surface::MgrSnapZone::read(body) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            // Handed back for the reason a chord is: the table lives in the input router, and
+            // this module is given a `WindowStack` and nothing else.
+            MgrOutcome::RegisterZone(z)
         }
         _ => MgrOutcome::Failed(SurfaceError::Malformed),
     }

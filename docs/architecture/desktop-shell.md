@@ -2,7 +2,7 @@
 
 ## Status
 
-**Partly built, and checked 2026-08-29** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-08-30** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar;
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
@@ -50,9 +50,14 @@ here as requests: `Surface::RequestState` becomes a `SetMinimized` or a `Configu
 not cover the bars — and a drag becomes `Surface::StartMove`, which the compositor performs
 itself while the shell watches the geometry go by. **Dragging a window's corner** is the same
 division seen from the other side (Part E): the compositor runs the gesture and draws an outline,
-and hands the shell one `ResizeEnded` at the release — which the shell answers with the
-`Configure` it would have sent anyway, because resizing a client is the manager's and there is
-one path to a window's geometry rather than two that can disagree. Closing is the pair the milestone added at
+and hands the shell one `DragEnded` at the release — which the shell answers with the `Configure`
+it would have sent anyway, because changing a window's geometry is the manager's and there is one
+path to it rather than two that can disagree. **Snapping** (Part F) is that same event reached a
+different way: the shell registers eight `SnapZone`s computed from the work area — four edges,
+four corners, a 24-pixel band — and re-registers all of them whenever the work area changes,
+because the zones *are* the work area. A window dropped in one takes that zone's target: half the
+work area for an edge, a quarter for a corner. The compositor previews the target under the
+pointer and matches the table; which region means which rectangle never reaches it. Closing is the pair the milestone added at
 both ends: a client's own close button ends the client, and the window list's middle-click sends
 `Manage::RequestClose` — an *ask*, which a client with unsaved work could answer with a dialog —
 followed by `Manage::Close` two seconds later if nothing happened. **The insist is not exercised

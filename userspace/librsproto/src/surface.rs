@@ -907,23 +907,29 @@ pub const OP_MGR_CLOSE: u16 = 0x0925;
 /// maximised is a rectangle the manager restores from and a second copy here could disagree.
 pub const OP_MGR_WINDOW_STATE_REQUEST: u16 = 0x0923;
 
-/// `Manage::ResizeEnded` — **server → manager. Unsolicited, no reply.**
+/// `Manage::DragEnded` — **server → manager. Unsolicited, no reply.**
 ///
-/// Body: a [`ConfigureEvent`], carrying the window and the rectangle the user let go at.
+/// Body: a [`ConfigureEvent`], carrying the window and the rectangle the gesture asks for.
 ///
-/// **One event for a whole gesture**, sent when the button comes up on an interactive resize the
-/// compositor was running ([`StartResize`](OP_START_RESIZE)). Nothing is sent per motion: the
-/// manager's queue does not coalesce and evicts its oldest when full, so a five-second drag at
-/// 100 Hz would push a `WindowCreated` off the front and leave the shell with a window it will
-/// never place and never hear about again. The outline the user sees while dragging is the
-/// compositor's own drawing and crosses no wire at all.
+/// **One event for a whole gesture**, sent when the button comes up. Two gestures produce it and
+/// they mean the same thing to a manager: an interactive **resize** ([`StartResize`](OP_START_RESIZE))
+/// asks for the rectangle the user let go at, and an interactive **move** released inside a
+/// registered [snap zone](OP_MGR_REGISTER_SNAP_ZONE) asks for that zone's target. The name says
+/// *drag* rather than *resize* because a manager's answer does not depend on which it was — it
+/// was `ResizeEnded` for one part, before the second gesture that produces it existed (M9 Part F).
+///
+/// Nothing is sent per motion: the manager's queue does not coalesce and evicts its oldest when
+/// full, so a five-second drag at 100 Hz would push a `WindowCreated` off the front and leave the
+/// shell with a window it will never place and never hear about again. The outline the user sees
+/// while dragging — the resize's rectangle, or the zone's target previewed under the pointer — is
+/// the compositor's own drawing and crosses no wire at all.
 ///
 /// **It carries a `ConfigureEvent` because that is what the manager sends back.** The shell's
 /// whole answer is `Manage::Configure` with these five numbers — the compositor deliberately
 /// does not apply them itself, so there is one path to a window's geometry rather than two that
 /// can disagree, and a shell that decided the window may not have that rectangle is behaving
-/// correctly (M9 Part E).
-pub const OP_MGR_RESIZE_ENDED: u16 = 0x0926;
+/// correctly.
+pub const OP_MGR_DRAG_ENDED: u16 = 0x0926;
 /// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
 ///
 /// A manager request rather than a client one because any application able to register `Super`
@@ -936,6 +942,32 @@ pub const OP_MGR_HOTKEY: u16 = 0x091F;
 /// Bounded because everything else here is. Sixteen covers a launcher chord plus switching and
 /// moving across the single-digit desktops, which is what M8's shell binds.
 pub const MAX_HOTKEYS: usize = 16;
+
+/// `Manage::RegisterSnapZone` — a region of the screen, and the rectangle a window dropped in it
+/// takes.
+///
+/// **A table the compositor matches against, exactly as [`RegisterHotkey`](OP_MGR_REGISTER_HOTKEY)
+/// gave it chords it does not understand.** During an interactive move the compositor tests the
+/// pointer against this table, shows the matching zone's *target* as the outline, and — if the
+/// button comes up inside one — hands the manager that rectangle. The policy is entirely in the
+/// numbers: which region means which rect, and how close counts, are the manager's to compute and
+/// re-register. The compositor evaluates a lookup and knows nothing about halves or corners
+/// (M9 Part F).
+///
+/// **Registering an existing id replaces it**, which is where this differs from a chord — and the
+/// difference is what the two tables are. A chord table is a set of *distinct* chords, so a
+/// duplicate id is a manager confusing itself and is refused. A zone table is a **layout**: it is
+/// recomputed wholesale whenever the work area changes, and a manager re-registering the same
+/// eight ids with new rectangles is doing the ordinary thing rather than a mistake.
+pub const OP_MGR_REGISTER_SNAP_ZONE: u16 = 0x0927;
+
+/// How many snap zones the compositor holds at once.
+///
+/// Bounded for the reason [`MAX_HOTKEYS`] is: it arrives off the wire and is held for the
+/// manager's life. Eight is the shape a desktop uses — four edges and four corners — and this
+/// leaves room for a shell that wants a few more without being a table a manager can grow
+/// without limit.
+pub const MAX_SNAP_ZONES: usize = 16;
 /// `Manage::SetCurrentDesktop` — switch which desktop is composited.
 ///
 /// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every other manager
@@ -1183,6 +1215,69 @@ pub struct MgrHotkey {
     pub mods: u16,
     /// The keycode, in the table `libkern::abi` mirrors.
     pub code: u16,
+}
+
+/// A snap zone: the region that triggers it, and the rectangle a window dropped there takes.
+///
+/// Both in screen coordinates. See [`RegisterSnapZone`](OP_MGR_REGISTER_SNAP_ZONE).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrSnapZone {
+    /// Manager-chosen identity. **Never zero** — reserved so a zeroed body registers nothing.
+    pub id: u32,
+    /// Where the pointer has to be, in screen coordinates.
+    pub trigger_x: i32,
+    /// See [`trigger_x`](Self::trigger_x).
+    pub trigger_y: i32,
+    /// See [`trigger_x`](Self::trigger_x).
+    pub trigger_w: u32,
+    /// See [`trigger_x`](Self::trigger_x).
+    pub trigger_h: u32,
+    /// What the window becomes, in screen coordinates.
+    pub target_x: i32,
+    /// See [`target_x`](Self::target_x).
+    pub target_y: i32,
+    /// See [`target_x`](Self::target_x).
+    pub target_w: u32,
+    /// See [`target_x`](Self::target_x).
+    pub target_h: u32,
+}
+
+impl MgrSnapZone {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 36 {
+            return None;
+        }
+        put_u32(out, 0, self.id);
+        put_u32(out, 4, self.trigger_x as u32);
+        put_u32(out, 8, self.trigger_y as u32);
+        put_u32(out, 12, self.trigger_w);
+        put_u32(out, 16, self.trigger_h);
+        put_u32(out, 20, self.target_x as u32);
+        put_u32(out, 24, self.target_y as u32);
+        put_u32(out, 28, self.target_w);
+        put_u32(out, 32, self.target_h);
+        Some(36)
+    }
+
+    /// Parse from the first 36 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 36 {
+            return None;
+        }
+        Some(Self {
+            id: get_u32(b, 0),
+            trigger_x: get_u32(b, 4) as i32,
+            trigger_y: get_u32(b, 8) as i32,
+            trigger_w: get_u32(b, 12),
+            trigger_h: get_u32(b, 16),
+            target_x: get_u32(b, 20) as i32,
+            target_y: get_u32(b, 24) as i32,
+            target_w: get_u32(b, 28),
+            target_h: get_u32(b, 32),
+        })
+    }
 }
 
 impl MgrHotkey {

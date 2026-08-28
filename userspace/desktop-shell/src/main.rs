@@ -1318,6 +1318,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         .s(b"x")
         .u(layout.screen_h as u64)
         .end();
+    // **And the snap zones the work area implies** (M9 Part F). Registered here rather than
+    // computed by the compositor: which region means which rectangle is policy, and the
+    // compositor's whole part is to match a pointer against a table it was given.
+    if let Some(m) = manager.as_mut() {
+        register_snap_zones(m, &layout);
+    }
+
     // Where a maximised window came from, so restoring it has somewhere to go.
     //
     // **The shell's, not the compositor's.** A `maximized` flag there would be a second source
@@ -1485,7 +1492,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
                 alloc::vec::Vec::new();
-            let mut resized: alloc::vec::Vec<librsproto::surface::ConfigureEvent> =
+            let mut dropped: alloc::vec::Vec<librsproto::surface::ConfigureEvent> =
                 alloc::vec::Vec::new();
             list_dirty |= place_new_windows(
                 m,
@@ -1495,24 +1502,26 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut fired,
                 &mut layout,
                 &mut states,
-                &mut resized,
+                &mut dropped,
                 &mut restore,
                 current_desktop,
             );
 
             // **A gesture the user finished, answered with the `Configure` it asked for**
-            // (M9 Part E). The compositor drew the outline and applied nothing: resizing a
-            // client is this process's, so there is one path to a window's geometry rather than
-            // two that can disagree. What arrives is the rectangle the user let go at, and the
-            // answer is the same request a maximise sends — which is why the event carries a
+            // (M9 Parts E and F). The compositor drew the outline and applied nothing: changing
+            // a window's geometry is this process's, so there is one path to it rather than two
+            // that can disagree. What arrives is the rectangle the gesture asks for — where a
+            // resize was let go, or the target of the zone a move was dropped in — and the
+            // answer is the same request a maximise sends, which is why the event carries a
             // `ConfigureEvent` and this is a loop rather than a translation.
-            for c in resized {
-                // **A resized window is no longer the one that was maximised.** Its restore
-                // rectangle described where it came from before a maximise it has now left by
-                // hand; keeping it would make the next restore put it somewhere it never was.
+            for c in dropped {
+                // **A window the user has resized or snapped is no longer the one that was
+                // maximised.** Its restore rectangle described where it came from before a
+                // maximise it has now left by hand; keeping it would make the next restore put
+                // it somewhere it never was.
                 restore.retain(|(id, _)| *id != c.window);
                 sent_request = true;
-                configure_window(m, c.window, c.x, c.y, c.width, c.height, b"resize");
+                configure_window(m, c.window, c.x, c.y, c.width, c.height, b"drop");
             }
             // **What a client asked to be, decided here.** The compositor forwarded the
             // question and applied nothing: minimising is a manager request and maximising is a
@@ -2345,6 +2354,84 @@ fn insist_on_close(mgr: &mut ChannelTransport, window: u32) -> bool {
 /// **A request, and the reply says only that the compositor forwarded it.** Whether the client
 /// adopts the size is the client's: declining is legal and stays legal, and a window that
 /// declines simply goes on committing what it has.
+/// How wide the band along each screen edge that triggers a snap is, in pixels.
+///
+/// **Policy, and it lives here rather than in the compositor** — which is the whole point of a
+/// registered table: the compositor tests the pointer against rectangles and knows nothing about
+/// edges, halves or how close counts. Wide enough to reach by throwing a window at the edge,
+/// narrow enough not to fire while dragging a window that happens to end up near one.
+const SNAP_BAND: u32 = 24;
+
+/// Register the eight snap zones — four edges and four corners — for `work`.
+///
+/// **Recomputed and re-registered wholesale**, which is why the ids are fixed and registering an
+/// existing id replaces it: the zones *are* the work area, so a bar appearing or going away
+/// makes every one of them wrong at once. A shell that registered them once at startup would
+/// snap windows over its own bars for the rest of the session.
+///
+/// The targets are the policy: half the work area for an edge, a quarter for a corner. The
+/// compositor never learns that — it matches a pointer against a rectangle and reports the one
+/// it matched.
+fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) -> bool {
+    use librsproto::surface::{MgrSnapZone, OP_MGR_REGISTER_SNAP_ZONE};
+    let (x, y, w, h) = (work.work_x, work.work_y, work.work_w, work.work_h);
+    let (hw, hh) = (w / 2, h / 2);
+    let band = SNAP_BAND.min(w.max(1)).min(h.max(1));
+    let b = band as i32;
+    // `(id, trigger, target)`. Corners first: they overlap the edges, and the compositor takes
+    // the **first** match — so the more specific zone has to come first, and that ordering is
+    // the manager's to get right because the manager wrote the table.
+    let zones = [
+        (1u32, (x, y, band, band), (x, y, hw, hh)),
+        (2, (x + w as i32 - b, y, band, band), (x + hw as i32, y, w - hw, hh)),
+        (3, (x, y + h as i32 - b, band, band), (x, y + hh as i32, hw, h - hh)),
+        (
+            4,
+            (x + w as i32 - b, y + h as i32 - b, band, band),
+            (x + hw as i32, y + hh as i32, w - hw, h - hh),
+        ),
+        (5, (x, y, band, h), (x, y, hw, h)),
+        (6, (x + w as i32 - b, y, band, h), (x + hw as i32, y, w - hw, h)),
+        (7, (x, y, w, band), (x, y, w, hh)),
+        (8, (x, y + h as i32 - b, w, band), (x, y + hh as i32, w, h - hh)),
+    ];
+    let mut all = true;
+    for (id, t, g) in zones {
+        let z = MgrSnapZone {
+            id,
+            trigger_x: t.0,
+            trigger_y: t.1,
+            trigger_w: t.2,
+            trigger_h: t.3,
+            target_x: g.0,
+            target_y: g.1,
+            target_w: g.2,
+            target_h: g.3,
+        };
+        let mut body = [0u8; 36];
+        let mut reply = [0u8; 8];
+        let ok = z.write(&mut body).is_some()
+            && mgr.request(OP_MGR_REGISTER_SNAP_ZONE, &body, None, &mut reply).is_ok();
+        if !ok {
+            Line::new().s(b"desktop-shell: snap zone ").u(id as u64).s(b" was refused").end();
+            all = false;
+        }
+    }
+    if all {
+        Line::new()
+            .s(b"desktop-shell: snap zones registered for work area ")
+            .i(x as i64)
+            .s(b",")
+            .i(y as i64)
+            .s(b" ")
+            .u(w as u64)
+            .s(b"x")
+            .u(h as u64)
+            .end();
+    }
+    all
+}
+
 fn configure_window(
     mgr: &mut ChannelTransport,
     window: u32,
@@ -3156,14 +3243,14 @@ fn place_new_windows(
     fired: &mut alloc::vec::Vec<u32>,
     layout: &mut MgrLayout,
     states: &mut alloc::vec::Vec<librsproto::surface::WindowState>,
-    resized: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
+    dropped: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
     restore: &mut alloc::vec::Vec<(u32, (i32, i32, u32, u32))>,
     current: u32,
 ) -> bool {
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
         OP_MGR_LAYOUT_CHANGED, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-        OP_MGR_RESIZE_ENDED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
+        OP_MGR_DRAG_ENDED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
         OP_MGR_WINDOW_STATE_REQUEST, OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
     };
     let mut dirty = false;
@@ -3201,6 +3288,10 @@ fn place_new_windows(
                 // not ask for.
                 if let Some(l) = MgrLayout::read(&buf[..n]) {
                     *layout = l;
+                    // **The zones are the work area**, so a strut appearing makes all eight
+                    // wrong at once — and a shell that registered them once at startup would
+                    // snap windows over its own bars for the rest of the session (M9 Part F).
+                    register_snap_zones(mgr, &l);
                     Line::new()
                         .s(b"desktop-shell: work area now ")
                         .i(l.work_x as i64)
@@ -3223,15 +3314,16 @@ fn place_new_windows(
                 }
                 continue;
             }
-            OP_MGR_RESIZE_ENDED => {
-                // **The one event a whole resize gesture produces** (M9 Part E). The compositor
-                // ran the drag and drew the outline; it did not resize anything, because
-                // resizing a client is the manager's — so this is a request and the answer is
-                // the `Configure` this shell would have sent anyway. Collected rather than
-                // answered here for the reason a state request is: sending manager requests
-                // belongs where the shell's own state lives.
+            OP_MGR_DRAG_ENDED => {
+                // **The one event a whole gesture produces** (M9 Parts E and F). Two produce it
+                // — a resize, and a move released in a snap zone — and they mean the same thing
+                // here: a rectangle somebody asked for. The compositor ran the drag and drew
+                // the outline; it changed no geometry, because that is the manager's — so this
+                // is a request and the answer is the `Configure` this shell would have sent
+                // anyway. Collected rather than answered here for the reason a state request
+                // is: sending manager requests belongs where the shell's own state lives.
                 if let Some(c) = librsproto::surface::ConfigureEvent::read(&buf[..n]) {
-                    resized.push(c);
+                    dropped.push(c);
                 }
                 continue;
             }

@@ -19721,3 +19721,54 @@ the clipping and the draw-into-every-damage-rectangle rule now have the cursor's
 Writing them found a fourth thing: the first version of the clip test used a clip *inside* a large
 outline, which intersects no strip, so it asserted nothing — caught by its own "something must
 have been drawn" line rather than by a control.
+
+---
+
+## 2026-08-30 — M9 Part F: the compositor matches a table it was handed, and Milestone 9 closes
+
+Snapping is the last of the milestone's gestures and the one with the least new mechanism in it,
+because Parts E and F are the same machinery reached two ways. The compositor already ran a drag,
+already drew an outline over the composed stack, and already had one event for handing a manager a
+rectangle at the release. What Part F adds is a *table*: eight rectangles the shell computes from
+the work area, and a lookup the compositor performs without knowing what any of them mean.
+
+**The policy is in the numbers, and that is the whole design.** Half the work area for an edge, a
+quarter for a corner, a 24-pixel band to trigger it: every one of those lives in `desktop-shell`,
+in the arithmetic that fills the table. The compositor tests a point against rectangles, shows the
+matching one's *target* as the outline, and reports it if the button comes up there. It cannot be
+wrong about halves because it has never heard of them — the same shape `RegisterHotkey` gave it
+chords it does not understand, and the reason snap policy can be changed without touching this
+process at all.
+
+**Registering an existing zone id replaces it, where a duplicate chord id is refused**, and the
+difference is what the two tables are rather than an inconsistency. A chord table is a set of
+distinct chords: a duplicate id is a manager confusing itself, and the compositor telling it so is
+the useful answer. A zone table is a *layout* — the zones **are** the work area, so a panel
+appearing makes all eight wrong at once, and a shell recomputes and re-registers them wholesale. A
+refusal there would leave it holding zones for a screen that had changed shape with no way to say
+so.
+
+**Part E's `ResizeEnded` is now `DragEnded`.** That review approved leaving the zone identifier off
+the event, at the acknowledged cost that Part F might change the wire format of an event Part E had
+just added. The cost arrived, and it was the *name*: a resize release and a snap drop ask the same
+question, and a manager's answer does not depend on which it was. The zone field is still absent,
+still for the reason given then — the rectangle is what a manager acts on, and the zone that
+produced it is derivable from a table the manager itself wrote.
+
+**The gate's control had to become a step of its own.** "A drag that passes through a zone without
+releasing in it snaps nothing" cannot be asserted by absence: the step after it produces exactly
+the line whose absence would be checked, and an `expect` scans forward. So the pass-through asserts
+what must happen *instead* — the ordinary move's geometry — and the press that follows is asserted
+to land on the window's title bar, which is where a wrongly-snapped window would not be. Run
+against a compositor that does not clear the zone when the pointer leaves it: it fails there.
+
+**And the gate had to slow down, which is Part E's rule working.** The first version injected
+thirty-six motions as fast as QMP would take them; the consumer ring overran, `input-server`
+announced the gap, `libinput` made it a `Logical::Dropped`, and the gesture ended without asking
+for anything — exactly what Part E's review required, arriving as a gate that lost its own drag. A
+person dragging a window produces nothing like that rate. The harness slows down; the rule stays.
+
+**Milestone 9 is complete**: decorations are the client's, the drag is the compositor's, what a
+drag *means* is the shell's, and a window can now be moved, minimised, maximised, restored,
+closed, resized and snapped — every one of them by a gesture a person makes, gated end to end on
+the release image.
