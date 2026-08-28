@@ -263,10 +263,11 @@ struct Server {
     screen: Rect,
     /// The layout last announced to the manager, so a change can be told from a repeat.
     last_layout: Option<librsproto::surface::MgrLayout>,
-    /// The interactive-resize outline's rectangle, or `None` when no resize is running.
+    /// The gesture outline's rectangle, or `None` when nothing is drawing one.
     ///
-    /// **Held here rather than asked of the router**, because every repaint needs it and
-    /// `repaint_region` takes the server immutably: it is the same shape as the cursor's
+    /// **Written by two gestures**: a resize's own rectangle, and the target a move is previewing
+    /// over a snap zone. **Held here rather than asked of the router**, because every repaint
+    /// needs it and `repaint_region` takes the server immutably — the same shape as the cursor's
     /// position, which is drawn over the composed stack by the same call.
     outline: Option<Rect>,
     /// The window last told it has the keyboard, if any.
@@ -884,11 +885,11 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
                 None => unserialisable(b"WindowStateRequest"),
             }
         }
-        MgrEvent::ResizeEnded(g) => {
+        MgrEvent::DragEnded(g) => {
             let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
             match g.write(&mut body) {
-                Some(n) => send_input(ch, librsproto::surface::OP_MGR_RESIZE_ENDED, &body[..n]),
-                None => unserialisable(b"ResizeEnded"),
+                Some(n) => send_input(ch, librsproto::surface::OP_MGR_DRAG_ENDED, &body[..n]),
+                None => unserialisable(b"DragEnded"),
             }
         }
         MgrEvent::Title { window, title } => {
@@ -1136,7 +1137,7 @@ fn route_one_batch(
                         .end();
                     mgr_emit(
                         srv,
-                        MgrEvent::ResizeEnded(librsproto::surface::ConfigureEvent {
+                        MgrEvent::DragEnded(librsproto::surface::ConfigureEvent {
                             window,
                             width: rect.size.w,
                             height: rect.size.h,
@@ -1669,6 +1670,44 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             announce_focus(srv);
             reply_on_session(ch, op, request_id, &[]);
         }
+        MgrOutcome::RegisterZone(z) => {
+            // **Applied here because the table is the router's**, like a chord — and *replacing*
+            // rather than refusing an id already registered, because a zone table is a layout a
+            // shell recomputes whenever the work area changes rather than a set of distinct
+            // things (M9 Part F).
+            match srv.router.register_zone(z) {
+                Ok(disturbed) => {
+                    // A registration that replaced the zone a drag is previewing moves the
+                    // outline with it; anything else disturbs no pixels.
+                    if let Some(o) = disturbed {
+                        srv.outline = o.now;
+                        for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges)
+                        {
+                            if !r.is_empty() {
+                                repaint_region(srv, fb, r);
+                            }
+                        }
+                    }
+                    Line::new()
+                        .s(b"compositor: snap zone ")
+                        .u(z.id as u64)
+                        .s(b" registered, target ")
+                        .i(z.target_x as i64)
+                        .s(b",")
+                        .i(z.target_y as i64)
+                        .s(b" ")
+                        .u(z.target_w as u64)
+                        .s(b"x")
+                        .u(z.target_h as u64)
+                        .end();
+                    reply_on_session(ch, op, request_id, &[]);
+                }
+                Err(_) => {
+                    kprint(b"compositor: a snap zone registration was refused\n");
+                    reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
+                }
+            }
+        }
         MgrOutcome::RegisterHotkey(hk) => {
             // **Applied here because the table is the router's**, and answered with the same
             // empty body every other manager request gets: the manager chose the id, so there
@@ -1815,6 +1854,21 @@ fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
     // silently reaches nothing for the life of the compositor, and a replacement manager
     // inherits the dead one's ids and is refused its own (PR #241 review, finding 3).
     srv.router.clear_hotkeys();
+    // **And the snap zones**: they are a layout the departed manager computed from a work area
+    // it was watching, and a replacement manager inherits nothing it did not register.
+    //
+    // **Unlike the chord table, this one can be drawing something.** A shell exiting while the
+    // user is mid-drag over a zone leaves a previewed rectangle on the screen — and every path
+    // that would take it down is gated on the zone the table no longer has, so it would be
+    // re-drawn by every later compose for the life of the process (PR #254 review, blocking 1).
+    if let Some(o) = srv.router.clear_zones() {
+        srv.outline = o.now;
+        for r in o.was.into_iter().flat_map(compositor::outline_edges) {
+            if !r.is_empty() {
+                repaint_region(srv, fb, r);
+            }
+        }
+    }
     // **Every window it was going to place is shown now, not after the deadline.** The clients
     // holding those windows are blocked, and waiting out a timer for a manager that has
     // demonstrably gone is latency bought for nothing.

@@ -2526,7 +2526,8 @@ dependency cut in two rather than two independent things.
       **edge strips**, not the rectangle: the union of where an outline was and where it is is
       very nearly the window, and repainting that per motion is the ~100 ms recompose that
       starves input. On button-up one `ResizeEnded` goes to the manager and the shell sends the
-      `Configure`; the compositor never resizes a client.
+      `Configure`; the compositor never resizes a client. (Renamed `DragEnded` in Part F, when a
+      second gesture started producing it.)
 
 - [x] **Gate** ✅ — `check-login` step 6j drags the maximised terminal's corner inward and asserts
       the mechanism in the order it happens: the compositor took the gesture and says which
@@ -2559,20 +2560,44 @@ dependency cut in two rather than two independent things.
 
 ### Part F — snap to edge and corner
 
-- [ ] **`Manage::RegisterSnapZone`** — the shell computes eight zones from the work area (four
-      edges, four corners), registers them, and re-registers when the work area changes. A table
-      the compositor matches against, exactly as `RegisterHotkey` gave it chords it does not
-      understand.
+- [x] **`Manage::RegisterSnapZone`** ✅ — the shell computes eight zones from the work area (four
+      edges, four corners), registers them at startup, and re-registers all eight on
+      `LayoutChanged`. A table the compositor matches against, exactly as `RegisterHotkey` gave it
+      chords it does not understand: first match wins, and the ordering — corners before edges —
+      is the manager's because the manager wrote the table.
 
-- [ ] **The gesture**: a move-drag whose pointer enters a zone shows that zone's target as the
-      outline; a release inside one ends the drag with that zone named, and the shell sends the
-      `Configure`. Half the work area for an edge, a quarter for a corner — which is policy, and
-      lives entirely in the numbers the shell put in the table.
+      **Registering an existing id replaces it**, which is where a zone differs from a chord and
+      the difference is what the two tables *are*. A chord table is a set of distinct chords, so a
+      duplicate id is a manager confusing itself. A zone table is a layout: the zones are the work
+      area, so a panel appearing makes all eight wrong at once, and a refusal would leave a shell
+      holding zones for a screen that has changed shape with no way to say so.
 
-- [ ] **Gate**: drag to the left edge, release, and assert the committed geometry equals the left
-      half of the **work area** — the assertion that fails if the zones were computed against the
-      screen and the window covers the bars. The control is a drag that passes *through* a zone
-      without releasing in it: it must snap nothing.
+- [x] **The gesture** ✅ — a move-drag whose pointer enters a zone shows that zone's *target* as
+      the outline, and a release inside one asks for that rectangle. Half the work area for an
+      edge, a quarter for a corner, `SNAP_BAND` (24 px) wide: all of it numbers the shell put in
+      the table, and none of it reachable from the compositor, which matches a pointer against a
+      rectangle and reports the one it matched.
+
+      **One event, renamed.** Part E's `ResizeEnded` becomes `Manage::DragEnded`: a resize release
+      and a snap drop ask the same question and the shell's answer does not depend on which it
+      was. The wire change Part E's review anticipated turned out to be the *name*, not the zone
+      field — which is still absent, and still for the reason given there.
+
+- [x] **Gate** ✅ — `check-login` steps 6k1 and 6k2. The drop asserts the committed geometry is
+      half the **work area** at its origin; the control that the zones were computed from the
+      screen was run and fails at exactly that line.
+
+      **The control is a step of its own with a positive assertion**: a drag that passes through
+      the zone and is released outside it must produce the *ordinary move's* geometry. Asserting
+      the absence of a snap would not work — the step after it produces exactly that line and an
+      `expect` scans forward — so what the pass-through asserts is where the window actually
+      ended up, and the press that follows is asserted to land on its title bar. Run against a
+      compositor that does not clear the zone on exit: it fails there.
+
+      **And the gate had to slow down.** The first version injected thirty-six motions as fast as
+      QMP would take them; the consumer ring overran, and a `SYN_DROPPED` ends a gesture without
+      asking for anything — Part E's rule, working. A person dragging a window produces nothing
+      like that rate.
 
 ### Out of scope, deliberately
 

@@ -416,13 +416,15 @@ pub enum MgrEvent {
     /// `Created` off the front of the manager's view of the world. The same argument `SetTitle`
     /// already makes for unchanged titles (M9 Part B).
     StateRequest(librsproto::surface::WindowState),
-    /// An interactive resize ended, at this rectangle — `Manage::ResizeEnded`.
+    /// An interactive gesture ended and asks for this rectangle — `Manage::DragEnded`.
     ///
-    /// **One per gesture, at the release.** The outline the user dragged never crossed this
-    /// queue: reporting it per motion would put a round trip back into the one place that cannot
-    /// take it, since this queue does not coalesce and evicts its oldest when full. Carries a
-    /// `ConfigureEvent` because that is exactly what the manager sends back (M9 Part E).
-    ResizeEnded(librsproto::surface::ConfigureEvent),
+    /// **One per gesture, at the release**, from either of the two that produce it: a resize
+    /// (the rectangle the user let go at) or a move released inside a snap zone (that zone's
+    /// target). The outline the user dragged never crossed this queue: reporting it per motion
+    /// would put a round trip back into the one place that cannot take it, since this queue does
+    /// not coalesce and evicts its oldest when full. Carries a `ConfigureEvent` because that is
+    /// exactly what the manager sends back (M9 Parts E and F).
+    DragEnded(librsproto::surface::ConfigureEvent),
 }
 
 /// How many manager events queue before the oldest are discarded.

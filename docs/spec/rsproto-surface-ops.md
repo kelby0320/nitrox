@@ -695,7 +695,7 @@ sides at once.
 `StartMove`. The window keeps its rectangle; what moves is an **outline** the compositor draws
 over the composed stack, which reaches no client, crosses no wire and has no place in the
 stacking order — the cursor sprite's neighbour rather than a window. When the button comes up the
-compositor sends the manager one [`ResizeEnded`](#resizeended-0x0926) carrying the rectangle the
+compositor sends the manager one [`DragEnded`](#dragended-0x0926) carrying the rectangle the
 user let go at, and **the manager sends the `Configure`**. The compositor never resizes a client,
 so there is one path to a window's geometry rather than two that can disagree.
 
@@ -714,17 +714,22 @@ A second `StartResize` while one is running changes nothing and reports success,
 second `StartMove` does. A `StartResize` while a *move* is running is refused: one grab is one
 gesture. While either is in flight, `Place` for that window is refused with `WouldBlock`.
 
-**A gesture the user did not finish reports nothing**, and only the button coming up counts as
-finishing. This is where a resize stops resembling a move: a move has *applied* every step as it
-went, so ending it however it ends merely stops something already on screen, while a resize has
-applied nothing — reporting *initiates* a change, and initiating one from an unfinished gesture is
-a window jumping to a half-chosen size while the user is still holding the button.
+<a id="finished-gesture"></a>
 
-So no `ResizeEnded` is sent when the window leaves the screen mid-drag (minimised, or sent to
+**A gesture the user did not finish reports nothing**, and only the button coming up counts as
+finishing. **This applies to both gestures that end in a [`DragEnded`](#dragended-0x0926)** — a
+resize, and a move released in a snap zone — and it is where either stops resembling a plain
+move. A move *applies* every step as it goes, so ending it however it ends merely stops something
+already on screen. A resize applies nothing, and a snap applies nothing: reporting *initiates* a
+change, and initiating one from an unfinished gesture is a window jumping to a half-chosen size,
+or across the screen, while the user is still holding the button.
+
+So no `DragEnded` is sent when the window leaves the screen mid-drag (minimised, or sent to
 another desktop): the rectangle the user was steering by is no longer visible. None is sent when
 the input stream reports a loss — the pointer position is then a guess, which is the last thing to
 derive a new window rectangle from. And none for a gesture that ended where it started, which is
-an ordinary click on a grip. In every case the outline is taken down.
+an ordinary click on a grip, or for a move released outside every zone, which is an ordinary move.
+In every case the outline is taken down.
 
 ### `RequestState` (`0x090B`)
 
@@ -779,7 +784,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`, `0x0921`, `0x0924`–`0x0925`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`, `0x0921`, `0x0924`–`0x0925`, `0x0927`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -950,6 +955,34 @@ answering — that is the cost of client-side decorations, and this pair is what
 that only had `Close` would destroy windows out from under processes that were fine; one that
 only had `RequestClose` would have no answer for a wedged application except the serial console.
 
+### `RegisterSnapZone` (`0x0927`)
+
+Request, 36 bytes: `id` (u32), a **trigger** rectangle (`x`, `y` signed; `w`, `h` unsigned) and a
+**target** rectangle in the same shape. Both in screen coordinates. Empty reply body on success.
+
+During an interactive [move](#startmove-0x090a) the compositor tests the pointer against this
+table. Inside a trigger, it draws that zone's *target* as the outline — a preview of what letting
+go there would ask for — and if the button comes up inside one it sends
+[`DragEnded`](#dragended-0x0926) carrying that target.
+
+**The policy is entirely in the numbers.** Which region means which rectangle, how close counts,
+whether a corner is a quarter or something else: all of it is the manager's, computed and
+registered by it, and none of it reaches the compositor — which evaluates a lookup, exactly as
+[`RegisterHotkey`](#registerhotkey-0x091e) made it match chords without knowing what any of them
+mean. **First match wins**, so overlapping triggers are ordered by the manager: a shell that wants
+corners to beat edges registers the corners first.
+
+**Registering an existing id replaces it**, which is where this differs from a chord — and the
+difference is what the two tables are. A chord table is a set of *distinct* chords, so a duplicate
+id is a manager confusing itself and is refused. A zone table is a **layout**: the zones *are* the
+work area, so a panel appearing makes every one of them wrong at once, and a manager
+re-registering its ids with new rectangles is doing the ordinary thing. A refusal would leave it
+holding zones for a screen that has changed shape with no way to say so.
+
+`InvalidArgument` for `id` zero — reserved so a zeroed body registers nothing — and for a *new*
+id once `MAX_SNAP_ZONES` are held. The table goes with the manager that registered it, like the
+chord table: a replacement manager inherits nothing it did not ask for.
+
 ### `Capture` (`0x0920`)
 
 Request, 16 bytes — `window` (u32), `width` (u32), `height` (u32), `pitch` (u32) — **and one
@@ -1065,7 +1098,7 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x091F` | `Hotkey`         | `MgrHotkey`         | A registered chord was **pressed** — see [`RegisterHotkey`](#registerhotkey-0x091e) |
 | `0x0922` | `LayoutChanged`  | `MgrLayout`         | The work area is not what it was — see [`QueryLayout`](#querylayout-0x0921) |
 | `0x0923` | `WindowStateRequest` | `WindowState`   | A client asked to be minimised or maximised — see [`RequestState`](#requeststate-0x090b) |
-| `0x0926` | `ResizeEnded`    | `ConfigureEvent`    | An interactive resize ended at this rectangle — see [`StartResize`](#startresize-0x090d) |
+| `0x0926` | `DragEnded`      | `ConfigureEvent`    | A finished gesture asks for this rectangle — a resize, or a move dropped in a [snap zone](#registersnapzone-0x0927) |
 
 `LayoutChanged` is sent when the work area *differs* from the one last announced, rather than on
 any particular cause. Today the only causes are a panel appearing and a panel going away — a
@@ -1102,26 +1135,33 @@ remove.
 `WindowFocus` reports both halves of a transition: the window losing focus, then the window
 gaining it. Either may be absent — nothing had focus, or nothing takes it.
 
-### `ResizeEnded` (`0x0926`)
+### `DragEnded` (`0x0926`)
 
 **Server → manager. Unsolicited, no reply.** Body: a [`ConfigureEvent`](#configure-0x0908) —
-`window`, `width`, `height`, `x`, `y` — carrying the rectangle an interactive resize
-([`StartResize`](#startresize-0x090d)) ended at.
+`window`, `width`, `height`, `x`, `y` — carrying the rectangle a finished gesture asks for.
+
+**Two gestures produce it and they mean the same thing here.** An interactive resize
+([`StartResize`](#startresize-0x090d)) asks for the rectangle the user let go at; an interactive
+move released inside a registered [snap zone](#registersnapzone-0x0927) asks for that zone's
+target. A manager's answer does not depend on which it was, which is why there is one event and
+why it is named for the drag rather than for the resize — it was `ResizeEnded` for one milestone
+part, before the second gesture that produces it existed.
 
 **One event for a whole gesture.** Nothing is sent per motion: this queue does not coalesce and
 evicts its oldest when full, so a five-second drag at 100 Hz would push a `WindowCreated` off the
 front and leave a manager with a window it will never place and never hear about again. The
-outline the user watches is the compositor's own drawing and crosses no wire.
+outline the user watches — the resize's rectangle, or the zone's target previewed under the
+pointer — is the compositor's own drawing and crosses no wire.
 
 **It carries a `ConfigureEvent` because that is what the manager sends back.** The whole answer is
 `Manage::Configure` with these five numbers. A manager that decides otherwise is behaving
 correctly — this is a report of what the user did, not an instruction — and a manager that does
-nothing leaves the window the size it was, which is also what a client that declines produces.
+nothing leaves the window as it was, which is also what a client that declines produces.
 
-It does **not** carry which snap zone the gesture ended in. That is not an omission of Part E's
-but a consequence of what a manager needs: the rectangle is what it acts on, and the zone that
-produced a rectangle is derivable from a table the manager itself registered. Milestone 9 Part F
-adds a zone identifier here if it turns out to need one.
+It does **not** carry which zone the gesture ended in. The rectangle is what a manager acts on,
+and the zone that produced it is derivable from a table the manager itself wrote; a field that is
+always ignored is worse than one that is absent. Sent only for a gesture the user *finished* —
+see [what that excludes and why](#finished-gesture).
 
 ## Titles, and the one variable-length body
 

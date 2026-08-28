@@ -2407,9 +2407,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     ))?;
     // **The shell is what resizes the client**, which is the whole reason the gesture ends in an
     // event rather than in a `Configure` from the compositor: one path to a window's geometry
-    // rather than two that can disagree.
+    // rather than two that can disagree. It says `drop` rather than `resize` because since
+    // Part F one event ends both gestures, so the shell has one word for what it is answering —
+    // the user let go, and this is the rectangle.
     session.expect(&format!(
-        "desktop-shell: resize window {term_id} to {},{} {resized_w}x{resized_h}",
+        "desktop-shell: drop window {term_id} to {},{} {resized_w}x{resized_h}",
         work.0, work.1
     ))?;
     session.expect(&format!("nxterm: resized to {resized_w}x{resized_h}, grid "))?;
@@ -2419,6 +2421,107 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         work.0, work.1
     ))?;
     println!("  ok: the terminal was dragged smaller by its corner, and committed it");
+
+    // 6k. **A window thrown at the left edge snaps to half the work area** (M9 Part F). The
+    //     shell registered eight zones — four edges, four corners — computed from the work area,
+    //     and the compositor matches the pointer against that table during a move. It knows
+    //     nothing about halves: what it shows and what it asks for is the *target* rectangle the
+    //     table gave it, which is why the policy can be wrong only in the shell.
+    //
+    //     **The assertion is against the work area, not the screen.** A zone table computed from
+    //     `screen_h` would put the window under the bars, and the committed geometry is the only
+    //     line that says which of the two the shell used.
+    //
+    //     The window is `resized_w x resized_h` at the work area's origin after 6j, so its title
+    //     bar is at `work.1 + 13` and clear of the buttons at `x = 100`.
+    // **First the control, as a step of its own with a positive assertion**: a drag that passes
+    // *through* a zone and is released outside it must snap nothing — and what it must do
+    // instead is the ordinary move, so the assertion is the geometry that move produces. A
+    // compositor that snapped on entry rather than on release would report the zone's target
+    // here, and this line is what catches it. Asserting the absence of a snap would not: the
+    // step after this one produces exactly that line, and an `expect` scans forward.
+    let press_at = (100, work.1 + 13);
+    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    qmp.pointer = Some(press_at);
+    qmp.send_button("left", true)?;
+    session.expect("compositor: interactive move of window ")?;
+    // **The expectation is summed from what is injected**, not written out beside it: the first
+    // version divided each leg into three and wrote the leg's total, which is two pixels away
+    // from three times a truncated third.
+    let mut walked = (0, 0);
+    for (dx, dy) in [(-30, 60), (-30, 60), (-30, 60), (66, 0), (66, 0), (66, 0)] {
+        qmp.send_motion(dx, dy)?;
+        walked = (walked.0 + dx, walked.1 + dy);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    qmp.send_button("left", false)?;
+    let passed_to = (press_at.0 + walked.0, press_at.1 + walked.1);
+    qmp.pointer = Some(passed_to);
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} {}x{}",
+        work.0 + walked.0,
+        work.1 + walked.1,
+        resized_w,
+        resized_h
+    ))?;
+    println!("  ok: a drag through the zone and out again moved the window and snapped nothing");
+
+    // Then the drop itself, from the title bar where the window now is.
+    //
+    // **The press is asserted to land on *that* window**, which is what makes the step above a
+    // control rather than a hope: a compositor that snapped on entry has moved the terminal to
+    // the left half, so this press lands on nothing — and the failure says so here, one line
+    // after the assertion it belongs to, instead of surfacing as a missing drag further down.
+    let press_at = (passed_to.0 + 90, passed_to.1);
+    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    qmp.pointer = Some(press_at);
+    qmp.send_button("left", true)?;
+    session.expect(&format!(
+        "compositor: press at x={} y={} win={term_id}",
+        press_at.0, press_at.1
+    ))?;
+    // **On its title bar specifically**, which is the sharpest statement of where the window is:
+    // a terminal that had snapped on the pass-through above sits at the work area's origin, so
+    // this press lands on its *grid* — inside the window, and no drag at all. Without this line
+    // the control's failure surfaces two steps later as a drag that never began.
+    session.expect("nxterm: dragging its own title bar")?;
+    session.expect("compositor: interactive move of window ")?;
+    // **Paced, and the reason is worth keeping.** The first version injected thirty-six motions
+    // as fast as QMP would take them; the consumer ring overran, `input-server` announced the
+    // gap, and `libinput` turned it into a `Logical::Dropped` — which ends a gesture *without*
+    // asking for anything, exactly as Part E's review required. So the gate lost its drag to
+    // the machinery working correctly. A person dragging a window produces nothing like this
+    // rate; a harness does, and it has to slow down rather than be accommodated.
+    // **Down as well as left**, because the *pointer* picks the zone and the title bar sits
+    // inside the top-left **corner**'s band — the window is at the work area's origin, so a
+    // straight drag left snaps a quarter, correctly, and would say nothing about edges. The
+    // corners are registered first precisely so the more specific zone wins, which is the
+    // manager's ordering to get right; this step is about the edge, so it aims at one.
+    let step = -(press_at.0 - 10) / 6;
+    for _ in 0..6 {
+        qmp.send_motion(step, 30)?;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    qmp.send_button("left", false)?;
+    qmp.pointer = Some((press_at.0 + step * 6, press_at.1 + 180));
+    // The compositor asks for the zone's target; the shell answers with the `Configure`; the
+    // client commits it. Half the **work area**, at its origin.
+    session.expect(&format!(
+        "desktop-shell: drop window {term_id} to {},{} {}x{}",
+        work.0,
+        work.1,
+        work.2 / 2,
+        work.3
+    ))?;
+    session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2 / 2, work.3))?;
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} {}x{}",
+        work.0,
+        work.1,
+        work.2 / 2,
+        work.3
+    ))?;
+    println!("  ok: dropped at the left edge, the terminal took half the work area");
 
     // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
@@ -2459,11 +2562,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //      which is what makes it the button rather than the taskbar. The two terminals have
     //      different ids precisely so that check can name one of them.
     //
-    //      **Measured from the resized width, not the work area's**: 6j dragged the window
-    //      smaller by its corner, so its right edge is no longer the screen's.
+    //      **Measured from the snapped width**: 6j dragged the window smaller by its corner and
+    //      6k then dropped it at the left edge, so its right edge is the work area's midpoint.
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
-    click_at(&mut qmp, &mut session, work.0 + resized_w as i32 - 13, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + (work.2 / 2) as i32 - 13, work.1 + 13)?;
     session.expect("nxterm: closing")?;
     session.expect("desktop-shell: window list on ")?;
     println!("  ok: the close button closed the terminal with no request to the shell");

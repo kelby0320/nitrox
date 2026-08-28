@@ -19721,3 +19721,107 @@ the clipping and the draw-into-every-damage-rectangle rule now have the cursor's
 Writing them found a fourth thing: the first version of the clip test used a clip *inside* a large
 outline, which intersects no strip, so it asserted nothing — caught by its own "something must
 have been drawn" line rather than by a control.
+
+---
+
+## 2026-08-30 — M9 Part F: the compositor matches a table it was handed, and Milestone 9 closes
+
+Snapping is the last of the milestone's gestures and the one with the least new mechanism in it,
+because Parts E and F are the same machinery reached two ways. The compositor already ran a drag,
+already drew an outline over the composed stack, and already had one event for handing a manager a
+rectangle at the release. What Part F adds is a *table*: eight rectangles the shell computes from
+the work area, and a lookup the compositor performs without knowing what any of them mean.
+
+**The policy is in the numbers, and that is the whole design.** Half the work area for an edge, a
+quarter for a corner, a 24-pixel band to trigger it: every one of those lives in `desktop-shell`,
+in the arithmetic that fills the table. The compositor tests a point against rectangles, shows the
+matching one's *target* as the outline, and reports it if the button comes up there. It cannot be
+wrong about halves because it has never heard of them — the same shape `RegisterHotkey` gave it
+chords it does not understand, and the reason snap policy can be changed without touching this
+process at all.
+
+**Registering an existing zone id replaces it, where a duplicate chord id is refused**, and the
+difference is what the two tables are rather than an inconsistency. A chord table is a set of
+distinct chords: a duplicate id is a manager confusing itself, and the compositor telling it so is
+the useful answer. A zone table is a *layout* — the zones **are** the work area, so a panel
+appearing makes all eight wrong at once, and a shell recomputes and re-registers them wholesale. A
+refusal there would leave it holding zones for a screen that had changed shape with no way to say
+so.
+
+**Part E's `ResizeEnded` is now `DragEnded`.** That review approved leaving the zone identifier off
+the event, at the acknowledged cost that Part F might change the wire format of an event Part E had
+just added. The cost arrived, and it was the *name*: a resize release and a snap drop ask the same
+question, and a manager's answer does not depend on which it was. The zone field is still absent,
+still for the reason given then — the rectangle is what a manager acts on, and the zone that
+produced it is derivable from a table the manager itself wrote.
+
+**The gate's control had to become a step of its own.** "A drag that passes through a zone without
+releasing in it snaps nothing" cannot be asserted by absence: the step after it produces exactly
+the line whose absence would be checked, and an `expect` scans forward. So the pass-through asserts
+what must happen *instead* — the ordinary move's geometry — and the press that follows is asserted
+to land on the window's title bar, which is where a wrongly-snapped window would not be. Run
+against a compositor that does not clear the zone when the pointer leaves it: it fails there.
+
+**And the gate had to slow down, which is Part E's rule working.** The first version injected
+thirty-six motions as fast as QMP would take them; the consumer ring overran, `input-server`
+announced the gap, `libinput` made it a `Logical::Dropped`, and the gesture ended without asking
+for anything — exactly what Part E's review required, arriving as a gate that lost its own drag. A
+person dragging a window produces nothing like that rate. The harness slows down; the rule stays.
+
+**Milestone 9 is complete**: decorations are the client's, the drag is the compositor's, what a
+drag *means* is the shell's, and a window can now be moved, minimised, maximised, restored,
+closed, resized and snapped — every one of them by a gesture a person makes, gated end to end on
+the release image.
+
+---
+
+## 2026-08-30 — Part F's review: the phantom reached by the one path that skips `stop_drag`
+
+**A previewed outline could outlive the table that produced it, for the compositor's life.**
+`clear_zones` emptied the table and cleared `in_zone` but left `self.outline` set — and every
+path that takes an outline down is gated on `in_zone`, so nothing was ever reported to the caller
+and `srv.outline` stayed set. `present_into` is handed it on every repaint, so the rectangle was
+re-drawn by every later compose. Reachable by the compositor's *designed* manager-death path: a
+shell exiting while the user is mid-drag over a zone.
+
+This is the third time this milestone has produced the same defect — an outline, or a drag, or a
+grab, outliving the thing it was derived from — and the file already names it twice. What made
+this instance survive review of the code that introduced it is the shape of the mistake:
+`clear_zones` was written as the mirror of `clear_hotkeys`, and that is a fair model for the
+*table* and no model at all for the *pixels*. **A function copied from a neighbour inherits the
+neighbour's obligations, not its own.**
+
+**Two guards had no negative control, and deleting either left 180 tests green.** The `finished`
+gate on a snap drop is the rule Part E's review required, reached by the other gesture — and every
+zone test released the button normally, so nothing consulted it. The gate did not cover it either.
+What is worth recording is that *the gate had already met this path*: the first version of step 6k
+overran the input ring, a `SYN_DROPPED` ended the drag, and it asked for nothing — the observation
+was in the PR description as a story about pacing, and it was a test two lines away from being
+written. **An anecdote about why a gate needed changing is usually a test.**
+
+**And two guards are unreachable through `route` at all**, because `reconcile_with` breaks the
+grab of a departed window before any arm can see it. Rather than delete them or pretend a route
+test covers them, they are pinned by calling `stop_drag`/`stop_resize` directly and the comment
+says why no other path reaches them: a second line of defence is worth keeping, and worth being
+honest about being second.
+
+**The rename left prose behind.** `ResizeEnded` → `DragEnded` was swept through the code and not
+through six doc comments and a spec paragraph — including a rustdoc link that now resolves to
+nothing, and two field docs (`outline`, `Server::outline`) that still claimed the field means "a
+resize is running". That second kind matters more than a broken link: it is an invariant
+statement, and it is exactly the reasoning a reader would use to conclude the field is safe to
+ignore when no resize is in flight — which is the gap behind the blocking finding above.
+
+**A class this repo has no gate for**: `cargo doc` reports 21 unresolved intra-doc links across
+the userspace workspace, of which this PR added one. A `-D warnings` rustdoc gate would catch the
+whole class, and is not built here because it needs those 21 fixed first and they belong to no
+part of this milestone. **Trigger — the next change that touches `librsproto`'s or `libos`'s doc
+comments broadly**, which is where most of them are.
+
+**One test's second half was decoration**, and the reviewer's method for finding it is the one to
+copy: delete the production line the test is named for and see whether the test notices.
+`preview_zone` is reached through an `.or_else` after the resize's own outline, so no
+implementation in reach consults the zone table during a resize — and "a resize is not snapped"
+therefore passed for every version of the code, including wrong ones. It is deleted, with the
+reason in its place, and what actually keeps a resize from being snapped — `start_move` and
+`start_resize` refusing each other — has its own test.
