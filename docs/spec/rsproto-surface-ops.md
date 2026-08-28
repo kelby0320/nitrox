@@ -699,7 +699,7 @@ it and none is needed**: a client that wants to ask "save first?" opens a dialog
 that resolves, and a client that ignores this stays open. What the request buys is that the
 decision reaches the process holding the work rather than being taken from it.
 
-A shell that means it will follow this with [`Manage::Close`](#close-0x0925) after a grace period.
+A shell that means it will follow this with [`Manage::Close`](#requestclose-0x0924-and-close-0x0925) after a grace period.
 That is a policy, not part of this contract — a client cannot tell how long it has, and should
 not try to.
 
@@ -872,8 +872,9 @@ and it is the one a shell reaches for first.
 client's own window: descendants go with it, and
 [`WindowDestroyed`](#manager-events-0x09180x091c-0x091f-0x09220x0923) follows. The client is not
 told, because there is nothing it could do with the information that `RequestClose` had not
-already offered it. Its next request naming that window is answered `NotFound`, like any other
-window that no longer exists.
+already offered it. Its next request naming that window — or any descendant that went with it —
+is answered `NotFound`, like any other window that no longer exists: the compositor stops
+crediting a connection with a window the moment it leaves the stack, whoever removed it.
 
 `NotFound` if no such window; `RequestClose` also answers `NotFound` when no session owns it.
 

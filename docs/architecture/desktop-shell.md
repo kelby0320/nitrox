@@ -2,7 +2,7 @@
 
 ## Status
 
-**Partly built, and checked 2026-08-26** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-08-28** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar;
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
@@ -13,7 +13,7 @@ server, filtered as you type — **launching** (§6's spawn half), each applicat
 namespace the shell constructs, **placement and window management** (§8), the shell driving
 `Place`/`Raise`/`SetFocus` as the compositor's attached manager, and — since M8 Part C — the
 **bottom bar** and its **window list** (§2, §7): one entry per `normal` window, click to raise,
-click the focused one to minimize, `Super+H` to minimize without the bar. The toolkit question
+click the focused one to minimize, middle-click to close, `Super+H` to minimize without the bar. The toolkit question
 §5 settled is answered and built ([`widget-toolkit.md`](widget-toolkit.md)).
 
 Since M8 Part D it also has **desktops** (§7): several of them, created on demand, switched with
@@ -41,6 +41,19 @@ survives the switch and re-captures for the desktop arrived at, whether that swi
 own sidebar or from a chord; the applications modal and the rename prompt are sticky for the same
 reason. Reported from a real session: only the drag had ever been built, and only the drag had
 ever been gated.
+
+Since Milestone 9 the shell is also the **other end of a window's own chrome** (§8's
+"placement", from the other side). A client
+draws its title bar and its buttons, and the two that are not the client's to perform arrive
+here as requests: `Surface::RequestState` becomes a `SetMinimized` or a `Configure` — maximise
+*moves* the window to the work area's origin as well as resizing it, so a maximised window does
+not cover the bars — and a drag becomes `Surface::StartMove`, which the compositor performs
+itself while the shell watches the geometry go by. Closing is the pair the milestone added at
+both ends: a client's own close button ends the client, and the window list's middle-click sends
+`Manage::RequestClose` — an *ask*, which a client with unsaved work could answer with a dialog —
+followed by `Manage::Close` two seconds later if nothing happened. **The insist is not exercised
+by any gate**, because no application in the image can be wedged on purpose; the trigger is
+recorded in [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
 What is **not**: the **system tray** (§9), which is v2 and an inter-process protocol rather than
 a widget; and **live thumbnails**, an optimisation §9 gives a trigger rather than a v1 goal. Sections describing those describe intent,

@@ -2135,24 +2135,34 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // this list is non-empty, so this happens without the user touching anything else — and
         // a window that went away on its own has already left `entries`, so the ordinary case
         // never reaches `Manage::Close` at all.
-        if !closing.is_empty()
-            && let Some(now) = now_ns()
-            && let Some(m) = manager.as_mut()
-        {
-            let mut still = alloc::vec::Vec::new();
-            for &(id, at) in &closing {
-                if !entries.iter().any(|e| e.id == id) {
-                    // Gone, by the client's own hand. Nothing to insist on.
-                    continue;
+        //
+        // **The list is emptied even when it cannot be acted on**, because the wait above is
+        // derived from it: an entry that no iteration can ever time or send would make
+        // `sys_wait` return at once on an already-past deadline, for ever — the spin this file
+        // calls machine-wide harmful at the top of the loop. Neither failure is reachable today
+        // (`manager` is assigned once and never cleared; `sys_clock_read(Monotonic)` fails only
+        // on a bad selector or a bad out-pointer, both constants here), which is exactly why it
+        // is worth making structural rather than leaving it true by luck (PR #251 review).
+        if !closing.is_empty() {
+            match (now_ns(), manager.as_mut()) {
+                (Some(now), Some(m)) => {
+                    let mut still = alloc::vec::Vec::new();
+                    for &(id, at) in &closing {
+                        if !entries.iter().any(|e| e.id == id) {
+                            // Gone, by the client's own hand. Nothing to insist on.
+                            continue;
+                        }
+                        if now < at {
+                            still.push((id, at));
+                            continue;
+                        }
+                        sent_request = true;
+                        insist_on_close(m, id);
+                    }
+                    closing = still;
                 }
-                if now < at {
-                    still.push((id, at));
-                    continue;
-                }
-                sent_request = true;
-                insist_on_close(m, id);
+                _ => closing.clear(),
             }
-            closing = still;
         }
 
         // **Redraw the bar when the list changed, and only then.** Every manager event would
@@ -2242,8 +2252,11 @@ static mut CLOCK_BUF: u64 = 0;
 
 /// The monotonic clock, in nanoseconds, or `None` if it will not answer.
 ///
-/// Only the close grace period needs it. `None` becomes "no deadline" at the call site, which
-/// degrades to "insist when something else wakes the loop" rather than to a spin.
+/// Only the close grace period needs it, and both call sites treat `None` as *no insisting*
+/// rather than as an unbounded one: the ask is still sent and nothing is recorded to follow it
+/// up. A client that ignores the request keeps its window, which is the failure that leaves the
+/// machine working — the alternative shapes all end in a wait bounded by a deadline nothing can
+/// ever evaluate, which is a spin.
 fn now_ns() -> Option<u64> {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     let r = unsafe {

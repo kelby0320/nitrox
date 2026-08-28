@@ -2446,6 +2446,14 @@ and Part D is the milestone where something can.
         same, and it fails the gate.
       - **`Manage::Close` is host-tested** on the manager dispatch: a window the caller does not
         own is removed, its rectangle is reported before it goes, and `WindowDestroyed` follows.
+        Two more host tests came out of the review — the damage is the union of *every* window
+        the destroy took, since a popup is not bounded by its parent, and the owning connection
+        stops claiming a window somebody else removed, which is the state a wedged client is
+        left in by construction.
+      - **The child shell going with the window is gated too**, which nothing had observed:
+        `nxterm` holds the pty master, so closing the window must end the `nxsh` it spawned or
+        every close leaks a process. `check-login` reads `nxsh: terminal closed` off the
+        transcript, and that line exists only on the path that exits.
 
       **What is not gated end to end is the insist**, because the release image has no client
       that can be made to ignore a request. Named here rather than left to be discovered:

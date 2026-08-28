@@ -18,7 +18,7 @@ it **never blocks**. It validates the request, initiates an
 [`Irp`](irp-layout.md) down the target's driver stack, and returns a
 `PendingOperation` handle. The caller blocks — if it chooses — by passing that
 handle to `sys_wait`, alongside any other waitables. The same `IoOp` is what the
-high-throughput [`IoRing`](syscall-abi.md#high-throughput-ring) submits per
+high-throughput [`IoRing`](syscall-abi.md#high-throughput-ring-additive-optimization) submits per
 entry, so the descriptor is defined once here and reused by both paths.
 
 ```rust

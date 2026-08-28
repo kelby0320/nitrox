@@ -60,6 +60,20 @@ impl Connection {
     pub fn owned(&self) -> &[u32] {
         &self.owned
     }
+
+    /// Drop `window` from what this connection claims. Silent if it never held it.
+    ///
+    /// **For removals this connection did not ask for** — a manager's `Manage::Close`, and
+    /// anything later that destroys a window on someone else's behalf. Its own `DestroyWindow`
+    /// prunes inline (it has the connection in hand); this is how the *other* paths reach the
+    /// same state, called once for every id the stack reports removed. Without it a client
+    /// outlives its window still claiming it: its own `DestroyWindow` would then answer
+    /// `InvalidArgument` (`Rejected(NoSuchWindow)`) where every other request answers
+    /// `NotFound`, and a manager could ask the compositor to send `CloseRequested` about a
+    /// window that no longer exists.
+    pub fn disown(&mut self, window: u32) {
+        self.owned.retain(|id| *id != window);
+    }
 }
 
 /// What a dispatched request produced.
@@ -805,6 +819,36 @@ mod tests {
         assert!(a.owned().is_empty(), "stale ids left on the connection: {:?}", a.owned());
         for gone in [w, menu, sub] {
             assert!(stack.window(gone).is_none());
+        }
+    }
+
+    #[test]
+    fn a_window_removed_by_someone_else_stops_being_owned() {
+        // **The manager's `Manage::Close` removes a window its owner still believes in.** That
+        // path does not run `destroy` here — it destroys through the stack — so the connection
+        // is pruned by the compositor's removal drain calling [`Connection::disown`]. Without
+        // it the client's own `DestroyWindow` is the one request that answers
+        // `Rejected(NoSuchWindow)` — mapped to `InvalidArgument` — where `AttachBuffer`,
+        // `Commit` and `SetTitle` all answer `NotFound`, and the spec says `NotFound`. A client
+        // that outlives its window is precisely the wedged one `Manage::Close` exists for.
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        let menu = create(&mut a, &mut stack, Role::Popup { parent: w }).unwrap();
+
+        // Exactly what the manager arm does, and then what the drain does with `take_removed`.
+        stack.destroy(w).unwrap();
+        for gone in stack.take_removed() {
+            a.disown(gone);
+        }
+
+        assert!(a.owned().is_empty(), "still claiming: {:?}", a.owned());
+        for gone in [w, menu] {
+            assert_eq!(
+                destroy(&mut a, &mut stack, gone),
+                Outcome::Failed(SurfaceError::NotFound),
+                "the answer every other request gives for a window that is not there"
+            );
         }
     }
 

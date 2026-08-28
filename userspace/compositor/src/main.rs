@@ -703,6 +703,15 @@ fn drain_stack_events(srv: &mut Server) {
         mgr_emit(srv, MgrEvent::Geometry(ev));
     }
     for window in srv.stack.take_removed() {
+        // **The owner stops claiming it here**, whoever removed it. A client's own
+        // `DestroyWindow` prunes its connection inline, but a manager's `Manage::Close` and a
+        // transitive destroy of someone else's child do not pass through that code — and this
+        // loop is the one place every removal, from every cause, is already enumerated. A
+        // connection that outlives its window is exactly the wedged client `Manage::Close`
+        // exists for, so this is not a hypothetical: see [`Connection::disown`].
+        for conn in srv.conns.iter_mut() {
+            conn.disown(window);
+        }
         mgr_emit(srv, MgrEvent::Destroyed { window });
     }
 }

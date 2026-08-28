@@ -1507,8 +1507,9 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
 ///
 /// **The position is verified with a left click before the middle one**, because the compositor
 /// logs where a press landed and nothing else here can say where the pointer is. On a
-/// window-list entry that left click raises the window, which is what a caller about to close it
-/// wants anyway.
+/// window-list entry that left click is a *gesture in its own right* — it raises the window, or
+/// minimises it if it already had the focus — so a caller must be able to live with either. The
+/// close request that follows does not care which happened.
 fn middle_click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
     click_at(qmp, session, x, y)?;
     qmp.send_button("middle", true)?;
@@ -1811,12 +1812,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     // 6a2. **The title bar's buttons ask, and the shell disposes** (M9 Part B). A client cannot
     //      minimise or maximise itself — both are manager operations — so the button sends
-    //      `Surface::RequestState`, the compositor forwards it, and the shell decides. The
-    //      buttons sit at the bar's right end: maximise is last, minimise beside it.
-    // **Measured from the right edge in layout order** — minimise, maximise, close, each
-    // `TITLE_BUTTON_W` (26) wide. Part C added close, which moved the other two a slot left; the
-    // first run after that clicked *close* where it meant maximise, which is what a coordinate
-    // constant hides and a changing layout exposes.
+    //      `Surface::RequestState`, the compositor forwards it, and the shell decides.
+    //
+    // **The buttons are measured from the right edge in layout order** — minimise, maximise,
+    // close, each `TITLE_BUTTON_W` (26) wide. Part C added close, which moved the other two a
+    // slot left; the first run after that clicked *close* where it meant maximise, which is what
+    // a coordinate constant hides and a changing layout exposes.
     let button_y = term_y + 13;
     let maximise_at = (term_w as i32 - 39, button_y);
     let minimise_at = (term_w as i32 - 65, button_y);
@@ -2290,19 +2291,6 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     ))?;
     println!("  ok: maximise moved the window to the work area's origin, not only resized it");
 
-    // 6i. **The close button is the client's own, and sends nothing** (M9 Part C). Everything
-    //      else on this bar asks the shell; this one exits. The window is at the work area's
-    //      origin after the maximise above, so the button is that far from its right edge.
-    //
-    //      **Asserted by what is absent as well as what is present.** `nxterm: closing` says it
-    //      went; the transcript check below says no `RequestClose` was sent for *this* window,
-    //      which is what makes it the button rather than the taskbar. The two terminals have
-    //      different ids precisely so that check can name one of them.
-    click_at(&mut qmp, &mut session, term_w as i32 - 13, work.1 + 13)?;
-    session.expect("nxterm: closing")?;
-    session.expect("desktop-shell: window list on ")?;
-    println!("  ok: the close button closed the terminal with no request to the shell");
-
     // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
     //
@@ -2327,6 +2315,26 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     real cursor — on the accelerator a person actually runs locally.
     burst_holds_its_position(&mut qmp, &mut session, &chord)?;
 
+    // 6i. **The close button is the client's own, and sends nothing** (M9 Part C). Everything
+    //      else on this bar asks the shell; this one exits. The window is at the work area's
+    //      origin after the maximise in 6g, so the button is that far from its right edge.
+    //
+    //      **After 6h, not before it**, which costs a desktop switch back: 6h's stall is a
+    //      whole-screen recompose, and a recompose with no window left in it is a weaker one
+    //      than the step's own rationale describes. Closing the terminal first made the local
+    //      diagnostic quieter for nothing (PR #251 review).
+    //
+    //      **Asserted by what is absent as well as what is present.** `nxterm: closing` says it
+    //      went; the transcript check below says no `RequestClose` was sent for *this* window,
+    //      which is what makes it the button rather than the taskbar. The two terminals have
+    //      different ids precisely so that check can name one of them.
+    chord(&mut qmp, false, "2")?;
+    session.expect("desktop-shell: switched to ")?;
+    click_at(&mut qmp, &mut session, term_w as i32 - 13, work.1 + 13)?;
+    session.expect("nxterm: closing")?;
+    session.expect("desktop-shell: window list on ")?;
+    println!("  ok: the close button closed the terminal with no request to the shell");
+
     // 4. **Two independent sessions**, which is Part D's fourth box and the one most easily
     //    asserted rather than tested. The graphical session is running *now* — its leader
     //    blocks, so it does not end on its own — and the serial column's prompt has been live
@@ -2344,17 +2352,35 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
-    // **The transcript is written here too.** `expect` saves it on its own failures, but this
-    // check runs after `finish()` — so a concurrency failure used to report a verdict with no
-    // guest output to diagnose it from, and the file left on disk was a *stale* one from an
-    // earlier run. That is worse than none: it reads as evidence.
+    // **Every check below writes the transcript on failure.** `expect` saves it on its own
+    // failures, but these run after `finish()` — so one used to report a verdict with no guest
+    // output to diagnose it from, and the file left on disk was a *stale* one from an earlier
+    // run. That is worse than none: it reads as evidence.
+
     // The shell said it asked — order-independent, because that line races the client it woke.
     if !transcript.contains(&format!("desktop-shell: asked window {first_term_id} to close")) {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
         return Err(format!(
             "the shell never reported asking window {first_term_id} to close, so the taskbar's \
              middle-click did not reach `Manage::RequestClose`"
         )
         .into());
+    }
+
+    // **The shell the terminal spawned went with it.** `nxterm` holds the pty master and hands
+    // the far end to its `nxsh`; closing the window therefore has to end that shell too, or
+    // every close leaks a process. Nothing observed the child until the Part C review asked —
+    // the machinery was there (`libstream` documents `PeerClosed` as "stop producing, exit")
+    // and the gate now says so out loud. Order-independent: the child notices its master go at
+    // whatever moment the tty-server gets there.
+    if !transcript.contains("nxsh: terminal closed") {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err("the terminal closed and its `nxsh` did not: no \"nxsh: terminal closed\" in \
+                    the transcript. A shell whose terminal is gone has nobody to read from and \
+                    nobody to print to — it must exit rather than be orphaned per window closed"
+            .into());
     }
 
     // **The close button sent nothing.** Present-and-absent together: the click above closed the
@@ -5597,6 +5623,10 @@ fn cmd_check_docs() -> R<()> {
 
     let mut violations: Vec<String> = Vec::new();
     let (mut links, mut paths) = (0usize, 0usize);
+    // `(citing file, line, target file, anchor)`, resolved after the walk — a link into
+    // *another* document's heading needs that document read, which the per-file pass below
+    // cannot do without re-reading it once per link.
+    let mut anchor_refs: Vec<(PathBuf, usize, PathBuf, String)> = Vec::new();
 
     // Everything that documents this project, not just `docs/`. The `CLAUDE.md` files are
     // instructions Claude Code loads directly, and `.claude/skills/` defines the review
@@ -5628,14 +5658,47 @@ fn cmd_check_docs() -> R<()> {
             let at = |m: &str| format!("{}:{}: {m}", path.display(), i + 1);
 
             // 1. Relative markdown links to .md files.
-            let mut rest = line;
+            //
+            // **Inline code is not markdown.** A document that *quotes* link syntax — this
+            // gate's own entry in `decision-log.md` writes ``](#anchor)`` — is talking about
+            // links, not making one. Blanking the code spans first is what lets prose describe
+            // the syntax without the checker chasing it.
+            let masked = mask_code_spans(line);
+            let mut rest = masked.as_str();
             while let Some(open) = rest.find("](") {
                 let after = &rest[open + 2..];
                 let Some(close) = after.find(')') else { break };
                 let target = &after[..close];
                 rest = &after[close..];
                 let file = target.split('#').next().unwrap_or("");
-                if file.is_empty() || !file.ends_with(".md") || file.contains("://") {
+                if target.contains("://") {
+                    continue;
+                }
+                // 1b. `](#anchor)` and `](other.md#anchor)`. A heading link that resolves to
+                // nothing is silent in every renderer — it scrolls nowhere — and this gate
+                // skipped it for years because it split on `#` and dropped what followed. A
+                // Part C link to `#close-0x0925` (the heading is `RequestClose … and Close …`,
+                // which slugs to something else entirely) is what found it; four more were
+                // already broken, one of them since the section was renamed.
+                if let Some((_, anchor)) = target.split_once('#')
+                    && !anchor.is_empty()
+                    // `#L36` is a GitHub line link, not a heading — it resolves on the web
+                    // and nowhere else, and it is deliberate where it appears.
+                    && !(anchor.starts_with('L')
+                        && anchor[1..].chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'L'))
+                {
+                    let target_file =
+                        if file.is_empty() { path.to_path_buf() } else { dir.join(file) };
+                    if target_file.extension().map_or(false, |e| e == "md") {
+                        anchor_refs.push((
+                            path.to_path_buf(),
+                            i + 1,
+                            target_file,
+                            anchor.to_string(),
+                        ));
+                    }
+                }
+                if file.is_empty() || !file.ends_with(".md") {
                     continue;
                 }
                 links += 1;
@@ -5700,6 +5763,34 @@ fn cmd_check_docs() -> R<()> {
 
     for r in &roots {
         visit_md_files_skipping(r, &["target"], &mut check)?;
+    }
+
+    // 1b (continued). Resolve the collected heading links, reading each target once.
+    let mut anchor_cache: std::collections::BTreeMap<PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let anchors = anchor_refs.len();
+    for (src, line, target, anchor) in anchor_refs {
+        if !target.exists() {
+            continue; // already reported by check 1 as a missing link target
+        }
+        let known = match anchor_cache.get(&target) {
+            Some(a) => a,
+            None => {
+                let a = heading_anchors(&fs::read_to_string(&target)?);
+                anchor_cache.entry(target.clone()).or_insert(a)
+            }
+        };
+        if !known.iter().any(|k| k == &anchor) {
+            let near = known
+                .iter()
+                .find(|k| k.starts_with(anchor.split('-').next().unwrap_or(&anchor)))
+                .map(|k| format!(" (did you mean #{k}?)"))
+                .unwrap_or_default();
+            violations.push(format!(
+                "{}:{line}: link to a heading that does not exist: #{anchor}{near}",
+                src.display()
+            ));
+        }
     }
 
     // 3. Every architecture and design doc states what is actually built. `design/` needs
@@ -5882,7 +5973,8 @@ fn cmd_check_docs() -> R<()> {
 
     if violations.is_empty() {
         println!(
-            "check-docs: {links} link(s), {paths} cited source path(s), \
+            "check-docs: {links} link(s), {anchors} heading link(s), \
+             {paths} cited source path(s), \
              {arch_docs} architecture doc(s) with a Status line, {} — all agree ✓",
             table_stats.join(" + ")
         );
@@ -6260,6 +6352,99 @@ fn cmd_check_arch() -> R<()> {
 
 /// Walk every `*.md` under `dir`, calling `f` on each, pruning any directory whose name
 /// is in `skip`. The markdown counterpart of [`visit_rs_files_skipping`].
+/// `line` with each **closed** inline-code span replaced by a character that cannot appear in a
+/// link, so a scan for `](` cannot find one inside backticks.
+///
+/// **Only closed pairs, and only within this line.** A code span may wrap across lines —
+/// ``Priority::RealTime`` does, in `thread-args.md` — which leaves a line holding one unmatched
+/// backtick and everything after it looking like code. Masking from an unmatched backtick to the
+/// end of the line would swallow the real links that follow it (two of them, both found the
+/// moment this was written the other way). An unmatched backtick therefore masks nothing, which
+/// errs toward checking a link that was only being quoted rather than skipping one that was not.
+fn mask_code_spans(line: &str) -> String {
+    let mut out: Vec<char> = line.chars().collect();
+    let mut open: Option<usize> = None;
+    for i in 0..out.len() {
+        if out[i] != '`' {
+            continue;
+        }
+        match open {
+            None => open = Some(i),
+            Some(start) => {
+                for c in out.iter_mut().take(i + 1).skip(start) {
+                    *c = '\0';
+                }
+                open = None;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Every anchor a markdown document offers: one per heading, plus explicit `<a id="…">`.
+///
+/// **GitHub's slug rules, because that is where these links are read**: lowercase, keep
+/// alphanumerics, underscores and hyphens, turn spaces into hyphens, drop everything else — so
+/// `## Transport — no bespoke protocol` is `transport--no-bespoke-protocol`, with *two* hyphens,
+/// the em dash having left its two spaces behind. Repeats of one slug are suffixed `-1`, `-2`,
+/// as `github-slugger` does. Headings inside fenced code are not headings.
+fn heading_anchors(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        // An explicit anchor is the escape hatch for a target that is not a heading at all —
+        // `syscall-abi.md` uses one to name a bullet in its type list.
+        let mut rest = line;
+        while let Some(at) = rest.find("<a ") {
+            rest = &rest[at + 3..];
+            let Some(open) = rest.find(['"']) else { break };
+            let key = rest[..open].trim();
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            if key.ends_with("id=") || key.ends_with("name=") {
+                out.push(after[..close].to_string());
+            }
+            rest = &after[close..];
+        }
+
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || !t.starts_with('#') {
+            continue;
+        }
+        let title = t.trim_start_matches('#').trim();
+        if title.is_empty() {
+            continue;
+        }
+        let mut slug = String::new();
+        for c in title.chars() {
+            if c.is_alphanumeric() {
+                slug.extend(c.to_lowercase());
+            } else if c == ' ' || c == '-' {
+                slug.push('-');
+            } else if c == '_' {
+                slug.push('_');
+            }
+        }
+        let n = match counts.iter_mut().find(|(s, _)| *s == slug) {
+            Some((_, n)) => {
+                *n += 1;
+                *n
+            }
+            None => {
+                counts.push((slug.clone(), 0));
+                0
+            }
+        };
+        out.push(if n == 0 { slug } else { format!("{slug}-{n}") });
+    }
+    out
+}
+
 fn visit_md_files_skipping(
     dir: &Path,
     skip: &[&str],
