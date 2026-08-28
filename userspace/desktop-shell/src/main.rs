@@ -1485,6 +1485,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
                 alloc::vec::Vec::new();
+            let mut resized: alloc::vec::Vec<librsproto::surface::ConfigureEvent> =
+                alloc::vec::Vec::new();
             list_dirty |= place_new_windows(
                 m,
                 &mut next_origin,
@@ -1493,9 +1495,25 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut fired,
                 &mut layout,
                 &mut states,
+                &mut resized,
                 &mut restore,
                 current_desktop,
             );
+
+            // **A gesture the user finished, answered with the `Configure` it asked for**
+            // (M9 Part E). The compositor drew the outline and applied nothing: resizing a
+            // client is this process's, so there is one path to a window's geometry rather than
+            // two that can disagree. What arrives is the rectangle the user let go at, and the
+            // answer is the same request a maximise sends — which is why the event carries a
+            // `ConfigureEvent` and this is a loop rather than a translation.
+            for c in resized {
+                // **A resized window is no longer the one that was maximised.** Its restore
+                // rectangle described where it came from before a maximise it has now left by
+                // hand; keeping it would make the next restore put it somewhere it never was.
+                restore.retain(|(id, _)| *id != c.window);
+                sent_request = true;
+                configure_window(m, c.window, c.x, c.y, c.width, c.height, b"resize");
+            }
             // **What a client asked to be, decided here.** The compositor forwarded the
             // question and applied nothing: minimising is a manager request and maximising is a
             // `Configure` to a rectangle only this process can compute, because only this
@@ -3138,14 +3156,15 @@ fn place_new_windows(
     fired: &mut alloc::vec::Vec<u32>,
     layout: &mut MgrLayout,
     states: &mut alloc::vec::Vec<librsproto::surface::WindowState>,
+    resized: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
     restore: &mut alloc::vec::Vec<(u32, (i32, i32, u32, u32))>,
     current: u32,
 ) -> bool {
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
         OP_MGR_LAYOUT_CHANGED, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_STATE_REQUEST,
-        OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
+        OP_MGR_RESIZE_ENDED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
+        OP_MGR_WINDOW_STATE_REQUEST, OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
     };
     let mut dirty = false;
     // **Four bytes more than `MAX_TITLE`, which is what a title record actually is.** A
@@ -3201,6 +3220,18 @@ fn place_new_windows(
                 // where the shell's own state lives rather than inside a drain.
                 if let Some(s) = librsproto::surface::WindowState::read(&buf[..n]) {
                     states.push(s);
+                }
+                continue;
+            }
+            OP_MGR_RESIZE_ENDED => {
+                // **The one event a whole resize gesture produces** (M9 Part E). The compositor
+                // ran the drag and drew the outline; it did not resize anything, because
+                // resizing a client is the manager's — so this is a request and the answer is
+                // the `Configure` this shell would have sent anyway. Collected rather than
+                // answered here for the reason a state request is: sending manager requests
+                // belongs where the shell's own state lives.
+                if let Some(c) = librsproto::surface::ConfigureEvent::read(&buf[..n]) {
+                    resized.push(c);
                 }
                 continue;
             }

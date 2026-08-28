@@ -2364,6 +2364,62 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("  ok: maximise moved the window and the client committed the work area exactly");
 
 
+    // 6j. **The window is dragged smaller by its own corner** (M9 Part E). The grip is pixels
+    //     `nxterm` committed, like the title bar; what crosses the wire is one `StartResize`,
+    //     and then nothing at all until the button comes up. The compositor moves an outline —
+    //     its own drawing, over the composed stack, reaching no client — and hands the shell one
+    //     rectangle at the release.
+    //
+    //     **The window is maximised here, so its corner is the work area's**, and dragging
+    //     inward is what keeps every injected motion inside the screen: a drag that ran into the
+    //     clamp would assert against a rectangle the pointer never reached.
+    //
+    //     **Four assertions, in the order the mechanism goes**: the compositor took the gesture
+    //     and says which edges; it reports one rectangle when the button comes up; the *shell*
+    //     turns that into a `Configure`, which is the half that proves the compositor did not
+    //     resize anything itself; and the client commits it. The last is the one the plan calls
+    //     for — the control is an outline that tracks and a release that commits nothing, and
+    //     every line before the last holds for that implementation too.
+    const RESIZE_STEPS: i32 = 4;
+    const RESIZE_DX: i32 = -50;
+    const RESIZE_DY: i32 = -25;
+    let resized_w = (work.2 as i32 + RESIZE_STEPS * RESIZE_DX) as u32;
+    let resized_h = (work.3 as i32 + RESIZE_STEPS * RESIZE_DY) as u32;
+    // The grip is a 16-pixel square over the window's bottom-right corner; its middle is eight
+    // pixels in from each edge.
+    let grip_at = (work.0 + work.2 as i32 - 8, work.1 + work.3 as i32 - 8);
+    move_pointer_to(&mut qmp, grip_at.0, grip_at.1)?;
+    qmp.pointer = Some(grip_at);
+    qmp.send_button("left", true)?;
+    // `RESIZE_RIGHT | RESIZE_BOTTOM` is `2 | 8`.
+    session.expect(&format!("compositor: interactive resize of window {term_id} edges 10"))?;
+    for _ in 0..RESIZE_STEPS {
+        qmp.send_motion(RESIZE_DX, RESIZE_DY)?;
+    }
+    qmp.send_button("left", false)?;
+    qmp.pointer = Some((
+        grip_at.0 + RESIZE_STEPS * RESIZE_DX,
+        grip_at.1 + RESIZE_STEPS * RESIZE_DY,
+    ));
+    session.expect(&format!(
+        "compositor: interactive resize of window {term_id} ended at {},{} {resized_w}x{resized_h}",
+        work.0, work.1
+    ))?;
+    // **The shell is what resizes the client**, which is the whole reason the gesture ends in an
+    // event rather than in a `Configure` from the compositor: one path to a window's geometry
+    // rather than two that can disagree.
+    session.expect(&format!(
+        "desktop-shell: resize window {term_id} to {},{} {resized_w}x{resized_h}",
+        work.0, work.1
+    ))?;
+    session.expect(&format!("nxterm: resized to {resized_w}x{resized_h}, grid "))?;
+    // And the committed geometry, which is the assertion a release that commits nothing fails.
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} {resized_w}x{resized_h}",
+        work.0, work.1
+    ))?;
+    println!("  ok: the terminal was dragged smaller by its corner, and committed it");
+
     // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
     //
@@ -2402,9 +2458,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //      went; the transcript check below says no `RequestClose` was sent for *this* window,
     //      which is what makes it the button rather than the taskbar. The two terminals have
     //      different ids precisely so that check can name one of them.
+    //
+    //      **Measured from the resized width, not the work area's**: 6j dragged the window
+    //      smaller by its corner, so its right edge is no longer the screen's.
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
-    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - 13, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + resized_w as i32 - 13, work.1 + 13)?;
     session.expect("nxterm: closing")?;
     session.expect("desktop-shell: window list on ")?;
     println!("  ok: the close button closed the terminal with no request to the shell");

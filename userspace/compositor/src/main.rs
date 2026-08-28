@@ -263,6 +263,12 @@ struct Server {
     screen: Rect,
     /// The layout last announced to the manager, so a change can be told from a repeat.
     last_layout: Option<librsproto::surface::MgrLayout>,
+    /// The interactive-resize outline's rectangle, or `None` when no resize is running.
+    ///
+    /// **Held here rather than asked of the router**, because every repaint needs it and
+    /// `repaint_region` takes the server immutably: it is the same shape as the cursor's
+    /// position, which is drawn over the composed stack by the same call.
+    outline: Option<Rect>,
     /// The window last told it has the keyboard, if any.
     ///
     /// Kept so a focus change can be *detected* rather than re-announced: `focus_candidate`
@@ -878,6 +884,13 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
                 None => unserialisable(b"WindowStateRequest"),
             }
         }
+        MgrEvent::ResizeEnded(g) => {
+            let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
+            match g.write(&mut body) {
+                Some(n) => send_input(ch, librsproto::surface::OP_MGR_RESIZE_ENDED, &body[..n]),
+                None => unserialisable(b"ResizeEnded"),
+            }
+        }
         MgrEvent::Title { window, title } => {
             // The one variable-length manager body, so its buffer is sized from the cap rather
             // than from a type — `MAX_TITLE` plus the window id.
@@ -1046,7 +1059,7 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         damage.push(compositor::cursor_rect(cursor_now));
     }
     if !damage.is_empty() {
-        srv.stack.present_into(fb, BACKGROUND, srv, &damage, cursor_now);
+        srv.stack.present_into(fb, BACKGROUND, srv, &damage, cursor_now, srv.outline);
     }
     alive
 }
@@ -1091,6 +1104,46 @@ fn route_one_batch(
                 // which `drag_to` computed from state read before the move.
                 if let Some(r) = routed.moved {
                     damage.push(r);
+                }
+                // **The outline's damage is its edges, not its rectangle.** The union of where
+                // an outline was and where it is is very nearly the window; repainting that per
+                // pointer motion is the full recompose that starves input under emulation.
+                // Four thin strips each side is a few thousand pixels whatever the size — and
+                // the strips of where it *was* are what erase it, since an outline is drawn
+                // over the composed stack and is not in it.
+                if let Some(o) = routed.outline {
+                    srv.outline = o.now;
+                    for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
+                        damage.push(r);
+                    }
+                }
+                // **One event for the gesture, at the release.** The compositor does not resize
+                // the client — that is the manager's, so there is one path to a window's
+                // geometry rather than two that can disagree — so this hands the shell the
+                // rectangle the user let go at and the shell answers with a `Configure`.
+                if let Some((window, rect)) = routed.resized {
+                    Line::new()
+                        .s(b"compositor: interactive resize of window ")
+                        .u(window as u64)
+                        .s(b" ended at ")
+                        .i(rect.origin.x as i64)
+                        .s(b",")
+                        .i(rect.origin.y as i64)
+                        .s(b" ")
+                        .u(rect.size.w as u64)
+                        .s(b"x")
+                        .u(rect.size.h as u64)
+                        .end();
+                    mgr_emit(
+                        srv,
+                        MgrEvent::ResizeEnded(librsproto::surface::ConfigureEvent {
+                            window,
+                            width: rect.size.w,
+                            height: rect.size.h,
+                            x: rect.origin.x,
+                            y: rect.origin.y,
+                        }),
+                    );
                 }
                 // **Drained per event, not per batch.** A chord and the window events it
                 // causes have to reach the manager in the order they happened, and the
@@ -1863,7 +1916,7 @@ fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
 /// into the stack would make it a window — with a position in the stacking order, a client
 /// that could cover it, and hit-testing that would have to skip it.
 fn repaint_region(srv: &Server, fb: &mut RawFramebuffer, region: Rect) {
-    srv.stack.present_into(fb, BACKGROUND, srv, &[region], srv.router.pointer());
+    srv.stack.present_into(fb, BACKGROUND, srv, &[region], srv.router.pointer(), srv.outline);
 }
 
 /// The wire error a rejected request reports.
@@ -2057,6 +2110,63 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                         .s(b": the pointer is not holding it")
                         .end();
                     Some(KError::NotFound)
+                }
+            },
+        };
+        return match err {
+            Some(e) => reply_error_on_session(ch, op, request_id, e),
+            None => reply_on_session(ch, op, request_id, &[]),
+        };
+    }
+
+    // **`StartResize` is answered here for the reason `StartMove` is**: it needs the router,
+    // which owns the pointer grab this request is checked against. What it does *not* do is
+    // resize anything — the window keeps its rectangle for the whole gesture, an outline follows
+    // the pointer, and the manager hears one event at the release (M9 Part E).
+    if op == librsproto::surface::OP_START_RESIZE {
+        if handle != 0 {
+            // SAFETY: closing a handle this process owns and will never interpret.
+            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        }
+        let err = match librsproto::surface::StartResize::read(body) {
+            None => Some(KError::InvalidArgument),
+            Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
+            Some(req) => match srv.router.start_resize(req.window, req.edges, &mut srv.stack) {
+                Ok(outline) => {
+                    srv.outline = outline;
+                    // Drawn at once, like a move's catch-up: the pointer has already travelled
+                    // during the round trip that brought this request, and a press-flick-release
+                    // with no motion event after it would otherwise show nothing at all.
+                    for r in outline.into_iter().flat_map(compositor::outline_edges) {
+                        if !r.is_empty() {
+                            repaint_region(srv, fb, r);
+                        }
+                    }
+                    Line::new()
+                        .s(b"compositor: interactive resize of window ")
+                        .u(req.window as u64)
+                        .s(b" edges ")
+                        .u(req.edges as u64)
+                        .end();
+                    None
+                }
+                // The caller does not hold the grab, the window has gone, or the edges name no
+                // gesture. Said out loud for the reason a refused move is: a drag that silently
+                // does not happen is indistinguishable from a request that never arrived.
+                Err(e) => {
+                    Line::new()
+                        .s(b"compositor: refused a resize of window ")
+                        .u(req.window as u64)
+                        .s(if matches!(e, compositor::StackError::BadGeometry) {
+                            b": those edges are not a gesture" as &[u8]
+                        } else {
+                            b": the pointer is not holding it"
+                        })
+                        .end();
+                    Some(match e {
+                        compositor::StackError::BadGeometry => KError::InvalidArgument,
+                        _ => KError::NotFound,
+                    })
                 }
             },
         };
@@ -2524,6 +2634,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         announced_focus: None,
         screen: fb.geometry().bounds(),
         last_layout: None,
+        outline: None,
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
         mgr_outbox: MgrOutbox::new(),
         interp: Interpreter::new(),

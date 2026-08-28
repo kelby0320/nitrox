@@ -327,6 +327,46 @@ pub fn title_bar<Msg: Clone>(
     )
 }
 
+/// The side of the square a window's resize grip occupies, in pixels.
+///
+/// Big enough to hit without aiming — the corner is the one place on a window where a person
+/// expects to be able to grab roughly — and small enough not to swallow the content under it,
+/// since the grip is drawn *over* the window's own bottom-right rather than reserving a strip.
+pub const GRIP_W: u32 = 16;
+
+/// A resize grip: a corner a window can be dragged bigger by.
+///
+/// **Client-side, like every other piece of chrome here** (decision 1 of Milestone 9), and like
+/// the title bar it *asks*: the message it sends becomes `Surface::StartResize`, the compositor
+/// runs the gesture, and the manager sends the `Configure` at the end. This widget draws a
+/// corner and reports a press; it knows nothing about rectangles.
+///
+/// **`on_press_down`, not `on_press`**, for the reason the title bar's drag uses it: the gesture
+/// begins at the press. A grip that waited for the click would hand the compositor a drag whose
+/// button was already up.
+///
+/// Positioned by its caller — an application stacks it over its own bottom-right corner, which
+/// is the one place this widget cannot work out for itself.
+pub fn resize_grip<Msg: Clone>(msg: Msg, palette: &Palette) -> Element<Msg> {
+    // Three nested corner bands — the conventional grip — drawn as squares of the groove
+    // colour rather than as glyphs: a grip that needed a font would need a theme, and this has
+    // neither. Each pair paints a band and then punches its middle back out.
+    let mut layers = alloc::vec::Vec::with_capacity(4);
+    layers.push(fill(palette.face));
+    for i in 0..3u32 {
+        let inset = i * 5;
+        layers.push(padding(
+            Insets { top: inset + 2, right: 2, bottom: 2, left: inset + 2 },
+            fill(palette.track),
+        ));
+        layers.push(padding(
+            Insets { top: inset + 4, right: 4, bottom: 4, left: inset + 4 },
+            fill(palette.face),
+        ));
+    }
+    sized(Size::new(GRIP_W, GRIP_W), stack(layers).on_press_down(msg))
+}
+
 /// What a title bar's buttons do, for the ones their application has an answer for.
 ///
 /// `None` is "do not draw it". See [`title_bar`] for why that is not the same as a button that

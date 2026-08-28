@@ -2515,18 +2515,41 @@ dependency cut in two rather than two independent things.
 
 ### Part E — resize by an edge, committing on release
 
-- [ ] **`Surface::StartResize(window, edges)`** — the same shape as `StartMove` with a direction,
-      and the same recorded press position.
+- [x] **`Surface::StartResize(window, edges)`** ✅ — the same shape as `StartMove` with a mask of
+      edges, refused the same way (the grab is the authority) and offsetting from the same
+      recorded press position. A corner is two bits; naming no edge, or both of an opposite pair,
+      is `InvalidArgument`.
 
-- [ ] **The compositor tracks the rect and draws its outline**, per decision 2 — no manager
-      traffic during the drag. On button-up it emits one event carrying the final rect, and the
-      shell sends the `Configure`. One `Configure` per gesture, and the compositor still never
-      resizes a client.
+- [x] **The compositor tracks the rect and draws its outline** ✅, per decision 2 — no manager
+      traffic during the drag, and the outline reaches no client at all: it is drawn over the
+      composed stack, the cursor sprite's neighbour rather than a window. Its damage is the four
+      **edge strips**, not the rectangle: the union of where an outline was and where it is is
+      very nearly the window, and repainting that per motion is the ~100 ms recompose that
+      starves input. On button-up one `ResizeEnded` goes to the manager and the shell sends the
+      `Configure`; the compositor never resizes a client.
 
-- [ ] **Gate**: drag `nxterm`'s bottom-right corner and assert the committed size — the
-      *committed* one, since a client may take less than it was offered and the compositor
-      composites what it is given. The control is an outline that tracks but a release that does
-      not commit: the window is unchanged and only the final assertion catches it.
+- [x] **Gate** ✅ — `check-login` step 6j drags the maximised terminal's corner inward and asserts
+      the mechanism in the order it happens: the compositor took the gesture and says which
+      edges, it reports one rectangle at the release, the **shell** turns that into a
+      `Configure` (the half that proves the compositor did not resize anything itself), the
+      client accepts, and the **committed** geometry is the new rectangle.
+
+      **Three controls, each failing at a different named assertion**, because the chain is
+      ordered by mechanism and each control breaks a different link: the release reporting
+      nothing fails at *"ended at …"*; the shell hearing it and sending no `Configure` fails at
+      *"resize window … to …"*; a client that accepts without committing fails at a geometry
+      assertion. The plan asked for the third one alone — "an outline that tracks but a release
+      that does not commit … only the final assertion catches it" — and the last assertion is
+      still the only one that reads the *committed* rect, which is what a client may decline.
+
+- [x] **Two deviations from decision 2, both "do not build what nothing uses"** ✅, and both
+      worth a reviewer's disagreement. Decision 2 says the manager hears an event when a drag
+      *begins* as well as when it ends: nothing in Part E or Part F has anything to do with one,
+      so it is not built. And it says the end event carries **which zone** the gesture ended in:
+      the event carries the rectangle only, because the rectangle is what a manager acts on and
+      the zone that produced it is derivable from a table the manager itself registered. Part F
+      adds a zone identifier if it turns out to need one — a wire change in a pre-stabilization
+      protocol, against a field that would be zero and unread until then.
 
 ### Part F — snap to edge and corner
 

@@ -19612,3 +19612,61 @@ geometry the compositor might have refused — unreachable today, and the module
 is unreachable rather than leaving the reader to reconstruct it; a failed attach was unmapping its
 memory without closing the handle that carried it, a leak inherited from the shape it replaced;
 and a dead store in `resize` that wrote `false` where `false` already was.
+
+---
+
+## 2026-08-29 — M9 Part E: the compositor draws a rectangle, and still resizes nothing
+
+Dragging a window's corner is two mechanisms that must not become one. The gesture belongs to the
+compositor — it holds the pointer grab, and it is the only participant that can follow a pointer
+without a round trip per motion. The *size* belongs to the manager, because a window's geometry
+has one path through this system and a second one would be a second source of truth. Part E is
+the seam between them: `Surface::StartResize` hands over the gesture, and one `Manage::ResizeEnded`
+hands back a rectangle at the release.
+
+**The outline is the compositor's own drawing, and that is not a hole in decision 1.** What
+client-side decorations refuse is chrome the compositor has to lay out and style, and the reason
+they refuse it is that such chrome changes what "the window's rectangle" means — a meaning
+threaded through compositing, damage, hit-testing, placement, struts and `Capture`. An outline
+changes none of it: it has no client, no buffer, no place in the stacking order and nothing can
+cover it. It is the cursor sprite's neighbour.
+
+**Its damage is four edge strips, not its rectangle**, and that is the whole difference between a
+drag that works and one that starves input. The union of where an outline was and where it is is
+very nearly the window; repainting that per pointer motion is the ~100 ms full recompose this
+milestone has already met twice — once as a window-list click that threw away the mouse movement
+around it, once as a desktop switch that swallowed a burst of motion. Four thin bands are a few
+thousand pixels whatever the window's size.
+
+**A gesture the user did not finish reports nothing**, and the test for it is one predicate rather
+than three: the window must still be *on screen* when the button comes up. A client that exited
+mid-drag has nobody to configure. A window minimised or sent to another desktop mid-drag is a
+gesture the user interrupted — the outline they were steering by is gone, and resizing a window
+somebody just put away to a size they were half-way through choosing is not what they asked for.
+An ordinary click on the grip is a resize of zero pixels and is dropped for the reason `end_drag`
+already drops a move of zero pixels: the manager's queue does not coalesce.
+
+**Two deviations from decision 2, both the same rule, both worth arguing with.** That decision
+says the manager hears an event when a drag *begins* as well as when it ends, and that the end
+event carries which snap zone the gesture finished in. Neither is built. Nothing in Part E or Part
+F does anything with a begin event; and the zone is derivable from the rectangle against a table
+the manager itself registered, so what would land today is a field that is always zero and never
+read — which this project has called out as a defect twice. Part F adds a zone identifier if it
+turns out to need one, at the cost of a wire change in a pre-stabilization protocol.
+
+**The event carries a `ConfigureEvent` because that is what the manager sends back.** The shell's
+entire answer is `Manage::Configure` with the same five numbers, which makes the handler a loop
+rather than a translation — and makes it obvious in the code that the compositor asked rather than
+acted.
+
+**The gate's assertions are ordered by mechanism, and each control fails at a different one.**
+The compositor took the gesture and says which edges; it reports one rectangle at the release; the
+*shell* turns that into a `Configure`; the client accepts; the committed geometry is the new
+rectangle. Three controls were run — the release reporting nothing, the shell answering nothing,
+and a client that accepts without committing — and each failed at exactly the assertion standing
+behind it. The plan asked for the third alone; having all three is what says the middle links are
+carrying weight rather than being satisfied by the ends.
+
+**And a knock-on worth recording**: a window resized by hand is no longer the window that was
+maximised, so the shell drops its restore rectangle. Keeping it would make the next restore put
+the window somewhere it had never been.

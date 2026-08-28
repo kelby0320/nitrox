@@ -304,6 +304,51 @@ pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
     }
 }
 
+/// The interactive-resize outline's thickness, in pixels.
+pub const OUTLINE_W: u32 = 2;
+
+/// The outline's colour — bright enough to read over any client's pixels.
+pub const OUTLINE_COLOUR: Rgb = Rgb::new(0xE0, 0xE0, 0xE0);
+
+/// The four edge strips of `rect`, which is what an outline occupies.
+///
+/// **Strips rather than the rectangle**, because this is what gets repainted per pointer motion.
+/// The union of an outline's old and new rectangles is very nearly the window, and repainting
+/// that under emulation is the ~100 ms full recompose that starves input — the failure this
+/// milestone has already met twice. Four thin bands are a few thousand pixels whatever the
+/// window's size.
+///
+/// Empty strips are returned as-is; the compositor's damage handling already skips them.
+pub fn outline_edges(rect: Rect) -> [Rect; 4] {
+    let t = OUTLINE_W.min(rect.size.h.max(1));
+    let side = OUTLINE_W.min(rect.size.w.max(1));
+    [
+        Rect::new(rect.origin.x, rect.origin.y, rect.size.w, t),
+        Rect::new(rect.origin.x, rect.bottom() as i32 - t as i32, rect.size.w, t),
+        Rect::new(rect.origin.x, rect.origin.y, side, rect.size.h),
+        Rect::new(rect.right() as i32 - side as i32, rect.origin.y, side, rect.size.h),
+    ]
+}
+
+/// Draw the interactive-resize outline at `rect`, clipped to `clip`.
+///
+/// **Over the composed stack, like the cursor**, and for the same reason: it is not a window. It
+/// has no client, no buffer, no place in the stacking order and nothing can cover it — a
+/// preview of a rectangle the user has not committed to yet. Decision 1 of Milestone 9 refuses
+/// chrome the compositor has to lay out and style; an outline has neither.
+pub fn draw_outline<F: Framebuffer + ?Sized>(fb: &mut F, rect: Rect, clip: Rect) {
+    for strip in outline_edges(rect) {
+        let Some(r) = strip.intersect(&clip) else { continue };
+        for y in r.origin.y..r.bottom() as i32 {
+            for x in r.origin.x..r.right() as i32 {
+                if x >= 0 && y >= 0 {
+                    fb.put_pixel(x as u32, y as u32, OUTLINE_COLOUR);
+                }
+            }
+        }
+    }
+}
+
 /// How long a key must be held before it starts repeating, in nanoseconds.
 ///
 /// Policy with no configuration surface yet. Both constants are what a settings service will
@@ -1104,12 +1149,18 @@ impl WindowStack {
         source: &S,
         damage: &[Rect],
         pointer: Point,
+        outline: Option<Rect>,
     ) where
         F: Framebuffer + ?Sized,
         S: BufferSource + ?Sized,
     {
         self.compose_into(fb, background, source, damage);
+        // **The outline under the cursor, both over everything else.** A cursor hidden behind
+        // the outline it is dragging would be the one pixel the user is actually steering by.
         for r in damage {
+            if let Some(o) = outline {
+                draw_outline(fb, o, *r);
+            }
             draw_cursor(fb, pointer, *r);
         }
     }
@@ -1379,13 +1430,13 @@ mod tests {
         let (mut s, src, (bottom, _top)) = overlapping_pair();
         let mut painted = screen();
         let full = Rect::new(0, 0, 32, 16);
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
 
         let d = s.raise(bottom).expect("in the stack");
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100), None);
 
         let mut reference = screen();
-        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
         assert_eq!(
             painted.bytes(),
             reference.bytes(),
@@ -1401,13 +1452,13 @@ mod tests {
         let (mut s, src, (_bottom, top)) = overlapping_pair();
         let mut painted = screen();
         let full = Rect::new(0, 0, 32, 16);
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
 
         let d = s.lower(top).expect("in the stack");
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100), None);
 
         let mut reference = screen();
-        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
         assert_eq!(painted.bytes(), reference.bytes(), "a lower's region must cover its own");
     }
 
@@ -2055,7 +2106,7 @@ mod tests {
         let pointer = Point::new(20, 20);
         let mut fb = big_screen();
         let full = fb.geometry().bounds();
-        s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer);
+        s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer, None);
 
         assert!(
             body_pixels(&fb, pointer) > 0,
@@ -2097,6 +2148,7 @@ mod tests {
             &src,
             &[elsewhere, cursor_rect(pointer)],
             pointer,
+            None,
         );
         assert!(
             body_pixels(&fb, pointer) > 0,

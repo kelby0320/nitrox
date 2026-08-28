@@ -675,6 +675,51 @@ The move produces **one** `WindowGeometry` event, when it ends. Not one per moti
 does not coalesce and discards its oldest when full, so a long drag would push a `WindowCreated`
 off the front of a manager's view of the world.
 
+### `StartResize` (`0x090D`)
+
+Request, 8 bytes: `window` (u32), `edges` (u32 — a mask of `1` left, `2` right, `4` top, `8`
+bottom). Asks the compositor to run an interactive resize of this window until the button holding
+it comes up. Empty reply body on success.
+
+**The same authority as [`StartMove`](#startmove-0x090a), and the same refusal**: `NotFound`
+unless the caller's window holds the implicit pointer grab, because the grab is what makes "the
+user is dragging my edge" true. The offset is taken from where the press landed, for the reason
+`StartMove` gives.
+
+**A corner is two bits.** `edges` is a mask so the arithmetic that moves an edge is written once
+per axis rather than once per direction. `InvalidArgument` for a mask that names no gesture: zero
+edges, an unknown bit, or *both* of an opposite pair — nobody drags a window's left and right
+sides at once.
+
+**Nothing about the window changes while it runs**, and this is the whole difference from
+`StartMove`. The window keeps its rectangle; what moves is an **outline** the compositor draws
+over the composed stack, which reaches no client, crosses no wire and has no place in the
+stacking order — the cursor sprite's neighbour rather than a window. When the button comes up the
+compositor sends the manager one [`ResizeEnded`](#resizeended-0x0926) carrying the rectangle the
+user let go at, and **the manager sends the `Configure`**. The compositor never resizes a client,
+so there is one path to a window's geometry rather than two that can disagree.
+
+**One `Configure` per gesture, not one per motion.** A live resize is a client cost rather than a
+protocol one — every motion would make the client allocate new shared buffers, map them,
+re-lay-out and repaint — and committing on release costs nothing on top of it. The protocol needs
+nothing for this: a `Configure` is a request, and a client that takes 79 whole cells instead of
+the 1003 pixels it was offered is the already-solved case that makes size hints unnecessary.
+
+An outline that would invert — an edge dragged past its opposite — stops at a floor the
+compositor keeps. That is a drawing bound, not a policy one: a rectangle with a negative width is
+a shape no repaint can describe. A client's own minimum is not expressible here and does not need
+to be, because it may decline whatever it is offered.
+
+A second `StartResize` while one is running changes nothing and reports success, exactly as a
+second `StartMove` does. A `StartResize` while a *move* is running is refused: one grab is one
+gesture. While either is in flight, `Place` for that window is refused with `WouldBlock`.
+
+**A gesture the user did not finish reports nothing.** If the window leaves the screen mid-drag —
+minimised, or sent to another desktop — the outline is taken down and no `ResizeEnded` is sent:
+the rectangle the user was steering by is no longer visible, and resizing a window somebody just
+put away to a size they were half-way through choosing is not what they asked for. Nor is
+anything sent for a gesture that ended where it started, which is an ordinary click on a grip.
+
 ### `RequestState` (`0x090B`)
 
 Request, 8 bytes: `window` (u32), `state` (u32 — `0` normal, `1` minimised, `2` maximised).
@@ -684,7 +729,7 @@ Asks the *manager* to put this window in that state. Empty reply body on success
 [`SetMinimized`](#setminimized-0x0917) and maximising is a [`Configure`](#configure-0x0915) to a
 rectangle computed from the work area; both are manager operations, and a client holding either
 could put another client's window away or place itself. So this asks, the compositor forwards it
-as [`WindowStateRequest`](#manager-events-0x09180x091c-0x091f-0x09220x0923), and the manager
+as [`WindowStateRequest`](#manager-events-0x09180x091c-0x091f-0x09220x0923-0x0926), and the manager
 answers with the request it would have sent anyway.
 
 `NotFound` for a window the caller does not own; `InvalidArgument` for a short body or a state
@@ -886,7 +931,7 @@ and it is the one a shell reaches for first.
 
 `Close` **destroys the window**, exactly as [`DestroyWindow`](#destroywindow-0x0904) does for a
 client's own window: descendants go with it, and
-[`WindowDestroyed`](#manager-events-0x09180x091c-0x091f-0x09220x0923) follows. The client is not
+[`WindowDestroyed`](#manager-events-0x09180x091c-0x091f-0x09220x0923-0x0926) follows. The client is not
 told, because there is nothing it could do with the information that `RequestClose` had not
 already offered it. Its next request naming that window — or any descendant that went with it —
 is answered `NotFound`, like any other window that no longer exists: the compositor stops
@@ -979,7 +1024,7 @@ the cursor is entered normally.
 A window that has been **destroyed** gets none of this: it is unreachable, so its id is simply
 forgotten. The suppression above still applies, because the sequence has still lost its owner.
 
-## Manager events (`0x0918`–`0x091C`, `0x091F`, `0x0922`–`0x0923`)
+## Manager events (`0x0918`–`0x091C`, `0x091F`, `0x0922`–`0x0923`, `0x0926`)
 
 Sent by the compositor **to** the manager channel, unsolicited. They are records, not
 requests: there is no reply, and the manager cannot refuse one.
@@ -1049,6 +1094,27 @@ remove.
 
 `WindowFocus` reports both halves of a transition: the window losing focus, then the window
 gaining it. Either may be absent — nothing had focus, or nothing takes it.
+
+### `ResizeEnded` (`0x0926`)
+
+**Server → manager. Unsolicited, no reply.** Body: a [`ConfigureEvent`](#configure-0x0908) —
+`window`, `width`, `height`, `x`, `y` — carrying the rectangle an interactive resize
+([`StartResize`](#startresize-0x090d)) ended at.
+
+**One event for a whole gesture.** Nothing is sent per motion: this queue does not coalesce and
+evicts its oldest when full, so a five-second drag at 100 Hz would push a `WindowCreated` off the
+front and leave a manager with a window it will never place and never hear about again. The
+outline the user watches is the compositor's own drawing and crosses no wire.
+
+**It carries a `ConfigureEvent` because that is what the manager sends back.** The whole answer is
+`Manage::Configure` with these five numbers. A manager that decides otherwise is behaving
+correctly — this is a report of what the user did, not an instruction — and a manager that does
+nothing leaves the window the size it was, which is also what a client that declines produces.
+
+It does **not** carry which snap zone the gesture ended in. That is not an omission of Part E's
+but a consequence of what a manager needs: the rectangle is what it acts on, and the zone that
+produced a rectangle is derivable from a table the manager itself registered. Milestone 9 Part F
+adds a zone identifier here if it turns out to need one.
 
 ## Titles, and the one variable-length body
 

@@ -449,19 +449,22 @@ None of the three is speculative and none would have been designed right in the 
 `offset_at`'s centring rule, in particular, is a decision about how a drag feels that only a
 real drag poses.
 
-**One more arrived with Milestone 9**, by the same rule and with the same shape — the terminal
-needed it, so it exists:
+**Two more arrived with Milestone 9**, by the same rule and with the same shape — the terminal
+needed them, so they exist:
 
 | Widget | Why it exists |
 |---|---|
 | `title_bar` | Client-side decorations. A `Stack` carrying the window's title, an `on_press_down` for the drag, and a `TitleButtons` set at its right end — minimise, maximise, close, each `TITLE_BUTTON_W` wide, in that order from the left. Every button is an `Option<Msg>`: an absent one draws nothing rather than a disabled square, so an application that cannot be maximised has a bar with two buttons and no gap |
+| `resize_grip` | The other end of the same idea (Part E): a `GRIP_W` square of nested corner bands with an `on_press_down`, which an application stacks over its own bottom-right. Positioned by its caller, because where a window's corner is is the one thing this widget cannot work out for itself — and stacked rather than docked, so it costs no row of the content under it |
 
-Its buttons **ask** and do not act, which is not the toolkit's rule but the protocol's:
+**Both ask and neither acts**, which is not the toolkit's rule but the protocol's:
 minimising and maximising are the manager's operations, so the messages a client emits from
 this bar become `Surface::RequestState`, and the shell decides
 ([`desktop-shell.md`](desktop-shell.md)). Close is the exception in both directions — a
 client's own close button ends the client, and it is the *manager* that has to ask a client to
-close, because only the compositor can reach a client's session.
+close, because only the compositor can reach a client's session. The grip's message becomes
+`Surface::StartResize`, after which nothing reaches this client until a `Configure` arrives at the
+end of the gesture: the compositor moves an outline of its own, and the shell sends the size.
 
 The `custom` widget deserves emphasis rather than apology. A toolkit whose escape hatch is
 an afterthought forces its flagship application to fight it; here the flagship *is* an

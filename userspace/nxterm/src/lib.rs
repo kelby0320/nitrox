@@ -31,11 +31,11 @@ use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED,
-    WINDOW_STATE_NORMAL,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
+    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
-use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, stack};
-use libui::widget::{TITLE_BAR_H, TitleButtons, title_bar};
+use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, stack};
+use libui::widget::{GRIP_W, TITLE_BAR_H, TitleButtons, resize_grip, title_bar};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
 /// The `custom` node the grid is drawn into.
@@ -64,6 +64,9 @@ pub const BAR_KEY: u64 = 3;
 pub const SCROLLBAR_KEY: u64 = 4;
 /// The key on the title bar — see [`BAR_KEY`].
 pub const TITLE_KEY: u64 = 5;
+
+/// The resize grip's key, so a test can find it without walking the tree.
+pub const GRIP_KEY: u64 = 6;
 
 /// Height of the menu bar, in pixels.
 pub const BAR_H: u32 = 24;
@@ -101,6 +104,12 @@ pub enum Msg {
     /// **One message for both**, because they mean the same thing to this terminal: somebody
     /// wants it gone. Which of them it was is not something it has to act on differently.
     Close,
+    /// The resize grip was pressed: the compositor is owed a `StartResize`.
+    ///
+    /// **Carries the edges** for the same reason [`RequestState`](Msg::RequestState) carries the
+    /// state: which corner a grip is, is the *grip's* business, and this crate would only be
+    /// deciding it a second time.
+    ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
     ///
     /// **Carries the state rather than being three messages**, because the terminal does nothing
@@ -171,6 +180,11 @@ pub struct App {
     /// answers to "what should this window be", so a frame that saw two presses has had the
     /// second one supersede the first.
     state_requested: Option<u32>,
+    /// The grip was pressed, and the binary owes the compositor a `StartResize` for these edges.
+    ///
+    /// **An outbox of one**, like [`move_requested`](Self::move_requested): `update` is a
+    /// function of values and "send a request on a channel" is a syscall.
+    resize_requested: Option<u32>,
     /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
     ///
     /// **An outbox of one**, for the reason `outbox` is one: `update` is a function of values
@@ -227,6 +241,7 @@ impl App {
             palette: Palette::default(),
             outbox: Vec::new(),
             move_requested: false,
+            resize_requested: None,
             state_requested: None,
             closing: false,
             view_top: None,
@@ -320,6 +335,11 @@ impl App {
         self.state_requested.take()
     }
 
+    /// The edges a `StartResize` is owed for, if the grip was pressed. Clears the record.
+    pub fn take_resize_request(&mut self) -> Option<u32> {
+        self.resize_requested.take()
+    }
+
     /// Take everything the user has typed since this was last called.
     pub fn take_outbox(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbox)
@@ -372,6 +392,8 @@ impl App {
             // The compositor is the one holding the grab this press opened, so all this does is
             // record that the binary owes it a request.
             Msg::DragWindow => self.move_requested = true,
+            // Likewise for the corner: the compositor holds the grab, and this records the ask.
+            Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
             // Likewise: minimising and maximising are the manager's, and this records the ask.
             Msg::RequestState(s) => {
                 // **The maximise button is a toggle**, and this bit is the whole of what makes
@@ -526,6 +548,18 @@ impl App {
             ],
             custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
         );
+
+        // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
+        // reserved for it would take a row of cells from every terminal for a control that is
+        // only ever aimed at; stacked over the corner it costs nothing and is exactly where a
+        // person reaches. `offset` places it, because a `stack` layer otherwise gets the whole
+        // area and `sized` alone would put it top-left.
+        let grip = offset(
+            (self.window.w.saturating_sub(GRIP_W)) as i32,
+            (self.window.h.saturating_sub(GRIP_W)) as i32,
+            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
+        );
+        let body = stack(vec![body, grip]);
 
         // **The menu is not in this tree.** It used to be a `Stack` layer over the whole
         // window — a layer inside the 24-pixel bar would have been clipped to 24 pixels, so it
@@ -833,9 +867,17 @@ mod tests {
             let mut a = app();
             a.menu_open = open;
             a.menu_anchor = anchor;
+            // **The same shape whether the menu is open or not**, which is the property: the
+            // menu is a *window*, so opening it adds nothing here. Since M9 Part E the root is
+            // a stack of two — the body and the resize grip over its corner — rather than the
+            // dock alone, and that is still fixed.
+            let libui::element::Node::Stack(layers) = &a.view().node else {
+                panic!("open={open}: the window's tree is the body under its grip");
+            };
+            assert_eq!(layers.len(), 2, "open={open}: the body and the grip, and nothing else");
             assert!(
-                matches!(a.view().node, libui::element::Node::Dock { .. }),
-                "open={open}: the window's tree is the body"
+                matches!(layers[0].node, libui::element::Node::Dock { .. }),
+                "open={open}: the body is the dock"
             );
         }
     }
