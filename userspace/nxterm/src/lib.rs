@@ -30,9 +30,10 @@ use libterm::cell::Palette;
 use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
-use librsproto::surface::{KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent};
+use librsproto::surface::{
+    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED,
+};
 use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, stack};
-use librsproto::surface::{WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED};
 use libui::widget::{TITLE_BAR_H, TitleButtons, title_bar};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 

@@ -1478,6 +1478,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut fired,
                 &mut layout,
                 &mut states,
+                &mut restore,
                 current_desktop,
             );
             // **What a client asked to be, decided here.** The compositor forwarded the
@@ -1501,6 +1502,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         }
                     }
                     WINDOW_STATE_MAXIMIZED => {
+                        // **Back on screen first.** A minimized window asked to maximise is
+                        // asking to be *seen* maximised; configuring it where it is would resize
+                        // something that is not on screen and leave it that way.
+                        if e.minimized && raise_window(m, e) {
+                            sent_request = true;
+                            list_dirty = true;
+                        }
                         // Remembered before it moves, and only the first time: maximising an
                         // already-maximised window must not overwrite where it came from with
                         // the work area itself, which is a restore that does nothing.
@@ -2989,6 +2997,7 @@ fn place_new_windows(
     fired: &mut alloc::vec::Vec<u32>,
     layout: &mut MgrLayout,
     states: &mut alloc::vec::Vec<librsproto::surface::WindowState>,
+    restore: &mut alloc::vec::Vec<(u32, (i32, i32, u32, u32))>,
     current: u32,
 ) -> bool {
     use librsproto::surface::{
@@ -3012,7 +3021,13 @@ fn place_new_windows(
         // being a second stack that can disagree with the compositor's.
         match op {
             OP_MGR_WINDOW_DESTROYED => {
+                // **The restore rectangle goes with the window.** Ids are never reused, so a
+                // stale entry can never be *mistaken* for another window — but it is never
+                // collected either, and a client looping create → maximise → destroy would grow
+                // this vector for the life of the session. The window cap bounds concurrent
+                // windows, not the number that have ever existed (PR #249 review, finding 3).
                 if let Some(r) = MgrWindowRef::read(&buf[..n]) {
+                    restore.retain(|(id, _)| *id != r.window);
                     let before = entries.len();
                     entries.retain(|e| e.id != r.window);
                     dirty |= entries.len() != before;

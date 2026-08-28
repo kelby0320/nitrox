@@ -696,6 +696,19 @@ impl WindowStack {
         true
     }
 
+    /// Forget what `id` last asked to be, because something else has changed it.
+    ///
+    /// **The shadow is only valid while nothing else has happened.** `state_requested` exists to
+    /// drop a client repeating itself, and it compares against what that client last asked —
+    /// which stops describing the window the moment a *manager* minimises, restores, places or
+    /// configures it by any other route. Clearing it there costs one field write and makes the
+    /// dedup unable to outlive its premise.
+    pub fn clear_state_request(&mut self, id: u32) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.state_requested = None;
+        }
+    }
+
     /// Move a window the user is dragging, without logging a geometry change.
     ///
     /// Returns `NoSuchWindow` if it has gone, which is the ordinary end of a drag whose client
@@ -1433,6 +1446,27 @@ mod tests {
             Rect::new(0, 10, 100, 82),
             "both struts, not just the first"
         );
+    }
+
+    #[test]
+    fn a_manager_changing_a_windows_state_invalidates_what_it_last_asked_to_be() {
+        // **The dedup compares against a value the manager also changes.** A client minimises
+        // through its title bar; the user restores through the taskbar, which is `SetMinimized`
+        // and not a client request; the next identical minimise was dropped as a repeat, and the
+        // client was told it had succeeded. The button worked once and then never again
+        // (PR #249 review, blocking 1).
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest::new(80, 60, Role::Normal)).unwrap();
+        assert!(s.note_state_request(w, 1), "the first minimise is news");
+
+        // What the shell does with it, and then what the taskbar does — neither is a client
+        // request, and both are reasons the shadow no longer describes the window.
+        s.set_minimized(w, true).unwrap();
+        s.clear_state_request(w);
+        s.set_minimized(w, false).unwrap();
+        s.clear_state_request(w);
+
+        assert!(s.note_state_request(w, 1), "and minimising again must reach the manager");
     }
 
     #[test]
