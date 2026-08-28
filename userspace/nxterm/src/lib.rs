@@ -32,6 +32,7 @@ use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use librsproto::surface::{
     KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED,
+    WINDOW_STATE_NORMAL,
 };
 use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, stack};
 use libui::widget::{TITLE_BAR_H, TitleButtons, title_bar};
@@ -108,6 +109,18 @@ pub enum Msg {
     RequestState(u32),
 }
 
+/// What a [`resize`](App::resize) did, beyond changing the size.
+///
+/// **Only the eviction, because only the eviction is not derivable.** Everything else about the
+/// new shape is readable from the grid afterwards; how many lines the bounded scrollback dropped
+/// on the way is not, and it is the difference between "the rewrap lost lines" and "the history
+/// was already full" — see [`libterm::grid::Reflow::evicted_lines`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Resized {
+    /// Logical lines the ring dropped during the rewrap.
+    pub evicted: usize,
+}
+
 /// Everything the terminal is.
 pub struct App {
     /// The screen, the cursor, and the scrollback.
@@ -172,6 +185,21 @@ pub struct App {
     /// Collapsing them is how a terminal ends up scrolling itself back to where you were
     /// reading half a second ago.
     view_top: Option<u64>,
+    /// This window last asked to be maximised, so its maximise button now asks for normal.
+    ///
+    /// See [`Msg::RequestState`]'s arm in [`update`](App::update) for why it is what was
+    /// *asked* rather than what the window is.
+    maximized: bool,
+    /// The window's size in pixels — what the client commits, not what the grid needs.
+    ///
+    /// **These are not the same number once a manager is involved** (M9 Part D). A maximised
+    /// terminal is exactly the work area; the grid inside it is the largest whole number of
+    /// cells that fits, and the few pixels left over are background. Deriving the window from
+    /// the grid instead — which is what [`window_size`](App::window_size) did until Part D, and
+    /// still does at startup — would make a maximised window a cell smaller than it was asked
+    /// for in each axis, so "the window is the work area" would be false by a rounding error
+    /// and the shell's own geometry log would say so.
+    window: Size,
     /// The viewport moved, so all of it repaints.
     ///
     /// **Not [`Grid::damage_all`], which was the first attempt** and is wrong for a reason
@@ -186,7 +214,10 @@ pub struct App {
 impl App {
     /// A terminal of `cols` × `rows` cells, drawn with `metrics`.
     pub fn new(cols: usize, rows: usize, metrics: Metrics) -> App {
+        let g = metrics.pixel_size(cols, rows);
         App {
+            window: Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H),
+            maximized: false,
             grid: Grid::new(cols, rows),
             parser: Parser::new(),
             menu_open: false,
@@ -203,12 +234,45 @@ impl App {
         }
     }
 
-    /// The window size this terminal wants: the grid, plus its chrome.
+    /// The size of this terminal's window in pixels.
+    ///
+    /// At startup it is the grid plus its chrome — the title bar is part of this window like
+    /// every other pixel, because client-side decorations mean the chrome is in the buffer.
+    /// After a [`resize`](App::resize) it is whatever the manager asked for, and the grid is
+    /// what fits inside it.
     pub fn window_size(&self) -> Size {
-        // The title bar is part of this window like every other pixel — client-side decorations
-        // mean the chrome is in the buffer, so the window is taller by exactly its height.
-        let g = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
-        Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H)
+        self.window
+    }
+
+    /// Take the window to `size`, refitting the grid and rewrapping the history.
+    ///
+    /// **This is the client's answer to `Configure`**, and it accepts rather than declines — the
+    /// thing M9 Part D exists to change. The window becomes exactly the size asked for; the grid
+    /// becomes the largest whole number of cells that fits inside the chrome, which is at least
+    /// one of each so that a hostile or degenerate size cannot produce a grid with no valid
+    /// cursor position.
+    ///
+    /// **The scrolled-back viewport is carried across the rewrap**, because a resize changes how
+    /// many lines the history has: a reader who has scrolled up sees the same text after the
+    /// resize as before it, not the same line number.
+    ///
+    /// `None` if nothing changed, so a caller can skip reallocating buffers for a `Configure`
+    /// that repeats the size a window already has — which is every `Configure` that follows a
+    /// move. `Some` carries what the resize cost the history: see [`Resized`].
+    pub fn resize(&mut self, size: Size) -> Option<Resized> {
+        if size == self.window {
+            return None;
+        }
+        self.window = size;
+        let cols = (size.w.saturating_sub(SCROLL_W) / self.metrics.cell_w).max(1) as usize;
+        let rows = (size.h.saturating_sub(BAR_H + TITLE_BAR_H) / self.metrics.cell_h).max(1)
+            as usize;
+        let reflow = self.grid.resize(cols, rows);
+        // **Through the map, not around it.** `view_top` is an absolute line number and the
+        // rewrap changed how many lines exist above it.
+        self.view_top = self.view_top.map(|t| self.grid.clamp_view(reflow.map_line(t)));
+        self.view_moved = true;
+        Some(Resized { evicted: reflow.evicted_lines() })
     }
 
     /// Where the grid's top-left sits inside the window.
@@ -309,7 +373,22 @@ impl App {
             // record that the binary owes it a request.
             Msg::DragWindow => self.move_requested = true,
             // Likewise: minimising and maximising are the manager's, and this records the ask.
-            Msg::RequestState(s) => self.state_requested = Some(s),
+            Msg::RequestState(s) => {
+                // **The maximise button is a toggle**, and this bit is the whole of what makes
+                // it one: a window that asked to be maximised asks to be *normal* next, which
+                // is what reaches the shell's restore path. Before M9 Part D the button was
+                // one-way because maximising did nothing visible — the client declined the
+                // `Configure` — so a window could not be un-maximised and nothing on the system
+                // ever sent `WINDOW_STATE_NORMAL`.
+                //
+                // **What was asked for, not what happened**, like every other half of this
+                // exchange: a shell that ignored the request leaves this bit wrong for exactly
+                // one click, which the next one corrects.
+                if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
+                    self.maximized = s == WINDOW_STATE_MAXIMIZED;
+                }
+                self.state_requested = Some(s);
+            }
             Msg::Close => self.closing = true,
             Msg::Clear => {
                 // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
@@ -390,7 +469,12 @@ impl App {
     /// separately for the thumb arithmetic — so this is the one number both the view and the
     /// drag have to agree on, and it exists so they cannot disagree.
     pub fn track_h(&self) -> u32 {
-        self.metrics.pixel_size(self.grid.cols(), self.grid.rows()).h
+        // **What the `Dock` will actually leave it**, which since M9 Part D is not the grid's
+        // pixel height: a window is whatever size the manager asked for, and the grid is the
+        // whole cells that fit inside it. Sizing the thumb against the grid instead would make
+        // it a fraction of a cell short in a maximised window, and the error would grow with
+        // the leftover.
+        self.window.h.saturating_sub(BAR_H + TITLE_BAR_H)
     }
 
     /// The element tree for the current state.
@@ -415,7 +499,11 @@ impl App {
             Msg::DragWindow,
             TitleButtons {
                 minimise: Some(Msg::RequestState(WINDOW_STATE_MINIMIZED)),
-                maximise: Some(Msg::RequestState(WINDOW_STATE_MAXIMIZED)),
+                maximise: Some(Msg::RequestState(if self.maximized {
+                    WINDOW_STATE_NORMAL
+                } else {
+                    WINDOW_STATE_MAXIMIZED
+                })),
                 // **Close sends nothing.** It is the one button whose answer is entirely this
                 // client's: it exits, and the compositor tears down its windows with its
                 // session. A `Manage::Close` exists for a client that will *not* do this, and it
@@ -501,6 +589,102 @@ mod tests {
     fn app() -> App {
         let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
         App::new(20, 6, Metrics::new(&f, 16.0))
+    }
+
+    #[test]
+    fn the_maximise_button_alternates_between_maximised_and_normal() {
+        // **The only thing that ever sends `WINDOW_STATE_NORMAL`.** The shell has had a restore
+        // path since M9 Part B and nothing could reach it: the button was one-way, which was
+        // invisible while maximising did nothing and is a window you cannot get back the moment
+        // it does (M9 Part D).
+        let mut a = app();
+        a.update(Msg::RequestState(WINDOW_STATE_MAXIMIZED));
+        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED));
+
+        // The *button* now carries the other message — clicked where a person clicks it, so
+        // this also says the toggle is on the bar rather than only in the state.
+        click_maximise(&mut a);
+        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_NORMAL));
+        click_maximise(&mut a);
+        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED), "and back again");
+    }
+
+    #[test]
+    fn minimising_does_not_disturb_which_way_the_maximise_button_points() {
+        // Three buttons, one message type: an arm that took every `RequestState` as an answer
+        // about maximisation would flip on a minimise, and the maximise button would then
+        // restore a window that had never been maximised.
+        let mut a = app();
+        a.update(Msg::RequestState(WINDOW_STATE_MAXIMIZED));
+        a.update(Msg::RequestState(WINDOW_STATE_MINIMIZED));
+        let _ = a.take_state_request();
+        click_maximise(&mut a);
+        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_NORMAL));
+    }
+
+    #[test]
+    fn a_configure_takes_the_window_exactly_and_fits_the_grid_inside_it() {
+        // **The window is the size the manager asked for**, to the pixel — that is what makes
+        // "the maximised terminal is the work area" a true statement rather than one off by a
+        // rounding error in each axis. The grid is the whole cells that fit inside the chrome,
+        // and what is left over is background.
+        let mut a = app();
+        let m = a.metrics;
+        let want = Size::new(1280, 752);
+        assert!(a.resize(want).is_some(), "a new size is a change");
+        assert_eq!(a.window_size(), want, "committed at exactly what was asked for");
+        assert_eq!(a.grid.cols(), ((1280 - SCROLL_W) / m.cell_w) as usize);
+        assert_eq!(a.grid.rows(), ((752 - BAR_H - TITLE_BAR_H) / m.cell_h) as usize);
+        // And the cells really do fit: chrome plus grid is no larger than the window.
+        let g = m.pixel_size(a.grid.cols(), a.grid.rows());
+        assert!(g.w + SCROLL_W <= want.w && g.h + BAR_H + TITLE_BAR_H <= want.h);
+    }
+
+    #[test]
+    fn a_configure_repeating_the_current_size_is_not_a_resize() {
+        // A `Configure` follows every *move* as well as every resize, carrying the origin. A
+        // client that reallocated its buffers and rewrapped its history for each one would do
+        // both per pointer motion of a drag.
+        let mut a = app();
+        let want = a.window_size();
+        assert!(a.resize(want).is_none(), "same size, nothing to do");
+    }
+
+    #[test]
+    fn a_degenerate_configure_still_leaves_a_usable_grid() {
+        // Smaller than the chrome. A grid of zero columns has no valid cursor position, so the
+        // floor is one of each rather than a refusal — the compositor composites whatever it is
+        // given, and a client that panicked here would be one a manager could crash.
+        let mut a = app();
+        assert!(a.resize(Size::new(1, 1)).is_some());
+        assert_eq!((a.grid.cols(), a.grid.rows()), (1, 1));
+        assert_eq!(a.window_size(), Size::new(1, 1));
+    }
+
+    #[test]
+    fn a_scrolled_back_view_shows_the_same_text_after_a_resize() {
+        // The anchor is an absolute line number and a rewrap changes how many lines there are.
+        // This is `Grid::resize`'s `Reflow` reaching the one place outside the grid that holds
+        // such a number.
+        let mut a = app();
+        for i in 0..30 {
+            a.feed(alloc::format!("line{i} and some more text here\r\n").as_bytes());
+        }
+        // **An even line, because each of those 29-character lines is two rows at 20 columns**
+        // and nothing has been evicted: line 4 is where "line2" starts. Anchoring on a
+        // *continuation* row would make the assertion below wrong rather than the code — the
+        // row that then holds that text is the rejoined line, and the text is in its middle.
+        a.scroll_to_line(a.grid.oldest_line() + 4);
+        let want = line(&a, 0);
+        assert!(want.starts_with("line2"), "the anchor is where it is thought to be: {want:?}");
+
+        a.resize(Size::new(600, 400));
+        assert!(
+            line(&a, 0).starts_with(&want),
+            "after the resize the viewport shows {:?}, which does not begin the text it showed \
+             before ({want:?})",
+            line(&a, 0)
+        );
     }
 
     /// The characters **on show** at viewport `row`, trailing blanks trimmed.
@@ -901,6 +1085,37 @@ mod tests {
         let id = t.find_by_key(GRID_KEY).expect("the grid is keyed");
         assert!(r.focus(&t, &e, id), "the grid must be able to take focus");
         (t, l, r)
+    }
+
+    /// Press and release the maximise button, at the coordinates a person would hit.
+    ///
+    /// **Through the router**, because the message the button carries is the thing under test:
+    /// reading the state instead would pass for a toggle that never reached the bar. The
+    /// buttons are laid out from the right edge — close, maximise, minimise — each
+    /// `TITLE_BUTTON_W` wide, so the middle of the maximise button is a slot and a half in.
+    fn click_maximise(a: &mut App) {
+        use libui::widget::TITLE_BUTTON_W;
+        let (t, l, mut r) = window(a);
+        let e = a.view();
+        let x = a.window_size().w as i32 - (TITLE_BUTTON_W as i32 + TITLE_BUTTON_W as i32 / 2);
+        let y = TITLE_BAR_H as i32 / 2;
+        let mut msgs = alloc::vec::Vec::new();
+        for (flags, held) in [(librsproto::surface::POINTER_PRESSED, 1), (0, 0)] {
+            let p = PointerEvent {
+                window: 1,
+                kind: librsproto::surface::POINTER_BUTTON,
+                x,
+                y,
+                buttons: held,
+                flags,
+                ..Default::default()
+            };
+            msgs.extend(r.pointer(&t, &e, &l, p).0);
+        }
+        assert!(!msgs.is_empty(), "nothing under the maximise button at ({x}, {y})");
+        for m in msgs {
+            a.update(m);
+        }
     }
 
     #[test]

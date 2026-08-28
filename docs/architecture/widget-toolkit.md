@@ -141,7 +141,10 @@ rectangle, or the event queue.
 
 **The pieces of that loop are built and the loop itself is not.** `libui` has `Element` and
 `view`'s return type (§3), `Tree::update` for the diff (§4), `Router` for events (§7),
-`BufferDamage` for accumulation (§6.2) and `paint` (§6) — but there is no `libui` module that
+`BufferDamage` for accumulation (§6.2) and `paint` (§6) — and, one layer down since M9 Part D,
+`libsurface::buffers::BufferPool` owns the *pixels*: allocating the shared memory, attaching it,
+and replacing it at a new size when a window is resized, which is the piece with an ordering rule
+in it and the one an application would get wrong quietly. But there is no `libui` module that
 owns the sequence. An application wires them together, and so far exactly one does, for a
 fixed picture with no `update` and no `Msg` dispatch (`libui::reference`, which the display
 gate renders).

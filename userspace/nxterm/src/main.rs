@@ -23,10 +23,9 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
-use libkern::{
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, exit, kprint, syscall2, syscall4,
-};
+use libkern::{exit, kprint};
 use librsproto::surface::{CreateWindowRequest, Role};
+use libsurface::buffers::BufferPool;
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 use libui::diff::Tree;
@@ -46,36 +45,23 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// lets a frame be drawn while the other is on screen.
 const BUFFERS: usize = 2;
 
-/// The terminal's size in cells. Fixed for this milestone — M6 owns resize.
+/// The terminal's size in cells **at startup**. A `Configure` changes it (M9 Part D).
 const COLS: usize = 80;
 const ROWS: usize = 24;
 
 /// Text size, matching the toolkit's default theme so the chrome and the grid agree.
 const FONT_PX: f32 = 16.0;
 
-/// Create a `MemoryObject` of `len` bytes and map it read-write.
-fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
-    // SAFETY: a plain anonymous object of `len` bytes.
-    let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
-    if h <= 0 {
-        return None;
-    }
-    // SAFETY: mapping an object this process just created, read-write.
-    let addr = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            h as u64,
-            0,
-            len as u64,
-            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
-        )
-    };
-    if addr <= 0 {
-        // SAFETY: the map failed, so nothing references the object; closing our only handle.
-        unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, h as u64, 0, 0, 0) };
-        return None;
-    }
-    Some((h as u64, addr as *mut u8))
+/// A private framebuffer of `size` to compose a frame into.
+///
+/// **Drawn here and copied into whichever buffer is free**, rather than painted directly into
+/// it: the toolkit's damage describes what changed since the *last frame*, and the free buffer
+/// holds the frame before that. Painting a one-row damage straight into it would leave the row
+/// from two frames ago everywhere else. `libui::damage`'s per-buffer accumulation is the real
+/// answer; a copy is correct now and is one `memcpy` of a window.
+fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
+    let pitch = (size.w as usize).checked_mul(4)?;
+    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
 }
 
 /// Report and end the run.
@@ -97,10 +83,8 @@ fn fail(msg: &[u8]) -> ! {
 /// and clipped only by the screen.
 struct Popup {
     id: u32,
-    /// Pixels for each buffer, mapped on this side and kept for the popup's life.
-    maps: [*mut u8; BUFFERS],
-    /// Bytes per buffer, for the unmap on close.
-    len: usize,
+    /// The pixels, allocated and mapped by `libsurface` and unmapped when this is dropped.
+    pool: BufferPool,
     /// Composed here and copied into whichever buffer is free — the same reason the terminal
     /// window does it: the toolkit's damage describes the last frame, not the free buffer's.
     scratch: MemFramebuffer,
@@ -151,39 +135,18 @@ impl Popup {
         // topmost focus candidate and stays there. Having committed nothing it is never drawn,
         // so the result is an invisible window silently eating every keystroke, and the caller
         // treats the failure as recoverable and carries on (PR #223 review, finding 4).
-        let pitch = size.w as usize * 4;
-        let len = pitch * size.h as usize;
-        let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];
         let built = (|| {
-            let geometry = Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888)?;
-            for (i, slot) in maps.iter_mut().enumerate() {
-                let (handle, addr) = shared_buffer(len)?;
-                *slot = addr;
-                session.window(id)?.attach(i as u32, size.w, size.h, pitch as u32, handle).ok()?;
-            }
-            Some(geometry)
+            let scratch = compose_buffer(size)?;
+            let pool = BufferPool::new(&mut session.window(id)?, size, BUFFERS)?;
+            Some((pool, scratch))
         })();
-        let Some(geometry) = built else {
+        let Some((pool, scratch)) = built else {
             if let Some(w) = session.window(id) {
                 let _ = w.destroy();
             }
-            for addr in maps {
-                if !addr.is_null() {
-                    // SAFETY: unmapping a range this process mapped in `shared_buffer`.
-                    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
-                }
-            }
             return None;
         };
-        Some(Self {
-            id,
-            maps,
-            len,
-            scratch: MemFramebuffer::new(geometry),
-            tree: Tree::new(),
-            router: Router::new(),
-            size,
-        })
+        Some(Self { id, pool, scratch, tree: Tree::new(), router: Router::new(), size })
     }
 
     /// Paint the menu and put it on screen **when something changed**, and say whether all is
@@ -214,12 +177,10 @@ impl Popup {
         }
         paint(&mut self.scratch, font, theme, &menu, &l, bounds, &mut |_, _, _, _| {});
         let Some(mut w) = session.window(self.id) else { return false };
-        let Ok(b) = w.acquire() else { return false };
-        // SAFETY: `maps[b]` maps `len` writable bytes and `scratch` holds exactly `len`; the two
-        // are distinct allocations.
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.scratch.bytes().as_ptr(), self.maps[b as usize], self.len)
-        };
+        let Ok(b) = self.pool.acquire(&mut w, self.size) else { return false };
+        if !self.pool.write(b, self.scratch.bytes()) {
+            return false;
+        }
         session
             .window(self.id)
             .is_some_and(|mut w| w.commit(b, (0, 0, self.size.w, self.size.h)).is_ok())
@@ -227,18 +188,13 @@ impl Popup {
 
     /// Destroy the window and give the client's half of the pixels back.
     ///
-    /// The compositor drops its mapping when the window goes; this is the mapping on *this*
-    /// side, which nothing else would ever release — a menu opened and closed a hundred times
-    /// would otherwise grow this process by a hundred buffers.
+    /// The compositor drops its mapping when the window goes; the mapping on *this* side is
+    /// the pool's, released when this value is dropped at the end of this function — a menu
+    /// opened and closed a hundred times would otherwise grow this process by a hundred
+    /// buffers.
     fn close(self, session: &mut Session<Box<ChannelTransport>>) {
         if let Some(w) = session.window(self.id) {
             let _ = w.destroy();
-        }
-        for addr in self.maps {
-            if !addr.is_null() {
-                // SAFETY: unmapping a range this process mapped in `shared_buffer`.
-                unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, self.len as u64) };
-            }
         }
     }
 }
@@ -262,9 +218,21 @@ fn draw(
     let grid = &app.grid;
     let palette = app.palette;
     let top = app.view_line();
-    paint(fb, font, theme, ui, l, damage, &mut |kind, _rect, clip, fb: &mut MemFramebuffer| {
+    paint(fb, font, theme, ui, l, damage, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
         if kind != GRID_KIND {
             return;
+        }
+        // **The cells do not always fill the node** (M9 Part D). A maximised window is exactly
+        // the work area and the grid is the whole cells that fit, so up to a cell's width and a
+        // cell's height of the node is not covered by any row — and `render_view` paints cells,
+        // nothing else. Left alone that margin holds whatever the last frame put there, which
+        // after a resize is a strip of the old window.
+        //
+        // Filled only when the node really is bigger than its cells, so the ordinary
+        // one-row-per-keystroke damage costs nothing extra.
+        let cells = m.pixel_size(grid.cols(), grid.rows());
+        if rect.size.w > cells.w || rect.size.h > cells.h {
+            fb.fill_rect(clip, palette.background);
         }
         let rows = rows_in(clip, origin, &m, grid.rows());
         libterm::render::render_view(fb, grid, font, &m, &palette, origin, top, &rows);
@@ -383,29 +351,26 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // would leave the row from two frames ago everywhere else. `libui::damage`'s per-buffer
     // accumulation is the real answer and it belongs in Part B's successor; a copy is correct
     // now and is one `memcpy` of a window.
-    let pitch = size.w as usize * 4;
-    let len = pitch * size.h as usize;
-    let geometry = match Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888) {
-        Some(g) => g,
+    let mut scratch = match compose_buffer(size) {
+        Some(fb) => fb,
         None => fail(b"nxterm: impossible window geometry\n"),
     };
-    let mut scratch = MemFramebuffer::new(geometry);
-    let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];
-    for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
-            fail(b"nxterm: buffer alloc FAILED\n");
-        };
-        maps[i] = addr;
+    // **The buffers and the resize belong to `libsurface`** since M9 Part D: allocating shared
+    // memory, attaching it, and — the part with an ordering rule in it — replacing it at a new
+    // size without touching what the compositor is reading. This client had its own copy of the
+    // first half and none of the second.
+    let mut pool = {
         let Some(mut w) = win.window(window_id) else {
             fail(b"nxterm: our own window is gone\n");
         };
-        if w.attach(i as u32, size.w, size.h, pitch as u32, handle).is_err() {
-            fail(b"nxterm: AttachBuffer FAILED\n");
+        match BufferPool::new(&mut w, size, BUFFERS) {
+            Some(p) => p,
+            None => fail(b"nxterm: buffer alloc FAILED\n"),
         }
-    }
+    };
 
     let theme = Theme { font_px: FONT_PX, ..Theme::default() };
-    let bounds = Rect::new(0, 0, size.w, size.h);
+    let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
     // The menu's window while it is open, and nothing at all while it is not — a popup is
@@ -534,17 +499,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let Some(mut w) = win.window(window_id) else {
                 fail(b"nxterm: our own window is gone\n");
             };
-            let Ok(b) = w.acquire() else {
-                fail(b"nxterm: no buffer released\n");
+            // **The size is asked for here rather than remembered**, so a buffer left at the
+            // old shape by a resize is replaced at the moment it is next drawn into — which is
+            // the frame after the one that committed the new size, when its release arrives.
+            let Ok(b) = pool.acquire(&mut w, app.window_size()) else {
+                // Two causes since Part D, and the message names both: no buffer came back from
+                // the compositor, or the memory for one at the new size could not be had.
+                fail(b"nxterm: no buffer to draw into\n");
             };
-            // SAFETY: `maps[b]` maps `len` writable bytes and `scratch` holds exactly `len`;
-            // the two are distinct allocations.
-            unsafe {
-                core::ptr::copy_nonoverlapping(scratch.bytes().as_ptr(), maps[b as usize], len)
-            };
-            let Some(mut w) = win.window(window_id) else {
-                fail(b"nxterm: our own window is gone\n");
-            };
+            if !pool.write(b, scratch.bytes()) {
+                fail(b"nxterm: the frame did not fit its buffer\n");
+            }
             if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
                 fail(b"nxterm: Commit FAILED\n");
             }
@@ -670,6 +635,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             },
         }
 
+        // Set by a `Configure` that actually changed the shape; acted on once, below.
+        let mut resized = false;
         for (from, event) in events {
         // **The menu's window routes through the menu's tree.** Same `App`, so an item's `Msg`
         // updates the same state; different tree, layout and router, because they describe a
@@ -776,15 +743,73 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // is the point: a client that silently ignored this would be wrong the moment it
             // started tracking anything.
             WindowEvent::Dropped => kprint(b"nxterm: input dropped\n"),
-            // **Declined, and legal.** Honouring a resize means resizing `libterm`'s grid and
-            // reflowing its scrollback, which M5 called "a different problem, not a parameter of
-            // this one" and which M6 keeps out of scope. A client that ignores a `Configure`
-            // simply keeps committing the size it has, and the compositor composites what it is
-            // given — see `docs/spec/rsproto-surface-ops.md`.
-            WindowEvent::Configure { .. } => {}
+            // **Accepted, as of M9 Part D.** Declining stayed legal and this client did it for
+            // three milestones — "a different problem, not a parameter of this one" — which
+            // made maximise, snap and every other sized gesture a no-op on the only application
+            // there is. Now the window becomes exactly the size asked for, the grid becomes the
+            // cells that fit inside it, and the history rewraps.
+            //
+            // **Same size is the ordinary case and costs nothing**: a `Configure` follows every
+            // *move* as well, carrying the origin, and reallocating a window's buffers each
+            // time it was dragged would be a resize per pointer motion.
+            WindowEvent::Configure { width, height, .. } => {
+                // **Counted before, reported beside what it became.** A rewrap moves where the
+                // line breaks are and must not create or destroy *lines* — so these two numbers
+                // are equal, and an implementation that joined every adjacent row would collapse
+                // the history to one and say so here. It is the only assertion about the reflow
+                // that a gate on a release image can make: a terminal's rows are somebody's
+                // session, and the serial log is not the place for them.
+                let lines_before = app.grid.logical_lines();
+                if let Some(r) = app.resize(Size::new(width, height)) {
+                    resized = true;
+                    libkern::debug::Line::new()
+                        .s(b"nxterm: resized to ")
+                        .u(u64::from(width))
+                        .s(b"x")
+                        .u(u64::from(height))
+                        .s(b", grid ")
+                        .u(app.grid.cols() as u64)
+                        .s(b"x")
+                        .u(app.grid.rows() as u64)
+                        .s(b", lines ")
+                        .u(lines_before as u64)
+                        .s(b"->")
+                        .u(app.grid.logical_lines() as u64)
+                        // **The eviction, because without it the difference is unattributable.**
+                        // Narrowing makes more rows out of the same text, so a deep history
+                        // loses its oldest to the ring rather than to the rewrap — and a reader
+                        // of this line who could not tell those apart would go looking for a
+                        // reflow bug that is not there (PR #252 review, finding 2).
+                        .s(b", ")
+                        .u(r.evicted as u64)
+                        .s(b" evicted")
+                        .end();
+                }
+            }
         }
         }
-        let _ = &maps;
+
+        // **The window changed shape, so everything about the frame does.** The compose buffer
+        // is a different size, the layout has a different rect to fill, the diff's record
+        // describes a tree laid out at the old one, and the grid has different rows. Each of
+        // those is cheap and none of them is optional; a frame that missed one would paint the
+        // new size through the old arithmetic.
+        //
+        // Done at the end of the iteration, so the render at the top of the next one is the
+        // first to see the new size — and the buffers themselves are replaced there, by
+        // `BufferPool::acquire`, because that is where a *free* one is in hand.
+        if resized {
+            let size = app.window_size();
+            match compose_buffer(size) {
+                Some(fb) => scratch = fb,
+                None => fail(b"nxterm: impossible window geometry\n"),
+            }
+            bounds = Rect::new(0, 0, size.w, size.h);
+            // A tree diffed against a layout from the old bounds reports damage in the old
+            // coordinates. Starting again reports the whole window, which is what a resize is.
+            tree = Tree::new();
+            app.grid.damage_all();
+        }
     }
 }
 

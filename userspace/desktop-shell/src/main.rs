@@ -1520,8 +1520,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // **Back on screen first.** A minimized window asked to maximise is
                         // asking to be *seen* maximised; configuring it where it is would resize
                         // something that is not on screen and leave it that way.
+                        // `sent_request` is not set here, and it is not an omission: the
+                        // `configure_window` below sets it unconditionally on every path
+                        // through this arm. Setting it twice was a dead store the compiler
+                        // pointed at once a rebuild stopped being cached.
                         if e.minimized && raise_window(m, e) {
-                            sent_request = true;
                             list_dirty = true;
                         }
                         // Remembered before it moves, and only the first time: maximising an
@@ -1535,9 +1538,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         }
                         sent_request = true;
                         // **What was asked for, not what happened.** A `Configure` is a request
-                        // the client may decline — `nxterm` declines every one until M9 Part D —
-                        // so the line `configure_window` prints is the shell's decision, and the
-                        // window's own geometry event is what says whether it took it.
+                        // the client may decline — legally, and a fixed-size window is an
+                        // ordinary thing — so the line `configure_window` prints is the shell's
+                        // decision, and the window's own geometry event is what says whether it
+                        // took it. `nxterm` declined every one until M9 Part D and now accepts.
                         configure_window(
                             m,
                             s.window,

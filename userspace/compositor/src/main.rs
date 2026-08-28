@@ -216,8 +216,9 @@ struct MappedBuffer {
 impl Drop for MappedBuffer {
     /// Unmap when the record goes away — **the record is not the mapping**.
     ///
-    /// Both places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
-    /// removed records and nothing else. Dropping a `MappedBuffer` used to leave the VMA
+    /// All three places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
+    /// removed records and nothing else — the two that follow a window going away, and, since
+    /// M9 Part D, the one in `map_attached_buffer` that drops the mapping a re-attach replaces. Dropping a `MappedBuffer` used to leave the VMA
     /// behind, so the comment at the destroy site — "otherwise a client looping
     /// create/attach/destroy grows the compositor's address space without bound" — described
     /// an intent the code did not carry out. It leaked on the ordinary application
@@ -1812,6 +1813,16 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
         return false;
     };
     let len = req.pitch as usize * req.height as usize;
+    // **The mapping this replaces goes first, not last.** Re-attaching an id is a resize
+    // (M9 Part D), and `dispatch` has already accepted the *new* geometry for it — so a
+    // moment where the old, smaller mapping is still what `Server::pixels` finds is a
+    // moment where compositing reads a large geometry out of a small allocation.
+    // `Vec::retain` drops the record, and dropping a `MappedBuffer` unmaps it.
+    //
+    // Dropping it before the new mapping is also what makes a *failed* map safe: the window
+    // is left with no pixels for that buffer, which composites as nothing, rather than with
+    // the wrong ones.
+    srv.buffers.retain(|b| !(b.window == req.window && b.buffer == req.buffer));
     // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
     // with the size its own geometry declares.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
