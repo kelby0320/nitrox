@@ -1088,7 +1088,7 @@ pub const OP_CLOSE_REQUESTED: u16 = 0x090C;
 /// edge" true. What differs is what the compositor does with it — a move changes the window's
 /// origin as the pointer travels, and a resize changes *nothing*. It tracks a rectangle, draws
 /// an outline over the composed stack, and when the button comes up it hands the manager the
-/// rectangle the user let go at ([`ResizeEnded`](OP_MGR_RESIZE_ENDED)).
+/// rectangle the user let go at ([`DragEnded`](OP_MGR_DRAG_ENDED)).
 ///
 /// **The compositor never resizes a client**, which is why the gesture ends in a manager event
 /// rather than in a `Configure` from here: there is one path to a window's geometry — the

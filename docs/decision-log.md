@@ -19772,3 +19772,56 @@ person dragging a window produces nothing like that rate. The harness slows down
 drag *means* is the shell's, and a window can now be moved, minimised, maximised, restored,
 closed, resized and snapped — every one of them by a gesture a person makes, gated end to end on
 the release image.
+
+---
+
+## 2026-08-30 — Part F's review: the phantom reached by the one path that skips `stop_drag`
+
+**A previewed outline could outlive the table that produced it, for the compositor's life.**
+`clear_zones` emptied the table and cleared `in_zone` but left `self.outline` set — and every
+path that takes an outline down is gated on `in_zone`, so nothing was ever reported to the caller
+and `srv.outline` stayed set. `present_into` is handed it on every repaint, so the rectangle was
+re-drawn by every later compose. Reachable by the compositor's *designed* manager-death path: a
+shell exiting while the user is mid-drag over a zone.
+
+This is the third time this milestone has produced the same defect — an outline, or a drag, or a
+grab, outliving the thing it was derived from — and the file already names it twice. What made
+this instance survive review of the code that introduced it is the shape of the mistake:
+`clear_zones` was written as the mirror of `clear_hotkeys`, and that is a fair model for the
+*table* and no model at all for the *pixels*. **A function copied from a neighbour inherits the
+neighbour's obligations, not its own.**
+
+**Two guards had no negative control, and deleting either left 180 tests green.** The `finished`
+gate on a snap drop is the rule Part E's review required, reached by the other gesture — and every
+zone test released the button normally, so nothing consulted it. The gate did not cover it either.
+What is worth recording is that *the gate had already met this path*: the first version of step 6k
+overran the input ring, a `SYN_DROPPED` ended the drag, and it asked for nothing — the observation
+was in the PR description as a story about pacing, and it was a test two lines away from being
+written. **An anecdote about why a gate needed changing is usually a test.**
+
+**And two guards are unreachable through `route` at all**, because `reconcile_with` breaks the
+grab of a departed window before any arm can see it. Rather than delete them or pretend a route
+test covers them, they are pinned by calling `stop_drag`/`stop_resize` directly and the comment
+says why no other path reaches them: a second line of defence is worth keeping, and worth being
+honest about being second.
+
+**The rename left prose behind.** `ResizeEnded` → `DragEnded` was swept through the code and not
+through six doc comments and a spec paragraph — including a rustdoc link that now resolves to
+nothing, and two field docs (`outline`, `Server::outline`) that still claimed the field means "a
+resize is running". That second kind matters more than a broken link: it is an invariant
+statement, and it is exactly the reasoning a reader would use to conclude the field is safe to
+ignore when no resize is in flight — which is the gap behind the blocking finding above.
+
+**A class this repo has no gate for**: `cargo doc` reports 21 unresolved intra-doc links across
+the userspace workspace, of which this PR added one. A `-D warnings` rustdoc gate would catch the
+whole class, and is not built here because it needs those 21 fixed first and they belong to no
+part of this milestone. **Trigger — the next change that touches `librsproto`'s or `libos`'s doc
+comments broadly**, which is where most of them are.
+
+**One test's second half was decoration**, and the reviewer's method for finding it is the one to
+copy: delete the production line the test is named for and see whether the test notices.
+`preview_zone` is reached through an `.or_else` after the resize's own outline, so no
+implementation in reach consults the zone table during a resize — and "a resize is not snapped"
+therefore passed for every version of the code, including wrong ones. It is deleted, with the
+reason in its place, and what actually keeps a resize from being snapped — `start_move` and
+`start_resize` refusing each other — has its own test.

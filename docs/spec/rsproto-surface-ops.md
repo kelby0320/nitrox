@@ -714,17 +714,22 @@ A second `StartResize` while one is running changes nothing and reports success,
 second `StartMove` does. A `StartResize` while a *move* is running is refused: one grab is one
 gesture. While either is in flight, `Place` for that window is refused with `WouldBlock`.
 
-**A gesture the user did not finish reports nothing**, and only the button coming up counts as
-finishing. This is where a resize stops resembling a move: a move has *applied* every step as it
-went, so ending it however it ends merely stops something already on screen, while a resize has
-applied nothing — reporting *initiates* a change, and initiating one from an unfinished gesture is
-a window jumping to a half-chosen size while the user is still holding the button.
+<a id="finished-gesture"></a>
 
-So no `ResizeEnded` is sent when the window leaves the screen mid-drag (minimised, or sent to
+**A gesture the user did not finish reports nothing**, and only the button coming up counts as
+finishing. **This applies to both gestures that end in a [`DragEnded`](#dragended-0x0926)** — a
+resize, and a move released in a snap zone — and it is where either stops resembling a plain
+move. A move *applies* every step as it goes, so ending it however it ends merely stops something
+already on screen. A resize applies nothing, and a snap applies nothing: reporting *initiates* a
+change, and initiating one from an unfinished gesture is a window jumping to a half-chosen size,
+or across the screen, while the user is still holding the button.
+
+So no `DragEnded` is sent when the window leaves the screen mid-drag (minimised, or sent to
 another desktop): the rectangle the user was steering by is no longer visible. None is sent when
 the input stream reports a loss — the pointer position is then a guess, which is the last thing to
 derive a new window rectangle from. And none for a gesture that ended where it started, which is
-an ordinary click on a grip. In every case the outline is taken down.
+an ordinary click on a grip, or for a move released outside every zone, which is an ordinary move.
+In every case the outline is taken down.
 
 ### `RequestState` (`0x090B`)
 
@@ -1156,7 +1161,7 @@ nothing leaves the window as it was, which is also what a client that declines p
 It does **not** carry which zone the gesture ended in. The rectangle is what a manager acts on,
 and the zone that produced it is derivable from a table the manager itself wrote; a field that is
 always ignored is worse than one that is absent. Sent only for a gesture the user *finished* —
-see `StartResize` for what that excludes and why.
+see [what that excludes and why](#finished-gesture).
 
 ## Titles, and the one variable-length body
 

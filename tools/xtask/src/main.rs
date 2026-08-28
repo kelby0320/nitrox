@@ -2486,11 +2486,6 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // the control's failure surfaces two steps later as a drag that never began.
     session.expect("nxterm: dragging its own title bar")?;
     session.expect("compositor: interactive move of window ")?;
-    // **Through the zone and out again first, which is the control the plan names**: a drag that
-    // passes through without releasing must snap nothing. It is asserted by what follows rather
-    // than by a line of its own — the release below happens *inside* the zone, and a compositor
-    // that snapped on entry would have asked for it already, out of order with the move.
-    //
     // **Paced, and the reason is worth keeping.** The first version injected thirty-six motions
     // as fast as QMP would take them; the consumer ring overran, `input-server` announced the
     // gap, and `libinput` turned it into a `Logical::Dropped` — which ends a gesture *without*

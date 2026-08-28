@@ -59,13 +59,17 @@ pub struct Routed {
     pub moved: Option<Rect>,
     /// The event was taken by a registered chord and reached no window.
     pub consumed: bool,
-    /// The resize outline moved: where it was, and where it is now. See [`Outline`].
-    pub outline: Option<Outline>,
-    /// An interactive resize ended, and this is the rectangle the user let go at.
+    /// The outline moved: where it was, and where it is now. See [`Outline`].
     ///
-    /// **The gesture's one report.** The compositor does not apply it — resizing a client is the
-    /// manager's, so this becomes a `ResizeEnded` event and the manager answers with the
-    /// `Configure` it would have sent anyway (M9 Part E).
+    /// Produced by both gestures — a resize's own rectangle, and the target a move is previewing
+    /// over a snap zone.
+    pub outline: Option<Outline>,
+    /// A gesture ended, and this is the rectangle it asks for.
+    ///
+    /// **The gesture's one report**, from either that produces one: a resize (where the user let
+    /// go) or a move released in a snap zone (that zone's target). The compositor does not apply
+    /// it — changing a window's geometry is the manager's, so this becomes a `DragEnded` event
+    /// and the manager answers with the `Configure` it would have sent anyway (M9 Parts E, F).
     pub resized: Option<(u32, Rect)>,
 }
 
@@ -188,10 +192,13 @@ pub struct InputRouter {
     /// **Never both**: a grab is opened by one press and carries one gesture, so `start_move`
     /// and `start_resize` each refuse while the other is running rather than replacing it.
     resize: Option<Resize>,
-    /// The rectangle the outline is drawn at, if a resize is running.
+    /// The rectangle the outline is drawn at, if anything is drawing one.
     ///
-    /// Derived from `resize` and the pointer, and kept because the *previous* value is what a
-    /// repaint needs in order to erase what was there.
+    /// **Two gestures write it**, which is what makes `resize.is_none()` say nothing about it: a
+    /// resize derives it from its edges and the pointer, and a move over a snap zone sets it to
+    /// that zone's target. Kept rather than recomputed because the *previous* value is what a
+    /// repaint needs in order to erase what was there — so every path that stops drawing has to
+    /// hand it back rather than merely forget it.
     outline: Option<Rect>,
     /// Which button opened [`grab`](Self::grab) — the one a synthetic release names when the
     /// grab is taken away by something other than that button coming up.
@@ -673,7 +680,7 @@ impl InputRouter {
     ///
     /// **Nothing about the window changes.** The window keeps its rectangle for the whole
     /// gesture; what moves is an outline the compositor draws over the composed stack, and the
-    /// manager hears one `ResizeEnded` when the button comes up. The stack is marked as being
+    /// manager hears one `DragEnded` when the button comes up. The stack is marked as being
     /// dragged all the same, so a `Place` landing mid-gesture is refused rather than fighting
     /// the pointer — the same reason a move refuses it.
     ///
@@ -860,6 +867,9 @@ impl InputRouter {
             .in_zone
             .filter(|_| finished)
             .and_then(|id| self.zones.iter().find(|z| z.id == id))
+            // A second line rather than the first: `reconcile_with` has already broken the grab
+            // of a window that has gone, so no path through `route` reaches this with `finished`
+            // true. Pinned directly by `a_gesture_whose_window_has_gone_asks_for_nothing…`.
             .filter(|_| stack.window(d.window).is_some())
             .map(|z| (d.window, Rect::new(z.target_x, z.target_y, z.target_w, z.target_h)));
         (asked, self.leave_zone())
@@ -914,7 +924,8 @@ impl InputRouter {
     /// Register a snap zone, **replacing** any zone already under that id.
     ///
     /// `Err` if `id` is zero — reserved so a zeroed body registers nothing — or if the table is
-    /// full and this is a new id.
+    /// full and this is a new id. `Ok(Some(_))` when this replaced the zone a drag is currently
+    /// previewing, which the caller must repaint.
     ///
     /// **Replacing rather than refusing** is the difference between this table and the chord
     /// table beside it, and it follows from what each one is. A chord table is a set of distinct
@@ -922,25 +933,46 @@ impl InputRouter {
     /// recomputed wholesale whenever the work area changes — a shell re-registering its eight
     /// ids with new rectangles is doing the ordinary thing, and a refusal would leave it holding
     /// zones for a screen that has changed shape with no way to say so.
-    pub fn register_zone(&mut self, z: MgrSnapZone) -> Result<(), HotkeyError> {
+    pub fn register_zone(&mut self, z: MgrSnapZone) -> Result<Option<Outline>, HotkeyError> {
         if z.id == 0 {
             return Err(HotkeyError::ZeroId);
         }
         if let Some(existing) = self.zones.iter_mut().find(|e| e.id == z.id) {
             *existing = z;
-            return Ok(());
+            // **A preview of the zone just replaced follows it.** A shell re-registers on
+            // `LayoutChanged`, which can arrive mid-drag — a panel appearing while a window is
+            // being dragged — and leaving the old rectangle on screen would break the one
+            // promise `stop_drag` makes: that what is asked for is what the user was looking at.
+            // Re-previewed rather than re-tested, so the two cannot come apart (PR #254 review,
+            // optional 5).
+            if self.in_zone == Some(z.id) {
+                let was = self.outline;
+                self.outline =
+                    Some(Rect::new(z.target_x, z.target_y, z.target_w, z.target_h));
+                return Ok(Some(Outline { was, now: self.outline }));
+            }
+            return Ok(None);
         }
         if self.zones.len() >= MAX_SNAP_ZONES {
             return Err(HotkeyError::TableFull);
         }
         self.zones.push(z);
-        Ok(())
+        Ok(None)
     }
 
     /// Forget every snap zone — the manager that registered them has gone.
-    pub fn clear_zones(&mut self) {
+    ///
+    /// **Returns the preview it took down**, and the caller must repaint it. Clearing the table
+    /// while a preview is showing is the one path that disturbs the outline without going
+    /// through `stop_drag`: every other way of taking it down is gated on `in_zone`, so an
+    /// outline left behind here is never reported to anybody and is redrawn by every later
+    /// compose for the life of the process. That is reachable by the compositor's *designed*
+    /// manager-death path — a shell exiting while the user is mid-drag over a zone — and it is
+    /// the same phantom two other comments in this file already name (PR #254 review,
+    /// blocking 1).
+    pub fn clear_zones(&mut self) -> Option<Outline> {
         self.zones.clear();
-        self.in_zone = None;
+        self.leave_zone()
     }
 
     /// The zone whose trigger region contains `at`, if any.
@@ -1972,14 +2004,124 @@ mod tests {
     }
 
     #[test]
-    fn zones_go_with_the_manager_that_registered_them() {
+    fn zones_go_with_the_manager_that_registered_them_and_so_does_the_preview() {
         // They are a layout that manager computed from a work area it was watching; a
         // replacement inherits nothing it did not register, exactly as with chords.
         let mut r = InputRouter::new(SCREEN);
         r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
         assert!(r.zone_at(Point::new(5, 5)).is_some());
-        r.clear_zones();
+        assert_eq!(r.clear_zones(), None, "nothing was being previewed");
         assert!(r.zone_at(Point::new(5, 5)).is_none());
+
+        // **And the pixels go with the table.** A shell exiting mid-drag is the compositor's
+        // designed manager-death path, and every other way of taking a preview down is gated on
+        // the zone this just removed — so an outline left here is never reported to anybody and
+        // is redrawn by every later compose for the life of the process (PR #254 review,
+        // blocking 1).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
+        hold(&mut r, &mut s, w, 240, 240);
+        let shown = go_routed(&mut r, &mut s, drag(-230, 0)).outline.expect("previewed");
+        assert_eq!(shown.now, Some(Rect::new(0, 0, 320, 480)));
+
+        let taken = r.clear_zones().expect("the preview is handed back to be repainted");
+        assert_eq!(taken.was, Some(Rect::new(0, 0, 320, 480)), "the rectangle to erase");
+        assert_eq!(taken.now, None);
+        // And nothing is left for a later event to report, because there is nothing left.
+        assert!(go_routed(&mut r, &mut s, drag(5, 0)).outline.is_none());
+        assert!(go_routed(&mut r, &mut s, button(false)).outline.is_none());
+    }
+
+    #[test]
+    fn re_registering_the_zone_under_the_pointer_moves_the_preview_with_it() {
+        // A shell re-registers its whole table on `LayoutChanged`, which can arrive mid-drag —
+        // a panel appearing while a window is being dragged. Leaving the old rectangle on screen
+        // would break the one promise the drop makes: that what is asked for is what the user
+        // was looking at (PR #254 review, optional 5).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
+        hold(&mut r, &mut s, w, 240, 240);
+        go(&mut r, &mut s, drag(-230, 0));
+
+        let moved = r
+            .register_zone(zone(1, (0, 0, 20, 480), (0, 24, 320, 456)))
+            .expect("replaced")
+            .expect("the preview moved with it");
+        assert_eq!(moved.was, Some(Rect::new(0, 0, 320, 480)));
+        assert_eq!(moved.now, Some(Rect::new(0, 24, 320, 456)));
+        assert_eq!(
+            go_routed(&mut r, &mut s, button(false)).resized,
+            Some((w, Rect::new(0, 24, 320, 456))),
+            "and the drop asks for the rectangle now on screen"
+        );
+    }
+
+    #[test]
+    fn a_drag_the_user_did_not_finish_snaps_nothing() {
+        // **The rule Part E's review required, on the other gesture.** A `Logical::Dropped` says
+        // events were lost and the pointer position is a guess; a grab taken away says the
+        // gesture was interrupted. Neither is a drop, and snapping a window somebody is still
+        // holding is what asking for one here would mean.
+        //
+        // The gate met this before the test did: its first version injected motions fast enough
+        // to overrun the consumer ring, and the drag correctly asked for nothing (PR #254
+        // review, finding 2).
+        for interrupted_by_loss in [true, false] {
+            let mut s = WindowStack::new();
+            let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+            let mut r = InputRouter::new(SCREEN);
+            r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
+            hold(&mut r, &mut s, w, 240, 240);
+            go(&mut r, &mut s, drag(-230, 0));
+
+            let routed = if interrupted_by_loss {
+                go_routed(&mut r, &mut s, Logical::Dropped)
+            } else {
+                // The window leaves the screen under the pointer; `reconcile_with` breaks the
+                // grab on the next event and the invariant tears the gesture down.
+                s.set_minimized(w, true).expect("put away mid-drag");
+                go_routed(&mut r, &mut s, key(30, true))
+            };
+            assert!(
+                routed.resized.is_none(),
+                "loss={interrupted_by_loss}: an unfinished drag asked for a snap"
+            );
+            assert_eq!(
+                routed.outline.expect("the preview is taken down").now,
+                None,
+                "loss={interrupted_by_loss}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gesture_whose_window_has_gone_asks_for_nothing_even_when_finished() {
+        // **Called directly, because no route through `route` reaches it.** `reconcile_with`
+        // runs before every arm and breaks the grab of a window that is not on screen, so by
+        // the time `finished` can be true the window is there — which makes these two checks a
+        // second line rather than the first. Asserting that through `route` would be asserting
+        // `reconcile_with`, which has its own tests; this states what the guards themselves do,
+        // so that a later change to the ordering does not silently make them wrong.
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
+        hold(&mut r, &mut s, w, 240, 240);
+        go(&mut r, &mut s, drag(-230, 0));
+        s.destroy(w).expect("the client exited mid-drag");
+        assert_eq!(r.stop_drag(&mut s, true).0, None, "a snap for a window that is not there");
+
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
+        let mut r = InputRouter::new(SCREEN);
+        grip(&mut r, &mut s, w, 299, 199, RESIZE_RIGHT | RESIZE_BOTTOM);
+        go(&mut r, &mut s, drag(40, 30));
+        s.set_minimized(w, true).expect("put away mid-gesture");
+        assert_eq!(r.stop_resize(&mut s, true).0, None, "a resize for a window off screen");
     }
 
     #[test]
@@ -1999,17 +2141,15 @@ mod tests {
             "the pointer crossed into a zone with nothing held, and something was previewed"
         );
 
-        // And a resize keeps its own outline: it is the rectangle the edges say, never a zone's
-        // target. (A resize is not offered snapping at all — the gesture a zone answers is a
-        // move, and one grab is one gesture.)
-        let mut s = WindowStack::new();
-        let w2 = win(&mut s, Role::Normal, 200, 200, 100, 80);
-        let mut r = InputRouter::new(SCREEN);
-        r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
         let _ = w;
-        grip(&mut r, &mut s, w2, 299, 279, RESIZE_RIGHT | RESIZE_BOTTOM);
-        let o = go_routed(&mut r, &mut s, drag(-290, 0)).outline.expect("the resize's own");
-        assert_ne!(o.now, Some(Rect::new(0, 0, 320, 480)), "a resize is not snapped");
+        // **A resize is not asserted here, and the reason is worth stating rather than
+        // asserting badly.** `preview_zone` is reached through an `.or_else` after
+        // `outline_to_pointer`, which returns `Some` for every motion while a resize runs — so
+        // no implementation in reach consults the table during one, and a test saying "a resize
+        // is not snapped" passes for every version of this code including the ones that would
+        // be wrong. It was there, it was decoration, and a control found it (PR #254 review,
+        // optional 6). What keeps a resize from being snapped is that `start_move` and
+        // `start_resize` refuse each other, which has its own test.
     }
 
     #[test]

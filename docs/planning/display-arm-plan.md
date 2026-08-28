@@ -2526,7 +2526,8 @@ dependency cut in two rather than two independent things.
       **edge strips**, not the rectangle: the union of where an outline was and where it is is
       very nearly the window, and repainting that per motion is the ~100 ms recompose that
       starves input. On button-up one `ResizeEnded` goes to the manager and the shell sends the
-      `Configure`; the compositor never resizes a client.
+      `Configure`; the compositor never resizes a client. (Renamed `DragEnded` in Part F, when a
+      second gesture started producing it.)
 
 - [x] **Gate** ✅ — `check-login` step 6j drags the maximised terminal's corner inward and asserts
       the mechanism in the order it happens: the compositor took the gesture and says which
