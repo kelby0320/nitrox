@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libfs::{self, TreeError};
+use libfs::TreeError;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;

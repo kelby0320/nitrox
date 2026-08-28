@@ -19943,6 +19943,16 @@ than taking for granted: a module that reaches sideways has to be untangled befo
 and the untangling is where a "pure move" stops being one. This one had been written as if it
 might leave.
 
+**The move also left a copy of `join` behind, in the crate it was moving out of.**
+`list.rs` had its own — character for character `libfs::join`, same guard, same result — with one
+caller, in a file this very change was editing to call `libfs::ns_children`. That is this part's
+own thesis pointed at itself: *copying the helpers is the shape that produces two implementations
+of `rename`*. The tested one was not the one `list` called, so a later fix to separator handling
+would have landed in `libfs::join` (which has the test) and left `list`'s recursive descent
+building child paths the other utilities would build differently. **Moving a helper down a layer
+is not finished until the callers that had their own copy are using it** — the copies are what the
+move exists to remove, and they do not announce themselves.
+
 **And the move surfaced a dependency the crate did not declare.** `cargo test -p libfs` failed on
 `librsproto::session` while the whole-workspace build passed, because Cargo's feature unification
 was supplying `librsproto`'s `io` feature through `coreutils`. Nothing was wrong while there was
@@ -19950,6 +19960,17 @@ one consumer; the failure arrives with the second one, which is precisely the ev
 exists to create. `libfs` now declares the feature it uses.
 
 **The gate for a refactor is the existing gate still passing**, and nothing new was written. The
-three host tests moved with the code — the count is unchanged at 1908 — and `test-interactive`
-drives `list`, `copy`, `rename` and `remove` at a real prompt. A new test written alongside a move
-proves that the new copy works, which is not the question.
+three host tests moved with the code — the count is unchanged at 1908 — and the two guest gates
+that already drive this code are `test-qemu`, which runs `copy`, `move`, `rename` and `remove`
+against a real filesystem through `test-harness`'s demos, and `test-interactive`, which types
+`list` at a real prompt. A new test written alongside a move proves that the new copy works, which
+is not the question.
+
+**Naming the wrong gate is its own defect**, and the first version of this entry did it: it
+credited `test-interactive` with all four programs, and it types none of the other three. Caught
+in review before merge, which is the only reason it is corrected here rather than retracted in a
+later entry. Worth keeping because of what the failure costs — a false claim about *which* gate
+covers a thing is worse than no claim, since it is the one somebody acts on. They edit
+`copy_tree`, read the crate doc in the file they are editing, run the gate it names, watch it
+pass, and ship; the gate that would have caught them was never started. **A coverage claim is a
+factual claim about a specific command, and is worth checking like one.**

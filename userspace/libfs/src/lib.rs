@@ -20,9 +20,13 @@
 //! the shape that produces two implementations of `rename`.
 //!
 //! **Moved rather than rewritten**, deliberately: every function below is the code the
-//! coreutils have been running since Milestone 3.5, and `test-interactive` drives `list`,
-//! `copy`, `rename` and `remove` at a real prompt, so a move that broke one fails there
-//! rather than nowhere.
+//! coreutils have been running since Milestone 3.5, and the gates that already drive that code
+//! are what a move has to survive. **Which gate is which matters, so it is spelled out**:
+//! `test-qemu` runs `copy`, `move`, `rename` and `remove` against a real filesystem through
+//! `test-harness`'s demos, and `test-interactive` types `list` at a real prompt. An earlier
+//! version of this note credited `test-interactive` with all four — it types none of the other
+//! three — which would have sent somebody editing `copy_tree` to the gate that cannot see it
+//! (PR #256 review, blocking 1).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -453,6 +457,12 @@ pub fn is_dir(ns: u64, path: &[u8]) -> bool {
     }
 }
 
+/// The final component of a path (`"/a/b/c"` → `"c"`).
+///
+/// **Trailing separators are ignored, and that is the rule worth stating**: `"/a/b/"` is `"b"`,
+/// not the empty string. A caller that took the empty name would build `"dir/"` and ask a
+/// directory server to create an entry with no name. `"/"` is itself, since there is no
+/// component to take.
 pub fn basename(path: &[u8]) -> &[u8] {
     let end = match path.iter().rposition(|&c| c != b'/') {
         Some(i) => i + 1,

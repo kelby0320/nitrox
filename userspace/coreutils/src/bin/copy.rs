@@ -35,7 +35,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libfs::{self, FileError, TreeError};
+use libfs::{FileError, TreeError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};

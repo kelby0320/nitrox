@@ -197,7 +197,7 @@ fn collect(
                 // path to report. Conflating them would either break the open (a
                 // relative path does not resolve) or the report (an absolute path
                 // buries what the user asked about).
-                let child_path = join(path, e.name());
+                let child_path = libfs::join(path, e.name());
                 let child_prefix = reported(prefix, e.name());
                 collect(stage, child_path.as_bytes(), &child_prefix, true, depth + 1, out)?;
             }
@@ -221,17 +221,6 @@ fn reported(prefix: &str, name: &[u8]) -> String {
     }
     let mut s = String::from(prefix);
     s.push('/');
-    s.push_str(&owned(name));
-    s
-}
-
-/// Join a directory path and an entry name, without doubling the separator on a path that
-/// already ends in one (`/` + `system` must be `/system`, not `//system`).
-fn join(dir: &[u8], name: &[u8]) -> String {
-    let mut s = owned(dir);
-    if !s.ends_with('/') {
-        s.push('/');
-    }
     s.push_str(&owned(name));
     s
 }

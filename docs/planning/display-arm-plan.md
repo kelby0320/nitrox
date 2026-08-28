@@ -2722,10 +2722,17 @@ on `coreutils` to get it would make one application depend on another's crate.
       might leave.
 
 - [x] **Gate** ✅ — `cargo xtask test` (the three host tests moved with the code, so the count is
-      unchanged at 1908), plus `test-interactive`, which drives `list`, `copy`, `rename` and
-      `remove` at a real prompt: a move that broke one fails there rather than nowhere. Nothing
+      unchanged at 1908), plus the two guest gates that already drive this code: **`test-qemu`**
+      runs `copy`, `move`, `rename` and `remove` against a real filesystem through
+      `test-harness`'s demos, and **`test-interactive`** types `list` at a real prompt. Nothing
       new is asserted, deliberately — a refactor's gate is the *existing* one still passing, and
       a new test written alongside a move proves only that the new copy works.
+
+      **Naming the wrong gate is its own defect**, and this part shipped one for a day: the
+      first version credited `test-interactive` with all four programs, and it types none of the
+      other three. A false statement about *which* gate covers a thing is worse than no
+      statement, because it is the one somebody acts on — they run it, it passes, and the gate
+      that would have caught them was never started (PR #256 review, blocking 1).
 
       **One thing the move did surface**: `cargo test -p libfs` alone failed where the workspace
       build passed, because `librsproto`'s `io` feature was reaching `libfs` through
