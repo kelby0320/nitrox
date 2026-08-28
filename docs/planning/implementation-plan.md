@@ -103,8 +103,16 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     "the client's committed buffer" everywhere geometry is computed), the compositor owns the
     drag and the shell owns what a drag *means*, resize **commits on release** rather than per
     motion, close asks the client and the shell can insist through a new `Manage::Close`, and
-    `nxterm`'s `Configure` brings **real scrollback reflow**. M10 is
-    applications and drag-and-drop between them; M11 is themes and visual polish. (Desktops and
+    `nxterm`'s `Configure` brings **real scrollback reflow**. **M10 is applications and
+    drag-and-drop between them** — detail-passed 2026-08-30, six parts, with five governing
+    decisions settled: a drop carries a **path** rather than a handle (a refused handle transfer
+    has no clean owner, and a consumer that cannot open a path reports its own error), the
+    acceptors a window declares are **ports in waiting** so a future port is a second carrier
+    rather than a second feature, drop *regions* are the client's and cost nothing in the
+    protocol, the match is **declared rather than queried** (superseding the composition model's
+    live `QueryCaps`), and both applications ship **thin**, with M12 named to hold the rest. M11
+    is themes and visual polish; **M12 is applications, deepened** — tabs, undo, find, file
+    operations. (Desktops and
     the applications milestone — M8, and what is now M10 — were rescoped 2026-08-21 when durable
     window-to-window wiring was cut; the milestone numbered 9 on that date is today's M10. See
     the decision log.)

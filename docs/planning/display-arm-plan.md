@@ -2622,9 +2622,10 @@ dependency cut in two rather than two independent things.
 
 ## Milestone 10 — applications, and drag-and-drop between them
 
-Sketched. A file browser and a text editor, as ordinary applications rather than as parts to be
-wired together, and the one composition mechanism that survived: **structural drag-and-drop** —
-`QueryCaps` against visible windows on a drag, valid targets highlighting, one message on drop.
+**Details pass 2026-08-30.** Six parts in dependency order, gated one at a time, the shape M8 and
+M9 used. A file browser and a text editor as ordinary applications rather than as parts to be
+wired together, and the one composition mechanism that survived revision 3: **structural
+drag-and-drop** — drag a file out of one window, valid targets highlight, one message on drop.
 
 The applications come first in the ordering because the mechanism needs two honest consumers, and
 because they are the two the cut argues for building properly: revision 3's conclusion was that a
@@ -2634,8 +2635,213 @@ workflow wanting tools tightly integrated is asking for an *application*.
 when an application crashes" — that question was among the better arguments *for* the graph and
 went with it.
 
-- [ ] **Graduate `display-substrate.md`** to `docs/architecture/` — by the end of this milestone
-      the substrate is fully built.
+### Governing decisions
+
+Settled with the maintainer 2026-08-30, so the parts below can be built rather than re-argued.
+
+**1. A drop carries a path, a kind and a display name — not a handle.** The obvious
+capability-shaped answer is to transfer the open file, and it was rejected for a reason that only
+shows up when you ask what a *refused* drop does: nobody owns that handle. The source cannot know
+whether the target wants read or write, the target may never read the message at all, and a
+transferred handle that is never received has no clean owner and no moment at which it is closed.
+A path has none of that shape — the consumer opens it, and **a consumer that cannot open it
+reports its own error**, which is a failure a person can act on.
+
+**What this rests on, stated because it is not free.** A path is only a portable reference here
+because `desktop-shell::build_app_namespace` gives *every* application the identical `/home` bind
+— the user's subtree, constructed by one process the same way each time. It is not a property of
+the system; it is a property of that function. **Trigger for revisiting: the first application
+given a narrower namespace than its neighbours** — a sandboxed viewer, a per-application scratch
+subtree — at which point a dropped path resolves for the source and not for the target, and the
+answer becomes a handle with the ownership question answered, or a broker.
+
+The **kind** (`file`, `dir`, and room for more) is what a target matches on, and is what makes
+"accepts files, rejects folders" expressible without a MIME table. The **name** is metadata for a
+tab or a title bar, never authority.
+
+**2. Named acceptors are ports in waiting, and that is the shared abstraction.** A client declares
+what it accepts as *named* acceptors — `open-file` accepts `file` — rather than as a bare type
+list. The drop event then says "this record, for acceptor `open-file`", and a future port path
+`/dev/draw/3/ports/in/open-file` writes **the same record to the same handler**. The port is a
+second *carrier*, not a second feature.
+
+This is the whole answer to "the window drop event and a port write must be two interfaces to one
+functionality". It also does something for `TODO(port-shape-rework)` that no amount of design
+could: that deferral is open because ports were drawn for a mechanism that was cut and nothing has
+needed one since. After this milestone a port has a **name and a type taken from a shipped
+consumer**, and what is left to settle — stream versus message, what a resolve does when nothing
+is listening, which server owns the path — is a smaller question asked against a real example.
+Ports themselves stay deferred.
+
+**3. Regions are the client's, and cost nothing in the protocol.** The drop event carries the
+pointer position in window coordinates, and `libui` routes it to the widget under it exactly as it
+routes a press — so a widget gets `on_drop` and a window with one droppable panel is an ordinary
+tree, not a protocol feature. The compositor highlights at **window** granularity, which is the
+one thing given up: a region cannot glow. That is the same division the whole display arm already
+uses — the compositor knows where a pointer is and which window it is over, and everything finer
+is the toolkit's.
+
+**4. Declared, not queried — `QueryCaps` is not the mechanism.** `ui-composition-model.md` §5 says
+a drag triggers "a live capability query against visible windows". That is superseded here.
+Milestone 9 spent three parts establishing that per-gesture traffic to a manager is the thing to
+avoid — a queue that does not coalesce, evicting its oldest — and a round trip to *every visible
+window* at the start of *every drag* is a worse version of the same mistake. A window declares its
+acceptors once; the compositor matches against a table it already holds, exactly as it does for
+hotkeys and snap zones.
+
+The claim §5 makes — that this is drag-and-drop driven by **structural type match** rather than a
+hardcoded MIME table — is untouched. What changes is when the match happens, not what it is.
+
+**5. Thin but honest applications, and M12 is named for the rest.** Both applications want to
+become real projects: tabs, undo, find, file operations, drag-and-drop *within* the browser. None
+of that is here. What is here is the smallest version of each that is not a demo — an editor that
+opens, edits and saves a real file, and a browser that lists, navigates and can hand a file to
+something else. **Milestone 12 — applications, deepened** is named now (below) so the rest has
+somewhere to be rather than accreting into this one.
+
+### Part A — the filesystem helpers move below the applications
+
+`coreutils::fs` already has what a file browser needs — `ns_children`, `is_dir`, `create_file`,
+`rename`, `copy_tree`, `remove_tree`, `basename`, `join` — and it is inside a crate whose library
+is *shell-program* infrastructure: the Tier-1 stage prologue, GNU-style argument parsing, TSM1
+stdout plumbing. A GUI application wants the filesystem half and none of the rest, and depending
+on `coreutils` to get it would make one application depend on another's crate.
+
+- [ ] **`libfs`**, below the applications and above `libos`: the path and directory helpers,
+      moved rather than copied, with `coreutils` depending on it. The move is the point — a second
+      consumer is exactly this project's rule for when something goes down a layer, and it is the
+      same argument that put `BufferPool` in `libsurface` in M9 Part D rather than leaving the
+      ordering rule in `nxterm`.
+
+- [ ] **Gate**: `cargo xtask test` — these are host-testable except where they touch a namespace,
+      and `coreutils`' existing behaviour is the regression test. `test-interactive` already
+      drives `list`, `copy`, `rename` and `remove` at a real prompt, so a move that broke one
+      would fail there rather than nowhere.
+
+### Part B — `nxfiles`, the file browser
+
+The simpler of the two applications and the one that needs no new widget: `list_view` exists, and
+its second designed consumer was always a list of things on disk.
+
+- [ ] **List a directory**, one row per entry, directories marked and sorted before files. Reads
+      through `libfs`; `$env.HOME` is where it starts, which is the binding `build_app_namespace`
+      gives it.
+
+- [ ] **Navigate** — into a directory on a row press, up on a control in the chrome. A path
+      strip showing where you are, which is also the affordance the address bar becomes later.
+
+- [ ] **Open a file** by launching the editor on it, through the shell's launcher — which is the
+      *other* half of what makes this milestone's applications composable, and it is not
+      drag-and-drop: it is one application asking the shell to start another with an argument.
+
+- [ ] **Gate**: `check-login` boots the release image, launches `nxfiles` from the applications
+      modal, and asserts what it listed — against a directory the image *has*, so the assertion
+      is a fact about the filesystem rather than about a fixture. Control: an empty directory
+      lists nothing and says so, which is the arm that a browser reporting a stale listing
+      passes.
+
+### Part C — the text area
+
+The widget `libui` has deliberately not built since M4, on the stated grounds that "building an
+editor's widget remains a guess at requirements no editor has yet posed". An editor is now posing
+them, which is the trigger §8 named.
+
+- [ ] **A multi-line text buffer with a cursor**, insert and delete, arrow keys, Home/End, and
+      the scrolling that follows from a cursor that can leave the viewport. Selection is
+      **in scope** — an editor without it is not one — and is where the widget's state type earns
+      itself, the way `TextFieldState` and `ListState` did.
+
+- [ ] **What it is not**: no wrapping decisions borrowed from `libterm`. The terminal's grid is a
+      `custom` widget for a documented reason, and a text area is a different problem — lines are
+      logical and of unbounded length, and the reflow question `libterm` answered in M9 Part D is
+      not the same question. Sharing code between them is a **non-goal**, and stating that is
+      what stops a plausible-looking merge later.
+
+- [ ] **Gate**: host tests in `libui`, driven through `Router` at laid-out coordinates the way
+      `title_bar`'s and `resize_grip`'s are — a press places the cursor, a drag selects, typing
+      replaces a selection. `check-display`'s reference render gains the widget, so its pixels
+      are compared against a host render like every other widget in the toolkit.
+
+### Part D — `nxedit`, the text editor
+
+- [ ] **Open, edit, save** — one file, one buffer. Opened from an argument (which is how the
+      browser launches it), read through `libfs`, saved back to the same path. A title bar
+      showing the name and whether the buffer is modified.
+
+- [ ] **Save is the part with a failure mode worth designing.** A save that truncates and then
+      fails leaves nothing; the editor writes and renames, which `libfs` already has because
+      `coreutils` needed it. What it does when the rename fails is *report and keep the buffer* —
+      an editor that loses your work quietly is the one thing an editor must never be.
+
+- [ ] **Gate**: `check-login` opens a file, types, saves, and the assertion is made **from
+      outside the editor** — the serial session `cat`s the file back and the gate matches on what
+      the shell prints. A gate that asked the editor what it had saved would be asking the
+      accused.
+
+### Part E — drag-and-drop between them
+
+Everything above exists so that this part has two honest consumers rather than a test client.
+
+- [ ] **`Surface::DeclareAcceptor(name, kinds)`** — a client says what it takes, once. Bounded
+      per window like every other table the compositor holds, and cleared with the window.
+
+- [ ] **`Surface::StartDrag(window, kind, path, name)`** — the same shape as `StartMove` and
+      `StartResize`, refused the same way: the grab is the authority, so a client can only start
+      a drag the user is already making. The compositor runs the gesture, highlights windows
+      whose acceptors match `kind`, and on release inside one sends
+      **`Surface::Dropped { acceptor, kind, path, name, x, y }`** to that window. Released
+      anywhere else, nothing is sent and the drag is over.
+
+- [ ] **The highlight is the compositor's own drawing**, like the resize outline and for the same
+      reason: it is not chrome anybody has to lay out, it is a rectangle over the composed stack,
+      and its damage is the four edge strips M9 Part E already computes.
+
+- [ ] **`libui` gains `on_drop`**, routed by position like a press (decision 3), so the widget
+      under the pointer receives it and a window can accept a drop in one panel and not another
+      without the protocol knowing.
+
+- [ ] **Gate**: `check-login` drags a file from `nxfiles` onto `nxedit` and asserts the editor
+      opened it — read back the way Part D's is, from outside. **Two controls**, and they are the
+      two halves of "structural": a `dir` dragged onto an editor that declares only `file` must
+      highlight nothing and deliver nothing, and a drop released over a window with **no**
+      acceptor must do the same. A mechanism that highlighted everything would pass the positive
+      assertion alone.
+
+### Part F — graduate `display-substrate.md`
+
+- [ ] **Move it to `docs/architecture/`** with a Status line naming what is built. By the end of
+      this milestone the substrate is fully built, which is the condition the root `CLAUDE.md`
+      sets for a `design/` document graduating — and the milestone that builds a thing carries
+      the move as a checkbox precisely because nobody remembers otherwise.
+
+### Out of scope, deliberately
+
+- **Ports** (`TODO(port-shape-rework)`) — decision 2 gives them a name and a type from a shipped
+  consumer, and leaves the rest deferred. Trigger unchanged: the first client that needs to
+  address a window from a command line.
+- **Drag-and-drop within one application** — reordering a list, moving a file between two panes of
+  the browser. The mechanism here crosses windows; a drag inside one window is the toolkit's and
+  is M12's.
+- **A drop that starts outside a window** — dragging from the desktop background or the taskbar.
+  Nothing owns those pixels as a drag source today.
+- **Cursor feedback during a drag.** There are no per-client cursor shapes, so the highlight is
+  the whole of the feedback. Filed with per-client cursors, which the substrate doc already
+  defers.
+
+## Milestone 12 — applications, deepened
+
+Named 2026-08-30 as part of M10's details pass, so that "the editor should have tabs" has
+somewhere to go that is not M10.
+
+Both applications ship thin in M10 and both want to be real: **tabs** in each, **undo/redo** and
+**find** in the editor, **file operations** in the browser (rename, delete, copy, new folder, with
+the confirmation dialogs they imply), and **drag-and-drop within** a window. None of it is
+designed here; what this entry does is exist, so the line M10 draws is a line rather than an
+omission.
+
+**Its trigger is M10 landing**, and its ordering against M11 (themes and visual polish) is open —
+polish wants something finished to polish, and these are the two applications that will most show
+it.
 
 ## Milestone 11 — themes and visual polish
 

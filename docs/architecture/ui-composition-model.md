@@ -257,10 +257,18 @@ which the system already has, rather than a wiring model, which it would have ha
 
 ## 5. Window-to-window composition
 
-**One mechanism, deliberately small.** Dragging a file from a browser triggers a live capability
-query against visible windows (`QueryCaps`, already defined in `librsproto`'s Meta category) —
-"who has an input port shaped like `FileRef`." Valid targets highlight; dropping sends one
-message, once. Nothing is pre-wired, nothing is persisted, no standing connection is created.
+**One mechanism, deliberately small.** Dragging a file from a browser makes valid targets
+highlight; dropping sends one message, once. Nothing is pre-wired, nothing is persisted, no
+standing connection is created.
+
+**The match is declared rather than queried** — corrected 2026-08-30 by Milestone 10's details
+pass, which is where this became a thing to build rather than a thing to describe. This section
+said a drag triggers a *live* `QueryCaps` against visible windows. It does not: a window declares
+its acceptors once, and the compositor matches a table it already holds. Milestone 9 spent three
+parts establishing that per-gesture traffic to a manager is what to avoid, and a round trip to
+every visible window at the start of every drag is a worse version of the same mistake. What the
+section claims is untouched — the match is **structural**, against a type rather than a hardcoded
+MIME table; what changed is *when* it happens. See `display-arm-plan.md`, Milestone 10.
 
 This should feel like ordinary desktop drag-and-drop, just driven by **structural type match**
 instead of a hardcoded MIME table — and that is the whole of its claim. It is an improvement on

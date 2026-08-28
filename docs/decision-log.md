@@ -19825,3 +19825,52 @@ implementation in reach consults the zone table during a resize — and "a resiz
 therefore passed for every version of the code, including wrong ones. It is deleted, with the
 reason in its place, and what actually keeps a resize from being snapped — `start_move` and
 `start_resize` refusing each other — has its own test.
+
+---
+
+## 2026-08-30 — M10's details pass: a path, and ports given a name they did not have
+
+Milestone 10 is two applications and the one composition mechanism that survived revision 3's
+cut. The details pass settled five things, and two of them went against what I proposed.
+
+**A drop carries a path, not a handle** — the maintainer's call, and the argument that decided it
+is one I had underweighted. The capability-shaped answer is to transfer the open file, and it
+reads as obviously right in a system whose whole premise is that authority lives in handles. Then
+ask what a *refused* drop does: the source cannot know whether the target wants read or write, the
+target may never read the message at all, and **a transferred handle that is never received has no
+owner and no moment at which it is closed**. A path has none of that shape, and a consumer that
+cannot open one reports an error a person can act on.
+
+**What that rests on is now written down, because it is not free.** A path is a portable reference
+between two applications here only because `desktop-shell::build_app_namespace` gives every one of
+them the identical `/home` bind. That is a property of one function, not of the system. The
+trigger for revisiting is named: the first application given a *narrower* namespace than its
+neighbours, at which point a dropped path resolves for the source and not the target. Recording
+the assumption is the difference between a decision and a coincidence.
+
+**Named acceptors are ports in waiting**, which is what makes the drop event and a future port
+write "two interfaces to the same functionality" rather than two features. A client declares
+`open-file` accepts `file`; the drop event names the acceptor; a port at
+`/dev/draw/<N>/ports/in/open-file` would later write the same record to the same handler. This
+does something for `TODO(port-shape-rework)` that no further design could: that deferral is open
+because ports were drawn for a mechanism that was cut and **nothing has needed one since**. After
+M10 a port has a name and a type taken from a shipped consumer, and what is left is smaller.
+
+**Drop regions cost nothing, once the question is asked the other way round.** I had it as a
+protocol feature — declared rectangles, the way snap zones are. But the client already routes
+clicks to widgets itself; if the drop event carries the pointer position, `libui` routes a drop
+exactly as it routes a press, a widget gets `on_drop`, and the protocol never learns what a region
+is. The compositor highlights whole windows, which is the one thing given up.
+
+**And `QueryCaps` is not the mechanism**, superseding `ui-composition-model.md` §5's "live
+capability query against visible windows". Milestone 9 spent three parts establishing that
+per-gesture traffic to a manager is the thing to avoid — a queue that does not coalesce, evicting
+its oldest — and a round trip to every visible window at the start of every drag is a worse
+version of it. The section's actual claim, that the match is **structural** rather than a
+hardcoded MIME table, is untouched; what changed is when it happens. The section is corrected
+rather than quietly rewritten.
+
+**Both applications ship thin, and Milestone 12 is named to hold the rest.** Tabs, undo, find,
+file operations and in-window drag-and-drop are all wanted and none is here. Naming the milestone
+now is what keeps M10's line a line rather than an omission — the maintainer's own framing, and
+the same move that kept M9's snap layouts and live resize out of M9.
