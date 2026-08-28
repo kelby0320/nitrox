@@ -216,8 +216,9 @@ struct MappedBuffer {
 impl Drop for MappedBuffer {
     /// Unmap when the record goes away — **the record is not the mapping**.
     ///
-    /// Both places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
-    /// removed records and nothing else. Dropping a `MappedBuffer` used to leave the VMA
+    /// All three places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
+    /// removed records and nothing else — the two that follow a window going away, and, since
+    /// M9 Part D, the one in `map_attached_buffer` that drops the mapping a re-attach replaces. Dropping a `MappedBuffer` used to leave the VMA
     /// behind, so the comment at the destroy site — "otherwise a client looping
     /// create/attach/destroy grows the compositor's address space without bound" — described
     /// an intent the code did not carry out. It leaked on the ordinary application

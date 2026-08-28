@@ -109,6 +109,18 @@ pub enum Msg {
     RequestState(u32),
 }
 
+/// What a [`resize`](App::resize) did, beyond changing the size.
+///
+/// **Only the eviction, because only the eviction is not derivable.** Everything else about the
+/// new shape is readable from the grid afterwards; how many lines the bounded scrollback dropped
+/// on the way is not, and it is the difference between "the rewrap lost lines" and "the history
+/// was already full" — see [`libterm::grid::Reflow::evicted_lines`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Resized {
+    /// Logical lines the ring dropped during the rewrap.
+    pub evicted: usize,
+}
+
 /// Everything the terminal is.
 pub struct App {
     /// The screen, the cursor, and the scrollback.
@@ -244,12 +256,12 @@ impl App {
     /// many lines the history has: a reader who has scrolled up sees the same text after the
     /// resize as before it, not the same line number.
     ///
-    /// `true` if anything actually changed, so a caller can skip reallocating buffers for a
-    /// `Configure` that repeats the size a window already has — which is every `Configure` that
-    /// follows a move.
-    pub fn resize(&mut self, size: Size) -> bool {
+    /// `None` if nothing changed, so a caller can skip reallocating buffers for a `Configure`
+    /// that repeats the size a window already has — which is every `Configure` that follows a
+    /// move. `Some` carries what the resize cost the history: see [`Resized`].
+    pub fn resize(&mut self, size: Size) -> Option<Resized> {
         if size == self.window {
-            return false;
+            return None;
         }
         self.window = size;
         let cols = (size.w.saturating_sub(SCROLL_W) / self.metrics.cell_w).max(1) as usize;
@@ -260,7 +272,7 @@ impl App {
         // rewrap changed how many lines exist above it.
         self.view_top = self.view_top.map(|t| self.grid.clamp_view(reflow.map_line(t)));
         self.view_moved = true;
-        true
+        Some(Resized { evicted: reflow.evicted_lines() })
     }
 
     /// Where the grid's top-left sits inside the window.
@@ -619,7 +631,7 @@ mod tests {
         let mut a = app();
         let m = a.metrics;
         let want = Size::new(1280, 752);
-        assert!(a.resize(want), "a new size is a change");
+        assert!(a.resize(want).is_some(), "a new size is a change");
         assert_eq!(a.window_size(), want, "committed at exactly what was asked for");
         assert_eq!(a.grid.cols(), ((1280 - SCROLL_W) / m.cell_w) as usize);
         assert_eq!(a.grid.rows(), ((752 - BAR_H - TITLE_BAR_H) / m.cell_h) as usize);
@@ -635,7 +647,7 @@ mod tests {
         // both per pointer motion of a drag.
         let mut a = app();
         let want = a.window_size();
-        assert!(!a.resize(want), "same size, nothing to do");
+        assert!(a.resize(want).is_none(), "same size, nothing to do");
     }
 
     #[test]
@@ -644,7 +656,7 @@ mod tests {
         // floor is one of each rather than a refusal — the compositor composites whatever it is
         // given, and a client that panicked here would be one a manager could crash.
         let mut a = app();
-        assert!(a.resize(Size::new(1, 1)));
+        assert!(a.resize(Size::new(1, 1)).is_some());
         assert_eq!((a.grid.cols(), a.grid.rows()), (1, 1));
         assert_eq!(a.window_size(), Size::new(1, 1));
     }

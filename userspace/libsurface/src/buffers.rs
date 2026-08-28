@@ -21,6 +21,17 @@
 //! syscall or a call into [`WindowRef`], whose own record-keeping *is* host-tested against the
 //! mock transport. The decision this makes — *is this buffer the size I want* — is a comparison
 //! of [`WindowRef::buffer_geometry`] against a `Size`.
+//!
+//! ## The one place the two records could part
+//!
+//! This module's correctness rests on the client's idea of a buffer and the compositor's staying
+//! in step, and [`WindowRef::attach`] does **not** await a reply — it returns as soon as the send
+//! succeeds, so the geometry is recorded here whether or not the compositor accepted it. That is
+//! unreachable as things stand: the only attach this module makes is on a buffer `next_free`
+//! handed back, the client's `busy` set is a superset of the compositor's `committed`, and the
+//! only refusal the compositor has for a replace is the committed buffer. It is worth knowing
+//! that the argument is *that* rather than an acknowledgement, because a future caller attaching
+//! outside this path would not inherit it (PR #252 review, optional 5).
 
 use alloc::vec::Vec;
 
@@ -132,9 +143,20 @@ impl BufferPool {
         let len = pitch.checked_mul(size.h as usize)?;
         let (handle, addr) = shared_buffer(len)?;
         if window.attach(id, size.w, size.h, pitch as u32, handle).is_err() {
+            // **Both halves go back**, which the shape this was copied from did not do: the
+            // handle is transferred by a *successful* send, so a failed one leaves it this
+            // process's to close. Every caller today either exits or destroys its window, so it
+            // was a leak on a dying path — but a client that carried on after a failed resize
+            // would keep the object, and therefore the memory, for its whole run (PR #252
+            // review, optional 6).
+            //
             // SAFETY: the attach failed, so the compositor took neither the handle's object nor
-            // this mapping; unmapping a range this process just mapped.
-            unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
+            // this mapping; unmapping a range this process just mapped and closing a handle it
+            // still owns.
+            unsafe {
+                syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64);
+                syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+            }
             return None;
         }
         // **The old mapping goes only once the new one is attached.** Unmapping first would

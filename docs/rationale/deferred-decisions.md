@@ -346,11 +346,18 @@ Found by writing C1's gate probe and having the compositor correctly refuse a po
 across connections. Closing it also made the *compositor's* limit real: nothing bounded windows
 per connection, because the API was the bound — see `MAX_WINDOWS_PER_CONNECTION`.
 
-**Buffers per window are unbounded — `TODO(window-buffer-cap)`.** `WindowStack::attach` refuses a
-duplicate buffer id and nothing else, so one window may attach any number of buffers and the
+**Buffers per window are unbounded — `TODO(window-buffer-cap)`.** Nothing limits how many
+*distinct* buffer ids one window may attach, so a client may keep inventing them and the
 compositor maps each. Pre-existing, and not reachable by a well-behaved client: `libsurface`
 attaches exactly the count a client asked for at creation, and `ui-testclient`'s churn proves the
 mappings are reclaimed on destroy.
+
+**Updated 2026-08-28 (M9 Part D).** This entry used to say the limit was that "`WindowStack::attach`
+refuses a duplicate buffer id and nothing else". It no longer refuses one: re-attaching an id
+*replaces* the memory behind it, which is how a client resizes, and only the committed buffer is
+refused. That makes the resize path bounded — a window that is maximised and restored a hundred
+times still holds its original two ids — and leaves this deferral about the case it was always
+really about, a client inventing new ids.
 
 Filed now because M6 C3 changed the arithmetic. The argument for
 `MAX_WINDOWS_PER_CONNECTION` was that everything else on this server is bounded — and this is

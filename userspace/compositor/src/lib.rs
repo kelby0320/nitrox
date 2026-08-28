@@ -744,11 +744,13 @@ impl WindowStack {
 
     /// Attach a buffer to a window.
     ///
-    /// **Unbounded in count — `TODO(window-buffer-cap)`.** A duplicate id is refused and nothing
-    /// else is; a client may attach as many buffers as it likes and the compositor maps each.
+    /// **Unbounded in count — `TODO(window-buffer-cap)`.** Nothing limits how many *distinct*
+    /// ids a window may attach; a client may keep inventing them and the compositor maps each.
     /// Not reachable from `libsurface`, which attaches exactly what a client asked for at
-    /// creation, and the mappings are reclaimed on destroy. Filed because the per-connection
-    /// window cap made this the one thing here that is not bounded.
+    /// creation and — since M9 Part D — *replaces* those ids on a resize rather than adding to
+    /// them, which is why the resize path is bounded while this is still filed. The mappings
+    /// are reclaimed on destroy. Filed because the per-connection window cap made this the one
+    /// thing here that is not bounded.
     pub fn attach(&mut self, req: &AttachBufferRequest) -> Result<(), StackError> {
         let geometry =
             Geometry::with_pitch(req.width, req.height, req.pitch as usize, PixelFormat::XRGB8888)

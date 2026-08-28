@@ -19567,3 +19567,48 @@ exchange, and wrong for exactly one click if a shell ignores the request.
 measured from the window's original width, which was correct only while the client declined. That
 is the shape of this change's cost: nothing was subtly wrong, several things were suddenly
 somewhere else.
+
+---
+
+## 2026-08-28 — Part D's review: the invariant that was not one, and five clears nothing tested
+
+Four findings, and three of them are the same shape: a claim stated more broadly than the code
+supports, or a guard with nothing behind it.
+
+**The line-count invariant is not unconditional, and the gate asserting it would have blamed the
+wrong file.** `logical_lines` said the number is the same either side of a resize; `resize` evicts
+at `SCROLLBACK`, and *narrowing makes more rows out of the same text* — so a terminal with a deep
+history loses its oldest lines to the ring, not to the rewrap. Demonstrated in review at 900 lines
+halved in width: 901 → 502. Today's `check-login` session comes nowhere near the cap, so this was
+latent rather than flaky; the cost is that the first person to hit it is sent to look for a reflow
+bug in `Line::wrapped`. `Reflow::evicted_lines` now counts what the ring dropped, `nxterm` reports
+it beside the two counts, and the gate subtracts it — so the assertion is about the rewrap and
+exactly that.
+
+**Five sites clear the wrapped flag and no test touched any of them.** The PR body singled the
+clearing rule out as the judgement call in the change, and the plan calls it the thing that keeps
+two short lines two lines; with all five clears deleted the crate stayed green at 105 tests. Three
+tests now cover them, and each of the five — plus the flag rotation in `scroll_up`, which nothing
+had covered either — was deleted *individually* and watched to fail by name. Deleting them
+together, as the review did, is the weaker check: a single test failing tells you nothing about
+which of five sites it was standing behind.
+
+**A test that resized to the shape it already had.** `a_coloured_run_to_the_right_margin_is_not_trimmed_away`
+called `resize(6, 3)` on a 6×3 grid, which takes the early return — so the trim it was written to
+constrain never ran, and it passed against a trim that deleted every logical line outright. This
+is the fourth time this milestone that a control has found an assertion of mine that held for both
+implementations, and the third with the same cause: the *setup* was chosen for the property being
+described rather than for the code path that computes it.
+
+**And a deferral that now says the opposite of what the code does.** `window-buffer-cap` described
+the limit as "`WindowStack::attach` refuses a duplicate buffer id and nothing else". It no longer
+refuses one — that is this PR's whole mechanism — so the entry and the doc comment it was copied
+from both said the wrong thing about the one detail the change touched. `check-deferrals` gates
+existence, not truth, so nothing else would have caught it. The deferral itself is still real and
+is now about the case it was always really about: a client inventing new ids.
+
+Also from the review: `WindowRef::attach` does not await a reply, so `BufferPool` records a
+geometry the compositor might have refused — unreachable today, and the module now says *why* it
+is unreachable rather than leaving the reader to reconstruct it; a failed attach was unmapping its
+memory without closing the handle that carried it, a leak inherited from the shape it replaced;
+and a dead store in `resize` that wrote `false` where `false` already was.

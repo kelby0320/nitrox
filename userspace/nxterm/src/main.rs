@@ -503,7 +503,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // old shape by a resize is replaced at the moment it is next drawn into — which is
             // the frame after the one that committed the new size, when its release arrives.
             let Ok(b) = pool.acquire(&mut w, app.window_size()) else {
-                fail(b"nxterm: no buffer released\n");
+                // Two causes since Part D, and the message names both: no buffer came back from
+                // the compositor, or the memory for one at the new size could not be had.
+                fail(b"nxterm: no buffer to draw into\n");
             };
             if !pool.write(b, scratch.bytes()) {
                 fail(b"nxterm: the frame did not fit its buffer\n");
@@ -758,7 +760,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // that a gate on a release image can make: a terminal's rows are somebody's
                 // session, and the serial log is not the place for them.
                 let lines_before = app.grid.logical_lines();
-                if app.resize(Size::new(width, height)) {
+                if let Some(r) = app.resize(Size::new(width, height)) {
                     resized = true;
                     libkern::debug::Line::new()
                         .s(b"nxterm: resized to ")
@@ -773,6 +775,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         .u(lines_before as u64)
                         .s(b"->")
                         .u(app.grid.logical_lines() as u64)
+                        // **The eviction, because without it the difference is unattributable.**
+                        // Narrowing makes more rows out of the same text, so a deep history
+                        // loses its oldest to the ring rather than to the rewrap — and a reader
+                        // of this line who could not tell those apart would go looking for a
+                        // reflow bug that is not there (PR #252 review, finding 2).
+                        .s(b", ")
+                        .u(r.evicted as u64)
+                        .s(b" evicted")
                         .end();
                 }
             }

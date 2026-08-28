@@ -1517,16 +1517,16 @@ fn middle_click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()
     Ok(())
 }
 
-/// Every `lines N->M` `nxterm` reported, one per resize it accepted.
-fn transcript_reflows(transcript: &str) -> Vec<(u32, u32)> {
+/// Every `lines N->M, E evicted` `nxterm` reported, one per resize it accepted.
+fn transcript_reflows(transcript: &str) -> Vec<(u32, u32, u32)> {
     transcript
         .lines()
         .filter_map(|l| l.split(", lines ").nth(1))
         .filter_map(|tail| {
-            let t: String =
-                tail.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '>').collect();
-            let (a, b) = t.split_once("->")?;
-            Some((a.parse().ok()?, b.parse().ok()?))
+            let (counts, rest) = tail.trim().split_once(", ")?;
+            let (a, b) = counts.split_once("->")?;
+            let e: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            Some((a.parse().ok()?, b.parse().ok()?, e.parse().ok()?))
         })
         .collect()
 }
@@ -2452,15 +2452,24 @@ fn cmd_check_login(accel: Accel) -> R<()> {
                     terminal never accepted a `Configure`"
             .into());
     }
-    for (before, after) in &reflows {
-        if before != after {
+    for &(before, after, evicted) in &reflows {
+        // **The eviction is subtracted, not tolerated.** Narrowing makes more rows out of the
+        // same text, so a history near `SCROLLBACK` loses its oldest lines to the ring — and a
+        // gate that asserted equality unconditionally would one day blame `Line::wrapped` for
+        // the bound, sending the first person to hit it to the wrong file. Nothing in this
+        // session comes near the cap, so `evicted` is 0 here; it is subtracted because the
+        // claim is about the rewrap and this is what makes it exactly that (PR #252 review,
+        // finding 2).
+        if after + evicted != before {
             let path = build_cache().join("guest-transcript-check-login.log");
             let _ = fs::write(&path, &transcript);
             return Err(format!(
-                "a resize turned {before} logical lines into {after}. Re-wrapping moves where \
-                 the breaks are and must not join lines that were never one — `Line::wrapped` \
-                 is what separates a soft wrap from a line that ended, and a rewrap that \
-                 ignores it merges paragraphs the first time a window widens"
+                "a resize turned {before} logical lines into {after}, with {evicted} evicted by \
+                 the bounded scrollback — so {} went missing. Re-wrapping moves where the \
+                 breaks are and must not join lines that were never one: `Line::wrapped` is \
+                 what separates a soft wrap from a line that ended, and a rewrap that ignores \
+                 it merges paragraphs the first time a window widens",
+                before as i64 - after as i64 - evicted as i64
             )
             .into());
         }
