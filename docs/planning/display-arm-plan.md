@@ -2468,33 +2468,50 @@ only application there is. **Its gate is Part B's, completed** — maximise is t
 test-only path is invented to drive a resize, and the two parts are honest about being one
 dependency cut in two rather than two independent things.
 
-- [ ] **Resizing is a client-side mechanism, not an `nxterm` one.** New buffers at the new size,
-      attached, committed, and the old ones released — every application will need exactly this,
-      so it belongs in `libsurface`/`libui` where the next one inherits it rather than copies it.
+- [x] **Resizing is a client-side mechanism, not an `nxterm` one** ✅ — `libsurface::buffers`.
+      Allocating shared memory, attaching it, and the half with an ordering rule in it: replacing
+      a buffer at a new size without touching the one the compositor is reading. **The protocol
+      needed one change to make that bounded**: re-attaching a buffer id now *replaces* it, and
+      is refused only for the committed buffer. There is no detach, so a resize with fresh ids
+      would grow a window's buffer list — and the compositor's mappings with it — by two for
+      every maximise and every restore.
 
-- [ ] **`Grid::resize(cols, rows)`** — the screen rows re-laid out, the cursor clamped, damage
-      taken for the whole grid. `COLS`' own doc still says the fixed size is fine because "M6
-      owns move and resize"; M6 shipped without either, and this is where the constant stops
-      being one.
+- [x] **`Grid::resize(cols, rows)`** ✅ — the whole terminal re-laid out, the cursor following the
+      character it was on, damage taken for everything. The screen's blank tail is dropped rather
+      than rewrapped, or every resize of an idle terminal would push a screenful of nothing into
+      the history.
 
-- [ ] **Scrollback rewrap, and the data model it needs.** `scrollback` is a
-      `VecDeque<Vec<Cell>>` of *already-wrapped* rows with **nothing recording which were soft
-      wraps**, so a rewrap today would join paragraphs that were never one line. Lines need a
-      `wrapped` flag set as they scroll off; the rewrap then joins logical lines and re-splits at
-      the new width.
+- [x] **Scrollback rewrap, and the data model it needs** ✅ — `libterm::Line { cells, wrapped }`,
+      set at the wrap in `print`, cleared by an explicit line feed on that row and by an erase
+      that takes the row's tail. The rewrap joins logical lines and re-splits at the new width,
+      trimming the trailing blanks that padded the old break.
 
-- [ ] **And the scroll anchor has to survive it.** `scrolled` is an absolute line number
-      precisely so that output arriving while you read history does not move the text under you
-      — and a rewrap changes how many lines exist. The anchor is re-derived so the visible region
-      shows the same *text* after a resize, which is the property a person notices.
+- [x] **And the scroll anchor has to survive it** ✅ — `Grid::resize` returns a `Reflow` mapping
+      old absolute line numbers onto new ones, and `nxterm`'s `view_top` goes through it. Without
+      that a reader who has scrolled up sees a different part of the history after a resize.
 
-- [ ] **Gate**: maximise `nxterm`, and assert the **committed** geometry is the work area and the
-      grid grew — which completes Part B. Then the reflow, and its control is what the assertion
-      is built around: put a line long enough to wrap *and* **two deliberately short adjacent
-      lines** in the scrollback before widening. A rewrap that ignores the `wrapped` flag joins
-      the short pair into one row, and "the long line is now on one row" holds for that
-      implementation too — so the assertion that separates them is that the short pair is
-      **still two rows** (PR #247 review, optional 6).
+- [x] **Gate** ✅, and it is the completion of Part B's: `check-login` maximises `nxterm` and reads
+      back the **committed** geometry — exactly the work area, which is why the client takes the
+      size it was asked for and fits whole cells inside it rather than rounding the window down —
+      and asserts the grid grew, from the client's own report of what it came to in cells.
+
+      **The reflow is asserted by an invariant rather than by content**, and that is a
+      consequence of this being the release image: a terminal's rows are somebody's session and
+      the serial log is not the place for them. A rewrap moves where the breaks are and does not
+      create or destroy *lines*, so `nxterm` reports the logical-line count either side of every
+      resize and the gate requires them equal. The control the box asked for — a wrapped line and
+      **two deliberately short adjacent lines**, where an implementation that ignores the flag
+      joins the pair and still passes "the long line is one row" — is the same property stated
+      over the whole history: that implementation collapses it to one line, in one number.
+      Negative-controlled by making the rewrap ignore `Line::wrapped`: `check-login` fails with
+      "a resize turned 3 logical lines into 1". The row-level control, with the long line and the
+      short pair spelled out, is `libterm`'s own test (PR #247 review, optional 6).
+
+- [x] **And the maximise button had to become a toggle** ✅, which was not in this part's plan and
+      is its most direct consequence. The shell has had a restore path since Part B and nothing
+      could reach it: `nxterm`'s button only ever sent `WINDOW_STATE_MAXIMIZED`, which was
+      invisible while the client declined every `Configure` and is *a window you cannot get back*
+      the moment it does not.
 
 ### Part E — resize by an edge, committing on release
 

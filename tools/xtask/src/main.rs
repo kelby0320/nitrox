@@ -1517,12 +1517,43 @@ fn middle_click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()
     Ok(())
 }
 
-/// Read `<x>,<y> <w>x<h>` — the tail of the shell's window-geometry line. Returns the width.
-fn parse_geometry(rest: &str) -> Option<u32> {
+/// Every `lines N->M` `nxterm` reported, one per resize it accepted.
+fn transcript_reflows(transcript: &str) -> Vec<(u32, u32)> {
+    transcript
+        .lines()
+        .filter_map(|l| l.split(", lines ").nth(1))
+        .filter_map(|tail| {
+            let t: String =
+                tail.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '>').collect();
+            let (a, b) = t.split_once("->")?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The largest grid `nxterm` reported reaching, in cells, from `nxterm: resized to WxH, grid CxR`.
+///
+/// **The largest rather than the last**, because a terminal is resized more than once in a run
+/// and the interesting one is the maximise. `None` if it never reported a resize at all, which
+/// is what a client that declines every `Configure` looks like.
+fn transcript_grid(transcript: &str) -> Option<(u32, u32)> {
+    transcript
+        .lines()
+        .filter_map(|l| l.split(", grid ").nth(1))
+        .filter_map(|tail| {
+            let t: String = tail.trim().chars().take_while(|c| c.is_ascii_digit() || *c == 'x').collect();
+            let (c, r) = t.split_once('x')?;
+            Some((c.parse().ok()?, r.parse().ok()?))
+        })
+        .max()
+}
+
+/// Read `<x>,<y> <w>x<h>` — the tail of the shell's window-geometry line. Returns `(w, h)`.
+fn parse_geometry(rest: &str) -> Option<(u32, u32)> {
     let mut it = rest.split_whitespace();
     let _origin = it.next()?;
-    let (w, _h) = it.next()?.split_once('x')?;
-    w.parse().ok()
+    let (w, h) = it.next()?.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// Read `<x>,<y> <w>x<h> of <sw>x<sh>` — the tail of the shell's work-area line.
@@ -1801,7 +1832,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // consume past the geometry this needs.
     session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
     let geom_line = session.rest_of_line()?;
-    let term_w = parse_geometry(&geom_line)
+    let (term_w, term_h) = parse_geometry(&geom_line)
         .ok_or_else(|| format!("could not read the terminal's geometry from {geom_line:?}"))?;
 
     // And it is listed, focused, because it has the keyboard.
@@ -1822,10 +1853,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let maximise_at = (term_w as i32 - 39, button_y);
     let minimise_at = (term_w as i32 - 65, button_y);
 
-    // **Maximise is asserted as far as the request, and no further.** `nxterm` declines every
-    // `Configure` until Part D, so the window does not change size yet — what this step proves
-    // is that the ask reached the shell and that the shell answered with the *work area* rather
-    // than the screen. Part D's gate is where the window itself is asserted.
+    // **Maximise here is asserted as far as the shell's answer** — that the ask reached it and
+    // that it answered with the *work area* rather than the screen. What the client does with
+    // the size is 6g's, which is where the whole round trip is read back.
     click_at(&mut qmp, &mut session, maximise_at.0, maximise_at.1)?;
     session.expect("nxterm: asked the shell for window state 2")?;
     session.expect(&format!(
@@ -1833,6 +1863,32 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         work.0, work.1, work.2, work.3
     ))?;
     println!("  ok: maximise asked for the work area, not the screen");
+
+    // **And put it back, which is a gesture in its own right and the only one that sends
+    // `WINDOW_STATE_NORMAL`** (M9 Part D). The shell has had a restore path since Part B and
+    // nothing could reach it: the button was one-way, which was invisible while the client
+    // declined every `Configure` and is a window you cannot get back the moment it does not.
+    //
+    // **The button has moved**, because the window has: it is the work area now, so its
+    // top-right corner is the work area's. A gate that clicked the old coordinates would land
+    // on the title bar and start a drag — which is exactly what the first run of this did.
+    session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2, work.3))?;
+    // **The committed geometry, not the client's report of what it was asked.** The resize line
+    // is printed when the `Configure` arrives; the window is still its old size until the frame
+    // after that is drawn and committed. Clicking on the strength of the first line lands
+    // outside the window — `win=none` — which is what the first run of this step did.
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} {}x{}",
+        work.0, work.1, work.2, work.3
+    ))?;
+    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - 39, work.1 + 13)?;
+    session.expect("nxterm: asked the shell for window state 0")?;
+    session.expect(&format!("desktop-shell: restore window {term_id} to "))?;
+    // The size is pinned by the client's own line rather than by the shell's: the shell prints
+    // what it asked for, and what this step is about is the window going back to the shape it
+    // had — which only the client can say it did.
+    session.expect(&format!("nxterm: resized to {term_w}x{term_h}, grid "))?;
+    println!("  ok: and the same button restored it to where it came from");
 
     // **And minimise, end to end**, because nothing in it depends on a client honouring
     // anything: the window leaves the screen and the bar marks it with `_`.
@@ -1905,7 +1961,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     })?;
     session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
     let regeom = session.rest_of_line()?;
-    let term_w = parse_geometry(&regeom)
+    let (term_w, _term_h) = parse_geometry(&regeom)
         .ok_or_else(|| format!("could not read the replacement's geometry from {regeom:?}"))?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
@@ -2271,9 +2327,14 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // **And maximising it now *moves* it, which is the half a `Configure` was not applying.**
     // The window is at (40, …) after the drag, so a maximise that only carried a size would
     // resize it in place and leave it hanging off the screen. The compositor applies the origin
-    // as `Place` would — the size is still the client's to decline, and `nxterm` does until
-    // Part D, so this asserts the *origin* the geometry event reports (PR #249 review,
-    // blocking 2).
+    // as `Place` would (PR #249 review, blocking 2).
+    //
+    // **The size is asserted here too, as of M9 Part D** — this is where Part B's box was left
+    // open, deliberately, because the size stays the client's to decline and `nxterm` declined
+    // every `Configure` for three milestones. Now it accepts, and the assertion is the whole
+    // round trip: the button asks, the shell decides, the compositor forwards, the client
+    // reallocates and *commits* at the new size, and the geometry the shell reads back is the
+    // committed one. A client that still declined would produce every line but the last.
     //
     // The button is at the window's top-right, and the window has moved: its origin is
     // `DRAG_STEPS * DRAG_DX` across and `term_y + DRAG_STEPS * DRAG_DY` down.
@@ -2289,7 +2350,19 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         "desktop-shell: window {term_id} geometry {},{} ",
         work.0, work.1
     ))?;
-    println!("  ok: maximise moved the window to the work area's origin, not only resized it");
+    // **The client's own report, before the geometry that proves it.** It says what it did with
+    // the size *and* what that came to in cells, which is the difference between a window that
+    // grew and a terminal that can use the room: a grid still 80x24 in a 1280x752 window would
+    // satisfy every other line here.
+    session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2, work.3))?;
+    // And the committed geometry — the one the compositor reports and `/dev/draw/<id>/info`
+    // answers with — is the work area exactly, not the work area rounded down to whole cells.
+    session.expect(&format!(
+        "desktop-shell: window {term_id} geometry {},{} {}x{}",
+        work.0, work.1, work.2, work.3
+    ))?;
+    println!("  ok: maximise moved the window and the client committed the work area exactly");
+
 
     // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
@@ -2316,8 +2389,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     burst_holds_its_position(&mut qmp, &mut session, &chord)?;
 
     // 6i. **The close button is the client's own, and sends nothing** (M9 Part C). Everything
-    //      else on this bar asks the shell; this one exits. The window is at the work area's
-    //      origin after the maximise in 6g, so the button is that far from its right edge.
+    //      else on this bar asks the shell; this one exits. The window **is** the work area
+    //      after 6g — origin *and* size, since M9 Part D — so its top-right corner is the work
+    //      area's, and that is what the button is measured from.
     //
     //      **After 6h, not before it**, which costs a desktop switch back: 6h's stall is a
     //      whole-screen recompose, and a recompose with no window left in it is a weaker one
@@ -2330,7 +2404,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //      different ids precisely so that check can name one of them.
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
-    click_at(&mut qmp, &mut session, term_w as i32 - 13, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - 13, work.1 + 13)?;
     session.expect("nxterm: closing")?;
     session.expect("desktop-shell: window list on ")?;
     println!("  ok: the close button closed the terminal with no request to the shell");
@@ -2356,6 +2430,59 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // failures, but these run after `finish()` — so one used to report a verdict with no guest
     // output to diagnose it from, and the file left on disk was a *stale* one from an earlier
     // run. That is worse than none: it reads as evidence.
+
+    // **The grid grew, in cells.** Read off the client's own line rather than computed here:
+    // the cell size is the font's, and re-deriving it in the gate would be a second
+    // implementation of `Metrics` that could agree with nothing. Every other assertion in 6g is
+    // about *pixels*, and a grid still 80x24 in a 1280x752 window satisfies all of them — a
+    // large window with a small terminal in the corner.
+    // **The reflow, asserted on a release image without reading anybody's terminal.** A rewrap
+    // re-breaks lines at a new width; it does not create or destroy them, so `nxterm` reports
+    // the count either side of every resize and they must agree. The control the plan asks for
+    // — "two deliberately short adjacent lines are still two rows" — is this same property
+    // stated over the whole history: an implementation that ignored the soft-wrap flag and
+    // joined every adjacent row collapses it to one line, in one number, whatever the content
+    // happened to be. The row-level version of the control, with the long line and the short
+    // pair spelled out, is `libterm`'s own test.
+    let reflows = transcript_reflows(&transcript);
+    if reflows.is_empty() {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err("no \"nxterm: resized to …, lines N->M\" line in the transcript: the \
+                    terminal never accepted a `Configure`"
+            .into());
+    }
+    for (before, after) in &reflows {
+        if before != after {
+            let path = build_cache().join("guest-transcript-check-login.log");
+            let _ = fs::write(&path, &transcript);
+            return Err(format!(
+                "a resize turned {before} logical lines into {after}. Re-wrapping moves where \
+                 the breaks are and must not join lines that were never one — `Line::wrapped` \
+                 is what separates a soft wrap from a line that ended, and a rewrap that \
+                 ignores it merges paragraphs the first time a window widens"
+            )
+            .into());
+        }
+    }
+    println!("  ok: {} reflow(s) kept every line a line", reflows.len());
+
+    match transcript_grid(&transcript) {
+        Some((c, r)) if c > 80 && r > 24 => {
+            println!("  ok: the maximised terminal's grid grew to {c}x{r} cells")
+        }
+        found => {
+            let path = build_cache().join("guest-transcript-check-login.log");
+            let _ = fs::write(&path, &transcript);
+            return Err(format!(
+                "the maximised terminal's grid is {found:?}, not bigger than the 80x24 it starts \
+                 at. `nxterm` must refit the grid to the window it accepted — the window growing \
+                 is Part D's easy half, and a terminal that cannot use the room is the point of \
+                 the reflow"
+            )
+            .into());
+        }
+    }
 
     // The shell said it asked — order-independent, because that line races the client it woke.
     if !transcript.contains(&format!("desktop-shell: asked window {first_term_id} to close")) {

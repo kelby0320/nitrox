@@ -201,7 +201,13 @@ pub enum StackError {
     NoSuchParent,
     /// The buffer's geometry is not one this compositor can read.
     BadGeometry,
-    /// A buffer id already attached to this window.
+    /// A buffer id already attached to this window **and currently on screen**.
+    ///
+    /// Re-attaching an id is how a client resizes (M9 Part D) — it replaces the pixels behind
+    /// that id — and the one buffer it may not do that to is the committed one, whose pixels
+    /// the compositor is reading. Replacing that would change what is on screen without a
+    /// commit, which is the tearing case the whole buffer protocol exists to make
+    /// unrepresentable.
     DuplicateBuffer,
     /// This connection already holds [`MAX_WINDOWS_PER_CONNECTION`] windows.
     TooManyWindows,
@@ -752,8 +758,20 @@ impl WindowStack {
             .iter_mut()
             .find(|w| w.id == req.window)
             .ok_or(StackError::NoSuchWindow)?;
-        if w.buffers.iter().any(|b| b.id == req.buffer) {
-            return Err(StackError::DuplicateBuffer);
+        // **Re-attaching an id replaces it, and that is how a client resizes** (M9 Part D). A
+        // resize needs buffers of the new size and the protocol has no detach, so the
+        // alternative was a fresh id per resize — which grows this list, and the compositor's
+        // mappings with it, for the life of a window somebody maximises and restores.
+        //
+        // **Except the committed one**, whose pixels the compositor may be reading: replacing
+        // that changes the screen without a commit. A double-buffered client always has a free
+        // buffer to replace first, so this refuses nothing an honest resize needs.
+        if let Some(existing) = w.buffers.iter_mut().find(|b| b.id == req.buffer) {
+            if w.committed == Some(req.buffer) {
+                return Err(StackError::DuplicateBuffer);
+            }
+            existing.geometry = geometry;
+            return Ok(());
         }
         w.buffers.push(AttachedBuffer { id: req.buffer, geometry });
         Ok(())
@@ -1545,13 +1563,39 @@ mod tests {
     }
 
     #[test]
-    fn attaching_the_same_buffer_id_twice_is_refused() {
+    fn re_attaching_a_free_buffer_replaces_it_and_the_committed_one_is_refused() {
+        // **How a client resizes** (M9 Part D). The protocol has no detach, so a resize that
+        // needed new ids would grow this window's buffer list — and the compositor's mappings
+        // — by two for every maximise and every restore. Replacing is bounded by construction.
+        //
+        // Refused for the *committed* buffer, whose pixels the compositor may be reading: that
+        // would change the screen with no commit, which is the tearing the buffer protocol
+        // exists to make unrepresentable. A double-buffered client always has a free buffer to
+        // replace first, so nothing an honest resize does is refused.
         let mut s = WindowStack::new();
         let w = s
             .create(&CreateWindowRequest::new(4, 4, Role::Normal))
             .unwrap();
         s.attach(&attach(w, 0, 4, 4)).unwrap();
-        assert_eq!(s.attach(&attach(w, 0, 4, 4)), Err(StackError::DuplicateBuffer));
+        s.attach(&attach(w, 1, 4, 4)).unwrap();
+        assert_eq!(s.windows()[0].buffers.len(), 2);
+
+        s.attach(&attach(w, 0, 8, 8)).expect("a free buffer takes new memory under its own id");
+        assert_eq!(s.windows()[0].buffers.len(), 2, "replaced, not added");
+        let g = s.windows()[0].buffers.iter().find(|b| b.id == 0).unwrap().geometry;
+        assert_eq!(
+            (g.width, g.height),
+            (8, 8),
+            "and the new geometry is what the compositor will read it at"
+        );
+
+        s.commit(&commit(w, 0)).unwrap();
+        assert_eq!(
+            s.attach(&attach(w, 0, 16, 16)),
+            Err(StackError::DuplicateBuffer),
+            "the buffer on screen is not replaceable"
+        );
+        s.attach(&attach(w, 1, 16, 16)).expect("the other one still is");
     }
 
     #[test]

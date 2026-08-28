@@ -1812,6 +1812,16 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
         return false;
     };
     let len = req.pitch as usize * req.height as usize;
+    // **The mapping this replaces goes first, not last.** Re-attaching an id is a resize
+    // (M9 Part D), and `dispatch` has already accepted the *new* geometry for it — so a
+    // moment where the old, smaller mapping is still what `Server::pixels` finds is a
+    // moment where compositing reads a large geometry out of a small allocation.
+    // `Vec::retain` drops the record, and dropping a `MappedBuffer` unmaps it.
+    //
+    // Dropping it before the new mapping is also what makes a *failed* map safe: the window
+    // is left with no pixels for that buffer, which composites as nothing, rather than with
+    // the wrong ones.
+    srv.buffers.retain(|b| !(b.window == req.window && b.buffer == req.buffer));
     // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
     // with the size its own geometry declares.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };

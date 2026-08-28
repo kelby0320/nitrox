@@ -359,6 +359,20 @@ The client picks the buffer id so it can name it in a later `Commit` without wai
 reply. A `pitch` too small to hold a row is **rejected**: accepting it would alias rows in
 a buffer the client owns, which the compositor cannot detect any other way.
 
+**Attaching an id that is already attached replaces it** — new memory, new geometry, under the
+same id — **except for the buffer currently committed**, which is refused with
+`InvalidArgument`. This is how a client resizes: it has no way to *detach*, so a resize that
+needed fresh ids would grow the window's buffer list, and the compositor's mappings with it, by
+one per buffer for every resize a window ever sees. Replacing is bounded by construction.
+
+The exception is the whole of the rule: the committed buffer's pixels are what the compositor
+reads when it composites, so replacing that would change the screen with no `Commit` — the
+tearing this protocol exists to make unrepresentable. A double-buffered client always has a free
+buffer to replace first, draws the new size into it and commits, and replaces the other when its
+`Release` arrives; so a resize costs two frames and refuses nothing. The compositor drops its
+mapping of the old memory as it takes the new one, and the handle for the new memory rides this
+message exactly as it did the first time.
+
 ### `Commit` (`0x0902`)
 
 Request, 24 bytes: `window`, `buffer`, then a damage rectangle
@@ -531,7 +545,9 @@ wire change, which is the same reason the device layer's extensibility lives in 
 | 16 | 4 | `y` — top-left in screen coordinates, signed |
 
 **The size is a request; the origin is applied.** The compositor cannot resize a client's buffer,
-because the client allocates it. A client answers by attaching and committing a buffer of that size, or **declines**
+because the client allocates it. A client answers by attaching and committing a buffer of that
+size — see [`AttachBuffer`](#attachbuffer-0x0901), which is where the ordering rule for doing
+that without tearing lives — or **declines**
 by committing whatever it likes — and declining is legal and stays legal: a fixed-size window is
 an ordinary thing, and a protocol that required compliance would make every client implement
 reflow before it could exist. The compositor composites whatever geometry it is given.

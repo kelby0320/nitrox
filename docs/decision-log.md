@@ -19488,3 +19488,82 @@ to the `nxsh` it spawns, so closing a window must end that shell or every close 
 It does — `libstream`'s `PeerClosed` contract works — but nothing observed it until the review
 asked, and now `check-login` reads `nxsh: terminal closed` off the transcript. The line exists
 only on the path that exits, which is what makes the check worth having.
+
+---
+
+## 2026-08-28 — M9 Part D: the terminal accepts a size, and the history rewraps
+
+`nxterm` had declined every `Configure` since M6, on purpose and legally — a fixed-size window
+is an ordinary thing and the protocol says so. The cost was that maximise, snap and every other
+sized gesture were no-ops on the only application there is, and Part B's own gate had to stop at
+the shell's decision because nothing downstream of it did anything. This is where that ends.
+
+**A resize needed a protocol change, and it is one word.** The client has no way to *detach* a
+buffer, so a window that reallocates at a new size under fresh ids grows its buffer list — and
+the compositor's mappings with it — by two for every maximise and every restore, for the life of
+the window. `AttachBuffer` with an id that already exists now **replaces** it: new memory, new
+geometry, same id, bounded by construction. The exception is the whole of the rule — the
+*committed* buffer is refused, because its pixels are what the compositor reads and replacing
+them would change the screen with no commit. A double-buffered client always has a free buffer to
+replace first, so a resize costs two frames and refuses nothing. The one thing lost is a
+diagnostic: a client that reuses an id by accident is no longer told.
+
+**The mechanism went into `libsurface`, not into `nxterm`.** `BufferPool` owns the shared memory,
+the attach, and the ordering rule above; a client asks for a buffer *at the size it means to
+draw* and gets one, replacing what was there if it was the wrong shape. `nxterm`'s own copy of
+the allocation half is gone and its menu popup uses the same code. An application that got the
+ordering wrong would tear rather than fail, which is the kind of thing that belongs one layer
+down.
+
+**The flag is what made the reflow possible.** `libterm`'s scrollback was a queue of
+already-wrapped rows with nothing recording *which* wraps were soft — so a rewrap could join
+every adjacent pair (merging paragraphs that were never one line) or none (freezing the old
+width's breaks into the history for ever), and no third option existed. `Line::wrapped` is set at
+the moment of the wrap, which is the only moment it is knowable: afterwards two full adjacent
+rows are indistinguishable from a program that printed exactly `cols` characters and a newline.
+It is cleared by an explicit line feed on that row and by an erase that takes the row's tail,
+which is what keeps two deliberately short lines two lines after the text that once wrapped there
+has been overwritten.
+
+**The screen's blank tail is not history.** Rows below the last one carrying anything are dropped
+rather than rewrapped, or a person who maximises and restores an idle terminal finds a screenful
+of blank lines in their scrollback. Found by a control: the first version of that test *grew* the
+screen, where nothing spills whether or not the tail is trimmed, and passed with the trim removed.
+
+**The anchor had to be mapped, not carried.** `scrolled` is an absolute line number precisely so
+that output arriving while you read history does not move the text under you — and a rewrap
+changes how many lines exist above the anchor. `Grid::resize` returns a `Reflow` mapping old
+numbers onto new ones. The same control caught the same class of mistake here: the first version
+of that test used history that fitted at both widths, where nothing moves and an unmapped anchor
+passes too.
+
+**The gate for the reflow is an invariant, because the gate runs on the release image.** A
+terminal's rows are somebody's session and the serial log is not the place for them — the same
+reasoning that keeps the compositor's `Super` diagnostic to the modifier alone. A rewrap moves
+where the breaks are and does not create or destroy *lines*, so `nxterm` reports the logical-line
+count either side of every resize and `check-login` requires them equal. That is the plan's
+control — a wrapped line plus two short adjacent ones, where an implementation ignoring the flag
+joins the pair and still satisfies "the long line is one row" — stated over the whole history:
+that implementation collapses it to one line, in one number, whatever the content was. Verified
+by making the rewrap ignore the flag: the gate fails with "a resize turned 3 logical lines into
+1". The row-level version, with the long line and the short pair spelled out, is `libterm`'s own
+test.
+
+**The window is the size it was asked for, and the grid is what fits inside it.** Deriving the
+window from the grid — which is what `window_size` did — would make a maximised terminal a cell
+short in each axis, so "the window is the work area" would be false by a rounding error and the
+shell's geometry log would say so. The leftover is background, and the grid's paint callback
+fills it only when the node really is bigger than its cells, so an ordinary keystroke costs
+nothing extra.
+
+**And the maximise button had to become a toggle**, which was not in the plan for this part and
+is its most direct consequence. The shell has had a restore path since Part B and *nothing could
+reach it*: the button only ever sent `WINDOW_STATE_MAXIMIZED`, which was invisible while the
+client declined every `Configure` and is a window you cannot get back the moment it does not. One
+bit, holding what the window last *asked* to be — the same convention as every other half of this
+exchange, and wrong for exactly one click if a shell ignores the request.
+
+**Three gate coordinates moved because the window now does.** The steps after a maximise were
+measured from the window's original width, which was correct only while the client declined. That
+is the shape of this change's cost: nothing was subtly wrong, several things were suddenly
+somewhere else.

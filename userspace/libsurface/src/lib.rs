@@ -42,6 +42,7 @@ use librsproto::surface::{
     build_destroy_window_request, parse_create_window_reply, parse_release_event,
 };
 
+pub mod buffers;
 pub mod ipc;
 
 /// What went wrong.
@@ -589,8 +590,15 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Attach shared memory as buffer `buffer_id`, transferring `handle`.
     ///
-    /// The handle crosses **once**; thereafter the buffer is named by id. `pitch` is the
-    /// client's own row stride and need not be `width * 4`.
+    /// The handle crosses **once per attach**; thereafter the buffer is named by id. `pitch` is
+    /// the client's own row stride and need not be `width * 4`.
+    ///
+    /// **Re-attaching an id replaces it**, which is how a client resizes (M9 Part D): a window
+    /// whose buffers are the wrong size hands the compositor new memory under the same ids
+    /// rather than inventing new ones the compositor would then hold for the window's life.
+    /// The compositor refuses this for the buffer it is currently displaying, so a caller
+    /// replaces a **free** buffer — [`BufferPool`](crate::buffers::BufferPool) is the piece
+    /// that gets that sequence right.
     pub fn attach(
         &mut self,
         buffer_id: u32,
@@ -615,8 +623,22 @@ impl<T: Transport> WindowRef<'_, T> {
         )
         .ok_or(UiError::Malformed)?;
         self.session.transport.request(OP_ATTACH_BUFFER, &body[..n], Some(handle), &mut [])?;
-        self.state_mut().buffers.push(ClientBuffer { id: buffer_id, geometry, busy: false });
+        // Replaced in place when the id is already known, so the record count tracks the
+        // compositor's rather than growing by one per resize.
+        match self.state_mut().buffers.iter_mut().find(|b| b.id == buffer_id) {
+            Some(b) => b.geometry = geometry,
+            None => {
+                self.state_mut().buffers.push(ClientBuffer { id: buffer_id, geometry, busy: false })
+            }
+        }
         Ok(())
+    }
+
+    /// The geometry attached under `buffer_id`, if this window has such a buffer.
+    ///
+    /// What tells a caller its buffers are the wrong size after a `Configure`.
+    pub fn buffer_geometry(&self, buffer_id: u32) -> Option<Geometry> {
+        self.state().buffers.iter().find(|b| b.id == buffer_id).map(|b| b.geometry)
     }
 
     /// A buffer the client may draw into, or `None` if the compositor holds them all.
@@ -1218,6 +1240,42 @@ mod tests {
             );
         }
         assert!(Session::new(MockTransport::default()).create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_ok());
+    }
+
+    #[test]
+    fn re_attaching_an_id_replaces_its_record_rather_than_adding_one() {
+        // **The client half of how a resize works** (M9 Part D). The compositor replaces the
+        // memory behind an id rather than refusing it, so this side must replace the record —
+        // a pushed duplicate would make `buffer_geometry` and `next_free` answer from
+        // whichever copy came first, and a client would go on believing its buffers were the
+        // old size after resizing them.
+        let mut w = window(2);
+        assert_eq!(w.buffers().len(), 2);
+
+        w.attach(0, 128, 64, 128 * 4, 200).unwrap();
+        assert_eq!(w.buffers().len(), 2, "replaced, not added");
+        let g = w.w().buffer_geometry(0).expect("still attached");
+        assert_eq!((g.width, g.height, g.pitch), (128, 64, 128 * 4));
+        let other = w.w().buffer_geometry(1).expect("untouched");
+        assert_eq!((other.width, other.height), (64, 32), "the other buffer is not affected");
+    }
+
+    #[test]
+    fn a_replaced_buffer_keeps_the_busy_state_the_compositor_has_for_it() {
+        // A commit makes a buffer busy; a client must not be able to launder that by
+        // re-attaching. It cannot reach this — the compositor refuses re-attaching the
+        // displayed buffer — but the record here is what `next_free` reads, and a replace that
+        // cleared `busy` would hand the caller a buffer the compositor is still reading back.
+        let mut w = window(2);
+        w.commit(0, (0, 0, 64, 32)).unwrap();
+        w.attach(0, 128, 64, 128 * 4, 201).unwrap();
+        w.commit(1, (0, 0, 64, 32)).unwrap();
+        assert_eq!(
+            w.next_free(),
+            None,
+            "both buffers are committed, so nothing is free: {:?}",
+            w.buffers()
+        );
     }
 
     #[test]
