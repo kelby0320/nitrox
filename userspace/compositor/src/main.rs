@@ -502,6 +502,9 @@ fn log_route(rec: &Outbound) {
             l.s(b"compositor: focus win=").u(*window as u64);
             l.s(b" has=").u(*focused as u64);
         }
+        Outbound::CloseRequested { window } => {
+            l.s(b"compositor: close-requested win=").u(*window as u64);
+        }
         Outbound::Configure { window, width, height, x, y } => {
             l.s(b"compositor: mgr-configure win=").u(*window as u64);
             l.s(b" ").u(*width as u64).s(b"x").u(*height as u64);
@@ -920,6 +923,13 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             let mut body = [0u8; librsproto::surface::RELEASE_EVENT_LEN];
             match librsproto::surface::build_release_event(&mut body, *window, *buffer) {
                 Some(n) => reply_on_session(ch, OP_RELEASE, 0, &body[..n]),
+                None => true,
+            }
+        }
+        Outbound::CloseRequested { window } => {
+            let mut body = [0u8; 4];
+            match (librsproto::surface::WindowRef { window: *window }).write(&mut body) {
+                Some(n) => send_input(ch, librsproto::surface::OP_CLOSE_REQUESTED, &body[..n]),
                 None => true,
             }
         }
@@ -1526,6 +1536,26 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             unsafe { syscall4(SYS_HANDLE_CLOSE, carried, 0, 0, 0) };
         }
         return ok;
+    }
+    if op == librsproto::surface::OP_MGR_REQUEST_CLOSE {
+        // **Handled here rather than in `dispatch`**, which sees only the stack: asking a client
+        // to close means putting a record in *that client's* outbox, and the outboxes are the
+        // server's. Nothing about the window changes — this is the polite half.
+        let Some(req) = librsproto::surface::MgrWindowRef::read(&body) else {
+            return reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
+        };
+        let Some(slot) = srv.session_of(req.window) else {
+            // No window, or no session owns it — one answer for both, like every other
+            // ownership question here.
+            return reply_error_on_session(ch, op, request_id, KError::NotFound);
+        };
+        enqueue(srv, slot, Outbound::CloseRequested { window: req.window });
+        Line::new()
+            .s(b"compositor: asked window ")
+            .u(req.window as u64)
+            .s(b" to close")
+            .end();
+        return reply_on_session(ch, op, request_id, &[]);
     }
     if op == librsproto::surface::OP_MGR_QUERY_LAYOUT {
         // Handled here for the reason `Capture` is: `manager::dispatch` sees a `WindowStack` and

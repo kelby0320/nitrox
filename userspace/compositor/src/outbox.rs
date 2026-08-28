@@ -84,6 +84,17 @@ pub enum Outbound {
         /// Requested origin, y.
         y: i32,
     },
+    /// A `Surface::CloseRequested` — somebody with the manager channel is asking this window to
+    /// close.
+    ///
+    /// Queued like every other server-initiated record, and for the same reason: sent directly
+    /// with `NOBLOCK` it would be lost against a client whose ring is briefly full — and a
+    /// close request that vanishes is one the shell then has to insist on, killing a client that
+    /// would have gone quietly.
+    CloseRequested {
+        /// Which window is being asked to close.
+        window: u32,
+    },
 }
 
 impl Outbound {
@@ -97,7 +108,8 @@ impl Outbound {
             Outbound::Pointer { event } => event.window,
             Outbound::Release { window, .. }
             | Outbound::Focus { window, .. }
-            | Outbound::Configure { window, .. } => *window,
+            | Outbound::Configure { window, .. }
+            | Outbound::CloseRequested { window } => *window,
         }
     }
 

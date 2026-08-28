@@ -559,6 +559,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The title bar was dragged.** Performed here rather than in `update`, which has no
         // syscalls — and performed *before* the frame below, so the compositor is already moving
         // the window while this client is still painting.
+        // **Asked to close, by its own button or by the shell.** Exiting is the whole of it: the
+        // kernel closes this process's handles, the compositor sees the session go and destroys
+        // the windows on it, and the shell hears `WindowDestroyed` like any other close.
+        if app.closing() {
+            kprint(b"nxterm: closing\n");
+            exit(0);
+        }
+
         if app.take_move_request()
             && let Some(mut w) = win.window(window_id)
         {
@@ -760,6 +768,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // modifiers arrive on each event — so there is nothing to discard, and saying so
             // is the point: a client that silently ignored this would be wrong the moment it
             // started tracking anything.
+            // **The shell asking, answered the same way the close button is.** There is nothing
+            // to refuse with and nothing to save: what a client with unsaved work would do here
+            // is open a dialog, which is why this arrives as a request rather than a destruction.
+            WindowEvent::CloseRequested => {
+                kprint(b"nxterm: asked to close, exiting\n");
+                app.update(Msg::Close);
+            }
             WindowEvent::Dropped => kprint(b"nxterm: input dropped\n"),
             // **Declined, and legal.** Honouring a resize means resizing `libterm`'s grid and
             // reflowing its scrollback, which M5 called "a different problem, not a parameter of

@@ -20,7 +20,8 @@
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
     MgrDesktop, MgrHotkey, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE,
-    OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_REGISTER_HOTKEY,
+    OP_MGR_CLOSE, OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE,
+    OP_MGR_REGISTER_HOTKEY,
     OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED,
     OP_MGR_SET_WINDOW_DESKTOP,
 };
@@ -140,6 +141,24 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // Empty damage means the stack did not change — raising what was already on top
                 // — and the caller repaints nothing at all.
                 Ok(d) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(d.rect()) },
+                Err(e) => refused(e),
+            }
+        }
+        OP_MGR_CLOSE => {
+            let Some(req) = MgrWindowRef::read(body) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            // The rectangle before it goes, because that is what has to be repainted — and
+            // afterwards there is nothing to read it from.
+            let Some(dirty) = stack.window(req.window).map(|w| w.bounds()) else {
+                return MgrOutcome::Failed(SurfaceError::NotFound);
+            };
+            match stack.destroy(req.window) {
+                // **Exactly what a client's own `DestroyWindow` does**, descendants included:
+                // this is the same removal reached by a different caller, not a second kind of
+                // destruction with its own rules. `WindowDestroyed` follows from `removed_log`
+                // like any other.
+                Ok(()) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(dirty) },
                 Err(e) => refused(e),
             }
         }
@@ -309,6 +328,32 @@ mod tests {
         let d = dirty.expect("named, not `everything`");
         assert!(d.size.w == 0 || d.size.h == 0, "already on top, so nothing moved: {d:?}");
         assert_eq!(order(&s), ids, "and the order is untouched");
+    }
+
+    #[test]
+    fn close_destroys_a_window_the_caller_does_not_own_and_names_what_to_repaint() {
+        // **The only answer available to a desktop whose applications draw their own chrome.** A
+        // close button the client paints cannot close a client that has stopped answering, so
+        // the manager needs a way to remove a window it does not own — which is the whole point
+        // of the manager channel, and is what `DestroyWindow` deliberately is not.
+        let (mut s, ids) = stack_with(2);
+        let want = s.window(ids[0]).expect("in the stack").bounds();
+        let MgrOutcome::Applied { window, dirty } =
+            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0))
+        else {
+            panic!("expected Applied")
+        };
+        assert_eq!(window, Some(ids[0]));
+        assert_eq!(dirty, Some(want), "the rectangle it vacated, read before it went");
+        assert_eq!(order(&s), [ids[1]], "and it is out of the stack");
+        assert_eq!(s.take_removed(), vec![ids[0]], "recorded, so `WindowDestroyed` follows");
+
+        // A second close of the same window is `NotFound`, like any other op naming a window
+        // that is not there.
+        assert!(matches!(
+            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0)),
+            MgrOutcome::Failed(SurfaceError::NotFound)
+        ));
     }
 
     #[test]

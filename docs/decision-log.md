@@ -19396,3 +19396,45 @@ design is right and is *why* the enumeration was wrong to write: it invited a re
 list the code never consulted. The spec now says the work area is the screen minus **every**
 panel's reservation — including a minimised or uncommitted one — because a strut is a declaration
 about space rather than a consequence of being drawn.
+
+## 2026-08-28 — M9 Part C: the taskbar asks, and only insists when nothing happens
+
+The close button on `nxterm`'s title bar sends nothing. It exits, the kernel closes its handles,
+the compositor sees the session go and destroys its windows, and the shell hears
+`WindowDestroyed` like any other close. That is the whole of the ordinary case, and it is what
+client-side decorations buy: the client that owns the work decides when to stop.
+
+**The awkward case is a client that will not, and the plan contradicted itself about it.**
+Decision 4 said the taskbar's close "ends in a new manager request, `Manage::Close`, and the
+compositor destroys the window" — one step. Part C's own gate control said closing a live client
+"must reach the client's own path rather than destroying a window out from under a process that
+was fine". Both cannot be built. The control wins, and it needed a second op: only the compositor
+can reach a client's session, so asking is `Manage::RequestClose` and insisting is
+`Manage::Close`. A desktop with only the second destroys windows out from under processes that
+were fine; one with only the first has no answer for a wedged application except the serial
+console.
+
+The shell asks, remembers a two-second grace period, and insists when it runs out. A window that
+goes away on its own has already left the list, so the ordinary case never reaches `Manage::Close`
+at all. Middle-click is the gesture — what every taskbar this borrows from uses, and it needs no
+room in a layout that is one fixed slot per window.
+
+**The gate could not be what the plan asked for, and the reason is structural.** The box wanted
+"a test client that stops answering, closed from the window list": the test clients are in the
+selftest image, `desktop-shell` runs only in the release one, and `check-images` exists precisely
+to stop that difference growing. So the *ask* is gated end to end in `check-login` with the only
+client there is, and `Manage::Close` is host-tested on the manager dispatch. **The insist is not
+gated end to end**, and the trigger is written into the plan rather than left to be discovered:
+the first application that can be wedged on purpose.
+
+**Two assertions by absence, which is unusual enough to note.** The close button is proved to
+send nothing by the transcript containing no `RequestClose` for that window — which is why the
+gate closes two terminals and names the second one's id, so the first one's genuine request
+cannot satisfy the check. And the control for the ask path is the assertion itself: `nxterm` says
+it was asked and says it is closing, and a shell that destroyed the window instead would produce
+neither line while the window went away all the same.
+
+**One ordering lesson, again.** The shell logs its ask *after* the request returns, and the
+compositor logs *before* replying — so the shell's line lands on either side of the client's two,
+depending on scheduling. It is checked against the whole transcript rather than in sequence, the
+rule PR #227 established for `nxterm`'s output and the third time this milestone has needed it.

@@ -1318,12 +1318,20 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         .s(b"x")
         .u(layout.screen_h as u64)
         .end();
-    /// Where a maximised window came from, so restoring it has somewhere to go.
-    ///
-    /// **The shell's, not the compositor's.** A `maximized` flag there would be a second source
-    /// of truth about a rectangle, and the rectangle a window returns to is a decision — this is
-    /// the process that made it.
+    // Where a maximised window came from, so restoring it has somewhere to go.
+    //
+    // **The shell's, not the compositor's.** A `maximized` flag there would be a second source
+    // of truth about a rectangle, and the rectangle a window returns to is a decision — this is
+    // the process that made it.
     let mut restore: alloc::vec::Vec<(u32, (i32, i32, u32, u32))> = alloc::vec::Vec::new();
+    // Windows asked to close, and when to stop waiting for them.
+    //
+    // **Asked first, insisted on afterwards.** A window holds a process's work, and a taskbar
+    // that destroyed it would take the decision away from the only participant that knows
+    // whether that matters. A client that ignores the request gets `Manage::Close` instead,
+    // which is the only answer available to a desktop whose applications draw their own chrome
+    // (M9 Part C).
+    let mut closing: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
     let mut next_origin = BAR_H as i32;
 
     // Registered on the first pass of the loop, once the manager channel is known to exist.
@@ -1408,7 +1416,14 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // nothing left in the kernel queue to wake this. Polling once after any request is the
         // belt: the drain below sees the parked events and the next iteration blocks normally
         // (PR #242 review, optional 10 — unverified there, and cheap enough to close).
-        let deadline = if sent_request { 0 } else { u64::MAX };
+        // **Bounded while a close is outstanding**, so the insist below happens without the
+        // user having to touch anything else. With nothing owed this is still an indefinite
+        // sleep rather than a poll.
+        let deadline = if sent_request {
+            0
+        } else {
+            closing.iter().map(|&(_, at)| at).min().unwrap_or(u64::MAX)
+        };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
@@ -2082,6 +2097,15 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     // name a different window than the one under the cursor as soon as a window
                     // moved away.
                     let Some(e) = entries.iter_mut().find(|e| e.id == wid) else { continue };
+                    // **The middle button closes**, which is what every taskbar this borrows
+                    // from does — and it needs no room in a layout that is already one fixed
+                    // slot per window. It *asks*: a window holds a process's work, and the
+                    // shell insists only when nothing happens (M9 Part C).
+                    if p.button == libkern::abi::BTN_MIDDLE {
+                        sent_request = true;
+                        ask_to_close(m, wid, &mut closing);
+                        continue;
+                    }
                     if e.focused && !e.minimized {
                         sent_request = true;
                         if minimize_window(m, e) {
@@ -2107,6 +2131,30 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
             }
         }
+        // **Insist on any close that has run out of patience.** The wait above is bounded while
+        // this list is non-empty, so this happens without the user touching anything else — and
+        // a window that went away on its own has already left `entries`, so the ordinary case
+        // never reaches `Manage::Close` at all.
+        if !closing.is_empty()
+            && let Some(now) = now_ns()
+            && let Some(m) = manager.as_mut()
+        {
+            let mut still = alloc::vec::Vec::new();
+            for &(id, at) in &closing {
+                if !entries.iter().any(|e| e.id == id) {
+                    // Gone, by the client's own hand. Nothing to insist on.
+                    continue;
+                }
+                if now < at {
+                    still.push((id, at));
+                    continue;
+                }
+                sent_request = true;
+                insist_on_close(m, id);
+            }
+            closing = still;
+        }
+
         // **Redraw the bar when the list changed, and only then.** Every manager event would
         // otherwise repaint a bar that says the same thing, and a panel commit is a full-width
         // blit the compositor has to composite.
@@ -2179,6 +2227,82 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
     }
+}
+
+/// How long a client has to answer a close request before the shell insists.
+///
+/// **Long enough for a client that is merely busy, short enough that a person does not think
+/// the click was lost.** A responsive client exits in milliseconds; this is for one that is
+/// wedged, and the alternative to waiting at all is destroying windows out from under processes
+/// that were fine.
+const CLOSE_GRACE_NS: u64 = 2_000_000_000;
+
+/// Scratch for [`now_ns`].
+static mut CLOCK_BUF: u64 = 0;
+
+/// The monotonic clock, in nanoseconds, or `None` if it will not answer.
+///
+/// Only the close grace period needs it. `None` becomes "no deadline" at the call site, which
+/// degrades to "insist when something else wakes the loop" rather than to a spin.
+fn now_ns() -> Option<u64> {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    let r = unsafe {
+        libkern::syscall::syscall2(
+            libkern::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_MONOTONIC,
+            (&raw mut CLOCK_BUF) as u64,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so the kernel wrote the ns count.
+    Some(unsafe { (&raw const CLOCK_BUF).read() })
+}
+
+/// Ask a window's client to close, and remember to insist if it does not.
+fn ask_to_close(
+    mgr: &mut ChannelTransport,
+    window: u32,
+    closing: &mut alloc::vec::Vec<(u32, u64)>,
+) {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+        return;
+    }
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_REQUEST_CLOSE, &body, None, &mut reply).is_err() {
+        Line::new().s(b"desktop-shell: RequestClose refused for window ").u(window as u64).end();
+        return;
+    }
+    Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
+    // A second ask before the first has run out replaces its deadline rather than adding an
+    // entry: one window is being closed once, however many times it is clicked.
+    closing.retain(|&(id, _)| id != window);
+    if let Some(now) = now_ns() {
+        closing.push((window, now.saturating_add(CLOSE_GRACE_NS)));
+    }
+}
+
+/// Destroy a window whose client did not answer — `Manage::Close`.
+fn insist_on_close(mgr: &mut ChannelTransport, window: u32) -> bool {
+    use librsproto::surface::{MgrWindowRef, OP_MGR_CLOSE};
+    let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+    if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
+        return false;
+    }
+    let mut reply = [0u8; 64];
+    if mgr.request(OP_MGR_CLOSE, &body, None, &mut reply).is_err() {
+        Line::new().s(b"desktop-shell: Close refused for window ").u(window as u64).end();
+        return false;
+    }
+    Line::new()
+        .s(b"desktop-shell: window ")
+        .u(window as u64)
+        .s(b" did not answer; closed it")
+        .end();
+    true
 }
 
 /// Ask a window's client to adopt a geometry — `Manage::Configure`.

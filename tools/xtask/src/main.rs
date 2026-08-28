@@ -1503,6 +1503,19 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
+/// Middle-click at `(x, y)`, having first walked the pointer there and checked it arrived.
+///
+/// **The position is verified with a left click before the middle one**, because the compositor
+/// logs where a press landed and nothing else here can say where the pointer is. On a
+/// window-list entry that left click raises the window, which is what a caller about to close it
+/// wants anyway.
+fn middle_click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
+    click_at(qmp, session, x, y)?;
+    qmp.send_button("middle", true)?;
+    qmp.send_button("middle", false)?;
+    Ok(())
+}
+
 /// Read `<x>,<y> <w>x<h>` — the tail of the shell's window-geometry line. Returns the width.
 fn parse_geometry(rest: &str) -> Option<u32> {
     let mut it = rest.split_whitespace();
@@ -1800,9 +1813,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //      minimise or maximise itself — both are manager operations — so the button sends
     //      `Surface::RequestState`, the compositor forwards it, and the shell decides. The
     //      buttons sit at the bar's right end: maximise is last, minimise beside it.
+    // **Measured from the right edge in layout order** — minimise, maximise, close, each
+    // `TITLE_BUTTON_W` (26) wide. Part C added close, which moved the other two a slot left; the
+    // first run after that clicked *close* where it meant maximise, which is what a coordinate
+    // constant hides and a changing layout exposes.
     let button_y = term_y + 13;
-    let maximise_at = (term_w as i32 - 13, button_y);
-    let minimise_at = (term_w as i32 - 39, button_y);
+    let maximise_at = (term_w as i32 - 39, button_y);
+    let minimise_at = (term_w as i32 - 65, button_y);
 
     // **Maximise is asserted as far as the request, and no further.** `nxterm` declines every
     // `Configure` until Part D, so the window does not change size yet — what this step proves
@@ -1843,6 +1860,52 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("  ok: the minimise button still works after the taskbar restored the window");
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
     session.expect("desktop-shell: raised window ")?;
+
+    // 6a3. **The taskbar asks, and the client is what closes** (M9 Part C). Middle-click is the
+    //      gesture — the same one every taskbar this borrows from uses, and it needs no room in
+    //      a layout that is one fixed slot per window. A window holds a process's work, so the
+    //      shell *asks*: `Manage::Close` exists for a client that will not answer, and reaching
+    //      for it first would destroy windows out from under processes that were fine.
+    //
+    //      **The control is the live client, and it is these two assertions rather than a
+    //      separate run**: `nxterm` says it was asked and says it is closing, so the window went
+    //      away by its own hand. A shell that destroyed it instead would produce neither line —
+    //      and the window would be gone all the same, which is why the client's side is the only
+    //      place the difference is visible.
+    middle_click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    // **Only the ordered half is an `expect`.** The compositor logs before it replies, so it
+    // leads; the client then wakes and answers. The *shell's* own line comes after its request
+    // returns, which is a race against the client it just woke — observed on both sides of the
+    // client's two lines — so it is checked against the whole transcript below, where order does
+    // not matter. Same rule as `nxterm`'s output in PR #227.
+    session.expect(&format!("compositor: asked window {term_id} to close"))?;
+    session.expect("nxterm: asked to close, exiting")?;
+    session.expect("nxterm: closing")?;
+    // The compositor tore the windows down with the session, and the list lost the entry.
+    session.expect("desktop-shell: window list on desktop 1 of 1 (empty)")?;
+    println!("  ok: the taskbar asked, and the client closed itself");
+    let first_term_id = term_id;
+
+    // Launch another, because everything below needs a terminal — the same sequence as the
+    // first launch, and the modal it opens is closed by the launch.
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+    for c in "nxterm".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxterm into its own namespace")?;
+    session.expect("desktop-shell: placed window ")?;
+    let replaced = session.rest_of_line()?;
+    let (term_id, term_y) = parse_placement(&replaced).ok_or_else(|| {
+        format!("could not read the replacement terminal's placement from {replaced:?}")
+    })?;
+    session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
+    let regeom = session.rest_of_line()?;
+    let term_w = parse_geometry(&regeom)
+        .ok_or_else(|| format!("could not read the replacement's geometry from {regeom:?}"))?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
     //    so it stayed on top of whatever was launched and the bar's click handler — gated on
@@ -2215,7 +2278,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `DRAG_STEPS * DRAG_DX` across and `term_y + DRAG_STEPS * DRAG_DY` down.
     let moved_x = DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
-    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 13, moved_y + 13)?;
+    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 39, moved_y + 13)?;
     session.expect("nxterm: asked the shell for window state 2")?;
     session.expect(&format!(
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
@@ -2226,6 +2289,19 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         work.0, work.1
     ))?;
     println!("  ok: maximise moved the window to the work area's origin, not only resized it");
+
+    // 6i. **The close button is the client's own, and sends nothing** (M9 Part C). Everything
+    //      else on this bar asks the shell; this one exits. The window is at the work area's
+    //      origin after the maximise above, so the button is that far from its right edge.
+    //
+    //      **Asserted by what is absent as well as what is present.** `nxterm: closing` says it
+    //      went; the transcript check below says no `RequestClose` was sent for *this* window,
+    //      which is what makes it the button rather than the taskbar. The two terminals have
+    //      different ids precisely so that check can name one of them.
+    click_at(&mut qmp, &mut session, term_w as i32 - 13, work.1 + 13)?;
+    session.expect("nxterm: closing")?;
+    session.expect("desktop-shell: window list on ")?;
+    println!("  ok: the close button closed the terminal with no request to the shell");
 
     // 6h. **Movement is not lost while the compositor is busy** — the one property the whole
     //     input path exists to keep, and the one nothing here checked.
@@ -2272,6 +2348,29 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // check runs after `finish()` — so a concurrency failure used to report a verdict with no
     // guest output to diagnose it from, and the file left on disk was a *stale* one from an
     // earlier run. That is worse than none: it reads as evidence.
+    // The shell said it asked — order-independent, because that line races the client it woke.
+    if !transcript.contains(&format!("desktop-shell: asked window {first_term_id} to close")) {
+        return Err(format!(
+            "the shell never reported asking window {first_term_id} to close, so the taskbar's \
+             middle-click did not reach `Manage::RequestClose`"
+        )
+        .into());
+    }
+
+    // **The close button sent nothing.** Present-and-absent together: the click above closed the
+    // window, and no `RequestClose` was ever sent for it — the id is the second terminal's, so
+    // the first one's genuine request cannot satisfy this.
+    if transcript.contains(&format!("asked window {term_id} to close")) {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err(format!(
+            "the close button asked the shell: the transcript contains \"asked window \
+             {term_id} to close\". `nxterm`'s close button is its own — it exits, and the \
+             compositor tears its windows down with its session. A client that routed its own \
+             close through the manager would be asking somebody else for permission to stop"
+        )
+        .into());
+    }
     if let Err(e) = check_two_sessions(&transcript) {
         let path = build_cache().join("guest-transcript-check-login.log");
         let saved = fs::write(&path, &transcript).is_ok();
