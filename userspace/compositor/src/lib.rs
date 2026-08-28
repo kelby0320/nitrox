@@ -304,6 +304,51 @@ pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
     }
 }
 
+/// The interactive-resize outline's thickness, in pixels.
+pub const OUTLINE_W: u32 = 2;
+
+/// The outline's colour — bright enough to read over any client's pixels.
+pub const OUTLINE_COLOUR: Rgb = Rgb::new(0xE0, 0xE0, 0xE0);
+
+/// The four edge strips of `rect`, which is what an outline occupies.
+///
+/// **Strips rather than the rectangle**, because this is what gets repainted per pointer motion.
+/// The union of an outline's old and new rectangles is very nearly the window, and repainting
+/// that under emulation is the ~100 ms full recompose that starves input — the failure this
+/// milestone has already met twice. Four thin bands are a few thousand pixels whatever the
+/// window's size.
+///
+/// Empty strips are returned as-is; the compositor's damage handling already skips them.
+pub fn outline_edges(rect: Rect) -> [Rect; 4] {
+    let t = OUTLINE_W.min(rect.size.h.max(1));
+    let side = OUTLINE_W.min(rect.size.w.max(1));
+    [
+        Rect::new(rect.origin.x, rect.origin.y, rect.size.w, t),
+        Rect::new(rect.origin.x, rect.bottom() as i32 - t as i32, rect.size.w, t),
+        Rect::new(rect.origin.x, rect.origin.y, side, rect.size.h),
+        Rect::new(rect.right() as i32 - side as i32, rect.origin.y, side, rect.size.h),
+    ]
+}
+
+/// Draw the interactive-resize outline at `rect`, clipped to `clip`.
+///
+/// **Over the composed stack, like the cursor**, and for the same reason: it is not a window. It
+/// has no client, no buffer, no place in the stacking order and nothing can cover it — a
+/// preview of a rectangle the user has not committed to yet. Decision 1 of Milestone 9 refuses
+/// chrome the compositor has to lay out and style; an outline has neither.
+pub fn draw_outline<F: Framebuffer + ?Sized>(fb: &mut F, rect: Rect, clip: Rect) {
+    for strip in outline_edges(rect) {
+        let Some(r) = strip.intersect(&clip) else { continue };
+        for y in r.origin.y..r.bottom() as i32 {
+            for x in r.origin.x..r.right() as i32 {
+                if x >= 0 && y >= 0 {
+                    fb.put_pixel(x as u32, y as u32, OUTLINE_COLOUR);
+                }
+            }
+        }
+    }
+}
+
 /// How long a key must be held before it starts repeating, in nanoseconds.
 ///
 /// Policy with no configuration surface yet. Both constants are what a settings service will
@@ -1104,12 +1149,18 @@ impl WindowStack {
         source: &S,
         damage: &[Rect],
         pointer: Point,
+        outline: Option<Rect>,
     ) where
         F: Framebuffer + ?Sized,
         S: BufferSource + ?Sized,
     {
         self.compose_into(fb, background, source, damage);
+        // **The outline under the cursor, both over everything else.** A cursor hidden behind
+        // the outline it is dragging would be the one pixel the user is actually steering by.
         for r in damage {
+            if let Some(o) = outline {
+                draw_outline(fb, o, *r);
+            }
             draw_cursor(fb, pointer, *r);
         }
     }
@@ -1163,6 +1214,100 @@ mod tests {
         draw_cursor(&mut fb, Point::new(-4, -4), clip);
         // Nothing wrapped to the opposite side: the far corner from each is untouched.
         assert_eq!(fb.get_pixel(0, 39), Some(Rgb::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn an_outlines_edges_are_four_strips_that_cover_its_border_and_nothing_inside() {
+        // **The arithmetic the whole gesture's damage rests on.** These strips are what gets
+        // repainted per pointer motion, and they are also what *erases* the outline — so a
+        // strip short of an edge leaves a line of it behind, and a strip that covered the middle
+        // would put the full recompose back that this exists to avoid.
+        let r = Rect::new(10, 20, 100, 60);
+        let e = outline_edges(r);
+        for strip in e {
+            assert!(strip.intersect(&r).is_some(), "a strip outside the rectangle: {strip:?}");
+        }
+        // Every border pixel is in some strip, and no interior pixel is in any.
+        for y in r.origin.y..r.bottom() as i32 {
+            for x in r.origin.x..r.right() as i32 {
+                let on_border = x < r.origin.x + OUTLINE_W as i32
+                    || x >= r.right() as i32 - OUTLINE_W as i32
+                    || y < r.origin.y + OUTLINE_W as i32
+                    || y >= r.bottom() as i32 - OUTLINE_W as i32;
+                let covered = e.iter().any(|s| s.contains(x, y));
+                assert_eq!(covered, on_border, "({x},{y}) border={on_border} covered={covered}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_degenerate_outline_stays_inside_itself() {
+        // A rectangle thinner than the outline is what a resize clamped to its floor produces
+        // in one axis; the strips must not reach outside it, or the damage names pixels the
+        // repaint will not restore.
+        for r in [Rect::new(5, 5, 1, 40), Rect::new(5, 5, 40, 1), Rect::new(5, 5, 0, 0)] {
+            for strip in outline_edges(r) {
+                assert!(
+                    strip.is_empty() || strip.intersect(&r) == Some(strip),
+                    "{strip:?} leaves {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_outline_draws_only_inside_its_clip() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Geometry, MemFramebuffer};
+        let mut fb = MemFramebuffer::new(Geometry::packed(60, 60, PixelFormat::XRGB8888));
+        let bg = Rgb::new(0x11, 0x22, 0x33);
+        for y in 0..60 {
+            for x in 0..60 {
+                fb.put_pixel(x, y, bg);
+            }
+        }
+        // **The clip is on the outline's corner, not inside it.** A clip in the middle of a
+        // large outline intersects no strip at all — the first version of this test used one,
+        // and its "something was drawn" assertion was what caught that rather than the clip.
+        let clip = Rect::new(8, 8, 4, 4);
+        draw_outline(&mut fb, Rect::new(8, 8, 40, 40), clip);
+        let mut ink = 0;
+        for y in 0..60u32 {
+            for x in 0..60u32 {
+                if fb.get_pixel(x, y) != Some(bg) {
+                    ink += 1;
+                    assert!(clip.contains(x as i32, y as i32), "ink at ({x},{y}) outside the clip");
+                }
+            }
+        }
+        assert!(ink > 0, "the clip covers the outline's corner, so something must be drawn");
+    }
+
+    #[test]
+    fn presenting_draws_the_outline_over_the_stack_and_into_every_damage_rectangle() {
+        // The same rule the cursor has, and for the same reason: `serve_input` hands one damage
+        // list holding where the outline *was* and where it is, and a `present_into` that drew
+        // into only the first would leave it erased at its destination.
+        let s = WindowStack::new();
+        let src = MapSource::default();
+        let mut fb = big_screen();
+        let outline = Rect::new(20, 20, 60, 40);
+        let corners = [Rect::new(20, 20, 4, 4), Rect::new(76, 56, 4, 4)];
+        s.present_into(
+            &mut fb,
+            Rgb::BLACK,
+            &src,
+            &corners,
+            Point::new(200, 200),
+            Some(outline),
+        );
+        for c in corners {
+            let painted = (c.origin.y..c.bottom() as i32)
+                .flat_map(|y| (c.origin.x..c.right() as i32).map(move |x| (x, y)))
+                .filter(|(x, y)| fb.get_pixel(*x as u32, *y as u32) == Some(OUTLINE_COLOUR))
+                .count();
+            assert!(painted > 0, "the outline was not drawn into {c:?}");
+        }
     }
 
     #[test]
@@ -1379,13 +1524,13 @@ mod tests {
         let (mut s, src, (bottom, _top)) = overlapping_pair();
         let mut painted = screen();
         let full = Rect::new(0, 0, 32, 16);
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
 
         let d = s.raise(bottom).expect("in the stack");
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100), None);
 
         let mut reference = screen();
-        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
         assert_eq!(
             painted.bytes(),
             reference.bytes(),
@@ -1401,13 +1546,13 @@ mod tests {
         let (mut s, src, (_bottom, top)) = overlapping_pair();
         let mut painted = screen();
         let full = Rect::new(0, 0, 32, 16);
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
 
         let d = s.lower(top).expect("in the stack");
-        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100));
+        s.present_into(&mut painted, Rgb::BLACK, &src, &[d.rect()], Point::new(100, 100), None);
 
         let mut reference = screen();
-        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100));
+        s.present_into(&mut reference, Rgb::BLACK, &src, &[full], Point::new(100, 100), None);
         assert_eq!(painted.bytes(), reference.bytes(), "a lower's region must cover its own");
     }
 
@@ -2055,7 +2200,7 @@ mod tests {
         let pointer = Point::new(20, 20);
         let mut fb = big_screen();
         let full = fb.geometry().bounds();
-        s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer);
+        s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer, None);
 
         assert!(
             body_pixels(&fb, pointer) > 0,
@@ -2097,6 +2242,7 @@ mod tests {
             &src,
             &[elsewhere, cursor_rect(pointer)],
             pointer,
+            None,
         );
         assert!(
             body_pixels(&fb, pointer) > 0,

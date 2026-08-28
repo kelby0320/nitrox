@@ -537,6 +537,19 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
+        // **The corner grip.** Asked for, not done — like the move above and for the same
+        // reason: the compositor holds the grab this press opened, and it is the only
+        // participant that can follow a pointer without a round trip per motion. What comes
+        // back is an ordinary `Configure` at the end of the gesture, from the shell.
+        if let Some(edges) = app.take_resize_request()
+            && let Some(mut w) = win.window(window_id)
+        {
+            match w.start_resize(edges) {
+                Ok(()) => kprint(b"nxterm: dragging its own corner\n"),
+                Err(_) => kprint(b"nxterm: the compositor refused the resize\n"),
+            }
+        }
+
         // **A title-bar button.** Asked for, not done: minimising and maximising are the
         // manager's, and the reply says the compositor forwarded the question rather than that
         // anything happened — a shell may decide otherwise, and this terminal will find out the

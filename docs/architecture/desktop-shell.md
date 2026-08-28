@@ -2,7 +2,7 @@
 
 ## Status
 
-**Partly built, and checked 2026-08-28** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-08-29** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar;
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
@@ -48,7 +48,11 @@ draws its title bar and its buttons, and the two that are not the client's to pe
 here as requests: `Surface::RequestState` becomes a `SetMinimized` or a `Configure` — maximise
 *moves* the window to the work area's origin as well as resizing it, so a maximised window does
 not cover the bars — and a drag becomes `Surface::StartMove`, which the compositor performs
-itself while the shell watches the geometry go by. Closing is the pair the milestone added at
+itself while the shell watches the geometry go by. **Dragging a window's corner** is the same
+division seen from the other side (Part E): the compositor runs the gesture and draws an outline,
+and hands the shell one `ResizeEnded` at the release — which the shell answers with the
+`Configure` it would have sent anyway, because resizing a client is the manager's and there is
+one path to a window's geometry rather than two that can disagree. Closing is the pair the milestone added at
 both ends: a client's own close button ends the client, and the window list's middle-click sends
 `Manage::RequestClose` — an *ask*, which a client with unsaved work could answer with a dialog —
 followed by `Manage::Close` two seconds later if nothing happened. **The insist is not exercised

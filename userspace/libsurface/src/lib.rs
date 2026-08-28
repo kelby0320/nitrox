@@ -751,6 +751,34 @@ impl<T: Transport> WindowRef<'_, T> {
         Ok(())
     }
 
+    /// Hand the compositor an interactive resize of this window — `Surface::StartResize`.
+    ///
+    /// **The same authority as [`start_move`](Self::start_move)**: refused unless this window
+    /// holds the pointer grab, which is what makes "the user is dragging my edge" true. Sent
+    /// from the press, not the click, for the reason a move is — the gesture *begins* at the
+    /// press, and by the time a button comes up the drag is over.
+    ///
+    /// **Nothing about the window changes while it runs.** The compositor moves an outline and
+    /// tells the manager where the user let go; the manager sends the `Configure`. So a client
+    /// calling this must expect its size to change through the ordinary `Configure` path, or
+    /// not at all — a shell may decide otherwise, and a fixed-size window declines it anyway.
+    ///
+    /// `edges` is a mask of `RESIZE_LEFT` and friends; a corner is two bits. Naming none, or
+    /// both of an opposite pair, is `InvalidArgument`.
+    pub fn start_resize(&mut self, edges: u32) -> Result<(), UiError> {
+        let mut body = [0u8; 8];
+        let n = librsproto::surface::StartResize { window: self.id(), edges }
+            .write(&mut body)
+            .ok_or(UiError::Malformed)?;
+        self.session.transport.request(
+            librsproto::surface::OP_START_RESIZE,
+            &body[..n],
+            None,
+            &mut [],
+        )?;
+        Ok(())
+    }
+
     /// Ask the manager to minimise, maximise or restore this window — `Surface::RequestState`.
     ///
     /// **An ask, not a change.** A client cannot minimise or maximise itself: both are manager

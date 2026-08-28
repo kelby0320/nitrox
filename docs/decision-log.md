@@ -19612,3 +19612,112 @@ geometry the compositor might have refused — unreachable today, and the module
 is unreachable rather than leaving the reader to reconstruct it; a failed attach was unmapping its
 memory without closing the handle that carried it, a leak inherited from the shape it replaced;
 and a dead store in `resize` that wrote `false` where `false` already was.
+
+---
+
+## 2026-08-29 — M9 Part E: the compositor draws a rectangle, and still resizes nothing
+
+Dragging a window's corner is two mechanisms that must not become one. The gesture belongs to the
+compositor — it holds the pointer grab, and it is the only participant that can follow a pointer
+without a round trip per motion. The *size* belongs to the manager, because a window's geometry
+has one path through this system and a second one would be a second source of truth. Part E is
+the seam between them: `Surface::StartResize` hands over the gesture, and one `Manage::ResizeEnded`
+hands back a rectangle at the release.
+
+**The outline is the compositor's own drawing, and that is not a hole in decision 1.** What
+client-side decorations refuse is chrome the compositor has to lay out and style, and the reason
+they refuse it is that such chrome changes what "the window's rectangle" means — a meaning
+threaded through compositing, damage, hit-testing, placement, struts and `Capture`. An outline
+changes none of it: it has no client, no buffer, no place in the stacking order and nothing can
+cover it. It is the cursor sprite's neighbour.
+
+**Its damage is four edge strips, not its rectangle**, and that is the whole difference between a
+drag that works and one that starves input. The union of where an outline was and where it is is
+very nearly the window; repainting that per pointer motion is the ~100 ms full recompose this
+milestone has already met twice — once as a window-list click that threw away the mouse movement
+around it, once as a desktop switch that swallowed a burst of motion. Four thin bands are a few
+thousand pixels whatever the window's size.
+
+**A gesture the user did not finish reports nothing**, and the test for it is one predicate rather
+than three: the window must still be *on screen* when the button comes up. A client that exited
+mid-drag has nobody to configure. A window minimised or sent to another desktop mid-drag is a
+gesture the user interrupted — the outline they were steering by is gone, and resizing a window
+somebody just put away to a size they were half-way through choosing is not what they asked for.
+An ordinary click on the grip is a resize of zero pixels and is dropped for the reason `end_drag`
+already drops a move of zero pixels: the manager's queue does not coalesce.
+
+**Two deviations from decision 2, both the same rule, both worth arguing with.** That decision
+says the manager hears an event when a drag *begins* as well as when it ends, and that the end
+event carries which snap zone the gesture finished in. Neither is built. Nothing in Part E or Part
+F does anything with a begin event; and the zone is derivable from the rectangle against a table
+the manager itself registered, so what would land today is a field that is always zero and never
+read — which this project has called out as a defect twice. Part F adds a zone identifier if it
+turns out to need one, at the cost of a wire change in a pre-stabilization protocol.
+
+**The event carries a `ConfigureEvent` because that is what the manager sends back.** The shell's
+entire answer is `Manage::Configure` with the same five numbers, which makes the handler a loop
+rather than a translation — and makes it obvious in the code that the compositor asked rather than
+acted.
+
+**The gate's assertions are ordered by mechanism, and each control fails at a different one.**
+The compositor took the gesture and says which edges; it reports one rectangle at the release; the
+*shell* turns that into a `Configure`; the client accepts; the committed geometry is the new
+rectangle. Three controls were run — the release reporting nothing, the shell answering nothing,
+and a client that accepts without committing — and each failed at exactly the assertion standing
+behind it. The plan asked for the third alone; having all three is what says the middle links are
+carrying weight rather than being satisfied by the ends.
+
+**And a knock-on worth recording**: a window resized by hand is no longer the window that was
+maximised, so the shell drops its restore rectangle. Keeping it would make the next restore put
+the window somewhere it had never been.
+
+---
+
+## 2026-08-29 — Part E's review: the door left open, and a control that could not be pressed
+
+Five findings, and the two that matter most are the same kind of mistake: a rule stated in a doc
+and enforced on one side of a symmetry.
+
+**`StartMove` was refused during a resize by nobody.** `start_resize` checks for a running move;
+`start_move` did not check for a running resize, while the field's own doc said "**Never both**:
+`start_move` and `start_resize` each refuse while the other is running" and the test named for the
+rule asserted one direction. Both gestures then run: the window follows the pointer *and* the
+outline follows the pointer, and the release hands the shell a rectangle built from the window's
+origin at the *resize* press — an origin the move has since changed, so the window jumps back by
+however far it was dragged. The compositor's own move record and the `ResizeEnded` disagree about
+the origin in the same release, which is exactly the "two paths to a window's geometry that can
+disagree" this part exists to prevent, arriving through the one door left open. A client is not
+required to have good manners; the grab is the compositor's trust boundary, and a boundary
+enforced in one direction is not one.
+
+**A lost input batch was committing a gesture the user was still holding.** `Logical::Dropped`
+means events were lost upstream and the pointer position is a guess — and the arm ended the resize
+*and reported it*, so the shell configured the window to a rectangle derived from that guess while
+the button was still down. The rule was inherited from the move it was modelled on, and does not
+transfer: **a move has applied every step as it went, so ending it merely stops something already
+on screen; a resize has applied nothing, so reporting initiates a change.** Only the button coming
+up finishes a gesture now. What makes this worth more than its size is which failure `Dropped`
+stands for — a ring overflow under a heavy recompose, the one this milestone keeps meeting.
+
+**The resize grip covered the scrollbar's thumb, entirely.** `GRIP_W` is 16 and `SCROLL_W` is 12,
+the grip is the topmost layer, and hit-testing takes the topmost — so the bottom 16 pixels of the
+track did nothing. `MIN_THUMB` is 16 and a *following* view puts the thumb at the very bottom, so
+a default 24-row terminal with a full scrollback had its thumb completely unreachable: pressing it
+started a resize. The scrollbar is now laid out short of the grip, and the test that pins it
+compares the two laid-out rectangles rather than reasoning about the thumb — which is the general
+statement, and it is what makes the fix hold for any window size.
+
+**A test that reached one of the three arms it was named for.** The gesture's ending is carried out
+of `route` through every arm, because `reconcile_with` can break a grab on any event. The test had
+*one* window, so minimizing it left nothing focusable and every run took the same early return;
+breaking either of the other two arms failed nothing in the crate. The reachable one is the hotkey
+arm — hold the grip, press a chord, and the chord's *release* is the event on which the grab
+breaks — and dropping the carry there strands the outline on screen, redrawn by every later
+repaint. Three arms, three controls, run separately.
+
+**And the outline had no pixel coverage at all**, in the crate whose `present_into` doc exists
+because "the cursor survives a recompose" once had no test it could fail. The strips' arithmetic,
+the clipping and the draw-into-every-damage-rectangle rule now have the cursor's three analogues.
+Writing them found a fourth thing: the first version of the clip test used a clip *inside* a large
+outline, which intersects no strip, so it asserted nothing — caught by its own "something must
+have been drawn" line rather than by a control.

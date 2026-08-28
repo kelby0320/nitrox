@@ -906,6 +906,24 @@ pub const OP_MGR_CLOSE: u16 = 0x0925;
 /// manager decides**; the compositor neither applies it nor remembers it, because a window being
 /// maximised is a rectangle the manager restores from and a second copy here could disagree.
 pub const OP_MGR_WINDOW_STATE_REQUEST: u16 = 0x0923;
+
+/// `Manage::ResizeEnded` — **server → manager. Unsolicited, no reply.**
+///
+/// Body: a [`ConfigureEvent`], carrying the window and the rectangle the user let go at.
+///
+/// **One event for a whole gesture**, sent when the button comes up on an interactive resize the
+/// compositor was running ([`StartResize`](OP_START_RESIZE)). Nothing is sent per motion: the
+/// manager's queue does not coalesce and evicts its oldest when full, so a five-second drag at
+/// 100 Hz would push a `WindowCreated` off the front and leave the shell with a window it will
+/// never place and never hear about again. The outline the user sees while dragging is the
+/// compositor's own drawing and crosses no wire at all.
+///
+/// **It carries a `ConfigureEvent` because that is what the manager sends back.** The shell's
+/// whole answer is `Manage::Configure` with these five numbers — the compositor deliberately
+/// does not apply them itself, so there is one path to a window's geometry rather than two that
+/// can disagree, and a shell that decided the window may not have that rectangle is behaving
+/// correctly (M9 Part E).
+pub const OP_MGR_RESIZE_ENDED: u16 = 0x0926;
 /// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
 ///
 /// A manager request rather than a client one because any application able to register `Super`
@@ -1030,6 +1048,39 @@ pub const WINDOW_STATE_MAXIMIZED: u32 = 2;
 /// window outright — takes the decision away from the process that owns the work in it, which is
 /// why the shell asks first and only insists when nothing happens (M9 Part C).
 pub const OP_CLOSE_REQUESTED: u16 = 0x090C;
+
+/// `Surface::StartResize` — hand the compositor an interactive resize of this window.
+///
+/// **The same shape as [`StartMove`](OP_START_MOVE), and refused the same way**: unless the
+/// caller holds the pointer grab on that window, which is what makes "the user is dragging my
+/// edge" true. What differs is what the compositor does with it — a move changes the window's
+/// origin as the pointer travels, and a resize changes *nothing*. It tracks a rectangle, draws
+/// an outline over the composed stack, and when the button comes up it hands the manager the
+/// rectangle the user let go at ([`ResizeEnded`](OP_MGR_RESIZE_ENDED)).
+///
+/// **The compositor never resizes a client**, which is why the gesture ends in a manager event
+/// rather than in a `Configure` from here: there is one path to a window's geometry — the
+/// manager's — rather than two that can disagree. That the outline moves per motion and the
+/// `Configure` goes out once is decision 3 of Milestone 9: a `Configure` per motion is a client
+/// cost (new buffers, mapped, re-laid-out, repainted) and not a protocol one (M9 Part E).
+pub const OP_START_RESIZE: u16 = 0x090D;
+
+/// [`StartResize`](OP_START_RESIZE): the pointer is dragging the window's left edge.
+pub const RESIZE_LEFT: u32 = 1 << 0;
+/// [`StartResize`](OP_START_RESIZE): the right edge.
+pub const RESIZE_RIGHT: u32 = 1 << 1;
+/// [`StartResize`](OP_START_RESIZE): the top edge.
+pub const RESIZE_TOP: u32 = 1 << 2;
+/// [`StartResize`](OP_START_RESIZE): the bottom edge.
+pub const RESIZE_BOTTOM: u32 = 1 << 3;
+/// Every edge [`StartResize`](OP_START_RESIZE) understands; anything else is `InvalidArgument`.
+///
+/// **A corner is two bits**, which is the whole reason this is a mask rather than an enum of
+/// eight directions: the bottom-right grip is `RESIZE_RIGHT | RESIZE_BOTTOM`, and the arithmetic
+/// that moves an edge is written once per axis rather than once per direction. Opposite edges
+/// together (`LEFT | RIGHT`) is refused — there is no gesture that drags both — as is naming no
+/// edge at all, which would be a drag that changes nothing while holding a grab.
+pub const RESIZE_EDGES: u32 = RESIZE_LEFT | RESIZE_RIGHT | RESIZE_TOP | RESIZE_BOTTOM;
 
 /// The longest window title accepted, in bytes.
 ///
@@ -1323,6 +1374,44 @@ impl StartMove {
             return None;
         }
         Some(Self { window: get_u32(b, 0) })
+    }
+}
+
+/// A client request naming a window and the edges being dragged — [`StartResize`](OP_START_RESIZE).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StartResize {
+    /// The window to resize. Must be one the caller owns and holds the pointer grab on.
+    pub window: u32,
+    /// Which edges the pointer is dragging — a mask of [`RESIZE_LEFT`] and friends.
+    pub edges: u32,
+}
+
+impl StartResize {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 8 {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.edges);
+        Some(8)
+    }
+
+    /// Parse from the first 8 bytes of a request body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(Self { window: get_u32(b, 0), edges: get_u32(b, 4) })
+    }
+
+    /// Whether `edges` names a gesture that exists: at least one edge, and not both of a pair.
+    pub fn edges_are_a_gesture(edges: u32) -> bool {
+        edges != 0
+            && edges & !RESIZE_EDGES == 0
+            && edges & (RESIZE_LEFT | RESIZE_RIGHT) != (RESIZE_LEFT | RESIZE_RIGHT)
+            && edges & (RESIZE_TOP | RESIZE_BOTTOM) != (RESIZE_TOP | RESIZE_BOTTOM)
     }
 }
 
