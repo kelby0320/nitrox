@@ -873,6 +873,33 @@ pub const OP_MGR_QUERY_LAYOUT: u16 = 0x0921;
 /// stops an event firing.
 pub const OP_MGR_LAYOUT_CHANGED: u16 = 0x0922;
 
+/// `Manage::RequestClose` — ask a window's client to close it.
+///
+/// Request: [`MgrWindowRef`] (`other` unused). The compositor forwards
+/// [`CloseRequested`](OP_CLOSE_REQUESTED) to that window's client and answers when it has;
+/// nothing about the window changes. `NotFound` if no such window, or if no session owns it.
+///
+/// **This is the polite half and it is the one a shell reaches for first.** A window holds a
+/// process's work, and a taskbar that destroyed it would take the decision away from the only
+/// participant that knows whether that matters.
+pub const OP_MGR_REQUEST_CLOSE: u16 = 0x0924;
+
+/// `Manage::Close` — destroy a window whose client will not.
+///
+/// Request: [`MgrWindowRef`] (`other` unused). The window is removed from the stack exactly as
+/// [`DestroyWindow`](OP_DESTROY_WINDOW) removes one, descendants and all, and
+/// [`WindowDestroyed`](OP_MGR_WINDOW_DESTROYED) is sent. `NotFound` if no such window.
+///
+/// **Distinct from `DestroyWindow`, which is a client's request on its own session.** This one
+/// names a window the caller does not own, which is what the manager channel is for — and it is
+/// the only answer available to a desktop whose applications draw their own chrome: a close
+/// button the client paints cannot close a client that has stopped answering.
+///
+/// The client is not told, because there is nothing it could do with the information that it
+/// could not have done with [`RequestClose`](OP_MGR_REQUEST_CLOSE). Its next request naming that
+/// window is answered `NotFound`, as for any window that no longer exists.
+pub const OP_MGR_CLOSE: u16 = 0x0925;
+
 /// `Manage::WindowStateRequest` — a manager event: a client asked to be minimised or maximised.
 ///
 /// Body: [`WindowState`]. The client's [`RequestState`](OP_REQUEST_STATE), forwarded. **The
@@ -991,6 +1018,18 @@ pub const WINDOW_STATE_NORMAL: u32 = 0;
 pub const WINDOW_STATE_MINIMIZED: u32 = 1;
 /// [`RequestState`](OP_REQUEST_STATE): fill the work area.
 pub const WINDOW_STATE_MAXIMIZED: u32 = 2;
+
+/// `Surface::CloseRequested` — **server → client. Unsolicited, `request_id` 0, no reply.**
+///
+/// Body, 4 bytes: `window` (u32). Somebody with the manager channel is asking this window to
+/// close — the taskbar's close, or anything else a shell offers. **It is a request and there is
+/// no way to refuse it**, which is deliberate: a client that wants to ask "save first?" opens a
+/// dialog and closes when that resolves, and a client that ignores this simply stays open.
+///
+/// What a client does *not* have to do is guess. The alternative — a manager destroying the
+/// window outright — takes the decision away from the process that owns the work in it, which is
+/// why the shell asks first and only insists when nothing happens (M9 Part C).
+pub const OP_CLOSE_REQUESTED: u16 = 0x090C;
 
 /// The longest window title accepted, in bytes.
 ///
@@ -1146,6 +1185,33 @@ impl MgrDesktop {
             return None;
         }
         Some(Self { desktop: get_u32(b, 0) })
+    }
+}
+
+/// One window, by id — [`CloseRequested`](OP_CLOSE_REQUESTED).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WindowRef {
+    /// Which window.
+    pub window: u32,
+}
+
+impl WindowRef {
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 4 {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        Some(4)
+    }
+
+    /// Parse from the first 4 bytes of a body.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(Self { window: get_u32(b, 0) })
     }
 }
 

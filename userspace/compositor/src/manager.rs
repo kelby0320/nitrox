@@ -20,7 +20,8 @@
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
     MgrDesktop, MgrHotkey, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE,
-    OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_REGISTER_HOTKEY,
+    OP_MGR_CLOSE, OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE,
+    OP_MGR_REGISTER_HOTKEY,
     OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED,
     OP_MGR_SET_WINDOW_DESKTOP,
 };
@@ -140,6 +141,48 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // Empty damage means the stack did not change — raising what was already on top
                 // — and the caller repaints nothing at all.
                 Ok(d) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(d.rect()) },
+                Err(e) => refused(e),
+            }
+        }
+        OP_MGR_CLOSE => {
+            let Some(req) = MgrWindowRef::read(body) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            if stack.window(req.window).is_none() {
+                return MgrOutcome::Failed(SurfaceError::NotFound);
+            }
+            // Every rectangle before any of them go, because those are what have to be
+            // repainted — and afterwards there is nothing to read them from.
+            let before: alloc::vec::Vec<(u32, Rect)> =
+                stack.windows().iter().map(|w| (w.id, w.bounds())).collect();
+            match stack.destroy(req.window) {
+                // **Exactly what a client's own `DestroyWindow` does**, descendants included:
+                // this is the same removal reached by a different caller, not a second kind of
+                // destruction with its own rules. `WindowDestroyed` follows from `removed_log`
+                // like any other.
+                //
+                // Which is why the damage is **the union of everything that vanished**, not the
+                // named window's rectangle: destroy is transitive, a popup is placed at its
+                // parent's origin *plus an offset* with its own size, and a dialog is placed
+                // independently — so a child is not bounded by its parent and its pixels would
+                // stay on screen until something unrelated repainted them. `server.rs` computes
+                // the same union for the same reason; this arm reported one rectangle until the
+                // Part C review found it.
+                Ok(()) => {
+                    let mut dirty: Option<Rect> = None;
+                    for (id, bounds) in before {
+                        if stack.window(id).is_none() {
+                            dirty = Some(match dirty {
+                                Some(d) => crate::union(d, bounds),
+                                None => bounds,
+                            });
+                        }
+                    }
+                    MgrOutcome::Applied {
+                        window: Some(req.window),
+                        dirty: Some(dirty.unwrap_or(Rect::new(0, 0, 0, 0))),
+                    }
+                }
                 Err(e) => refused(e),
             }
         }
@@ -309,6 +352,63 @@ mod tests {
         let d = dirty.expect("named, not `everything`");
         assert!(d.size.w == 0 || d.size.h == 0, "already on top, so nothing moved: {d:?}");
         assert_eq!(order(&s), ids, "and the order is untouched");
+    }
+
+    #[test]
+    fn close_destroys_a_window_the_caller_does_not_own_and_names_what_to_repaint() {
+        // **The only answer available to a desktop whose applications draw their own chrome.** A
+        // close button the client paints cannot close a client that has stopped answering, so
+        // the manager needs a way to remove a window it does not own — which is the whole point
+        // of the manager channel, and is what `DestroyWindow` deliberately is not.
+        let (mut s, ids) = stack_with(2);
+        let want = s.window(ids[0]).expect("in the stack").bounds();
+        let MgrOutcome::Applied { window, dirty } =
+            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0))
+        else {
+            panic!("expected Applied")
+        };
+        assert_eq!(window, Some(ids[0]));
+        assert_eq!(dirty, Some(want), "the rectangle it vacated, read before it went");
+        assert_eq!(order(&s), [ids[1]], "and it is out of the stack");
+        assert_eq!(s.take_removed(), vec![ids[0]], "recorded, so `WindowDestroyed` follows");
+
+        // A second close of the same window is `NotFound`, like any other op naming a window
+        // that is not there.
+        assert!(matches!(
+            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0)),
+            MgrOutcome::Failed(SurfaceError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn close_repaints_the_descendants_it_takes_with_it() {
+        // **Destroy is transitive and so is the damage.** A popup is placed at its parent's
+        // origin *plus an offset*, with its own size, so it is not bounded by the window that
+        // owns it: reporting the parent's rectangle leaves the menu's pixels on screen until
+        // something unrelated repaints them. The arm reported one rectangle until the Part C
+        // review demonstrated exactly this.
+        let (mut s, ids) = stack_with(1);
+        let parent = ids[0];
+        let popup = s
+            .create(&CreateWindowRequest::at(8, 8, Role::Popup { parent }, 100, 100))
+            .unwrap();
+        s.mark_configured(popup);
+        let want = crate::union(
+            s.window(parent).unwrap().bounds(),
+            s.window(popup).unwrap().bounds(),
+        );
+
+        let MgrOutcome::Applied { dirty, .. } =
+            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(parent, 0))
+        else {
+            panic!("expected Applied")
+        };
+        assert!(s.window(popup).is_none(), "the popup went with its parent");
+        assert_eq!(
+            dirty,
+            Some(want),
+            "the union of everything that vanished, not just the named window"
+        );
     }
 
     #[test]

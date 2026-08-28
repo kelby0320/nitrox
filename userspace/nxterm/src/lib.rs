@@ -95,6 +95,11 @@ pub enum Msg {
     /// The answer is one request and no arithmetic: the compositor already holds the grab this
     /// press opened and knows where the window is, and this terminal knows neither.
     DragWindow,
+    /// The window should close — its own close button, or the shell asking.
+    ///
+    /// **One message for both**, because they mean the same thing to this terminal: somebody
+    /// wants it gone. Which of them it was is not something it has to act on differently.
+    Close,
     /// A title-bar button asking the manager for a window state.
     ///
     /// **Carries the state rather than being three messages**, because the terminal does nothing
@@ -141,6 +146,12 @@ pub struct App {
     /// the toolkit's messages — the application says what happened, the shell of a `main`
     /// performs it.
     outbox: Vec<u8>,
+    /// The terminal has been asked to close, and the binary owes an exit.
+    ///
+    /// **A flag rather than an `exit` here.** `update` is a function of values — it has no
+    /// syscalls and no way to tear down a session — and a terminal that vanished mid-frame would
+    /// leave its buffers mapped and its window undestroyed.
+    closing: bool,
     /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
     ///
     /// **The last one wins, and there is only ever one.** The buttons are mutually exclusive
@@ -186,6 +197,7 @@ impl App {
             outbox: Vec::new(),
             move_requested: false,
             state_requested: None,
+            closing: false,
             view_top: None,
             view_moved: false,
         }
@@ -232,6 +244,11 @@ impl App {
     /// Whether a `StartMove` is owed, clearing it.
     pub fn take_move_request(&mut self) -> bool {
         core::mem::take(&mut self.move_requested)
+    }
+
+    /// Whether the terminal has been asked to close.
+    pub fn closing(&self) -> bool {
+        self.closing
     }
 
     /// The window state a button asked for, clearing it.
@@ -293,6 +310,7 @@ impl App {
             Msg::DragWindow => self.move_requested = true,
             // Likewise: minimising and maximising are the manager's, and this records the ask.
             Msg::RequestState(s) => self.state_requested = Some(s),
+            Msg::Close => self.closing = true,
             Msg::Clear => {
                 // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
                 // one implementation of it rather than a menu-shaped second one.
@@ -388,9 +406,9 @@ impl App {
             BAR_H,
             &ui,
         );
-        // **The title bar is the terminal's own chrome** (M9 Part A), and since Part B two of
-        // its buttons have somewhere to go. Close is still absent: a button that does nothing is
-        // worse than no button, and closing is Part C.
+        // **The title bar is the terminal's own chrome** (M9 Part A), and since Part C all three
+        // of its buttons do something: minimise and maximise ask the shell, close is this
+        // client's own answer.
         let title = title_bar(
             TITLE,
             self.focused,
@@ -398,7 +416,11 @@ impl App {
             TitleButtons {
                 minimise: Some(Msg::RequestState(WINDOW_STATE_MINIMIZED)),
                 maximise: Some(Msg::RequestState(WINDOW_STATE_MAXIMIZED)),
-                close: None,
+                // **Close sends nothing.** It is the one button whose answer is entirely this
+                // client's: it exits, and the compositor tears down its windows with its
+                // session. A `Manage::Close` exists for a client that will *not* do this, and it
+                // is the shell's to reach for (M9 Part C).
+                close: Some(Msg::Close),
             },
             &ui,
         )

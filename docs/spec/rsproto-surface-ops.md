@@ -690,6 +690,19 @@ to restore has changed state twice.
 The compositor keeps no notion of a window *being* maximised — that is a rectangle the manager
 restores from, and a second copy here could disagree with it.
 
+### `CloseRequested` (`0x090C`)
+
+**Server → client. Unsolicited, `request_id` 0, no reply.** Body, 4 bytes: `window` (u32).
+
+Somebody holding the manager channel is asking this window to close. **There is no way to refuse
+it and none is needed**: a client that wants to ask "save first?" opens a dialog and closes when
+that resolves, and a client that ignores this stays open. What the request buys is that the
+decision reaches the process holding the work rather than being taken from it.
+
+A shell that means it will follow this with [`Manage::Close`](#requestclose-0x0924-and-close-0x0925) after a grace period.
+That is a policy, not part of this contract — a client cannot tell how long it has, and should
+not try to.
+
 ### `DestroyWindow` (`0x0904`)
 
 Request, 4 bytes: `window`. Destroys the window, its attached buffers, and **every popup or
@@ -699,7 +712,7 @@ position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
 
-## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`, `0x0921`)
+## The manager channel (`0x0910`–`0x0917`, `0x091D`, `0x091E`, `0x0920`, `0x0921`, `0x0924`–`0x0925`)
 
 Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
 names a window by id and **none checks ownership**; that is the capability. Each replies with an
@@ -846,6 +859,29 @@ minimised, on another desktop, or has never committed a buffer. A strut is a dec
 space rather than a consequence of being drawn, and a work area that grew and shrank as panels
 came and went would move every maximised window with it. Clamped rather than allowed to invert:
 panels claiming more than the screen leave an empty rectangle, not a negative one.
+
+### `RequestClose` (`0x0924`) and `Close` (`0x0925`)
+
+Request for both: `MgrWindowRef` (`other` unused, zero).
+
+`RequestClose` forwards [`CloseRequested`](#closerequested-0x090c) to the window's client and
+answers when it has queued it. **Nothing about the window changes** — this is the polite half,
+and it is the one a shell reaches for first.
+
+`Close` **destroys the window**, exactly as [`DestroyWindow`](#destroywindow-0x0904) does for a
+client's own window: descendants go with it, and
+[`WindowDestroyed`](#manager-events-0x09180x091c-0x091f-0x09220x0923) follows. The client is not
+told, because there is nothing it could do with the information that `RequestClose` had not
+already offered it. Its next request naming that window — or any descendant that went with it —
+is answered `NotFound`, like any other window that no longer exists: the compositor stops
+crediting a connection with a window the moment it leaves the stack, whoever removed it.
+
+`NotFound` if no such window; `RequestClose` also answers `NotFound` when no session owns it.
+
+**Why both exist.** A close button a client paints cannot close a client that has stopped
+answering — that is the cost of client-side decorations, and this pair is what pays it. A desktop
+that only had `Close` would destroy windows out from under processes that were fine; one that
+only had `RequestClose` would have no answer for a wedged application except the serial console.
 
 ### `Capture` (`0x0920`)
 

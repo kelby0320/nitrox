@@ -19,7 +19,7 @@ For the record shape's origin see `docs/archive/os-design-v5.1.md` § Logging. T
 supersedes that sketch's wiring: there is **no** per-service broker/relay through
 service-mgr — see [Identity is capability-derived](#identity-is-capability-derived) — and
 **no bespoke logging protocol**: connecting reuses namespace resolve, appending is a
-generic channel send — see [Transport](#transport-no-bespoke-protocol).
+generic channel send — see [Transport](#transport--no-bespoke-protocol).
 
 ## What it is
 
@@ -118,7 +118,7 @@ off ..  fields[field_count]         (absent in slice 1)
 ```
 
 This is a **payload format, not a protocol** — it is the raw body of a `sys_channel_send`
-on a dedicated log channel (see [Transport](#transport-no-bespoke-protocol)). Appending is
+on a dedicated log channel (see [Transport](#transport--no-bespoke-protocol)). Appending is
 **fire-and-forget** — no request id, no reply, no op discriminator — so a slow sink never
 blocks an emitter beyond channel backpressure.
 

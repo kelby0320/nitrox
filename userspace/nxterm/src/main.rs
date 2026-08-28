@@ -550,12 +550,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
-        // ---- the tty ----
-        //
-        // **Both directions, every frame.** What the user typed goes out; whatever the server
-        // has sent comes in and goes through the parser. Done here rather than in the event
-        // arm because output arrives unprompted — the shell prints when it likes, and a
-        // terminal that only looked after a keystroke would show a prompt one keypress late.
+        // **Asked to close, by its own button or by the shell.** Exiting is the whole of it: the
+        // kernel closes this process's handles, the compositor sees the session go and destroys
+        // the windows on it, and the shell hears `WindowDestroyed` like any other close.
+        if app.closing() {
+            kprint(b"nxterm: closing\n");
+            exit(0);
+        }
+
         // **The title bar was dragged.** Performed here rather than in `update`, which has no
         // syscalls — and performed *before* the frame below, so the compositor is already moving
         // the window while this client is still painting.
@@ -592,6 +594,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
+        // ---- the tty ----
+        //
+        // **Both directions, every frame.** What the user typed goes out; whatever the server
+        // has sent comes in and goes through the parser. Done here rather than in the event
+        // arm because output arrives unprompted — the shell prints when it likes, and a
+        // terminal that only looked after a keystroke would show a prompt one keypress late.
         if let Some(b) = &mut backend {
             let out = app.take_outbox();
             if !out.is_empty() && !b.typed(&out) {
@@ -755,6 +763,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // The title bar shows which window has the keyboard, so this is content as well
                 // as routing state.
                 app.focused = f;
+            }
+            // **The shell asking, answered the same way the close button is.** There is nothing
+            // to refuse with and nothing to save: what a client with unsaved work would do here
+            // is open a dialog, which is why this arrives as a request rather than a destruction.
+            WindowEvent::CloseRequested => {
+                kprint(b"nxterm: asked to close, exiting\n");
+                app.update(Msg::Close);
             }
             // Everything accumulated about held keys is a guess now. This client keeps none —
             // modifiers arrive on each event — so there is nothing to discard, and saying so

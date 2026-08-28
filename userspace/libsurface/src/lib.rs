@@ -194,6 +194,13 @@ pub enum WindowEvent {
     /// Filtered to *this* window: one session can hold several, and a popup taking focus
     /// from its parent sends both halves down the one channel.
     Focus(bool),
+    /// Somebody with the manager channel is asking this window to close.
+    ///
+    /// **A request with no way to refuse it, and none needed.** A client that wants to ask
+    /// "save first?" opens a dialog and closes when that resolves; a client that ignores this
+    /// stays open, and a shell that cares will eventually insist. What this buys is that the
+    /// decision reaches the process holding the work rather than being taken from it.
+    CloseRequested,
     /// The compositor would like this window at this position and size.
     ///
     /// **A request, not a command.** The compositor cannot resize a client's buffer — the
@@ -496,6 +503,13 @@ impl<T: Transport> Session<T> {
                     && let Some(i) = self.idx(e.window)
                 {
                     self.enqueue(i, WindowEvent::Focus(e.focused != 0));
+                }
+            }
+            librsproto::surface::OP_CLOSE_REQUESTED => {
+                if let Some(r) = librsproto::surface::WindowRef::read(body)
+                    && let Some(i) = self.idx(r.window)
+                {
+                    self.enqueue(i, WindowEvent::CloseRequested);
                 }
             }
             OP_CONFIGURE => {

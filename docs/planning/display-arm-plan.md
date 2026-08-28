@@ -2410,19 +2410,56 @@ and Part D is the milestone where something can.
 
 ### Part C — close, and closing something that will not close itself
 
-- [ ] **The button is the client's own.** `nxterm`'s close button exits; nothing new crosses the
-      wire for the ordinary case.
+- [x] **The button is the client's own** ✅. `nxterm`'s close button exits; nothing crosses the
+      wire, and the gate asserts that by *absence* — the transcript must contain no
+      `RequestClose` for that window, which is why the gate closes two different terminals and
+      names the second one's id.
 
-- [ ] **`Manage::Close(window)`** — the manager asks the compositor to destroy a window whose
+- [x] **`Manage::Close(window)`** ✅ — the manager asks the compositor to destroy a window whose
       client is not answering. Distinct from `DestroyWindow`, which is the client's own request
       on its own session: this one names a window the caller does not own, which is exactly what
       the manager channel is for.
 
-- [ ] **The shell offers it** from the window list, and says what it did on the console.
+      **And `Manage::RequestClose` beside it**, which this box did not name. Decision 4 said the
+      taskbar's close "ends in a new manager request, `Manage::Close`, and the compositor
+      destroys the window" — one step — while this part's own control said closing a live client
+      "must reach the client's own path rather than destroying a window out from under a process
+      that was fine". Those cannot both be built. The control wins: a window holds a process's
+      work, so the shell asks first and insists only when nothing happens, and asking needs an op
+      of its own because only the compositor can reach a client's session.
 
-- [ ] **Gate**: a test client that stops answering, closed from the window list, and its window
-      gone from the stack. The control is a *live* client: closing it must reach the client's own
-      path rather than destroying a window out from under a process that was fine.
+- [x] **The shell offers it** from the window list ✅ — middle-click, which every taskbar this
+      borrows from uses and which needs no room in a layout that is one fixed slot per window.
+      It asks, remembers a two-second grace period, and insists when that runs out; a window that
+      goes away on its own has already left the list, so the ordinary case never reaches
+      `Manage::Close` at all.
+
+- [x] **Gate**, adapted, and the adaptation is worth stating ✅. The box asked for "a test client
+      that stops answering, closed from the window list" — and those two cannot be in the same
+      image: the test clients live in the selftest build, `desktop-shell` runs only in the
+      release one, and `check-images` exists to keep that difference from growing. So:
+
+      - **`check-login` gates the ask, end to end, with the only client there is**: middle-click
+        the taskbar entry, the compositor forwards, `nxterm` says it was asked and says it is
+        closing, and the list loses it. The stated control is the assertion itself — a shell that
+        destroyed the window would produce neither client line while the window went away all the
+        same, and it fails the gate.
+      - **`Manage::Close` is host-tested** on the manager dispatch: a window the caller does not
+        own is removed, its rectangle is reported before it goes, and `WindowDestroyed` follows.
+        Two more host tests came out of the review — the damage is the union of *every* window
+        the destroy took, since a popup is not bounded by its parent, and the owning connection
+        stops claiming a window somebody else removed, which is the state a wedged client is
+        left in by construction.
+      - **The child shell going with the window is gated too**, which nothing had observed:
+        `nxterm` holds the pty master, so closing the window must end the `nxsh` it spawned or
+        every close leaks a process. `check-login` reads `nxsh: terminal closed` off the
+        transcript, and that line exists only on the path that exits.
+
+      **What is not gated end to end is the insist**, because the release image has no client
+      that can be made to ignore a request. Named here rather than left to be discovered:
+      **trigger — the first application that can be wedged on purpose** (M10's file browser, or
+      any client with a blocking operation), at which point the grace period and the
+      `Manage::Close` that follows it can be driven from a gate.
 
 ### Part D — `nxterm` honours `Configure`, and `libterm` reflows
 

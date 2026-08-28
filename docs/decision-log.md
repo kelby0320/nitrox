@@ -19396,3 +19396,95 @@ design is right and is *why* the enumeration was wrong to write: it invited a re
 list the code never consulted. The spec now says the work area is the screen minus **every**
 panel's reservation — including a minimised or uncommitted one — because a strut is a declaration
 about space rather than a consequence of being drawn.
+
+## 2026-08-28 — M9 Part C: the taskbar asks, and only insists when nothing happens
+
+The close button on `nxterm`'s title bar sends nothing. It exits, the kernel closes its handles,
+the compositor sees the session go and destroys its windows, and the shell hears
+`WindowDestroyed` like any other close. That is the whole of the ordinary case, and it is what
+client-side decorations buy: the client that owns the work decides when to stop.
+
+**The awkward case is a client that will not, and the plan contradicted itself about it.**
+Decision 4 said the taskbar's close "ends in a new manager request, `Manage::Close`, and the
+compositor destroys the window" — one step. Part C's own gate control said closing a live client
+"must reach the client's own path rather than destroying a window out from under a process that
+was fine". Both cannot be built. The control wins, and it needed a second op: only the compositor
+can reach a client's session, so asking is `Manage::RequestClose` and insisting is
+`Manage::Close`. A desktop with only the second destroys windows out from under processes that
+were fine; one with only the first has no answer for a wedged application except the serial
+console.
+
+The shell asks, remembers a two-second grace period, and insists when it runs out. A window that
+goes away on its own has already left the list, so the ordinary case never reaches `Manage::Close`
+at all. Middle-click is the gesture — what every taskbar this borrows from uses, and it needs no
+room in a layout that is one fixed slot per window.
+
+**The gate could not be what the plan asked for, and the reason is structural.** The box wanted
+"a test client that stops answering, closed from the window list": the test clients are in the
+selftest image, `desktop-shell` runs only in the release one, and `check-images` exists precisely
+to stop that difference growing. So the *ask* is gated end to end in `check-login` with the only
+client there is, and `Manage::Close` is host-tested on the manager dispatch. **The insist is not
+gated end to end**, and the trigger is written into the plan rather than left to be discovered:
+the first application that can be wedged on purpose.
+
+**Two assertions by absence, which is unusual enough to note.** The close button is proved to
+send nothing by the transcript containing no `RequestClose` for that window — which is why the
+gate closes two terminals and names the second one's id, so the first one's genuine request
+cannot satisfy the check. And the control for the ask path is the assertion itself: `nxterm` says
+it was asked and says it is closing, and a shell that destroyed the window instead would produce
+neither line while the window went away all the same.
+
+**One ordering lesson, again.** The shell logs its ask *after* the request returns, and the
+compositor logs *before* replying — so the shell's line lands on either side of the client's two,
+depending on scheduling. It is checked against the whole transcript rather than in sequence, the
+rule PR #227 established for `nxterm`'s output and the third time this milestone has needed it.
+
+---
+
+## 2026-08-28 — Part C's review: transitive removal has transitive consequences
+
+Three of the four findings against M9 Part C were the same mistake in different places:
+`Manage::Close` **removes a window and its descendants**, and everything downstream of a removal
+was written for the one window that was named.
+
+**The damage was the named window's rectangle.** A popup is placed at its parent's origin plus an
+offset, with its own size; a dialog is placed independently. Neither is bounded by its parent, so
+a menu open when its window was force-closed left its pixels on screen until something unrelated
+repainted them. `server.rs` had computed the union of everything that vanished since the client's
+own destroy was written, with a comment saying why — the manager's arm was written later and did
+not copy it. The fix is that same loop.
+
+**The owner went on claiming the window.** A client's `DestroyWindow` prunes its connection
+inline because it has the connection in hand; a manager's close does not pass through that code.
+The consequence is small and exact: `DestroyWindow` is the one request that answers
+`Rejected(NoSuchWindow)` — `InvalidArgument` at the wire — where `AttachBuffer`, `Commit` and
+`SetTitle` all answer `NotFound`, so the spec sentence written *in this PR* ("its next request
+naming that window is answered `NotFound`") was false for the most likely request. And
+`session_of` is the connection's list rather than a stack lookup, so `Manage::RequestClose` for a
+force-closed window answered success and enqueued `CloseRequested` for a window that was gone.
+
+Both only bite for a client that outlives its window — which is exactly the wedged client
+`Manage::Close` exists for. **A capability whose only user is the failure case gets its
+consequences tested against the failure case, not the ordinary one.**
+
+The pruning went into the removal drain rather than into the close arm: that loop already
+enumerates every removal from every cause, and a second call site would be the same omission
+waiting to happen with the next op that destroys something.
+
+**`check-docs` could not see a broken heading link**, which is how this PR shipped one: it split
+a link target on `#` and dropped everything after it. Four more were already broken, one since
+its section was renamed. It now resolves `](#anchor)` and `](file.md#anchor)` against the target
+document's headings, slugged GitHub's way — `## Transport — no bespoke protocol` is
+`transport--no-bespoke-protocol`, with two hyphens, the em dash having left its spaces behind.
+`<a id="…">` counts as an anchor; `#L36` is a GitHub line link and is skipped.
+
+**A gate that closed the terminal before the step that needed one.** 6i ran before 6h, whose
+whole premise is a full-screen recompose to out-inject — with no window left, the stall it
+depends on is weaker. Reordered, at the cost of a desktop switch back, because a diagnostic that
+quietly stops diagnosing is worse than one that costs two lines.
+
+**And one thing nobody had ever looked at**: `nxterm` holds the pty master and hands the far end
+to the `nxsh` it spawns, so closing a window must end that shell or every close leaks a process.
+It does — `libstream`'s `PeerClosed` contract works — but nothing observed it until the review
+asked, and now `check-login` reads `nxsh: terminal closed` off the transcript. The line exists
+only on the path that exits, which is what makes the check worth having.
