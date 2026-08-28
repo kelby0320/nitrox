@@ -40,7 +40,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs;
+use libfs;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
@@ -102,16 +102,16 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         if path.is_empty() {
             stage.die(b"touch: empty path\n", EXIT_USAGE);
         }
-        if fs::is_dir(stage.namespace, path) {
+        if libfs::is_dir(stage.namespace, path) {
             stage.die(b"touch: path is a directory\n", EXIT_USAGE);
         }
-        let exists = fs::file_size(stage.namespace, path).is_some();
+        let exists = libfs::file_size(stage.namespace, path).is_some();
 
         if !exists {
             if no_create {
                 continue; // the flag's whole purpose: skip, do not fail
             }
-            if fs::create_file(stage.namespace, path).is_err() {
+            if libfs::create_file(stage.namespace, path).is_err() {
                 stage.die(b"touch: cannot create file\n", EXIT_FAILURE);
             }
             // A just-created inode is stamped by the server as it creates it, so there is
@@ -140,11 +140,11 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// failure.
 fn stamp(stage: &Stage, path: &[u8]) {
     let mut buf = [0u8; 4096];
-    let mut dir = match Dir::open(stage.namespace, fs::parent(path), &mut buf) {
+    let mut dir = match Dir::open(stage.namespace, libfs::parent(path), &mut buf) {
         Ok(d) => d,
         Err(_) => stage.die(b"touch: cannot open the parent directory\n", EXIT_FAILURE),
     };
-    let r = dir.touch(fs::basename(path));
+    let r = dir.touch(libfs::basename(path));
     dir.close();
     if r.is_err() {
         stage.die(b"touch: cannot stamp the modification time\n", EXIT_FAILURE);

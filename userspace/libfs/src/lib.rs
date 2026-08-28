@@ -1,13 +1,32 @@
-//! File-level filesystem helpers shared by the coreutils.
+//! `libfs` — whole-file and path helpers, for anything that touches the filesystem.
 //!
 //! The *directory* operations live in [`librsproto::session::Dir`] (name-addressed RPC on
-//! a directory session). This module covers the other half — whole-file read and write —
+//! a directory session). This crate covers the other half — whole-file read and write —
 //! which does not go through that protocol at all: a file resolves to a **page-cache
 //! object** the process maps, so copying a file is a `memcpy` between two mappings and the
 //! kernel moves the data (Model A; `docs/architecture/filesystem-data-path.md`).
 //!
-//! Kept here rather than in `librsproto` because there is no protocol involved: these are
-//! namespace + memory syscalls.
+//! Not in `librsproto` because there is no protocol involved: these are namespace and
+//! memory syscalls, and a crate that speaks a wire format is the wrong home for something
+//! that speaks none.
+//!
+//! ## Why it is a crate rather than a module in `coreutils`
+//!
+//! It was `coreutils::fs` until M10 Part A, and moved when a **second consumer** arrived.
+//! `coreutils`' library is otherwise shell-program infrastructure — the Tier-1 stage
+//! prologue, GNU-style argument parsing, TSM1 stdout plumbing — and a graphical file
+//! browser wants the filesystem half and none of that. One application depending on
+//! another application's crate to reach it is the wrong shape, and copying the helpers is
+//! the shape that produces two implementations of `rename`.
+//!
+//! **Moved rather than rewritten**, deliberately: every function below is the code the
+//! coreutils have been running since Milestone 3.5, and `test-interactive` drives `list`,
+//! `copy`, `rename` and `remove` at a real prompt, so a move that broke one fails there
+//! rather than nowhere.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

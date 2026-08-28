@@ -155,7 +155,7 @@ fn collect(
     // listing. So there is no "which mechanism?" decision: ask both, merge, and let each
     // answer for the part it owns. `/dev` is then unremarkable (all bindings, no
     // filesystem); `/system` is unremarkable the other way; `/` genuinely needs both.
-    let ns_entries = coreutils::fs::ns_children(stage.namespace, path);
+    let ns_entries = libfs::ns_children(stage.namespace, path);
 
     let mut entries: Vec<OwnedEntry> = Vec::new();
     let mut buf = [0u8; 4096];

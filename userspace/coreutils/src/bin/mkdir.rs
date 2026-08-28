@@ -19,7 +19,7 @@
 //!   ABI pass; it was indistinguishable from a malformed request before), so the common
 //!   path — the component is missing — is one round trip rather than a probe and a
 //!   create. What the code *cannot* infer is whether the occupant is a directory, and
-//!   `--parents` accepts only a directory, so [`fs::is_dir`] is asked exactly there: on
+//!   `--parents` accepts only a directory, so [`libfs::is_dir`] is asked exactly there: on
 //!   the collision, not ahead of every component.
 //! - **A failure stops the run**, as in `copy`. The rows already emitted say what was
 //!   created before the failure; the exit status says the run did not succeed. Fail
@@ -37,7 +37,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs;
+use libfs;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -116,8 +116,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Create `path`, whose parent must already exist. Diverges on failure.
 fn make_one(stage: &Stage, path: &[u8]) -> bool {
-    let parent = fs::parent(path);
-    let name = fs::basename(path);
+    let parent = libfs::parent(path);
+    let name = libfs::basename(path);
     if name.is_empty() {
         stage.die(b"mkdir: cannot create the root directory\n", EXIT_USAGE);
     }
@@ -155,8 +155,8 @@ fn make_parents(stage: &Stage, path: &[u8]) -> bool {
     let mut created_leaf = false;
     for end in component_ends(path) {
         let prefix = &path[..end];
-        let parent = fs::parent(prefix);
-        let name = fs::basename(prefix);
+        let parent = libfs::parent(prefix);
+        let name = libfs::basename(prefix);
         if name.is_empty() {
             continue;
         }
@@ -173,7 +173,7 @@ fn make_parents(stage: &Stage, path: &[u8]) -> bool {
                 // `--parents` means "ensure this path exists as a directory". A file
                 // wearing the name does not satisfy that, and silently continuing would
                 // report success for a tree that was never built.
-                if !fs::is_dir(stage.namespace, prefix) {
+                if !libfs::is_dir(stage.namespace, prefix) {
                     stage.die(
                         b"mkdir: path exists and is not a directory\n",
                         EXIT_FAILURE,

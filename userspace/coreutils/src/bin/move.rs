@@ -15,7 +15,7 @@
 //!
 //! - **Rename first, copy only if forced to.** A rename is O(1) and preserves the file's
 //!   identity; a copy is neither. So `move` asks for the rename and falls back only on
-//!   the kernel's `CrossDevice` verdict — which `coreutils::fs` documents as *"a caller's
+//!   the kernel's `CrossDevice` verdict — which `libfs` documents as *"a caller's
 //!   cue to fall back to `copy_file` + unlink rather than an error to report"*.
 //! - **It reports which method it used.** `Table<{from, to, method: String}>` with
 //!   `method` one of `rename` or `copy`. This is not decoration: the two differ in cost
@@ -27,7 +27,7 @@
 //!   reported as a failure rather than papered over: the exit status is non-zero and the
 //!   row is not emitted, so nothing downstream is told the move happened.
 //! - **A cross-mount *directory* move copies the tree, then removes it.** Both halves are
-//!   [`fs::copy_tree`] / [`fs::remove_tree`] — the same walks `copy` and `remove` use, not
+//!   [`libfs::copy_tree`] / [`libfs::remove_tree`] — the same walks `copy` and `remove` use, not
 //!   a third copy of the loop. This was refused until 2026-07-30, not because it was hard
 //!   but because the image had no second writable mount to test it against, and writing it
 //!   blind was worse than refusing it.
@@ -47,7 +47,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs::{self, FileError};
+use libfs::{self, FileError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
@@ -105,7 +105,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let (sources, dest) = args.operands.split_at(args.operands.len() - 1);
     let dest_owned = stage.path(dest[0].as_bytes());
     let dest = dest_owned.as_slice();
-    let dest_is_dir = fs::is_dir(stage.namespace, dest);
+    let dest_is_dir = libfs::is_dir(stage.namespace, dest);
 
     // As in `copy`: several sources only make sense into a directory, since with a file
     // destination they would each overwrite the last.
@@ -118,7 +118,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         let src_owned = stage.path(source.as_bytes());
         let src = src_owned.as_slice();
         let target = if dest_is_dir {
-            fs::join(dest, fs::basename(src))
+            libfs::join(dest, libfs::basename(src))
         } else {
             String::from_utf8_lossy(dest).into_owned()
         };
@@ -146,7 +146,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Relocate `src` to `dst`, returning the method used. Diverges on failure.
 fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str {
-    match fs::rename(stage.namespace, src, dst, force) {
+    match libfs::rename(stage.namespace, src, dst, force) {
         Ok(()) => return "rename",
         // The one error that is not a failure: the two paths are on different mounts, so
         // the cheap operation cannot express this and the expensive one must.
@@ -164,8 +164,8 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
         stage.die(b"move: source is a namespace binding, not a file\n", EXIT_FAILURE);
     }
 
-    let is_dir = fs::is_dir(stage.namespace, src);
-    if fs::copy_tree(stage.namespace, src, dst, force, &mut |_, _, _| {}).is_err() {
+    let is_dir = libfs::is_dir(stage.namespace, src);
+    if libfs::copy_tree(stage.namespace, src, dst, force, &mut |_, _, _| {}).is_err() {
         // The copy failed partway. The source is untouched, which is the property that
         // matters; a partial destination is left where it fell rather than cleaned up,
         // because removing it would delete whatever of the destination already existed.
@@ -177,9 +177,9 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
     // filesystem is in is the whole value of the message: "both now exist" tells an
     // operator that re-running is safe, and that nothing was lost.
     let removed = if is_dir {
-        fs::remove_tree(stage.namespace, src, &mut |_, _| {}).is_ok()
+        libfs::remove_tree(stage.namespace, src, &mut |_, _| {}).is_ok()
     } else {
-        fs::unlink_at(stage.namespace, src).is_ok()
+        libfs::unlink_at(stage.namespace, src).is_ok()
     };
     if !removed {
         stage.die(
@@ -194,8 +194,8 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
 /// bindings, which is where a mount point appears. Mirrors `remove`'s check, and for the
 /// same reason: this program can now delete a tree.
 fn is_binding(stage: &Stage, path: &[u8]) -> bool {
-    let name = fs::basename(path);
-    fs::ns_children(stage.namespace, fs::parent(path))
+    let name = libfs::basename(path);
+    libfs::ns_children(stage.namespace, libfs::parent(path))
         .iter()
         .any(|(n, _)| n.as_bytes() == name)
 }

@@ -5,12 +5,11 @@
 //!
 //! - [`stage`] — the Tier-0/Tier-1 startup prologue: streams, `argv`, `stderr`, exits.
 //! - [`args`] — GNU-style flag parsing (`--long`, `-f`, `--`, `--help`/`--version`).
-//! - [`fs`] — whole-file read/write + path splitting. File *contents* do not go through
-//!   the directory protocol at all: a file resolves to a page-cache object the process
-//!   maps, so a copy is a `memcpy` between two mappings.
 //!
-//! The directory client they all use is [`librsproto::session::Dir`], not something in
-//! here: it belongs beside the protocol it speaks.
+//! The **filesystem** half is [`libfs`], not something in here — it moved out in M10 Part A
+//! when a graphical file browser needed it and did not need any of the above. The directory
+//! client they all use is [`librsproto::session::Dir`], likewise not here: it belongs beside
+//! the protocol it speaks.
 //!
 //! Every program is an ordinary process speaking **TSM1 on stdio** — not a resource
 //! server. It may be a *client* of one (as each of these is a client of the fs-server),
@@ -22,7 +21,6 @@
 extern crate alloc;
 
 pub mod args;
-pub mod fs;
 pub mod stage;
 pub mod time;
 

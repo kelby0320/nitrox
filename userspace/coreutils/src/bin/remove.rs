@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs::{self, TreeError};
+use libfs::{self, TreeError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -149,13 +149,13 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// Remove `path` and everything under it, depth-first, appending a row per entry.
 /// Diverges on failure.
 ///
-/// The walk is [`fs::remove_tree`], shared with `move`'s cross-mount fallback. The
+/// The walk is [`libfs::remove_tree`], shared with `move`'s cross-mount fallback. The
 /// property this program depends on lives there: the descent enumerates **filesystem
 /// entries only**, never `ns_children`, so it cannot delete through a mount point. The
 /// check that `path` *itself* is not a binding stays here, at the operand — a walker
 /// cannot tell whether the path it was handed was a mistake.
 fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
-    let r = fs::remove_tree(stage.namespace, path, &mut |p, is_dir| {
+    let r = libfs::remove_tree(stage.namespace, path, &mut |p, is_dir| {
         out.push(Removed {
             path: as_string(p),
             kind: if is_dir { "directory" } else { "file" },
@@ -182,16 +182,16 @@ fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
 
 /// `unlink` the entry named by `path`. Diverges on failure.
 fn unlink_one(stage: &Stage, path: &[u8]) {
-    if fs::unlink_at(stage.namespace, path).is_err() {
+    if libfs::unlink_at(stage.namespace, path).is_err() {
         stage.die(b"remove: cannot remove file\n", EXIT_FAILURE);
     }
 }
 
 /// What the filesystem says `path` is.
 fn classify(stage: &Stage, path: &[u8]) -> What {
-    if fs::is_dir(stage.namespace, path) {
+    if libfs::is_dir(stage.namespace, path) {
         What::Dir
-    } else if fs::file_size(stage.namespace, path).is_some() {
+    } else if libfs::file_size(stage.namespace, path).is_some() {
         What::File
     } else {
         What::Missing
@@ -201,8 +201,8 @@ fn classify(stage: &Stage, path: &[u8]) -> What {
 /// Is `path` a namespace binding rather than a filesystem entry? Asked of the parent's
 /// bindings, which is where a mount point appears.
 fn is_binding(stage: &Stage, path: &[u8]) -> bool {
-    let name = fs::basename(path);
-    fs::ns_children(stage.namespace, fs::parent(path))
+    let name = libfs::basename(path);
+    libfs::ns_children(stage.namespace, libfs::parent(path))
         .iter()
         .any(|(n, _)| n.as_bytes() == name)
 }

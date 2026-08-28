@@ -35,7 +35,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs::{self, FileError, TreeError};
+use libfs::{self, FileError, TreeError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
@@ -91,7 +91,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let (sources, dest) = args.operands.split_at(args.operands.len() - 1);
     let dest_owned = stage.path(dest[0].as_bytes());
     let dest = dest_owned.as_slice();
-    let dest_is_dir = fs::is_dir(stage.namespace, dest);
+    let dest_is_dir = libfs::is_dir(stage.namespace, dest);
 
     // Several sources only make sense into a directory: with a file destination they
     // would each overwrite the last, which is never what was meant.
@@ -106,7 +106,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         // Into an existing directory, a source keeps its own name; otherwise the
         // destination path names the copy itself.
         let target = if dest_is_dir {
-            fs::join(dest, fs::basename(src))
+            libfs::join(dest, libfs::basename(src))
         } else {
             String::from_utf8_lossy(dest).into_owned()
         };
@@ -129,12 +129,12 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Copy `src` to `dst` — a file, or a directory and everything under it.
 ///
-/// The walk itself is [`fs::copy_tree`], shared with `move`'s cross-mount fallback: it was
+/// The walk itself is [`libfs::copy_tree`], shared with `move`'s cross-mount fallback: it was
 /// duplicated here until `move` needed the recursive case, and a recursive walker is not a
 /// thing to keep two of. What stays here is this program's *reporting* — one row per file,
 /// and the message each failure earns.
 fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<Copied>) {
-    let r = fs::copy_tree(stage.namespace, src, dst, force, &mut |s, d, bytes| {
+    let r = libfs::copy_tree(stage.namespace, src, dst, force, &mut |s, d, bytes| {
         done.push(Copied {
             source: String::from_utf8_lossy(s).into_owned(),
             destination: String::from_utf8_lossy(d).into_owned(),

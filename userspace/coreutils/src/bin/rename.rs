@@ -28,7 +28,7 @@ extern crate alloc;
 use alloc::string::String;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs::{self, FileError};
+use libfs::{self, FileError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
@@ -82,7 +82,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"rename: source and destination are the same name\n", EXIT_USAGE);
     }
 
-    match fs::rename(stage.namespace, from, to, args.has("force")) {
+    match libfs::rename(stage.namespace, from, to, args.has("force")) {
         Ok(()) => {}
         // The one error worth naming specifically: it is not a failure of the filesystem
         // but a statement that this operation cannot express what was asked, and the

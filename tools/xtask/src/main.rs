@@ -5111,6 +5111,18 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libfs` — whole-file and path helpers, host-tested where they do not touch a
+    // namespace. Was `coreutils::fs` until M10 Part A; it moved down a layer when a
+    // graphical file browser needed it and needed none of the shell-program machinery
+    // around it.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libfs")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `coreutils` shared-library tests (argument parsing). `--lib` skips the
     // bare-target program `[[bin]]`s.
     run(Command::new("cargo")

@@ -1,0 +1,29 @@
+[package]
+name = "libfs"
+version = "0.1.0"
+edition = "2024"
+
+# `libfs` — whole-file and path helpers, above `librsproto` and below the programs that
+# use them. It speaks no protocol of its own: a file resolves to a **page-cache object**
+# the process maps, so copying one is a `memcpy` between two mappings and the kernel moves
+# the data (`docs/architecture/filesystem-data-path.md`). The *directory* half is
+# `librsproto::session::Dir`, which is name-addressed RPC and belongs beside its protocol.
+#
+# **It lives here because a second consumer arrived.** Every line of this was
+# `coreutils::fs` until M10 Part A, in a crate whose library is otherwise *shell-program*
+# infrastructure — the Tier-1 stage prologue, GNU-style argument parsing, TSM1 stdout
+# plumbing. A graphical file browser wants the filesystem half and none of that, and one
+# application depending on another's crate to get it is the wrong shape. Moving what a
+# second consumer needs down a layer is the same call that put `BufferPool` in
+# `libsurface` rather than leaving the buffer-ordering rule inside `nxterm`.
+[dependencies]
+libkern = { path = "../libkern" }
+# `io` for `session::Dir` — the directory client this crate's file half sits beside.
+# Declared here rather than inherited from `coreutils`: feature unification made the
+# workspace build pass while `cargo test -p libfs` alone did not, which is the shape of
+# dependency that breaks the moment a second consumer arrives without that feature.
+librsproto = { path = "../librsproto", features = ["io"] }
+
+[lib]
+name = "libfs"
+path = "src/lib.rs"
