@@ -55,8 +55,8 @@ use crate::element::{Edge, Element, Insets, custom, docked, dock, padding, text}
 use crate::layout::layout;
 use crate::paint::{FontMetrics, Theme, paint};
 use crate::widget::{
-    ListRow, ListState, Palette, ScrollState, TextFieldState, WidgetState, button, list_view,
-    menu_bar, scrollbar, text_field,
+    ListRow, ListState, Palette, ScrollState, TextAreaState, TextFieldState, WidgetState, button,
+    list_view, menu_bar, scrollbar, text_area, text_field,
 };
 
 /// The reference UI's width, in pixels.
@@ -67,13 +67,13 @@ pub const WIDTH: u32 = 320;
 /// taken theirs. At 120 it was squeezed to nothing, the callback drew zero pixels, and every
 /// other assertion here still passed.
 ///
-/// **Raised from 160 to 260 in M7 Part A**, for the text field and the list. The extra height
-/// is not decoration: `ui-testclient` stacks the three reference windows at the origin
+/// **Raised from 160 to 260 in M7 Part A** for the text field and the list, and to 300 in M10
+/// Part C for the text area. The extra height is not decoration: `ui-testclient` stacks the three reference windows at the origin
 /// largest-first, so the terminal's 180×96 covers this window's top-left corner and the
 /// display gate excludes that region. Anything added at the top of the column would be
 /// compared over a few columns of its right-hand edge and nowhere else. Below y=96 the whole
 /// widget is visible, which is what makes the gate a check on how they draw.
-pub const HEIGHT: u32 = 260;
+pub const HEIGHT: u32 = 300;
 /// The reference UI's stride, in bytes.
 ///
 /// **Not** `WIDTH × 4` (1280): the extra 12 bytes are three pixels of row padding, for the
@@ -128,6 +128,8 @@ const ROWS: [ListRow<'static>; 6] = [
 const ROW_H: u32 = 20;
 /// See [`ROW_H`].
 const LIST_H: u32 = 60;
+/// The text area's height: two rows, so the selection's second line is drawn.
+const AREA_H: u32 = 2 * ROW_H;
 
 /// The reference UI's element tree.
 ///
@@ -173,6 +175,12 @@ pub fn view() -> Element<Msg> {
                 // the first row — a list that painted every row the selected colour, or that
                 // always highlighted row 0, would both pass a picture that chose either.
                 reference_list(&palette),
+                // **A selection spanning a line break, with the caret at its far end.** Three
+                // things a text area can get wrong that only a picture shows: a highlight drawn
+                // over the whole line rather than the selected run, one that stops at the end of
+                // the first line instead of continuing onto the second, and a caret drawn at the
+                // line's end rather than where the cursor is (M10 Part C).
+                reference_area(&palette),
             ]),
         ),
     )
@@ -193,6 +201,25 @@ fn reference_list(palette: &Palette) -> Element<Msg> {
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
     crate::element::sized(Size::new(0, LIST_H), e)
+}
+
+/// The text area the reference UI draws: two lines, mid-selection, caret at the far end.
+///
+/// Fixed height for the reason [`reference_list`] is fixed: the picture must depend on the
+/// widget rather than on how much room the column had left.
+fn reference_area(palette: &Palette) -> Element<Msg> {
+    let mut a = TextAreaState::with_text("select me\nand me");
+    a.apply(libkern::abi::KEY_RIGHT, 0);
+    a.apply(libkern::abi::KEY_RIGHT, 0);
+    a.apply(libkern::abi::KEY_RIGHT, 0);
+    for _ in 0..4 {
+        a.apply(libkern::abi::KEY_RIGHT, librsproto::surface::MOD_SHIFT);
+    }
+    a.apply(libkern::abi::KEY_DOWN, librsproto::surface::MOD_SHIFT);
+    crate::element::sized(
+        Size::new(0, AREA_H),
+        text_area(&mut a, AREA_H, ROW_H, true, palette),
+    )
 }
 
 /// Paint the custom node: a pattern varying along both axes, clipped to `clip`.

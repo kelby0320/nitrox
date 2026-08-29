@@ -20068,3 +20068,47 @@ Found by a reviewer *reading something else* — it is in no diff this PR touche
 for what it says about where this class hides: **a buffer whose size is a literal and whose
 consumer is a growing set will not be revisited when the set grows**, because nothing links them.
 The fix ties the two together in the declaration.
+
+---
+
+## 2026-09-01 — M10 Part C: the widget that waited six milestones, and what waiting bought
+
+`libui` has said since Milestone 4 that a text area would arrive "when an application posed real
+requirements rather than hypothetical ones", and has declined to build one four times since. M10's
+editor posed them. The widget exists now, and the interesting part is which requirement the wait
+produced.
+
+**The goal column.** Selection was obvious and would have been guessed. That vertical movement
+must remember the column it was *aiming* for — so that moving down through a short line and back
+up returns to where you were, rather than to the short line's end — is a rule you learn from
+using an editor, not from designing a widget. A text area built in M4 to satisfy a plan item
+would not have had it, and nobody would have noticed until somebody tried to edit something.
+
+**And the wait vindicated the sentence it was protecting.** M5 Part B said the terminal's grid is
+custom-drawn because "a terminal's selection, wrapping and scrollback semantics are not a text
+editor's, and bending a generic text area to serve both would distort the whole text stack" —
+which sat in `widget-toolkit.md` §1 as an unresolved contradiction with a plan item asking for a
+text area. It is resolved by what got built: the two share nothing, because a grid's line is as
+wide as the screen and *rewraps* on resize while a text area's is as long as somebody typed and
+never wraps. Had it been built to order in M4, it would have been built *for the terminal*, which
+is precisely the distortion that sentence names. The plan states the non-sharing as a **non-goal**
+so that a future "these could be merged" argues against something.
+
+**The widget takes its state by `&mut` and scrolls it itself.** `list_view` takes it by value and
+returns it scrolled, which is where Part B's browser dropped it and shipped a selection that never
+left the last visible row. Rather than repeat a signature whose correctness depends on the caller
+remembering something, the new widget does it. Two widgets in one toolkit now disagree about this,
+which is worth being explicit about: the newer one is right, and `list_view` is what it is because
+it predates knowing that.
+
+**Eight controls, each run alone.** The one worth naming is `with_text` adding a trailing newline:
+it failed *seven* tests rather than one, because half the suite builds its buffer that way. A
+control that fails broadly is not a better control — it says the fixture is load-bearing, which is
+worth knowing before trusting any single test built on it.
+
+**One deviation from the plan's gate, named rather than quietly taken.** The box asked for the
+press-and-drag to be driven "through `Router` at laid-out coordinates". Mapping a pixel to a
+`(line, col)` needs the application's own font metrics, so the widget exposes `place`/`extend_to`
+and the application does the arithmetic — the same division `scrollbar`'s `offset_at` already uses.
+Routing a press *to* a widget is `Router`'s and is covered by `title_bar`'s tests; what is new here
+is what a press *means*, and that is state.

@@ -18,6 +18,7 @@
 //! cannot animate on its own, which is deferred along with the frame clock (§11).
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use libdraw::format::Rgb;
 use libdraw::geom::Size;
 
@@ -29,8 +30,10 @@ use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, 
 // `libinput::keymap` does not map them because it answers "what text does this produce", and
 // these produce none.
 use libkern::abi::{
-    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP,
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_LEFT, KEY_RIGHT,
+    KEY_UP,
 };
+use librsproto::surface::MOD_SHIFT;
 
 /// How a widget should look, given what the application knows about it.
 ///
@@ -68,6 +71,13 @@ pub struct Palette {
     pub thumb: Rgb,
     /// A title bar's face while its window holds the keyboard.
     pub title_active: Rgb,
+    /// The background behind selected text.
+    ///
+    /// **A background rather than an inverted foreground**, which is what a terminal does: a
+    /// terminal owns every cell's colours and can swap them, while a toolkit draws text over
+    /// whatever a widget's own layers put down. Darker than `focus_ring` so black text stays
+    /// legible on it — the one constraint a selection colour actually has (M10 Part C).
+    pub selection: Rgb,
     /// A title bar's face while it does not.
     ///
     /// **Two faces rather than one**, because a title bar is the only chrome that says which
@@ -87,6 +97,7 @@ impl Default for Palette {
             thumb: Rgb::new(0x3A, 0x46, 0x54),
             title_active: Rgb::new(0x2E, 0x3A, 0x4A),
             title_inactive: Rgb::new(0x1C, 0x22, 0x2A),
+            selection: Rgb::new(0x2A, 0x4A, 0x6A),
         }
     }
 }
@@ -615,6 +626,483 @@ pub fn text_field<Msg>(
     stack(layers).focusable()
 }
 
+
+/// A multi-line text buffer with a cursor, a selection and a scroll position.
+///
+/// **The widget `libui` deliberately did not build until an editor asked for it.** §8 has said
+/// since M4 that "building an editor's widget remains a guess at requirements no editor has yet
+/// posed"; M10's editor poses them, which is the trigger firing rather than being ignored.
+///
+/// **Lines are logical and of unbounded length, and nothing here wraps.** That is the whole of
+/// what separates this from [`libterm`]'s grid, which is a fixed rectangle of cells that
+/// *rewraps* on resize (M9 Part D). The two look similar and are different problems: a grid's
+/// line is as wide as the screen by construction, and a text area's line is as long as somebody
+/// typed. Sharing code between them is a **non-goal** stated in the plan, so that a later
+/// "these could be merged" is argued against something rather than into a vacuum.
+///
+/// **Byte offsets, always on character boundaries** — the invariant [`TextFieldState`] rests on,
+/// for the same reason: slicing needs bytes, and every mutation here keeps them valid.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TextAreaState {
+    /// The lines. **Never empty**: an empty buffer is one empty line, so a cursor always has a
+    /// line to be on and every method below can index without a guard.
+    lines: Vec<String>,
+    /// The cursor's line.
+    line: usize,
+    /// The cursor's byte offset within its line.
+    col: usize,
+    /// Where a selection started, or `None` when there is no selection.
+    ///
+    /// **An anchor rather than a range**, because a selection is *directional* while it is being
+    /// made: dragging back past the anchor selects the other way, and a stored range would have
+    /// to be re-derived every step to know which end is moving.
+    anchor: Option<(usize, usize)>,
+    /// The column vertical movement is aiming for, in **characters**.
+    ///
+    /// Set by the first Up or Down and cleared by anything horizontal. Without it, moving down
+    /// through a short line and back up leaves the cursor at the short line's end — the column
+    /// is lost, and a person who did not touch a horizontal key has had one moved for them.
+    goal: Option<usize>,
+    /// The first visible line.
+    offset: usize,
+}
+
+impl Default for TextAreaState {
+    fn default() -> Self {
+        Self {
+            lines: alloc::vec![String::new()],
+            line: 0,
+            col: 0,
+            anchor: None,
+            goal: None,
+            offset: 0,
+        }
+    }
+}
+
+impl TextAreaState {
+    /// An empty buffer: one empty line, cursor at its start.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A buffer holding `text`, cursor at the start — where an editor opening a file wants it.
+    ///
+    /// **`\r\n` and `\n` both end a line, and the `\r` is dropped.** A file written elsewhere is
+    /// a file this editor should be able to open, and a carriage return kept in the buffer would
+    /// be an invisible character at the end of every line that the cursor has to step over.
+    pub fn with_text(text: &str) -> Self {
+        let mut lines: Vec<String> =
+            text.split('\n').map(|l| String::from(l.strip_suffix('\r').unwrap_or(l))).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        Self { lines, ..Self::default() }
+    }
+
+    /// The buffer as one string, lines joined with `\n`.
+    ///
+    /// **No trailing newline is added.** What was opened is what is saved: a file that did not
+    /// end with one does not gain one, and one that did keeps its final empty line — which
+    /// `with_text` produced and this rejoins.
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// The lines, for a caller drawing them.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// The cursor, as `(line, byte offset)`.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.line, self.col)
+    }
+
+    /// The first visible line.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The selection as `(start, end)` in document order, or `None`.
+    ///
+    /// Normalised here rather than at each call site: the anchor may be before or after the
+    /// cursor, and every consumer wants them the other way round.
+    pub fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let a = self.anchor?;
+        let c = (self.line, self.col);
+        if a == c {
+            return None;
+        }
+        Some(if a <= c { (a, c) } else { (c, a) })
+    }
+
+    /// The selected text, or `None` when nothing is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sl, sc), (el, ec)) = self.selection()?;
+        if sl == el {
+            return Some(String::from(&self.lines[sl][sc..ec]));
+        }
+        let mut out = String::from(&self.lines[sl][sc..]);
+        for l in &self.lines[sl + 1..el] {
+            out.push('\n');
+            out.push_str(l);
+        }
+        out.push('\n');
+        out.push_str(&self.lines[el][..ec]);
+        Some(out)
+    }
+
+    /// Put the cursor at `(line, col)`, clamped into the buffer, and drop any selection.
+    ///
+    /// What a press does. `col` is a byte offset and is moved back to a character boundary
+    /// rather than refused: it comes from arithmetic on a pixel position, which knows nothing
+    /// about encoding.
+    pub fn place(&mut self, line: usize, col: usize) {
+        self.anchor = None;
+        self.goal = None;
+        self.line = line.min(self.lines.len() - 1);
+        let l = &self.lines[self.line];
+        let mut c = col.min(l.len());
+        while c > 0 && !l.is_char_boundary(c) {
+            c -= 1;
+        }
+        self.col = c;
+    }
+
+    /// Extend the selection to `(line, col)` — what a drag does.
+    ///
+    /// The anchor is taken from where the cursor is *now* if there is no selection yet, which is
+    /// what makes press-then-drag select from the press.
+    pub fn extend_to(&mut self, line: usize, col: usize) {
+        let from = self.anchor.unwrap_or((self.line, self.col));
+        self.place(line, col);
+        self.anchor = Some(from);
+    }
+
+    /// Delete the selection, leaving the cursor where it was. `false` if there was none.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(((sl, sc), (el, ec))) = self.selection() else {
+            return false;
+        };
+        let tail = String::from(&self.lines[el][ec..]);
+        self.lines[sl].truncate(sc);
+        self.lines[sl].push_str(&tail);
+        self.lines.drain(sl + 1..=el);
+        self.line = sl;
+        self.col = sc;
+        self.anchor = None;
+        self.goal = None;
+        true
+    }
+
+    /// Insert `c` at the cursor, replacing any selection.
+    pub fn insert(&mut self, c: char) {
+        self.delete_selection();
+        self.lines[self.line].insert(self.col, c);
+        self.col += c.len_utf8();
+        self.goal = None;
+    }
+
+    /// Split the line at the cursor, replacing any selection.
+    pub fn newline(&mut self) {
+        self.delete_selection();
+        let tail = self.lines[self.line].split_off(self.col);
+        self.lines.insert(self.line + 1, tail);
+        self.line += 1;
+        self.col = 0;
+        self.goal = None;
+    }
+
+    /// Delete backwards: the selection if there is one, else the character before the cursor,
+    /// else join with the previous line.
+    pub fn backspace(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
+        self.goal = None;
+        if self.col > 0 {
+            let prev = self.prev_boundary();
+            self.lines[self.line].remove(prev);
+            self.col = prev;
+            return true;
+        }
+        if self.line == 0 {
+            return false;
+        }
+        // **Joining is the case a single-line field never has**, and the cursor lands where the
+        // join happened rather than at the start of the merged line — which is where the text
+        // the person was deleting towards now is.
+        let cur = self.lines.remove(self.line);
+        self.line -= 1;
+        self.col = self.lines[self.line].len();
+        self.lines[self.line].push_str(&cur);
+        true
+    }
+
+    /// Delete forwards: the selection, else the character after the cursor, else join with the
+    /// next line.
+    pub fn delete(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
+        self.goal = None;
+        if self.col < self.lines[self.line].len() {
+            self.lines[self.line].remove(self.col);
+            return true;
+        }
+        if self.line + 1 >= self.lines.len() {
+            return false;
+        }
+        let next = self.lines.remove(self.line + 1);
+        self.lines[self.line].push_str(&next);
+        true
+    }
+
+    /// Move left one character, or to the end of the previous line.
+    pub fn left(&mut self, extend: bool) -> bool {
+        self.before_move(extend);
+        self.goal = None;
+        if self.col > 0 {
+            self.col = self.prev_boundary();
+            return true;
+        }
+        if self.line == 0 {
+            return false;
+        }
+        self.line -= 1;
+        self.col = self.lines[self.line].len();
+        true
+    }
+
+    /// Move right one character, or to the start of the next line.
+    pub fn right(&mut self, extend: bool) -> bool {
+        self.before_move(extend);
+        self.goal = None;
+        if let Some(c) = self.lines[self.line][self.col..].chars().next() {
+            self.col += c.len_utf8();
+            return true;
+        }
+        if self.line + 1 >= self.lines.len() {
+            return false;
+        }
+        self.line += 1;
+        self.col = 0;
+        true
+    }
+
+    /// Move up one line, keeping the goal column.
+    pub fn up(&mut self, extend: bool) -> bool {
+        self.before_move(extend);
+        if self.line == 0 {
+            return false;
+        }
+        let goal = self.goal_chars();
+        self.line -= 1;
+        self.col = self.col_for(self.line, goal);
+        true
+    }
+
+    /// Move down one line, keeping the goal column.
+    pub fn down(&mut self, extend: bool) -> bool {
+        self.before_move(extend);
+        if self.line + 1 >= self.lines.len() {
+            return false;
+        }
+        let goal = self.goal_chars();
+        self.line += 1;
+        self.col = self.col_for(self.line, goal);
+        true
+    }
+
+    /// To the start of the line.
+    pub fn home(&mut self, extend: bool) -> bool {
+        self.before_move(extend);
+        self.goal = None;
+        let moved = self.col != 0;
+        self.col = 0;
+        moved
+    }
+
+    /// To the end of the line.
+    pub fn end(&mut self, extend: bool) -> bool {
+        self.before_move(extend);
+        self.goal = None;
+        let moved = self.col != self.lines[self.line].len();
+        self.col = self.lines[self.line].len();
+        moved
+    }
+
+    /// Set or clear the anchor before a movement.
+    ///
+    /// **Shift starts a selection from where the cursor is**, and an unshifted movement drops
+    /// one. That is the whole of the selection model: there is no separate "selecting" mode to
+    /// get out of sync with what is on screen.
+    fn before_move(&mut self, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some((self.line, self.col));
+            }
+        } else {
+            self.anchor = None;
+        }
+    }
+
+    /// The goal column in characters, set from the current column the first time.
+    fn goal_chars(&mut self) -> usize {
+        match self.goal {
+            Some(g) => g,
+            None => {
+                let g = self.lines[self.line][..self.col].chars().count();
+                self.goal = Some(g);
+                g
+            }
+        }
+    }
+
+    /// The byte offset `chars` characters into `line`, clamped to its end.
+    fn col_for(&self, line: usize, chars: usize) -> usize {
+        let l = &self.lines[line];
+        l.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(l.len())
+    }
+
+    /// The byte offset of the character before the cursor, within its line.
+    fn prev_boundary(&self) -> usize {
+        let l = &self.lines[self.line];
+        l[..self.col].chars().next_back().map(|c| self.col - c.len_utf8()).unwrap_or(0)
+    }
+
+    /// Scroll so the cursor's line is among the `visible` shown.
+    ///
+    /// The same shape [`ListState::ensure_visible`] has, and called by [`text_area`] rather than
+    /// by the application — a caller that had to remember it would have a cursor that walks off
+    /// the bottom of its own window.
+    pub fn ensure_visible(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        if self.line < self.offset {
+            self.offset = self.line;
+        } else if self.line >= self.offset + visible {
+            self.offset = self.line + 1 - visible;
+        }
+    }
+
+    /// Apply a key, answering **whether the buffer or the cursor changed**.
+    ///
+    /// One implementation of "what does this keycode do to a text area", for the reason
+    /// [`TextFieldState::apply`] gives. **Shift extends**, which is why this takes the modifiers
+    /// rather than only the code.
+    ///
+    /// **Enter is claimed here and Tab is not.** A text area is the one widget for which Enter
+    /// is text rather than submission — that is what multi-line means — while Tab remains
+    /// traversal's, because a buffer that swallowed it would trap the keyboard in itself.
+    pub fn apply(&mut self, keycode: u16, modifiers: u16) -> bool {
+        let extend = modifiers & MOD_SHIFT != 0;
+        match keycode {
+            KEY_BACKSPACE => self.backspace(),
+            KEY_DELETE => self.delete(),
+            KEY_LEFT => self.left(extend),
+            KEY_RIGHT => self.right(extend),
+            KEY_UP => self.up(extend),
+            KEY_DOWN => self.down(extend),
+            KEY_HOME => self.home(extend),
+            KEY_END => self.end(extend),
+            KEY_ENTER => {
+                self.newline();
+                true
+            }
+            _ => match libinput::keymap::to_char(keycode, modifiers) {
+                // Printable ASCII only, the same range a text field takes and for the same
+                // reason: `to_char` folds Ctrl-C to 0x03 because a terminal needs it to, and an
+                // editor that inserted that would put an unprintable byte in somebody's file.
+                Some(b) if (0x20..0x7F).contains(&b) => {
+                    self.insert(b as char);
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// A multi-line editable text view over a [`TextAreaState`].
+///
+/// **Takes the state by `&mut`, and scrolls it.** `list_view` takes its state by value and
+/// returns it scrolled, which put the obligation on the caller — and the caller that dropped it
+/// shipped a browser whose selection never left the last visible row (PR #257 review). A widget
+/// whose correctness depends on somebody remembering to write something back has the wrong
+/// signature, so this one does it itself.
+///
+/// `height` is what the caller will lay it out at; wrap the result in `sized` to keep the two in
+/// step, for the reason [`list_view`] gives.
+///
+/// **What it draws:** the visible lines, the selection behind the text on each, and the caret
+/// when `active`. What it does *not* draw is a scrollbar — that is `scrollbar`'s, composed
+/// beside it by an application that wants one, the way the terminal composes its own.
+pub fn text_area<Msg>(
+    state: &mut TextAreaState,
+    height: u32,
+    row_height: u32,
+    active: bool,
+    palette: &Palette,
+) -> Element<Msg> {
+    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    state.ensure_visible(visible);
+    let sel = state.selection();
+    let (cur_line, cur_col) = state.cursor();
+
+    let last = (state.offset + visible).min(state.lines.len());
+    let mut rows: Vec<Element<Msg>> = Vec::with_capacity(last.saturating_sub(state.offset));
+    for i in state.offset..last {
+        let l = &state.lines[i];
+        // Where this line's selection starts and ends, in bytes. A line wholly inside a
+        // multi-line selection is `(0, len)`; one outside it is `None`.
+        let span = sel.and_then(|((sl, sc), (el, ec))| {
+            if i < sl || i > el {
+                return None;
+            }
+            let from = if i == sl { sc } else { 0 };
+            let to = if i == el { ec } else { l.len() };
+            (from < to).then_some((from, to))
+        });
+
+        let mut pieces: Vec<Element<Msg>> = Vec::with_capacity(5);
+        let mut at = 0usize;
+        let push_text = |pieces: &mut Vec<Element<Msg>>, from: usize, to: usize| {
+            if from < to {
+                pieces.push(text(String::from(&l[from..to])));
+            }
+        };
+        if let Some((from, to)) = span {
+            push_text(&mut pieces, 0, from);
+            // The highlight is a `fill` *under* the run: `fill` measures as zero, so the stack
+            // takes the text's size and the colour covers exactly the glyphs' box.
+            pieces.push(stack(alloc::vec![
+                fill(palette.selection),
+                text(String::from(&l[from..to])),
+            ]));
+            at = to;
+        }
+        // The caret splits whatever is left, so it sits between characters rather than over one.
+        if active && i == cur_line && cur_col >= at {
+            push_text(&mut pieces, at, cur_col);
+            pieces.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
+            at = cur_col;
+        }
+        push_text(&mut pieces, at, l.len());
+        if pieces.is_empty() {
+            // An empty line still needs a row, or the lines below it move up by one.
+            pieces.push(text(""));
+        }
+        rows.push(sized(Size::new(0, row_height), row(pieces)));
+    }
+
+    let mut layers = alloc::vec::Vec::with_capacity(2);
+    layers.push(fill(palette.track));
+    layers.push(padding(FIELD_PAD, column(rows)));
+    stack(layers).focusable()
+}
 
 /// One row of a [`list_view`].
 ///
@@ -1554,6 +2042,242 @@ mod tests {
         );
     }
 
+    // ---- the text area (M10 Part C) ----
+
+    /// `abc` / `de` / `fghi`, cursor at the start.
+    fn area() -> TextAreaState {
+        TextAreaState::with_text("abc\nde\nfghi")
+    }
+
+    const KEY_A: u16 = 30;
+    const KEY_X: u16 = 45;
+
+    #[test]
+    fn a_buffer_round_trips_its_text_and_keeps_a_trailing_empty_line() {
+        // **What was opened is what is saved.** A file that ended with a newline has a final
+        // empty line; one that did not, does not — and an editor that "helpfully" added one
+        // would rewrite every file it touched on the first save.
+        for src in ["abc\nde", "abc\nde\n", "", "\n"] {
+            assert_eq!(TextAreaState::with_text(src).text(), src, "round trip of {src:?}");
+        }
+        // A carriage return is dropped rather than kept: an invisible character at the end of
+        // every line is one the cursor has to step over and nobody can see.
+        assert_eq!(TextAreaState::with_text("a\r\nb").text(), "a\nb");
+    }
+
+    #[test]
+    fn an_empty_buffer_is_one_empty_line_so_the_cursor_always_has_somewhere_to_be() {
+        let a = TextAreaState::new();
+        assert_eq!(a.lines().len(), 1);
+        assert_eq!(a.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn typing_inserts_and_enter_splits_the_line() {
+        let mut a = TextAreaState::new();
+        for k in [KEY_A, KEY_A] {
+            a.apply(k, 0);
+        }
+        a.apply(KEY_ENTER, 0);
+        a.apply(KEY_X, 0);
+        assert_eq!(a.text(), "aa\nx");
+        assert_eq!(a.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_a_line_joins_it_to_the_one_above() {
+        // The case a single-line field never has. The cursor lands **where the join happened**,
+        // which is where the text the person was deleting towards now is — not at the start of
+        // the merged line.
+        let mut a = area();
+        a.apply(KEY_DOWN, 0);
+        assert_eq!(a.cursor(), (1, 0));
+        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert_eq!(a.text(), "abcde\nfghi");
+        assert_eq!(a.cursor(), (0, 3), "at the join, not at the start of the line");
+    }
+
+    #[test]
+    fn delete_at_the_end_of_a_line_pulls_the_next_one_up() {
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        assert!(a.apply(KEY_DELETE, 0));
+        assert_eq!(a.text(), "abcde\nfghi");
+        assert_eq!(a.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn backspace_at_the_very_start_and_delete_at_the_very_end_do_nothing() {
+        let mut a = area();
+        assert!(!a.apply(KEY_BACKSPACE, 0));
+        let mut a = area();
+        for _ in 0..2 {
+            a.apply(KEY_DOWN, 0);
+        }
+        a.apply(KEY_END, 0);
+        assert!(!a.apply(KEY_DELETE, 0));
+        assert_eq!(a.text(), "abc\nde\nfghi", "and neither changed the buffer");
+    }
+
+    #[test]
+    fn vertical_movement_keeps_the_column_it_was_aiming_for() {
+        // **The goal column.** Down from column 3 of `abc` onto `de` (length 2) clamps to 2 —
+        // and coming back up must return to 3, not stay at 2. Without it a person who pressed
+        // only Down and Up has had their column moved for them.
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        assert_eq!(a.cursor(), (0, 3));
+        a.apply(KEY_DOWN, 0);
+        assert_eq!(a.cursor(), (1, 2), "clamped to the short line's end");
+        a.apply(KEY_DOWN, 0);
+        assert_eq!(a.cursor(), (2, 3), "and back out to the goal on a line long enough");
+        a.apply(KEY_UP, 0);
+        a.apply(KEY_UP, 0);
+        assert_eq!(a.cursor(), (0, 3), "all the way back to where it started");
+    }
+
+    #[test]
+    fn a_horizontal_move_gives_up_the_goal_column() {
+        // Otherwise the goal outlives the intent that set it: press Down, Left, Down, and the
+        // second Down would jump back out to a column the person just moved away from.
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_LEFT, 0);
+        assert_eq!(a.cursor(), (1, 1));
+        a.apply(KEY_DOWN, 0);
+        assert_eq!(a.cursor(), (2, 1), "the new column, not the old goal");
+    }
+
+    #[test]
+    fn shift_extends_a_selection_and_an_unshifted_move_drops_it() {
+        let mut a = area();
+        for _ in 0..2 {
+            a.apply(KEY_RIGHT, MOD_SHIFT);
+        }
+        assert_eq!(a.selection(), Some(((0, 0), (0, 2))));
+        assert_eq!(a.selected_text().as_deref(), Some("ab"));
+
+        a.apply(KEY_RIGHT, 0);
+        assert_eq!(a.selection(), None, "an unshifted move drops it");
+    }
+
+    #[test]
+    fn a_selection_reads_the_same_whichever_way_it_was_made() {
+        // The anchor may be before or after the cursor; every consumer wants document order.
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        for _ in 0..2 {
+            a.apply(KEY_LEFT, MOD_SHIFT);
+        }
+        assert_eq!(a.selection(), Some(((0, 1), (0, 3))));
+        assert_eq!(a.selected_text().as_deref(), Some("bc"));
+    }
+
+    #[test]
+    fn a_selection_spanning_lines_reads_the_newlines_back() {
+        let mut a = area();
+        a.apply(KEY_RIGHT, 0);
+        a.apply(KEY_DOWN, MOD_SHIFT);
+        a.apply(KEY_DOWN, MOD_SHIFT);
+        assert_eq!(a.selected_text().as_deref(), Some("bc\nde\nf"));
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        // **The rule that makes a selection worth having.** An editor where typing appends
+        // beside a highlighted run rather than replacing it is one nobody can use.
+        let mut a = area();
+        a.apply(KEY_DOWN, MOD_SHIFT);
+        a.apply(KEY_END, MOD_SHIFT);
+        assert_eq!(a.selected_text().as_deref(), Some("abc\nde"));
+        a.apply(KEY_X, 0);
+        assert_eq!(a.text(), "x\nfghi");
+        assert_eq!(a.selection(), None);
+        assert_eq!(a.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn backspace_over_a_selection_deletes_the_selection_and_not_a_character() {
+        let mut a = area();
+        for _ in 0..2 {
+            a.apply(KEY_RIGHT, MOD_SHIFT);
+        }
+        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert_eq!(a.text(), "c\nde\nfghi", "the two selected characters, not three");
+    }
+
+    #[test]
+    fn the_view_scrolls_to_follow_the_cursor_and_the_widget_does_it() {
+        // **`ensure_visible` is the widget's to call, not the application's.** A caller that had
+        // to remember it would have a cursor that walks off the bottom of its own window — and
+        // the widget takes `&mut` precisely so it cannot be forgotten (PR #257 review).
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7");
+        let p = Palette::default();
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        assert_eq!(a.offset(), 0);
+
+        for _ in 0..5 {
+            a.apply(KEY_DOWN, 0);
+        }
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        assert_eq!(a.offset(), 3, "line 5 is visible in a three-line window");
+
+        for _ in 0..5 {
+            a.apply(KEY_UP, 0);
+        }
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        assert_eq!(a.offset(), 0, "and it scrolls back the other way");
+    }
+
+    #[test]
+    fn a_press_places_the_cursor_and_a_drag_selects_from_where_it_landed() {
+        // The pointer half, which the state owns because the pixel-to-cell arithmetic is the
+        // application's — it knows its own metrics — and what a press *means* is not.
+        let mut a = area();
+        a.place(2, 2);
+        assert_eq!(a.cursor(), (2, 2));
+        assert_eq!(a.selection(), None, "a press starts no selection");
+
+        a.extend_to(0, 1);
+        assert_eq!(a.selection(), Some(((0, 1), (2, 2))), "the drag selects from the press");
+        assert_eq!(a.selected_text().as_deref(), Some("bc\nde\nfg"));
+    }
+
+    #[test]
+    fn a_press_past_the_end_of_a_line_lands_on_its_last_character_boundary() {
+        // The coordinates come from arithmetic on a pixel position, which knows nothing about
+        // encoding or line lengths. Clamping is the widget's job, not the caller's.
+        let mut a = area();
+        a.place(1, 99);
+        assert_eq!(a.cursor(), (1, 2));
+        a.place(99, 0);
+        assert_eq!(a.cursor(), (2, 0), "and past the last line lands on the last line");
+    }
+
+    #[test]
+    fn enter_is_the_text_areas_and_tab_is_not() {
+        // **The one widget for which Enter is text rather than submission** — that is what
+        // multi-line means. Tab stays traversal's: a buffer that swallowed it would trap the
+        // keyboard inside itself with no way out.
+        const KEY_TAB: u16 = 15;
+        let mut a = TextAreaState::new();
+        assert!(a.apply(KEY_ENTER, 0));
+        assert_eq!(a.lines().len(), 2);
+        assert!(!a.apply(KEY_TAB, 0), "Tab is not claimed");
+        assert_eq!(a.text(), "\n", "and it inserted nothing");
+    }
+
+    #[test]
+    fn a_control_chord_is_not_text() {
+        // `to_char` folds Ctrl-C to 0x03 because a terminal needs it to; an editor that
+        // inserted that would put an unprintable byte in somebody's file.
+        const KEY_C: u16 = 46;
+        let mut a = TextAreaState::new();
+        assert!(!a.apply(KEY_C, librsproto::surface::MOD_CTRL));
+        assert_eq!(a.text(), "");
+    }
+
     #[test]
     fn a_grip_is_a_square_that_reports_its_press_rather_than_its_click() {
         // **At the press, like the title bar's drag**, because a resize is a gesture that
@@ -1634,8 +2358,8 @@ mod tests {
         };
         // The press and the release, kept apart: a drag is decided by the first and a click by
         // the second, and this widget carries one of each.
-        let mut down = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, true)).0;
-        let mut up = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, false)).0;
+        let down = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, true)).0;
+        let up = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, false)).0;
 
         let mut r = Router::new();
         assert_eq!(down(&mut r, 200), vec![M::Drag], "the bar moves the window on the press…");

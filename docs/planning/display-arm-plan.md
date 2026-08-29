@@ -2804,21 +2804,47 @@ The widget `libui` has deliberately not built since M4, on the stated grounds th
 editor's widget remains a guess at requirements no editor has yet posed". An editor is now posing
 them, which is the trigger §8 named.
 
-- [ ] **A multi-line text buffer with a cursor**, insert and delete, arrow keys, Home/End, and
-      the scrolling that follows from a cursor that can leave the viewport. Selection is
-      **in scope** — an editor without it is not one — and is where the widget's state type earns
-      itself, the way `TextFieldState` and `ListState` did.
+- [x] **A multi-line text buffer with a cursor** ✅ — insert, delete, the arrows, Home/End, Enter
+      splitting a line, Backspace joining one, selection with Shift, and the scrolling that
+      follows a cursor that can leave the viewport. `TextAreaState` carries all of it.
 
-- [ ] **What it is not**: no wrapping decisions borrowed from `libterm`. The terminal's grid is a
+      **The wait bought a requirement a guess would not have produced**: the **goal column**.
+      Without it, moving down through a short line and back up leaves the cursor at the short
+      line's end — a person who pressed only vertical keys has had their column moved for them.
+      That is a rule you learn from *using* an editor, not from designing a widget, which is what
+      §8's "no editor has yet posed them" was protecting against.
+
+      **And the widget takes its state by `&mut`**, scrolling it itself, rather than returning it
+      for the caller to store. `list_view` does the latter, and the caller that dropped it
+      shipped a browser whose selection never left the last visible row (PR #257 review). A
+      widget whose correctness depends on somebody remembering something has the wrong signature.
+
+- [x] **What it is not** ✅: no wrapping decisions borrowed from `libterm`. The terminal's grid is a
       `custom` widget for a documented reason, and a text area is a different problem — lines are
       logical and of unbounded length, and the reflow question `libterm` answered in M9 Part D is
       not the same question. Sharing code between them is a **non-goal**, and stating that is
-      what stops a plausible-looking merge later.
+      what stops a plausible-looking merge later. Nothing is shared, and `widget-toolkit.md` §1's
+      standing contradiction — M5 Part B saying a generic text area "would distort the whole text
+      stack" while a plan item asked for one — is now closed the way waiting was supposed to
+      close it: built for an editor, sharing nothing with the terminal.
 
-- [ ] **Gate**: host tests in `libui`, driven through `Router` at laid-out coordinates the way
-      `title_bar`'s and `resize_grip`'s are — a press places the cursor, a drag selects, typing
-      replaces a selection. `check-display`'s reference render gains the widget, so its pixels
-      are compared against a host render like every other widget in the toolkit.
+- [x] **Gate** ✅ — eighteen host tests in `libui`, and **eight controls**, each run alone and
+      watched to fail by name: no goal column, insert not replacing a selection, an unshifted
+      move keeping the anchor, `selection()` not normalising, the widget not scrolling, `place`
+      not clamping, backspace not joining lines, and `with_text` adding a trailing newline.
+
+      `check-display`'s reference render gains the widget — **a selection spanning a line break
+      with the caret at its far end**, which is the arrangement where three separate mistakes
+      show as pixels: a highlight drawn over the whole line rather than the selected run, one
+      that stops at the first line's end instead of continuing, and a caret at the line's end
+      rather than at the cursor. The gate now compares 78,720 pixels of a 320×300 window.
+
+      **The press-and-drag half is tested through the state rather than the `Router`**, which is
+      a deviation from the box worth naming: mapping a pixel to a `(line, col)` needs the
+      application's own font metrics, so the widget takes `place`/`extend_to` and the
+      application does the arithmetic — exactly as `scrollbar` takes `offset_at`. Routing a
+      press *to* the widget is `Router`'s and is already covered by `title_bar`'s and
+      `resize_grip`'s tests; what is new here is what a press *means*, and that is state.
 
 ### Part D — `nxedit`, the text editor
 

@@ -1,8 +1,9 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-08-31), and this document describes what
+**Status: built (2026-08-11, last checked 2026-09-01), and this document describes what
 exists.** M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
-the *text area* is still absent and a single line is not the same widget. M9 Part A added
+the *text area* arrived in M10 Part C, six milestones after this section reserved a space for
+it — and a single line was never the same widget. M9 Part A added
 `title_bar` and, with it, `on_press_down` — the first handler in this toolkit that fires on the
 press rather than on the click. Milestone 4 built
 all of it: the retained tree and the declarative `view` (`userspace/libui/src/element.rs`),
@@ -16,9 +17,9 @@ and compares against the guest's screen pixel for pixel.
 
 **What is specified here and not built**, each with its reason in place: the **application
 runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
-assembles it by hand and is the first application to do so), **theming** (§11), and the
-**text area** (§8, still absent on purpose — M7 added a *single-line* field, which is a
-different widget, and the terminal's grid remains a `custom` one). The menu's **popup half** left this list in M5 Part B and left the toolkit
+assembles it by hand and is the first application to do so) and **theming** (§11). The **text
+area** left this list in **M10 Part C**: §8 said it would arrive when an application posed real
+requirements rather than hypothetical ones, and M10's editor posed them. The menu's **popup half** left this list in M5 Part B and left the toolkit
 entirely in M6 C3: a menu is a `popup` *window* now, parented to its application's window,
 positioned by the client at the anchor `locate` gives and clipped by the **screen**. `nxterm`
 still uses `locate`; it no longer uses `offset`, which has no consumer outside this crate's own
@@ -68,7 +69,13 @@ Part B says the terminal's grid is **a custom-drawn widget of its own**, because
 terminal's selection, wrapping and scrollback semantics are not a text editor's, and bending
 a generic text area to serve both would distort the whole text stack". Both cannot be right:
 if the grid is custom-drawn, nothing in Milestone 5 uses a text area, and by the rule above
-it should not exist yet. §8 resolves this.
+it should not exist yet. §8 resolved it by waiting.
+
+**And the wait vindicated the quoted sentence** (M10 Part C). The text area exists now, an
+editor uses it, and it shares nothing with the grid — because the two are different problems,
+exactly as M5 Part B said: a grid's line is as wide as the screen and rewraps on resize, a text
+area's is as long as somebody typed and never wraps. Had it been built in M4 to satisfy a plan
+item, it would have been built *for the terminal*, which is the distortion that sentence names.
 
 ---
 
@@ -406,13 +413,29 @@ so they exist:
 | `text_field` | The greeter's password box and the applications modal's search box. Single-line, optionally masked |
 | `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*" |
 
-**The text area is still not in this set**, and a single-line field is not it. §1's
-contradiction stands resolved the way it was: Milestone 5's terminal grid is a `custom` widget
-by the plan's own decision, so nothing there wanted a text area, and building an editor's
-widget remains a guess at requirements no editor has yet posed. What M7 needed was a password
-box and a search box — no wrapping, no selection, no undo, no multi-line cursor — which is the
-narrow thing §8 said would arrive when something needed it, arriving earlier and smaller than
-the thing it is still reserving.
+**And the text area arrived in M10 Part C**, six milestones after this section first reserved a
+space for it:
+
+| Widget | Why it exists |
+|---|---|
+| `text_area` | The editor's buffer. Multi-line, with a cursor, a **selection**, a goal column for vertical movement, and scrolling that follows the cursor. `TextAreaState` carries all of it; the widget draws the visible lines, the selection behind them and the caret |
+
+**The waiting was the point, and it is worth saying what it bought.** This section's standing
+reason was that "building an editor's widget remains a guess at requirements no editor has yet
+posed" — and the requirements an editor actually posed were not the ones a guess would have
+produced. Selection is the obvious one and would have been guessed; the **goal column** would
+not have been. Without it, moving down through a short line and back up leaves the cursor at
+the short line's end, and a person who pressed only vertical keys has had their column moved for
+them. That is a rule you learn from using an editor, not from designing one.
+
+**It shares no code with `libterm`'s grid, deliberately** (M10's plan states it as a non-goal).
+The two look similar and are different problems: a grid's line is as wide as the screen by
+construction and *rewraps* on resize, and a text area's line is as long as somebody typed and
+never wraps. A later "these could be merged" now has something to argue against.
+
+M7's `text_field` was and remains the narrow thing: a password box and a search box, with no
+wrapping, no selection and no multi-line cursor. A single-line field is not a text area, which
+is what §1's contradiction turned on.
 
 **What the two widgets are, at the toolkit's seam.** Both are pure functions of state the
 application owns, like every widget here — but both also ship a *state* type
