@@ -2,8 +2,8 @@
 //! from the target directory, so a relative path in `.cargo/config.toml` would not
 //! resolve — this mirrors `kernel/build.rs`.
 //!
-//! Like `compositor`, `nxterm` is also a **library** with host unit tests
-//! (`cargo test -p nxterm --lib`). The fixed-address bare-target script must NOT
+//! Like `compositor` and `nxterm`, `nxfiles` is also a **library** with host unit tests
+//! (`cargo test -p nxfiles --lib`). The fixed-address bare-target script must NOT
 //! reach that host link (it corrupts it — the linker errors), so we use
 //! `rustc-link-arg-bins`, which applies only to the `[[bin]]`, never to the lib test
 //! binary.

@@ -119,7 +119,10 @@ fn home_of(env: &libstream::wire::Record) -> String {
         .unwrap_or_else(|| String::from("/"))
 }
 
-/// Block until either handle has something.
+/// Block until the compositor has something to say.
+///
+/// One handle, unlike `nxterm`'s two: a browser has no second source of work. It reads a
+/// directory when it is told to and otherwise waits on the session channel alone.
 fn wait_one(h: u64) {
     let handles = [h];
     let mut results = [0u8; 24];
@@ -248,6 +251,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // than going there itself.
         if let Some(to) = app.take_goto() {
             navigate(&mut app, root_ns, &to);
+            // **Round again rather than waiting**, or the listing just installed is not drawn
+            // until the *next* event happens to arrive. In practice that is the key's own
+            // release a moment later, which is why hand testing and the gate both pass — and
+            // why it is worth removing rather than reasoning about (PR #257 review, finding 4).
+            continue;
+        }
+
+        // **Asked to close, by its own button or by the shell.**
+        if app.closing() {
+            kprint(b"nxfiles: closing\n");
+            exit(0);
         }
 
         // ---- events ----
@@ -302,8 +316,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             .end();
                     }
                 }
+                // **The shell asking, answered the way the close button is.** Exiting is the
+                // whole of it: the kernel closes this process's handles and the compositor
+                // tears its windows down with its session.
+                WindowEvent::CloseRequested => {
+                    kprint(b"nxfiles: asked to close, exiting\n");
+                    app.update(Msg::Close);
+                }
+                // **Everything accumulated about held keys is a guess now.** This client keeps
+                // none, so there is nothing to discard — and saying so is the point: a client
+                // that silently ignored this would be wrong the moment it started tracking
+                // anything.
                 WindowEvent::Dropped => kprint(b"nxfiles: input dropped\n"),
-                _ => {}
             }
         }
         if resized {

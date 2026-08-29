@@ -1,14 +1,19 @@
 //! `libfs` — whole-file and path helpers, for anything that touches the filesystem.
 //!
-//! The *directory* operations live in [`librsproto::session::Dir`] (name-addressed RPC on
-//! a directory session). This crate covers the other half — whole-file read and write —
-//! which does not go through that protocol at all: a file resolves to a **page-cache
-//! object** the process maps, so copying a file is a `memcpy` between two mappings and the
-//! kernel moves the data (Model A; `docs/architecture/filesystem-data-path.md`).
+//! **Whole-file operations, and the composition of directory ones.** A file's *contents* do not
+//! go through the directory protocol at all: a file resolves to a **page-cache object** the
+//! process maps, so copying one is a `memcpy` between two mappings and the kernel moves the data
+//! (Model A; `docs/architecture/filesystem-data-path.md`). That half is the bulk of this crate.
 //!
-//! Not in `librsproto` because there is no protocol involved: these are namespace and
-//! memory syscalls, and a crate that speaks a wire format is the wrong home for something
-//! that speaks none.
+//! The directory *protocol* is [`librsproto::session::Dir`] and stays there, beside the wire
+//! format it speaks. What lives here is the rule for putting its answers together —
+//! [`list_dir`], where a path's entries are the filesystem's **plus** the namespace bindings
+//! mounted there, with bindings shadowing. That is not a protocol operation; it is a decision
+//! about two sources, and it had two consumers (PR #257 review, finding 6, which caught this
+//! paragraph still claiming the crate held no directory operations at all).
+//!
+//! Not in `librsproto` either way, because this crate owns no wire format: what is below is
+//! namespace and memory syscalls, and composition on top of somebody else's protocol.
 //!
 //! ## Why it is a crate rather than a module in `coreutils`
 //!

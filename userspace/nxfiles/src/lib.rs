@@ -61,9 +61,16 @@ pub const PATH_KEY: u64 = 6;
 ///
 /// **Every docked child needs one**, not just the ones a test looks for: the diff requires a
 /// container's children to be all keyed or all unkeyed, and a single bare sibling makes the
-/// whole frame `MixedKeying`. It fails on the *second* frame, not the first — the first builds
-/// the tree and the second compares against it — which is a first paint that works followed by
-/// a window that never updates again.
+/// whole frame `MixedKeying` — **on the first frame**, because `reconcile_children` runs the
+/// check against an empty previous list for a brand-new node too. In this application that
+/// reaches `fail(b"nxfiles: the view is not diffable")` before anything is committed, so the
+/// symptom is *no window ever appears*.
+///
+/// **Not to be confused with `KeyingChanged`**, which is the second-frame error: it needs a
+/// successful first frame to compare against, and its symptom is the one that sounds like an
+/// event-loop bug — a window that paints once and then never updates. Two errors, two symptoms;
+/// an earlier version of this note merged them under the wrong name (PR #257 review,
+/// blocking 2).
 pub const STRIP_KEY: u64 = 5;
 
 /// The window's size in pixels at startup, before any manager places it.
@@ -137,6 +144,11 @@ pub struct App {
     move_requested: bool,
     /// The grip was pressed, and the binary owes the compositor a `StartResize`.
     resize_requested: Option<u32>,
+    /// The browser has been asked to close, and the binary owes an exit.
+    ///
+    /// A flag rather than an `exit` here: `update` is a function of values and has no way to
+    /// tear down a session.
+    closing: bool,
 }
 
 /// What can happen to the browser.
@@ -154,6 +166,11 @@ pub enum Msg {
     ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
     RequestState(u32),
+    /// Somebody wants this window gone — its own close button, or the shell asking.
+    ///
+    /// **One message for both**, as `nxterm` has: which of them it was is not something this
+    /// application acts on differently.
+    Close,
 }
 
 impl App {
@@ -170,6 +187,7 @@ impl App {
             state_requested: None,
             move_requested: false,
             resize_requested: None,
+            closing: false,
         }
     }
 
@@ -200,11 +218,16 @@ impl App {
         self.list = ListState { selected: (!self.entries.is_empty()).then_some(0), offset: 0 };
     }
 
-    /// Turn a wire entry into a row, dropping the ones a browser has no use for.
+    /// Turn a wire entry into a row.
     ///
-    /// `.` and `..` are already filtered by [`libfs::list_dir`]; what this drops is anything
-    /// whose kind says nothing — a browser that showed an `UNKNOWN` as a file would offer to
-    /// open something it cannot describe.
+    /// `.` and `..` are already filtered by [`libfs::list_dir`]; the only thing dropped here is
+    /// an entry with an **empty name**, which is not a thing a person can act on.
+    ///
+    /// **An unknown kind is listed as a file, deliberately.** `DIRENT_KIND_UNKNOWN` and
+    /// `DIRENT_KIND_SYMLINK` both land here, and a row that is not a directory is inert — it
+    /// shows a name and does nothing when pressed. Hiding it would be worse: something is on
+    /// disk and the browser would be the one place that does not say so. (An earlier version of
+    /// this doc claimed the filter existed; the code never had it — PR #257 review, finding 5.)
     pub fn entry_of(e: &OwnedEntry) -> Option<Entry> {
         let name = String::from_utf8_lossy(e.name()).into_owned();
         if name.is_empty() {
@@ -245,6 +268,7 @@ impl App {
             Msg::Key(k) => self.key(k),
             Msg::DragWindow => self.move_requested = true,
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
+            Msg::Close => self.closing = true,
             Msg::RequestState(s) => {
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
                     self.maximized = s == WINDOW_STATE_MAXIMIZED;
@@ -301,6 +325,11 @@ impl App {
         self.resize_requested.take()
     }
 
+    /// Whether the browser has been asked to close.
+    pub fn closing(&self) -> bool {
+        self.closing
+    }
+
     /// The size of this window in pixels.
     pub fn window_size(&self) -> Size {
         self.window
@@ -319,13 +348,25 @@ impl App {
         true
     }
 
-    /// The height the listing is laid out at — the window less its chrome.
+    /// The height the listing is laid out at — the window less its chrome and the grip's corner.
+    ///
+    /// The grip's square is subtracted for the reason `nxterm`'s scrollbar subtracts it: the grip
+    /// is the topmost layer and takes any press under it, so a row there would be a row that
+    /// cannot be clicked.
     pub fn list_h(&self) -> u32 {
         self.window.h.saturating_sub(TITLE_BAR_H + PATH_H + GRIP_W)
     }
 
     /// The element tree for the current state.
-    pub fn view(&self) -> Element<Msg> {
+    ///
+    /// **`&mut self`, because building the view scrolls the list.** `list_view` takes its state
+    /// by value and returns it scrolled to follow the selection, and a caller that drops the
+    /// return value re-derives the offset from zero on every frame — which parks the highlight
+    /// on the last visible row and scrolls the whole list under it on every arrow press. The
+    /// toolkit's other consumer returns the state to *its* caller; doing that here would move
+    /// the mistake rather than remove it, so the state is written back where it cannot be
+    /// forgotten (PR #257 review, blocking 1).
+    pub fn view(&mut self) -> Element<Msg> {
         let ui = UiPalette::default();
         let title = title_bar(
             TITLE,
@@ -338,7 +379,13 @@ impl App {
                 } else {
                     WINDOW_STATE_MAXIMIZED
                 })),
-                close: None,
+                // **A close button, because without one every close takes the wedged path.**
+                // The taskbar's middle-click sends `CloseRequested`; a client that ignores it
+                // survives the two-second grace period and is then destroyed by
+                // `Manage::Close` — the route the shell documents as being for a client that
+                // has *stopped answering*. An application with no way to close itself would
+                // take it every single time (PR #257 review, finding 3).
+                close: Some(Msg::Close),
             },
             &ui,
         )
@@ -351,20 +398,26 @@ impl App {
                 .key(PATH_KEY),
         ]);
 
-        let rows: Vec<ListRow<'_>> = Vec::new();
         let labels: Vec<String> = self.entries.iter().map(|e| e.label()).collect();
-        let mut rows = rows;
+        let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
         for (i, l) in labels.iter().enumerate() {
             rows.push(ListRow { key: i as u64, label: l });
         }
-        let (list, _) = list_view(&rows, self.list, self.list_h(), ROW_H, Msg::Activate, &ui);
+        let h = self.list_h();
+        let (list, scrolled) = list_view(&rows, self.list, h, ROW_H, Msg::Activate, &ui);
+        self.list = scrolled;
 
         let body = dock(
             alloc::vec![
                 docked(Edge::Top, title),
                 docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
             ],
-            list.key(LIST_KEY),
+            // **Sized to the height it was built for.** `list_view` does not size itself, and
+            // the dock's flex child otherwise gets everything left over — so the widget would
+            // build rows for one height and be drawn at another, leaving `visible` off by one
+            // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
+            // wrapper as the reliable way to keep the two in step.
+            sized(Size::new(0, h), list).key(LIST_KEY),
         );
 
         // The grip over the bottom-right corner, as `nxterm` places its own.
@@ -425,17 +478,23 @@ mod tests {
         a
     }
 
-    /// Two consecutive frames must diff — **the second is where a keying mistake shows.**
+    /// Three consecutive frames must diff, and **the frame that fails tells you which mistake
+    /// it is.**
     ///
-    /// The first `update` builds the tree and the second compares against it, so a container
-    /// whose children are partly keyed produces a window that paints once and then never
-    /// updates again. Found the expensive way, in a four-minute boot, when this would have
-    /// found it in a millisecond (M10 Part B).
+    /// `MixedKeying` — a container with some keyed children and some not — fails at frame **0**,
+    /// because the check runs against an empty previous list for a new node as well. In this
+    /// application that is `fail()` before the first commit, so no window ever appears.
+    /// `KeyingChanged` needs a successful first frame to compare against and fails at frame 1,
+    /// which is the window that paints once and then goes dead. Reporting the frame number is
+    /// what separates them.
+    ///
+    /// Found the expensive way, in a four-minute boot, when this would have found it in a
+    /// millisecond — and it did, for the second instance, at frame 0 (M10 Part B).
     #[test]
-    fn consecutive_frames_diff_rather_than_erroring_on_the_second() {
+    fn consecutive_frames_diff_and_the_failing_one_is_named() {
         use libui::diff::Tree;
         use libui::layout::{FixedCell, layout};
-        let a = app();
+        let mut a = app();
         let cell = FixedCell { w: 8, h: 16 };
         let mut tree = Tree::new();
         for frame in 0..3 {
@@ -445,20 +504,63 @@ mod tests {
         }
     }
 
+    /// A listing long enough to scroll.
+    fn big() -> App {
+        let mut a = App::new("/big");
+        let rows: Vec<Entry> = (0..40)
+            .map(|i| Entry::file(&alloc::format!("f{i:02}")))
+            .collect();
+        a.show("/big", rows);
+        a
+    }
+
+    fn down(a: &mut App) {
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_DOWN, KEY_DOWN, 0)));
+    }
+
+    fn up(a: &mut App) {
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_UP, KEY_DOWN, 0)));
+    }
+
+    #[test]
+    fn the_scroll_offset_persists_so_up_moves_the_selection_and_not_the_list() {
+        // **`list_view` returns its state scrolled, and a caller that drops it re-derives the
+        // offset from zero every frame.** The selection then sits on the *last visible row*
+        // for ever: press Up and the highlight does not move, the entire listing scrolls down
+        // by one underneath it — and the whole list area repaints instead of two rows
+        // (PR #257 review, blocking 1).
+        let mut a = big();
+        for _ in 0..19 {
+            down(&mut a);
+        }
+        let _ = a.view();
+        let scrolled = a.list.offset;
+        assert!(scrolled > 0, "precondition: 19 rows down has scrolled the list");
+        assert_eq!(a.list.selected, Some(19));
+
+        up(&mut a);
+        let _ = a.view();
+        assert_eq!(
+            a.list.offset, scrolled,
+            "the selection moved up inside the visible rows, so the list must not have moved"
+        );
+        assert_eq!(a.list.selected, Some(18));
+    }
+
     #[test]
     fn a_listing_puts_directories_first_then_names_in_order() {
         // **The order is the browser's, not the filesystem's.** Entries arrive in whatever order
         // the directory server and the namespace enumeration produced, which is not an order
         // anybody chose — and a listing that changed order between two visits to the same
         // directory would be unusable for the one thing a browser is for.
-        let a = app();
+        let mut a = app();
         let names: Vec<&str> = a.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["archive", "work", "a.txt", "notes.txt"]);
     }
 
     #[test]
     fn a_directory_is_marked_by_a_trailing_separator() {
-        let a = app();
+        let mut a = app();
         assert_eq!(a.entries()[0].label(), "archive/");
         assert_eq!(a.entries()[2].label(), "a.txt");
     }

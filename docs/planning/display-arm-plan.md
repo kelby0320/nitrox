@@ -2791,6 +2791,13 @@ its second designed consumer was always a list of things on disk.
       deleted, one arrow press leaves the selection at `Some(0)`, which is what the correct code
       produces, so both tests passed for both implementations. They press twice now.
 
+- [x] **And the browser closes itself, which the first version could not** ✅ (PR #257 review).
+      Without a close button and without honouring `CloseRequested`, the *only* way to close it
+      was the taskbar's middle-click — which asks, waits out the two-second grace period, and
+      then destroys the window with `Manage::Close`. That is the path the shell documents as
+      being for a client that has stopped answering, and every close of this application would
+      have taken it.
+
 ### Part C — the text area
 
 The widget `libui` has deliberately not built since M4, on the stated grounds that "building an
