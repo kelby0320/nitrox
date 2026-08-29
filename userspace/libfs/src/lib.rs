@@ -457,6 +457,54 @@ pub fn is_dir(ns: u64, path: &[u8]) -> bool {
     }
 }
 
+/// Every entry directly under `path`: the filesystem's, plus the namespace bindings mounted
+/// there, with bindings shadowing same-named files.
+///
+/// **A path's listing is a union, and that is not a policy choice — it is how mount points
+/// appear in a parent's listing.** The filesystem under a path and the namespace bindings
+/// directly beneath it are two sources for one question, so this asks both and lets each answer
+/// for the part it owns: `/dev` is all bindings and no filesystem, `/system` is the other way,
+/// and `/` genuinely needs both. A binding shadows a same-named filesystem entry exactly as a
+/// mount point shadows the directory it covers.
+///
+/// `Err` only when there is neither — no filesystem here *and* nothing bound beneath. A
+/// kernel-served directory like `/dev` is an ordinary success with the bindings as the whole
+/// answer.
+///
+/// **Moved out of `list` in M10 Part B**, when the file browser became the second consumer. The
+/// union rule is the kind that gets re-derived slightly differently by whoever needs it next —
+/// and a browser that forgot the shadowing would show a mount point twice, once as the directory
+/// it covers (M10 Part B; the rule is `userspace/CLAUDE.md`'s).
+pub fn list_dir(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, DirError> {
+    let ns_entries = ns_children(ns, path);
+
+    let mut entries: Vec<OwnedEntry> = Vec::new();
+    let mut buf = [0u8; 4096];
+    match Dir::open(ns, path, &mut buf) {
+        Ok(mut dir) => {
+            let r = dir.read_dir(|e| {
+                if e.name != b"." && e.name != b".." {
+                    entries.push(OwnedEntry::from_entry(e));
+                }
+                true
+            });
+            dir.close();
+            r?;
+        }
+        Err(e) => {
+            if ns_entries.is_empty() {
+                return Err(e);
+            }
+        }
+    }
+
+    for (name, kind) in &ns_entries {
+        entries.retain(|e| e.name() != name.as_bytes());
+        entries.push(OwnedEntry::binding(name.as_bytes(), *kind));
+    }
+    Ok(entries)
+}
+
 /// The final component of a path (`"/a/b/c"` → `"c"`).
 ///
 /// **Trailing separators are ignored, and that is the rule worth stating**: `"/a/b/"` is `"b"`,

@@ -1,0 +1,29 @@
+[package]
+name = "nxfiles"
+version = "0.1.0"
+edition = "2024"
+
+# The file browser: Milestone 10 Part B of `docs/planning/display-arm-plan.md`.
+#
+# Split lib/bin the way `nxterm` is, and for the same reason: what a directory listing *is*
+# — sorted, marked, navigable — is a function of values and host-tests in milliseconds,
+# while the window, the shared buffers and the event pump need an OS. The first application
+# to be built after the toolkit was finished rather than alongside it, so it is also the
+# check on whether `libui` is usable by somebody who is not extending it at the same time.
+[dependencies]
+libfs = { path = "../libfs" }
+libui = { path = "../libui" }
+libdraw = { path = "../libdraw", features = ["io"] }
+libsurface = { path = "../libsurface" }
+librsproto = { path = "../librsproto", features = ["io"] }
+libkern = { path = "../libkern" }
+libstream = { path = "../libstream", features = ["io"] }
+libheap = { path = "../libheap" }
+
+[lib]
+name = "nxfiles"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nxfiles"
+path = "src/main.rs"

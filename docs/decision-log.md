@@ -19974,3 +19974,53 @@ covers a thing is worse than no claim, since it is the one somebody acts on. The
 `copy_tree`, read the crate doc in the file they are editing, run the gate it names, watch it
 pass, and ship; the gate that would have caught them was never started. **A coverage claim is a
 factual claim about a specific command, and is worth checking like one.**
+
+---
+
+## 2026-08-31 — M10 Part B: the second application, and what it says about the toolkit
+
+`nxfiles` lists a directory, descends, and comes back up. It is the first application built
+*after* the toolkit was finished rather than alongside it, which makes it the only honest answer
+to a question `libui` could not ask itself: is this usable by somebody who is not extending it at
+the same time?
+
+**Mostly yes, and the exception cost a four-minute boot.** The browser needed no new widget —
+`list_view`'s second designed consumer was always a list of things on disk — and its whole view
+is nine lines of `dock`, `row` and `list_view`. What it did need, twice, was the diff's rule that
+a container's children are **all keyed or all unkeyed**, and that rule announces itself in the
+worst possible way: `MixedKeying` is returned on the *second* frame, because the first builds the
+tree and the second compares against it. So a window paints correctly once and then never updates
+again — which is a symptom that looks like an event-loop bug and is not.
+
+**The fix that matters is not the keys, it is where the failure was found.** The first instance
+cost a full `check-login` run to see. The second was found in a millisecond by a host test that
+diffs three consecutive frames and reports which one failed and why — a test any application
+using this toolkit should have, and one that is now written for the next author to copy. It
+caught the second mistake at frame 0, before the boot.
+
+**The listing rule went down a layer before the browser could copy it.** "A path's entries are
+the filesystem's plus the namespace bindings mounted there, with bindings shadowing" lived in
+`list.rs`; `nxfiles` needed exactly it, and a second derivation would have shown a mount point
+twice — once as the directory it covers. Part A's review had just caught a copy of `join` left
+behind by the same kind of move, so this one moved first rather than being noticed later.
+
+**The gate uses the two sessions as one fact.** The serial shell creates a directory; the
+graphical browser is asserted to see it, descend into it, report it empty, and come back up.
+Nothing is arranged by the harness — the two halves see the same subtree because
+`libsession::build_namespace` and `desktop-shell::build_app_namespace` bind it identically, which
+is M10's decision 1 doing load-bearing work for the third time. A gate that seeded a fixture
+would prove less and be easier to write.
+
+**And two of the browser's own tests were decoration until the control was run.** With the
+selection reset deleted, one arrow press leaves the selection at `Some(0)` — the same value the
+correct code produces — so both the reset test and the empty-listing test passed for both
+implementations. This is the fifth instance this phase of the same shape: **the setup was chosen
+to illustrate the property rather than to reach the code that computes it.** The fix is always
+the same, and it is always one line: move the pre-state somewhere the two implementations
+disagree about.
+
+**One box moved rather than shrank.** "Open a file by launching the editor" is Part D's now,
+because there is no editor to launch. Building the request here would mean gating it against a
+program that does not exist, and a row that launched nothing would be a control that looks live —
+the defect M8's overview shipped three of. A file row does nothing today, and a host test says so
+by name.
