@@ -20094,12 +20094,32 @@ never wraps. Had it been built to order in M4, it would have been built *for the
 is precisely the distortion that sentence names. The plan states the non-sharing as a **non-goal**
 so that a future "these could be merged" argues against something.
 
-**The widget takes its state by `&mut` and scrolls it itself.** `list_view` takes it by value and
-returns it scrolled, which is where Part B's browser dropped it and shipped a selection that never
-left the last visible row. Rather than repeat a signature whose correctness depends on the caller
-remembering something, the new widget does it. Two widgets in one toolkit now disagree about this,
-which is worth being explicit about: the newer one is right, and `list_view` is what it is because
-it predates knowing that.
+**The widget takes its state by `&mut` and scrolls it itself**, and `list_view` was converted to
+match in the same part rather than left to disagree.
+
+The value-returning form is where Part B's browser dropped the state and shipped a selection that
+never left the last visible row, and the reason it could is worth writing down: **nothing in the
+type system can require a caller to keep part of a return value.** `#[must_use]` fires on an
+*unused* return, and `let (e, _) = list_view(…)` uses the tuple; putting it on `ListState` does not
+help either, since binding to `_` is the documented way to silence that lint. `ListState` being
+`Copy` removed the last chance — passing `self.list` by value and dropping the result left a
+perfectly valid stale copy, where a non-`Copy` state would have been a move-out error. `Copy` plus
+value-return is what made the bug silent.
+
+The obligation also *propagated*: `desktop-shell` had grown `(T, ListState)` returns three
+functions deep to carry state none of them used. All three collapse.
+
+**And in-place update is what Rust uses for this** — `Vec::sort`, `Vec::retain`,
+`read_line(&mut String)` — while a returned value is for a caller who may genuinely decline it.
+There is no correct program that ignores a scroll offset. The claim is precise rather than
+absolute: the *accidental* form no longer compiles, and a caller determined to throw the state
+away can still pass `&mut x.clone()`. That is true of every `&mut` API, and the test catches it.
+
+**What this does not fix is the second forget-me obligation in the same signature**: the caller
+must wrap the result in `sized(height)` or the widget is drawn at a height it did not build for —
+a bug hit twice in this milestone. The real answer to both is for a widget to own its rectangle
+rather than be told one and trusted, which is the same rework as making `view` pure again.
+**Trigger: a third scrolling widget, or the first time `view` is called speculatively.**
 
 **Eight controls, each run alone.** The one worth naming is `with_text` adding a trailing newline:
 it failed *seven* tests rather than one, because half the suite builds its buffer that way. A

@@ -2815,9 +2815,10 @@ them, which is the trigger §8 named.
       §8's "no editor has yet posed them" was protecting against.
 
       **And the widget takes its state by `&mut`**, scrolling it itself, rather than returning it
-      for the caller to store. `list_view` does the latter, and the caller that dropped it
-      shipped a browser whose selection never left the last visible row (PR #257 review). A
-      widget whose correctness depends on somebody remembering something has the wrong signature.
+      for the caller to store — a widget whose correctness depends on somebody remembering
+      something has the wrong signature. **`list_view` was converted to match**, since leaving
+      two widgets in one toolkit disagreeing about it is worse than either choice: fourteen call
+      sites, and `desktop-shell`'s three-deep chain of `(T, ListState)` returns collapses.
 
 - [x] **What it is not** ✅: no wrapping decisions borrowed from `libterm`. The terminal's grid is a
       `custom` widget for a documented reason, and a text area is a different problem — lines are

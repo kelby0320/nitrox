@@ -194,10 +194,14 @@ fn reference_field() -> TextFieldState {
     f
 }
 
-/// The list the reference UI draws, dropping the state it scrolls to.
+/// The list the reference UI draws.
+///
+/// The state is a local: a fixed picture is rebuilt from constants on every call, so there is
+/// nothing to persist. That is the one case where discarding the scroll is right, and since
+/// M10 Part C it is expressed by the state being local rather than by a `_` in a pattern.
 fn reference_list(palette: &Palette) -> Element<Msg> {
-    let state = ListState { selected: Some(1), offset: 0 };
-    let (e, _) = list_view(&ROWS, state, LIST_H, ROW_H, Msg::Row, palette);
+    let mut state = ListState { selected: Some(1), offset: 0 };
+    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, palette);
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
     crate::element::sized(Size::new(0, LIST_H), e)

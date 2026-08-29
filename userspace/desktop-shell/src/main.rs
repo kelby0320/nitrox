@@ -417,33 +417,35 @@ const MODAL_PITCH: usize = (MODAL_W as usize) * 4;
 const ROW_H: u32 = 20;
 
 /// The applications modal's element tree: a filter field over a list of `/bin` programs.
-fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: ListState) -> (Element<()>, ListState) {
+fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: &mut ListState) -> Element<()> {
     let palette = Palette::default();
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, &palette);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
-    let (list, state) = list_view(rows, state, list_h, ROW_H, |_| (), &palette);
-    (
-        padding(
-            Insets::all(8),
-            column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
-        ),
-        state,
+    let list = list_view(rows, state, list_h, ROW_H, |_| (), &palette);
+    padding(
+        Insets::all(8),
+        column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
     )
 }
 
 /// Render the modal.
-fn render_modal(font: &Font, query: &TextFieldState, rows: &[ListRow<'_>], state: ListState) -> (MemFramebuffer, ListState) {
+fn render_modal(
+    font: &Font,
+    query: &TextFieldState,
+    rows: &[ListRow<'_>],
+    state: &mut ListState,
+) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(MODAL_W, MODAL_H, MODAL_PITCH, PixelFormat::XRGB8888)
         .expect("the modal pitch is wide enough for a row");
     let mut fb = MemFramebuffer::new(geometry);
-    let (ui, state) = modal_view(query, rows, state);
+    let ui = modal_view(query, rows, state);
     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
     let metrics = FontMetrics::new(font, FONT_PX);
     let l = layout(&ui, bounds, &metrics);
     let theme = Theme { font_px: FONT_PX, ..Theme::default() };
     paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
-    (fb, state)
+    fb
 }
 
 /// The entries matching `q`, in order. An empty query matches everything.
@@ -3490,7 +3492,12 @@ fn present_modal(
     addrs: &[*mut u8; BUFFERS],
 ) {
     let len = MODAL_PITCH * MODAL_H as usize;
-    let (fb, _) = render_modal(font, query, rows, ListState::default());
+    // **A local, because the launcher keeps no selection.** Enter launches the filtered list's
+    // first entry (see the `KEY_ENTER` arm), so there is nothing to persist between frames —
+    // and since M10 Part C that is said by the state being a throwaway here rather than by a
+    // `_` in a pattern, which is what it looked like when the widget returned it.
+    let mut list = ListState::default();
+    let fb = render_modal(font, query, rows, &mut list);
     let bytes = fb.into_bytes();
     if bytes.len() != len {
         return;
@@ -3569,7 +3576,9 @@ fn open_modal(
         // would pair row 2's widget with row 3's element the moment a character is typed.
         .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
         .collect();
-    let (picture, _) = render_modal(font, query, &rows, ListState::default());
+    // A throwaway for the reason `present_modal`'s is one: no selection is kept.
+    let mut list = ListState::default();
+    let picture = render_modal(font, query, &rows, &mut list);
     let bytes = picture.into_bytes();
     let len = MODAL_PITCH * MODAL_H as usize;
     if bytes.len() != len {

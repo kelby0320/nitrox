@@ -1236,18 +1236,30 @@ const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 /// (An earlier version of this sentence claimed a caller "cannot get it out of step", which is
 /// exactly backwards; PR #233 review.)
 ///
-/// `state` is taken by value and scrolled to follow the selection — see
-/// [`ensure_visible`](ListState::ensure_visible). A caller that wants the scroll to persist
-/// reads it back from the returned state.
+/// **`state` is taken by `&mut` and scrolled in place** to follow the selection — see
+/// [`ensure_visible`](ListState::ensure_visible).
+///
+/// It returned the scrolled state instead until M10 Part C, and the difference is not
+/// stylistic: **nothing in the type system could make a caller keep it.** `#[must_use]` fires on
+/// an *unused* return, and `let (e, _) = list_view(…)` uses the tuple; putting it on `ListState`
+/// does not help either, since binding to `_` is the documented way to silence exactly that
+/// lint. `ListState` is `Copy`, which removed the last chance — a caller passing `self.list`
+/// by value and dropping the result kept a perfectly valid stale copy, where a non-`Copy` state
+/// would have been a move-out error. `nxfiles` shipped precisely that: an offset re-derived
+/// from zero every frame, so the selection never left the last visible row (PR #257 review).
+///
+/// The obligation also *propagated*: `desktop-shell` grew `(T, ListState)` returns three
+/// functions deep to carry state none of them used. In-place update is what Rust uses for this
+/// — `Vec::sort`, `Vec::retain`, `read_line(&mut String)` — and a returned value is for when a
+/// caller may genuinely decline it. There is no correct program that ignores a scroll offset.
 pub fn list_view<Msg>(
     rows: &[ListRow<'_>],
-    state: ListState,
+    state: &mut ListState,
     height: u32,
     row_height: u32,
     activate: fn(u64) -> Msg,
     palette: &Palette,
-) -> (Element<Msg>, ListState) {
-    let mut state = state;
+) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
     // **The selection is clamped first, because it is an index into a list that may have just
     // been replaced.** A launcher rebuilds its results on every keystroke, so a selection made
@@ -1291,7 +1303,7 @@ pub fn list_view<Msg>(
     } else {
         list
     };
-    (stack(alloc::vec![fill(palette.track), body]).focusable(), state)
+    stack(alloc::vec![fill(palette.track), body]).focusable()
 }
 
 /// How wide a list's scrollbar is, in pixels.
@@ -1311,8 +1323,8 @@ mod list_view_tests {
     fn only_the_visible_rows_become_elements() {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
-        let (e, _): (Element<u64>, _) =
-            list_view(&r, ListState::default(), 100, 20, |k| k, &Palette::default());
+        let e: Element<u64> =
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, &Palette::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -1321,8 +1333,8 @@ mod list_view_tests {
     #[test]
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
-        let (e, _): (Element<u64>, _) =
-            list_view(&rows(&data), ListState::default(), 100, 20, |k| k, &Palette::default());
+        let e: Element<u64> =
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -1331,10 +1343,10 @@ mod list_view_tests {
     fn a_reordered_window_list_keeps_each_rows_identity() {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
-        let (a, _): (Element<u64>, _) =
-            list_view(&rows(&before), ListState::default(), 100, 20, |k| k, &Palette::default());
-        let (b, _): (Element<u64>, _) =
-            list_view(&rows(&after), ListState::default(), 100, 20, |k| k, &Palette::default());
+        let a: Element<u64> =
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
+        let b: Element<u64> =
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -1344,15 +1356,13 @@ mod list_view_tests {
     #[test]
     fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
-        let (_, state): (Element<u64>, _) = list_view(
-            &rows(&long),
-            ListState { selected: Some(19), offset: 0 },
-            100, 20, |k| k, &Palette::default(),
-        );
+        let mut state = ListState { selected: Some(19), offset: 0 };
+        let _: Element<u64> =
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, &Palette::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
-        let (e, mut state): (Element<u64>, _) =
-            list_view(&rows(&short), state, 100, 20, |k| k, &Palette::default());
+        let e: Element<u64> =
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, &Palette::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -1374,11 +1384,9 @@ mod list_view_tests {
     /// Shrinking to nothing leaves nothing selected, rather than row `-1`.
     #[test]
     fn a_list_that_empties_clears_the_selection() {
-        let (_, state): (Element<u64>, _) = list_view(
-            &[],
-            ListState { selected: Some(3), offset: 2 },
-            100, 20, |k| k, &Palette::default(),
-        );
+        let mut state = ListState { selected: Some(3), offset: 2 };
+        let _: Element<u64> =
+            list_view(&[], &mut state, 100, 20, |k| k, &Palette::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -1437,8 +1445,8 @@ mod list_view_tests {
     fn the_selected_row_is_painted_differently() {
         let data = [(1u64, "a"), (2, "b")];
         let p = Palette::default();
-        let (e, _): (Element<u64>, _) =
-            list_view(&rows(&data), ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, &p);
+        let e: Element<u64> =
+            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
@@ -1450,12 +1458,12 @@ mod list_view_tests {
     fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
         let p = Palette::default();
         let few = [(1u64, "a"), (2, "b")];
-        let (e, _): (Element<u64>, _) =
-            list_view(&rows(&few), ListState::default(), 100, 20, |k| k, &p);
+        let e: Element<u64> =
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
-        let (e, _): (Element<u64>, _) =
-            list_view(&rows(&many), ListState::default(), 100, 20, |k| k, &p);
+        let e: Element<u64> =
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -1463,8 +1471,8 @@ mod list_view_tests {
     #[test]
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
-        let (e, _): (Element<u64>, _) =
-            list_view(&rows(&data), ListState::default(), 100, 20, |k| k, &Palette::default());
+        let e: Element<u64> =
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -1472,8 +1480,8 @@ mod list_view_tests {
     #[test]
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
-        let (e, _): (Element<u64>, _) =
-            list_view(&rows(&data), ListState::default(), 100, 0, |k| k, &Palette::default());
+        let e: Element<u64> =
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, &Palette::default());
         assert_eq!(keys(&e).len(), 0);
     }
 
