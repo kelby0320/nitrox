@@ -2745,13 +2745,20 @@ on `coreutils` to get it would make one application depend on another's crate.
 The simpler of the two applications and the one that needs no new widget: `list_view` exists, and
 its second designed consumer was always a list of things on disk.
 
-- [ ] **List a directory**, one row per entry, directories marked and sorted before files. Reads
-      through `libfs`, starting at `HOME` from its Tier-1 environment record — `/home`, which
-      `build_app_namespace` binds to the user's subtree. (Not `$env.HOME`: that is the shell's
-      notation and `nxfiles` is not the shell.)
+- [x] **List a directory** ✅, one row per entry, directories marked with a trailing separator
+      and sorted before files. Reads through `libfs`, starting at `HOME` from its Tier-1
+      environment record — `/home`, which `build_app_namespace` binds to the user's subtree.
 
-- [ ] **Navigate** — into a directory on a row press, up on a control in the chrome. A path
-      strip showing where you are, which is also the affordance the address bar becomes later.
+      **The listing rule moved down a layer first.** "A path's entries are the filesystem's plus
+      the namespace bindings mounted there, with bindings shadowing" lived in `list.rs`; it is
+      `libfs::list_dir` now, shared with `list`. A browser that re-derived it would show a mount
+      point twice — once as the directory it covers — and that is exactly the class of rule Part
+      A's own review caught a copy of.
+
+- [x] **Navigate** ✅ — into a directory on a row press or Enter, up on the strip's control or
+      Backspace. A path strip showing where you are, which is also the affordance the address
+      bar becomes later. **The keyboard and the pointer reach the same three messages**, because
+      a browser where Enter and a row press disagree about what "open" means is two browsers.
 
       **`widget-toolkit.md` §8 names "the file browser" as the trigger for scrolling containers**,
       and this part expects not to fire it: `list_view` carries its own scroll, and a browser whose
@@ -2761,15 +2768,35 @@ its second designed consumer was always a list of things on disk.
       honouring §8's *other* trigger, the text area, and a sibling passed over in silence reads as
       an oversight.
 
-- [ ] **Open a file** by launching the editor on it, through the shell's launcher — which is the
-      *other* half of what makes this milestone's applications composable, and it is not
-      drag-and-drop: it is one application asking the shell to start another with an argument.
+- [ ] **Open a file** by launching the editor on it — **moved to Part D**, where there is an
+      editor to launch. Building the mechanism here would mean gating a launch request against a
+      program that does not exist, and a row that launched nothing would be a control that looks
+      live — the defect M8's overview shipped three of. A file row does nothing today and the
+      host test says so by name.
 
-- [ ] **Gate**: `check-login` boots the release image, launches `nxfiles` from the applications
-      modal, and asserts what it listed — against a directory the image *has*, so the assertion
-      is a fact about the filesystem rather than about a fixture. Control: an empty directory
-      lists nothing and says so, which is the arm that a browser reporting a stale listing
-      passes.
+- [x] **Gate** ✅ — `check-login` step 7, and it uses the two sessions as one fact. The **serial**
+      shell creates a directory; the **graphical** browser is then asserted to see it, descend
+      into it with Enter, report it empty, and come back up with Backspace. Nothing is arranged
+      by the harness: the two halves see the same subtree because `libsession::build_namespace`
+      and `desktop-shell::build_app_namespace` bind it identically, which is M10's decision 1
+      load-bearing for the third time.
+
+      The count in `HOME` is *read and reported*, not asserted — what is in a user's home is the
+      image's business, and a gate that pinned it would fail the first time anything else wrote
+      there. What is asserted is the part the gate creates: `listed /home/papers - 0 entries`.
+
+      **Four host controls, each watched to fail by name**: files sorting among directories, a
+      file row navigating, the selection surviving a new listing, and "up" not stopping at the
+      root. **Two of those tests were decoration until the control was run** — with the reset
+      deleted, one arrow press leaves the selection at `Some(0)`, which is what the correct code
+      produces, so both tests passed for both implementations. They press twice now.
+
+- [x] **And the browser closes itself, which the first version could not** ✅ (PR #257 review).
+      Without a close button and without honouring `CloseRequested`, the *only* way to close it
+      was the taskbar's middle-click — which asks, waits out the two-second grace period, and
+      then destroys the window with `Manage::Close`. That is the path the shell documents as
+      being for a client that has stopped answering, and every close of this application would
+      have taken it.
 
 ### Part C — the text area
 

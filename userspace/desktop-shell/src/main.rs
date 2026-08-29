@@ -908,7 +908,8 @@ fn recv_handle(ch: u64) -> u64 {
 
 /// Block until `h` is signalled.
 fn wait_one(h: u64) -> bool {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers, and `WAIT_RESULTS` holds one
+    // `IoResult` per handle in the set — see its declaration for why that is the requirement.
     let waited = unsafe {
         WAIT_HANDLES[0] = h;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
@@ -1061,10 +1062,23 @@ fn launch(
 /// deliberately dull: below the bar, stepped. A real one is `desktop-shell.md`'s to specify.
 const CASCADE_STEP: i32 = 24;
 
-/// Wait set: the compositor's event channel, and the manager channel.
+/// Wait set: the compositor's event channel, the manager channel, `/dev/desktop` and its
+/// sessions.
 static mut WAIT_HANDLES: [u64; 2 + 1 + MAX_DESKTOP_SESSIONS] = [0; 3 + MAX_DESKTOP_SESSIONS];
-/// One 24-byte `IoResult`.
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// One 24-byte `IoResult` **per handle in the set**, because that is what the kernel writes.
+///
+/// `sys_wait` takes no length for this buffer: it writes one record for *every signalled*
+/// handle (`kernel/src/syscall/table.rs`, `k * size_of::<IoResult>()`), and the caller is
+/// required to have room for all of them. This was sized at one record while the handle set
+/// grew to seven — so any wake where two handles signalled together wrote 24 bytes past the
+/// end of a static. Nothing had noticed because the shell reads only the first record, and the
+/// bytes past it land in whatever the linker put next.
+///
+/// Every other server in this tree already sizes it this way (`compositor`,
+/// `logging-service`, `fs-server-ext4`); `session-mgr` waits on exactly one handle, where one
+/// record is right. Found by the PR #257 reviewer while reading something else.
+static mut WAIT_RESULTS: [u8; 24 * (3 + MAX_DESKTOP_SESSIONS)] =
+    [0; 24 * (3 + MAX_DESKTOP_SESSIONS)];
 
 /// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying

@@ -395,6 +395,11 @@ fn cmd_build(mode: BuildMode) -> R<()> {
         "nxterm",
         mode.is_test_harness().then_some("test-harness"),
     )?;
+    // The file browser (M10 Part B). A lib/bin split like `nxterm`: the listing, the view and
+    // the update are host-tested, the bin is the window and the event pump. No `test-harness`
+    // feature — what its gate asserts is the line it prints when it lists a directory, which a
+    // release image prints too, so there is nothing to compile in conditionally.
+    build_userspace_bin("nxfiles", None)?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
@@ -2585,6 +2590,46 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("password:")?;
     session.send(DEMO_PASSWORD)?;
     session.expect("/home>")?;
+
+    // 7. **The file browser, and the two sessions used as one fact** (M10 Part B). The serial
+    //    shell just logged in above, and it sees the *same* `/home` subtree the graphical
+    //    session does — `libsession::build_namespace` and `desktop-shell::build_app_namespace`
+    //    bind it identically, which is the assumption M10's decision 1 rests on. So the serial
+    //    side can *make* the thing the graphical side is then asserted to see, which is a
+    //    stronger gate than a fixture: nothing here is arranged by the harness.
+    session.send("mkdir ./papers")?;
+    session.expect("/home>")?;
+
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+    for c in "nxfiles".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxfiles into its own namespace")?;
+    // **It starts at `HOME`**, which is the binding the shell gave it and not a path compiled
+    // in. The count is read rather than asserted: what is in a user's home is the image's
+    // business, and a gate that pinned it would fail the first time anything else wrote there.
+    session.expect("nxfiles: listed /home - ")?;
+    let listed = session.rest_of_line()?;
+    println!("  ok: nxfiles started at HOME and listed it ({})", listed.trim());
+
+    // **Enter descends into the selected row**, which is the directory the serial side just
+    // made: directories sort before files and a fresh listing selects row 0, so this is the
+    // keyboard reaching the same message a row press produces. If `/home` ever holds a
+    // directory sorting before `papers`, this fails naming the path it did open — which is a
+    // loud failure rather than a quiet one.
+    press(&mut qmp, "ret")?;
+    session.expect("nxfiles: listed /home/papers - 0 entries")?;
+    println!("  ok: Enter descended, and an empty directory lists nothing");
+
+    // And Backspace leaves it again. Two navigations, both from the keyboard, because a
+    // listing a person cannot drive without aiming at it is a listing they have to aim at.
+    press(&mut qmp, "backspace")?;
+    session.expect("nxfiles: listed /home - ")?;
+    println!("  ok: Backspace went back up");
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
@@ -5133,6 +5178,17 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `nxfiles` — what a listing *is*: sorted, marked, navigable. Every rule is a decision
+    // about a `Vec`, which is why the browser's half that reads a disk is the binary's and this
+    // one runs in milliseconds. `--lib` skips the bare-target `[[bin]]`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("nxfiles")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `nxsh` language tests — lexer and parser (Milestone 3 Part A). The whole language
     // is a library with no syscalls in it precisely so it can be tested here, in a
     // second, rather than through a 90-second boot. `--lib` skips the bare-target bin.
@@ -7099,6 +7155,9 @@ fn profile_programs() -> Vec<&'static str> {
     // The terminal is a program a person runs, not a service the system runs — the same class
     // as the shell beside it. Part C's `session-mgr` will spawn it from `/bin` like any other.
     v.push("nxterm");
+    // The file browser, likewise a program a person runs. In `/bin`, so the applications modal
+    // lists it without anything being told about it (M10 Part B).
+    v.push("nxfiles");
     v
 }
 

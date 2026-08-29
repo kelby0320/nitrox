@@ -19974,3 +19974,97 @@ covers a thing is worse than no claim, since it is the one somebody acts on. The
 `copy_tree`, read the crate doc in the file they are editing, run the gate it names, watch it
 pass, and ship; the gate that would have caught them was never started. **A coverage claim is a
 factual claim about a specific command, and is worth checking like one.**
+
+---
+
+## 2026-08-31 — M10 Part B: the second application, and what it says about the toolkit
+
+`nxfiles` lists a directory, descends, and comes back up. It is the first application built
+*after* the toolkit was finished rather than alongside it, which makes it the only honest answer
+to a question `libui` could not ask itself: is this usable by somebody who is not extending it at
+the same time?
+
+**Mostly yes, and the exception cost a four-minute boot.** The browser needed no new widget —
+`list_view`'s second designed consumer was always a list of things on disk — and its whole view
+is nine lines of `dock`, `row` and `list_view`. What it did need, twice, was the diff's rule that
+a container's children are **all keyed or all unkeyed**.
+
+**And the two keying errors have different symptoms, which the first version of this entry got
+wrong.** `MixedKeying` fails on the **first** frame — the check runs against an empty previous
+list for a new node too — and in an application that treats an undiffable view as fatal, that
+means *no window ever appears*. `KeyingChanged` is the second-frame one, because it needs a
+successful first frame to compare against, and *its* symptom is the window that paints once and
+then goes dead. Merging them under the wrong name would have taught the next author to look for
+the wrong thing entirely (PR #257 review, blocking 2).
+
+**The fix that matters is not the keys, it is where the failure was found.** The first instance
+cost a full `check-login` run to see. The second was found in a millisecond by a host test that
+diffs three consecutive frames and **reports which one failed** — a test any application using
+this toolkit should have, and one that is now written for the next author to copy. Reporting the
+frame number is not decoration: it is what tells the two errors apart.
+
+**The listing rule went down a layer before the browser could copy it.** "A path's entries are
+the filesystem's plus the namespace bindings mounted there, with bindings shadowing" lived in
+`list.rs`; `nxfiles` needed exactly it, and a second derivation would have shown a mount point
+twice — once as the directory it covers. Part A's review had just caught a copy of `join` left
+behind by the same kind of move, so this one moved first rather than being noticed later.
+
+**The gate uses the two sessions as one fact.** The serial shell creates a directory; the
+graphical browser is asserted to see it, descend into it, report it empty, and come back up.
+Nothing is arranged by the harness — the two halves see the same subtree because
+`libsession::build_namespace` and `desktop-shell::build_app_namespace` bind it identically, which
+is M10's decision 1 doing load-bearing work for the third time. A gate that seeded a fixture
+would prove less and be easier to write.
+
+**And two of the browser's own tests were decoration until the control was run.** With the
+selection reset deleted, one arrow press leaves the selection at `Some(0)` — the same value the
+correct code produces — so both the reset test and the empty-listing test passed for both
+implementations. This is the fifth instance this phase of the same shape: **the setup was chosen
+to illustrate the property rather than to reach the code that computes it.** The fix is always
+the same, and it is always one line: move the pre-state somewhere the two implementations
+disagree about.
+
+**One box moved rather than shrank.** "Open a file by launching the editor" is Part D's now,
+because there is no editor to launch. Building the request here would mean gating it against a
+program that does not exist, and a row that launched nothing would be a control that looks live —
+the defect M8's overview shipped three of. A file row does nothing today, and a host test says so
+by name.
+
+---
+
+## 2026-08-31 — Part B's review: a widget's return value, and a static sized for one
+
+**The scrolled list state was being thrown away**, which is the kind of defect that passes every
+test and fails every user. `list_view` takes its state by value and returns it scrolled to follow
+the selection; `nxfiles` wrote `let (list, _) = …`. The offset therefore re-derived from zero on
+every frame, which parks the selection on the *last visible row* for ever: press Up in a list
+longer than the window and the highlight does not move — the whole listing scrolls down by one
+underneath it, repainting the entire list area instead of two rows.
+
+**The fix chose the API that cannot be got wrong.** The toolkit's other consumer returns the
+state to *its* caller, and copying that here would have moved the mistake rather than removed it —
+the next author writes `let (ui, _) = app.view()` and is back where we started. `view` takes
+`&mut self` and writes the state back itself. A view that mutates is a small wart; a view whose
+correctness depends on the caller remembering something is a bigger one.
+
+**Two keying errors, two symptoms, and I had merged them.** `MixedKeying` — some children keyed,
+some not — fires on the **first** frame, because the check runs against an empty previous list for
+a new node as well; in an application that treats an undiffable view as fatal, that means *no
+window ever appears*. `KeyingChanged` is the second-frame one, since it needs a successful first
+frame to compare against, and *that* is the window which paints once and goes dead. The note I
+wrote described the second symptom under the first name, in four places including the test's own
+name. A comment that teaches the next author to look for the wrong symptom is worse than no
+comment: they will conclude their bug is something else.
+
+**And a static sized for one record behind a wait set of seven.** `sys_wait` writes one 24-byte
+`IoResult` for every *signalled* handle and takes no length for that buffer — the caller is
+required to have room for all of them. `desktop-shell` declared `[u8; 24]` while its handle set
+grew to `2 + 1 + MAX_DESKTOP_SESSIONS`, so any wake with two handles ready wrote 24 bytes past the
+end of a static. Nothing noticed because the shell reads only the first record and the overrun
+lands in whatever the linker put next. Every other server in the tree already sizes it
+`MAX * 24`.
+
+Found by a reviewer *reading something else* — it is in no diff this PR touches. Worth recording
+for what it says about where this class hides: **a buffer whose size is a literal and whose
+consumer is a growing set will not be revisited when the set grows**, because nothing links them.
+The fix ties the two together in the declaration.

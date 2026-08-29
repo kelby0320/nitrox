@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-08-27), and this document describes what
+**Status: built (2026-08-11, last checked 2026-08-31), and this document describes what
 exists.** M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
 the *text area* is still absent and a single line is not the same widget. M9 Part A added
 `title_bar` and, with it, `on_press_down` — the first handler in this toolkit that fires on the
@@ -622,7 +622,11 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   react to something other than input.
 - **Scrolling containers.** The terminal's scrollback is the `custom` grid's own business;
   a general scroll viewport is a different widget with clipping and virtualisation
-  questions. Trigger: the file browser.
+  questions. Trigger was "the file browser" — **which landed in M10 Part B (2026-08-31) and did
+  not fire it**: `nxfiles`' whole content is one `list_view`, which carries its own scrolling, so
+  nothing needed a container that scrolls. The trigger stands, narrowed to what would actually
+  produce one: **chrome that must stay put while content moves under it** — a path strip beside a
+  scrolling pane, or the editor's gutter.
 - **Multi-window applications.** One `App` drives one window. Trigger: dialogs that are
   real windows rather than `stack` overlays.
 

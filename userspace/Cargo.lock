@@ -270,6 +270,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxfiles"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
+ "libfs",
+ "libheap",
+ "libkern",
+ "librsproto",
+ "libstream",
+ "libsurface",
+ "libui",
+]
+
+[[package]]
 name = "nxsh"
 version = "0.1.0"
 dependencies = [
