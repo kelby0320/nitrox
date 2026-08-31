@@ -10,6 +10,7 @@
 //!   check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry
 //!   check-docs      fail if a doc links to, or cites, a path that does not exist
 //!   check-images    fail if a test image and a release image differ by anything new
+//!   preview         render the toolkit on the host to a PNG; no boot
 //!   check-display   boot + screendump; compare the screen against a libdraw render
 //!   check-terminal  boot + type into the GUI terminal; assert the shell answered
 //!   check-login     boot the release image + drive the graphical greeter to a session
@@ -18,9 +19,12 @@
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
-//! Stays on std and avoids external crates so the host build can be a
-//! single `cargo run -p xtask`. No "stable Rust only" rule applies here
-//! the way it does to the kernel; this is host tooling.
+//! **Host tooling, and the kernel's rules do not reach it.** No "stable Rust only" and no
+//! "no external crates": both are about what runs on the target. What applies here is written
+//! down in `tools/CLAUDE.md` — the bar a host dependency clears, and why the checked-in lockfile
+//! is what pins it. This file said "avoids external crates" until M11 Part A took `png`, which
+//! is the sort of stale rule a reader hits before they find the reasoning (PR #261 review,
+//! finding 1).
 
 use std::env;
 use std::error::Error;
@@ -186,6 +190,13 @@ fn main() -> ExitCode {
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
         Some("check-images") => cmd_check_images(),
+        // **The first *positional* argument, not the first argument.** `qargs` has the global
+        // flags stripped, and anything else beginning with `-` is a flag this command does not
+        // have — landing one in the name slot reports "no preview called `--offline`", which
+        // names the wrong problem (PR #261 review, optional 3).
+        Some("preview") => cmd_preview(
+            qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
+        ),
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
@@ -230,6 +241,7 @@ fn print_help() {
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
+           preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
@@ -3616,6 +3628,130 @@ fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
 /// is the *binding* — base address, stride, channel order — not the compositing, which
 /// §8b already covers.
 ///
+/// `cargo xtask preview [ui|term|all]` — render the toolkit on the host and write it as a PNG.
+///
+/// **The whole point is that a judgement about how something looks should cost a glance rather
+/// than a boot** (M11 Part A). Polish is a hundred small decisions, and a decision that costs
+/// three minutes of QEMU is a decision not made — so this puts the same renders `check-display`
+/// adjudicates against into a file anyone can open.
+///
+/// **The same renderer, deliberately.** `xtask` already links `libui`, `libdraw` and `libterm`
+/// because the display gate renders the expected picture here rather than checking in a golden
+/// file. This is a second entry point onto that, not a second renderer: a preview that could
+/// differ from what the gate demands of the guest would be a picture of nothing in particular.
+///
+/// **What it cannot show**, said plainly so nobody reads more into it: anything the *compositor*
+/// draws — the cursor, the drag outline, the background between windows — and the arrangement of
+/// real windows on a real screen. Those are composed in the guest by clients that have to run.
+/// What this covers is the toolkit's own surfaces, which is where most of the polish lives.
+fn cmd_preview(what: &str) -> R<()> {
+    let font = host_font()?;
+    let dir = build_cache();
+    fs::create_dir_all(&dir).ok();
+    let frames = preview_frames(&font);
+    let names: Vec<&str> = frames.iter().map(|(n, _)| *n).collect();
+    if what != "all" && !names.contains(&what) {
+        // Checked before anything is drawn: the first version reported this by rendering both
+        // references a second time purely to list their names.
+        return Err(format!(
+            "no preview called {what:?} — try `all` or one of: {}",
+            names.join(", ")
+        )
+        .into());
+    }
+    for (name, frame) in &frames {
+        if what != "all" && what != *name {
+            continue;
+        }
+        let (w, h, rgb) = rgb_of(frame);
+        let path = dir.join(format!("preview-{name}.png"));
+        write_png(&path, w, h, &rgb)?;
+        println!("xtask: {} ({w}x{h})", path.display());
+    }
+    Ok(())
+}
+
+/// The font every host-side render uses — the same file the image build stages at
+/// `/system/fonts/`, so a picture drawn here is drawn with the font the guest will read.
+fn host_font() -> R<libdraw::text::Font> {
+    let path = repo_root().join("assets/fonts/DejaVuSansMono.ttf");
+    libdraw::text::Font::from_bytes(
+        fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?,
+    )
+    .ok_or_else(|| "the vendored font did not parse on the host".into())
+}
+
+/// One reference render by name, for the gate that compares it against a guest.
+///
+/// **The gate reads this rather than calling the renderer itself**, which is what makes
+/// `preview_frames` the single source it claims to be: adding a region to `check-display` and
+/// adding a preview are one change, and a preview that stopped being the gate's picture fails
+/// against the guest instead of quietly becoming a picture of nothing (PR #261 review, finding 2).
+fn reference_frame(
+    font: &libdraw::text::Font,
+    name: &str,
+) -> R<libdraw::framebuffer::MemFramebuffer> {
+    preview_frames(font)
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, f)| f)
+        .ok_or_else(|| format!("no reference render called {name:?}").into())
+}
+
+/// Every arrangement the host can render, by name.
+///
+/// **The one place either the preview or the display gate builds a reference picture.** Both used
+/// to construct their own; the comment claiming they were the same renders was true and unenforced
+/// until it was tested, and a solid rectangle at the right size passed everything.
+fn preview_frames(
+    font: &libdraw::text::Font,
+) -> Vec<(&'static str, libdraw::framebuffer::MemFramebuffer)> {
+    vec![
+        ("ui", libui::reference::render(font)),
+        ("term", libterm::render::reference::render_with(font)),
+    ]
+}
+
+/// A framebuffer's visible pixels as RGB triples, row-major.
+///
+/// **Read through `Framebuffer::get_pixel` rather than off the bytes**, which is not laziness:
+/// the toolkit reference's pitch is 1292 for a 1280-byte row, and `XRGB8888` stores
+/// little-endian — so the bytes run blue, green, red, pad. Walking the buffer directly is two
+/// chances to be wrong (a stride and a channel order) in code whose only job is to be a faithful
+/// copy, and `libdraw` already answers both questions correctly for its own compositing.
+fn rgb_of(fb: &libdraw::framebuffer::MemFramebuffer) -> (u32, u32, Vec<u8>) {
+    use libdraw::framebuffer::Framebuffer;
+    let g = fb.geometry();
+    let mut out = Vec::with_capacity((g.width as usize) * (g.height as usize) * 3);
+    for y in 0..g.height {
+        for x in 0..g.width {
+            let p = Framebuffer::get_pixel(fb, x, y).unwrap_or_default();
+            out.extend_from_slice(&[p.r, p.g, p.b]);
+        }
+    }
+    (g.width, g.height, out)
+}
+
+/// Write `rgb` — `w * h` triples — to `path` as an 8-bit RGB PNG.
+fn write_png(path: &std::path::Path, w: u32, h: u32, rgb: &[u8]) -> R<()> {
+    fs::write(path, encode_png(w, h, rgb)?).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// The PNG's bytes, for a caller that wants them without a file — which is what lets the test
+/// below decode what was encoded rather than trusting that it round-trips.
+fn encode_png(w: u32, h: u32, rgb: &[u8]) -> R<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(|e| format!("png header: {e}"))?;
+        writer.write_image_data(rgb).map_err(|e| format!("png data: {e}"))?;
+    }
+    Ok(out)
+}
+
 /// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
 /// so the plan runs it once per display-arm change.
 fn cmd_check_display(accel: Accel) -> R<()> {
@@ -3801,11 +3937,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The font both reference renders are drawn with here — the same file the image build
     // stages at `/system/fonts/`, against a guest render made from the bytes it read off the
     // disk. This is the only check anywhere that a font loads on the target at all.
-    let font_file = repo_root().join("assets/fonts/DejaVuSansMono.ttf");
-    let font = libdraw::text::Font::from_bytes(
-        fs::read(&font_file).map_err(|e| format!("read {}: {e}", font_file.display()))?,
-    )
-    .ok_or("the vendored font did not parse on the host")?;
+    let font = host_font()?;
 
     // **The terminal's picture**, between the two. Same construction and the same argument as
     // the toolkit's: `libterm` on the host renders the fixed reference stream, the guest renders
@@ -3813,10 +3945,21 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // above do not cover. This is the only place a terminal render is checked against pixels
     // that actually reached a screen — every other check on it is the guest agreeing with
     // itself.
+    // **Taken from `preview_frames`, which is what makes "a second entry point, not a second
+    // renderer" true rather than claimed.** Both were built here independently until PR #261's
+    // review demonstrated the gap: a preview replaced by a solid rectangle *at the gate's
+    // dimensions* left every host test passing, because nothing tied the two together but a
+    // comment. One source means the drift is not possible, and a wrong source fails here —
+    // against a real guest, which is the only thing that can tell a render from a picture.
     let (uw, uh) = (libui::reference::WIDTH, libui::reference::HEIGHT);
-    let term = libterm::render::reference::render_with(&font);
-    let tsize = libterm::render::reference::size(&font);
-    let (tw, th) = (tsize.w, tsize.h);
+    let term = reference_frame(&font, "term")?;
+    // The terminal's size comes from the frame rather than from `reference::size`, for the same
+    // reason: two answers to one question are two answers that can differ. The host test still
+    // compares them, so the agreement is asserted somewhere.
+    let (tw, th) = {
+        let g = libdraw::framebuffer::Framebuffer::geometry(&term);
+        (g.width, g.height)
+    };
     // The stacking the exclusions below assume, stated rather than trusted: each window must sit
     // wholly inside the one beneath it, or a region the gate believes it is comparing is covered
     // by something it is not comparing against — a hole that would be silent.
@@ -3858,7 +4001,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // Compared everywhere *except* the rectangles of the windows above it. That exclusion is
     // not a weakening: a compositor that stacked them the other way would fail the comparisons
     // above, so the ordering is still covered.
-    let ui = libui::reference::render(&font);
+    let ui = reference_frame(&font, "ui")?;
     let mut ui_mismatches = 0usize;
     let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     let mut ui_compared = 0usize;
@@ -7953,6 +8096,70 @@ fn format_cmd(cmd: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A preview is the same picture the display gate demands of the guest.
+    ///
+    /// **What this pins, and what it deliberately no longer claims to.** *Sharing* is structural
+    /// now: `cmd_check_display` reads its expected frames from `preview_frames`, so a preview
+    /// that is not the gate's picture fails against a real guest rather than passing here. This
+    /// test said the size assertion would catch "a different size **or theme**" and it would not —
+    /// a solid rectangle at 320×300 passed it (PR #261 review, finding 2).
+    ///
+    /// What it does pin is worth pinning. The sizes are the gate's own constants and
+    /// `libterm`'s own `size()`, which is the one place those agree with the frames the gate
+    /// measures. And the PNG is **decoded back to the framebuffer's pixels**, which covers the
+    /// conversion: the toolkit reference's pitch is 1292 for a 1280-byte row and `XRGB8888` is
+    /// little-endian, so a direct copy is wrong twice over — a stride and a channel order.
+    ///
+    /// Decoded rather than compared against what went in, because a round trip through one
+    /// library's encoder and back tests the encoder; what is under test here is the pixels.
+    #[test]
+    fn a_preview_is_the_picture_the_display_gate_demands() {
+        use libdraw::framebuffer::Framebuffer;
+        let font = host_font().expect("the vendored font");
+        let frames = preview_frames(&font);
+
+        let sizes: Vec<(&str, u32, u32)> = frames
+            .iter()
+            .map(|(n, f)| (*n, f.geometry().width, f.geometry().height))
+            .collect();
+        let term = libterm::render::reference::size(&font);
+        assert_eq!(
+            sizes,
+            [
+                ("ui", libui::reference::WIDTH, libui::reference::HEIGHT),
+                ("term", term.w, term.h),
+            ],
+            "the previews are the gate's arrangements, at the gate's sizes"
+        );
+
+        for (name, frame) in &frames {
+            let (w, h, rgb) = rgb_of(frame);
+            let png = encode_png(w, h, &rgb).expect("encode");
+            let decoder = png::Decoder::new(std::io::Cursor::new(png));
+            let mut reader = decoder.read_info().expect("a readable PNG");
+            let info = reader.info().clone();
+            assert_eq!((info.width, info.height), (w, h), "{name}: size on the way out");
+            assert_eq!(info.color_type, png::ColorType::Rgb, "{name}: eight-bit RGB");
+
+            let mut buf = vec![0u8; reader.output_buffer_size().expect("a bounded image")];
+            let out = reader.next_frame(&mut buf).expect("one frame");
+            let decoded = &buf[..out.buffer_size()];
+
+            for y in 0..h {
+                for x in 0..w {
+                    let want = Framebuffer::get_pixel(frame, x, y).unwrap_or_default();
+                    let i = ((y as usize) * (w as usize) + x as usize) * 3;
+                    assert_eq!(
+                        (decoded[i], decoded[i + 1], decoded[i + 2]),
+                        (want.r, want.g, want.b),
+                        "{name}: pixel {x},{y} came back different"
+                    );
+                }
+            }
+        }
+    }
 
     /// The line scanner both directions share.
     ///
@@ -8141,7 +8348,7 @@ mod tests {
         // A comment mentioning it is not a call site either.
         assert_eq!(scope_binding("/// calls enter_interrupt()"), ScopeBinding::Temporary);
     }
-    use super::*;
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);

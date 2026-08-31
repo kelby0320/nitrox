@@ -25,3 +25,9 @@ libui = { path = "../../userspace/libui" }
 # one place that can see `libterm` and `libui` at once, which is what makes their shared
 # background colour checkable rather than merely claimed (PR #189 review, finding 6).
 libterm = { path = "../../userspace/libterm" }
+# **An external crate, and the first in `tools/`.** The forbidden list is about the *kernel*, and
+# `userspace/CLAUDE.md`'s bar is about what ships in the image; this is build tooling that runs on
+# the host and reaches no target. What it buys is that a render made here can be *looked at* —
+# which is the whole of Part A, and a hand-rolled encoder would be a hundred lines of checksum
+# arithmetic standing between a judgement about how something looks and seeing it.
+png = "0.18.1"
