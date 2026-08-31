@@ -2362,15 +2362,19 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
         work.0, work.1, work.2, work.3
     ))?;
-    session.expect(&format!(
-        "desktop-shell: window {term_id} geometry {},{} ",
-        work.0, work.1
-    ))?;
-    // **The client's own report, before the geometry that proves it.** It says what it did with
-    // the size *and* what that came to in cells, which is the difference between a window that
-    // grew and a terminal that can use the room: a grid still 80x24 in a 1280x752 window would
-    // satisfy every other line here.
-    session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2, work.3))?;
+    // **Two producers, one cause, so no order between them.** The shell logs the window's new
+    // origin when the compositor's geometry event reaches it; the client logs the size it took
+    // when the `Configure` reaches it. Both are downstream of the same apply and neither is
+    // downstream of the other, so on four vCPUs either can reach the console first. Asserted as
+    // a sequence this passed for two milestones and then failed in CI with both lines present
+    // and the *first* expect having scanned past the second (2026-08-31).
+    //
+    // The client's line says what it did with the size *and* what that came to in cells, which
+    // is the difference between a window that grew and a terminal that can use the room: a grid
+    // still 80x24 in a 1280x752 window would satisfy every other line here.
+    let moved = format!("desktop-shell: window {term_id} geometry {},{} ", work.0, work.1);
+    let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);
+    session.expect_all(&[&moved, &took])?;
     // And the committed geometry — the one the compositor reports and `/dev/draw/<id>/info`
     // answers with — is the work area exactly, not the work area rounded down to whole cells.
     session.expect(&format!(
@@ -4553,45 +4557,113 @@ impl Session {
                 }
             }
             if std::time::Instant::now() > deadline {
-                // **Distinguish "the guest said nothing" from "the guest stopped early".**
-                // They are the same line in the log and completely different faults: no
-                // output at all usually means QEMU never got as far as the guest — a disk
-                // held open by an orphaned instance, a missing image, bad firmware — while
-                // partial output is a real hang, and the tail says where.
-                let g = self.out.lock().map_err(|_| "transcript lock")?;
-                if g.trim().is_empty() {
-                    return Err(format!(
-                        "timed out after {TIMEOUT:?} waiting for {pat:?}, and the guest \
-                         produced NO output at all — this is usually QEMU failing to start \
-                         rather than a hang (a stale qemu-system-x86_64 holding \
-                         build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
-                    )
-                    .into());
-                }
-                let tail: String = g.chars().rev().take(400).collect::<Vec<_>>()
-                    .into_iter().rev().collect();
-                // **The whole transcript goes to a file, not just the tail.**
-                //
-                // The tail is what you read first and it is almost never enough: these gates
-                // fail *between* two things the guest said, so the interesting part is the
-                // hundred lines before the end. The transcript was already accumulated in
-                // full and only ever printed truncated, which cost three separate
-                // investigations in M5 and M6 — each one reduced to guessing at a guest whose
-                // log existed and was thrown away.
-                let path = build_cache().join(format!("guest-transcript-{}.log", self.gate));
-                let saved = fs::write(&path, g.as_str()).is_ok();
-                let where_ = if saved {
-                    format!("\n\nthe full transcript is at {}", path.display())
-                } else {
-                    String::new()
-                };
-                return Err(format!(
-                    "timed out after {TIMEOUT:?} waiting for {pat:?}; last output was:\n{tail}{where_}"
-                )
-                .into());
+                return Err(self.timeout_report(&format!("{pat:?}"), TIMEOUT)?.into());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Wait for **all** of `pats`, in whatever order the guest emits them.
+    ///
+    /// **For lines whose order is not the guest's to guarantee.** [`expect`](Self::expect)
+    /// consumes forward — a match moves the cursor past it — so a chain of them asserts a
+    /// *sequence*, and that is the right shape when one line causes the next. It is the wrong
+    /// shape when two processes react to the same event: they are scheduled independently on
+    /// four vCPUs and the order they reach the serial console in is not a property of the
+    /// system. Asserted as a sequence, the pair passes until the day the other one wins, and
+    /// then fails by scanning *past* the line it will ask for next — so the timeout names a
+    /// line that is sitting in the transcript, which reads like a lost message and is not one.
+    ///
+    /// Observed on 2026-08-31: maximising the terminal makes `desktop-shell` log the window's
+    /// new geometry and `nxterm` log the size it took, both downstream of one compositor apply
+    /// and neither downstream of the other.
+    ///
+    /// **This is not a licence to unorder an assertion that is merely inconvenient.** A pair
+    /// belongs here only when nothing in the system orders it — where one line's producer sends
+    /// the message that causes the other's, the sequence is the assertion. `configure_window`
+    /// logging before it sends is what makes every `… window N to …` → `nxterm: resized …` pair
+    /// in this file a genuine chain.
+    fn expect_all(&mut self, pats: &[&str]) -> R<()> {
+        for pat in pats {
+            if let Some(echoed) = echo_source(&self.sent_since_match, pat) {
+                return Err(format!(
+                    "expect_all({pat:?}) is satisfied by the guest's echo of the text just \
+                     typed ({echoed:?}) — see `expect`, which explains the whole trap."
+                )
+                .into());
+            }
+        }
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let found: Vec<(usize, &str)> = pats
+                    .iter()
+                    .filter_map(|p| g[self.cursor..].find(p).map(|i| (i + p.len(), *p)))
+                    .collect();
+                if found.len() == pats.len() {
+                    // **Past the last of them, not the first.** The cursor is what stops a
+                    // later step matching a line this one already accounted for, and the whole
+                    // point here is that which of these is last is not known in advance.
+                    let mut found = found;
+                    found.sort_by_key(|(end, _)| *end);
+                    for (_, p) in &found {
+                        println!("  ok: saw {p:?}");
+                    }
+                    self.cursor += found.last().map_or(0, |(end, _)| *end);
+                    self.sent_since_match.clear();
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let missing: Vec<&str> =
+                    pats.iter().copied().filter(|p| !g[self.cursor..].contains(p)).collect();
+                drop(g);
+                // Naming the ones that *did* arrive is the point: an unordered wait that times
+                // out with one of two lines present is a different fault from one with neither.
+                let what = format!("all of {pats:?}, still missing {missing:?}");
+                return Err(self.timeout_report(&what, TIMEOUT)?.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// What a timed-out wait reports, and the transcript it saves on the way out.
+    ///
+    /// Shared so that every wait fails the same way, and **distinguishes "the guest said
+    /// nothing" from "the guest stopped early".** They are the same line in the log and
+    /// completely different faults: no output at all usually means QEMU never got as far as the
+    /// guest — a disk held open by an orphaned instance, a missing image, bad firmware — while
+    /// partial output is a real hang, and the tail says where.
+    ///
+    /// **The whole transcript goes to a file, not just the tail.** The tail is what you read
+    /// first and it is almost never enough: these gates fail *between* two things the guest
+    /// said, so the interesting part is the hundred lines before the end. The transcript was
+    /// already accumulated in full and only ever printed truncated, which cost three separate
+    /// investigations in M5 and M6 — each one reduced to guessing at a guest whose log existed
+    /// and was thrown away.
+    fn timeout_report(&self, waiting_for: &str, timeout: std::time::Duration) -> R<String> {
+        let g = self.out.lock().map_err(|_| "transcript lock")?;
+        if g.trim().is_empty() {
+            return Ok(format!(
+                "timed out after {timeout:?} waiting for {waiting_for}, and the guest \
+                 produced NO output at all — this is usually QEMU failing to start \
+                 rather than a hang (a stale qemu-system-x86_64 holding \
+                 build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
+            ));
+        }
+        let tail: String =
+            g.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+        let path = build_cache().join(format!("guest-transcript-{}.log", self.gate));
+        let saved = fs::write(&path, g.as_str()).is_ok();
+        let where_ = if saved {
+            format!("\n\nthe full transcript is at {}", path.display())
+        } else {
+            String::new()
+        };
+        Ok(format!("timed out after {timeout:?} waiting for {waiting_for}; last output was:\n{tail}{where_}"))
     }
 
     /// Send bytes with **no trailing newline** — for keys that are not a line.

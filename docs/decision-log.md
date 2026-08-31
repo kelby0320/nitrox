@@ -20169,3 +20169,43 @@ came of having no diagnosis to attach: a gate that asserts an exact position and
 reads as stable right up until the run that loses a packet. The split assertion — position first,
 effect second — is what made the second occurrence legible in one line, which is the thing it was
 added for. Its own claim of stability was the part that needed correcting.
+
+## 2026-09-01 — Two processes, one cause, no order: `expect_all` and the sequence that was never a sequence
+
+The same CI job then failed a step further on, in `check-login`, and the second failure is a
+different fault with the same shape as the first: a gate asserting something the system never
+promised.
+
+**What happened.** The maximise round trip timed out waiting for
+`nxterm: resized to 1280x752, grid ` — a line that is *in the transcript*, four lines above the
+tail the failure printed. `expect` consumes forward, so the previous step's pattern
+(`desktop-shell: window 8 geometry 0,24 `) had matched the shell's geometry line and moved the
+cursor past the client's, which was sitting in front of it.
+
+**Why the order is not the guest's to promise.** Both lines are downstream of one compositor
+apply and neither is downstream of the other: the shell logs when the geometry event reaches it,
+the client logs when the `Configure` does. They are separate processes on four vCPUs. Asserted as
+a sequence the pair passed for two milestones, which is what an unordered pair does until the
+other one wins.
+
+**`Session::expect_all` waits for a set rather than a sequence** — every pattern present, in any
+order, cursor advanced past the last of them. The distinction it makes is the one worth keeping:
+where a line's producer *sends the message that causes* the other line, the sequence **is** the
+assertion, and `configure_window` logging before it sends is exactly what makes every
+`… window N to …` → `nxterm: resized …` pair in these gates a genuine chain. Only the pair with no
+such link is unordered, and the doc says so, so that this does not become the way to make an
+inconvenient assertion pass.
+
+**Proven by two controls rather than by a green run.** A green run proves nothing here: locally
+the lines arrive in the order the old code assumed. So the wait was run with its two patterns
+*reversed* against that stream — the arrangement the old sequential code could not survive — and
+the gate passed; and an unmatchable pattern was added to a wait in `check-terminal` to see the
+failure path name the missing line and save the transcript, which also exercises the timeout
+report now shared by both waits.
+
+**And the pattern that made it worse is worth naming**: the step matched
+`window 8 geometry 0,24 ` with no size, so it matched the *intermediate* geometry line — the move
+half of the maximise, before the resize. A prefix that matches two lines is a cursor that can end
+up in two places. The assertion is kept as it was, because the intermediate line is real evidence
+that the origin is applied as `Place` would apply it; what changed is that it no longer claims to
+know whether the client answered first.
