@@ -665,6 +665,18 @@ pub struct TextAreaState {
     goal: Option<usize>,
     /// The first visible line.
     offset: usize,
+    /// How many times the *text* has changed.
+    ///
+    /// **Because "is this buffer modified?" is a question only the state can answer.** An editor
+    /// asking it from outside has two bad options: compare the whole text against a copy on
+    /// every keystroke, or re-derive which keycodes edit — a second copy of [`apply`]'s dispatch
+    /// that goes stale the first time this type learns a key. Byte length cannot stand in for
+    /// it either: replacing a one-character selection with one character leaves the length
+    /// unchanged.
+    ///
+    /// Movement never bumps it, and neither does an edit that did nothing — `Backspace` at the
+    /// start of the buffer, `Delete` at its end.
+    revision: u64,
 }
 
 impl Default for TextAreaState {
@@ -676,6 +688,7 @@ impl Default for TextAreaState {
             anchor: None,
             goal: None,
             offset: 0,
+            revision: 0,
         }
     }
 }
@@ -726,6 +739,17 @@ impl TextAreaState {
     /// The first visible line.
     pub fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// How many times the text has changed — the buffer's identity for a "modified" marker.
+    ///
+    /// Compare it against the value taken when the file was last read or written; equal means
+    /// what is on screen is what is on disk. Never reset, so a buffer edited, saved and edited
+    /// again reads as modified, and one edited back to a saved state still does — an editor
+    /// claiming a file is unmodified because the text happens to match again would be claiming
+    /// to have diffed it.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The selection as `(start, end)` in document order, or `None`.
@@ -812,6 +836,7 @@ impl TextAreaState {
         self.col = sc;
         self.anchor = None;
         self.goal = None;
+        self.revision += 1;
         true
     }
 
@@ -821,6 +846,7 @@ impl TextAreaState {
         self.lines[self.line].insert(self.col, c);
         self.col += c.len_utf8();
         self.goal = None;
+        self.revision += 1;
     }
 
     /// Split the line at the cursor, replacing any selection.
@@ -831,6 +857,7 @@ impl TextAreaState {
         self.line += 1;
         self.col = 0;
         self.goal = None;
+        self.revision += 1;
     }
 
     /// Delete backwards: the selection if there is one, else the character before the cursor,
@@ -844,6 +871,7 @@ impl TextAreaState {
             let prev = self.prev_boundary();
             self.lines[self.line].remove(prev);
             self.col = prev;
+            self.revision += 1;
             return true;
         }
         if self.line == 0 {
@@ -856,6 +884,7 @@ impl TextAreaState {
         self.line -= 1;
         self.col = self.lines[self.line].len();
         self.lines[self.line].push_str(&cur);
+        self.revision += 1;
         true
     }
 
@@ -868,6 +897,7 @@ impl TextAreaState {
         self.goal = None;
         if self.col < self.lines[self.line].len() {
             self.lines[self.line].remove(self.col);
+            self.revision += 1;
             return true;
         }
         if self.line + 1 >= self.lines.len() {
@@ -875,6 +905,7 @@ impl TextAreaState {
         }
         let next = self.lines.remove(self.line + 1);
         self.lines[self.line].push_str(&next);
+        self.revision += 1;
         true
     }
 
@@ -2305,6 +2336,48 @@ mod tests {
         }
         let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
         assert_eq!(a.offset(), 0, "and it scrolls back the other way");
+    }
+
+    #[test]
+    fn the_revision_counts_edits_and_not_movement() {
+        // **What an editor's "modified" marker is made of.** The alternatives it replaces are
+        // both wrong: comparing byte length misses replacing a one-character selection with one
+        // character, and re-deriving which keycodes edit is a second copy of `apply`'s dispatch.
+        let mut a = area();
+        let start = a.revision();
+
+        for k in [KEY_RIGHT, KEY_DOWN, KEY_END, KEY_HOME, KEY_UP, KEY_LEFT] {
+            a.apply(k, 0);
+        }
+        assert_eq!(a.revision(), start, "moving is not editing");
+
+        // **Typed with nothing selected, and that is not incidental.** The first version made a
+        // selection first and then typed, so the insert's own bump was covered by the deletion
+        // of the selection — the assertion passed with `insert` not counting at all.
+        a.apply(KEY_X, 0);
+        assert!(a.revision() > start, "typing is");
+
+        let mut sel = area();
+        let quiet = sel.revision();
+        for _ in 0..2 {
+            sel.apply(KEY_RIGHT, MOD_SHIFT);
+        }
+        assert_eq!(sel.revision(), quiet, "nor is selecting");
+
+        // The case a length comparison cannot see: one character selected, one typed.
+        let mut b = TextAreaState::with_text("abc");
+        b.apply(KEY_RIGHT, MOD_SHIFT);
+        let before = b.revision();
+        let len = b.text().len();
+        b.apply(KEY_X, 0);
+        assert_eq!(b.text().len(), len, "the fixture must keep its length, or it proves nothing");
+        assert!(b.revision() > before, "replacing a selection is an edit");
+
+        // And an edit that does nothing is not one.
+        let mut c = TextAreaState::with_text("abc");
+        let quiet = c.revision();
+        assert!(!c.apply(KEY_BACKSPACE, 0), "backspace at the start of the buffer does nothing");
+        assert_eq!(c.revision(), quiet, "so it is not an edit");
     }
 
     #[test]

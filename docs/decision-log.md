@@ -20247,3 +20247,66 @@ broken version too**, and forward-only was exactly that.
 
 The reference stays forward-only on purpose: the picture is one arrangement rather than a gallery,
 and the directions belong in host tests where they can be counted.
+
+## 2026-09-01 — M10 Part D: the editor, and the request that turned out not to be a launch
+
+The plan asked for a text editor opened "from an argument (which is how the browser launches
+it)". The editor is the ordinary half. The parenthesis is where the design changed.
+
+**A browser cannot launch anything, and should not be able to.** An application's namespace is
+built by `desktop-shell` and holds `/dev/draw/new`, `/home`, a terminal and `/dev/desktop` — no
+`/bin`, no `BIND_NAMESPACE`, nothing to resolve an image from. That is not an oversight to route
+around; it is the property `verify_app_namespace` refuses to launch without. So "open this file"
+is a **question the browser asks the shell**, and `Desktop::Open` (`0x0C03`) carries a path.
+
+**The path, never the program**, which is the same argument M10's decision 1 made about the drop
+payload arriving in a second place. A request naming a program would be the shell running
+arbitrary code on a caller's say-so — ambient authority delivered through a protocol instead of
+through a handle. A request naming a path asks a question the shell already answers for its own
+launcher, and the answer stays the launcher's: one constant today (`nxedit`), an extension table
+the day a second program can open something.
+
+**And the shell does not check the path first.** It could stat it, and the answer would be about
+the *shell's* namespace rather than the caller's or the opener's — three namespaces that agree
+today only because one process builds all three, which is exactly the kind of agreement not to
+build on. What the path turns out to be is reported by whatever opens it, in the window the
+person who asked is looking at.
+
+**The second client is what moved the plumbing.** `desktop` — the coreutil — hand-rolled the
+send, the `sys_wait`, the recv and the reply decode; `nxfiles` needed the same. Both now use
+`librsproto::desktop::Desktop`, and `Dir`'s `round_trip` was extracted so the two clients of one
+envelope share one implementation of it. The error type came along too: the distinction between
+a dead channel, a refusal, and the refusal's `KError` was learned the expensive way in PR #245
+and would have had to be learned again.
+
+**What the editor decides is what a failed save means.** A temporary beside the target, renamed
+over it — the sequence `coreutils` has used since M3.5 — and on failure the buffer is *kept*, and
+kept **modified**. Marking it saved would be the editor losing somebody's work while telling them
+it had not.
+
+**The failure the plan did not name is the more dangerous one: a buffer that could not be read.**
+A failed read shows an empty window, and saving that over a file is the file destroyed by an
+editor that never displayed it. So a blocked buffer declines to be written and says why, and a
+directory and a file that is not UTF-8 both block rather than opening as nothing. A *missing*
+file is not a failure — opening a path that is not there is how a file gets made — and the strip
+says which of the two happened, because somebody who meant to open an existing file wants to know
+they did not.
+
+**"Modified" is derived, and that needed a counter in the widget.** `TextAreaState` gained a
+`revision`, because the two alternatives are both wrong: byte length misses replacing a
+one-character selection with one character, and re-deriving which keycodes edit is a second copy
+of `apply`'s dispatch that goes stale the first time the widget learns a key. Only the state
+knows whether the text changed.
+
+**The gate asserts from outside the accused**, which is the whole shape of Part D's proof: the
+serial session makes the file, the graphical browser opens it, six keystrokes each get a receipt,
+`Ctrl+S` saves — and then `nxsh`'s `open` reads the file back and the gate matches what the
+*shell* prints. The control is the reason to trust it: with the rename removed, the editor still
+reported "saved — 7 bytes" and the gate failed at the read-back.
+
+**Two of nine controls found decoration rather than confirming it.** The chord test used
+`Ctrl+X`, which the keymap folds to a control byte the text area already declines — so it passed
+with the guard deleted; `Ctrl+1` is printable and does not. And the revision test made a selection
+before typing, so the insert's own count was covered by the deletion of the selection. Both are
+the same recurring mistake: **a fixture chosen to illustrate the property rather than to reach
+the code that computes it.**

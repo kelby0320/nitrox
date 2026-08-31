@@ -27,6 +27,15 @@
 //! `ui-composition-model.md` §6's "name it if it turns out to matter" turned into the lifecycle
 //! rule itself.
 //!
+//! ## What is no longer here
+//!
+//! **The resolve, the send, the `sys_wait` and the reply decode.** They were this file's until
+//! M10 Part D made `nxfiles` the second client of `/dev/desktop` — a browser asking the shell to
+//! open a file — and they live in [`librsproto::desktop::Desktop`] now. The code is the same
+//! code; what changed is that there is one of it. Even the error type came along, because the
+//! distinction it draws (transport, refusal, and the refusal's `KError`) was learned here and
+//! would have had to be learned again.
+//!
 //! ## Positions, not ids
 //!
 //! Every operand is a **position**, one-based, as the indicator counts them. Ids are stable and
@@ -43,6 +52,7 @@ use coreutils::args::parse;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::{exit, kprint};
 use libkern::debug::Line;
+use librsproto::desktop::{Desktop, DesktopError};
 
 /// `alloc` backing.
 #[global_allocator]
@@ -82,7 +92,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     // `test-harness` only — so on a release image, which is what `check-login` boots, the
     // stage's output is invisible and a failure would look like the command never ran.
     kprint(b"desktop: running\n");
-    let Some(ch) = open_desktop(ns) else {
+    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut desktop) = Desktop::connect(ns, &mut buf) else {
         kprint(b"desktop: /dev/desktop did not resolve\n");
         stage.die(
             b"desktop: no /dev/desktop in this namespace -- not a graphical session\n",
@@ -92,17 +103,18 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let ops: alloc::vec::Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let code = match ops.as_slice() {
-        [] => list(&stage, ch),
+        [] => list(&stage, &mut desktop),
         ["switch", n] => match parse_index(n) {
-            Some(i) => switch(&stage, ch, i),
+            Some(i) => switch(&stage, &mut desktop, i),
             None => stage.die(b"desktop: switch takes a position, starting at 1\n", EXIT_USAGE),
         },
         ["name", n, rest @ ..] if !rest.is_empty() => match parse_index(n) {
-            Some(i) => name(&stage, ch, i, rest),
+            Some(i) => name(&stage, &mut desktop, i, rest),
             None => stage.die(b"desktop: name takes a position, starting at 1\n", EXIT_USAGE),
         },
         _ => stage.die(b"desktop: bad operands (try --help)\n", EXIT_USAGE),
     };
+    desktop.close();
     exit(code)
 }
 
@@ -112,128 +124,11 @@ fn parse_index(s: &str) -> Option<u32> {
     (n >= 1).then_some(n)
 }
 
-/// Resolve `/dev/desktop` and return the session channel.
-fn open_desktop(ns: u64) -> Option<u64> {
-    use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
-    use libkern::syscall::{SYS_NS_LOOKUP, syscall4};
-    let path = b"/dev/desktop";
-    // SAFETY: a lookup on this process's own namespace, with a valid path slice.
-    let pending = unsafe {
-        syscall4(
-            SYS_NS_LOOKUP,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT,
-        )
-    };
-    if pending < 0 {
-        return None;
-    }
-    // **Async, like every potentially-blocking syscall**: the lookup returns a
-    // `PendingOperation` and the answer is read out of the wait result, not an out-param.
-    let mut results = [0u8; 24];
-    let handles = [pending as u64];
-    // SAFETY: waiting on the pending operation this process just created.
-    unsafe {
-        libkern::syscall::syscall4(
-            libkern::syscall::SYS_WAIT,
-            handles.as_ptr() as u64,
-            1,
-            results.as_mut_ptr() as u64,
-            u64::MAX,
-        )
-    };
-    let status = i32::from_le_bytes([results[8], results[9], results[10], results[11]]);
-    let handle = u64::from_le_bytes([
-        results[16], results[17], results[18], results[19], results[20], results[21],
-        results[22], results[23],
-    ]);
-    (status == 0 && handle != 0).then_some(handle)
-}
-
-/// Why a request produced no reply body.
-///
-/// **The distinction is the point.** The first version collapsed all three into `None`, so a
-/// channel that died and a shell that answered `Unsupported` both printed *no such desktop* —
-/// a diagnosis of the operand for a fault that had nothing to do with it (PR #245 review,
-/// finding 9). `Refused` carries the shell's own `KError` code so the message can name it.
-enum ReqError {
-    /// The send failed, the recv failed, or the reply did not decode: the channel is gone or
-    /// the peer is not speaking this protocol.
-    Transport,
-    /// The shell replied with `RS_FLAG_ERROR`. The code is its `KError` as an `i32`, or `None`
-    /// if the error reply carried no body.
-    Refused(Option<i32>),
-}
-
-/// Send one request and return its reply body.
-fn request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Result<usize, ReqError> {
-    use libkern::abi::SENDMODE_NOBLOCK;
-    use libkern::syscall::{SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_WAIT, syscall4, syscall5};
-    let mut msg = alloc::vec![0u8; 4096];
-    let Some(n) = librsproto::encode(&mut msg[24..], op, 1, 0, body, 0) else {
-        return Err(ReqError::Transport);
-    };
-    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-    let handles = [0u64; 1];
-    // SAFETY: a send on a channel this process owns, with valid buffers.
-    let r = unsafe {
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            msg.as_ptr() as u64,
-            handles.as_ptr() as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    if r != 0 {
-        return Err(ReqError::Transport);
-    }
-    // Wait for the reply rather than polling: the shell answers on its next loop pass.
-    let wait = [ch];
-    let mut results = [0u8; 24];
-    // SAFETY: waiting on the channel handle this process owns.
-    unsafe { syscall4(SYS_WAIT, wait.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
-    let mut rmsg = alloc::vec![0u8; 4096];
-    // Sized from the ABI rather than from what the shell is expected to send: `recv` copies
-    // out the *sender's* count, bounded only by `IPC_HANDLE_MAX`.
-    let mut rhandles = [0u64; libkern::abi::IPC_HANDLE_MAX];
-    let mut rcount = 0usize;
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            rmsg.as_mut_ptr() as u64,
-            rhandles.as_mut_ptr() as u64,
-            (&raw mut rcount) as u64,
-        )
-    };
-    if rr != 0 {
-        return Err(ReqError::Transport);
-    }
-    let payload = u32::from_le_bytes([rmsg[4], rmsg[5], rmsg[6], rmsg[7]]) as usize;
-    let Ok(m) = librsproto::decode(&rmsg[24..24 + payload.min(4096 - 24)]) else {
-        return Err(ReqError::Transport);
-    };
-    if m.flags & librsproto::RS_FLAG_ERROR != 0 {
-        // The shell's `bad()` sends the `KError` as four little-endian bytes.
-        let code = (m.body.len() >= 4)
-            .then(|| i32::from_le_bytes([m.body[0], m.body[1], m.body[2], m.body[3]]));
-        return Err(ReqError::Refused(code));
-    }
-    let len = m.body.len().min(out.len());
-    out[..len].copy_from_slice(&m.body[..len]);
-    Ok(len)
-}
-
 /// `desktop` with no operands.
-fn list(stage: &Stage, ch: u64) -> i64 {
+fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
     use librsproto::desktop::{DesktopList, OP_DESKTOP_LIST};
     let mut out = alloc::vec![0u8; 1024];
-    let n = match request(ch, OP_DESKTOP_LIST, &[], &mut out) {
+    let n = match desktop.request(OP_DESKTOP_LIST, &[], &mut out) {
         Ok(n) => n,
         Err(e) => return fail(stage, b"list the desktops", e),
     };
@@ -329,14 +224,14 @@ fn emit(stage: &Stage, stdout: u64, list: &librsproto::desktop::DesktopList<'_>)
 }
 
 /// `desktop switch N`.
-fn switch(stage: &Stage, ch: u64, index: u32) -> i64 {
+fn switch(stage: &Stage, desktop: &mut Desktop<'_>, index: u32) -> i64 {
     use librsproto::desktop::{DesktopIndex, OP_DESKTOP_SWITCH};
     let mut body = [0u8; 4];
     if (DesktopIndex { index }).write(&mut body).is_none() {
         return EXIT_FAILURE;
     }
     let mut out = [0u8; 16];
-    if let Err(e) = request(ch, OP_DESKTOP_SWITCH, &body, &mut out) {
+    if let Err(e) = desktop.request(OP_DESKTOP_SWITCH, &body, &mut out) {
         return fail(stage, b"switch", e);
     }
     Line::new().s(b"desktop: switched to ").u(index as u64).end();
@@ -344,7 +239,7 @@ fn switch(stage: &Stage, ch: u64, index: u32) -> i64 {
 }
 
 /// `desktop name N LABEL...`.
-fn name(stage: &Stage, ch: u64, index: u32, words: &[&str]) -> i64 {
+fn name(stage: &Stage, desktop: &mut Desktop<'_>, index: u32, words: &[&str]) -> i64 {
     use librsproto::desktop::{DesktopIndex, MAX_DESKTOP_NAME, OP_DESKTOP_NAME};
     let mut label = String::new();
     for (i, w) in words.iter().enumerate() {
@@ -363,7 +258,7 @@ fn name(stage: &Stage, ch: u64, index: u32, words: &[&str]) -> i64 {
     }
     body[4..].copy_from_slice(label.as_bytes());
     let mut out = [0u8; 16];
-    if let Err(e) = request(ch, OP_DESKTOP_NAME, &body, &mut out) {
+    if let Err(e) = desktop.request(OP_DESKTOP_NAME, &body, &mut out) {
         return fail(stage, b"name that desktop", e);
     }
     Line::new().s(b"desktop: named ").u(index as u64).s(b" ").s(label.as_bytes()).end();
@@ -376,13 +271,13 @@ fn name(stage: &Stage, ch: u64, index: u32, words: &[&str]) -> i64 {
 /// the shell said the operand was the problem: `InvalidArgument` is what its `bad()` sends for
 /// a position that does not exist, and anything else gets its code printed rather than a
 /// diagnosis this command is in no position to make.
-fn fail(stage: &Stage, verb: &[u8], e: ReqError) -> i64 {
+fn fail(stage: &Stage, verb: &[u8], e: DesktopError) -> i64 {
     let mut text = String::from("desktop: ");
     match e {
-        ReqError::Refused(Some(c)) if c == libkern::error::KError::InvalidArgument.as_i32() => {
+        DesktopError::Refused(Some(c)) if c == libkern::error::KError::InvalidArgument.as_i32() => {
             text.push_str("no such desktop\n");
         }
-        ReqError::Refused(code) => {
+        DesktopError::Refused(code) => {
             text.push_str("the shell refused to ");
             text.push_str(core::str::from_utf8(verb).unwrap_or("act"));
             if let Some(c) = code {
@@ -392,8 +287,13 @@ fn fail(stage: &Stage, verb: &[u8], e: ReqError) -> i64 {
             }
             text.push('\n');
         }
-        ReqError::Transport => {
+        DesktopError::Transport(_) => {
             text.push_str("lost the connection to the graphical session\n");
+        }
+        // The request did not fit its buffer — this command's operands are a number and a
+        // bounded name, so it means a bug here rather than anything about the session.
+        DesktopError::Protocol => {
+            text.push_str("could not encode that request\n");
         }
     }
     stage.diag(text.as_bytes());

@@ -93,6 +93,34 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
     }
 }
 
+/// Ask `desktop-shell` to open `path`, and say whether it took the request.
+///
+/// **A session per request, rather than one held for the browser's run.** The shell allows a
+/// bounded number of `/dev/desktop` sessions and this one is used once per file opened — where a
+/// held session would be a slot occupied for the whole run of every browser window, to save a
+/// resolve that happens at human speed. It is also the shape that cannot leak one: the session
+/// is closed on every path out of this function.
+///
+/// The answer is about the *request*: the shell replies once it has launched something, which is
+/// before that program has read anything. What the file turned out to be is the opener's to
+/// report, in its own window.
+fn ask_shell_to_open(root_ns: u64, path: &str) -> bool {
+    use librsproto::desktop::Desktop;
+    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let Ok(mut desktop) = Desktop::connect(root_ns, &mut buf) else {
+        kprint(b"nxfiles: no /dev/desktop; cannot open anything\n");
+        return false;
+    };
+    let ok = desktop.open(path.as_bytes()).is_ok();
+    desktop.close();
+    if ok {
+        libkern::debug::Line::new().s(b"nxfiles: asked to open ").s(path.as_bytes()).end();
+    } else {
+        libkern::debug::Line::new().s(b"nxfiles: could not open ").s(path.as_bytes()).end();
+    }
+    ok
+}
+
 /// Paint `damage` of `app` into `fb`.
 fn draw(
     fb: &mut MemFramebuffer,
@@ -249,6 +277,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The listing is read here, not in `update`.** `update` is a function of values; a
         // directory read is a syscall, and the application says where it wants to be rather
         // than going there itself.
+        // **Asking the shell to open a file, which is where a browser's authority stops.** It
+        // has no `/bin`, no way to build a namespace and no business spawning anything; what it
+        // has is `/dev/desktop`, bound into every application namespace by the shell that built
+        // it. So the browser names a path and the shell decides what opens it (M10 Part D).
+        if let Some(path) = app.take_open() {
+            let ok = ask_shell_to_open(root_ns, &path);
+            app.opened(&path, ok);
+        }
         if let Some(to) = app.take_goto() {
             navigate(&mut app, root_ns, &to);
             // **Round again rather than waiting**, or the listing just installed is not drawn

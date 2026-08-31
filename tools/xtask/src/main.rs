@@ -400,6 +400,10 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // feature — what its gate asserts is the line it prints when it lists a directory, which a
     // release image prints too, so there is nothing to compile in conditionally.
     build_userspace_bin("nxfiles", None)?;
+    // The text editor (M10 Part D), split the same way and for the same reason. No
+    // `test-harness` feature either: what its gate asserts is what it prints when it opens and
+    // saves a file, which a release image prints too.
+    build_userspace_bin("nxedit", None)?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
@@ -2645,6 +2649,62 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
     println!("  ok: Backspace went back up");
+
+    // 8. **The editor, opened by the browser, and read back by the shell** (M10 Part D). The
+    //    same two-session fact as step 7, used the other way round: there the serial side made
+    //    something the graphical side had to see; here the graphical side writes something the
+    //    serial side has to read. Nothing in between is arranged by the harness.
+    //
+    //    **The file is made empty and inside `papers`**, which is what makes the listing
+    //    deterministic: `/home` holds whatever the image put there, but `papers` was created by
+    //    step 7 and holds exactly this.
+    session.send("touch ./papers/notes.txt")?;
+    session.expect("/home>")?;
+
+    press(&mut qmp, "ret")?;
+    session.expect("nxfiles: listed /home/papers - 1 entries")?;
+
+    // **Enter on a file row asks the shell to open it**, which is Part B's box, moved here
+    // because it needed something to launch. The browser holds no authority to spawn anything —
+    // it names a path over `/dev/desktop` and the shell decides what opens it.
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxedit into its own namespace")?;
+    // **Two processes reacting to one launch, so no order between them**: the browser learns
+    // its request was taken when the shell's reply arrives, and the editor reads the file when
+    // the kernel gets round to running it.
+    let asked = String::from("nxfiles: asked to open /home/papers/notes.txt");
+    let opened = String::from("nxedit: opened /home/papers/notes.txt - 0 bytes");
+    session.expect_all(&[&asked, &opened])?;
+    println!("  ok: a file row launched the editor on the file it names");
+
+    // **A receipt per character, and it is a count rather than an echo.** An editor's echo is
+    // its own window, and this gate boots a release image — there are no rendered glyphs to
+    // read on serial. Injection is relative and unacknowledged, so without a per-key wait a
+    // dropped PS/2 batch would show up as a *wrong file* two steps later.
+    const TYPED: &str = "nitrox";
+    for (i, c) in TYPED.chars().enumerate() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxedit: buffer rev {}", i + 1))?;
+    }
+    println!("  ok: {} keystrokes reached the editor's buffer", TYPED.len());
+
+    // Ctrl+S, and the editor says what it wrote. Seven bytes: six typed and the newline the
+    // editor adds, because a last line without one reads as one line shorter than it looks.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: saved /home/papers/notes.txt - 7 bytes")?;
+
+    // **And the assertion is made from outside the editor.** Asking the editor what it saved
+    // would be asking the accused: it would answer from the buffer it holds, which is the thing
+    // in doubt. The serial session reads the file with `nxsh`'s `open` — there is no `cat`; a
+    // path is a stream — and what the shell prints is what is on disk.
+    session.send("open ./papers/notes.txt")?;
+    session.expect(TYPED)?;
+    session.expect("/home>")?;
+    println!("  ok: the shell read back what the editor saved, from outside it");
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
@@ -5268,6 +5328,17 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `nxedit` — what an editor *is*: a buffer, a modified marker, and what a failed save does
+    // to both. The rule that matters most here is the one a host test can pin and a gate cannot
+    // reach without a broken filesystem: a save that fails keeps the buffer.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("nxedit")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `nxsh` language tests — lexer and parser (Milestone 3 Part A). The whole language
     // is a library with no syscalls in it precisely so it can be tested here, in a
     // second, rather than through a 90-second boot. `--lib` skips the bare-target bin.
@@ -7237,6 +7308,11 @@ fn profile_programs() -> Vec<&'static str> {
     // The file browser, likewise a program a person runs. In `/bin`, so the applications modal
     // lists it without anything being told about it (M10 Part B).
     v.push("nxfiles");
+    // The editor (M10 Part D). In `/bin` for two reasons rather than one: the modal lists it,
+    // *and* `desktop-shell` resolves `/bin/nxedit` when a client asks it to open a path — so a
+    // build that packaged the browser and not the editor would present a file row that opens
+    // nothing, which is the failure this list exists to make impossible.
+    v.push("nxedit");
     v
 }
 

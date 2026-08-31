@@ -35,6 +35,34 @@ pub const OP_DESKTOP_SWITCH: u16 = 0x0C01;
 /// one op here that changes which desktops survive rather than which is showing.
 pub const OP_DESKTOP_NAME: u16 = 0x0C02;
 
+/// `Desktop::Open` — open a path with whatever program the shell says opens it. Body: the
+/// path's UTF-8 bytes, at most [`MAX_OPEN_PATH`].
+///
+/// **The client names the path, never the program**, and that is the whole of the design. An
+/// application holds no authority to spawn anything: `desktop-shell` is the process with the
+/// `/bin` to resolve an image from and the ability to build the namespace a new application
+/// runs in (`graphical-session.md` §3). A request naming a *program* would be asking the shell
+/// to run arbitrary code on the caller's say-so, which is ambient authority wearing a protocol;
+/// a request naming a *path* asks a question the shell already answers for its own launcher.
+///
+/// **What the reply means.** Success says the shell launched something, not that the program
+/// could read the file — an editor opened on a path it cannot read reports that in its own
+/// window, where the person who asked for it is looking. `NotFound` is the shell declining
+/// because nothing there resolves; `Unsupported` because nothing is registered to open it.
+///
+/// M10 Part D, and the first op here a *client* sends about something other than desktops. That
+/// it lives on this resource rather than a new one is deliberate: `/dev/desktop` is already the
+/// shell's channel, already bound into every application namespace, and a second endpoint for
+/// one op would be a binding to audit for no gain.
+pub const OP_DESKTOP_OPEN: u16 = 0x0C03;
+
+/// Longest path an [`Open`](OP_DESKTOP_OPEN) may name, in bytes.
+///
+/// Bounded like every other variable-length field here, and generously: a path is composed by
+/// walking a tree, so the bound wants to be above what a person can reach rather than above
+/// what a form can hold.
+pub const MAX_OPEN_PATH: usize = 512;
+
 /// Which desktop an op names — a **position**, one-based, as a person counts them.
 ///
 /// Not an id: ids are stable and never reused, so after a few desktops have come and gone they
@@ -146,6 +174,129 @@ impl<'a> DesktopList<'a> {
             left -= 1;
             Some(DesktopEntry { id, name })
         })
+    }
+}
+
+/// A client of `/dev/desktop`: an endpoint handle and the one message buffer its traffic uses.
+///
+/// **The buffer is the caller's**, exactly as [`Dir`](crate::session::Dir)'s is, so this crate
+/// stays `alloc`-free and a coreutil can put 4 KiB on its stack while a graphical client keeps
+/// one for its whole run.
+///
+/// It exists because there are two clients now. `desktop` — the coreutil — hand-rolled the
+/// send, the `sys_wait`, the recv and the reply decode, and M10 Part D added `nxfiles` asking
+/// the shell to open a file. A second copy of that is how two implementations of one wire
+/// format come to disagree, so it moved down here beside the ops it speaks.
+#[cfg(feature = "io")]
+pub struct Desktop<'a> {
+    endpoint: u64,
+    buf: &'a mut [u8],
+    next_request_id: u64,
+}
+
+/// What a `/dev/desktop` request can fail with.
+///
+/// **Three cases and not one**, which the coreutil learned the expensive way: collapsing them
+/// meant a dead channel and a shell answering `Unsupported` both printed *no such desktop* — a
+/// diagnosis of the operand for a fault that had nothing to do with it (PR #245 review,
+/// finding 9).
+#[cfg(feature = "io")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DesktopError {
+    /// A syscall failed, or the reply did not decode: the channel is gone, or the peer is not
+    /// speaking this protocol. The payload is the syscall's negative return where there was one.
+    Transport(i32),
+    /// The request did not fit the message buffer.
+    Protocol,
+    /// The shell replied with an error. The payload is its `KError`, or `None` if the error
+    /// reply carried no body.
+    Refused(Option<i32>),
+}
+
+#[cfg(feature = "io")]
+impl<'a> Desktop<'a> {
+    /// Resolve `/dev/desktop` in `ns` and wrap the session it answers with.
+    ///
+    /// `buf` must be at least [`IPC_MSG_SIZE`](libkern::abi::IPC_MSG_SIZE) bytes.
+    pub fn connect(ns: u64, buf: &'a mut [u8]) -> Result<Desktop<'a>, DesktopError> {
+        use libkern::abi::IPC_MSG_SIZE;
+        use libkern::syscall::{SYS_NS_LOOKUP, syscall4};
+        if buf.len() < IPC_MSG_SIZE {
+            return Err(DesktopError::Protocol);
+        }
+        let path = b"/dev/desktop";
+        // SAFETY: a valid path slice and a namespace handle this process holds.
+        let po = unsafe {
+            syscall4(
+                SYS_NS_LOOKUP,
+                ns,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                crate::session::DIR_SESSION_RIGHTS,
+            )
+        };
+        if po < 0 {
+            return Err(DesktopError::Transport(po as i32));
+        }
+        let (status, endpoint) = crate::session::po_wait(po as u64);
+        if status < 0 {
+            return Err(DesktopError::Transport(status));
+        }
+        if endpoint == 0 {
+            return Err(DesktopError::Protocol);
+        }
+        Ok(Desktop { endpoint, buf, next_request_id: 1 })
+    }
+
+    /// Wrap an endpoint resolved elsewhere. Takes ownership: [`close`](Self::close) closes it.
+    pub fn from_endpoint(endpoint: u64, buf: &'a mut [u8]) -> Result<Desktop<'a>, DesktopError> {
+        if buf.len() < libkern::abi::IPC_MSG_SIZE {
+            return Err(DesktopError::Protocol);
+        }
+        Ok(Desktop { endpoint, buf, next_request_id: 1 })
+    }
+
+    /// Close the session's endpoint.
+    ///
+    /// Explicit rather than a `Drop`, for [`Dir`](crate::session::Dir)'s reason: dropping
+    /// cannot report a failure, and a handle close is worth not doing silently.
+    pub fn close(self) {
+        // SAFETY: closing an endpoint this session owns.
+        unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, self.endpoint) };
+    }
+
+    /// Send one request and copy its reply body into `out`, returning the length written.
+    pub fn request(&mut self, op: u16, body: &[u8], out: &mut [u8]) -> Result<usize, DesktopError> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body)
+            .map_err(|e| match e {
+                crate::session::WireError::Transport(c) => DesktopError::Transport(c),
+                crate::session::WireError::Protocol => DesktopError::Protocol,
+            })?;
+        let payload = &self.buf[24..24 + len];
+        let msg = crate::decode(payload).map_err(|_| DesktopError::Transport(0))?;
+        if msg.flags & crate::RS_FLAG_ERROR != 0 {
+            // The shell's error reply is its `KError` as four little-endian bytes.
+            let code = (msg.body.len() >= 4)
+                .then(|| i32::from_le_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]));
+            return Err(DesktopError::Refused(code));
+        }
+        let n = msg.body.len().min(out.len());
+        out[..n].copy_from_slice(&msg.body[..n]);
+        Ok(n)
+    }
+
+    /// Ask the shell to open `path` with whatever program opens it — [`Open`](OP_DESKTOP_OPEN).
+    ///
+    /// Returns once the shell has answered, which is *before* the program it launched has drawn
+    /// anything: what is being waited for is the decision, not the window.
+    pub fn open(&mut self, path: &[u8]) -> Result<(), DesktopError> {
+        if path.is_empty() || path.len() > MAX_OPEN_PATH {
+            return Err(DesktopError::Protocol);
+        }
+        let mut out = [0u8; 8];
+        self.request(OP_DESKTOP_OPEN, path, &mut out).map(|_| ())
     }
 }
 

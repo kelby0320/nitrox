@@ -238,80 +238,122 @@ impl<'a> Dir<'a> {
     fn round_trip(&mut self, op: u16, body: &[u8]) -> Result<usize> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-
-        let region = &mut self.buf[PAYLOAD_OFF..];
-        let rs_len = crate::encode(region, op, request_id, 0, body, 0).ok_or(DirError::Protocol)?;
-        self.buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
-            .copy_from_slice(&(rs_len as u32).to_le_bytes());
-        self.buf[OFF_HANDLE_COUNT] = 0;
-
-        // A session reply is one message on a channel we are the sole client of, so the
-        // ring always has room: a non-blocking send is correct and avoids a PO round trip.
-        // SAFETY: `buf` is a valid IPC_MSG_SIZE buffer; no handles accompany the request.
-        let sent = unsafe {
-            syscall5(
-                SYS_CHANNEL_SEND,
-                self.endpoint,
-                self.buf.as_ptr() as u64,
-                0,
-                0,
-                SENDMODE_NOBLOCK,
-            )
-        };
-        if sent != 0 {
-            return Err(DirError::Transport(sent as i32));
-        }
-
-        // Park until the reply lands, then take it. `sys_wait` is where the thread
-        // blocks — never inside the send or the recv.
-        let handles = [self.endpoint];
-        let mut results = [0u8; 24];
-        // SAFETY: valid handle array + result out-buffer for one waiter.
-        let waited = unsafe {
-            syscall4(
-                SYS_WAIT,
-                handles.as_ptr() as u64,
-                1,
-                results.as_mut_ptr() as u64,
-                u64::MAX,
-            )
-        };
-        if waited != 1 {
-            return Err(DirError::Transport(waited as i32));
-        }
-
-        let mut transferred = [0u64; 8];
-        let mut count: usize = 0;
-        // SAFETY: valid message/handle/count out-params.
-        let got = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                self.endpoint,
-                self.buf.as_mut_ptr() as u64,
-                transferred.as_mut_ptr() as u64,
-                (&raw mut count) as u64,
-            )
-        };
-        if got != 0 {
-            return Err(DirError::Transport(got as i32));
-        }
-        // Close anything the server transferred: no directory op sends handles, and
-        // leaking one on a misbehaving server would exhaust the table over a long listing.
-        for h in transferred.iter().take(count.min(8)) {
-            // SAFETY: closing a handle just installed into our table.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
-        }
-        let payload_len = u32::from_le_bytes([
-            self.buf[OFF_PAYLOAD_LEN],
-            self.buf[OFF_PAYLOAD_LEN + 1],
-            self.buf[OFF_PAYLOAD_LEN + 2],
-            self.buf[OFF_PAYLOAD_LEN + 3],
-        ]) as usize;
-        if payload_len < RS_HEADER_LEN || PAYLOAD_OFF + payload_len > self.buf.len() {
-            return Err(DirError::Protocol);
-        }
-        Ok(payload_len)
+        round_trip(self.endpoint, self.buf, request_id, op, body).map_err(DirError::from)
     }
+}
+
+/// What a round trip on a session channel can fail with, before any protocol on top of it.
+///
+/// **Not [`DirError`]**, because this is the transport under *every* session client and the
+/// directory protocol is only one of them. Each client maps it into its own error type, which
+/// is where "the server refused" — a well-formed reply carrying an error — belongs; a refusal
+/// is not a transport fault and this layer never sees one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WireError {
+    /// A syscall failed; the payload is its negative return.
+    Transport(i32),
+    /// The request did not fit the buffer, or the reply did not parse as one.
+    Protocol,
+}
+
+impl From<WireError> for DirError {
+    fn from(e: WireError) -> Self {
+        match e {
+            WireError::Transport(c) => DirError::Transport(c),
+            WireError::Protocol => DirError::Protocol,
+        }
+    }
+}
+
+/// Send one request on `endpoint` and receive its reply into `buf`, returning the reply's
+/// rsproto payload length.
+///
+/// **Shared, because a session channel is a session channel.** [`Dir`] had this to itself until
+/// M10 Part D put a second client on the other end of the same envelope
+/// ([`crate::desktop::Desktop`]) — and the alternative was a second copy of the send, the
+/// `sys_wait`, the recv and the handle sweep, which is how two implementations of one wire
+/// format come to disagree. The rule this follows is the one `libfs` was extracted under: a
+/// helper with two consumers belongs below both.
+pub fn round_trip(
+    endpoint: u64,
+    buf: &mut [u8],
+    request_id: u64,
+    op: u16,
+    body: &[u8],
+) -> core::result::Result<usize, WireError> {
+    let region = &mut buf[PAYLOAD_OFF..];
+    let rs_len = crate::encode(region, op, request_id, 0, body, 0).ok_or(WireError::Protocol)?;
+    buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
+        .copy_from_slice(&(rs_len as u32).to_le_bytes());
+    buf[OFF_HANDLE_COUNT] = 0;
+
+    // A session reply is one message on a channel we are the sole client of, so the
+    // ring always has room: a non-blocking send is correct and avoids a PO round trip.
+    // SAFETY: `buf` is a valid IPC_MSG_SIZE buffer; no handles accompany the request.
+    let sent = unsafe {
+        syscall5(
+            SYS_CHANNEL_SEND,
+            endpoint,
+            buf.as_ptr() as u64,
+            0,
+            0,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sent != 0 {
+        return Err(WireError::Transport(sent as i32));
+    }
+
+    // Park until the reply lands, then take it. `sys_wait` is where the thread
+    // blocks — never inside the send or the recv.
+    let handles = [endpoint];
+    let mut results = [0u8; 24];
+    // SAFETY: valid handle array + result out-buffer for one waiter.
+    let waited = unsafe {
+        syscall4(
+            SYS_WAIT,
+            handles.as_ptr() as u64,
+            1,
+            results.as_mut_ptr() as u64,
+            u64::MAX,
+        )
+    };
+    if waited != 1 {
+        return Err(WireError::Transport(waited as i32));
+    }
+
+    let mut transferred = [0u64; 8];
+    let mut count: usize = 0;
+    // SAFETY: valid message/handle/count out-params.
+    let got = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            endpoint,
+            buf.as_mut_ptr() as u64,
+            transferred.as_mut_ptr() as u64,
+            (&raw mut count) as u64,
+        )
+    };
+    if got != 0 {
+        return Err(WireError::Transport(got as i32));
+    }
+    // Close anything the server transferred: no session op above this layer sends handles
+    // back, and leaking one on a misbehaving server would exhaust the table over a long
+    // listing.
+    for h in transferred.iter().take(count.min(8)) {
+        // SAFETY: closing a handle just installed into our table.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
+    }
+    let payload_len = u32::from_le_bytes([
+        buf[OFF_PAYLOAD_LEN],
+        buf[OFF_PAYLOAD_LEN + 1],
+        buf[OFF_PAYLOAD_LEN + 2],
+        buf[OFF_PAYLOAD_LEN + 3],
+    ]) as usize;
+    if payload_len < RS_HEADER_LEN || PAYLOAD_OFF + payload_len > buf.len() {
+        return Err(WireError::Protocol);
+    }
+    Ok(payload_len)
 }
 
 /// The `KError` an error reply carries, or a generic failure if the body is malformed.
@@ -323,7 +365,10 @@ fn server_error(body: &[u8]) -> i32 {
 }
 
 /// Wait on a `PendingOperation`, returning its `(status, result)` and closing it.
-fn po_wait(po: u64) -> (i32, u64) {
+///
+/// `pub(crate)` since M10 Part D: [`crate::desktop::Desktop`] resolves its endpoint the same
+/// way, and a second copy of eight lines of `sys_wait` plumbing is a second thing to get wrong.
+pub(crate) fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
     // SAFETY: valid handle array + result out-buffer for one waiter.
