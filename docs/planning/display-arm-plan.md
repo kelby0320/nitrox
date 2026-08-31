@@ -2768,11 +2768,13 @@ its second designed consumer was always a list of things on disk.
       honouring §8's *other* trigger, the text area, and a sibling passed over in silence reads as
       an oversight.
 
-- [ ] **Open a file** by launching the editor on it — **moved to Part D**, where there is an
-      editor to launch. Building the mechanism here would mean gating a launch request against a
-      program that does not exist, and a row that launched nothing would be a control that looks
-      live — the defect M8's overview shipped three of. A file row does nothing today and the
-      host test says so by name.
+- [x] **Open a file** by launching the editor on it ✅ — **built in Part D**, where there was an
+      editor to launch. Building the mechanism here would have meant gating a launch request
+      against a program that does not exist, and a row that launched nothing would be a control
+      that looks live — the defect M8's overview shipped three of. The waiting also changed the
+      answer: what landed is not a launch at all but `Desktop::Open`, a *path* handed to the
+      shell, because a browser holds no authority to spawn and asking for one would have been
+      the wrong shape however it was tested.
 
 - [x] **Gate** ✅ — `check-login` step 7, and it uses the two sessions as one fact. The **serial**
       shell creates a directory; the **graphical** browser is then asserted to see it, descend
@@ -2858,22 +2860,51 @@ them, which is the trigger §8 named.
 
 ### Part D — `nxedit`, the text editor
 
-- [ ] **Open, edit, save** — one file, one buffer. Opened from an argument (which is how the
-      browser launches it), read through `libfs`, saved back to the same path. A title bar
-      showing the name and whether the buffer is modified.
+- [x] **Open, edit, save** ✅ — one file, one buffer, in [`nxedit`](../../userspace/nxedit).
+      Opened from `argv[1]` (which is what the shell puts there), read through `libfs::read_file`,
+      written back with `libfs::write_file` + `rename`. The title bar shows the name and marks a
+      modified buffer, and "modified" is derived rather than tracked: `TextAreaState` gained a
+      **revision counter**, because the two alternatives are both wrong — comparing byte length
+      misses replacing a one-character selection with one character, and re-deriving which
+      keycodes edit is a second copy of the widget's own dispatch.
 
-- [ ] **Save is the part with a failure mode worth designing.** A save that truncates and then
-      fails leaves nothing; the editor writes and renames, which `libfs` already has because
-      `coreutils` needed it. What it does when the rename fails is *report and keep the buffer* —
-      an editor that loses your work quietly is the one thing an editor must never be.
+      **How the browser opens it is not a launch**, which is the part the plan did not predict.
+      A browser holds no authority to spawn a program and should not: no `/bin`, no
+      `BIND_NAMESPACE`. So `Desktop::Open` (`0x0C03`) carries a **path** to the shell, which
+      decides what runs — the same argument decision 1 made about the drop payload, arriving in
+      a second place. `librsproto::desktop` gained the client both callers share, and the
+      `desktop` coreutil's hand-rolled request plumbing moved into it.
 
-- [ ] **Gate**: `check-login` opens a file, types, saves, and the assertion is made **from
-      outside the editor** — the serial session reads the file back with `nxsh`'s `open` (there is
-      no `cat`; the coreutils are `list`, `copy`, `move`, `remove`, `rename`, `touch` and friends)
-      and the gate matches on what the shell prints. A gate that asked the editor what it had
-      saved would be asking the accused. The two halves see the same bytes because
-      `libsession::build_namespace` and `desktop-shell::build_app_namespace` bind `/home` to the
-      same subtree — which is decision 1's assumption, load-bearing a second time.
+- [x] **Save is the part with a failure mode worth designing** ✅ — a temporary beside the
+      target, renamed over it, with the temporary removed on either failure. What it does when
+      the write or the rename fails is *report and keep the buffer*: the text stays, and it stays
+      **modified**, because a buffer marked saved is one a person can close without being asked.
+
+      **And the failure the plan did not name: a buffer that could not be read.** A failed read
+      shows an empty window, and saving that over a file is the file destroyed by an editor that
+      never displayed it — so a blocked buffer declines to be written and says why. A *missing*
+      file is not a failure; opening a path that is not there is how a file gets made.
+
+- [x] **Gate** ✅ — `check-login` step 8, and the assertion is made **from outside the editor**:
+      the serial session creates the file, the graphical browser opens it, six characters are
+      typed with a receipt each, `Ctrl+S` saves, and then the *shell* reads the file back with
+      `open` and the gate matches what it prints. Asking the editor what it had saved would be
+      asking the accused — and the control proves the difference: with the rename removed the
+      editor still reported "saved — 7 bytes" and the gate failed at the read-back.
+
+      The two halves see the same bytes because `libsession::build_namespace` and
+      `desktop-shell::build_app_namespace` bind `/home` to the same subtree — decision 1's
+      assumption, load-bearing a second time.
+
+      **Nine host controls, each run alone and watched to fail by name**: a failed save marking
+      the buffer saved, a blocked buffer writing anyway, a chord typing into the file, no trailing
+      newline, a file row opening nothing, a listing keeping a stale notice, and — in `libui` —
+      movement counting as an edit, typing not counting as one, and the caret guard. **Two of
+      them were decoration until the control was run.** `ctrl_s` used `Ctrl+X`, which the keymap
+      folds to a control byte the text area already declines, so it passed with the guard
+      deleted; it uses `Ctrl+1` now, which the keymap leaves printable. And the revision test
+      made a selection before typing, so the insert's own count was covered by the deletion of
+      the selection.
 
 ### Part E — drag-and-drop between them
 

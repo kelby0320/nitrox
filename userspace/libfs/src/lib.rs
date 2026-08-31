@@ -235,6 +235,108 @@ fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Read the whole file at `path`.
+///
+/// **The other half of [`copy_file`], for a caller whose destination is memory.** A file
+/// resolves to a page-cache object and the read is a `memcpy` out of a mapping of it — there is
+/// no read syscall to make and no offset to track, which is Model A's whole point.
+///
+/// Empty files are `Ok(empty)` rather than an error: `sys_memory_map` has no meaning for a
+/// zero-length object, so there is nothing to map and nothing to copy, and an editor opening a
+/// file `touch` just made is the ordinary case rather than an edge one.
+///
+/// **In `libfs` rather than in its one consumer**, which is worth stating because the rule that
+/// moved this crate out of `coreutils` says the opposite: a helper with one consumer belongs to
+/// that consumer. The rule is about *policy* — where a decision lives — and this is mechanism
+/// whose primitives (`lookup`, `create`, `truncate`, the PO wait) are private to this module. A
+/// copy outside it would be a second implementation of the mapping dance, which is the thing
+/// the rule exists to prevent.
+pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
+    let size = file_size(ns, path).ok_or(FileError::NotFound)?;
+    if size > MAX_COPY {
+        return Err(FileError::TooLarge);
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).map_err(FileError::Io)?;
+    // SAFETY: mapping an object we hold a handle to, with a right it carries.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, size, RIGHT_MAP_READ) };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+        return Err(FileError::Io(addr as i32));
+    }
+    let mut out = alloc::vec![0u8; size as usize];
+    // SAFETY: `size` bytes are mapped at `addr`, and `out` is a fresh allocation of exactly
+    // that length, so the ranges are distinct.
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), size as usize);
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+        syscall1(SYS_HANDLE_CLOSE, handle);
+    }
+    Ok(out)
+}
+
+/// Write `bytes` to `path`, replacing whatever was there.
+///
+/// **Shrinks before it writes**, for [`copy_file`]'s reason and with the same verification: a
+/// file grown to a smaller size is a no-op, so without the truncate the old tail would survive
+/// past the new content — a file that is neither what it was nor what it was meant to become.
+///
+/// **This is not a safe save on its own**, and no caller should treat it as one: it truncates
+/// the destination, so a failure between the truncate and the flush leaves a file shorter than
+/// both versions. The safe sequence is to write a temporary and [`rename`] it over the target,
+/// which is atomic on the server side — see `nxedit`, which does exactly that and is the reason
+/// this exists.
+pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
+    let size = bytes.len() as u64;
+    if size > MAX_COPY {
+        return Err(FileError::TooLarge);
+    }
+    if let Some(existing) = file_size(ns, path)
+        && existing > size
+    {
+        truncate(ns, path, size)?;
+        if file_size(ns, path) != Some(size) {
+            return Err(FileError::TruncateFailed);
+        }
+    }
+    // An empty file still has to come into existence; there is nothing to map.
+    if size == 0 {
+        let handle = create(ns, path, 0)?;
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+        return Ok(());
+    }
+    let handle = create(ns, path, size)?;
+    // SAFETY: mapping an object created with MAP_READ | MAP_WRITE.
+    let addr = unsafe {
+        syscall4(SYS_MEMORY_MAP, handle, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
+    };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+        return Err(FileError::Io(addr as i32));
+    }
+    // SAFETY: `size` bytes are mapped at `addr`, `bytes` holds exactly that many, and a caller's
+    // slice cannot alias a mapping this call just made.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, size as usize) };
+    // Flush before dropping the mapping, or the write lives only in the page cache and a reader
+    // that re-resolves the path sees a short file — `copy_file`'s hard-won line.
+    // SAFETY: `handle` is our writable file handle.
+    let synced = unsafe { syscall1(SYS_FILE_SYNC, handle) };
+    // SAFETY: unmapping our own mapping and closing our own handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+        syscall1(SYS_HANDLE_CLOSE, handle);
+    }
+    if synced != 0 {
+        return Err(FileError::Io(synced as i32));
+    }
+    Ok(())
+}
+
 /// Create `path` as an empty file if it is not already there, then release the handle.
 ///
 /// The underlying create is idempotent, so this is safe to call on a path that exists —
@@ -527,6 +629,23 @@ pub fn basename(path: &[u8]) -> &[u8] {
     }
 }
 
+/// [`basename`] on a `str`, for the callers whose paths are already text.
+///
+/// **Not a second rule, and that is the point of it being here.** The two graphical
+/// applications each grew a private copy — byte-identical, each with a comment explaining that
+/// this half of the application never sees a path as bytes, which was true when there was one
+/// of them (PR #259 review, optional 6). One consumer's helper belongs to that consumer; two
+/// belong below both, which is the rule this crate itself was extracted under.
+///
+/// The conversion is free rather than lossy: a `str` is UTF-8, `/` never occurs inside a
+/// multi-byte sequence, and the bytes handed back are a subslice cut only at one — so the
+/// `from_utf8` **cannot fail**, and the fallback below is unreachable rather than a repair.
+/// Changing what it returns changes no test, which is the evidence for that claim rather than a
+/// gap in the tests: what the test pins is that a non-ASCII name comes back whole.
+pub fn basename_str(path: &str) -> &str {
+    core::str::from_utf8(basename(path.as_bytes())).unwrap_or(path)
+}
+
 /// Everything before the final component (`"/a/b/c"` → `"/a/b"`), or `"/"` when the path
 /// has a single component — the root is its own parent, which is what a caller opening the
 /// parent directory needs.
@@ -564,6 +683,19 @@ mod tests {
         // "dir/" and create a nameless entry.
         assert_eq!(basename(b"/a/b/"), b"b");
         assert_eq!(basename(b"/"), b"/");
+    }
+
+    #[test]
+    fn basename_str_is_the_same_rule_and_never_loses_the_text() {
+        assert_eq!(basename_str("/a/b/c"), "c");
+        assert_eq!(basename_str("/a/b/"), "b", "a trailing separator is not the name");
+        assert_eq!(basename_str("/"), "/");
+        // **The claim worth pinning**: the byte version can only cut at an ASCII `/`, and a `/`
+        // byte never occurs inside a multi-byte UTF-8 sequence — so the subslice it hands back is
+        // always still text, and the fallback in `basename_str` is unreachable rather than a
+        // silent repair. A name that is not ASCII is what would expose the difference.
+        assert_eq!(basename_str("/home/notes-café.txt"), "notes-café.txt");
+        assert_eq!(basename_str("café"), "café");
     }
 
     #[test]

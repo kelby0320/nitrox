@@ -2,7 +2,7 @@
 
 ## Status
 
-**Partly built, and checked 2026-08-30** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-01** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar;
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
@@ -10,7 +10,8 @@ added its second bar;
 **This document outruns its code on purpose, so read it section by section.** What is built:
 the **top bar** (§3), the **applications modal** (§4) — `/bin` listed through the profile
 server, filtered as you type — **launching** (§6's spawn half), each application into a
-namespace the shell constructs, **placement and window management** (§8), the shell driving
+namespace the shell constructs, and since M10 Part D **launching on somebody else's behalf**
+(§4a): a client names a path over `/dev/desktop` and the shell opens it, **placement and window management** (§8), the shell driving
 `Place`/`Raise`/`SetFocus` as the compositor's attached manager, and — since M8 Part C — the
 **bottom bar** and its **window list** (§2, §7): one entry per `normal` window, click to raise,
 click the focused one to minimize, middle-click to close, `Super+H` to minimize without the bar. The toolkit question
@@ -137,6 +138,29 @@ feature.
 
 The Super key means the shell receives a keystroke **regardless of focus** — see §8's global
 hotkey requirement, which is a capability rather than an ambient grab.
+
+### 4a. Opening a path, which is launching asked for by somebody else
+
+Since M10 Part D an application can ask the shell to open a path — `Desktop::Open` on
+`/dev/desktop` ([`rsproto-desktop-ops.md`](../spec/rsproto-desktop-ops.md)) — and the file
+browser is its first caller: pressing a file row names the path and the shell launches
+[`nxedit`](../../userspace/nxedit) on it.
+
+**The client names a path and never a program**, and that is the whole of the capability
+argument. An application has no `/bin` in its namespace and no `BIND_NAMESPACE`, so it cannot
+launch anything and should not be able to; what it has is a question. A request naming a program
+would be the shell running arbitrary code on a caller's say-so — ambient authority arriving
+through a protocol rather than through a handle, which is exactly the shape this system rejects.
+
+**What opens a path is one constant** (`nxedit`, whatever the path). A table keyed on extension
+is what that becomes when a second program can open something, and a mechanism with one entry
+has no second case to check itself against. The launcher's policy staying in the launcher is the
+part that matters; which program it picks is data.
+
+**The shell does not check the path first.** It could ask whether the path is a file, and the
+answer would be about the *shell's* namespace rather than the caller's or the opener's — three
+namespaces that agree today only because one process builds all three. What the path turns out to
+be is reported by whatever opens it, in the window the person who asked is looking at.
 
 ## 5. What the shell settled about the toolkit
 

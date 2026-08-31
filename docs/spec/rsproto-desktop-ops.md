@@ -1,8 +1,8 @@
 # Nitrox: Desktop operations (`0x0Cxx`)
 
 The graphical session's desktops, served by
-[`desktop-shell`](../../userspace/desktop-shell) at `/dev/desktop`. Three ops: describe them,
-switch to one, name one.
+[`desktop-shell`](../../userspace/desktop-shell) at `/dev/desktop`. Four ops: describe the
+desktops, switch to one, name one — and, since M10 Part D, ask the shell to **open a path**.
 
 ## Where it sits
 
@@ -71,12 +71,53 @@ out to matter" is the rule itself rather than a separate mechanism.
 `NotFound` for a position that does not exist; `InvalidArgument` for a short body, a name over
 the cap, or bytes that are not UTF-8.
 
+## `Open` (`0x0C03`)
+
+Request: the path's UTF-8 bytes, absolute, at most `MAX_OPEN_PATH` (512). Empty reply.
+
+**The client names the path; the shell decides what runs.** An application holds no authority to
+spawn anything — it has no `/bin` to resolve an image from and no way to build the namespace a
+new application would run in — so "open this" is a question rather than an instruction. A request
+that named the *program* would be ambient authority wearing a protocol: the shell would be
+running arbitrary code on a caller's say-so, and the whole point of
+[`graphical-session.md`](../architecture/graphical-session.md) §3's accounting is that the
+launcher's authority stays with the launcher.
+
+**The reply is about the request, not the file.** Success says the shell launched something; it
+does not say the program could read the path, and the shell deliberately does not check. Whether
+the path exists, is a directory, or holds bytes nobody can decode is answered by *what opens it*,
+in the window the person who asked is looking at — and the shell's answer would in any case be
+about the shell's namespace rather than the caller's or the opener's.
+
+`InvalidArgument` for an empty path, one over the cap, one that is not UTF-8, or one that is not
+absolute — a relative path would be relative to a working directory this server does not have.
+`Unsupported` if the shell cannot launch: no compositor endpoint, no such program in `/bin`, or
+application namespaces that do not gate, which disables launching outright.
+
+**Nothing bounds how often a client may ask.** This is the first op in the system a *program*
+can drive that causes a process to be spawned — the applications modal needs a person — and the
+shell does not rate-limit it, cap live openers, or dedup paths. `MAX_DESKTOP_SESSIONS` is not the
+bound: a client may open and close a session per request, and `nxfiles` does. Filed as
+`TODO(open-amplification)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md#userspace), where the trigger is the
+shell gaining a record of what it launched — which it deliberately does not keep today, since it
+is not a supervisor of the applications it starts.
+
+**One op, not a family.** There is no "open with", no "what would open this", and no reply saying
+what was launched. Each is a mechanism with one caller and no second case to check it against;
+`Open` is the shape a browser needs and the shape a drop will need
+(M10 Part E carries a path for the same reason — see the decision log, 2026-08-30).
+
 ## What this does not do
 
 **No `new`, and no delete.** Desktops are created and destroyed by the lifecycle rule rather than
 by request: something lands on the trailing empty desktop and a new empty one is appended; a
 desktop that is unnamed and empty goes. A caller that wants a fresh desktop moves a window to the
 last one.
+
+**No opener registry.** What opens a path is one constant in the shell (`nxedit`). An extension
+table is what that becomes the first time a second program can open something, and writing it now
+would be a mechanism with one entry.
 
 **No events.** A caller learns the state by asking. The shell's own bar and overview are driven
 by its internal model rather than by this protocol, so there is no second consumer to notify and

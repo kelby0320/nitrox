@@ -947,23 +947,55 @@ static mut SPAWN_APP: SpawnArgs = SpawnArgs {
     syscaps: 0,   // empty, and it stays empty
 };
 
-/// Launch `program` into a namespace built for it.
+/// Everything a launch needs, gathered once.
 ///
-/// **The namespace is verified before anything runs in it**, and a shell that finds the gate
-/// open declines to launch. See [`verify_app_namespace`] for why that is behaviour rather than
-/// a test: an application that *can* reach `manage` never says so, and nothing downstream
-/// would notice.
-fn launch(
+/// **A struct because there is a second caller now.** The applications modal was the only one
+/// until M10 Part D added `Desktop::Open` — a client asking the shell to open a path — and the
+/// nine values a launch needs were about to be threaded through the desktop session handler as
+/// nine more parameters. What they actually are is one thing: the authority this shell holds to
+/// start an application.
+struct Launcher<'a> {
+    /// The session's namespace, which is where `/bin/<program>` is resolved from.
     session_ns: u64,
+    /// The compositor endpoint every application is given.
     draw: u64,
+    /// The filesystem, the terminal server and the profile server, bound the same way.
     fs: u64,
+    /// See [`Launcher::fs`].
     tty: u64,
+    /// See [`Launcher::fs`].
     profile: u64,
-    program: &str,
-    env: &libstream::wire::Record,
-    home: &str,
+    /// This shell's own `/dev/desktop`, bound into what it builds.
     desktop: u64,
-) -> bool {
+    /// The user's home, bound as `/home` in an application's namespace.
+    home: &'a str,
+    /// The environment record an application reads its `HOME` from.
+    env: &'a libstream::wire::Record,
+    /// Whether a namespace this shell builds actually gates. False disables launching outright.
+    enabled: bool,
+}
+
+impl Launcher<'_> {
+    /// Launch `program` into a namespace built for it, with `args` after `argv[0]`.
+    ///
+    /// **The namespace is verified before anything runs in it**, and a shell that finds the gate
+    /// open declines to launch. See [`verify_app_namespace`] for why that is behaviour rather
+    /// than a test: an application that *can* reach `manage` never says so, and nothing
+    /// downstream would notice.
+    fn launch(&self, program: &str, args: &[&str]) -> bool {
+        if !self.enabled {
+            kprint(b"desktop-shell: launching is disabled; ignoring\n");
+            return false;
+        }
+        launch(self, program, args)
+    }
+}
+
+/// The body of [`Launcher::launch`], kept a free function so the long sequence of handle
+/// bookkeeping reads as it did before the context was gathered.
+fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
+    let (session_ns, draw, fs, tty, profile, desktop, home, env) =
+        (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.home, l.env);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
@@ -1034,12 +1066,16 @@ fn launch(
     // lifecycle it has no opinion about.
     // SAFETY: closing the process handle; the child runs independently.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-    // `argv[0]` is the program name, as every Tier-1 stage's is. No streams: an application
-    // is not a pipeline stage with a parent reading its output — a terminal makes its own.
+    // `argv[0]` is the program name, as every Tier-1 stage's is, and `args` follows it — which
+    // for an editor is the file it was asked to open. No streams: an application is not a
+    // pipeline stage with a parent reading its output — a terminal makes its own.
+    let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + args.len());
+    argv.push(program);
+    argv.extend_from_slice(args);
     let sent = libstream::setup::send_setup_env(
         setup_ours,
         &libstream::setup::Streams::default(),
-        &[program],
+        &argv,
         env,
     )
     .is_ok();
@@ -1218,6 +1254,17 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     if !may_launch {
         kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
     }
+    let launcher = Launcher {
+        session_ns,
+        draw: draw_endpoint,
+        fs: fs_endpoint,
+        tty: tty_endpoint,
+        profile: profile_endpoint,
+        desktop: desktop_endpoint,
+        home,
+        env: &env,
+        enabled: may_launch,
+    };
 
     Line::new()
         .s(b"desktop-shell: top bar presented, window ")
@@ -1496,6 +1543,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         &entries,
                         &mut current_desktop,
                         &mut next_desktop_id,
+                        &launcher,
                     );
                 }
             }
@@ -1868,13 +1916,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // moves it yet, and "the top hit" is what a launcher does with an
                             // untouched list anyway.
                             let filtered = filter(&programs, query.text());
-                            if !may_launch {
-                                kprint(b"desktop-shell: launching is disabled; ignoring\n");
-                            } else if let Some(name) = filtered.first() {
-                                launch(
-                                    session_ns, draw_endpoint, fs_endpoint, tty_endpoint,
-                                    profile_endpoint, name, &env, home, desktop_endpoint,
-                                );
+                            if let Some(name) = filtered.first() {
+                                launcher.launch(name, &[]);
                                 // **Closed after launching, and this was the bug.** `modal`
                                 // was set once and never cleared, so the popup stayed on top
                                 // of whatever was launched and the top bar's click handler —
@@ -2926,11 +2969,12 @@ fn serve_desktop_session(
     entries: &[WinEntry],
     current: &mut u32,
     next_id: &mut u32,
+    launcher: &Launcher<'_>,
 ) -> bool {
     use librsproto::decode;
     use librsproto::desktop::{
-        DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, OP_DESKTOP_LIST,
-        OP_DESKTOP_NAME, OP_DESKTOP_SWITCH, write_list,
+        DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, MAX_OPEN_PATH, OP_DESKTOP_LIST,
+        OP_DESKTOP_NAME, OP_DESKTOP_OPEN, OP_DESKTOP_SWITCH, write_list,
     };
     // SAFETY: valid recv out-params, sized from `IPC_HANDLE_MAX`.
     let rr = unsafe {
@@ -3041,9 +3085,52 @@ fn serve_desktop_session(
             Line::new().s(b"desktop-shell: served Name ").s(name.as_bytes()).end();
             true
         }
+        OP_DESKTOP_OPEN => {
+            // **The client names a path; the shell decides what runs.** An application holds no
+            // authority to spawn — it has no `/bin` and no way to build a namespace — so
+            // "open this" is a question rather than an instruction, and the answer is the
+            // shell's policy. A request that named the *program* would be ambient authority
+            // wearing a protocol.
+            let Ok(path) = core::str::from_utf8(&body) else {
+                return bad(KError::InvalidArgument);
+            };
+            if path.is_empty() || path.len() > MAX_OPEN_PATH || !path.starts_with('/') {
+                // **Absolute only.** A relative path would be relative to *something*, and the
+                // only candidate is a working directory this shell does not have and the
+                // caller's namespace does not share.
+                return bad(KError::InvalidArgument);
+            }
+            // **And nothing bounds how many times this may be asked.** `Open` is the first
+            // spawn path a *program* can drive — the modal needs a person — and the handler
+            // checks the path's shape and launches. `MAX_DESKTOP_SESSIONS` is not the bound
+            // (`nxfiles` opens a session per file, so a per-session counter resets every call),
+            // and this shell does not reap what it launches, so it cannot count what is alive.
+            // TODO(open-amplification): bound this once the shell has that record.
+            //
+            // **Not stat'ed here, deliberately.** The shell could ask whether the path is a
+            // file, and the answer would be about the *shell's* namespace rather than the
+            // caller's or the editor's — three namespaces that agree today because one process
+            // builds all three, which is exactly the kind of agreement not to lean on. What
+            // opens the path reports what it found, in the window the person is looking at.
+            if !launcher.launch(OPENER, &[path]) {
+                return bad(KError::Unsupported);
+            }
+            ds_reply(ch, op, request_id, &[], 0, false);
+            Line::new().s(b"desktop-shell: served Open ").s(path.as_bytes()).end();
+            false
+        }
         _ => bad(KError::Unsupported),
     }
 }
+
+/// What opens a path.
+///
+/// **One program, and a constant rather than a table, because there is one.** Dispatching on an
+/// extension is what this grows into the first time a second program can open something — an
+/// image viewer, a `.tsm` table — and writing the table now would be writing a mechanism with
+/// one entry and no second case to check it against. M12 names the applications that give it
+/// one.
+const OPENER: &str = "nxedit";
 
 /// Answer one message on the desktop endpoint's serve end — a resolve, minting a session.
 ///

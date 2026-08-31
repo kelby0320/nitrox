@@ -1,0 +1,33 @@
+[package]
+name = "nxedit"
+version = "0.1.0"
+edition = "2024"
+
+# The text editor: Milestone 10 Part D of `docs/planning/display-arm-plan.md`.
+#
+# Split lib/bin like `nxfiles` and `nxterm`. What an editor *is* — a buffer, a modified
+# marker, what a save means when it fails — is a function of values and host-tests in
+# milliseconds; opening the file, writing it and pumping events need an OS.
+[dependencies]
+libfs = { path = "../libfs" }
+libui = { path = "../libui" }
+libdraw = { path = "../libdraw", features = ["io"] }
+libsurface = { path = "../libsurface" }
+librsproto = { path = "../librsproto", features = ["io"] }
+libkern = { path = "../libkern" }
+libstream = { path = "../libstream", features = ["io"] }
+libheap = { path = "../libheap" }
+
+# Test-only: the save chord's keycode is pinned against the keymap it has to agree with,
+# rather than against the comment beside it. Nothing in the editor decodes keys itself —
+# `TextAreaState::apply` does that — so this is not a dependency of the program.
+[dev-dependencies]
+libinput = { path = "../libinput" }
+
+[lib]
+name = "nxedit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nxedit"
+path = "src/main.rs"

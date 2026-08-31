@@ -57,6 +57,13 @@ pub const TITLE_KEY: u64 = 3;
 pub const GRIP_KEY: u64 = 4;
 /// The element key on the path text inside the strip.
 pub const PATH_KEY: u64 = 6;
+/// The element key on the notice beside the path.
+///
+/// **Always present, empty when there is nothing to say.** A child that appears and disappears
+/// changes the strip's child count between frames, and the diff pairs children by key — an
+/// element that is sometimes there is one the reconciler has to rebuild the row around.
+pub const NOTICE_KEY: u64 = 7;
+
 /// The element key on the path strip.
 ///
 /// **Every docked child needs one**, not just the ones a test looks for: the diff requires a
@@ -138,6 +145,13 @@ pub struct App {
     /// is a function of values and reading a directory is a syscall. The application says where
     /// it wants to be; the `main` that owns the namespace performs it.
     goto: Option<String>,
+    /// What the strip says beside the path, or `None` — an answer to the last row activated.
+    notice: Option<String>,
+    /// A path the binary owes an `Open` for — set by activating a row that is not a directory.
+    ///
+    /// The same outbox shape as [`goto`](Self::goto), for the same reason: asking the shell to
+    /// open something is IPC.
+    open: Option<String>,
     /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
     state_requested: Option<u32>,
     /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
@@ -184,6 +198,8 @@ impl App {
             focused: true,
             maximized: false,
             goto: None,
+            notice: None,
+            open: None,
             state_requested: None,
             move_requested: false,
             resize_requested: None,
@@ -216,6 +232,8 @@ impl App {
         self.path = String::from(path);
         self.entries = entries;
         self.list = ListState { selected: (!self.entries.is_empty()).then_some(0), offset: 0 };
+        // A listing supersedes whatever the last row press had to say about itself.
+        self.notice = None;
     }
 
     /// Turn a wire entry into a row.
@@ -242,18 +260,29 @@ impl App {
         e.is_dir.then(|| join(&self.path, &e.name))
     }
 
+    /// The path a row *names*, whether or not it is a directory.
+    fn full(&self, i: usize) -> Option<String> {
+        self.entries.get(i).map(|e| join(&self.path, &e.name))
+    }
+
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Activate(i) => {
                 let i = i as usize;
                 self.list.selected = Some(i);
-                // **A directory navigates; a file does nothing yet.** Opening a file means
-                // launching something that can show it, and there is nothing to launch until
-                // the editor exists (M10 Part D). A row that does nothing is honest; a row that
-                // launched a program that is not there would be a control that looks live.
-                if let Some(to) = self.child(i) {
-                    self.goto = Some(to);
+                // **A directory navigates; anything else is opened**, which since M10 Part D
+                // means asking the shell — `Desktop::Open` — rather than launching anything
+                // here. A browser holds no authority to spawn a program and should not: it has
+                // no `/bin` and no way to build a namespace for one. It names a path; the shell
+                // decides what opens it.
+                //
+                // **Including a row whose kind is unknown.** `entry_of` lists those as files,
+                // and asking to open one is the same honest answer a directory listing gives:
+                // something is there, and whatever opens it will say what it found.
+                match self.child(i) {
+                    Some(to) => self.goto = Some(to),
+                    None => self.open = self.full(i),
                 }
             }
             Msg::Up => {
@@ -308,6 +337,26 @@ impl App {
     /// The path the binary owes a listing for, if anything navigated. Clears the record.
     pub fn take_goto(&mut self) -> Option<String> {
         self.goto.take()
+    }
+
+    /// The path the binary owes an `Open` for, if a file was activated. Clears the record.
+    pub fn take_open(&mut self) -> Option<String> {
+        self.open.take()
+    }
+
+    /// Say what happened to the last [`take_open`](Self::take_open) — shown in the path strip.
+    ///
+    /// **Because a row press that does nothing visible is indistinguishable from a broken
+    /// one.** The shell answers before the program it launched has drawn anything, so the only
+    /// thing the browser can report is whether the *request* was taken — which is worth
+    /// reporting, since the failure it names (a shell that will not launch) is otherwise silent
+    /// on this side.
+    pub fn opened(&mut self, path: &str, ok: bool) {
+        self.notice = Some(if ok {
+            alloc::format!("opening {}", libfs::basename_str(path))
+        } else {
+            alloc::format!("could not open {}", libfs::basename_str(path))
+        });
     }
 
     /// The state a `RequestState` is owed for. Clears the record.
@@ -395,6 +444,11 @@ impl App {
             button("^", Msg::Up, WidgetState::default(), &ui).key(UP_KEY),
             padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.path.clone()))
                 .key(PATH_KEY),
+            padding(
+                Insets { top: 4, right: 4, bottom: 4, left: 6 },
+                text(self.notice.clone().unwrap_or_default()),
+            )
+            .key(NOTICE_KEY),
         ]);
 
         let labels: Vec<String> = self.entries.iter().map(|e| e.label()).collect();
@@ -461,6 +515,30 @@ pub fn bounds(size: Size) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text under the element keyed `key`, joined — for asserting on chrome without
+    /// hard-coding where in the tree it sits.
+    fn labelled<M>(e: &Element<M>, key: u64) -> String {
+        fn texts<M>(e: &Element<M>, out: &mut String) {
+            if let libui::element::Node::Text(t) = &e.node {
+                out.push_str(t);
+            }
+            for c in e.children() {
+                texts(c, out);
+            }
+        }
+        fn find<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+            if e.key == Some(key) {
+                return Some(e);
+            }
+            e.children().find_map(|c| find(c, key))
+        }
+        let mut out = String::new();
+        if let Some(n) = find(e, key) {
+            texts(n, &mut out);
+        }
+        out
+    }
 
     fn app() -> App {
         let mut a = App::new("/home");
@@ -553,29 +631,53 @@ mod tests {
         // the directory server and the namespace enumeration produced, which is not an order
         // anybody chose — and a listing that changed order between two visits to the same
         // directory would be unusable for the one thing a browser is for.
-        let mut a = app();
+        let a = app();
         let names: Vec<&str> = a.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["archive", "work", "a.txt", "notes.txt"]);
     }
 
     #[test]
     fn a_directory_is_marked_by_a_trailing_separator() {
-        let mut a = app();
+        let a = app();
         assert_eq!(a.entries()[0].label(), "archive/");
         assert_eq!(a.entries()[2].label(), "a.txt");
     }
 
     #[test]
-    fn pressing_a_directory_navigates_and_pressing_a_file_does_not() {
-        // **A file row does nothing until there is something to open it with** (M10 Part D). A
-        // row that launched a program which is not there would be a control that looks live —
-        // the defect M8's overview shipped three of.
+    fn pressing_a_directory_navigates_and_pressing_a_file_opens_it() {
+        // **The two halves of what a row press means**, and the reason they are one message:
+        // Enter and a press must agree about "open", or there are two browsers. Which of the
+        // two outboxes fills is the entry's kind, and nothing else.
         let mut a = app();
         a.update(Msg::Activate(0)); // archive/
         assert_eq!(a.take_goto().as_deref(), Some("/home/archive"));
+        assert_eq!(a.take_open(), None, "a directory is navigated, not opened");
 
         a.update(Msg::Activate(2)); // a.txt
         assert_eq!(a.take_goto(), None, "a file is not a place to go");
+        assert_eq!(a.take_open().as_deref(), Some("/home/a.txt"), "it is a thing to open");
+    }
+
+    #[test]
+    fn the_strip_says_what_happened_to_the_last_row_opened() {
+        // **A row press with no visible effect is indistinguishable from a broken one.** The
+        // window the shell launches belongs to another process and may take a moment; what this
+        // browser can say is whether the request was taken.
+        let mut a = app();
+        a.update(Msg::Activate(2));
+        let path = a.take_open().unwrap();
+        a.opened(&path, true);
+        let ui: Element<Msg> = a.view();
+        assert!(labelled(&ui, NOTICE_KEY).contains("opening a.txt"), "the strip says so");
+
+        a.opened(&path, false);
+        let ui: Element<Msg> = a.view();
+        assert!(labelled(&ui, NOTICE_KEY).contains("could not open a.txt"));
+
+        // And a new listing supersedes it: the notice is about a press, not about the directory.
+        a.show("/home", alloc::vec![Entry::file("a.txt")]);
+        let ui: Element<Msg> = a.view();
+        assert_eq!(labelled(&ui, NOTICE_KEY), "", "a listing clears it");
     }
 
     #[test]

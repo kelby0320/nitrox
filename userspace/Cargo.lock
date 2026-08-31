@@ -270,6 +270,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxedit"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
+ "libfs",
+ "libheap",
+ "libinput",
+ "libkern",
+ "librsproto",
+ "libstream",
+ "libsurface",
+ "libui",
+]
+
+[[package]]
 name = "nxfiles"
 version = "0.1.0"
 dependencies = [
