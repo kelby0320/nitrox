@@ -221,6 +221,8 @@ When uncertain why something is the way it is, check `docs/rationale/rejected-ap
 
 Per-subdirectory `CLAUDE.md` files exist for the major workspaces. Read the relevant one before significant work:
 
+- `tools/CLAUDE.md` — host tooling: which rules do *not* reach it, and the bar for a
+  host dependency
 - `kernel/CLAUDE.md` — `#![no_std]`, no external crates, unsafe policy
 - `userspace/CLAUDE.md` — crate layering, async-first
 - `userspace/libkern/CLAUDE.md` — `#![no_std]` + no alloc; raw syscall surface

@@ -19,9 +19,12 @@
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
-//! Stays on std and avoids external crates so the host build can be a
-//! single `cargo run -p xtask`. No "stable Rust only" rule applies here
-//! the way it does to the kernel; this is host tooling.
+//! **Host tooling, and the kernel's rules do not reach it.** No "stable Rust only" and no
+//! "no external crates": both are about what runs on the target. What applies here is written
+//! down in `tools/CLAUDE.md` — the bar a host dependency clears, and why the checked-in lockfile
+//! is what pins it. This file said "avoids external crates" until M11 Part A took `png`, which
+//! is the sort of stale rule a reader hits before they find the reasoning (PR #261 review,
+//! finding 1).
 
 use std::env;
 use std::error::Error;
@@ -187,7 +190,13 @@ fn main() -> ExitCode {
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
         Some("check-images") => cmd_check_images(),
-        Some("preview") => cmd_preview(rest.first().map(String::as_str).unwrap_or("all")),
+        // **The first *positional* argument, not the first argument.** `qargs` has the global
+        // flags stripped, and anything else beginning with `-` is a flag this command does not
+        // have — landing one in the name slot reports "no preview called `--offline`", which
+        // names the wrong problem (PR #261 review, optional 3).
+        Some("preview") => cmd_preview(
+            qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
+        ),
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
@@ -3639,20 +3648,25 @@ fn cmd_preview(what: &str) -> R<()> {
     let font = host_font()?;
     let dir = build_cache();
     fs::create_dir_all(&dir).ok();
-    let mut wrote = 0;
-    for (name, frame) in preview_frames(&font) {
-        if what != "all" && what != name {
+    let frames = preview_frames(&font);
+    let names: Vec<&str> = frames.iter().map(|(n, _)| *n).collect();
+    if what != "all" && !names.contains(&what) {
+        // Checked before anything is drawn: the first version reported this by rendering both
+        // references a second time purely to list their names.
+        return Err(format!(
+            "no preview called {what:?} — try `all` or one of: {}",
+            names.join(", ")
+        )
+        .into());
+    }
+    for (name, frame) in &frames {
+        if what != "all" && what != *name {
             continue;
         }
-        let (w, h, rgb) = rgb_of(&frame);
+        let (w, h, rgb) = rgb_of(frame);
         let path = dir.join(format!("preview-{name}.png"));
         write_png(&path, w, h, &rgb)?;
         println!("xtask: {} ({w}x{h})", path.display());
-        wrote += 1;
-    }
-    if wrote == 0 {
-        let names: Vec<&str> = preview_frames(&font).iter().map(|(n, _)| *n).collect();
-        return Err(format!("no preview called {what:?} — try `all` or one of: {}", names.join(", ")).into());
     }
     Ok(())
 }
@@ -3667,10 +3681,28 @@ fn host_font() -> R<libdraw::text::Font> {
     .ok_or_else(|| "the vendored font did not parse on the host".into())
 }
 
+/// One reference render by name, for the gate that compares it against a guest.
+///
+/// **The gate reads this rather than calling the renderer itself**, which is what makes
+/// `preview_frames` the single source it claims to be: adding a region to `check-display` and
+/// adding a preview are one change, and a preview that stopped being the gate's picture fails
+/// against the guest instead of quietly becoming a picture of nothing (PR #261 review, finding 2).
+fn reference_frame(
+    font: &libdraw::text::Font,
+    name: &str,
+) -> R<libdraw::framebuffer::MemFramebuffer> {
+    preview_frames(font)
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, f)| f)
+        .ok_or_else(|| format!("no reference render called {name:?}").into())
+}
+
 /// Every arrangement the host can render, by name.
 ///
-/// **The same renders `check-display` compares**, built the same way, so adding a region to that
-/// gate and adding a preview is one change rather than two that drift.
+/// **The one place either the preview or the display gate builds a reference picture.** Both used
+/// to construct their own; the comment claiming they were the same renders was true and unenforced
+/// until it was tested, and a solid rectangle at the right size passed everything.
 fn preview_frames(
     font: &libdraw::text::Font,
 ) -> Vec<(&'static str, libdraw::framebuffer::MemFramebuffer)> {
@@ -3905,11 +3937,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The font both reference renders are drawn with here — the same file the image build
     // stages at `/system/fonts/`, against a guest render made from the bytes it read off the
     // disk. This is the only check anywhere that a font loads on the target at all.
-    let font_file = repo_root().join("assets/fonts/DejaVuSansMono.ttf");
-    let font = libdraw::text::Font::from_bytes(
-        fs::read(&font_file).map_err(|e| format!("read {}: {e}", font_file.display()))?,
-    )
-    .ok_or("the vendored font did not parse on the host")?;
+    let font = host_font()?;
 
     // **The terminal's picture**, between the two. Same construction and the same argument as
     // the toolkit's: `libterm` on the host renders the fixed reference stream, the guest renders
@@ -3917,10 +3945,21 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // above do not cover. This is the only place a terminal render is checked against pixels
     // that actually reached a screen — every other check on it is the guest agreeing with
     // itself.
+    // **Taken from `preview_frames`, which is what makes "a second entry point, not a second
+    // renderer" true rather than claimed.** Both were built here independently until PR #261's
+    // review demonstrated the gap: a preview replaced by a solid rectangle *at the gate's
+    // dimensions* left every host test passing, because nothing tied the two together but a
+    // comment. One source means the drift is not possible, and a wrong source fails here —
+    // against a real guest, which is the only thing that can tell a render from a picture.
     let (uw, uh) = (libui::reference::WIDTH, libui::reference::HEIGHT);
-    let term = libterm::render::reference::render_with(&font);
-    let tsize = libterm::render::reference::size(&font);
-    let (tw, th) = (tsize.w, tsize.h);
+    let term = reference_frame(&font, "term")?;
+    // The terminal's size comes from the frame rather than from `reference::size`, for the same
+    // reason: two answers to one question are two answers that can differ. The host test still
+    // compares them, so the agreement is asserted somewhere.
+    let (tw, th) = {
+        let g = libdraw::framebuffer::Framebuffer::geometry(&term);
+        (g.width, g.height)
+    };
     // The stacking the exclusions below assume, stated rather than trusted: each window must sit
     // wholly inside the one beneath it, or a region the gate believes it is comparing is covered
     // by something it is not comparing against — a hole that would be silent.
@@ -3962,7 +4001,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // Compared everywhere *except* the rectangles of the windows above it. That exclusion is
     // not a weakening: a compositor that stacked them the other way would fail the comparisons
     // above, so the ordering is still covered.
-    let ui = libui::reference::render(&font);
+    let ui = reference_frame(&font, "ui")?;
     let mut ui_mismatches = 0usize;
     let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     let mut ui_compared = 0usize;
@@ -8061,13 +8100,17 @@ mod tests {
 
     /// A preview is the same picture the display gate demands of the guest.
     ///
-    /// **Two claims, and the second is the one with a bug waiting in it.** That the *dimensions*
-    /// are the gate's own constants says the preview renders the arrangement `check-display`
-    /// compares rather than one of its own — it fails the day somebody gives the preview a
-    /// different size or theme, which is exactly when a preview stops meaning anything. And that
-    /// the PNG **decodes back to the framebuffer's pixels** covers the conversion: the toolkit
-    /// reference's pitch is 1292 for a 1280-byte row, and `XRGB8888` is little-endian, so a
-    /// direct copy would be wrong twice over — a stride and a channel order.
+    /// **What this pins, and what it deliberately no longer claims to.** *Sharing* is structural
+    /// now: `cmd_check_display` reads its expected frames from `preview_frames`, so a preview
+    /// that is not the gate's picture fails against a real guest rather than passing here. This
+    /// test said the size assertion would catch "a different size **or theme**" and it would not —
+    /// a solid rectangle at 320×300 passed it (PR #261 review, finding 2).
+    ///
+    /// What it does pin is worth pinning. The sizes are the gate's own constants and
+    /// `libterm`'s own `size()`, which is the one place those agree with the frames the gate
+    /// measures. And the PNG is **decoded back to the framebuffer's pixels**, which covers the
+    /// conversion: the toolkit reference's pitch is 1292 for a 1280-byte row and `XRGB8888` is
+    /// little-endian, so a direct copy is wrong twice over — a stride and a channel order.
     ///
     /// Decoded rather than compared against what went in, because a round trip through one
     /// library's encoder and back tests the encoder; what is under test here is the pixels.

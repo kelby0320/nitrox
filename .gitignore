@@ -10,9 +10,5 @@ tools/build-cache/
 *.swo
 .DS_Store
 
-# Cargo lockfiles are checked in for every workspace. The kernel's and userspace's
-# produce the OS artifacts we ship; `tools/` was exempted while it had nothing but
-# path dependencies and therefore nothing to pin — that stopped being true in M11
-# Part A, when `xtask` took `png` so a render could be written as an image. "Host
-# tooling can drift" is fine until drift means a *different picture*, and the
-# display gate adjudicates on pixels.
+# Cargo lockfiles are checked in for every workspace, `tools/` included since M11
+# Part A — see tools/CLAUDE.md, "The lockfile is the pin".

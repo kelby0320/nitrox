@@ -20481,3 +20481,14 @@ further along: they produce what ships.
 **And the first thing the preview showed is the milestone's own case.** Every label in the
 picture is monospaced, because `DejaVuSansMono` is the only font the image ships. That is Part D,
 and now it can be looked at rather than argued about.
+
+**Review then found the sharing was a comment rather than a fact.** The doc said the preview and
+`check-display` render the same pictures "so adding a region to that gate and adding a preview is
+one change rather than two that drift" — and the two built their frames independently, from two
+call sites and two font loads. The demonstration was exact: replace the preview's toolkit frame
+with a *solid rectangle at the gate's own dimensions* and every host test still passed, because
+the only tie between them was the size. `cmd_check_display` now takes its font from `host_font`
+and both expected frames from `preview_frames`, which makes the claim true by construction —
+and the reviewer's break, re-run against the fixed code, fails `check-display` with 78,720 of
+78,720 pixels differing. **The generalisable part: a comment asserting that two call sites agree
+is a comment, and the fix is one call site rather than a third assertion.**
