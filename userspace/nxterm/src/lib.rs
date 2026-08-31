@@ -36,7 +36,7 @@ use librsproto::surface::{
 };
 use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
 use libui::widget::{GRIP_W, TITLE_BAR_H, TitleButtons, resize_grip, title_bar};
-use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
+use libui::widget::{Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -243,6 +243,10 @@ impl App {
             focused: true,
             menu_anchor: None,
             metrics,
+            // `libterm`'s ANSI palette — the sixteen colours a program addresses with
+            // `ESC[31m` — and deliberately *not* the desktop theme. M11 Part B collapsed
+            // `libui`'s `Palette` into the shared `Theme`; this one stays where it is, because
+            // it is defined by what programs expect rather than by how this system looks.
             palette: Palette::default(),
             outbox: Vec::new(),
             move_requested: false,
@@ -513,7 +517,7 @@ impl App {
 
     /// The element tree for the current state.
     pub fn view(&self) -> Element<Msg> {
-        let ui = UiPalette::default();
+        let ui = UiTheme::default();
         let grid_px = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
 
         let bar = menu_bar(
@@ -599,11 +603,11 @@ impl App {
     /// `libui::layout::measure` under loose constraints gives the size the popup window should
     /// be created at.
     pub fn menu_view(&self) -> Element<Msg> {
-        self.menu(&UiPalette::default())
+        self.menu(&UiTheme::default())
     }
 
     /// The popup's contents.
-    fn menu(&self, ui: &UiPalette) -> Element<Msg> {
+    fn menu(&self, ui: &UiTheme) -> Element<Msg> {
         use libui::element::{column, fill};
         let items = column(vec![
             button("Clear", Msg::Clear, WidgetState::default(), ui),

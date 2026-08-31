@@ -37,7 +37,7 @@ use libui::element::{
     Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
 };
 use libui::widget::{
-    GRIP_W, Palette as UiPalette, TITLE_BAR_H, TextAreaState, TitleButtons, WidgetState, button,
+    GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TitleButtons, WidgetState, button,
     resize_grip, text_area, title_bar,
 };
 
@@ -417,7 +417,7 @@ impl App {
     /// `&mut self` because `text_area` scrolls the state it is handed — see `nxfiles::App::view`
     /// for the bug the value-returning shape shipped.
     pub fn view(&mut self) -> Element<Msg> {
-        let ui = UiPalette::default();
+        let ui = UiTheme::default();
         let title = title_bar(
             &self.title(),
             self.focused,

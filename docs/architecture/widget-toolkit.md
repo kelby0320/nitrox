@@ -17,7 +17,10 @@ and compares against the guest's screen pixel for pixel.
 
 **What is specified here and not built**, each with its reason in place: the **application
 runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
-assembles it by hand and is the first application to do so) and **theming** (§11). The **text
+assembles it by hand and is the first application to do so). **Theming** (§11) left this list in
+M11 Part B, in the half that matters to this crate: there is one `Theme`, it is `libdraw`'s
+because the compositor needs it too, and `Palette` folded into it. Where its values come from is
+Part C's. The **text
 area** left this list in **M10 Part C**: §8 said it would arrive when an application posed real
 requirements rather than hypothetical ones, and M10's editor posed them. The menu's **popup half** left this list in M5 Part B and left the toolkit
 entirely in M6 C3: a menu is a `popup` *window* now, parented to its application's window,
@@ -633,8 +636,20 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 - **Animation and a frame clock.** §6.3 has no timer. Anything that moves on its own needs
   one, and a compositor-side vsync signal to pace it. Trigger: the desktop shell's window
   transitions.
-- **Theming and styling.** Colours and metrics are constants. Trigger: a second application
-  that must look different from the terminal, or a settings service.
+- **Theming and styling** — *partly here since M11 Part B*. Colours and text size are one
+  `Theme`, and it lives in [`libdraw`](../../userspace/libdraw) rather than in this crate: the
+  compositor paints chrome too — a cursor, a drag outline, the ground between windows — and it
+  does not link a widget toolkit, deliberately. `libui`'s `Palette` folded into it; the two were
+  split by which *function* needed which, which is not a distinction between kinds of value.
+
+  **Metrics are still constants**, and that is a decision rather than a leftover: padding,
+  title-bar height and the resize grip stay compiled in because the gates click title bars at
+  `+13` and close buttons at `-39`, and a gate that had to read a theme to know where to click
+  could disagree with the thing it is checking (M11 decision 2).
+
+  What is *not* here yet is where the values come from — Part C reads them from a file at session
+  start. Until then a theme is one `const fn` with one constructor, `Theme::dark()`, named so that
+  a second is a constructor rather than a redesign.
 - **Accessibility.** No accessible tree, no screen-reader surface. Worth stating plainly as
   a gap rather than leaving it unmentioned; retrofitting one is substantially harder than
   designing it in, and this is a deliberate deferral rather than an oversight.

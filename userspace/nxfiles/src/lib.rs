@@ -34,7 +34,7 @@ use libui::element::{
     Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
 };
 use libui::widget::{
-    GRIP_W, ListRow, ListState, Palette as UiPalette, TITLE_BAR_H, TitleButtons, WidgetState,
+    GRIP_W, ListRow, ListState, Theme as UiTheme, TITLE_BAR_H, TitleButtons, WidgetState,
     button, list_view, resize_grip, title_bar,
 };
 
@@ -487,7 +487,7 @@ impl App {
     /// when the widget still *returned* the state and this caller dropped it; it takes `&mut`
     /// now, so the same mistake no longer compiles (PR #257 review, blocking 1).
     pub fn view(&mut self) -> Element<Msg> {
-        let ui = UiPalette::default();
+        let ui = UiTheme::default();
         let title = title_bar(
             TITLE,
             self.focused,

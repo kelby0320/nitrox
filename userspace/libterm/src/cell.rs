@@ -114,16 +114,20 @@ pub struct Palette {
 impl Default for Palette {
     /// A conventional dark palette.
     ///
-    /// `background` and `foreground` **equal** `libui::paint::Theme::default()`'s, so a terminal
-    /// does not flash against the chrome around it — and since A5 that is **enforced**: a host
-    /// test in `xtask` fails the build if either side is retuned.
+    /// **The sixteen are the terminal's; the two defaults are the desktop's.** `ansi` is what a
+    /// program addresses with `ESC[31m` — a vocabulary defined by what programs expect, which is
+    /// why retheming a desktop must not retheme `ls` output. `foreground` and `background` are
+    /// what `Colour::Default` means, and a terminal whose ground differed from the chrome around
+    /// it would flash against it — so those two are **read from the shared theme** rather than
+    /// written out again (M11 Part B).
     ///
-    /// `xtask` is an odd home for a colour assertion and it is the only one available.
-    /// `libterm` and `libui` are siblings, neither may depend on the other, and putting a theme
-    /// colour in `libdraw` would make the pixel layer own a theme; `xtask` links both. It also
-    /// did not need the display gate to grow a third region, which is what an earlier version
-    /// of this comment predicted the enforcement would wait for (PR #189 review, finding 6;
-    /// PR #190 review, finding 2).
+    /// **That replaces an assertion with a fact.** From A5 until Part B this equality was a pair
+    /// of literals in two crates, enforced by a host test in `xtask` — the one place that links
+    /// `libterm` and `libui`, chosen because they are siblings and "putting a theme colour in
+    /// `libdraw` would make the pixel layer own a theme". Part B did precisely that, on purpose:
+    /// the compositor paints chrome too and links no toolkit, so `libdraw` is where a value all
+    /// three need belongs. One source, so the test that compared two of them has nothing left
+    /// to compare (PR #189 review, finding 6; PR #190 review, finding 2).
     fn default() -> Self {
         Self {
             ansi: [
@@ -144,8 +148,8 @@ impl Default for Palette {
                 Rgb::new(0x60, 0xC8, 0xC8), // bright cyan
                 Rgb::new(0xEC, 0xF0, 0xF4), // bright white
             ],
-            foreground: Rgb::new(0xE0, 0xE6, 0xEC),
-            background: Rgb::new(0x0E, 0x14, 0x1B),
+            foreground: libdraw::theme::Theme::dark().foreground,
+            background: libdraw::theme::Theme::dark().background,
         }
     }
 }

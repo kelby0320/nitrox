@@ -19,8 +19,11 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use libdraw::format::Rgb;
 use libdraw::geom::Size;
+// **Re-exported, because every widget here takes one.** A caller importing `button` and
+// `list_view` from this module should not have to reach into `libdraw` for the third argument
+// they all share; `libui::paint::Theme` names the same type for the painting half.
+pub use libdraw::theme::Theme;
 
 use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, text};
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
@@ -52,56 +55,6 @@ pub struct WidgetState {
 
 /// The colours a widget draws itself in.
 ///
-/// Constants rather than a theming system, for the reason `widget-toolkit.md` §11 gives —
-/// and shaped as a struct so that becoming one later is a change of provenance rather than a
-/// change of every call site.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Palette {
-    /// A button's face at rest.
-    pub face: Rgb,
-    /// Its face under the pointer.
-    pub face_hover: Rgb,
-    /// Its face while held.
-    pub face_pressed: Rgb,
-    /// The ring drawn around the focused widget.
-    pub focus_ring: Rgb,
-    /// A scrollbar's groove.
-    pub track: Rgb,
-    /// A scrollbar's thumb.
-    pub thumb: Rgb,
-    /// A title bar's face while its window holds the keyboard.
-    pub title_active: Rgb,
-    /// The background behind selected text.
-    ///
-    /// **A background rather than an inverted foreground**, which is what a terminal does: a
-    /// terminal owns every cell's colours and can swap them, while a toolkit draws text over
-    /// whatever a widget's own layers put down. Darker than `focus_ring` so black text stays
-    /// legible on it — the one constraint a selection colour actually has (M10 Part C).
-    pub selection: Rgb,
-    /// A title bar's face while it does not.
-    ///
-    /// **Two faces rather than one**, because a title bar is the only chrome that says which
-    /// window is focused. The compositor announces focus and the window list marks it, but a
-    /// person looking at two overlapping windows reads it here.
-    pub title_inactive: Rgb,
-}
-
-impl Default for Palette {
-    fn default() -> Self {
-        Self {
-            face: Rgb::new(0x24, 0x2C, 0x36),
-            face_hover: Rgb::new(0x30, 0x3A, 0x46),
-            face_pressed: Rgb::new(0x18, 0x1E, 0x26),
-            focus_ring: Rgb::new(0x5A, 0x9F, 0xD4),
-            track: Rgb::new(0x18, 0x1E, 0x26),
-            thumb: Rgb::new(0x3A, 0x46, 0x54),
-            title_active: Rgb::new(0x2E, 0x3A, 0x4A),
-            title_inactive: Rgb::new(0x1C, 0x22, 0x2A),
-            selection: Rgb::new(0x2A, 0x4A, 0x6A),
-        }
-    }
-}
-
 /// Space between a button's label and its edge.
 const BUTTON_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
 
@@ -114,21 +67,21 @@ pub fn button<Msg>(
     label: impl Into<String>,
     msg: Msg,
     state: WidgetState,
-    palette: &Palette,
+    theme: &Theme,
 ) -> Element<Msg> {
     let face = if state.pressed {
-        palette.face_pressed
+        theme.face_pressed
     } else if state.hovered {
-        palette.face_hover
+        theme.face_hover
     } else {
-        palette.face
+        theme.face
     };
     // Bottom to top: the ring, then the face, then the label. A `Stack` gives every layer
     // the whole area, so the ring is only visible because the face above it is inset by the
     // ring's width — and the label sits above both, inset further so it clears the edge.
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if state.active {
-        layers.push(fill(palette.focus_ring));
+        layers.push(fill(theme.focus_ring));
         layers.push(padding(Insets::all(RING), fill(face)));
     } else {
         layers.push(fill(face));
@@ -236,17 +189,17 @@ impl ScrollState {
 /// does. Making the widget measure itself would need a second layout pass, which the toolkit
 /// does not have; until it does, this is an obligation on the caller rather than a guarantee
 /// (PR #185 review, finding 7).
-pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, palette: &Palette) -> Element<Msg> {
+pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme) -> Element<Msg> {
     let (pos, len) = state.thumb(height);
     sized(
         Size::new(width, 0),
         stack(alloc::vec![
-            fill(palette.track),
+            fill(theme.track),
             column(alloc::vec![
-                sized(Size::new(0, pos), fill(palette.track)),
-                sized(Size::new(0, len), fill(palette.thumb)),
+                sized(Size::new(0, pos), fill(theme.track)),
+                sized(Size::new(0, len), fill(theme.thumb)),
                 // The remainder, so the thumb does not stretch to the bottom.
-                fill(palette.track).flex(1),
+                fill(theme.track).flex(1),
             ]),
         ]),
     )
@@ -259,10 +212,10 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, palette: &Pal
 /// layer over the application's content until M6 C3, which works only for a menu that fits
 /// inside the window it drops from. This is the part the terminal's chrome needs; the anchor it
 /// is dropped from comes from [`layout::locate`](crate::layout::locate).
-pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, palette: &Palette) -> Element<Msg> {
+pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, theme: &Theme) -> Element<Msg> {
     sized(
         Size::new(0, height),
-        stack(alloc::vec![fill(palette.face), row(items)]),
+        stack(alloc::vec![fill(theme.face), row(items)]),
     )
 }
 
@@ -302,9 +255,9 @@ pub fn title_bar<Msg: Clone>(
     focused: bool,
     drag: Msg,
     buttons: TitleButtons<Msg>,
-    palette: &Palette,
+    theme: &Theme,
 ) -> Element<Msg> {
-    let face = if focused { palette.title_active } else { palette.title_inactive };
+    let face = if focused { theme.title_active } else { theme.title_inactive };
     let btn = |label: &str, msg: Msg| {
         sized(
             Size::new(TITLE_BUTTON_W, TITLE_BAR_H),
@@ -358,21 +311,21 @@ pub const GRIP_W: u32 = 16;
 ///
 /// Positioned by its caller — an application stacks it over its own bottom-right corner, which
 /// is the one place this widget cannot work out for itself.
-pub fn resize_grip<Msg: Clone>(msg: Msg, palette: &Palette) -> Element<Msg> {
+pub fn resize_grip<Msg: Clone>(msg: Msg, theme: &Theme) -> Element<Msg> {
     // Three nested corner bands — the conventional grip — drawn as squares of the groove
     // colour rather than as glyphs: a grip that needed a font would need a theme, and this has
     // neither. Each pair paints a band and then punches its middle back out.
     let mut layers = alloc::vec::Vec::with_capacity(4);
-    layers.push(fill(palette.face));
+    layers.push(fill(theme.face));
     for i in 0..3u32 {
         let inset = i * 5;
         layers.push(padding(
             Insets { top: inset + 2, right: 2, bottom: 2, left: inset + 2 },
-            fill(palette.track),
+            fill(theme.track),
         ));
         layers.push(padding(
             Insets { top: inset + 4, right: 4, bottom: 4, left: inset + 4 },
-            fill(palette.face),
+            fill(theme.face),
         ));
     }
     sized(Size::new(GRIP_W, GRIP_W), stack(layers).on_press_down(msg))
@@ -599,7 +552,7 @@ pub fn text_field<Msg>(
     field: &TextFieldState,
     masked: bool,
     state: WidgetState,
-    palette: &Palette,
+    theme: &Theme,
 ) -> Element<Msg> {
     let render = |s: &str| -> String {
         if masked { core::iter::repeat_n(MASK_CHAR, s.chars().count()).collect() } else { s.into() }
@@ -609,7 +562,7 @@ pub fn text_field<Msg>(
     let mut content = alloc::vec::Vec::with_capacity(3);
     content.push(text(render(before)));
     if state.active {
-        content.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
+        content.push(sized(Size::new(CARET, 0), fill(theme.focus_ring)));
     }
     content.push(text(render(after)));
 
@@ -617,10 +570,10 @@ pub fn text_field<Msg>(
     // idea: a well the content sits in, rather than a face that stands out of the surface.
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if state.active {
-        layers.push(fill(palette.focus_ring));
-        layers.push(padding(Insets::all(RING), fill(palette.track)));
+        layers.push(fill(theme.focus_ring));
+        layers.push(padding(Insets::all(RING), fill(theme.track)));
     } else {
-        layers.push(fill(palette.track));
+        layers.push(fill(theme.track));
     }
     layers.push(padding(FIELD_PAD, row(content)));
     stack(layers).focusable()
@@ -1095,7 +1048,7 @@ pub fn text_area<Msg>(
     height: u32,
     row_height: u32,
     active: bool,
-    palette: &Palette,
+    theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
     state.ensure_visible(visible);
@@ -1140,7 +1093,7 @@ pub fn text_area<Msg>(
         let mut caret_drawn = false;
         let push_caret = |pieces: &mut Vec<Element<Msg>>, at: &mut usize, to: usize| {
             push_text(pieces, *at, to);
-            pieces.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
+            pieces.push(sized(Size::new(CARET, 0), fill(theme.focus_ring)));
             *at = to;
         };
         if let Some(cc) = caret {
@@ -1154,7 +1107,7 @@ pub fn text_area<Msg>(
             // The highlight is a `fill` *under* the run: `fill` measures as zero, so the stack
             // takes the text's size and the colour covers exactly the glyphs' box.
             pieces.push(stack(alloc::vec![
-                fill(palette.selection),
+                fill(theme.selection),
                 text(String::from(&l[from..to])),
             ]));
             at = to;
@@ -1180,7 +1133,7 @@ pub fn text_area<Msg>(
     }
 
     let mut layers = alloc::vec::Vec::with_capacity(2);
-    layers.push(fill(palette.track));
+    layers.push(fill(theme.track));
     layers.push(padding(FIELD_PAD, column(rows)));
     stack(layers).focusable()
 }
@@ -1340,7 +1293,7 @@ pub fn list_view<Msg>(
     row_height: u32,
     activate: fn(u64) -> Msg,
     grab: Option<fn(u64) -> Msg>,
-    palette: &Palette,
+    theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
     // **The selection is clamped first, because it is an index into a list that may have just
@@ -1366,7 +1319,7 @@ pub fn list_view<Msg>(
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
         let selected = state.selected == Some(i);
-        let face = if selected { palette.face_hover } else { palette.track };
+        let face = if selected { theme.face_hover } else { theme.track };
         let row_el = stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))]);
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
@@ -1394,12 +1347,12 @@ pub fn list_view<Msg>(
         };
         row(alloc::vec![
             list.flex(1),
-            scrollbar(bar, SCROLLBAR_W, height, palette),
+            scrollbar(bar, SCROLLBAR_W, height, theme),
         ])
     } else {
         list
     };
-    stack(alloc::vec![fill(palette.track), body]).focusable()
+    stack(alloc::vec![fill(theme.track), body]).focusable()
 }
 
 /// How wide a list's scrollbar is, in pixels.
@@ -1408,6 +1361,7 @@ const SCROLLBAR_W: u32 = 10;
 #[cfg(test)]
 mod list_view_tests {
     use super::*;
+    use libdraw::format::Rgb;
     use crate::element::Node;
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
@@ -1420,7 +1374,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -1430,7 +1384,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -1440,9 +1394,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -1454,11 +1408,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState { selected: Some(19), offset: 0 };
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, &Palette::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, &Palette::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -1469,7 +1423,7 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_faces(&e).iter().any(|f| *f == Palette::default().face_hover),
+            row_faces(&e).iter().any(|f| *f == Theme::default().face_hover),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -1482,7 +1436,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState { selected: Some(3), offset: 2 };
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, &Palette::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -1540,7 +1494,7 @@ mod list_view_tests {
     #[test]
     fn the_selected_row_is_painted_differently() {
         let data = [(1u64, "a"), (2, "b")];
-        let p = Palette::default();
+        let p = Theme::default();
         let e: Element<u64> =
             list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, &p);
         let faces = row_faces(&e);
@@ -1552,7 +1506,7 @@ mod list_view_tests {
     /// A scrollbar that is always there wastes width; one that never appears strands rows.
     #[test]
     fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
-        let p = Palette::default();
+        let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
             list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, &p);
@@ -1568,7 +1522,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -1577,7 +1531,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, &Palette::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 
@@ -1744,10 +1698,10 @@ mod text_field_tests {
     fn masking_counts_characters_not_bytes() {
         let f = TextFieldState::with_text("aé");
         assert_eq!(f.text().len(), 3, "the fixture is not multi-byte");
-        let e: Element<()> = text_field(&f, true, WidgetState { active: true, ..Default::default() }, &Palette::default());
+        let e: Element<()> = text_field(&f, true, WidgetState { active: true, ..Default::default() }, &Theme::default());
         assert_eq!(rendered(&e), "**", "the mask leaked the byte length");
         // Negative control: unmasked shows the real text.
-        let e: Element<()> = text_field(&f, false, WidgetState::default(), &Palette::default());
+        let e: Element<()> = text_field(&f, false, WidgetState::default(), &Theme::default());
         assert_eq!(rendered(&e), "aé");
     }
 
@@ -1756,8 +1710,8 @@ mod text_field_tests {
     fn the_caret_appears_only_when_active() {
         let f = TextFieldState::with_text("ab");
         let active: Element<()> =
-            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Palette::default());
-        let idle: Element<()> = text_field(&f, false, WidgetState::default(), &Palette::default());
+            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Theme::default());
+        let idle: Element<()> = text_field(&f, false, WidgetState::default(), &Theme::default());
         assert_eq!(row_children(&active), 3, "no caret between the two text runs");
         assert_eq!(row_children(&idle), 2, "an inactive field drew a caret");
     }
@@ -1770,7 +1724,7 @@ mod text_field_tests {
         f.home();
         f.right();
         let e: Element<()> =
-            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Palette::default());
+            text_field(&f, false, WidgetState { active: true, ..Default::default() }, &Theme::default());
         assert_eq!(runs(&e), alloc::vec!["a", "bcd"], "the caret was not placed at the cursor");
     }
 
@@ -1810,6 +1764,7 @@ mod text_field_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libdraw::format::Rgb;
     use crate::layout::{FixedCell, layout};
     use crate::paint::{Theme, paint};
     use alloc::vec;
@@ -1964,7 +1919,7 @@ mod tests {
     fn a_scrollbar_lays_its_thumb_out_where_the_arithmetic_says() {
         // The layout half: a `Column` of spacer, thumb and filler places the thumb without
         // any node needing to offset a child.
-        let p = Palette::default();
+        let p = Theme::default();
         let s = ScrollState { offset: 50, visible: 25, total: 100 };
         let e: Element<Msg> = scrollbar(s, 12, 400, &p);
         let l = layout(&e, Rect::new(0, 0, 12, 400), &CELL);
@@ -1980,7 +1935,7 @@ mod tests {
 
     #[test]
     fn a_button_carries_its_message_and_takes_focus() {
-        let p = Palette::default();
+        let p = Theme::default();
         let e = button("OK", (), WidgetState::default(), &p);
         assert!(e.on_press.is_some(), "a button that sends nothing is not a button");
         assert!(e.focusable, "a keyboard user must be able to reach it");
@@ -1990,7 +1945,7 @@ mod tests {
     fn a_buttons_face_follows_the_state_it_is_given() {
         // Widgets take their state as an argument rather than remembering it, so this is the
         // whole of a button's appearance logic and it is a pure function.
-        let p = Palette::default();
+        let p = Theme::default();
         let face_of = |st: WidgetState| {
             let e: Element<Msg> = button("OK", (), st, &p);
             // The first layer is the face at rest and the ring when active; either way the
@@ -2021,7 +1976,7 @@ mod tests {
     fn a_focused_button_draws_a_ring_that_the_face_does_not_cover() {
         // Painted rather than inspected: the ring is the outermost layer, so a face drawn
         // over the whole area would hide it and the tree would still look right.
-        let p = Palette::default();
+        let p = Theme::default();
         let t = Theme::default();
         let mut fb =
             MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
@@ -2035,7 +1990,7 @@ mod tests {
 
     #[test]
     fn an_unfocused_button_draws_no_ring() {
-        let p = Palette::default();
+        let p = Theme::default();
         let t = Theme::default();
         let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
@@ -2046,7 +2001,7 @@ mod tests {
 
     #[test]
     fn a_menu_bar_is_as_tall_as_asked_and_no_taller() {
-        let p = Palette::default();
+        let p = Theme::default();
         let e: Element<Msg> = menu_bar(vec![text("File"), text("Edit")], 24, &p);
         let l = layout(&e, Rect::new(0, 0, 200, 100), &CELL);
         assert_eq!(l.rect.size.h, 24);
@@ -2061,7 +2016,7 @@ mod tests {
         // they are not: until 2026-08-11 `Node::Fill` measured to `c.max`, so the first
         // `button` — a `Stack` over a `Fill` — took the whole row and the second laid out at
         // zero width, off the right edge. The bar looked correct in every assertion above.
-        let p = Palette::default();
+        let p = Theme::default();
         let items: vec::Vec<Element<Msg>> = vec![
             button("File", (), WidgetState::default(), &p),
             button("Edit", (), WidgetState::default(), &p),
@@ -2085,7 +2040,7 @@ mod tests {
     fn a_button_measures_to_its_label_not_to_the_room_it_is_given() {
         // The same defect stated as a property rather than as a composition. A button in a
         // 400-pixel-tall column is not a 400-pixel-tall button.
-        let p = Palette::default();
+        let p = Theme::default();
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
         let big = crate::layout::measure(
             &e,
@@ -2114,7 +2069,7 @@ mod tests {
             Max,
             Close,
         }
-        let p = Palette::default();
+        let p = Theme::default();
         let e = title_bar(
             "a terminal",
             true,
@@ -2336,7 +2291,7 @@ mod tests {
         // to remember it would have a cursor that walks off the bottom of its own window — and
         // the widget takes `&mut` precisely so it cannot be forgotten (PR #257 review).
         let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7");
-        let p = Palette::default();
+        let p = Theme::default();
         let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
         assert_eq!(a.offset(), 0);
 
@@ -2476,7 +2431,7 @@ mod tests {
         // with `Shift+Right`, so the gate compares a *forward* one — and the caret was drawn
         // only after the highlight, which a forward selection satisfies and a backward one
         // never does. Both directions here, counted in the tree (PR #258 review, blocking 2).
-        let p = Palette::default();
+        let p = Theme::default();
         let draw = |a: &mut TextAreaState| -> usize {
             let e: Element<()> = text_area(a, 3 * 16, 16, true, &p);
             fills(&e, p.focus_ring)
@@ -2514,7 +2469,7 @@ mod tests {
     fn a_selection_is_highlighted_on_every_line_it_covers() {
         // The other half of what `text_area` draws, and the reason the count is per *line*: a
         // multi-line selection is one highlight per row, not one rectangle.
-        let p = Palette::default();
+        let p = Theme::default();
         let mut a = area();
         a.apply(KEY_RIGHT, 0);
         a.apply(KEY_DOWN, MOD_SHIFT);
@@ -2540,8 +2495,8 @@ mod tests {
         assert_eq!(a.text(), "ab\nde\nfghi");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Palette::default());
-        assert_eq!(fills(&e, Palette::default().selection), 0, "nothing is selected, so nothing \
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Theme::default());
+        assert_eq!(fills(&e, Theme::default().selection), 0, "nothing is selected, so nothing \
             is highlighted");
 
         // The quieter symptom of the same defect: typing instead of deleting used to leave a
@@ -2559,7 +2514,7 @@ mod tests {
         a.extend_to(0, 3);
         assert!(a.apply(KEY_BACKSPACE, 0));
         assert_eq!(a.text(), "ab\nde\nfghi");
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Palette::default());
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Theme::default());
     }
 
     #[test]
@@ -2623,7 +2578,7 @@ mod tests {
 
         #[derive(Clone, PartialEq, Debug)]
         struct Resize;
-        let p = Palette::default();
+        let p = Theme::default();
         let e = resize_grip(Resize, &p);
         assert_eq!(
             measure(&e, Constraints::loose(Size::new(400, 400)), &CELL),
@@ -2663,7 +2618,7 @@ mod tests {
             Max,
             Close,
         }
-        let p = Palette::default();
+        let p = Theme::default();
         let e = title_bar(
             "a terminal",
             true,

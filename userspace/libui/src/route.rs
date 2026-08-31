@@ -708,7 +708,7 @@ mod tests {
         // it only because it ended here. Nothing about the pointer's own state changes.
         let ui: Element<Msg> = sized(Size::new(640, 200), custom(1, Size::new(640, 40))).on_drop(Msg::Pressed(1));
         let (t, l) = build(&ui);
-        let mut r = Router::new();
+        let r = Router::new();
         assert_eq!(r.drop_at(&t, &ui, &l, 5, 5), Some(Msg::Pressed(1)));
         assert_eq!(r.capture(), None, "a drop opens no capture");
         assert_eq!(r.inside(), None, "and synthesises no crossing");
@@ -732,9 +732,9 @@ mod tests {
     /// There was no click-to-focus test here at all, which is why the walk-up looked harmless.
     #[test]
     fn clicking_a_button_does_not_take_the_keyboard_from_the_focused_widget() {
-        use crate::widget::{Palette, WidgetState, button};
+        use crate::widget::{WidgetState, button};
 
-        let p = Palette::default();
+        let p = crate::paint::Theme::default();
         // A focusable widget that handles keys — the terminal grid's shape — beside a button.
         let e: Element<Msg> = column(vec![
             button("Menu", Msg::Pressed(1), WidgetState::default(), &p),
@@ -768,10 +768,10 @@ mod tests {
     #[test]
     fn a_press_on_a_button_in_a_padded_column_produces_its_message() {
         use crate::element::padding;
-        use crate::widget::{Palette, WidgetState, button};
+        use crate::widget::{WidgetState, button};
         use crate::element::Insets;
 
-        let p = Palette::default();
+        let p = crate::paint::Theme::default();
         let e: Element<Msg> = stack(vec![
             crate::element::fill(p.face),
             padding(

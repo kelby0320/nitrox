@@ -20492,3 +20492,42 @@ and both expected frames from `preview_frames`, which makes the claim true by co
 and the reviewer's break, re-run against the fixed code, fails `check-display` with 78,720 of
 78,720 pixels differing. **The generalisable part: a comment asserting that two call sites agree
 is a comment, and the fix is one call site rather than a third assertion.**
+
+## 2026-09-01 — M11 Part B: the pixel layer owns a theme now, and that was the point
+
+One `Theme` in `libdraw`, holding every colour the desktop draws itself in and the size it draws
+text at. `libui`'s `Palette` folded into it, and the compositor's cursor and outline colours come
+from it.
+
+**`libdraw` rather than `libui`, and the reason is the compositor.** It paints chrome — a cursor,
+a drag outline, the ground between windows — and it does not link a widget toolkit, deliberately:
+a compositor with opinions about widgets is the wrong shape. What the two share is `libdraw`,
+where `Rgb` and the background already lived. A **`const fn` constructor** is what makes this
+free at the seam: `const CURSOR: Rgb = Theme::dark().cursor_body;` is a constant expression, so
+nothing turned into a runtime lookup for a value that has not changed since boot.
+
+**One type, not two.** `Theme` (background, foreground, text size) and `Palette` (widget colours)
+were split by which *function* needed which. That is a distinction between call sites rather than
+between kinds of value, and it is the wrong seam for a milestone whose whole point is that these
+arrive together from one place.
+
+**It reached one crate further than the plan said, and that is the interesting part.**
+`libterm`'s default foreground and background — what `Colour::Default` means — were literals kept
+equal to `libui`'s by a host test in `xtask`, the one place linking both. That test's own comment
+explained why it had to live there: `libterm` and `libui` are siblings, and "putting a theme
+colour in `libdraw` would make the pixel layer own a theme". Part B did precisely that, on
+purpose, which turned an assertion into a fact — the same lesson Part A's review taught one part
+earlier: **a comment asserting that two call sites agree is a comment, and the fix is one call
+site rather than a third assertion.**
+
+**The sixteen ANSI colours stayed put**, and the test that compared grounds now asserts *that*
+instead: none of the sixteen may equal a chrome colour. They are the vocabulary a program
+addresses with `ESC[31m` — defined by what programs expect, not by how this system chooses to
+look — so a theme that reached into them would retint `ls` output on its way to restyling a
+button.
+
+**And the gate needed Part A to be meaningful.** "check-display green with its reference
+unchanged" cannot be shown by `check-display`: it compares the host's render against the guest's
+screen, and a theme change moves both together, so it would stay green. What says no pixel moved
+is the picture itself — `git worktree add` of `main`, `cargo xtask preview` in each, `md5sum`.
+Both PNGs match. That is the first time the preview paid for itself, one part after it landed.

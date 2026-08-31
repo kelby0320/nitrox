@@ -33,6 +33,7 @@ use libdraw::compose::{SurfaceRef, compose};
 use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry};
 use libdraw::geom::{Point, Rect};
+use libdraw::theme::Theme;
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, STICKY_DESKTOP,
     WINDOW_FLAG_MINIMIZED,
@@ -302,9 +303,20 @@ pub const CURSOR_W: u32 = 12;
 pub const CURSOR_H: u32 = 16;
 
 /// The cursor's fill colour (`#` in the sprite).
-pub const CURSOR_BODY: Rgb = Rgb::new(0xFF, 0xFF, 0xFF);
+///
+/// **From the shared theme since M11 Part B**, which is what "one theme the shell, the toolkit
+/// and the decorations share" actually meant: this crate does not link `libui` and should not —
+/// a compositor with opinions about widgets is the wrong shape — so the value lives in
+/// `libdraw`, which both link. A `const fn` constructor is what keeps these constants.
+///
+/// **Compiled in, and that is the one thing the theme *file* does not reach** (M11 decision 1).
+/// The compositor is started by `init` rather than by the session, so it never sees the setup
+/// record a theme is handed on. Named rather than skipped; the trigger for changing it is a
+/// control panel that wants to restyle the cursor or the drop highlight, and the mechanism would
+/// be a manager op on a channel the shell already holds.
+pub const CURSOR_BODY: Rgb = Theme::dark().cursor_body;
 /// The cursor's outline colour (`.` in the sprite), so it stays visible against white.
-pub const CURSOR_OUTLINE: Rgb = Rgb::new(0x00, 0x00, 0x00);
+pub const CURSOR_OUTLINE: Rgb = Theme::dark().cursor_outline;
 
 /// The rectangle a cursor at `at` occupies.
 ///
@@ -340,7 +352,11 @@ pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
 pub const OUTLINE_W: u32 = 2;
 
 /// The outline's colour — bright enough to read over any client's pixels.
-pub const OUTLINE_COLOUR: Rgb = Rgb::new(0xE0, 0xE0, 0xE0);
+///
+/// One colour for all three things an outline marks — a resize, a snap preview, a drop target —
+/// which is a decision deferred rather than taken: what a drop target should look like as
+/// distinct from a resize is a question for M11's polish passes.
+pub const OUTLINE_COLOUR: Rgb = Theme::dark().outline;
 
 /// The four edge strips of `rect`, which is what an outline occupies.
 ///

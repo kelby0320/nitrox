@@ -83,7 +83,7 @@ use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{ListRow, ListState, Palette, TextFieldState, WidgetState, list_view, text_field};
+use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, text_field};
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
@@ -418,7 +418,7 @@ const ROW_H: u32 = 20;
 
 /// The applications modal's element tree: a filter field over a list of `/bin` programs.
 fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: &mut ListState) -> Element<()> {
-    let palette = Palette::default();
+    let palette = Theme::default();
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, &palette);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);

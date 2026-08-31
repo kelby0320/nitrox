@@ -49,6 +49,7 @@ pub mod ppm;
 pub mod scale;
 pub mod scene;
 pub mod text;
+pub mod theme;
 
 pub use compose::{SurfaceRef, compose, compose_full};
 pub use format::{Channel, PixelFormat, Rgb};

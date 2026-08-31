@@ -8609,30 +8609,34 @@ mod diag_tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// The terminal's default palette agrees with the toolkit's default theme.
+    /// The terminal's ground is the desktop's ground, and the sixteen ANSI colours are not.
     ///
-    /// **A cross-crate invariant that had nowhere to live.** `libterm::Palette::default` says
-    /// its background matches `libui`'s so a terminal does not flash against the chrome around
-    /// it — and `libterm` and `libui` are siblings, neither may depend on the other, and a
-    /// theme colour in `libdraw` would make the pixel layer own a theme. So the claim sat
-    /// unenforced through PR #189, as its review pointed out.
+    /// **This used to compare two literals in two crates**, because `libterm` and `libui` are
+    /// siblings and a theme colour in `libdraw` "would make the pixel layer own a theme" — and
+    /// `xtask` was the one place that linked both. M11 Part B put the theme in `libdraw`
+    /// deliberately, since the compositor paints chrome too and links no toolkit, so the
+    /// equality is now a shared constructor rather than a coincidence two crates maintain.
     ///
-    /// `xtask` is the one place that links both. That is a slightly odd home for a colour
-    /// assertion, and it is better than a comment hoping two literals stay equal: retuning
-    /// either side now fails a build rather than being noticed by someone looking at a
-    /// screenshot.
+    /// What is left worth asserting is the *distinction*: the two defaults follow the desktop,
+    /// and the sixteen do not. A future theme that reached into `ansi` would retheme `ls`
+    /// output, which is the mistake this guards now.
     #[test]
-    fn the_terminals_palette_agrees_with_the_toolkits_theme() {
+    fn the_terminals_ground_follows_the_theme_and_its_ansi_colours_do_not() {
         let theme = libui::paint::Theme::default();
         let palette = libterm::cell::Palette::default();
-        assert_eq!(
-            palette.background, theme.background,
-            "libterm's default background drifted from libui's — a terminal will flash \
-             against the chrome around it"
-        );
-        assert_eq!(
-            palette.foreground, theme.foreground,
-            "libterm's default foreground drifted from libui's"
-        );
+        assert_eq!(palette.background, theme.background, "one ground, from one place");
+        assert_eq!(palette.foreground, theme.foreground);
+
+        // The sixteen are the terminal's own vocabulary. Nothing in the desktop theme should be
+        // able to move them — and nothing in them should quietly equal a chrome colour by
+        // accident, which is how a "theme" starts recolouring program output.
+        let chrome = [theme.face, theme.face_hover, theme.focus_ring, theme.title_active];
+        for (i, c) in palette.ansi.iter().enumerate() {
+            assert!(
+                !chrome.contains(c),
+                "ANSI colour {i} equals a chrome colour; retheming the desktop would retint \
+                 what programs print"
+            );
+        }
     }
 }

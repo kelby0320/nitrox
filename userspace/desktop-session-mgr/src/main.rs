@@ -33,7 +33,7 @@ use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{Palette, TextFieldState, WidgetState, text_field};
+use libui::widget::{TextFieldState, WidgetState, text_field};
 use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
 
 /// `alloc` backing: the toolkit builds an element tree per frame and `libsession` builds the
@@ -125,7 +125,7 @@ impl Greeter {
     ///
     /// Rebuilt per frame, which is the toolkit's model: `view(&state) -> Element`.
     fn view(&self) -> Element<()> {
-        let palette = Palette::default();
+        let palette = Theme::default();
         let active = |f: Focus| WidgetState { active: self.focus == f, ..Default::default() };
         let mut rows = alloc::vec::Vec::with_capacity(6);
         rows.push(text("nitrox"));
