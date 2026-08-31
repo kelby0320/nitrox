@@ -160,7 +160,14 @@ pub struct App {
     /// **A press is not yet a drag.** A person pressing a row to select or open it moves the
     /// pointer a pixel or two doing it, so the gesture only becomes a drag once it has travelled
     /// [`DRAG_SLOP`] — which is what keeps a click a click.
-    pressed: Option<(usize, i32, i32)>,
+    ///
+    /// **The entry's *name*, not its index**, and that is not fussiness: anything that replaces
+    /// the listing between the press and the first motion past the slop makes those two
+    /// different rows. It is reachable — hold the button on a row, press Backspace (the press
+    /// just raised this window, so it has the keyboard), then move: the drag would carry the
+    /// *parent* listing's row at that index. `list_view`'s rows are keyed precisely so an index
+    /// does not have to survive a rebuild (PR #260 review, optional 4).
+    pressed: Option<(String, i32, i32)>,
     /// A drag the binary owes the compositor a `StartDrag` for: the entry it carries.
     ///
     /// The same outbox shape as everything else here: `update` is a function of values, and
@@ -310,7 +317,11 @@ impl App {
             }
             // **Remembered, not acted on.** What a press becomes is decided by what happens
             // next: a release makes it a click, and enough movement makes it a drag.
-            Msg::Grab(i) => self.pressed = Some((i as usize, 0, 0)),
+            Msg::Grab(i) => {
+                // Resolved here, while the listing this index came from is still the listing.
+                self.pressed =
+                    self.entries.get(i as usize).map(|e| (e.name.clone(), 0, 0));
+            }
             Msg::Up => {
                 let up = parent(&self.path);
                 // The root is its own parent, so this is a no-op there rather than an error —
@@ -376,9 +387,9 @@ impl App {
             self.pressed = None;
             return false;
         }
-        let Some((i, ox, oy)) = self.pressed else { return false };
+        let Some((name, ox, oy)) = self.pressed.clone() else { return false };
         if (ox, oy) == (0, 0) {
-            self.pressed = Some((i, x, y));
+            self.pressed = Some((name, x, y));
             return false;
         }
         if (x - ox).abs() < DRAG_SLOP && (y - oy).abs() < DRAG_SLOP {
@@ -387,7 +398,9 @@ impl App {
         // The gesture is a drag now, and it is a drag *once*: the record is taken so the next
         // motion does not start a second one on top of the first.
         self.pressed = None;
-        self.drag = self.entries.get(i).cloned();
+        // **Looked up by name in the *current* listing.** A row that is no longer there is a
+        // drag of nothing rather than a drag of whatever now sits at that position.
+        self.drag = self.entries.iter().find(|e| e.name == name).cloned();
         self.drag.is_some()
     }
 
@@ -771,6 +784,30 @@ mod tests {
         assert!(!a.pointer_moved(10, 10, 0), "the button came up");
         assert!(!a.pointer_moved(400, 400, 1), "a later motion carries nothing");
         assert_eq!(a.take_drag(), None);
+    }
+
+    #[test]
+    fn a_listing_that_changes_under_a_press_carries_nothing() {
+        // **Reachable, not theoretical**: the press that starts this also raised the window, so
+        // the keyboard is here — Backspace between the press and the move is one keystroke away.
+        // An index remembered across that names a different row; a name names none.
+        let mut a = app();
+        a.update(Msg::Grab(2)); // a.txt, in /home
+        assert!(!a.pointer_moved(10, 10, 1), "the press is recorded");
+
+        a.show("/", alloc::vec![Entry::dir("bin"), Entry::dir("dev"), Entry::file("zzz")]);
+        assert!(!a.pointer_moved(10 + DRAG_SLOP, 10, 1), "the row it was on is gone");
+        assert_eq!(a.take_drag(), None, "so nothing is offered");
+
+        // And a listing that still holds the row drags *that* row, whatever moved around it.
+        let mut a = app();
+        a.update(Msg::Grab(2)); // a.txt
+        a.pointer_moved(10, 10, 1);
+        a.show("/home", alloc::vec![Entry::file("a.txt"), Entry::dir("new"), Entry::dir("work")]);
+        assert!(a.pointer_moved(10 + DRAG_SLOP, 10, 1));
+        let (entry, path) = a.take_drag().expect("the row that was pressed");
+        assert_eq!(entry.name, "a.txt", "by name, not by position");
+        assert_eq!(path, "/home/a.txt");
     }
 
     #[test]

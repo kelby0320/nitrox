@@ -527,9 +527,9 @@ fn log_route(rec: &Outbound) {
             // which file — the same reason the chord log carries the modifier and not the key
             // beside it. The display name is what is already on screen under the pointer.
             l.s(b"compositor: drop win=").u(*window as u64);
-            l.s(b" on=").s(acceptor.as_bytes());
+            l.s(b" on=").untrusted(acceptor.as_bytes());
             l.s(b" kind=").u(*kind as u64);
-            l.s(b" name=").s(name.as_bytes());
+            l.s(b" name=").untrusted(name.as_bytes());
             l.s(b" at ").i(*x as i64).s(b",").i(*y as i64);
         }
         Outbound::Configure { window, width, height, x, y } => {
@@ -995,10 +995,11 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             }
         }
         Outbound::Dropped { window, acceptor, kind, path, name, x, y } => {
-            use librsproto::surface::{DroppedEvent, MAX_ACCEPTOR_NAME, MAX_DROP_NAME, MAX_DROP_PATH, OP_DROPPED};
-            // Sized from the caps rather than from what this drop happens to carry: a stack
-            // buffer that fitted the common case is the shape that fails on the long one.
-            let mut body = [0u8; DroppedEvent::HEAD + MAX_ACCEPTOR_NAME + MAX_DROP_PATH + MAX_DROP_NAME];
+            use librsproto::surface::{DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
+            // **The same constant the client sizes its receive buffer from**, so the two cannot
+            // drift: a sender that can emit more than a receiver can take is a record that
+            // vanishes on delivery, which is what PR #260's review found here.
+            let mut body = [0u8; MAX_EVENT_BODY];
             let ev = DroppedEvent {
                 window: *window,
                 kind: *kind,
@@ -2310,7 +2311,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                             .s(b"compositor: window ")
                             .u(req.window as u64)
                             .s(b" accepts ")
-                            .s(name.as_bytes())
+                            .untrusted(name.as_bytes())
                             .s(b" kinds ")
                             .u(req.kinds as u64)
                             .end();
@@ -2361,7 +2362,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                             .s(b" kind ")
                             .u(req.kind as u64)
                             .s(b" name ")
-                            .s(name.as_bytes())
+                            .untrusted(name.as_bytes())
                             .end();
                         None
                     }

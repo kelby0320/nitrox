@@ -20359,3 +20359,40 @@ rectangle is asserted in host tests instead. Those host tests are also where Par
 controls live, which is stronger than driving them through the gate: a `dir` over a files-only
 editor and a drop over a window with no acceptor must each highlight nothing and deliver
 nothing, or "declares nothing" would quietly come to mean "takes everything".
+
+## 2026-09-01 — Part E's review: a cap on a record is a promise to the receiver
+
+The blocking finding was that the payload could not cross the wire at the size the protocol
+promised, and the gate passed by **one byte**.
+
+`Dropped` is the first Surface event that carries text. Every event before it was a handful of
+integers, so `libsurface` read them into a 64-byte buffer and nothing had ever noticed — and the
+real transport, meeting a body that does not fit, *shortened* it. A shortened length-prefixed
+record does not fail loudly: it either fails its own length check and vanishes with nothing
+logged anywhere in the client, or — worse — parses as a **different** record, because every
+variable-length field here is length-prefixed and a cut one describes something the sender never
+sent. The reviewer demonstrated both: a 33-byte path made the whole drop disappear, and a shorter
+one silently truncated the display name.
+
+**The gate could not have caught it, and that is the more useful half.** `check-login` drags
+`/home/papers/other.txt` onto an acceptor called `document`: `24 + 8 + 22 + 9 = 63`, one byte
+under the buffer. A gate fixture is a plausible example; a cap is a property, and pinning a
+property needs the maximum. The test that closes it hands `Session` a drop with every field at
+its cap, and a second one at the ordinary size — because the failure was *size-dependent*, so a
+test with one size proves one size.
+
+**Three fixes, in the three places the mistake could live.** The size is now one constant in
+`librsproto` (`MAX_EVENT_BODY`) that the compositor's send buffer and every client receive buffer
+are spelled from, so they cannot drift. A body that does not fit is a **loss** — reported through
+the mechanism this library already had for saying "events were discarded" — rather than a shorter
+body. And the mock transport models that, because a mock that truncates lets a test pass on a
+shape the real transport drops.
+
+**And the second finding is the same shape one layer up: bytes that are somebody else's.** The
+compositor logs a drag's display name, and three gates adjudicate by matching exact console
+lines — so a name containing a newline ends the server's line and starts one that appears to have
+come from the server. A *filename* with a newline reaches it with no malicious client involved.
+`libkern::debug::Line::untrusted` replaces control bytes with `?`, and every site that logs a
+string from the wire or the filesystem now uses it. Configuration strings deliberately do not:
+they are the image's own, read from a file the same build produced, and routing them through it
+would say they are somebody else's.

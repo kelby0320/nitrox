@@ -89,7 +89,7 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
                 app.loaded(text, &bytes);
                 libkern::debug::Line::new()
                     .s(b"nxedit: opened ")
-                    .s(path.as_bytes())
+                    .untrusted(path.as_bytes())
                     .s(b" - ")
                     .u(bytes.len() as u64)
                     .s(b" bytes")
@@ -312,14 +312,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             match result {
                 Ok(n) => libkern::debug::Line::new()
                     .s(b"nxedit: saved ")
-                    .s(editing.as_bytes())
+                    .untrusted(editing.as_bytes())
                     .s(b" - ")
                     .u(n as u64)
                     .s(b" bytes")
                     .end(),
                 Err(why) => libkern::debug::Line::new()
                     .s(b"nxedit: save FAILED for ")
-                    .s(editing.as_bytes())
+                    .untrusted(editing.as_bytes())
                     .s(b" - ")
                     .s(why.as_bytes())
                     .end(),
@@ -408,7 +408,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     let taken = router.drop_at(&tree, &ui, &l, x, y).is_some();
                     libkern::debug::Line::new()
                         .s(b"nxedit: drop of ")
-                        .s(name.as_bytes())
+                        .untrusted(name.as_bytes())
                         .s(if taken { b" on the document" as &[u8] } else { b" outside it" })
                         .end();
                     if taken && app.accept_drop(path) {

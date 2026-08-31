@@ -1212,6 +1212,20 @@ pub const MAX_DROP_PATH: usize = 512;
 /// The longest display name a drag may carry, in bytes.
 pub const MAX_DROP_NAME: usize = 64;
 
+/// The largest Surface **event** body, in bytes — what a client must be able to receive.
+///
+/// **A cap on a record is a promise to the receiver**, and until M10 Part E every event was a
+/// handful of integers, so `libsurface` read them into 64 bytes and nothing noticed. `Dropped`
+/// is the first record that can exceed that, and a client sized for the old maximum truncates
+/// the path — or fails to parse it at all, and the whole gesture vanishes with nothing logged
+/// (PR #260 review, blocking 1).
+///
+/// So the size lives here, beside the caps it is derived from, and both ends spell it the same
+/// way: the compositor's send buffer and every client receive buffer are this expression rather
+/// than a number that happened to agree.
+pub const MAX_EVENT_BODY: usize =
+    DroppedEvent::HEAD + MAX_ACCEPTOR_NAME + MAX_DROP_PATH + MAX_DROP_NAME;
+
 /// The longest window title accepted, in bytes.
 ///
 /// Bounded at the protocol edge for the reason [`MAX_STRUT_RESERVE`] is: it arrives off the wire

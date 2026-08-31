@@ -77,7 +77,7 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
             let rows: Vec<Entry> = entries.iter().filter_map(App::entry_of).collect();
             libkern::debug::Line::new()
                 .s(b"nxfiles: listed ")
-                .s(path.as_bytes())
+                .untrusted(path.as_bytes())
                 .s(b" - ")
                 .u(rows.len() as u64)
                 .s(b" entries")
@@ -87,7 +87,7 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
         Err(_) => {
             libkern::debug::Line::new()
                 .s(b"nxfiles: cannot list ")
-                .s(path.as_bytes())
+                .untrusted(path.as_bytes())
                 .end();
         }
     }
@@ -352,7 +352,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             match w.start_drag(kind, &path, &entry.name) {
                                 Ok(()) => libkern::debug::Line::new()
                                     .s(b"nxfiles: dragging ")
-                                    .s(entry.name.as_bytes())
+                                    .untrusted(entry.name.as_bytes())
                                     .end(),
                                 // Refused means the pointer is not holding this window — the
                                 // press ended between the motion and this request, which is
@@ -395,7 +395,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 WindowEvent::Drop { ref name, .. } => {
                     libkern::debug::Line::new()
                         .s(b"nxfiles: ignoring a drop of ")
-                        .s(name.as_bytes())
+                        .untrusted(name.as_bytes())
                         .end();
                 }
                 WindowEvent::InputLost => kprint(b"nxfiles: input dropped\n"),

@@ -1275,6 +1275,15 @@ drop delivered from a guess is a file opened by a window nobody dropped it on.
 **Two lengths, and both are checked against the body that arrived** — including their sum. Two
 fields that each fit and together do not is the shape a length-prefixed record gets wrong.
 
+**A client must size its event buffer to `MAX_EVENT_BODY`** — `DroppedEvent::HEAD` plus the three
+caps, 632 bytes — and this is a requirement rather than a suggestion. Every Surface event before
+this one was a handful of integers, so `libsurface` read them into 64 bytes; a `Dropped` carrying
+an ordinary path then failed its own length check and the event vanished with nothing logged, so
+a gesture the user completed was silently forgotten. **A cap on a record is a promise to the
+receiver**: a sender that can emit more than a receiver can take is a record that disappears on
+delivery. The compositor's send buffer and `libsurface`'s receive buffers are both this constant,
+spelled the same way, so the two cannot drift (PR #260 review).
+
 ## See also
 
 - [rsproto wire format](rsproto-wire-format.md) — the envelope every category shares

@@ -365,7 +365,7 @@ impl<T: Transport> Session<T> {
             mapped: false,
         });
         while self.idx(id).is_some_and(|i| self.windows[i].configured.is_none()) {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
             let (op, n) = match self.transport.wait_event(&mut buf) {
                 Ok(ev) => ev,
                 // **Take the half-made window back out.** Leaving it would break
@@ -440,7 +440,7 @@ impl<T: Transport> Session<T> {
             if let Some(e) = self.next_event() {
                 return Ok(Some(e));
             }
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
             match self.transport.poll_event(&mut buf)? {
                 Some((op, len)) => self.apply_event(op, &buf[..len]),
                 None => return Ok(None),
@@ -458,7 +458,7 @@ impl<T: Transport> Session<T> {
             if let Some(e) = self.next_event() {
                 return Ok(e);
             }
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
             let (op, len) = self.transport.wait_event(&mut buf)?;
             self.apply_event(op, &buf[..len]);
         }
@@ -479,7 +479,7 @@ impl<T: Transport> Session<T> {
                 w.lost = true;
             }
         }
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
         while let Some((op, len)) = self.transport.poll_event(&mut buf)? {
             self.apply_event(op, &buf[..len]);
             seen += 1;
@@ -719,7 +719,7 @@ impl<T: Transport> WindowRef<'_, T> {
                 return Err(UiError::NoSuchBuffer);
             }
             // Nothing free: block until the compositor says something, then re-check.
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
             let (op, len) = self.session.transport.wait_event(&mut buf)?;
             self.session.apply_event(op, &buf[..len]);
         }
@@ -1030,6 +1030,14 @@ mod tests {
 
         fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
             let Some((op, body)) = self.events.pop() else { return Ok(None) };
+            // **Models the real transport's answer to a body that does not fit**: a loss, not a
+            // shorter body. A mock that panicked here would fail loudly for the wrong reason,
+            // and one that truncated would let a test pass on a shape `ChannelTransport` drops
+            // (PR #260 review, blocking 1).
+            if body.len() > buf.len() {
+                self.lost = true;
+                return Ok(None);
+            }
             buf[..body.len()].copy_from_slice(&body);
             Ok(Some((op, body.len())))
         }
@@ -1097,6 +1105,24 @@ mod tests {
             let mut b = [0u8; core::mem::size_of::<PointerEvent>()];
             let n = e.write(&mut b).unwrap();
             self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
+        }
+
+        /// A `Dropped` event, built exactly as the compositor builds one.
+        fn queue_drop(&mut self, window: u32, acceptor: &str, path: &str, name: &str) {
+            use librsproto::surface::{DROP_KIND_FILE, DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
+            let mut b = alloc::vec![0u8; MAX_EVENT_BODY];
+            let ev = DroppedEvent {
+                window,
+                kind: DROP_KIND_FILE,
+                x: 3,
+                y: 4,
+                acceptor_len: 0,
+                path_len: 0,
+            };
+            let n = ev
+                .write(&mut b, acceptor.as_bytes(), path.as_bytes(), name.as_bytes())
+                .expect("within the protocol's caps");
+            self.events.insert(0, (OP_DROPPED, b[..n].to_vec()));
         }
 
         fn queue_release(&mut self, window: u32, buffer: u32) {
@@ -1213,6 +1239,59 @@ mod tests {
             "the handshake failed"
         );
         assert!(s.window_ids().is_empty(), "and the session kept no half-made window");
+    }
+
+    /// A drop the size the protocol permits reaches the client whole.
+    ///
+    /// **The test that was missing, and the defect it would have caught.** Every event was a
+    /// handful of integers until M10 Part E, so this library read them into 64 bytes — and
+    /// `Dropped` carries a path. A 33-byte path was enough to overflow it: the record failed its
+    /// own length check and the event vanished with nothing logged anywhere in the client, so a
+    /// completed gesture was silently forgotten. Shorter than that and the *display name* came
+    /// out cut, which parses fine and is simply wrong.
+    ///
+    /// `check-login`'s drag passed by **one byte** (`24 + 8 + 22 + 9 = 63`), which is the reason
+    /// this is a host test and not a longer fixture in the gate: the size is a property of the
+    /// protocol, and pinning it needs the maximum rather than a plausible example
+    /// (PR #260 review, blocking 1).
+    #[test]
+    fn a_drop_at_the_protocol_maximum_reaches_the_client_whole() {
+        use librsproto::surface::{DROP_KIND_FILE, MAX_ACCEPTOR_NAME, MAX_DROP_NAME, MAX_DROP_PATH};
+        let mut s = Session::new(MockTransport::default());
+        let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
+
+        // Every field at its cap, which is the only size that pins the buffer to the protocol.
+        let acceptor = "a".repeat(MAX_ACCEPTOR_NAME);
+        let path = alloc::format!("/{}", "p".repeat(MAX_DROP_PATH - 1));
+        let name = "n".repeat(MAX_DROP_NAME);
+        s.transport.queue_drop(w, &acceptor, &path, &name);
+        s.pump().expect("pump");
+
+        assert_eq!(
+            s.next_event(),
+            Some((
+                w,
+                WindowEvent::Drop {
+                    acceptor: acceptor.clone(),
+                    kind: DROP_KIND_FILE,
+                    path: path.clone(),
+                    name: name.clone(),
+                    x: 3,
+                    y: 4,
+                }
+            )),
+            "a maximal drop arrives with nothing shortened"
+        );
+
+        // And an ordinary one, the shape the gate drags — kept beside the maximum because the
+        // failure was *size-dependent*, so a test with only one size proves only that size.
+        s.transport.queue_drop(w, "document", "/home/papers/quarterly-report.txt", "quarterly-report.txt");
+        s.pump().expect("pump");
+        let Some((_, WindowEvent::Drop { path, name, .. })) = s.next_event() else {
+            panic!("an ordinary drop did not arrive");
+        };
+        assert_eq!(path, "/home/papers/quarterly-report.txt");
+        assert_eq!(name, "quarterly-report.txt");
     }
 
     /// Transport-level loss is announced to **every** window, not just one.

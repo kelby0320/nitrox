@@ -1534,6 +1534,28 @@ mod tests {
     }
 
     #[test]
+    fn the_finished_guard_is_what_refuses_a_drop_and_not_only_its_callers() {
+        // **A guard nothing can fail is documentation.** `stop_carrying`'s `finished` parameter
+        // was defence in depth behind two call sites that both discard the record anyway — so
+        // deleting the guard left all seventy tests in this module passing, and the doc comment
+        // describing it was the only thing asserting it (PR #260 review, optional 3).
+        //
+        // Called directly, because that is the only way to see the parameter rather than the
+        // callers: the state is set up exactly as a real gesture would leave it.
+        let mut s = WindowStack::new();
+        let (src, dst) = two_windows(&mut s);
+        s.declare_acceptor(dst, "document", DROP_KIND_FILE).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+        begin_drag(&mut r, &mut s, src, DROP_KIND_FILE, (450, 60));
+        assert_eq!(r.over, Some(dst), "precondition: a drop would land on the target");
+
+        let (event, gone) = r.stop_carrying(&s, false);
+        assert!(event.is_none(), "an unfinished gesture delivers nothing");
+        assert!(gone.is_some(), "and its highlight still comes down");
+        assert!(r.carrying.is_none(), "the payload goes either way");
+    }
+
+    #[test]
     fn a_drag_is_refused_unless_the_pointer_is_holding_the_window() {
         let mut s = WindowStack::new();
         let (src, dst) = two_windows(&mut s);

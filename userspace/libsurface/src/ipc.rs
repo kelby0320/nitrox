@@ -19,7 +19,13 @@ const MSG_LEN: usize = 4096;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 /// Largest event body parked while waiting for a reply.
-const MAX_BODY: usize = 64;
+///
+/// **Sized from the protocol, not from what events happened to be.** This was 64 until M10 Part
+/// E, which was every event's size until `Dropped` carried a path — and a buffer smaller than a
+/// record the protocol permits does not fail loudly, it hands the client a shortened body that
+/// either parses as something else or does not parse at all. Eight of these is the cost, and a
+/// boxed transport already carries four kilobytes.
+const MAX_BODY: usize = librsproto::surface::MAX_EVENT_BODY;
 /// How many out-of-order messages can be parked while waiting for a reply.
 ///
 /// Overflow **never discards a `Release`**, and errors rather than doing so. A lost
@@ -384,7 +390,13 @@ impl Transport for ChannelTransport {
 
             // Anything else — a `Release`, or a reply to a request we have given up on —
             // goes to the parked queue rather than being lost.
-            let n = m.body.len().min(MAX_BODY);
+            // Same rule as `poll_event`'s: a body too large to park is discarded whole and
+            // said out loud, rather than parked shortened and parsed as something else.
+            if m.body.len() > MAX_BODY {
+                self.lost = true;
+                continue;
+            }
+            let n = m.body.len();
             let mut body = [0u8; MAX_BODY];
             body[..n].copy_from_slice(&m.body[..n]);
             self.park(m.op, body, n)?;
@@ -422,9 +434,12 @@ impl Transport for ChannelTransport {
             let (op, body, n) = self.parked[0];
             self.parked.copy_within(1..self.parked_len, 0);
             self.parked_len -= 1;
-            let k = n.min(buf.len());
-            buf[..k].copy_from_slice(&body[..k]);
-            return Ok(Some((op, k)));
+            if n > buf.len() {
+                self.lost = true;
+                return Ok(None);
+            }
+            buf[..n].copy_from_slice(&body[..n]);
+            return Ok(Some((op, n)));
         }
         // Non-blocking: `WouldBlock` means no event is waiting, which is the common case
         // and not an error. Anything else is.
@@ -452,7 +467,17 @@ impl Transport for ChannelTransport {
         ]) as usize;
         let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
         let m = decode(req).map_err(|_| UiError::BadReply)?;
-        let n = m.body.len().min(buf.len());
+        // **A body that does not fit is a loss, not a shorter body.** Shortening it is the worst
+        // of the three possible answers: the record either fails to parse and the event vanishes
+        // with nothing said, or — worse — parses as a *different* event, because every
+        // variable-length field in this protocol is length-prefixed and a cut one describes
+        // something the sender never sent. Reported through the mechanism this library already
+        // has for saying "events were discarded" (PR #260 review, blocking 1).
+        if m.body.len() > buf.len() {
+            self.lost = true;
+            return Ok(None);
+        }
+        let n = m.body.len();
         buf[..n].copy_from_slice(&m.body[..n]);
         Ok(Some((m.op, n)))
     }

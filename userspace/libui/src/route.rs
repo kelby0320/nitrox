@@ -647,6 +647,32 @@ mod tests {
     }
 
     #[test]
+    fn one_element_may_carry_both_a_press_down_and_a_click() {
+        // **The combination `list_view` now ships and nothing tested.** A row carries
+        // `on_press_down` (a drag begins) *and* `on_press` (a click opens), and the shadowing
+        // rule that lets a title bar hold buttons compares *depth* — so two handlers on one
+        // element is the case that rule says nothing about (PR #260 review, optional 5).
+        let ui: Element<Msg> = sized(Size::new(640, 40), custom(1, Size::new(640, 40)))
+            .on_press_down(Msg::Pressed(1))
+            .on_press(Msg::Pressed(2));
+        let (t, l) = build(&ui);
+        let mut r = Router::new();
+
+        let (down, _) = r.pointer(&t, &ui, &l, press(10, 10));
+        assert_eq!(down, vec![Msg::Pressed(1)], "the press fires the gesture, not the click");
+
+        let (up, _) = r.pointer(&t, &ui, &l, release(10, 10));
+        assert_eq!(up, vec![Msg::Pressed(2)], "and the release inside fires the click");
+
+        // Releasing *outside* is a cancel, so the gesture happened and the click did not —
+        // which is the shape a drag out of a row actually takes.
+        let (down, _) = r.pointer(&t, &ui, &l, press(10, 10));
+        assert_eq!(down, vec![Msg::Pressed(1)]);
+        let (up, _) = r.pointer(&t, &ui, &l, release(10, 400));
+        assert!(up.is_empty(), "a release outside the widget is not a click");
+    }
+
+    #[test]
     fn a_drop_is_routed_by_position_like_a_press() {
         // **This is what makes a drop *region* the client's** (M10 decision 3). The compositor
         // knows only that the window declared an acceptor; which part of the window means
