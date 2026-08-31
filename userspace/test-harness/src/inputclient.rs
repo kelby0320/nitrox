@@ -578,7 +578,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 WindowEvent::Focus(_) => b"focus",
                 WindowEvent::Key(_) => b"key",
                 WindowEvent::Pointer(_) => b"pointer",
-                WindowEvent::Dropped => b"dropped",
+                WindowEvent::InputLost => b"dropped",
+                // This client declares no acceptor, so nothing can be dropped on it.
+                WindowEvent::Drop { .. } => b"drop",
                 WindowEvent::CloseRequested => b"close",
                 // Not this client's business: its window is fixed-size and it never moves.
                 WindowEvent::Configure { .. } => b"configure",
@@ -654,7 +656,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 // this window becomes the topmost focusable one.
                 Line::new().s(b"input-testclient: win focus has=").u(u64::from(f)).end();
             }
-            WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+            WindowEvent::InputLost => kprint(b"input-testclient: win events DROPPED\n"),
+            WindowEvent::Drop { .. } => kprint(b"input-testclient: a drop arrived\n"),
             // **Reported and ignored, deliberately.** This client exists to be driven by a gate,
             // and a window that vanished because something asked politely would take the rest of
             // the run with it. A client is free to ignore a close request — that is the whole
@@ -699,7 +702,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 }
             }
             WindowEvent::Pointer(_) | WindowEvent::Focus(_) => {}
-            WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+            WindowEvent::InputLost => kprint(b"input-testclient: win events DROPPED\n"),
+            WindowEvent::Drop { .. } => kprint(b"input-testclient: a drop arrived\n"),
             // **Reported and ignored, deliberately.** This client exists to be driven by a gate,
             // and a window that vanished because something asked politely would take the rest of
             // the run with it. A client is free to ignore a close request — that is the whole

@@ -6,7 +6,7 @@
 old §5 "Tier 2" and §7 "Templates". See "Changes in revision 3" below; the reasoning is worth
 reading before proposing anything shaped like it.
 
-**Partly built, and checked 2026-08-26** — graduated from `design/` with Milestone 8, revision 3.
+**Partly built, and checked 2026-09-01** — graduated from `design/` with Milestone 8, revision 3.
 
 **What is built: desktops (§6), and the split §6 rests on.** The compositor holds a `desktop`
 attribute per window and one `current` value and has **no notion of a desktop object** — no list,
@@ -15,6 +15,14 @@ Membership is one attribute (§2a) and moving a window between desktops is one w
 stable and never reused (§2b), and the human name lives beside them as metadata — which turned
 out to be load-bearing rather than decorative: **naming is what makes a desktop persist**.
 Desktops are reachable as a resource at `/dev/desktop`, with a `desktop` command as the proof.
+
+**And window-to-window composition (§5) is built as of M10 Part E** — the one mechanism this
+section describes, in the shape the details pass corrected it to: a window declares its acceptors
+once (`Surface::DeclareAcceptor`), the compositor matches the table it already holds while the
+pointer moves, highlights what would take the payload, and delivers one `Surface::Dropped` if the
+gesture ends over it. The payload is a **path**, for the reason §5's own "nothing is persisted"
+argument implies: a handle in flight would have to belong to somebody, and a refused transfer has
+no clean owner. `nxfiles` offers files and folders; `nxedit` takes files.
 
 **What is not built: ports (§5a), and they are unscheduled** — `TODO(port-shape-rework)`. Naming,
 stream-versus-message, what happens when nothing is listening, and which server owns the path are
@@ -261,8 +269,9 @@ which the system already has, rather than a wiring model, which it would have ha
 highlight; dropping sends one message, once. Nothing is pre-wired, nothing is persisted, no
 standing connection is created.
 
-**The match is declared rather than queried** — corrected 2026-08-30 by Milestone 10's details
-pass, which is where this became a thing to build rather than a thing to describe. This section
+**Built in M10 Part E, and the match is declared rather than queried** — corrected 2026-08-30 by
+Milestone 10's details pass, which is where this became a thing to build rather than a thing to
+describe. This section
 said a drag triggers a *live* `QueryCaps` against visible windows. It does not: a window declares
 its acceptors once, and the compositor matches a table it already holds. Milestone 9 spent three
 parts establishing that per-gesture traffic to a manager is what to avoid, and a round trip to
@@ -277,6 +286,18 @@ how drag-and-drop works elsewhere, not the foundation of a composition system.
 **There is no second tier.** Revision 3 cut durable per-instance wiring, the patch canvas and
 templates; see the Status section for why, and for the prior it leaves behind. A workflow that
 wants tools durably integrated is asking for an application, and should be given one.
+
+**What an acceptor is, now that one exists.** A *name* and a set of kinds, held per window and
+cleared with it — and the name is the part that matters for §5a: it is the port's name in
+waiting. When ports arrive, `/dev/draw/3/ports/in/document` is the same sink a drag addresses by
+ending over it, rather than a second mechanism that happens to look similar. That is why the
+protocol carries a string rather than an index, and why a `Dropped` says which acceptor it landed
+on even though every window built so far declares exactly one.
+
+**Where on a window a drop is allowed is the client's**, not the protocol's: the event carries the
+pointer position and `libui` routes it to the widget under that point, exactly as it routes a
+press. `nxedit` takes a file on its text area and not on its title bar, and the compositor knows
+nothing about either.
 
 ### 5a. Ports live under the window
 

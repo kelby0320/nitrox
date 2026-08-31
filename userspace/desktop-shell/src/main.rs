@@ -422,7 +422,7 @@ fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: &mut ListStat
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, &palette);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
-    let list = list_view(rows, state, list_h, ROW_H, |_| (), &palette);
+    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, &palette);
     padding(
         Insets::all(8),
         column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),

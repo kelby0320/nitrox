@@ -233,6 +233,20 @@ pub struct Element<Msg> {
     /// press that begins them, so pressing close does not also start a move. Dispatch is in
     /// [`Router::pointer`](crate::route::Router::pointer).
     pub on_press_down: Option<Msg>,
+    /// A drag-and-drop payload released over this element — `Surface::Dropped`.
+    ///
+    /// **Routed by position, exactly like a press** (M10 decision 3), which is what makes a drop
+    /// *region* a client-side matter: the compositor knows only that this window declared an
+    /// acceptor, and where on the window a drop is allowed is decided here, by which element is
+    /// under the point. A window can take a file in its document area and refuse one on its
+    /// title bar without the protocol growing a rectangle.
+    ///
+    /// **The message carries no payload**, and that is deliberate: an `Option<Msg>` cannot be
+    /// parameterised by a value the toolkit does not have, and the payload is already in the
+    /// event the application is holding when it calls the router. What this answers is *which
+    /// widget* the drop landed on; what was dropped is the caller's, and pairing them at the one
+    /// call site is clearer than a closure that has to be built into every frame's tree.
+    pub on_drop: Option<Msg>,
     /// Raw key events, while this element holds widget focus.
     ///
     /// The path the terminal grid uses: a `custom` widget that wants keycodes rather than a
@@ -262,6 +276,7 @@ impl<Msg> Element<Msg> {
             node,
             on_press: None,
             on_press_down: None,
+            on_drop: None,
             on_key: None,
             on_pointer: None,
             focusable: false,
@@ -277,6 +292,13 @@ impl<Msg> Element<Msg> {
     /// Give this element a share of its parent's leftover space.
     pub fn flex(mut self, flex: u16) -> Self {
         self.flex = flex;
+        self
+    }
+
+    /// Send `msg` when a drag is released over this element — see
+    /// [`on_drop`](Self::on_drop).
+    pub fn on_drop(mut self, msg: Msg) -> Self {
+        self.on_drop = Some(msg);
         self
     }
 

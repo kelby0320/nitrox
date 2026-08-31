@@ -37,7 +37,7 @@ const MAX_BODY: usize = 64;
 ///
 /// The line is drawn at recoverability, not at importance. A lost `FocusEvent` leaves a
 /// client wrong about whether it has the keyboard until the next focus change; a lost key or
-/// motion degrades an event stream `WindowEvent::Dropped` already warns about. A lost
+/// motion degrades an event stream `WindowEvent::InputLost` already warns about. A lost
 /// `Release` has no next anything — there is no resync op, and the buffer never comes back.
 ///
 /// **It is reachable, and `parked_len` never resets between requests.** It accumulates for
@@ -53,7 +53,7 @@ const MAX_PARKED: usize = 8;
 /// Whether a parked entry may be discarded to make room.
 ///
 /// Only `Release` may not. Everything else either supersedes itself (motion), degrades an
-/// event stream the client is already told about (`WindowEvent::Dropped`), or corrects itself
+/// event stream the client is already told about (`WindowEvent::InputLost`), or corrects itself
 /// on the next change (`FocusEvent`). A `Release` has no next: there is no resync op, and
 /// `Window::acquire` waits on it with no timeout.
 fn losable(entry: &(u16, [u8; MAX_BODY], usize)) -> bool {
@@ -245,7 +245,7 @@ impl ChannelTransport {
     /// describes the world as it is now.
     ///
     /// The loss is reported through [`took_loss`](libsurface::Transport::took_loss), so it
-    /// surfaces as a `WindowEvent::Dropped` rather than vanishing.
+    /// surfaces as a `WindowEvent::InputLost` rather than vanishing.
     ///
     /// Split out of `request` so it can be tested: everything around it issues syscalls and
     /// this does not. The shift arithmetic rested on the boot gate not hanging until it was
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn a_drop_is_reported_once_and_then_cleared() {
         // `took_loss` is take-and-clear, because `Window::pump` folds it into a flag that
-        // produces exactly one `WindowEvent::Dropped`. Reporting on every call would emit a
+        // produces exactly one `WindowEvent::InputLost`. Reporting on every call would emit a
         // `Dropped` per pump for the rest of the window's life.
         let mut t = transport();
         for n in 0..(MAX_PARKED as u16 + 1) {

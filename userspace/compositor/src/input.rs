@@ -102,6 +102,24 @@ struct Drag {
     origin: Point,
 }
 
+/// A drag-and-drop gesture the compositor is running on a client's behalf.
+///
+/// **The payload is a path and never a handle** (M10 decision 1): a handle would have to belong
+/// to somebody while the gesture is in flight, and a transfer the receiver refuses has no clean
+/// owner. A path is a name the receiving program opens for itself, and reports its own errors
+/// about in its own window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Carrying {
+    /// The window the drag came out of — the one that must hold the grab.
+    window: u32,
+    /// What the payload is: exactly one of `DROP_KIND_FILE` and friends.
+    kind: u32,
+    /// What is being offered.
+    path: alloc::string::String,
+    /// What to call it on screen.
+    name: alloc::string::String,
+}
+
 /// An interactive resize the compositor is running on a client's behalf.
 ///
 /// **The window does not move and does not change size while this runs.** Only an outline does,
@@ -192,6 +210,18 @@ pub struct InputRouter {
     /// **Never both**: a grab is opened by one press and carries one gesture, so `start_move`
     /// and `start_resize` each refuse while the other is running rather than replacing it.
     resize: Option<Resize>,
+    /// The drag-and-drop gesture in progress, if any — the third thing a grab can carry.
+    ///
+    /// **The payload lives here for the gesture's life**, because that is exactly how long it
+    /// exists: a drag is an offer, and an offer that outlived the button would be a payload
+    /// belonging to nobody. Cleared wherever the grab ends, like the other two.
+    carrying: Option<Carrying>,
+    /// The window a drop would land on right now — what the highlight is drawn around.
+    ///
+    /// Kept rather than recomputed at the release for the reason the snap zone's id is: the
+    /// window the user let go over must be the one they were *shown*, and two hit tests of the
+    /// same pointer are two chances to disagree.
+    over: Option<u32>,
     /// The rectangle the outline is drawn at, if anything is drawing one.
     ///
     /// **Two gestures write it**, which is what makes `resize.is_none()` say nothing about it: a
@@ -285,6 +315,8 @@ impl InputRouter {
             grab_at: pointer,
             drag: None,
             resize: None,
+            carrying: None,
+            over: None,
             outline: None,
             grab_button: 0,
             grab_broken: false,
@@ -302,6 +334,17 @@ impl InputRouter {
     /// Where the cursor is, in screen coordinates.
     pub fn pointer(&self) -> Point {
         self.pointer
+    }
+
+    /// The rectangle an outline is being drawn at, if anything is drawing one.
+    ///
+    /// **The compositor already keeps its own copy** — `Server::outline`, which is what
+    /// `present_into` reads — and this is the router's, which is what that copy is *derived*
+    /// from through the `Outline` changes `route` hands back. Exposed so a test can ask the
+    /// state rather than accumulating the changes itself, which would be a test that
+    /// re-implements the thing it checks.
+    pub fn outline(&self) -> Option<Rect> {
+        self.outline
     }
 
     /// The window the cursor is inside, if any.
@@ -384,6 +427,12 @@ impl InputRouter {
             let (r, gone) = self.stop_resize(stack, false);
             ended = ended.or(r);
             outline_gone = outline_gone.or(gone);
+            // **And a payload goes with the grab that was carrying it.** `finished` is false, so
+            // nothing is delivered: a grab taken away is not somebody letting go, and a drop
+            // handed to a window because the gesture was interrupted is a file opened by an
+            // application nobody dropped it on.
+            let (_, gone) = self.stop_carrying(stack, false);
+            outline_gone = outline_gone.or(gone);
         }
 
         match *ev {
@@ -429,8 +478,11 @@ impl InputRouter {
                 // it to the rectangle the edges say, and a *move* over a registered snap zone
                 // shows that zone's target — a preview of what letting go there would ask for
                 // (M9 Part F).
-                let outline =
-                    self.outline_to_pointer().or_else(|| self.preview_zone()).or(outline_gone);
+                let outline = self
+                    .outline_to_pointer()
+                    .or_else(|| self.preview_zone())
+                    .or_else(|| self.highlight_target(stack))
+                    .or(outline_gone);
                 self.update_crossing(stack, out);
                 if let Some(window) = self.target(stack) {
                     self.emit(window, POINTER_MOTION, 0, 0, stack, out);
@@ -492,6 +544,15 @@ impl InputRouter {
                     let (r, gone) = self.stop_resize(stack, true);
                     ended = ended.or(r);
                     outline_gone = outline_gone.or(gone);
+                    // **And this is where a drag becomes a drop.** Over a window that takes the
+                    // payload it is one message to that window; over anything else the gesture
+                    // is simply over — a drop on nothing is how somebody changes their mind, not
+                    // an error to report to either side.
+                    let (drop, gone) = self.stop_carrying(stack, true);
+                    outline_gone = outline_gone.or(gone);
+                    if let Some(rec) = drop {
+                        out.push(rec);
+                    }
                     // Last button up: the grab ends, and the cursor may have been dragged
                     // somewhere else entirely while it was held, so re-derive the crossing.
                     //
@@ -523,6 +584,10 @@ impl InputRouter {
                 outline_gone = outline_gone.or(gone);
                 let (r, gone) = self.stop_resize(stack, false);
                 ended = ended.or(r);
+                outline_gone = outline_gone.or(gone);
+                // The payload too: `Logical::Dropped` says the pointer's position is a guess,
+                // and a guess is the last thing to hand another application a file on.
+                let (_, gone) = self.stop_carrying(stack, false);
                 outline_gone = outline_gone.or(gone);
                 if had {
                     self.update_crossing(stack, out);
@@ -628,8 +693,11 @@ impl InputRouter {
     /// nobody touching it — a `Place` for itself by another name, and `Place` is deliberately a
     /// manager op.
     ///
-    /// **Refused while a resize is running**, which is the other half of a rule that was
-    /// enforced in one direction only until the Part E review found it. Both gestures would
+    /// **Refused while a resize or a drag-and-drop is running** — one grab carries one gesture.
+    /// The resize half of that rule was enforced in one direction only until the M9 Part E
+    /// review found it; the drag half was missing in *both* directions until a Part E test
+    /// asked, which would have let a window follow the pointer while a payload was in flight
+    /// out of it and made the release mean two things at once. Both gestures would
     /// run: the window would follow the pointer *and* the outline would follow the pointer,
     /// and the release would hand the shell a rectangle built from the window's origin at the
     /// *resize* press — an origin the move has since changed. The window jumps back by
@@ -652,7 +720,7 @@ impl InputRouter {
         window: u32,
         stack: &mut WindowStack,
     ) -> Result<Option<Rect>, StackError> {
-        if self.grab != Some(window) || self.resize.is_some() {
+        if self.grab != Some(window) || self.resize.is_some() || self.carrying.is_some() {
             return Err(StackError::NoSuchWindow);
         }
         if self.drag.is_some_and(|d| d.window == window) {
@@ -697,7 +765,7 @@ impl InputRouter {
         edges: u32,
         stack: &mut WindowStack,
     ) -> Result<Option<Rect>, StackError> {
-        if self.grab != Some(window) || self.drag.is_some() {
+        if self.grab != Some(window) || self.drag.is_some() || self.carrying.is_some() {
             return Err(StackError::NoSuchWindow);
         }
         if !StartResize::edges_are_a_gesture(edges) {
@@ -715,6 +783,111 @@ impl InputRouter {
         // show no outline at all and end at the rectangle it started from.
         self.outline = Some(self.outline_now());
         Ok(self.outline)
+    }
+
+    /// Begin a drag-and-drop gesture out of `window` — `Surface::StartDrag`.
+    ///
+    /// **The grab is the authority**, exactly as it is for [`start_move`](Self::start_move) and
+    /// [`start_resize`](Self::start_resize), and for a reason that is sharper here: a drag is an
+    /// *offer of a payload* to whatever window it ends over. A client that could start one with
+    /// nobody touching it could push a path into another application's window at any moment.
+    ///
+    /// **Refused while a move or a resize is running**, and they refuse while this is — one grab
+    /// carries one gesture. A second `StartDrag` while one is running replaces the payload
+    /// rather than being refused: the gesture is the same gesture, and a client that decided
+    /// what it was dragging a moment later than it decided *that* it was dragging is not doing
+    /// anything wrong.
+    ///
+    /// Returns the highlight to draw, if the pointer already stands over a window that takes it
+    /// — for the reason a move applies its first step at once: the pointer has travelled during
+    /// the round trip that brought this request.
+    pub fn start_drag(
+        &mut self,
+        window: u32,
+        kind: u32,
+        path: &str,
+        name: &str,
+        stack: &WindowStack,
+    ) -> Result<Option<Outline>, StackError> {
+        if self.grab != Some(window) || self.drag.is_some() || self.resize.is_some() {
+            return Err(StackError::NoSuchWindow);
+        }
+        self.carrying = Some(Carrying {
+            window,
+            kind,
+            path: alloc::string::String::from(path),
+            name: alloc::string::String::from(name),
+        });
+        Ok(self.highlight_target(stack))
+    }
+
+    /// Whether a drag is in flight — for a caller deciding what a release means.
+    pub fn is_dragging_payload(&self) -> bool {
+        self.carrying.is_some()
+    }
+
+    /// Move the highlight to whatever window would take the drag now.
+    ///
+    /// **The topmost window under the pointer, and only if it takes this kind** — not the
+    /// topmost *acceptor*. A window that does not take the payload is still a window: a drag
+    /// passing over it must not highlight something behind it, because letting go there drops on
+    /// nothing, and a highlight that lies about where a payload will land is worse than none.
+    fn highlight_target(&mut self, stack: &WindowStack) -> Option<Outline> {
+        let Some(c) = &self.carrying else { return None };
+        // **The source window is skipped.** A drag out of a window that also accepts drops would
+        // otherwise highlight itself the instant it began, which is a gesture nobody is making —
+        // and dropping a thing back where it came from is the definition of a no-op.
+        let found = self
+            .hit(stack)
+            .filter(|&w| w != c.window)
+            .filter(|&w| stack.acceptor_for(w, c.kind).is_some());
+        if found == self.over {
+            return None;
+        }
+        let was = self.outline;
+        self.over = found;
+        self.outline = found.and_then(|w| stack.window(w)).map(|w| w.bounds());
+        Some(Outline { was, now: self.outline })
+    }
+
+    /// End a drag-and-drop gesture, if one is running.
+    ///
+    /// **The drop is reported only if `finished`**, which is the same rule a resize follows and
+    /// for the same reason: a gesture whose grab was taken away, or whose input stream reported
+    /// a loss, is not somebody letting go. Here the stakes are plainer than a rectangle — a drop
+    /// hands a payload to another application, and one delivered because the pointer's position
+    /// was a guess is a file opened by a window nobody dropped it on.
+    ///
+    /// Returns the event to deliver (if any) and the highlight to take down.
+    fn stop_carrying(
+        &mut self,
+        stack: &WindowStack,
+        finished: bool,
+    ) -> (Option<Outbound>, Option<Outline>) {
+        let Some(c) = self.carrying.take() else { return (None, None) };
+        let target = self.over.take();
+        let gone = self.outline.take().map(|was| Outline { was: Some(was), now: None });
+        let event = finished
+            .then_some(target)
+            .flatten()
+            // Re-read here rather than trusted: the window may have gone between the last
+            // motion and this release, and `acceptor_for` is what says it still takes this.
+            .and_then(|w| {
+                let acceptor = stack.acceptor_for(w, c.kind)?;
+                let rect = stack.window(w)?.bounds();
+                Some(Outbound::Dropped {
+                    window: w,
+                    acceptor: alloc::string::String::from(acceptor),
+                    kind: c.kind,
+                    path: c.path.clone(),
+                    name: c.name.clone(),
+                    // **Window-local, like a `PointerEvent`'s**, which is what lets the client
+                    // route it to a widget without the protocol knowing about regions.
+                    x: self.pointer.x - rect.origin.x,
+                    y: self.pointer.y - rect.origin.y,
+                })
+            });
+        (event, gone)
     }
 
     /// The rectangle the outline should occupy for the pointer's current position.
@@ -1139,8 +1312,8 @@ impl InputRouter {
 mod tests {
     use super::*;
     use librsproto::surface::{
-        AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, MOD_SHIFT, Role,
-        SURFACE_FORMAT_XRGB8888,
+        AttachBufferRequest, CommitRequest, CreateWindowRequest, DROP_KIND_DIR, DROP_KIND_FILE,
+        Edge, MOD_SHIFT, Role, SURFACE_FORMAT_XRGB8888,
     };
 
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
@@ -1219,6 +1392,204 @@ mod tests {
     const MOD_SUPER: u16 = librsproto::surface::MOD_META;
     /// `2` in the keycode table `libkern::abi` mirrors.
     const KEY_2: u16 = 3;
+
+    // ---- drag and drop (M10 Part E) ----
+
+    /// Two windows side by side: a source at the left and a target at the right.
+    fn two_windows(s: &mut WindowStack) -> (u32, u32) {
+        let src = win(s, Role::Normal, 0, 0, 200, 200);
+        let dst = win(s, Role::Normal, 400, 0, 200, 200);
+        (src, dst)
+    }
+
+    /// Press inside `src`, ask to carry `kind`, and drag to `(x, y)`.
+    fn begin_drag(
+        r: &mut InputRouter,
+        s: &mut WindowStack,
+        src: u32,
+        kind: u32,
+        to: (i32, i32),
+    ) -> Option<Outline> {
+        warp(r, s, 20, 20);
+        go(r, s, button(true));
+        let started = r.start_drag(src, kind, "/home/a.txt", "a.txt", s).expect("the grab is held");
+        let p = r.pointer();
+        go(r, s, drag(to.0 - p.x, to.1 - p.y));
+        started
+    }
+
+    /// The drop record a release produced, if any.
+    fn drop_of(out: &[Outbound]) -> Option<&Outbound> {
+        out.iter().find(|o| matches!(o, Outbound::Dropped { .. }))
+    }
+
+    #[test]
+    fn a_drag_highlights_a_window_that_takes_it_and_delivers_on_release() {
+        let mut s = WindowStack::new();
+        let (src, dst) = two_windows(&mut s);
+        s.declare_acceptor(dst, "document", DROP_KIND_FILE).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+
+        begin_drag(&mut r, &mut s, src, DROP_KIND_FILE, (450, 60));
+        assert_eq!(
+            r.outline(),
+            Some(Rect::new(400, 0, 200, 200)),
+            "the window that would take it is outlined"
+        );
+
+        let out = go(&mut r, &mut s, button(false));
+        let Some(Outbound::Dropped { window, acceptor, kind, path, name, x, y }) = drop_of(&out)
+        else {
+            panic!("no drop was delivered: {out:?}");
+        };
+        assert_eq!(*window, dst);
+        assert_eq!((acceptor.as_str(), kind, path.as_str(), name.as_str()),
+            ("document", &DROP_KIND_FILE, "/home/a.txt", "a.txt"));
+        // **Window-local, like a press's**, which is what lets the client route it to a widget.
+        assert_eq!((*x, *y), (50, 60), "the pointer, relative to the window it landed on");
+        assert_eq!(r.outline(), None, "and the highlight goes with the gesture");
+    }
+
+    #[test]
+    fn a_window_that_does_not_take_this_kind_is_neither_highlighted_nor_dropped_on() {
+        // **The first of Part E's two controls.** An editor that declares `file` must be inert
+        // for a folder: a mechanism that highlighted everything would pass the positive test
+        // above on its own, and the person dragging would be told a drop was possible where it
+        // is not.
+        let mut s = WindowStack::new();
+        let (src, dst) = two_windows(&mut s);
+        s.declare_acceptor(dst, "document", DROP_KIND_FILE).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+
+        begin_drag(&mut r, &mut s, src, DROP_KIND_DIR, (450, 60));
+        assert_eq!(r.outline(), None, "a folder over a files-only window highlights nothing");
+
+        let out = go(&mut r, &mut s, button(false));
+        assert!(drop_of(&out).is_none(), "and letting go delivers nothing");
+    }
+
+    #[test]
+    fn a_window_with_no_acceptor_is_neither_highlighted_nor_dropped_on() {
+        // **The second control**, and the one that says the table is consulted at all: a window
+        // that never declared anything must be exactly as inert as one that declared the wrong
+        // kind — otherwise "declares nothing" would mean "takes everything".
+        let mut s = WindowStack::new();
+        let (src, dst) = two_windows(&mut s);
+        let _ = dst;
+        let mut r = InputRouter::new(SCREEN);
+
+        begin_drag(&mut r, &mut s, src, DROP_KIND_FILE, (450, 60));
+        assert_eq!(r.outline(), None);
+
+        let out = go(&mut r, &mut s, button(false));
+        assert!(drop_of(&out).is_none());
+    }
+
+    #[test]
+    fn a_drag_does_not_highlight_the_window_it_came_out_of() {
+        // A browser that also took drops would otherwise outline itself the instant a drag
+        // began — a gesture nobody is making, and one whose completion means nothing.
+        let mut s = WindowStack::new();
+        let src = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        s.declare_acceptor(src, "self", DROP_KIND_FILE).unwrap();
+        let mut r = InputRouter::new(SCREEN);
+
+        let started = begin_drag(&mut r, &mut s, src, DROP_KIND_FILE, (60, 60));
+        assert!(started.is_none(), "nothing to highlight when the drag begins");
+        assert_eq!(r.outline(), None);
+        let out = go(&mut r, &mut s, button(false));
+        assert!(drop_of(&out).is_none(), "and dropping a thing back where it came from is a no-op");
+    }
+
+    #[test]
+    fn a_drag_that_ends_any_way_but_the_button_delivers_nothing() {
+        // **The same rule a resize follows, and the stakes are plainer here**: a drop hands a
+        // payload to another application, and one delivered because the pointer's position was
+        // a guess is a file opened by a window nobody dropped it on.
+        // **The two ways a gesture ends without the button coming up**, and they are the two
+        // the router models: the input stream reporting a loss, and the grab being taken away
+        // because the window carrying it left the screen. (Motion arriving with no buttons held
+        // is *not* one of them — a lost release is what `Logical::Dropped` exists to say, and
+        // the router does not guess from a mirrored field.)
+        for lost_input in [true, false] {
+            let mut s = WindowStack::new();
+            let (src, dst) = two_windows(&mut s);
+            s.declare_acceptor(dst, "document", DROP_KIND_FILE).unwrap();
+            let mut r = InputRouter::new(SCREEN);
+
+            begin_drag(&mut r, &mut s, src, DROP_KIND_FILE, (450, 60));
+            assert!(r.outline().is_some(), "precondition: the target is highlighted");
+
+            let out = if lost_input {
+                go(&mut r, &mut s, Logical::Dropped)
+            } else {
+                // The source window goes away mid-gesture: `reconcile_with` breaks the grab,
+                // and the invariant at the top of `route` tears the drag down with it.
+                s.set_minimized(src, true).expect("minimize");
+                go(&mut r, &mut s, drag(1, 0))
+            };
+            assert!(drop_of(&out).is_none(), "an interrupted gesture is not somebody letting go");
+            assert_eq!(r.outline(), None, "and the highlight comes down with the gesture");
+        }
+    }
+
+    #[test]
+    fn a_drag_is_refused_unless_the_pointer_is_holding_the_window() {
+        let mut s = WindowStack::new();
+        let (src, dst) = two_windows(&mut s);
+        let mut r = InputRouter::new(SCREEN);
+
+        // Nothing pressed at all.
+        assert!(r.start_drag(src, DROP_KIND_FILE, "/a", "a", &s).is_err());
+
+        // Pressed on the *other* window: the grab is what says the user is dragging *this*.
+        warp(&mut r, &mut s, 450, 20);
+        go(&mut r, &mut s, button(true));
+        assert!(r.start_drag(src, DROP_KIND_FILE, "/a", "a", &s).is_err());
+        assert!(r.start_drag(dst, DROP_KIND_FILE, "/a", "a", &s).is_ok(), "the held one may");
+    }
+
+    #[test]
+    fn one_grab_carries_one_gesture() {
+        // A move and a drag would both run: the window would follow the pointer while a payload
+        // was in flight from it, and the release would be both a drop and a snap.
+        let mut s = WindowStack::new();
+        let src = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 20, 20);
+        go(&mut r, &mut s, button(true));
+
+        r.start_move(src, &mut s).expect("the grab is held");
+        assert!(r.start_drag(src, DROP_KIND_FILE, "/a", "a", &s).is_err(), "not while moving");
+
+        let mut s = WindowStack::new();
+        let src = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 20, 20);
+        go(&mut r, &mut s, button(true));
+        r.start_drag(src, DROP_KIND_FILE, "/a", "a", &s).expect("the grab is held");
+        assert!(r.start_move(src, &mut s).is_err(), "and not the other way round either");
+        assert!(r.start_resize(src, RESIZE_RIGHT, &mut s).is_err());
+    }
+
+    #[test]
+    fn a_window_may_declare_a_bounded_number_of_acceptors() {
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        for i in 0..librsproto::surface::MAX_ACCEPTORS {
+            let name = alloc::format!("sink{i}");
+            s.declare_acceptor(w, &name, DROP_KIND_FILE).expect("within the bound");
+        }
+        assert_eq!(
+            s.declare_acceptor(w, "one-more", DROP_KIND_FILE),
+            Err(StackError::TooManyAcceptors),
+            "refused rather than evicting one the client still believes in"
+        );
+        // **Re-declaring is not a new entry**, so a client that changes its mind is not
+        // eventually refused for saying the same thing again.
+        s.declare_acceptor(w, "sink0", DROP_KIND_DIR).expect("replaces");
+        assert_eq!(s.acceptor_for(w, DROP_KIND_DIR), Some("sink0"));
+    }
 
     #[test]
     fn a_registered_chord_goes_to_the_manager_and_not_to_the_focused_window() {
@@ -2539,7 +2910,7 @@ mod tests {
         let Outbound::Pointer { event, .. } = out
             .iter()
             .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION))
-            .copied()
+            .cloned()
             .expect("a motion")
         else {
             unreachable!()
@@ -2597,7 +2968,7 @@ mod tests {
 
         let out = go(&mut r, &mut s, motion(5, 5));
         let Outbound::Pointer { event } =
-            out.iter().find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION)).copied().expect("a motion")
+            out.iter().find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION)).cloned().expect("a motion")
         else {
             unreachable!()
         };
@@ -2650,7 +3021,7 @@ mod tests {
         let Outbound::Pointer { event, .. } = out
             .iter()
             .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION))
-            .copied()
+            .cloned()
             .expect("a motion")
         else {
             unreachable!()

@@ -33,7 +33,12 @@ use alloc::vec::Vec;
 use librsproto::surface::{KeyEvent, POINTER_MOTION, PointerEvent};
 
 /// One message addressed to one window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// **`Clone` rather than `Copy` since M10 Part E**: a drop carries a path and two names, which
+/// are variable-length by nature — bounded at the protocol edge, but not small enough to sit
+/// inline in every queued record. Thirty-two slots per session times a 512-byte path is the
+/// arithmetic that decided it.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outbound {
     /// A `Surface::KeyEvent`, addressed by the window **inside** the record.
     ///
@@ -95,6 +100,27 @@ pub enum Outbound {
         /// Which window is being asked to close.
         window: u32,
     },
+    /// A `Surface::Dropped` — a drag ended over this window (M10 Part E).
+    ///
+    /// Queued like every other server-initiated record. A drop that was lost to a briefly full
+    /// ring would be a gesture the user completed and the system silently forgot, which is worse
+    /// here than for a `Configure`: there is nothing to repeat it.
+    Dropped {
+        /// Which window it landed on.
+        window: u32,
+        /// The acceptor it matched, by the name that window declared.
+        acceptor: alloc::string::String,
+        /// What the payload is.
+        kind: u32,
+        /// The payload.
+        path: alloc::string::String,
+        /// What to call it on screen.
+        name: alloc::string::String,
+        /// Where the pointer was, window-local.
+        x: i32,
+        /// See [`x`](Self::Dropped::x).
+        y: i32,
+    },
 }
 
 impl Outbound {
@@ -109,6 +135,7 @@ impl Outbound {
             Outbound::Release { window, .. }
             | Outbound::Focus { window, .. }
             | Outbound::Configure { window, .. }
+            | Outbound::Dropped { window, .. }
             | Outbound::CloseRequested { window } => *window,
         }
     }
@@ -164,8 +191,12 @@ impl Outbox {
     }
 
     /// The oldest queued message, if any.
-    pub fn front(&self) -> Option<Outbound> {
-        self.q.first().copied()
+    ///
+    /// **Borrowed rather than copied out**, since a `Dropped` carries a path: the caller sends
+    /// from it and then [`pop`](Self::pop)s, so a clone per send would be a clone per record for
+    /// the benefit of the one variant that needs one.
+    pub fn front(&self) -> Option<&Outbound> {
+        self.q.first()
     }
 
     /// Discard the oldest queued message — call after it has been sent.
@@ -214,7 +245,7 @@ mod tests {
 
     fn drain(o: &mut Outbox) -> Vec<Outbound> {
         let mut out = Vec::new();
-        while let Some(r) = o.front() {
+        while let Some(r) = o.front().cloned() {
             out.push(r);
             o.pop();
         }
@@ -285,7 +316,7 @@ mod tests {
             o.push(motion(1, x));
         }
         assert_eq!(o.len(), 2);
-        assert_eq!(o.front(), Some(Outbound::Focus { window: 1, focused: true }));
+        assert_eq!(o.front(), Some(&Outbound::Focus { window: 1, focused: true }));
     }
 
     #[test]
@@ -324,7 +355,7 @@ mod tests {
         assert!(o.push(key(1, 999)), "the one that overflowed says so");
         assert_eq!(o.len(), OUTBOX_MAX);
         assert_eq!(o.dropped(), 1);
-        assert_eq!(o.front(), Some(key(1, 1)), "keycode 0 is the one that went");
+        assert_eq!(o.front(), Some(&key(1, 1)), "keycode 0 is the one that went");
     }
 
     #[test]

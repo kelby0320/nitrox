@@ -117,9 +117,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     **M9 — ✅ complete (2026-08-28)**, client-side decorations, interactive move, close,
     `Configure` with real reflow, edge resize and snap. **M10 — 🚧 Parts A–D landed**:
     `libfs` (A), the file browser `nxfiles` (B), the text area the toolkit had deferred four
-    times (C), and the editor `nxedit` with `Desktop::Open` (D) — a client naming a *path* for
-    the shell to open, because an application holds no authority to spawn. Parts E (drag and
-    drop) and F remain. (Desktops and the applications milestone — M8, and what is now M10 — were
+    times (C), the editor `nxedit` with `Desktop::Open` (D) — a client naming a *path* for the
+    shell to open, because an application holds no authority to spawn — and **drag-and-drop
+    between the two (E)**: `DeclareAcceptor`, `StartDrag`, `Dropped`, and a compositor that
+    highlights what would take a payload. Part F remains. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
     Design in

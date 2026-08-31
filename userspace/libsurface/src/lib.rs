@@ -181,7 +181,11 @@ impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
 pub const EVENT_QUEUE_MAX: usize = 64;
 
 /// One input event, as a window receives it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// **`Clone` rather than `Copy` since M10 Part E**, because a [`Drop`](Self::Drop) carries a path
+/// and two names. Every other variant is still a handful of integers; what changed is that one
+/// of them owns text, which is what a payload is.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum WindowEvent {
     /// A key transition, with the modifiers held at that moment.
     Key(KeyEvent),
@@ -229,7 +233,36 @@ pub enum WindowEvent {
     /// down has to assume it missed a release, exactly as `libinput` requires of a
     /// `SYN_DROPPED`. A client that ignores this carries a phantom held modifier for the
     /// rest of its life, which is the failure the marker exists to prevent.
-    Dropped,
+    ///
+    /// **Called `Dropped` until M10 Part E**, when drag-and-drop gave the word a second meaning
+    /// in the same match. Two variants a client reads as "dropped" — one meaning *lost input*
+    /// and one meaning *somebody handed you a file* — is a mistake waiting in every `match`, and
+    /// the wire never named this one anyway: it is `libsurface`'s own marker, derived from a
+    /// per-window `lost` flag.
+    InputLost,
+    /// Somebody dragged a payload onto this window and let go — `Surface::Dropped`.
+    ///
+    /// **Only for a window that declared an acceptor** ([`WindowRef::declare_acceptor`]) whose
+    /// kinds include this one; the compositor matches before it highlights, so a client that
+    /// declared nothing never sees this.
+    ///
+    /// `x` and `y` are window-local, like a press's, and are what makes a client-side drop
+    /// *region* possible: route them to the widget under the point and a window can accept a
+    /// drop in one panel and not another.
+    Drop {
+        /// The acceptor this landed on, by the name this window declared.
+        acceptor: alloc::string::String,
+        /// What the payload is — a mask bit, one of `DROP_KIND_FILE` and friends.
+        kind: u32,
+        /// The payload: a path the receiver opens for itself.
+        path: alloc::string::String,
+        /// What to call it on screen.
+        name: alloc::string::String,
+        /// Window-local x of the pointer when the button came up.
+        x: i32,
+        /// Window-local y.
+        y: i32,
+    },
 }
 
 /// Per-window state on a [`Session`].
@@ -248,7 +281,7 @@ struct WindowState {
     buffers: Vec<ClientBuffer>,
     /// Input delivered but not yet drained by the client.
     events: alloc::collections::VecDeque<WindowEvent>,
-    /// Whether the next drain owes the client a [`WindowEvent::Dropped`].
+    /// Whether the next drain owes the client a [`WindowEvent::InputLost`].
     ///
     /// A flag rather than a count: the client's obligation is the same whether it missed one
     /// event or forty — discard what you believed — so a number would be information nobody
@@ -377,7 +410,7 @@ impl<T: Transport> Session<T> {
                 // Announced before the surviving events, so a client resets its state and
                 // *then* applies what it still has, rather than the other way round.
                 w.lost = false;
-                return Some((w.id, WindowEvent::Dropped));
+                return Some((w.id, WindowEvent::InputLost));
             }
             if let Some(e) = w.events.pop_front() {
                 return Some((w.id, e));
@@ -504,6 +537,24 @@ impl<T: Transport> Session<T> {
                     && let Some(i) = self.idx(e.window)
                 {
                     self.enqueue(i, WindowEvent::Focus(e.focused != 0));
+                }
+            }
+            librsproto::surface::OP_DROPPED => {
+                if let Some((e, acceptor, path, name)) =
+                    librsproto::surface::DroppedEvent::read(body)
+                    && let Some(i) = self.idx(e.window)
+                {
+                    self.enqueue(
+                        i,
+                        WindowEvent::Drop {
+                            acceptor: alloc::string::String::from(acceptor),
+                            kind: e.kind,
+                            path: alloc::string::String::from(path),
+                            name: alloc::string::String::from(name),
+                            x: e.x,
+                            y: e.y,
+                        },
+                    );
                 }
             }
             librsproto::surface::OP_CLOSE_REQUESTED => {
@@ -772,6 +823,69 @@ impl<T: Transport> WindowRef<'_, T> {
             .ok_or(UiError::Malformed)?;
         self.session.transport.request(
             librsproto::surface::OP_START_RESIZE,
+            &body[..n],
+            None,
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    /// Say what this window takes when something is dropped on it — `Surface::DeclareAcceptor`.
+    ///
+    /// **Declared once, not answered per drag.** The compositor holds the table and matches
+    /// against it while the pointer moves, so a drag costs no round trip to any client; the
+    /// alternative — asking each window mid-gesture — puts a message exchange on the path that
+    /// has to stay cheap enough to run per motion.
+    ///
+    /// `name` is what a [`WindowEvent::Drop`] says it landed on, and what a *port* will address
+    /// when ports arrive — which is why it is a name rather than an index. `kinds` is a mask of
+    /// `DROP_KIND_FILE` and friends: a window that takes files but not folders says so here, and
+    /// nothing else has to know.
+    ///
+    /// **Where on the window a drop is allowed is not part of this.** The event carries the
+    /// pointer's position, and `libui` routes it to the widget under that point exactly as it
+    /// routes a press — so a window can accept a drop in one panel and refuse it in another
+    /// without the protocol growing a rectangle.
+    ///
+    /// Re-declaring a name replaces it. Cleared with the window.
+    pub fn declare_acceptor(&mut self, name: &str, kinds: u32) -> Result<(), UiError> {
+        let mut body = [0u8; librsproto::surface::DeclareAcceptor::HEAD
+            + librsproto::surface::MAX_ACCEPTOR_NAME];
+        let n = librsproto::surface::DeclareAcceptor { window: self.id(), kinds }
+            .write(&mut body, name.as_bytes())
+            .ok_or(UiError::Malformed)?;
+        self.session.transport.request(
+            librsproto::surface::OP_DECLARE_ACCEPTOR,
+            &body[..n],
+            None,
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    /// Offer a payload to whatever window the user drags it onto — `Surface::StartDrag`.
+    ///
+    /// **The same authority as [`start_move`](Self::start_move)**, and it matters more here:
+    /// refused unless this window holds the pointer grab, because a drag is an *offer* to
+    /// another application and a client that could start one at will could push a path into
+    /// somebody else's window with nobody touching anything.
+    ///
+    /// Sent from a press-and-move, not from a click: by the time a button comes up the gesture
+    /// is over. The compositor runs it from there — highlighting windows that take `kind`, and
+    /// delivering one [`WindowEvent::Drop`] if it ends over one. Ending anywhere else sends
+    /// nothing, to anybody: a drop on nothing is how somebody changes their mind.
+    ///
+    /// **`path` is the payload and `name` is only a label.** A handle would have to belong to
+    /// somebody mid-gesture and a refused transfer has no clean owner; a path is a name the
+    /// receiver opens for itself, reporting its own errors in its own window (M10 decision 1).
+    pub fn start_drag(&mut self, kind: u32, path: &str, name: &str) -> Result<(), UiError> {
+        use librsproto::surface::{MAX_DROP_NAME, MAX_DROP_PATH, StartDrag};
+        let mut body = [0u8; StartDrag::HEAD + MAX_DROP_PATH + MAX_DROP_NAME];
+        let n = StartDrag { window: self.id(), kind, path_len: 0 }
+            .write(&mut body, path.as_bytes(), name.as_bytes())
+            .ok_or(UiError::Malformed)?;
+        self.session.transport.request(
+            librsproto::surface::OP_START_DRAG,
             &body[..n],
             None,
             &mut [],
@@ -1121,8 +1235,8 @@ mod tests {
         s.transport.lost = true;
         s.pump().expect("pump");
 
-        assert_eq!(s.next_event(), Some((a, WindowEvent::Dropped)), "the first window is told");
-        assert_eq!(s.next_event(), Some((b, WindowEvent::Dropped)), "and so is the second");
+        assert_eq!(s.next_event(), Some((a, WindowEvent::InputLost)), "the first window is told");
+        assert_eq!(s.next_event(), Some((b, WindowEvent::InputLost)), "and so is the second");
         assert_eq!(s.next_event(), None, "once each");
     }
 
@@ -1148,7 +1262,7 @@ mod tests {
         // The noisy window overflowed and is told so; the quiet one is untouched.
         assert_eq!(
             s.next_event(),
-            Some((noisy, WindowEvent::Dropped)),
+            Some((noisy, WindowEvent::InputLost)),
             "the window that overflowed is the window that is told"
         );
         let mut from_noisy = 0;
@@ -1159,7 +1273,7 @@ mod tests {
                 assert_eq!(e, WindowEvent::Key(KeyEvent::new(quiet, 99, 1, 0)));
                 quiet_key = Some(e);
             } else {
-                assert_ne!(e, WindowEvent::Dropped, "only the overflowing window is marked");
+                assert_ne!(e, WindowEvent::InputLost, "only the overflowing window is marked");
                 from_noisy += 1;
             }
         }
@@ -1539,7 +1653,7 @@ mod tests {
         let mut w = window(2);
         w.s.transport.lost = true;
         w.pump().expect("pump");
-        assert_eq!(w.next_event(), Some(WindowEvent::Dropped));
+        assert_eq!(w.next_event(), Some(WindowEvent::InputLost));
         assert_eq!(w.next_event(), None, "announced once, not on every drain");
     }
 
@@ -1707,13 +1821,13 @@ mod tests {
 
         // The marker comes first, so a client resets what it believed *before* applying
         // what survived.
-        assert_eq!(w.next_event(), Some(WindowEvent::Dropped));
+        assert_eq!(w.next_event(), Some(WindowEvent::InputLost));
         let Some(WindowEvent::Key(k)) = w.next_event() else { panic!("a key") };
         assert_eq!(k.keycode, 3, "the three oldest went, not the three newest");
 
         // And it is announced once, not on every subsequent drain.
         while let Some(e) = w.next_event() {
-            assert_ne!(e, WindowEvent::Dropped);
+            assert_ne!(e, WindowEvent::InputLost);
         }
     }
 

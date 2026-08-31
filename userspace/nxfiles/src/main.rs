@@ -336,6 +336,31 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
+                    // **The distance the toolkit does not measure.** `libui` routes messages,
+                    // and what makes a press a *drag* is how far it has travelled since — so the
+                    // application reads the record it already has. `buttons` is on every pointer
+                    // record for exactly this reason (M10 Part E).
+                    if app.pointer_moved(p.x, p.y, p.buttons)
+                        && let Some((entry, path)) = app.take_drag()
+                    {
+                        let kind = if entry.is_dir {
+                            librsproto::surface::DROP_KIND_DIR
+                        } else {
+                            librsproto::surface::DROP_KIND_FILE
+                        };
+                        if let Some(mut w) = win.window(window_id) {
+                            match w.start_drag(kind, &path, &entry.name) {
+                                Ok(()) => libkern::debug::Line::new()
+                                    .s(b"nxfiles: dragging ")
+                                    .s(entry.name.as_bytes())
+                                    .end(),
+                                // Refused means the pointer is not holding this window — the
+                                // press ended between the motion and this request, which is
+                                // ordinary rather than an error.
+                                Err(_) => kprint(b"nxfiles: the compositor refused the drag\n"),
+                            }
+                        }
+                    }
                 }
                 WindowEvent::Focus(f) => {
                     router.set_window_focused(f);
@@ -363,7 +388,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // none, so there is nothing to discard — and saying so is the point: a client
                 // that silently ignored this would be wrong the moment it started tracking
                 // anything.
-                WindowEvent::Dropped => kprint(b"nxfiles: input dropped\n"),
+                // **This browser offers drags and takes none** (M10 Part E). Moving a file by
+                // dropping it into another folder is a file *operation*, which is M12's along
+                // with rename, delete and copy — and a window that declared an acceptor without
+                // implementing one would be highlighted for drops it then swallowed.
+                WindowEvent::Drop { ref name, .. } => {
+                    libkern::debug::Line::new()
+                        .s(b"nxfiles: ignoring a drop of ")
+                        .s(name.as_bytes())
+                        .end();
+                }
+                WindowEvent::InputLost => kprint(b"nxfiles: input dropped\n"),
             }
         }
         if resized {

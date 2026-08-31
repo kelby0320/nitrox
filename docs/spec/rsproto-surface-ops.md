@@ -1192,6 +1192,89 @@ cannot be used to probe for other clients' ids. Re-setting an unchanged title pr
 manager event, because the manager queue is bounded and a client that sets its title every
 frame would otherwise push older events out of it.
 
+## Drag and drop (`0x090E`, `0x090F`, `0x0930`)
+
+Built in **M10 Part E**. Three records: a window says what it takes, a client offers a payload,
+and the compositor delivers one to whatever the gesture ended over.
+
+### `DeclareAcceptor` (`0x090E`, client → server)
+
+| Field | Bytes | Notes |
+|---|---|---|
+| `window` | 4 | must be the caller's |
+| `kinds` | 4 | mask of `DROP_KIND_FILE` (1), `DROP_KIND_DIR` (2) |
+| `name` | the rest | UTF-8, 1..=`MAX_ACCEPTOR_NAME` (32) |
+
+**A name and a set of kinds, and deliberately no rectangle.** An acceptor is a *port in waiting*
+(M10 decision 2): the same name a drop reports is what a command line will address when ports
+arrive, so a protocol that described a *region* instead would have to be re-specified to be
+addressed any other way. Where on a window a drop is allowed is the client's, decided from the
+pointer position the event carries (decision 3) — `libui` routes it to the widget under the point
+exactly as it routes a press.
+
+**Declared, not queried.** The compositor holds the table and matches against it as the pointer
+moves; asking clients mid-gesture would put a round trip on the path that must stay cheap. This
+supersedes the composition model's `QueryCaps`.
+
+At most `MAX_ACCEPTORS` (4) per window, **cleared with the window** — an acceptor describes a
+window, not a session. Re-declaring a name **replaces** it, as a snap zone id does: the set
+describes what the window can take *now*, and there is no remove. A full table is `Unsupported`
+rather than an eviction — dropping an acceptor a client still believes in would stop it taking a
+drag it says it takes, silently and much later. An empty or over-long name, a non-UTF-8 one, or
+`kinds` naming nothing known is `InvalidArgument`; another connection's window is `NotFound`.
+
+### `StartDrag` (`0x090F`, client → server)
+
+| Field | Bytes | Notes |
+|---|---|---|
+| `window` | 4 | must hold the pointer grab |
+| `kind` | 4 | exactly one known bit |
+| `path_len` | 4 | how much of the tail is the path |
+| `path` | `path_len` | UTF-8, 1..=`MAX_DROP_PATH` (512) |
+| `name` | the rest | UTF-8, at most `MAX_DROP_NAME` (64) |
+
+**The grab is the authority**, as it is for `StartMove` and `StartResize`, and it matters more
+here: a drag is an *offer to another application*, so a client that could start one at will could
+push a path into somebody else's window with nobody touching anything. `NoSuchWindow` when the
+caller does not hold the grab, or a move or resize is already running — **one grab carries one
+gesture**, in every direction.
+
+**The payload is a path** (M10 decision 1). A handle would have to belong to somebody while the
+gesture is in flight and a refused transfer has no clean owner; a path is a name the receiver
+opens for itself, reporting its own errors in its own window. Both ends resolving it is a real
+requirement, and holds because `desktop-shell` binds `/home` identically into every application
+namespace it builds.
+
+**`kind` is exactly one bit.** A drag carries one payload; a drag offering "file or directory"
+would be asking whatever it lands on to guess. The *set* belongs on the acceptor.
+
+While it runs the compositor highlights windows whose acceptors take `kind` — its own drawing
+over the composed stack, damaged as four edge strips like the resize outline. Released over one
+it sends `Dropped`; released anywhere else **nothing is sent to anybody**, because a drop on
+nothing is how somebody changes their mind.
+
+### `Dropped` (`0x0930`, server → client)
+
+| Field | Bytes | Notes |
+|---|---|---|
+| `window` | 4 | which window it landed on |
+| `kind` | 4 | what the payload is |
+| `x`, `y` | 4 + 4, signed | **window-local**, like a `PointerEvent`'s |
+| `acceptor_len` | 4 | |
+| `path_len` | 4 | |
+| `acceptor`, `path`, `name` | the rest, in that order | UTF-8 |
+
+**`0x0930` rather than `0x0910`**: the client block `0x0900`–`0x090F` is full and `0x0910`–`0x092F`
+is the manager's, so this begins a second client block rather than borrowing a number from a
+range that means something else.
+
+**Delivered only for a gesture the user finished** — the button coming up. A grab taken away, or
+a `SYN_DROPPED` from the input stream, cancels: the pointer's position is then a guess, and a
+drop delivered from a guess is a file opened by a window nobody dropped it on.
+
+**Two lengths, and both are checked against the body that arrived** — including their sum. Two
+fields that each fit and together do not is the shape a length-prefixed record gets wrong.
+
 ## See also
 
 - [rsproto wire format](rsproto-wire-format.md) — the envelope every category shares

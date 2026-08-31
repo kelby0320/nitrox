@@ -80,6 +80,14 @@ pub const NOTICE_KEY: u64 = 7;
 /// blocking 2).
 pub const STRIP_KEY: u64 = 5;
 
+/// How far the pointer must travel with a button down before a press becomes a drag, in pixels.
+///
+/// **Because a click is a press that moved a little.** Nobody presses a mouse button without
+/// nudging it, and a browser that started a drag on the first pixel would make opening a file by
+/// clicking it a matter of luck. Four is the smallest number that survives a hand; a person
+/// deliberately dragging crosses it immediately.
+pub const DRAG_SLOP: i32 = 4;
+
 /// The window's size in pixels at startup, before any manager places it.
 pub const START_SIZE: Size = Size::new(560, 420);
 
@@ -147,6 +155,17 @@ pub struct App {
     goto: Option<String>,
     /// What the strip says beside the path, or `None` — an answer to the last row activated.
     notice: Option<String>,
+    /// The row a press landed on, and where the pointer was, until the button comes up.
+    ///
+    /// **A press is not yet a drag.** A person pressing a row to select or open it moves the
+    /// pointer a pixel or two doing it, so the gesture only becomes a drag once it has travelled
+    /// [`DRAG_SLOP`] — which is what keeps a click a click.
+    pressed: Option<(usize, i32, i32)>,
+    /// A drag the binary owes the compositor a `StartDrag` for: the entry it carries.
+    ///
+    /// The same outbox shape as everything else here: `update` is a function of values, and
+    /// telling the compositor is IPC.
+    drag: Option<Entry>,
     /// A path the binary owes an `Open` for — set by activating a row that is not a directory.
     ///
     /// The same outbox shape as [`goto`](Self::goto), for the same reason: asking the shell to
@@ -170,6 +189,8 @@ pub struct App {
 pub enum Msg {
     /// A listing row was activated — its index into [`App::entries`].
     Activate(u64),
+    /// A press landed on a row: the gesture that *may* become a drag (M10 Part E).
+    Grab(u64),
     /// The "up" control was pressed.
     Up,
     /// A key reached the window.
@@ -199,6 +220,8 @@ impl App {
             maximized: false,
             goto: None,
             notice: None,
+            pressed: None,
+            drag: None,
             open: None,
             state_requested: None,
             move_requested: false,
@@ -285,6 +308,9 @@ impl App {
                     None => self.open = self.full(i),
                 }
             }
+            // **Remembered, not acted on.** What a press becomes is decided by what happens
+            // next: a release makes it a click, and enough movement makes it a drag.
+            Msg::Grab(i) => self.pressed = Some((i as usize, 0, 0)),
             Msg::Up => {
                 let up = parent(&self.path);
                 // The root is its own parent, so this is a no-op there rather than an error —
@@ -337,6 +363,39 @@ impl App {
     /// The path the binary owes a listing for, if anything navigated. Clears the record.
     pub fn take_goto(&mut self) -> Option<String> {
         self.goto.take()
+    }
+
+    /// Note where the pointer is while a button is held, and say whether a drag begins now.
+    ///
+    /// **Called with window-local coordinates from the pointer record**, because the toolkit
+    /// routes *messages* and this needs a distance. The first motion after the press fixes the
+    /// origin — the press itself carries no position through `on_press_down`, and asking the
+    /// router for one would be asking it to remember a pixel it has no reason to keep.
+    pub fn pointer_moved(&mut self, x: i32, y: i32, buttons: u16) -> bool {
+        if buttons == 0 {
+            self.pressed = None;
+            return false;
+        }
+        let Some((i, ox, oy)) = self.pressed else { return false };
+        if (ox, oy) == (0, 0) {
+            self.pressed = Some((i, x, y));
+            return false;
+        }
+        if (x - ox).abs() < DRAG_SLOP && (y - oy).abs() < DRAG_SLOP {
+            return false;
+        }
+        // The gesture is a drag now, and it is a drag *once*: the record is taken so the next
+        // motion does not start a second one on top of the first.
+        self.pressed = None;
+        self.drag = self.entries.get(i).cloned();
+        self.drag.is_some()
+    }
+
+    /// The entry the binary owes a `StartDrag` for. Clears the record.
+    pub fn take_drag(&mut self) -> Option<(Entry, String)> {
+        let e = self.drag.take()?;
+        let path = join(&self.path, &e.name);
+        Some((e, path))
     }
 
     /// The path the binary owes an `Open` for, if a file was activated. Clears the record.
@@ -457,7 +516,12 @@ impl App {
             rows.push(ListRow { key: i as u64, label: l });
         }
         let h = self.list_h();
-        let list = list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, &ui);
+        // **`Grab` on the press, `Activate` on the click.** A drag is decided when the button
+        // lands on a row; by the time it comes up the gesture is over. The two do not fight —
+        // a press that never moves produces a click and opens what was pressed, and one that
+        // moves has already told the compositor it is carrying something.
+        let list =
+            list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, Some(Msg::Grab), &ui);
 
         let body = dock(
             alloc::vec![
@@ -678,6 +742,48 @@ mod tests {
         a.show("/home", alloc::vec![Entry::file("a.txt")]);
         let ui: Element<Msg> = a.view();
         assert_eq!(labelled(&ui, NOTICE_KEY), "", "a listing clears it");
+    }
+
+    #[test]
+    fn a_press_becomes_a_drag_only_after_it_has_travelled() {
+        // **A click is a press that moved a little.** Nobody presses a button without nudging
+        // it, so a browser that started a drag on the first pixel would make opening a file by
+        // clicking it a matter of luck.
+        let mut a = app();
+        a.update(Msg::Grab(2)); // a.txt
+        assert!(!a.pointer_moved(100, 100, 1), "the first motion fixes the origin");
+        assert!(!a.pointer_moved(100 + DRAG_SLOP - 1, 100, 1), "a nudge is not a drag");
+        assert!(a.pointer_moved(100 + DRAG_SLOP, 100, 1), "and travelling is");
+
+        let (entry, path) = a.take_drag().expect("the row that was pressed");
+        assert_eq!((entry.name.as_str(), entry.is_dir), ("a.txt", false));
+        assert_eq!(path, "/home/a.txt");
+        assert_eq!(a.take_drag(), None, "and it is offered once");
+    }
+
+    #[test]
+    fn releasing_without_travelling_leaves_no_drag_behind() {
+        // The record has to be cleared by the button coming up, or the *next* press-free motion
+        // would start a drag for a row nobody is holding.
+        let mut a = app();
+        a.update(Msg::Grab(0));
+        assert!(!a.pointer_moved(10, 10, 1));
+        assert!(!a.pointer_moved(10, 10, 0), "the button came up");
+        assert!(!a.pointer_moved(400, 400, 1), "a later motion carries nothing");
+        assert_eq!(a.take_drag(), None);
+    }
+
+    #[test]
+    fn a_directory_row_drags_as_a_directory() {
+        // The kind is the entry's, not the gesture's: an editor that takes files only must not
+        // be highlighted for a folder, and the compositor decides that from what this says.
+        let mut a = app();
+        a.update(Msg::Grab(0)); // archive/
+        a.pointer_moved(10, 10, 1);
+        a.pointer_moved(10 + DRAG_SLOP, 10, 1);
+        let (entry, path) = a.take_drag().expect("a drag");
+        assert!(entry.is_dir, "the browser reports what the row is");
+        assert_eq!(path, "/home/archive");
     }
 
     #[test]

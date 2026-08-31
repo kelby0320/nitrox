@@ -250,6 +250,34 @@ impl Router {
         }
         None
     }
+    /// Route a drop at `(x, y)` — window-local, as `Surface::Dropped` carries it.
+    ///
+    /// Answers **which widget** took it, as the message that widget declared with
+    /// [`on_drop`](crate::element::Element::on_drop), or `None` when nothing under the point
+    /// wants one. What was dropped stays with the caller: the payload is in the event it is
+    /// holding, and pairing the two at one call site beats threading a value through a tree
+    /// built fresh every frame.
+    ///
+    /// **The handler may be on an ancestor of what was hit**, the same walk a press does and
+    /// for the same reason: a widget drawn out of smaller pieces puts its handler on the
+    /// outside, so a drop landing on a line of text inside a document area is that area's.
+    ///
+    /// **No capture, and no crossing.** A drop is one event with no press to have opened
+    /// anything: the gesture belonged to the *other* window, and this one learns of it only
+    /// because it ended here.
+    pub fn drop_at<Msg: Clone>(
+        &self,
+        tree: &Tree,
+        element: &Element<Msg>,
+        layout: &Layout,
+        x: i32,
+        y: i32,
+    ) -> Option<Msg> {
+        let id = hit_test(tree.root(), layout, Point::new(x, y))?;
+        let path = path_to_id(tree.root(), id)?;
+        (0..=path.len()).rev().find_map(|n| element_at(element, &path[..n])?.on_drop.clone())
+    }
+
 
     /// Route a pointer event, returning the messages it produced.
     ///
@@ -616,6 +644,48 @@ mod tests {
 
     fn motion(x: i32, y: i32) -> PointerEvent {
         PointerEvent { kind: POINTER_MOTION, buttons: 1, x, y, ..Default::default() }
+    }
+
+    #[test]
+    fn a_drop_is_routed_by_position_like_a_press() {
+        // **This is what makes a drop *region* the client's** (M10 decision 3). The compositor
+        // knows only that the window declared an acceptor; which part of the window means
+        // something is decided here, so a document area can take a file while the chrome above
+        // it does not.
+        let ui: Element<Msg> = column(vec![
+            sized(Size::new(640, 40), custom(1, Size::new(640, 40))),
+            sized(Size::new(640, 200), custom(2, Size::new(640, 200))).on_drop(Msg::Pressed(9)),
+        ]);
+        let (t, l) = build(&ui);
+        let r = Router::new();
+
+        assert_eq!(r.drop_at(&t, &ui, &l, 20, 100), Some(Msg::Pressed(9)), "inside the region");
+        assert_eq!(r.drop_at(&t, &ui, &l, 20, 10), None, "on the chrome above it");
+        assert_eq!(r.drop_at(&t, &ui, &l, 20, 400), None, "past everything");
+    }
+
+    #[test]
+    fn a_drops_handler_may_be_on_an_ancestor_of_what_it_landed_on() {
+        // The same walk a press does, and for the same reason: a widget drawn out of smaller
+        // pieces carries its handler on the outside, so a drop onto a line of text inside a
+        // document area is the area's drop.
+        let ui: Element<Msg> =
+            stack(vec![row(vec![text("a line"), text("another")])]).on_drop(Msg::Pressed(4));
+        let (t, l) = build(&ui);
+        let r = Router::new();
+        assert_eq!(r.drop_at(&t, &ui, &l, 4, 4), Some(Msg::Pressed(4)));
+    }
+
+    #[test]
+    fn a_drop_needs_no_press_and_leaves_no_capture() {
+        // A drop is one event: the gesture belonged to another window, and this one hears about
+        // it only because it ended here. Nothing about the pointer's own state changes.
+        let ui: Element<Msg> = sized(Size::new(640, 200), custom(1, Size::new(640, 40))).on_drop(Msg::Pressed(1));
+        let (t, l) = build(&ui);
+        let mut r = Router::new();
+        assert_eq!(r.drop_at(&t, &ui, &l, 5, 5), Some(Msg::Pressed(1)));
+        assert_eq!(r.capture(), None, "a drop opens no capture");
+        assert_eq!(r.inside(), None, "and synthesises no crossing");
     }
 
     /// A key record for these tests. The window id is arbitrary: routing to a *widget* happens

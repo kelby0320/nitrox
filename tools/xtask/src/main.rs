@@ -1612,6 +1612,31 @@ fn parse_popup_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
     Some((id, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
 }
 
+/// Read `desktop-shell: window N geometry X,Y WxH` — the shell's own report of where a window is.
+///
+/// **Asked rather than computed**, because the alternative is re-implementing the shell's
+/// placement cascade in the harness and having it drift the first time the shell's policy
+/// changes. The gate needs real coordinates to press on a row and to grab a title bar, and the
+/// shell prints them for every window it places.
+fn parse_geometry_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
+    let mut it = rest.split_whitespace();
+    let id = it.next()?.parse().ok()?;
+    if it.next()? != "geometry" {
+        return None;
+    }
+    let (x, y) = it.next()?.split_once(',')?;
+    let (w, h) = it.next()?.split_once('x')?;
+    Some((id, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
+}
+
+/// Wait for the next window-geometry line and read it.
+fn next_geometry(session: &mut Session) -> R<(u32, i32, i32, u32, u32)> {
+    session.expect("desktop-shell: window ")?;
+    let line = session.rest_of_line()?;
+    parse_geometry_line(&line)
+        .ok_or_else(|| format!("could not read a window geometry from {line:?}").into())
+}
+
 /// Pin the pointer to the bottom-right corner, then walk it to `(x, y)`.
 ///
 /// **Relative injection, so the pointer must be somewhere known first.** A PS/2 packet carries a
@@ -2635,6 +2660,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let listed = session.rest_of_line()?;
     println!("  ok: nxfiles started at HOME and listed it ({})", listed.trim());
 
+    // **Where the shell put it**, read after the listing rather than before it: a client lists
+    // its directory *then* creates its window, so the shell's geometry line comes second — and
+    // asking for it first consumed the listing this step asserts. The gate presses on a row
+    // later, and a row's position is the window's origin plus chrome; re-deriving the shell's
+    // placement cascade here would be a second copy of a policy that is the shell's to change.
+    let files_win = next_geometry(&mut session)?;
+
     // **Enter descends into the selected row**, which is the directory the serial side just
     // made: directories sort before files and a fresh listing selects row 0, so this is the
     // keyboard reaching the same message a row press produces. If `/home` ever holds a
@@ -2675,6 +2707,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let asked = String::from("nxfiles: asked to open /home/papers/notes.txt");
     let opened = String::from("nxedit: opened /home/papers/notes.txt - 0 bytes");
     session.expect_all(&[&asked, &opened])?;
+    // After the open, for the reason the browser's is read after its listing: the editor reads
+    // its file before it has a window to place.
+    let edit_win = next_geometry(&mut session)?;
     println!("  ok: a file row launched the editor on the file it names");
 
     // **A receipt per character, and it is a count rather than an echo.** An editor's echo is
@@ -2705,6 +2740,97 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect(TYPED)?;
     session.expect("/home>")?;
     println!("  ok: the shell read back what the editor saved, from outside it");
+
+    // 9. **A file dragged from the browser onto the editor** (M10 Part E) — the part every
+    //    application above exists to make honest: two real windows, one payload, and no test
+    //    client on either end.
+    //
+    //    **The editor is snapped to the right half first**, because the shell cascades new
+    //    windows and the editor is sitting on top of the browser it was launched from. Dropping
+    //    a window at the screen's right edge is M9 Part F's own gesture, so the geometry the
+    //    drag then uses is the work area's half rather than a number this gate invented.
+    let (edit_id, ex, ey, ew, _eh) = edit_win;
+    let title_grab = (ex + ew as i32 / 2, ey + 13);
+    move_pointer_to(&mut qmp, title_grab.0, title_grab.1)?;
+    qmp.pointer = Some(title_grab);
+    qmp.send_button("left", true)?;
+    for _ in 0..6 {
+        qmp.send_motion(120, 0)?;
+    }
+    session.expect("compositor: interactive move of window ")?;
+    // To the right edge, which is where the shell registered a snap zone.
+    for _ in 0..6 {
+        qmp.send_motion(120, 0)?;
+    }
+    qmp.send_button("left", false)?;
+    qmp.pointer = None;
+    session.expect(&format!(
+        "desktop-shell: drop window {edit_id} to {},{} {}x{}",
+        work.0 + (work.2 / 2) as i32,
+        work.1,
+        work.2 / 2,
+        work.3
+    ))?;
+    session.expect(&format!("nxedit: resized to {}x{}", work.2 / 2, work.3))?;
+    println!("  ok: the editor snapped to the right half, clear of the browser");
+
+    // A second file, so the drag carries something the editor is not already showing — dropping
+    // the open file is deliberately a no-op, and a gate that did it would assert nothing.
+    session.send("touch ./papers/other.txt")?;
+    session.expect("/home>")?;
+
+    // **Click the browser to give it the keyboard**, then walk it out and back in so it lists
+    // the file the serial side just made. A listing is read when something navigates; nothing
+    // polls, deliberately.
+    let (_, fx, fy, _fw, _fh) = files_win;
+    // **On the path strip, not the title bar.** A press on a title bar is a `StartMove` — the
+    // click would work and the window would not move, but the gate would be asserting against a
+    // gesture it did not mean to make. The path text carries no handler and still raises the
+    // window, because click-to-focus is the compositor's and not the toolkit's.
+    click_at(&mut qmp, &mut session, fx + 120, fy + 26 + 12)?;
+    press(&mut qmp, "backspace")?;
+    session.expect("nxfiles: listed /home - ")?;
+    press(&mut qmp, "ret")?;
+    session.expect("nxfiles: listed /home/papers - 2 entries")?;
+
+    // Row 1 is `other.txt`: the listing sorts directories first and then by name, and `notes`
+    // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
+    // and the path strip — plus half a row.
+    const TITLE_BAR_H: i32 = 26;
+    const PATH_H: i32 = 24;
+    const ROW_H: i32 = 20;
+    let row1 = (fx + 120, fy + TITLE_BAR_H + PATH_H + ROW_H + ROW_H / 2);
+    move_pointer_to(&mut qmp, row1.0, row1.1)?;
+    qmp.pointer = Some(row1);
+    qmp.send_button("left", true)?;
+    // **Past the slop, then across.** The browser turns a press into a drag once it has
+    // travelled, which is what keeps a click a click.
+    for _ in 0..6 {
+        qmp.send_motion(100, 40)?;
+    }
+    session.expect("nxfiles: dragging other.txt")?;
+    session.expect("compositor: drag from window ")?;
+    // Into the editor's document area — below its title bar and status strip, and well inside
+    // the half of the screen it now occupies.
+    let onto = (work.0 + work.2 as i32 * 3 / 4, work.1 + work.3 as i32 / 2);
+    let mut at = row1;
+    while at != onto {
+        let step = (
+            (onto.0 - at.0).clamp(-100, 100),
+            (onto.1 - at.1).clamp(-100, 100),
+        );
+        qmp.send_motion(step.0, step.1)?;
+        at = (at.0 + step.0, at.1 + step.1);
+    }
+    // **Letting go is what delivers it.** The highlight the compositor draws while the pointer
+    // is over a window that takes the payload is pixels rather than a line — its logic is
+    // host-tested in `compositor::input`, including the two cases that must show *nothing*.
+    qmp.send_button("left", false)?;
+    qmp.pointer = Some(onto);
+    session.expect(&format!("compositor: drop win={edit_id} on=document"))?;
+    session.expect("nxedit: drop of other.txt on the document")?;
+    session.expect("nxedit: opened /home/papers/other.txt - 0 bytes")?;
+    println!("  ok: a file dragged from the browser opened in the editor");
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
