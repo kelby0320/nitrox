@@ -94,6 +94,17 @@ pub struct App {
     saved_at: u64,
     /// Why this buffer may not be written, or `None` when it may.
     blocked: Option<String>,
+    /// The buffer did not match the file the moment it was read.
+    ///
+    /// **Because reading is not always lossless.** `TextAreaState::with_text` drops a `\r` from
+    /// the end of every line, so a CRLF file is *already* something else by the time it is on
+    /// screen — and a `saved_at` taken after that says the buffer matches a file it does not.
+    /// The consequence was an editor that could open a file, be told nothing had changed, and
+    /// rewrite it two bytes shorter per line on the first `Ctrl+S` (PR #259 review, finding 3).
+    ///
+    /// So it is folded into [`modified`](Self::modified): what the title bar marks is "this is
+    /// not what is on disk", which is true from the first frame here.
+    differs: bool,
     /// What the status strip says.
     status: String,
     /// The window's size in pixels — what the client commits.
@@ -136,10 +147,11 @@ impl App {
     pub fn new(path: &str) -> App {
         App {
             path: String::from(path),
-            name: basename(path).to_string(),
+            name: libfs::basename_str(path).to_string(),
             text: TextAreaState::new(),
             saved_at: 0,
             blocked: None,
+            differs: false,
             status: String::from("opening…"),
             window: START_SIZE,
             focused: true,
@@ -152,12 +164,22 @@ impl App {
         }
     }
 
-    /// The file's contents are `text`: this is now what is on disk.
-    pub fn loaded(&mut self, text: &str) {
+    /// The file held `raw`, which decoded to `text`.
+    ///
+    /// **Both, because the buffer may already differ from the file.** Line endings are
+    /// normalised on the way in, so a CRLF file is not what is on screen — and an editor that
+    /// called that "unmodified" would rewrite it, shorter, on a `Ctrl+S` the person pressed out
+    /// of habit. Comparing what *would be written* against what was read is the only honest
+    /// answer, and it is one comparison at open rather than a rule about encodings.
+    pub fn loaded(&mut self, text: &str, raw: &[u8]) {
         self.text = TextAreaState::with_text(text);
         self.saved_at = self.text.revision();
         self.blocked = None;
-        self.status = describe(text.len(), "opened");
+        self.differs = to_bytes(&self.text.text()) != raw;
+        self.status = describe(raw.len(), "opened");
+        if self.differs {
+            self.status.push_str(" · line endings normalised, so saving rewrites it");
+        }
     }
 
     /// There is nothing at this path yet, which is not a failure.
@@ -169,6 +191,7 @@ impl App {
         self.text = TextAreaState::new();
         self.saved_at = self.text.revision();
         self.blocked = None;
+        self.differs = false;
         self.status = String::from("new file");
     }
 
@@ -182,6 +205,7 @@ impl App {
         self.text = TextAreaState::new();
         self.saved_at = self.text.revision();
         self.blocked = Some(String::from(why));
+        self.differs = false;
         self.status = String::from(why);
     }
 
@@ -206,9 +230,12 @@ impl App {
         self.text.revision()
     }
 
-    /// Whether what is on screen differs from what was last read or written.
+    /// Whether what is on screen differs from what is on disk.
+    ///
+    /// Two ways for that to be true: something was typed, or the file did not survive being read
+    /// unchanged — see [`differs`](Self::differs).
     pub fn modified(&self) -> bool {
-        self.text.revision() != self.saved_at
+        self.differs || self.text.revision() != self.saved_at
     }
 
     /// What the status strip is saying.
@@ -246,6 +273,8 @@ impl App {
         match result {
             Ok(n) => {
                 self.saved_at = self.text.revision();
+                // The file is now what the buffer holds, whatever it held before.
+                self.differs = false;
                 self.status = describe(n, "saved");
             }
             Err(why) => self.status = alloc::format!("NOT saved — {why}"),
@@ -408,18 +437,6 @@ fn describe(bytes: usize, what: &str) -> String {
     s
 }
 
-/// The last component of a path, or the whole of it if there is no separator.
-///
-/// `libfs::basename`'s rule on `str` rather than bytes, for the reason `nxfiles` keeps its own
-/// `join` and `parent`: this half of the application never sees a path as bytes.
-pub fn basename(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(i) => &trimmed[i + 1..],
-        None => trimmed,
-    }
-}
-
 /// The rectangle the window occupies, for the binary's layout call.
 pub fn bounds(size: Size) -> Rect {
     Rect::new(0, 0, size.w, size.h)
@@ -447,7 +464,9 @@ mod tests {
     /// An editor with `hello` open, as if the file had been read.
     fn app() -> App {
         let mut a = App::new("/home/notes.txt");
-        a.loaded("hello");
+        // `hello\n` on disk, which is what `hello` writes back — so this buffer starts matching
+        // its file, which every test below depends on.
+        a.loaded("hello", b"hello\n");
         a
     }
 
@@ -495,6 +514,33 @@ mod tests {
         assert_eq!(a.take_save(), None, "a blocked buffer owes no write");
         assert!(a.status().contains("not saved"), "status was {:?}", a.status());
         assert_eq!(a.refusal(), Some("could not be read"));
+    }
+
+    #[test]
+    fn a_file_that_did_not_survive_being_read_opens_modified() {
+        // **The one case where the editor would write something it never showed.** Reading
+        // normalises line endings, so a CRLF file is already something else on screen — and an
+        // editor that called that unmodified would rewrite it, two bytes shorter per line, on a
+        // `Ctrl+S` pressed out of habit (PR #259 review, finding 3).
+        let mut a = App::new("/home/dos.txt");
+        a.loaded("alpha\nbeta\n", b"alpha\r\nbeta\r\n");
+        assert!(a.modified(), "the buffer is not what the file holds");
+        assert_eq!(a.title(), "* dos.txt", "and the title says so before anything is typed");
+        assert!(a.status().contains("line endings"), "status was {:?}", a.status());
+        assert_eq!(a.refusal(), None, "it is writable — it just is not the same bytes");
+
+        // Saving makes the file match the buffer, which is what clears it.
+        a.update(Msg::Save);
+        let owed = a.take_save().expect("a blocked buffer is a different thing");
+        a.saved(Ok(owed.len()));
+        assert!(!a.modified());
+        assert_eq!(a.title(), "dos.txt");
+
+        // And a file that *does* survive is not marked: this must distinguish, or it is a
+        // permanent asterisk rather than an answer.
+        let mut b = App::new("/home/unix.txt");
+        b.loaded("alpha\nbeta\n", b"alpha\nbeta\n");
+        assert!(!b.modified());
     }
 
     #[test]
@@ -578,10 +624,12 @@ mod tests {
 
     #[test]
     fn the_name_is_the_last_component() {
-        assert_eq!(basename("/home/alice/notes.txt"), "notes.txt");
-        assert_eq!(basename("/notes.txt"), "notes.txt");
-        assert_eq!(basename("notes.txt"), "notes.txt");
-        assert_eq!(basename("/home/papers/"), "papers", "a trailing separator is not the name");
+        // The title's name comes from `libfs`, so this pins what this application depends on
+        // rather than re-testing that crate: a trailing separator must not give an empty title.
+        let named = |p: &str| App::new(p).title();
+        assert_eq!(named("/home/alice/notes.txt"), "notes.txt");
+        assert_eq!(named("notes.txt"), "notes.txt");
+        assert_eq!(named("/home/papers/"), "papers", "a trailing separator is not the name");
     }
 
     #[test]

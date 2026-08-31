@@ -1400,6 +1400,34 @@ place without changing its length.
 
 ### Userspace
 
+**Nothing bounds `Desktop::Open` — `TODO(open-amplification)`.** Before M10 Part D an application
+could not cause a spawn at all: its namespace holds no `/bin` and no `BIND_NAMESPACE`, and the
+applications modal needs a person to click. `Open` is the **first machine-drivable spawn path**,
+and the shell's handler validates the path's shape and then launches. There is no rate limit, no
+cap on live openers, and no dedup — a client calling it in a loop makes the shell build a
+namespace, resolve `/bin/nxedit`, spawn a process and hand it a setup channel, once per pass, and
+each survivor then maps the system font and allocates two window buffers.
+
+**Nothing existing bounds it either, and the near misses are worth naming** so nobody reads one as
+the answer. `MAX_DESKTOP_SESSIONS` (4) bounds *concurrent sessions*, not requests — `nxfiles`
+opens and closes a session per file, deliberately, so a per-session counter would reset on every
+call. The shell serves one request per loop pass, which bounds the *rate* and not the total. And
+`desktop-shell` does not reap what it launches, by design (`graphical-session.md` §3: it is not a
+supervisor of the applications it starts), so it does not know how many are alive to refuse the
+next one.
+
+**What the fix needs is the accounting the shell deliberately does not have**, which is why this
+is deferred rather than patched: a cap is a number to argue about, and a real answer is the shell
+knowing what it launched and what is still running. The exposure today is one application, in a
+namespace this same shell built, spending its own session's resources — the amplification is real
+but the blast radius is a session the user is already inside.
+
+> **Trigger: the shell gaining a record of what it launched** — which M12's application work
+> implies, since tabs and a document model need it — **or the second unprivileged client of
+> `Open`.** Whichever arrives first, the bound goes in with it.
+
+Found in review (PR #259, finding 4).
+
 **A resource server behind `/session/*` — `TODO(session-metadata-server)`.** Nitrox has no kernel
 user identity: authority is held in handles, so there is nothing for the kernel to report and
 identity is a *session* concept. `session-mgr` authenticates a login and then constructs the

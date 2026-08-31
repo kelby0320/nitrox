@@ -2381,6 +2381,81 @@ mod tests {
     }
 
     #[test]
+    fn every_edit_path_counts_its_own_edit() {
+        // **One case per bump, because the bumps are not one line.** `insert` has its own and so
+        // does the `delete_selection` it calls first; `backspace` and `delete` each have two, a
+        // character and a join. A test that only typed left five of the seven uncontrolled, and
+        // the one that matters most is `delete_selection`'s: `backspace` and `delete` both
+        // return the moment it reports it deleted something, so without its bump a person could
+        // select a word, press Delete, and watch the buffer change while the title bar kept
+        // saying the file was saved (PR #259 review, finding 2).
+        let bumps = |setup: &dyn Fn(&mut TextAreaState)| -> u64 {
+            let mut a = area();
+            let before = a.revision();
+            setup(&mut a);
+            a.revision() - before
+        };
+
+        // A selection, deleted by each of the two keys that delete one.
+        let select_two = |a: &mut TextAreaState| {
+            for _ in 0..2 {
+                a.apply(KEY_RIGHT, MOD_SHIFT);
+            }
+        };
+        assert!(
+            bumps(&|a| {
+                select_two(a);
+                assert!(a.apply(KEY_BACKSPACE, 0));
+            }) > 0,
+            "backspace over a selection"
+        );
+        assert!(
+            bumps(&|a| {
+                select_two(a);
+                assert!(a.apply(KEY_DELETE, 0));
+            }) > 0,
+            "delete over a selection"
+        );
+
+        assert!(bumps(&|a| a.newline()) > 0, "enter splits a line");
+
+        // Backspace's two paths: a character, and the join at the start of a line.
+        assert!(
+            bumps(&|a| {
+                a.apply(KEY_RIGHT, 0);
+                assert!(a.apply(KEY_BACKSPACE, 0));
+            }) > 0,
+            "backspace over a character"
+        );
+        assert!(
+            bumps(&|a| {
+                a.apply(KEY_DOWN, 0);
+                a.apply(KEY_HOME, 0);
+                assert!(a.apply(KEY_BACKSPACE, 0));
+            }) > 0,
+            "backspace joining two lines"
+        );
+
+        // Delete's two, the same shape from the other side.
+        assert!(bumps(&|a| assert!(a.apply(KEY_DELETE, 0))) > 0, "delete over a character");
+        assert!(
+            bumps(&|a| {
+                a.apply(KEY_END, 0);
+                assert!(a.apply(KEY_DELETE, 0));
+            }) > 0,
+            "delete joining two lines"
+        );
+
+        // And the two that change nothing still count nothing, so "an edit" means an edit.
+        let mut ends = TextAreaState::with_text("a");
+        let quiet = ends.revision();
+        assert!(!ends.apply(KEY_BACKSPACE, 0), "backspace at the buffer's start");
+        ends.apply(KEY_END, 0);
+        assert!(!ends.apply(KEY_DELETE, 0), "delete at its end");
+        assert_eq!(ends.revision(), quiet);
+    }
+
+    #[test]
     fn the_caret_is_drawn_at_either_end_of_a_selection() {
         // **The half a picture cannot check.** `check-display`'s reference builds its selection
         // with `Shift+Right`, so the gate compares a *forward* one — and the caret was drawn

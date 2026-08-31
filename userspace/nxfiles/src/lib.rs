@@ -353,9 +353,9 @@ impl App {
     /// on this side.
     pub fn opened(&mut self, path: &str, ok: bool) {
         self.notice = Some(if ok {
-            alloc::format!("opening {}", basename(path))
+            alloc::format!("opening {}", libfs::basename_str(path))
         } else {
-            alloc::format!("could not open {}", basename(path))
+            alloc::format!("could not open {}", libfs::basename_str(path))
         });
     }
 
@@ -494,15 +494,6 @@ fn join(dir: &str, name: &str) -> String {
     }
     s.push_str(name);
     s
-}
-
-/// The last component of a path, for a message about one entry rather than the whole path.
-fn basename(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(i) => &trimmed[i + 1..],
-        None => trimmed,
-    }
 }
 
 /// Everything before the final component, or `"/"` at the root.

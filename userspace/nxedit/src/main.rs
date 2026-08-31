@@ -86,7 +86,7 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
     match libfs::read_file(ns, path.as_bytes()) {
         Ok(bytes) => match core::str::from_utf8(&bytes) {
             Ok(text) => {
-                app.loaded(text);
+                app.loaded(text, &bytes);
                 libkern::debug::Line::new()
                     .s(b"nxedit: opened ")
                     .s(path.as_bytes())
@@ -211,7 +211,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // title bar; retitling on every keystroke would be a message per keystroke to say something
     // the window already shows.
     if let Some(mut w) = win.window(window_id)
-        && w.set_title(nxedit::basename(&path)).is_err()
+        && w.set_title(libfs::basename_str(&path)).is_err()
     {
         kprint(b"nxedit: SetTitle refused\n");
     }
@@ -345,12 +345,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             match event {
                 WindowEvent::Key(k) => {
+                    // **Every key reaches the buffer today, and the router branch is a
+                    // placeholder rather than live routing.** `Router::key` returns early
+                    // without a focused widget, this editor focuses none, and no toolkit widget
+                    // sets `on_key` — so the `if` has never once been taken. It is kept because
+                    // the first widget that wants a key (a find field) needs exactly this shape,
+                    // and reading it as dispatch that already happens is the mistake: today the
+                    // save button has **no keyboard path**, which is worth knowing before M12
+                    // adds one (PR #259 review, optional 7).
                     if let Some(msg) = router.key(&tree, &ui, k) {
                         app.update(msg);
                     } else {
-                        // Everything else is the buffer's: the text area is not focusable
-                        // through the router — it *is* the window's content — so keys reach it
-                        // by being the editor's own message rather than a widget's.
                         app.update(Msg::Key(k));
                     }
                 }

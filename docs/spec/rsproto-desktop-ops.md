@@ -94,6 +94,15 @@ absolute — a relative path would be relative to a working directory this serve
 `Unsupported` if the shell cannot launch: no compositor endpoint, no such program in `/bin`, or
 application namespaces that do not gate, which disables launching outright.
 
+**Nothing bounds how often a client may ask.** This is the first op in the system a *program*
+can drive that causes a process to be spawned — the applications modal needs a person — and the
+shell does not rate-limit it, cap live openers, or dedup paths. `MAX_DESKTOP_SESSIONS` is not the
+bound: a client may open and close a session per request, and `nxfiles` does. Filed as
+`TODO(open-amplification)` in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md#userspace), where the trigger is the
+shell gaining a record of what it launched — which it deliberately does not keep today, since it
+is not a supervisor of the applications it starts.
+
 **One op, not a family.** There is no "open with", no "what would open this", and no reply saying
 what was launched. Each is a mechanism with one caller and no second case to check it against;
 `Open` is the shape a browser needs and the shape a drop will need

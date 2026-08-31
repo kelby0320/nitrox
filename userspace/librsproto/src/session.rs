@@ -38,7 +38,7 @@ use libkern::syscall::{
 };
 
 /// Byte offset of the rsproto payload within an `IpcMsg` (the IPC header precedes it).
-const PAYLOAD_OFF: usize = 24;
+pub(crate) const PAYLOAD_OFF: usize = 24;
 /// `IpcMsgHeader.payload_len` field offset.
 const OFF_PAYLOAD_LEN: usize = 4;
 /// `IpcMsgHeader.handle_count` field offset.

@@ -3100,6 +3100,13 @@ fn serve_desktop_session(
                 // caller's namespace does not share.
                 return bad(KError::InvalidArgument);
             }
+            // **And nothing bounds how many times this may be asked.** `Open` is the first
+            // spawn path a *program* can drive — the modal needs a person — and the handler
+            // checks the path's shape and launches. `MAX_DESKTOP_SESSIONS` is not the bound
+            // (`nxfiles` opens a session per file, so a per-session counter resets every call),
+            // and this shell does not reap what it launches, so it cannot count what is alive.
+            // TODO(open-amplification): bound this once the shell has that record.
+            //
             // **Not stat'ed here, deliberately.** The shell could ask whether the path is a
             // file, and the answer would be about the *shell's* namespace rather than the
             // caller's or the editor's — three namespaces that agree today because one process

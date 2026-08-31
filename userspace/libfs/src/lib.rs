@@ -629,6 +629,23 @@ pub fn basename(path: &[u8]) -> &[u8] {
     }
 }
 
+/// [`basename`] on a `str`, for the callers whose paths are already text.
+///
+/// **Not a second rule, and that is the point of it being here.** The two graphical
+/// applications each grew a private copy — byte-identical, each with a comment explaining that
+/// this half of the application never sees a path as bytes, which was true when there was one
+/// of them (PR #259 review, optional 6). One consumer's helper belongs to that consumer; two
+/// belong below both, which is the rule this crate itself was extracted under.
+///
+/// The conversion is free rather than lossy: a `str` is UTF-8, `/` never occurs inside a
+/// multi-byte sequence, and the bytes handed back are a subslice cut only at one — so the
+/// `from_utf8` **cannot fail**, and the fallback below is unreachable rather than a repair.
+/// Changing what it returns changes no test, which is the evidence for that claim rather than a
+/// gap in the tests: what the test pins is that a non-ASCII name comes back whole.
+pub fn basename_str(path: &str) -> &str {
+    core::str::from_utf8(basename(path.as_bytes())).unwrap_or(path)
+}
+
 /// Everything before the final component (`"/a/b/c"` → `"/a/b"`), or `"/"` when the path
 /// has a single component — the root is its own parent, which is what a caller opening the
 /// parent directory needs.
@@ -666,6 +683,19 @@ mod tests {
         // "dir/" and create a nameless entry.
         assert_eq!(basename(b"/a/b/"), b"b");
         assert_eq!(basename(b"/"), b"/");
+    }
+
+    #[test]
+    fn basename_str_is_the_same_rule_and_never_loses_the_text() {
+        assert_eq!(basename_str("/a/b/c"), "c");
+        assert_eq!(basename_str("/a/b/"), "b", "a trailing separator is not the name");
+        assert_eq!(basename_str("/"), "/");
+        // **The claim worth pinning**: the byte version can only cut at an ASCII `/`, and a `/`
+        // byte never occurs inside a multi-byte UTF-8 sequence — so the subslice it hands back is
+        // always still text, and the fallback in `basename_str` is unreachable rather than a
+        // silent repair. A name that is not ASCII is what would expose the difference.
+        assert_eq!(basename_str("/home/notes-café.txt"), "notes-café.txt");
+        assert_eq!(basename_str("café"), "café");
     }
 
     #[test]

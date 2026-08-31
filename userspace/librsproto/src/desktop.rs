@@ -47,8 +47,16 @@ pub const OP_DESKTOP_NAME: u16 = 0x0C02;
 ///
 /// **What the reply means.** Success says the shell launched something, not that the program
 /// could read the file — an editor opened on a path it cannot read reports that in its own
-/// window, where the person who asked for it is looking. `NotFound` is the shell declining
-/// because nothing there resolves; `Unsupported` because nothing is registered to open it.
+/// window, where the person who asked for it is looking.
+///
+/// **Two error codes, and neither is about the file.** `InvalidArgument` is the path's *shape*:
+/// empty, over the cap, not UTF-8, or not absolute. `Unsupported` is **the launch failing** — no
+/// compositor endpoint, no such program in `/bin`, or application namespaces that do not gate.
+/// There is no `NotFound` here, because the shell does not resolve the path at all; a reader who
+/// took one from this comment would write a `no such file` arm that can never run, and read
+/// `Unsupported` as "nothing opens that kind of file" when the cause was a shell that could not
+/// launch — the diagnosis-of-the-operand mistake [`DesktopError`] exists to prevent
+/// (PR #259 review, finding 1).
 ///
 /// M10 Part D, and the first op here a *client* sends about something other than desktops. That
 /// it lives on this resource rather than a new one is deliberate: `/dev/desktop` is already the
@@ -274,7 +282,12 @@ impl<'a> Desktop<'a> {
                 crate::session::WireError::Transport(c) => DesktopError::Transport(c),
                 crate::session::WireError::Protocol => DesktopError::Protocol,
             })?;
-        let payload = &self.buf[24..24 + len];
+        // `PAYLOAD_OFF`, not a literal: the bound that makes this slice safe is `round_trip`'s
+        // own `PAYLOAD_OFF + payload_len > buf.len()` check, and two constants that agree by
+        // coincidence are a seam in the one module built to stop implementations diverging
+        // (PR #259 review, optional 5).
+        let off = crate::session::PAYLOAD_OFF;
+        let payload = &self.buf[off..off + len];
         let msg = crate::decode(payload).map_err(|_| DesktopError::Transport(0))?;
         if msg.flags & crate::RS_FLAG_ERROR != 0 {
             // The shell's error reply is its `KError` as four little-endian bytes.
