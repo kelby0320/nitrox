@@ -437,14 +437,21 @@ M7's `text_field` was and remains the narrow thing: a password box and a search 
 wrapping, no selection and no multi-line cursor. A single-line field is not a text area, which
 is what §1's contradiction turned on.
 
-**What the two widgets are, at the toolkit's seam.** Both are pure functions of state the
-application owns, like every widget here — but both also ship a *state* type
-(`TextFieldState`, `ListState`) carrying the logic their callers would otherwise each
-reimplement: key dispatch for the field, and selection-follows-scroll for the list. That is
-not a retreat from §3's "a widget is a function": `Element::on_key` is a **function pointer**,
-so a widget cannot close over anything to mutate, and the editing rules have to live
-somewhere the application can call. Putting them next to the widget rather than in each
-caller is what stops two implementations of Home and End existing.
+**What these widgets are, at the toolkit's seam.** Each ships a *state* type
+(`TextFieldState`, `ListState`, `TextAreaState`) carrying the logic their callers would
+otherwise each reimplement: key dispatch for the field, selection-follows-scroll for the list,
+and the whole editing model for the text area. That is not a retreat from §3's "a widget is a
+function": `Element::on_key` is a **function pointer**, so a widget cannot close over anything
+to mutate, and the editing rules have to live somewhere the application can call. Putting them
+next to the widget rather than in each caller is what stops two implementations of Home and End
+existing.
+
+**Two of the three are no longer pure functions of that state, as of M10 Part C.** `text_area`
+and `list_view` take it by `&mut` and scroll it themselves, because a caller cannot be *required*
+to keep part of a return value — `nxfiles` dropped `list_view`'s and shipped a selection that
+never left the last visible row. `text_field` still takes its state by shared reference; it has
+no scroll offset to maintain, so there is nothing for a caller to drop. The decision log's
+2026-09-01 Part C entry carries the argument and the rework this leaves open.
 
 `list_view` builds **only the rows that fit**, which is the point of it rather than an
 optimisation: a hundred windows cost as many elements as fit on screen, and the diff walks

@@ -2829,10 +2829,19 @@ them, which is the trigger §8 named.
       stack" while a plan item asked for one — is now closed the way waiting was supposed to
       close it: built for an editor, sharing nothing with the terminal.
 
-- [x] **Gate** ✅ — eighteen host tests in `libui`, and **eight controls**, each run alone and
+- [x] **Gate** ✅ — twenty-one host tests in `libui`, and **eleven controls**, each run alone and
       watched to fail by name: no goal column, insert not replacing a selection, an unshifted
       move keeping the anchor, `selection()` not normalising, the widget not scrolling, `place`
-      not clamping, backspace not joining lines, and `with_text` adding a trailing newline.
+      not clamping, backspace not joining lines, and `with_text` adding a trailing newline —
+      then, from PR #258's review, the caret drawn only after the highlight, an anchor surviving
+      the edit that shortens the text it names, and a multi-line selection highlighted on its
+      first line only.
+
+      **The last three are the drawing half, and it had no host coverage at all** when this box
+      was first ticked: eight controls for the state, one picture for the pixels, and nothing
+      counting what the widget actually emits. Both bugs the review found lived exactly there.
+      A picture checks one arrangement — the reference's selection runs forward — so the caret
+      was missing from every backward selection and the gate could not see it.
 
       `check-display`'s reference render gains the widget — **a selection spanning a line break
       with the caret at its far end**, which is the arrangement where three separate mistakes

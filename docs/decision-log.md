@@ -20209,3 +20209,41 @@ half of the maximise, before the resize. A prefix that matches two lines is a cu
 up in two places. The assertion is kept as it was, because the intermediate line is real evidence
 that the origin is applied as `Place` would apply it; what changed is that it no longer claims to
 know whether the client answered first.
+
+## 2026-09-01 — Part C's review: eight controls for the state, none for the drawing
+
+Both blocking findings were in `text_area`'s drawing, and the reason they were both there is the
+same one: the gate had eight controls for what the widget *computes* and nothing at all for what
+it *emits*. Eighteen host tests, one of which called `text_area`, and it asserted `offset()`.
+
+**A collapsed selection outlived the text it pointed into.** Walking the cursor back onto its own
+anchor leaves no *selection* — `selection()` returns `None` when the two are equal — but it does
+leave an anchor, and an anchor is a pair of indices. `delete_selection` took its early-out without
+clearing it, so the next `Backspace` shortened the line the anchor named and the frame after that
+panicked slicing it. Typing instead of deleting gave the quiet half: a selection nobody made, over
+the character just typed, which the next keystroke would replace.
+
+The fix is one line in the one place every edit passes through, and the reason it is right there
+rather than in the six methods that move the cursor: a stale anchor is harmless until the text
+moves under it. Movement can leave a collapsed anchor as long as it likes — `Shift+Down` from a
+collapsed one selects from exactly where it should. **Only an edit invalidates indices, and every
+edit funnels through `delete_selection`.**
+
+**And the caret was drawn only after the selection's highlight**, behind a `cur_col >= at` guard
+that a backward selection cannot satisfy — so the cursor was not on screen for any selection made
+with `Shift+Left`, `Shift+Up`, or a backwards drag. The caret is now emitted before the highlight
+when the cursor is at its start, and the fallback is a `max` rather than a guard: an arrangement
+nobody has made yet draws a caret in the wrong column rather than none at all. A caret nobody can
+find is worse than one a pixel out of place.
+
+**What the two have in common is the coverage, not the code.** `check-display` renders the widget,
+and the reference builds its selection with `Shift+Right` — so the gate compares a *forward* one.
+The doc for that render names three mistakes a picture catches; it cannot catch a caret that is
+never drawn, because a picture checks one arrangement and a caret's absence looks like an
+arrangement. The three new tests count what the tree holds — `Fill(focus_ring)` for the caret,
+`Fill(selection)` for the highlight — in both directions, which is the shape that catches a
+one-sided implementation. **A fixture chosen to illustrate a property will illustrate it for the
+broken version too**, and forward-only was exactly that.
+
+The reference stays forward-only on purpose: the picture is one arrangement rather than a gallery,
+and the directions belong in host tests where they can be counted.

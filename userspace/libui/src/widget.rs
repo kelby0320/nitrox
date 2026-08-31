@@ -692,11 +692,15 @@ impl TextAreaState {
     /// a file this editor should be able to open, and a carriage return kept in the buffer would
     /// be an invisible character at the end of every line that the cursor has to step over.
     pub fn with_text(text: &str) -> Self {
-        let mut lines: Vec<String> =
+        // **One line minimum, and `split` is what guarantees it** rather than a check here:
+        // `str::split('\n')` yields at least one piece for every input, `""` included, so an
+        // empty buffer is one empty line. The rest of this type indexes `lines[self.line]`
+        // without checking, so the invariant matters — it is just not this function's to
+        // enforce. An `is_empty` guard stood here until PR #258's review pointed out that it
+        // cannot fire, and a guard that cannot fire reads as protecting an invariant it does
+        // not (optional 2).
+        let lines: Vec<String> =
             text.split('\n').map(|l| String::from(l.strip_suffix('\r').unwrap_or(l))).collect();
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
         Self { lines, ..Self::default() }
     }
 
@@ -780,9 +784,24 @@ impl TextAreaState {
         self.anchor = Some(from);
     }
 
-    /// Delete the selection, leaving the cursor where it was. `false` if there was none.
+    /// Delete the selection, leaving the cursor at where it started. `false` if there was none.
+    ///
+    /// **The anchor is dropped either way, and that is the whole of it.** A cursor that has
+    /// walked back onto its own anchor has no *selection* — [`selection`](Self::selection)
+    /// returns `None` for it — but it still has an anchor, and an anchor is a pair of indices
+    /// into text this call is about to shorten. Every edit funnels through here (`insert`,
+    /// `newline`, `backspace`, `delete` all call it first), so this is the one place that has to
+    /// know: whatever it pointed at is not there any more.
+    ///
+    /// It survived one review because both of its symptoms need two keystrokes to reach.
+    /// `Shift+Left` then `Shift+Right` collapses a selection onto its anchor; a `Backspace` after
+    /// that used to leave an anchor naming a byte past the end of the line, and the *next frame*
+    /// panicked inside `text_area` slicing it. Typing instead of deleting gave the quieter half:
+    /// a selection nobody made, over the character just typed, which the keystroke after that
+    /// would replace (PR #258 review, blocking 1).
     pub fn delete_selection(&mut self) -> bool {
         let Some(((sl, sc), (el, ec))) = self.selection() else {
+            self.anchor = None;
             return false;
         };
         let tail = String::from(&self.lines[el][ec..]);
@@ -1064,6 +1083,12 @@ pub fn text_area<Msg>(
             }
             let from = if i == sl { sc } else { 0 };
             let to = if i == el { ec } else { l.len() };
+            // **An empty line inside a multi-line selection draws no highlight**, because
+            // `from == to` and there is nothing to put a colour behind. A selected blank line
+            // therefore looks unselected. Recorded rather than fixed: showing it means drawing
+            // a sliver a space wide, and the widget cannot measure a space — text is measured by
+            // the caller's `Metrics` at layout time, not here (PR #258 review, optional 4).
+            // **Trigger: the first time a widget can ask for a glyph's advance.**
             (from < to).then_some((from, to))
         });
 
@@ -1074,8 +1099,27 @@ pub fn text_area<Msg>(
                 pieces.push(text(String::from(&l[from..to])));
             }
         };
+        // Where the caret goes on this line, if it is on this line at all. The pieces are built
+        // left to right, so *when* it is emitted decides where it appears — and a selection's
+        // cursor is at its **start** as often as at its end: every `Shift+Left`, `Shift+Up` and
+        // backwards drag makes one. The first version emitted it only after the highlight, under
+        // a `cur_col >= at` guard that a backwards selection cannot satisfy, so the cursor
+        // vanished from the screen for exactly those (PR #258 review, blocking 2).
+        let caret = (active && i == cur_line).then_some(cur_col);
+        let mut caret_drawn = false;
+        let push_caret = |pieces: &mut Vec<Element<Msg>>, at: &mut usize, to: usize| {
+            push_text(pieces, *at, to);
+            pieces.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
+            *at = to;
+        };
+        if let Some(cc) = caret {
+            if span.map(|(from, _)| cc <= from).unwrap_or(true) {
+                push_caret(&mut pieces, &mut at, cc);
+                caret_drawn = true;
+            }
+        }
         if let Some((from, to)) = span {
-            push_text(&mut pieces, 0, from);
+            push_text(&mut pieces, at, from);
             // The highlight is a `fill` *under* the run: `fill` measures as zero, so the stack
             // takes the text's size and the colour covers exactly the glyphs' box.
             pieces.push(stack(alloc::vec![
@@ -1084,11 +1128,17 @@ pub fn text_area<Msg>(
             ]));
             at = to;
         }
-        // The caret splits whatever is left, so it sits between characters rather than over one.
-        if active && i == cur_line && cur_col >= at {
-            push_text(&mut pieces, at, cur_col);
-            pieces.push(sized(Size::new(CARET, 0), fill(palette.focus_ring)));
-            at = cur_col;
+        if let Some(cc) = caret {
+            if !caret_drawn {
+                // **`max`, not a guard, and that is the fix's whole shape.** The cursor is one
+                // end of the selection, so on its own line it sits at the highlight's start —
+                // drawn above — or at its end, and `cc` is then already past `at`. Should some
+                // future arrangement put it inside the run, this draws a caret in the wrong
+                // column rather than none at all: a caret nobody can find is the failure this
+                // replaces, and it is worse than one a pixel out of place.
+                let to = cc.max(at);
+                push_caret(&mut pieces, &mut at, to);
+            }
         }
         push_text(&mut pieces, at, l.len());
         if pieces.is_empty() {
@@ -2057,6 +2107,25 @@ mod tests {
         TextAreaState::with_text("abc\nde\nfghi")
     }
 
+    /// How many `Fill`s of `colour` the tree holds — the caret is one, and a selection's
+    /// highlight is one per line it covers.
+    ///
+    /// **What `text_area` draws had no host coverage in either direction** until PR #258's
+    /// review; `check-display` renders one arrangement of it and a picture cannot count.
+    fn fills<M>(e: &Element<M>, colour: Rgb) -> usize {
+        fn walk<M>(e: &Element<M>, colour: Rgb, n: &mut usize) {
+            if matches!(&e.node, crate::element::Node::Fill(rgb) if *rgb == colour) {
+                *n += 1;
+            }
+            for c in e.children() {
+                walk(c, colour, n);
+            }
+        }
+        let mut n = 0;
+        walk(e, colour, &mut n);
+        n
+    }
+
     const KEY_A: u16 = 30;
     const KEY_X: u16 = 45;
 
@@ -2236,6 +2305,98 @@ mod tests {
         }
         let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
         assert_eq!(a.offset(), 0, "and it scrolls back the other way");
+    }
+
+    #[test]
+    fn the_caret_is_drawn_at_either_end_of_a_selection() {
+        // **The half a picture cannot check.** `check-display`'s reference builds its selection
+        // with `Shift+Right`, so the gate compares a *forward* one — and the caret was drawn
+        // only after the highlight, which a forward selection satisfies and a backward one
+        // never does. Both directions here, counted in the tree (PR #258 review, blocking 2).
+        let p = Palette::default();
+        let draw = |a: &mut TextAreaState| -> usize {
+            let e: Element<()> = text_area(a, 3 * 16, 16, true, &p);
+            fills(&e, p.focus_ring)
+        };
+
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        assert_eq!(draw(&mut a), 1, "no selection at all");
+
+        let mut a = area();
+        for _ in 0..2 {
+            a.apply(KEY_RIGHT, MOD_SHIFT);
+        }
+        assert_eq!(draw(&mut a), 1, "forward: the cursor is at the highlight's end");
+
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        for _ in 0..2 {
+            a.apply(KEY_LEFT, MOD_SHIFT);
+        }
+        assert_eq!(draw(&mut a), 1, "backward: the cursor is at the highlight's start");
+
+        let mut a = area();
+        a.apply(KEY_DOWN, 0);
+        a.apply(KEY_UP, MOD_SHIFT);
+        assert_eq!(draw(&mut a), 1, "backward across a line break");
+
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &p);
+        assert_eq!(fills(&e, p.focus_ring), 0, "and none at all when the widget is not active");
+    }
+
+    #[test]
+    fn a_selection_is_highlighted_on_every_line_it_covers() {
+        // The other half of what `text_area` draws, and the reason the count is per *line*: a
+        // multi-line selection is one highlight per row, not one rectangle.
+        let p = Palette::default();
+        let mut a = area();
+        a.apply(KEY_RIGHT, 0);
+        a.apply(KEY_DOWN, MOD_SHIFT);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        assert_eq!(fills(&e, p.selection), 2, "the tail of line 0 and the head of line 1");
+
+        let mut a = area();
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        assert_eq!(fills(&e, p.selection), 0, "and nothing when nothing is selected");
+    }
+
+    #[test]
+    fn a_collapsed_selection_leaves_no_anchor_behind_an_edit() {
+        // **Two keystrokes to arm and one to fire**, which is why it survived a review: walking
+        // the cursor back onto its own anchor leaves no *selection* but does leave an anchor,
+        // and the next edit shortens the text it names (PR #258 review, blocking 1).
+        let mut a = area();
+        a.apply(KEY_END, 0);
+        a.apply(KEY_LEFT, MOD_SHIFT);
+        a.apply(KEY_RIGHT, MOD_SHIFT);
+        assert_eq!(a.selection(), None, "the cursor is back on its anchor");
+        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert_eq!(a.text(), "ab\nde\nfghi");
+        assert_eq!(a.selection(), None, "and the anchor went with the character");
+        // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Palette::default());
+        assert_eq!(fills(&e, Palette::default().selection), 0, "nothing is selected, so nothing \
+            is highlighted");
+
+        // The quieter symptom of the same defect: typing instead of deleting used to leave a
+        // selection over the character just typed, which the next keystroke would replace.
+        let mut a = area();
+        a.apply(KEY_RIGHT, MOD_SHIFT);
+        a.apply(KEY_LEFT, MOD_SHIFT);
+        a.insert('x');
+        assert_eq!(a.text(), "xabc\nde\nfghi");
+        assert_eq!(a.selection(), None, "typing selects nothing");
+
+        // And by pointer, which arms it the same way: a press and a release that never moved.
+        let mut a = area();
+        a.place(0, 3);
+        a.extend_to(0, 3);
+        assert!(a.apply(KEY_BACKSPACE, 0));
+        assert_eq!(a.text(), "ab\nde\nfghi");
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Palette::default());
     }
 
     #[test]

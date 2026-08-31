@@ -211,6 +211,14 @@ fn reference_list(palette: &Palette) -> Element<Msg> {
 ///
 /// Fixed height for the reason [`reference_list`] is fixed: the picture must depend on the
 /// widget rather than on how much room the column had left.
+///
+/// **The selection is a forward one, and that is a limit worth naming.** A picture catches a
+/// highlight over the whole line rather than the selected run, one that stops at the first
+/// line's end, and a caret at the line's end rather than at the cursor — but it checks one
+/// arrangement, and the caret was missing from every *backward* selection for as long as this
+/// was the only coverage `text_area`'s drawing had (PR #258 review, blocking 2). Both directions
+/// are counted in `widget.rs`'s host tests now; this stays forward so the picture keeps being
+/// one thing rather than a gallery.
 fn reference_area(palette: &Palette) -> Element<Msg> {
     let mut a = TextAreaState::with_text("select me\nand me");
     a.apply(libkern::abi::KEY_RIGHT, 0);
