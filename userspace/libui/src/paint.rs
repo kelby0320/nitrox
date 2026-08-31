@@ -40,7 +40,6 @@ use crate::layout::{Layout, Metrics};
 /// point is that these arrive together from one place.
 pub use libdraw::theme::Theme;
 
-
 /// A font at a size, as something layout can measure with.
 ///
 /// The bridge between `libdraw`'s glyphs and [`Metrics`]. Layout must measure with the *same*

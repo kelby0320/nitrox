@@ -3114,10 +3114,13 @@ it is noticed on. Its own list, and its own milestone.
       stronger check a one-liner — render `main` in a worktree, `md5sum` both PNGs — and both
       match. A refactor that moves no pixel is exactly what this part is.
 
-      `xtask`'s cross-crate colour test survives with a **different claim**: not that the two
-      grounds are equal, which is now structural, but that the sixteen ANSI colours are *not* any
-      chrome colour — the mistake a future theme would make on its way to recolouring program
-      output.
+      `xtask`'s cross-crate colour test survives with a **different claim**, and the first
+      version of that claim was wrong. It asserted that no ANSI colour equals a *chrome* colour —
+      provenance encoded as inequality — and the counterexample was in the palette itself:
+      `ansi[0]` and `title_inactive` are both `#1C222A`. It passed only because `title_inactive`
+      was the one theme colour left out of the list it checked (PR #262 review, blocking 1). What
+      it asserts now is what comparing values can establish: the grounds follow the theme, and no
+      cell colour equals the ground it is drawn on.
 
 ### Part C — the theme becomes data
 

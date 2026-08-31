@@ -107,8 +107,9 @@ impl Popup {
         anchor: Rect,
         app: &App,
         font: &Font,
+        theme: &Theme,
     ) -> Option<Self> {
-        let menu = app.menu_view();
+        let menu = app.menu_view(theme);
         let m = FontMetrics::new(font, FONT_PX);
         let size = measure(&menu, Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &m);
         if size.w == 0 || size.h == 0 {
@@ -167,7 +168,7 @@ impl Popup {
         font: &Font,
         theme: &Theme,
     ) -> bool {
-        let menu = app.menu_view();
+        let menu = app.menu_view(theme);
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
         let l = layout(&menu, bounds, &FontMetrics::new(font, FONT_PX));
         match self.tree.update(&menu, &l) {
@@ -412,7 +413,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     loop {
         // ---- render ----
-        let ui = app.view();
+        let ui = app.view(&theme);
         let l = layout(&ui, bounds, &FontMetrics::new(&font, FONT_PX));
         // The anchor for the next frame's popup. Read every frame rather than only when the
         // menu opens: the item's position is a fact about the layout, not about the menu.
@@ -427,7 +428,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // anchor computed just above rather than the one from when the menu was toggled.
         match (app.menu_open, popup.is_some(), app.menu_anchor) {
             (true, false, Some(anchor)) => {
-                popup = Popup::open(&mut win, window_id, anchor, &app, &font);
+                popup = Popup::open(&mut win, window_id, anchor, &app, &font, &theme);
                 // **Where it is and how big**, because the gate has no other way to see a
                 // second window: it reads the serial log, and this is the only thing that
                 // says the menu became a window rather than a layer. The origin is in screen
@@ -657,7 +658,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
         // dropped rather than routed into the terminal.
         if popup.as_ref().is_some_and(|p| p.id == from) {
-            let menu = app.menu_view();
+            let menu = app.menu_view(&theme);
             let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
             let ml = layout(&menu, bounds, &FontMetrics::new(&font, FONT_PX));
             let msgs: alloc::vec::Vec<Msg> = match event {

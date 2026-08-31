@@ -20520,11 +20520,33 @@ purpose, which turned an assertion into a fact — the same lesson Part A's revi
 earlier: **a comment asserting that two call sites agree is a comment, and the fix is one call
 site rather than a third assertion.**
 
-**The sixteen ANSI colours stayed put**, and the test that compared grounds now asserts *that*
-instead: none of the sixteen may equal a chrome colour. They are the vocabulary a program
-addresses with `ESC[31m` — defined by what programs expect, not by how this system chooses to
-look — so a theme that reached into them would retint `ls` output on its way to restyling a
-button.
+**The sixteen ANSI colours stayed put.** They are the vocabulary a program addresses with
+`ESC[31m` — defined by what programs expect, not by how this system chooses to look — so a theme
+that reached into them would retint `ls` output on its way to restyling a button.
+
+**And the first attempt to guard that was unsound, which is the lesson worth keeping.** The test
+that had compared the two grounds was rewritten to assert that no ANSI colour equals a *chrome*
+colour — an attempt to encode **provenance as inequality**. Review found the counterexample
+inside the palette this very change ships: `ansi[0]` and `title_inactive` are both `#1C222A`,
+because both were chosen independently as the darkest tone in one scheme. The test passed only
+because `title_inactive` was the single theme colour missing from its list, so it was scoped
+around its own counterexample.
+
+Two independent choices coinciding says nothing about whether one is derived from the other.
+Provenance is read in the code — `Palette::default`'s `ansi` is sixteen literals — and no
+comparison of values can see it. What the test asserts now is what a value comparison can
+establish: the two defaults follow the theme (structural, and it fails if either is written out
+as a literal again), and **no cell colour equals the ground it is drawn on**, which is the one
+legibility property with a sharp edge rather than a judgement.
+
+**Review also found one type making a mistake two types could not express.** A view function
+building widgets from `Theme::default()` while its caller painted with
+`Theme { font_px: FONT_PX, .. }` is *two themes in one frame* — invisible today only because
+`FONT_PX` happens to equal the default. The old split made that unwriteable: you could not paint
+with a `Palette`. The fix is that a view takes the theme its caller paints with, and the sweep
+went past the two files the review named to all five, because the shape was the same in each.
+It is also the plumbing Part C needs: a theme read from a file arrives in `main` and is handed
+down, rather than being fetched from a default in the middle of a view.
 
 **And the gate needed Part A to be meaningful.** "check-display green with its reference
 unchanged" cannot be shown by `check-display`: it compares the host's render against the guest's

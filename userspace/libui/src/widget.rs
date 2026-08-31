@@ -53,8 +53,6 @@ pub struct WidgetState {
     pub active: bool,
 }
 
-/// The colours a widget draws itself in.
-///
 /// Space between a button's label and its edge.
 const BUTTON_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
 

@@ -144,9 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn a_window_and_the_space_between_windows_are_the_same_ground() {
-        // A seam appears the moment these differ and a client's committed buffer is smaller than
-        // the window it fills — which is every window during a resize.
+    fn the_scenes_ground_is_still_the_themes_ground() {
+        // **A provenance guard, not a pixel guard**, and the difference is worth stating because
+        // the obvious reading is wrong: `BACKGROUND` is *derived* from this field, so retuning
+        // the field moves both and leaves this green. What catches a moved pixel is
+        // `scene::REFERENCE_HASH`, which fails on exactly that change.
+        //
+        // What this fails on is the re-divergence: somebody writing `BACKGROUND` out as a
+        // literal again, which is how the two came to need an equality test in the first place.
         let t = Theme::dark();
         assert_eq!(t.background, crate::scene::BACKGROUND);
     }

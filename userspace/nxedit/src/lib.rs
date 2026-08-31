@@ -416,8 +416,14 @@ impl App {
     ///
     /// `&mut self` because `text_area` scrolls the state it is handed — see `nxfiles::App::view`
     /// for the bug the value-returning shape shipped.
-    pub fn view(&mut self) -> Element<Msg> {
-        let ui = UiTheme::default();
+    ///
+    /// **The theme is the caller's**, because the caller paints this tree — and a tree built from
+    /// one theme and painted with another is two themes in one frame, which one type makes easy
+    /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
+    /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
+    /// handed down, rather than being fetched from a default in the middle of a view.
+    pub fn view(&mut self, ui: &UiTheme) -> Element<Msg> {
+
         let title = title_bar(
             &self.title(),
             self.focused,

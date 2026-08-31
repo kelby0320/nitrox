@@ -1,4 +1,11 @@
-//! `libdraw` — geometry, pixel formats, framebuffers and compositing.
+//! `libdraw` — geometry, pixel formats, framebuffers, compositing, and the theme.
+//!
+//! **The theme is the fifth item and it arrived last**, in M11 Part B, against the grain of every
+//! sentence below that calls this "the pixel layer". It is here because the *compositor* paints
+//! chrome — a cursor, a drag outline, the ground between windows — and does not link a widget
+//! toolkit, deliberately; this crate is what it and `libui` share. See [`theme`] for the argument
+//! in full. Nothing else about the layering changed: a theme is a table of colours, which is
+//! pixel vocabulary, and not a claim that this crate knows what a button is.
 //!
 //! The pixel layer of the display arm, and **the gate that arrives with it**. The
 //! plan is explicit about the ordering ([`docs/planning/display-arm-plan.md`],
