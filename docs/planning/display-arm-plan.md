@@ -3060,19 +3060,33 @@ it is noticed on. Its own list, and its own milestone.
 
 ### Part A — `xtask preview`, because it changes the cost of everything after it
 
-- [ ] **Render an arrangement of widgets to a viewable image on the host.** `xtask` already links
-      `libui`, `libdraw` and `libterm` and renders `libui::reference` here — that is how
-      `check-display` adjudicates — so this is a new entry point onto a renderer that exists and
-      is already trusted.
+- [x] **Render an arrangement of widgets to a viewable image on the host** ✅ —
+      `cargo xtask preview [ui|term|all]`, writing `tools/build-cache/preview-*.png`. A new entry
+      point onto the renderer `check-display` already adjudicates with, not a second renderer.
 
       **First, because it is what makes the loop affordable.** Polish is a hundred small
-      judgements, and a judgement that costs a boot to see is a judgement not made. The same
-      renderer keeps it honest: what a preview shows is what `check-display` will demand of the
-      guest.
+      judgements, and a judgement that costs a boot to see is a judgement not made.
 
-- [ ] **Gate**: a host test that the preview of the reference arrangement is byte-identical to
-      the render `check-display` compares against. Two renderers that could disagree would make
-      the preview a *different* picture, which is worse than no preview.
+      **An external crate, and the first in `tools/`.** The forbidden list is the *kernel's*, and
+      `userspace/CLAUDE.md`'s bar is about what ships in the image; this is build tooling that
+      runs on the host and reaches no target. A hand-rolled PNG writer was started and thrown
+      away — a stored-block encoder is a hundred lines of checksum arithmetic standing between a
+      judgement about how something looks and seeing it, which is precisely the cost this part
+      exists to remove (settled with the maintainer 2026-09-01).
+
+      **What it does not show, stated rather than discovered later**: anything the *compositor*
+      draws — the cursor, the drag outline, the background between windows — and the arrangement
+      of real windows on a real screen. Those are composed in the guest by clients that have to
+      run. What it covers is the toolkit's own surfaces, which is where most of the polish lives.
+
+- [x] **Gate** ✅ — a host test with two claims, and **three controls, each run alone**. The
+      *sizes* are the display gate's own constants, so a preview that rendered an arrangement of
+      its own would fail: the control is a preview-only frame, and it does. And the PNG is
+      **decoded back** and compared to the framebuffer pixel by pixel, which covers the
+      conversion — the toolkit reference's pitch is 1292 for a 1280-byte row and `XRGB8888` is
+      little-endian, so a direct copy is wrong twice over. Both controls fire: channels swapped
+      fails at pixel 0,0, and the pitch ignored fails at pixel 0,1 — the first pixel of the
+      second row, which is exactly where a stride mistake begins.
 
 ### Part B — one theme, with `libdraw` as the seam
 

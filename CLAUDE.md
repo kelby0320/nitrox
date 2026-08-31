@@ -53,6 +53,7 @@ cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
 cargo xtask test           # host-side unit tests
 cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
 cargo xtask test-interactive # boot the RELEASE image and drive a real login + shell
+cargo xtask preview        # render the toolkit on the host to a PNG — no boot, no QEMU
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
@@ -118,6 +119,13 @@ display arm exists for a person rather than for a test: everything else display-
 bottom-most — `service-mgr` brings the login chain up before declared services, which is what
 keeps `check-display`'s reference windows undisturbed — so it holds no keyboard and nothing
 typed reaches it.
+
+`cargo xtask preview` writes `tools/build-cache/preview-{ui,term}.png` — the same renders
+`check-display` compares the guest against, drawn here and made viewable. **It exists so that a
+judgement about how something looks costs a glance rather than a boot** (M11 Part A), which is
+what makes a polish loop affordable at all. It shows the *toolkit's* surfaces only: anything the
+compositor draws — the cursor, the drag outline, the background between windows — and the
+arrangement of real windows are composed in the guest and still need one.
 
 `cargo xtask check-display` is the display arm's **smoke gate**, not a per-commit one:
 it boots an image and compares the guest's screen against a `libdraw` render over QMP

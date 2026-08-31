@@ -20442,3 +20442,42 @@ nothing with a colour but the window it is noticed on. Its own list, and not thi
 **One theme, built to hold a second.** Dark-and-light doubles every judgement and every review,
 and doubles the reference the display gate keeps. The mechanism carries a second; nothing ships
 one.
+
+## 2026-09-01 — M11 Part A: the first external crate in `tools/`, and why the rule does not reach it
+
+`cargo xtask preview` renders the toolkit on the host and writes a PNG. It is Part A because it
+changes what every part after it costs: polish is a hundred small judgements, and a judgement that
+costs a three-minute boot to see is a judgement not made.
+
+**It is a second entry point, not a second renderer.** `xtask` already links `libui`, `libdraw`
+and `libterm`, because `check-display` renders the expected picture here rather than checking in
+a golden file. A preview that could differ from what that gate demands of the guest would be a
+picture of nothing in particular, so the test asserts the previews are the gate's arrangements at
+the gate's own constants — and the control is a preview-only frame, which fails it.
+
+**A hand-rolled PNG writer was started and thrown away.** PNG's stored deflate blocks let a valid
+file be written with no compressor, which made it look like a reasonable hundred lines: two
+checksums and a chunk framer. The maintainer's correction was the right one — **the no-external-
+crates rule is the kernel's**, and `userspace/CLAUDE.md`'s bar is about what ships in the image.
+This is build tooling that runs on the host and reaches no target, and a hundred lines of checksum
+arithmetic standing between a judgement about how something looks and seeing it is exactly the
+cost this part exists to remove. `png` is the first crates.io dependency in `tools/`.
+
+**The conversion is where the bug would have been, so that is what the test covers.** The toolkit
+reference's pitch is 1292 for a 1280-byte row, and `XRGB8888` stores little-endian — so bytes run
+blue, green, red, pad. Reading through `Framebuffer::get_pixel` makes both questions `libdraw`'s,
+which already answers them for its own compositing; the test decodes the PNG back and compares
+pixel by pixel, and the two controls fire in the two places they should: channels swapped fails at
+pixel 0,0, the pitch ignored at pixel 0,1 — the first pixel of the second row.
+
+**Taking a dependency made `tools/Cargo.lock` matter, so it is checked in now.** It was ignored
+with the note "host tooling can drift", which was true while every dependency was a path: there
+was nothing to pin. `png = "0.18.1"` is a caret requirement, so an unpinned tree means CI resolves
+a possibly different encoder from the one this was tested against — and "host tooling can drift"
+stops being harmless the moment drift means a *different picture*, on a gate that adjudicates
+pixels. The kernel's and userspace's locks were already checked in for the same reason one step
+further along: they produce what ships.
+
+**And the first thing the preview showed is the milestone's own case.** Every label in the
+picture is monospaced, because `DejaVuSansMono` is the only font the image ships. That is Part D,
+and now it can be looked at rather than argued about.
