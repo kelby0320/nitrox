@@ -21,7 +21,6 @@
 //! concession — Milestone 5's terminal grid is an escape-hatch client, so the escape hatch
 //! is a first-class path rather than an afterthought.
 
-use libdraw::format::Rgb;
 use libdraw::framebuffer::Framebuffer;
 use libdraw::geom::{Point, Rect};
 use libdraw::text::Font;
@@ -29,32 +28,17 @@ use libdraw::text::Font;
 use crate::element::{Element, Node};
 use crate::layout::{Layout, Metrics};
 
-/// Colours and sizes, as constants rather than a theming system.
+/// The theme everything is drawn from — **`libdraw`'s, since M11 Part B**.
 ///
-/// `widget-toolkit.md` §11 defers theming until a second application needs to look different
-/// from the terminal. This is the shape that will grow into it, not a placeholder to throw
-/// away — a `Theme` threaded through `paint` is what a theming system would thread anyway.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Theme {
-    /// What the damaged region is cleared to.
-    pub background: Rgb,
-    /// Text and other ink.
-    pub foreground: Rgb,
-    /// Text size, in pixels per em.
-    pub font_px: f32,
-}
-
-impl Default for Theme {
-    /// A dark background with light text, matching the compositor's own clear colour so a
-    /// window does not flash against its surroundings.
-    fn default() -> Self {
-        Self {
-            background: Rgb::new(0x0E, 0x14, 0x1B),
-            foreground: Rgb::new(0xE0, 0xE6, 0xEC),
-            font_px: 16.0,
-        }
-    }
-}
+/// Re-exported rather than moved silently, because `libui::paint::Theme` is what every client in
+/// the tree names. It lives one crate down now for a reason `libui` cannot serve: the compositor
+/// paints chrome too — a cursor, a drag outline, the ground between windows — and it does not
+/// link a widget toolkit, deliberately. `libdraw` is what both link.
+///
+/// It absorbed `Palette` in the same part. The two were split by which *function* needed which,
+/// which is not a distinction between kinds of value — and the wrong seam for a milestone whose
+/// point is that these arrive together from one place.
+pub use libdraw::theme::Theme;
 
 /// A font at a size, as something layout can measure with.
 ///
@@ -159,6 +143,7 @@ fn draw<F, Msg, C>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libdraw::format::Rgb;
     use crate::diff::Tree;
     use crate::element::{column, custom as custom_node, fill as fill_node, sized, stack, text};
     use crate::layout::layout;

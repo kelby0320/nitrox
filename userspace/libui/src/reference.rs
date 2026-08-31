@@ -55,7 +55,7 @@ use crate::element::{Edge, Element, Insets, custom, docked, dock, padding, text}
 use crate::layout::layout;
 use crate::paint::{FontMetrics, Theme, paint};
 use crate::widget::{
-    ListRow, ListState, Palette, ScrollState, TextAreaState, TextFieldState, WidgetState, button,
+    ListRow, ListState, ScrollState, TextAreaState, TextFieldState, WidgetState, button,
     list_view, menu_bar, scrollbar, text_area, text_field,
 };
 
@@ -136,7 +136,7 @@ const AREA_H: u32 = 2 * ROW_H;
 /// Public because the client renders it and the host renders it, and because a test that wants
 /// to assert about the tree should not have to rebuild it from this module's prose.
 pub fn view() -> Element<Msg> {
-    let palette = Palette::default();
+    let theme = Theme::default();
     // Mid-scroll on purpose: a thumb at offset 0 is where an off-by-one in the position
     // arithmetic is invisible, because zero times anything is zero.
     let scroll = ScrollState { offset: 30, visible: 25, total: 100 };
@@ -146,14 +146,14 @@ pub fn view() -> Element<Msg> {
                 Edge::Top,
                 menu_bar(
                     vec![
-                        button("File", Msg::File, WidgetState::default(), &palette),
-                        button("Edit", Msg::Edit, WidgetState::default(), &palette),
+                        button("File", Msg::File, WidgetState::default(), &theme),
+                        button("Edit", Msg::Edit, WidgetState::default(), &theme),
                     ],
                     24,
-                    &palette,
+                    &theme,
                 ),
             ),
-            docked(Edge::Right, scrollbar(scroll, 12, HEIGHT - 24, &palette)),
+            docked(Edge::Right, scrollbar(scroll, 12, HEIGHT - 24, &theme)),
         ],
         padding(
             Insets::all(8),
@@ -162,7 +162,7 @@ pub fn view() -> Element<Msg> {
                 text("widget toolkit"),
                 // `active`, so the focus ring is drawn. A button at rest would paint the same
                 // whether or not the ring code exists.
-                button("Run", Msg::Run, WidgetState { active: true, ..Default::default() }, &palette)
+                button("Run", Msg::Run, WidgetState { active: true, ..Default::default() }, &theme)
                     .flex(0),
                 custom(CUSTOM_KIND, Size::new(64, 24)).flex(1),
                 // **Masked, with the caret mid-string.** Both are things a field can get
@@ -170,17 +170,17 @@ pub fn view() -> Element<Msg> {
                 // wrong number of stars, and a caret drawn at the end rather than at the
                 // cursor would look plausible in isolation. `active` so the ring and the
                 // caret are drawn at all.
-                text_field(&reference_field(), true, WidgetState { active: true, ..Default::default() }, &palette),
+                text_field(&reference_field(), true, WidgetState { active: true, ..Default::default() }, &theme),
                 // **Selected row 1, scrolled to 0**, so the highlight is visible and is not
                 // the first row — a list that painted every row the selected colour, or that
                 // always highlighted row 0, would both pass a picture that chose either.
-                reference_list(&palette),
+                reference_list(&theme),
                 // **A selection spanning a line break, with the caret at its far end.** Three
                 // things a text area can get wrong that only a picture shows: a highlight drawn
                 // over the whole line rather than the selected run, one that stops at the end of
                 // the first line instead of continuing onto the second, and a caret drawn at the
                 // line's end rather than where the cursor is (M10 Part C).
-                reference_area(&palette),
+                reference_area(&theme),
             ]),
         ),
     )
@@ -199,9 +199,9 @@ fn reference_field() -> TextFieldState {
 /// The state is a local: a fixed picture is rebuilt from constants on every call, so there is
 /// nothing to persist. That is the one case where discarding the scroll is right, and since
 /// M10 Part C it is expressed by the state being local rather than by a `_` in a pattern.
-fn reference_list(palette: &Palette) -> Element<Msg> {
+fn reference_list(theme: &Theme) -> Element<Msg> {
     let mut state = ListState { selected: Some(1), offset: 0 };
-    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, palette);
+    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, theme);
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
     crate::element::sized(Size::new(0, LIST_H), e)
@@ -219,7 +219,7 @@ fn reference_list(palette: &Palette) -> Element<Msg> {
 /// was the only coverage `text_area`'s drawing had (PR #258 review, blocking 2). Both directions
 /// are counted in `widget.rs`'s host tests now; this stays forward so the picture keeps being
 /// one thing rather than a gallery.
-fn reference_area(palette: &Palette) -> Element<Msg> {
+fn reference_area(theme: &Theme) -> Element<Msg> {
     let mut a = TextAreaState::with_text("select me\nand me");
     a.apply(libkern::abi::KEY_RIGHT, 0);
     a.apply(libkern::abi::KEY_RIGHT, 0);
@@ -230,7 +230,7 @@ fn reference_area(palette: &Palette) -> Element<Msg> {
     a.apply(libkern::abi::KEY_DOWN, librsproto::surface::MOD_SHIFT);
     crate::element::sized(
         Size::new(0, AREA_H),
-        text_area(&mut a, AREA_H, ROW_H, true, palette),
+        text_area(&mut a, AREA_H, ROW_H, true, theme),
     )
 }
 
@@ -316,14 +316,14 @@ mod tests {
         // label would have turned it red while the labels rasterised perfectly.
         let f = font();
         let fb = render(&f);
-        let palette = Palette::default();
+        let theme = Theme::default();
         // The widgets' own flat colours are not ink.
         let chrome = [
             Theme::default().background,
-            palette.face,
-            palette.focus_ring,
-            palette.track,
-            palette.thumb,
+            theme.face,
+            theme.focus_ring,
+            theme.track,
+            theme.thumb,
         ];
         // **And nor is the custom node's pattern**, which is 18,688 of the 20,012 non-chrome
         // pixels in this picture. Counting "not chrome" without excluding it gives a test that
@@ -365,14 +365,13 @@ mod tests {
         // finding two different non-theme colours on one row means the callback ran.
         let fb = render(&font());
         let theme = Theme::default();
-        let palette = Palette::default();
         let known = [
             theme.background,
             theme.foreground,
-            palette.face,
-            palette.focus_ring,
-            palette.track,
-            palette.thumb,
+            theme.face,
+            theme.focus_ring,
+            theme.track,
+            theme.thumb,
         ];
         let n = (0..HEIGHT)
             .map(|y| {

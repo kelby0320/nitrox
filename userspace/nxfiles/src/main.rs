@@ -232,7 +232,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     loop {
         // ---- render ----
-        let ui = app.view();
+        let ui = app.view(&theme);
         let l = layout(&ui, bounds, &FontMetrics::new(&font, FONT_PX));
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,

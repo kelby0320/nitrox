@@ -36,7 +36,7 @@ use librsproto::surface::{
 };
 use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
 use libui::widget::{GRIP_W, TITLE_BAR_H, TitleButtons, resize_grip, title_bar};
-use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
+use libui::widget::{Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -243,6 +243,10 @@ impl App {
             focused: true,
             menu_anchor: None,
             metrics,
+            // `libterm`'s ANSI palette — the sixteen colours a program addresses with
+            // `ESC[31m` — and deliberately *not* the desktop theme. M11 Part B collapsed
+            // `libui`'s `Palette` into the shared `Theme`; this one stays where it is, because
+            // it is defined by what programs expect rather than by how this system looks.
             palette: Palette::default(),
             outbox: Vec::new(),
             move_requested: false,
@@ -512,8 +516,14 @@ impl App {
     }
 
     /// The element tree for the current state.
-    pub fn view(&self) -> Element<Msg> {
-        let ui = UiPalette::default();
+    ///
+    /// **The theme is the caller's**, because the caller paints this tree — and a tree built from
+    /// one theme and painted with another is two themes in one frame, which one type makes easy
+    /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
+    /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
+    /// handed down, rather than being fetched from a default in the middle of a view.
+    pub fn view(&self, ui: &UiTheme) -> Element<Msg> {
+
         let grid_px = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
 
         let bar = menu_bar(
@@ -598,12 +608,16 @@ impl App {
     /// its own diff state. It carries no `Fill` sizing of its own beyond the backing, so
     /// `libui::layout::measure` under loose constraints gives the size the popup window should
     /// be created at.
-    pub fn menu_view(&self) -> Element<Msg> {
-        self.menu(&UiPalette::default())
+    ///
+    /// **The theme is the caller's**, like [`view`](Self::view)'s: the popup is painted by the
+    /// binary, and a menu built from one theme beside a window painted with another is the same
+    /// two-themes mistake one surface further out.
+    pub fn menu_view(&self, ui: &UiTheme) -> Element<Msg> {
+        self.menu(ui)
     }
 
     /// The popup's contents.
-    fn menu(&self, ui: &UiPalette) -> Element<Msg> {
+    fn menu(&self, ui: &UiTheme) -> Element<Msg> {
         use libui::element::{column, fill};
         let items = column(vec![
             button("Clear", Msg::Clear, WidgetState::default(), ui),
@@ -660,7 +674,7 @@ mod tests {
         }
         assert!(a.scroll().scrollable(), "precondition: there is a thumb to press");
 
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar is keyed");
@@ -693,7 +707,7 @@ mod tests {
         // must reach the grip rather than the title bar's drag or the grid's keys.
         let mut a = app();
         let (t, l, mut r) = window(&a);
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
         let g = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
         let p = PointerEvent {
             window: 1,
@@ -957,7 +971,7 @@ mod tests {
             // menu is a *window*, so opening it adds nothing here. Since M9 Part E the root is
             // a stack of two — the body and the resize grip over its corner — rather than the
             // dock alone, and that is still fixed.
-            let libui::element::Node::Stack(layers) = &a.view().node else {
+            let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default()).node else {
                 panic!("open={open}: the window's tree is the body under its grip");
             };
             assert_eq!(layers.len(), 2, "open={open}: the body and the grip, and nothing else");
@@ -979,7 +993,7 @@ mod tests {
         let cell = FixedCell { w: 8, h: 16 };
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
 
-        let view = a.view();
+        let view = a.view(&UiTheme::default());
         let l = layout(&view, bounds, &cell);
         let item = locate(&view, &l, MENU_ITEM_KEY).expect("the menu item is keyed");
         a.menu_anchor = Some(item);
@@ -992,7 +1006,7 @@ mod tests {
 
         // And the menu it will hold has a real size to be created at — measured, not guessed,
         // because a popup window needs its extent before it exists.
-        let menu = a.menu_view();
+        let menu = a.menu_view(&UiTheme::default());
         let size = libui::layout::measure(
             &menu,
             libui::layout::Constraints::loose(bounds.size),
@@ -1205,7 +1219,7 @@ mod tests {
     /// The tree, layout and router of a live window, with the grid focused as `main` does it.
     fn window(a: &App) -> (libui::diff::Tree, libui::layout::Layout, libui::route::Router) {
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let mut t = libui::diff::Tree::new();
         t.update(&e, &l).expect("a clean frame");
@@ -1224,7 +1238,7 @@ mod tests {
     fn click_maximise(a: &mut App) {
         use libui::widget::TITLE_BUTTON_W;
         let (t, l, mut r) = window(a);
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
         let x = a.window_size().w as i32 - (TITLE_BUTTON_W as i32 + TITLE_BUTTON_W as i32 / 2);
         let y = TITLE_BAR_H as i32 / 2;
         let mut msgs = alloc::vec::Vec::new();
@@ -1254,7 +1268,7 @@ mod tests {
         // line, so this is the difference between a demo and a terminal.
         let mut a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
 
         for msg in [
             r.key(&t, &e, key_ev(35, KEY_DOWN)),   // h, pressed
@@ -1274,7 +1288,7 @@ mod tests {
         // down, so acting on the release too doubles every character typed.
         let mut a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
         a.update(r.key(&t, &e, key_ev(35, KEY_DOWN)).unwrap());
         a.update(r.key(&t, &e, key_ev(35, KEY_UP)).unwrap());
         assert_eq!(a.take_outbox(), b"h", "the release typed as well");
@@ -1288,7 +1302,7 @@ mod tests {
         // with the pointer, and `route`'s bubbling is there for a keyboard menu that M6 owns.
         let a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view();
+        let e = a.view(&UiTheme::default());
         assert!(matches!(r.key(&t, &e, key_ev(35, KEY_DOWN)), Some(Msg::Key(_))));
     }
 

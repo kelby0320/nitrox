@@ -33,7 +33,7 @@ use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{Palette, TextFieldState, WidgetState, text_field};
+use libui::widget::{TextFieldState, WidgetState, text_field};
 use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
 
 /// `alloc` backing: the toolkit builds an element tree per frame and `libsession` builds the
@@ -124,8 +124,13 @@ impl Greeter {
     /// The element tree for the current state.
     ///
     /// Rebuilt per frame, which is the toolkit's model: `view(&state) -> Element`.
-    fn view(&self) -> Element<()> {
-        let palette = Palette::default();
+    ///
+    /// **The theme comes from the caller**, because the caller is what paints this tree — and it
+    /// paints with `Theme { font_px: FONT_PX, .. }`, equal to the default today only because
+    /// `FONT_PX` happens to be `16.0`. One frame built from one theme and painted with another is
+    /// the mistake one type makes easy and the old two-type split made unwriteable
+    /// (PR #262 review, optional 5).
+    fn view(&self, theme: &Theme) -> Element<()> {
         let active = |f: Focus| WidgetState { active: self.focus == f, ..Default::default() };
         let mut rows = alloc::vec::Vec::with_capacity(6);
         rows.push(text("nitrox"));
@@ -137,11 +142,11 @@ impl Greeter {
         }
         rows.push(row(alloc::vec![
             sized(Size::new(90, 0), text("username")),
-            text_field(&self.user, false, active(Focus::User), &palette).flex(1),
+            text_field(&self.user, false, active(Focus::User), theme).flex(1),
         ]));
         rows.push(row(alloc::vec![
             sized(Size::new(90, 0), text("password")),
-            text_field(&self.password, true, active(Focus::Password), &palette).flex(1),
+            text_field(&self.password, true, active(Focus::Password), theme).flex(1),
         ]));
         padding(Insets::all(16), column(rows))
     }
@@ -202,11 +207,12 @@ impl Greeter {
         let geometry = Geometry::with_pitch(GREETER_W, GREETER_H, GREETER_PITCH, PixelFormat::XRGB8888)
             .expect("the greeter pitch is wide enough for a row");
         let mut fb = MemFramebuffer::new(geometry);
-        let ui = self.view();
+        // Built once and used for both: the tree and the paint see the same theme.
+        let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+        let ui = self.view(&theme);
         let bounds = Rect::new(0, 0, GREETER_W, GREETER_H);
         let metrics = FontMetrics::new(font, FONT_PX);
         let l = layout(&ui, bounds, &metrics);
-        let theme = Theme { font_px: FONT_PX, ..Theme::default() };
         paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
         fb
     }

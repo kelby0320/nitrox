@@ -8,6 +8,9 @@ edition = "2024"
 # encoder (A6). See `docs/planning/display-arm-plan.md`.
 #
 # **Not in `libdraw`**, which the plan originally said and the M5 planning pass corrected.
+# (M11 Part B weakened the premise below without touching the conclusion: `libdraw` does hold
+# the desktop's *theme* now, because the compositor needs one and links no toolkit. A table of
+# colours is pixel vocabulary; an escape-state machine is not.)
 # `libdraw` is the pixel layer — geometry, formats, framebuffers, compositing. An escape-state
 # machine, a cell grid, scrollback and line wrapping contain no pixels; putting them there
 # would make the pixel layer know what a cursor is. This crate sits above `libdraw` exactly as

@@ -8609,30 +8609,41 @@ mod diag_tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// The terminal's default palette agrees with the toolkit's default theme.
+    /// The terminal's ground is the desktop's ground, and no cell colour is invisible on it.
     ///
-    /// **A cross-crate invariant that had nowhere to live.** `libterm::Palette::default` says
-    /// its background matches `libui`'s so a terminal does not flash against the chrome around
-    /// it — and `libterm` and `libui` are siblings, neither may depend on the other, and a
-    /// theme colour in `libdraw` would make the pixel layer own a theme. So the claim sat
-    /// unenforced through PR #189, as its review pointed out.
+    /// **What this used to claim, and why that was unsound.** M11 Part B first asserted that no
+    /// ANSI colour equals a *chrome* colour — an attempt to encode "a theme must not retint what
+    /// programs print" as an inequality. It is the wrong encoding, and the palette this ships
+    /// contains the counterexample: `ansi[0]` and `title_inactive` are both `#1C222A`, because
+    /// both were chosen independently as the darkest tone in one scheme. The test passed only
+    /// because `title_inactive` was the one theme colour missing from its list — scoped around
+    /// its own counterexample (PR #262 review, blocking 1).
     ///
-    /// `xtask` is the one place that links both. That is a slightly odd home for a colour
-    /// assertion, and it is better than a comment hoping two literals stay equal: retuning
-    /// either side now fails a build rather than being noticed by someone looking at a
-    /// screenshot.
+    /// **Provenance is not equality.** What matters is that the sixteen are *not derived from*
+    /// the theme, and two independent choices coinciding says nothing about that. That property
+    /// is read in the code — `Palette::default`'s `ansi` is sixteen literals — and a test
+    /// comparing values cannot see it.
+    ///
+    /// So what is asserted here is what a value comparison can actually establish:
+    ///
+    /// - **The two defaults follow the theme**, which is structural since Part B and fails if
+    ///   either is written out as a literal again.
+    /// - **No cell colour is the ground it is drawn on.** A cell painted in a colour equal to
+    ///   the background is text that cannot be read at all — the one legibility property with a
+    ///   sharp edge. (Nearly-equal is a judgement; ANSI black on a dark ground is dim
+    ///   everywhere, which is the convention rather than a bug.)
     #[test]
-    fn the_terminals_palette_agrees_with_the_toolkits_theme() {
+    fn the_terminals_ground_follows_the_theme_and_no_cell_is_invisible_on_it() {
         let theme = libui::paint::Theme::default();
         let palette = libterm::cell::Palette::default();
-        assert_eq!(
-            palette.background, theme.background,
-            "libterm's default background drifted from libui's — a terminal will flash \
-             against the chrome around it"
-        );
-        assert_eq!(
-            palette.foreground, theme.foreground,
-            "libterm's default foreground drifted from libui's"
-        );
+        assert_eq!(palette.background, theme.background, "one ground, from one place");
+        assert_eq!(palette.foreground, theme.foreground);
+
+        for (i, c) in palette.ansi.iter().enumerate() {
+            assert_ne!(
+                *c, palette.background,
+                "ANSI colour {i} is the terminal's own background — text in it is invisible"
+            );
+        }
     }
 }

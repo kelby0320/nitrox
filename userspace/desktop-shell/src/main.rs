@@ -83,7 +83,7 @@ use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{ListRow, ListState, Palette, TextFieldState, WidgetState, list_view, text_field};
+use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, text_field};
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
@@ -417,12 +417,22 @@ const MODAL_PITCH: usize = (MODAL_W as usize) * 4;
 const ROW_H: u32 = 20;
 
 /// The applications modal's element tree: a filter field over a list of `/bin` programs.
-fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: &mut ListState) -> Element<()> {
-    let palette = Palette::default();
-    let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, &palette);
+///
+/// **The theme is passed in rather than built here**, and that is not tidiness. This function
+/// builds widgets while its caller *paints* them, and the caller's theme is
+/// `Theme { font_px: FONT_PX, ..Theme::default() }` — equal to the default today only because
+/// `FONT_PX` happens to be `16.0`. Two themes in one frame is a thing the old two-type split made
+/// unwriteable and one type makes easy, so the fix is to have one (PR #262 review, optional 5).
+fn modal_view(
+    query: &TextFieldState,
+    rows: &[ListRow<'_>],
+    state: &mut ListState,
+    theme: &Theme,
+) -> Element<()> {
+    let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
-    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, &palette);
+    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, theme);
     padding(
         Insets::all(8),
         column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
@@ -439,11 +449,14 @@ fn render_modal(
     let geometry = Geometry::with_pitch(MODAL_W, MODAL_H, MODAL_PITCH, PixelFormat::XRGB8888)
         .expect("the modal pitch is wide enough for a row");
     let mut fb = MemFramebuffer::new(geometry);
-    let ui = modal_view(query, rows, state);
+    // **Built once and used for both**, which is the whole of optional 5: this function lays the
+    // tree out and paints it, and a tree built from one theme painted with another is two themes
+    // in one frame.
+    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+    let ui = modal_view(query, rows, state, &theme);
     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
     let metrics = FontMetrics::new(font, FONT_PX);
     let l = layout(&ui, bounds, &metrics);
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
     paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
 }

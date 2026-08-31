@@ -3090,18 +3090,37 @@ it is noticed on. Its own list, and its own milestone.
 
 ### Part B — one theme, with `libdraw` as the seam
 
-- [ ] **Collapse `Theme` and `Palette` into one theme, and give the compositor's chrome the same
-      source.** The compositor does not link `libui` and should not — it links `libdraw`, where
-      `Rgb` and the background already live, so that is where the theme's *type* belongs.
+- [x] **Collapse `Theme` and `Palette` into one theme, and give the compositor's chrome the same
+      source** ✅ — `libdraw::theme::Theme`, with a **`const fn` constructor** so the compositor's
+      cursor and outline colours stay `const` items while still coming from here. The compositor
+      does not link `libui` and should not; `libdraw` is what both link.
 
-- [ ] **The compositor's three colours stay compiled in**, and this is the one thing decision 1's
-      file does not reach: the compositor is started by `init`, not by the session, so it never
-      sees a setup record. Named rather than quietly skipped. **Trigger: a control panel that
-      wants to change the cursor or the drop highlight** — the mechanism is a manager op, and the
-      shell already holds that channel.
+      **And it reached one crate further than the plan said.** `libterm`'s default foreground and
+      background — what `Colour::Default` means — now read from the same theme. They had been a
+      pair of literals in two crates kept equal by a host test in `xtask`, written when "a theme
+      colour in `libdraw` would make the pixel layer own a theme"; Part B did exactly that on
+      purpose, so the equality is a shared constructor rather than a coincidence two crates
+      maintain. **The sixteen ANSI colours stay the terminal's**: they are what a program
+      addresses with `ESC[31m`, and retheming a desktop must not retint `ls`.
 
-- [ ] **Gate**: `check-display` green with its reference **unchanged**. A refactor that moves no
-      pixel is exactly what this part is, and the gate can say so.
+- [x] **The compositor's three colours stay compiled in** ✅ — the one thing decision 1's file does
+      not reach, because the compositor is started by `init` and never sees a setup record. Named
+      in the code rather than quietly skipped. **Trigger: a control panel that wants to change the
+      cursor or the drop highlight** — a manager op on a channel the shell already holds.
+
+- [x] **Gate** ✅ — `check-display` green, **and the picture byte-identical to `main`'s**, which is
+      the claim the gate alone cannot make: it compares the host's render against the *guest's*
+      screen, and a theme change moves both together. Part A's `preview` is what makes the
+      stronger check a one-liner — render `main` in a worktree, `md5sum` both PNGs — and both
+      match. A refactor that moves no pixel is exactly what this part is.
+
+      `xtask`'s cross-crate colour test survives with a **different claim**, and the first
+      version of that claim was wrong. It asserted that no ANSI colour equals a *chrome* colour —
+      provenance encoded as inequality — and the counterexample was in the palette itself:
+      `ansi[0]` and `title_inactive` are both `#1C222A`. It passed only because `title_inactive`
+      was the one theme colour left out of the list it checked (PR #262 review, blocking 1). What
+      it asserts now is what comparing values can establish: the grounds follow the theme, and no
+      cell colour equals the ground it is drawn on.
 
 ### Part C — the theme becomes data
 

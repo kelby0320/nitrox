@@ -67,7 +67,11 @@ pub const SCREEN_PITCH: usize = 268;
 ///
 /// Not black, so a compositor that skips the clear entirely produces a different hash
 /// rather than one that happens to match a zeroed buffer.
-pub const BACKGROUND: Rgb = Rgb::new(0x0E, 0x14, 0x1B);
+///
+/// **Taken from the theme since M11 Part B**, so the ground between windows and the ground
+/// inside one are one value rather than two that agree today. A `const fn` constructor is what
+/// keeps this a constant.
+pub const BACKGROUND: Rgb = crate::theme::Theme::dark().background;
 
 /// The scene's screen geometry.
 pub fn screen_geometry() -> Geometry {

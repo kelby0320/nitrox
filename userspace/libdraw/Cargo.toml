@@ -3,8 +3,10 @@ name = "libdraw"
 version = "0.1.0"
 edition = "2024"
 
-# `libdraw` — the pixel layer: geometry, pixel formats, framebuffers, and
-# compositing. See `docs/design/display-substrate.md` §3, §7, §8a and
+# `libdraw` — the pixel layer: geometry, pixel formats, framebuffers, compositing,
+# and — since M11 Part B — the desktop's theme, because the compositor paints chrome
+# and links no widget toolkit, so this is what it and `libui` share. See
+# `docs/design/display-substrate.md` §3, §7, §8a and
 # `docs/planning/display-arm-plan.md` Milestone 1 Part A.
 #
 # **Shared from the start, deliberately.** The compositor composites surfaces and a
