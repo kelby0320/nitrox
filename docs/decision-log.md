@@ -20068,3 +20068,182 @@ Found by a reviewer *reading something else* — it is in no diff this PR touche
 for what it says about where this class hides: **a buffer whose size is a literal and whose
 consumer is a growing set will not be revisited when the set grows**, because nothing links them.
 The fix ties the two together in the declaration.
+
+---
+
+## 2026-09-01 — M10 Part C: the widget that waited six milestones, and what waiting bought
+
+`libui` has said since Milestone 4 that a text area would arrive "when an application posed real
+requirements rather than hypothetical ones", and has declined to build one four times since. M10's
+editor posed them. The widget exists now, and the interesting part is which requirement the wait
+produced.
+
+**The goal column.** Selection was obvious and would have been guessed. That vertical movement
+must remember the column it was *aiming* for — so that moving down through a short line and back
+up returns to where you were, rather than to the short line's end — is a rule you learn from
+using an editor, not from designing a widget. A text area built in M4 to satisfy a plan item
+would not have had it, and nobody would have noticed until somebody tried to edit something.
+
+**And the wait vindicated the sentence it was protecting.** M5 Part B said the terminal's grid is
+custom-drawn because "a terminal's selection, wrapping and scrollback semantics are not a text
+editor's, and bending a generic text area to serve both would distort the whole text stack" —
+which sat in `widget-toolkit.md` §1 as an unresolved contradiction with a plan item asking for a
+text area. It is resolved by what got built: the two share nothing, because a grid's line is as
+wide as the screen and *rewraps* on resize while a text area's is as long as somebody typed and
+never wraps. Had it been built to order in M4, it would have been built *for the terminal*, which
+is precisely the distortion that sentence names. The plan states the non-sharing as a **non-goal**
+so that a future "these could be merged" argues against something.
+
+**The widget takes its state by `&mut` and scrolls it itself**, and `list_view` was converted to
+match in the same part rather than left to disagree.
+
+The value-returning form is where Part B's browser dropped the state and shipped a selection that
+never left the last visible row, and the reason it could is worth writing down: **nothing in the
+type system can require a caller to keep part of a return value.** `#[must_use]` fires on an
+*unused* return, and `let (e, _) = list_view(…)` uses the tuple; putting it on `ListState` does not
+help either, since binding to `_` is the documented way to silence that lint. `ListState` being
+`Copy` removed the last chance — passing `self.list` by value and dropping the result left a
+perfectly valid stale copy, where a non-`Copy` state would have been a move-out error. `Copy` plus
+value-return is what made the bug silent.
+
+The obligation also *propagated*: `desktop-shell` had grown `(T, ListState)` returns three
+functions deep to carry state none of them used. All three collapse.
+
+**And in-place update is what Rust uses for this** — `Vec::sort`, `Vec::retain`,
+`read_line(&mut String)` — while a returned value is for a caller who may genuinely decline it.
+There is no correct program that ignores a scroll offset. The claim is precise rather than
+absolute: the *accidental* form no longer compiles, and a caller determined to throw the state
+away can still pass `&mut x.clone()`. That is true of every `&mut` API, and the test catches it.
+
+**What this does not fix is the second forget-me obligation in the same signature**: the caller
+must wrap the result in `sized(height)` or the widget is drawn at a height it did not build for —
+a bug hit twice in this milestone. The real answer to both is for a widget to own its rectangle
+rather than be told one and trusted, which is the same rework as making `view` pure again.
+**Trigger: a third scrolling widget, or the first time `view` is called speculatively.**
+
+**Eight controls, each run alone.** The one worth naming is `with_text` adding a trailing newline:
+it failed *seven* tests rather than one, because half the suite builds its buffer that way. A
+control that fails broadly is not a better control — it says the fixture is load-bearing, which is
+worth knowing before trusting any single test built on it.
+
+**One deviation from the plan's gate, named rather than quietly taken.** The box asked for the
+press-and-drag to be driven "through `Router` at laid-out coordinates". Mapping a pixel to a
+`(line, col)` needs the application's own font metrics, so the widget exposes `place`/`extend_to`
+and the application does the arithmetic — the same division `scrollbar`'s `offset_at` already uses.
+Routing a press *to* a widget is `Router`'s and is covered by `title_bar`'s tests; what is new here
+is what a press *means*, and that is state.
+
+## 2026-09-01 — The gate that asserted a position once: a lost PS/2 packet, and the drain that stops it
+
+`check-terminal` failed in CI on Part C's branch, and the failure is worth a record because the
+diagnosis closes a note the gate has carried since it was written.
+
+**What happened.** The gate aims a click at (397, 295) inside `nxterm`, and the compositor
+reported the press at (495, 351) — *exactly* one step of (-98, -56) short of the aim, the whole
+packet missing rather than a truncated one. The click itself worked: `nxterm` logged `clicked` and
+took focus. Only the position assertion failed, and it failed by a whole injected motion.
+
+**Why a whole one.** Injection is relative and unacknowledged, and QEMU's PS/2 queue is sixteen
+bytes that drops a packet it cannot fit rather than delivering part of it. The gate pinned the
+pointer by over-driving twenty motions into a corner and then walked nine exact steps to the aim,
+back to back, as fast as QMP would take them — so the queue was full when the part that had to
+arrive exactly was sent. **The pin can afford to lose a packet and the walk cannot**, and injecting
+them as one burst is what put the loss in the wrong half.
+
+This is host-side, and no guest change addresses it: `input-server` has carried the motion of an
+undeliverable batch forward since 2026-08-26 (and `burst_holds_its_position` gates that), but a
+delta that never reached the guest is not a delta the guest can carry. A loss here leaves no
+`input batch DROPPED` line, which is how the two are told apart.
+
+**Two fixes, at the two places they belong.** `move_pointer_to` now lets the pin drain before
+walking — the same 500 ms, for the same reason, that `burst_holds_its_position` already took after
+its own pin. And the gate's two clicks go through `click_at`, which has retried a press that
+misses its aim since PR #243 and which every click in `check-login` already used; `check-terminal`
+was the one place still hand-rolling the sequence, so it was the one place where a dropped packet
+was a failed build. The assertion is unchanged and still exact: a press anywhere else is still a
+failure, and a systematic misplacement still fails all three attempts.
+
+**And the note it closes.** The comment being replaced called this position "bit-identical over 40
+loaded runs" and recorded one earlier failure of this gate as "still unexplained". Both readings
+came of having no diagnosis to attach: a gate that asserts an exact position and never retries
+reads as stable right up until the run that loses a packet. The split assertion — position first,
+effect second — is what made the second occurrence legible in one line, which is the thing it was
+added for. Its own claim of stability was the part that needed correcting.
+
+## 2026-09-01 — Two processes, one cause, no order: `expect_all` and the sequence that was never a sequence
+
+The same CI job then failed a step further on, in `check-login`, and the second failure is a
+different fault with the same shape as the first: a gate asserting something the system never
+promised.
+
+**What happened.** The maximise round trip timed out waiting for
+`nxterm: resized to 1280x752, grid ` — a line that is *in the transcript*, four lines above the
+tail the failure printed. `expect` consumes forward, so the previous step's pattern
+(`desktop-shell: window 8 geometry 0,24 `) had matched the shell's geometry line and moved the
+cursor past the client's, which was sitting in front of it.
+
+**Why the order is not the guest's to promise.** Both lines are downstream of one compositor
+apply and neither is downstream of the other: the shell logs when the geometry event reaches it,
+the client logs when the `Configure` does. They are separate processes on four vCPUs. Asserted as
+a sequence the pair passed for two milestones, which is what an unordered pair does until the
+other one wins.
+
+**`Session::expect_all` waits for a set rather than a sequence** — every pattern present, in any
+order, cursor advanced past the last of them. The distinction it makes is the one worth keeping:
+where a line's producer *sends the message that causes* the other line, the sequence **is** the
+assertion, and `configure_window` logging before it sends is exactly what makes every
+`… window N to …` → `nxterm: resized …` pair in these gates a genuine chain. Only the pair with no
+such link is unordered, and the doc says so, so that this does not become the way to make an
+inconvenient assertion pass.
+
+**Proven by two controls rather than by a green run.** A green run proves nothing here: locally
+the lines arrive in the order the old code assumed. So the wait was run with its two patterns
+*reversed* against that stream — the arrangement the old sequential code could not survive — and
+the gate passed; and an unmatchable pattern was added to a wait in `check-terminal` to see the
+failure path name the missing line and save the transcript, which also exercises the timeout
+report now shared by both waits.
+
+**And the pattern that made it worse is worth naming**: the step matched
+`window 8 geometry 0,24 ` with no size, so it matched the *intermediate* geometry line — the move
+half of the maximise, before the resize. A prefix that matches two lines is a cursor that can end
+up in two places. The assertion is kept as it was, because the intermediate line is real evidence
+that the origin is applied as `Place` would apply it; what changed is that it no longer claims to
+know whether the client answered first.
+
+## 2026-09-01 — Part C's review: eight controls for the state, none for the drawing
+
+Both blocking findings were in `text_area`'s drawing, and the reason they were both there is the
+same one: the gate had eight controls for what the widget *computes* and nothing at all for what
+it *emits*. Eighteen host tests, one of which called `text_area`, and it asserted `offset()`.
+
+**A collapsed selection outlived the text it pointed into.** Walking the cursor back onto its own
+anchor leaves no *selection* — `selection()` returns `None` when the two are equal — but it does
+leave an anchor, and an anchor is a pair of indices. `delete_selection` took its early-out without
+clearing it, so the next `Backspace` shortened the line the anchor named and the frame after that
+panicked slicing it. Typing instead of deleting gave the quiet half: a selection nobody made, over
+the character just typed, which the next keystroke would replace.
+
+The fix is one line in the one place every edit passes through, and the reason it is right there
+rather than in the six methods that move the cursor: a stale anchor is harmless until the text
+moves under it. Movement can leave a collapsed anchor as long as it likes — `Shift+Down` from a
+collapsed one selects from exactly where it should. **Only an edit invalidates indices, and every
+edit funnels through `delete_selection`.**
+
+**And the caret was drawn only after the selection's highlight**, behind a `cur_col >= at` guard
+that a backward selection cannot satisfy — so the cursor was not on screen for any selection made
+with `Shift+Left`, `Shift+Up`, or a backwards drag. The caret is now emitted before the highlight
+when the cursor is at its start, and the fallback is a `max` rather than a guard: an arrangement
+nobody has made yet draws a caret in the wrong column rather than none at all. A caret nobody can
+find is worse than one a pixel out of place.
+
+**What the two have in common is the coverage, not the code.** `check-display` renders the widget,
+and the reference builds its selection with `Shift+Right` — so the gate compares a *forward* one.
+The doc for that render names three mistakes a picture catches; it cannot catch a caret that is
+never drawn, because a picture checks one arrangement and a caret's absence looks like an
+arrangement. The three new tests count what the tree holds — `Fill(focus_ring)` for the caret,
+`Fill(selection)` for the highlight — in both directions, which is the shape that catches a
+one-sided implementation. **A fixture chosen to illustrate a property will illustrate it for the
+broken version too**, and forward-only was exactly that.
+
+The reference stays forward-only on purpose: the picture is one arrangement rather than a gallery,
+and the directions belong in host tests where they can be counted.

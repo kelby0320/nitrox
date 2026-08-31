@@ -1622,6 +1622,17 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
             for _ in 0..20 {
                 qmp.send_motion(100, 100)?; // pin to (1279, 799)
             }
+            // **Let the pin drain before walking, because the two are not equally forgiving.**
+            // The pin is over-driven — twenty motions to cross thirteen hundred pixels — so a
+            // packet it loses changes nothing. The walk is exact, and a packet it loses is a
+            // permanent offset. Injected back to back they are one burst, and QEMU's PS/2 queue
+            // is sixteen bytes that drops a *whole packet* which will not fit rather than
+            // truncating it — so the burst arrives full and the walk is the half that pays.
+            //
+            // Seen in CI on 2026-08-31: `check-terminal` aimed at (397, 295) and the press
+            // landed at (495, 351), exactly one step of (-98, -56) short. The same drain, for
+            // the same reason, as the one `burst_holds_its_position` takes after its own pin.
+            std::thread::sleep(std::time::Duration::from_millis(500));
             (1279, 799)
         }
     };
@@ -2351,15 +2362,19 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
         work.0, work.1, work.2, work.3
     ))?;
-    session.expect(&format!(
-        "desktop-shell: window {term_id} geometry {},{} ",
-        work.0, work.1
-    ))?;
-    // **The client's own report, before the geometry that proves it.** It says what it did with
-    // the size *and* what that came to in cells, which is the difference between a window that
-    // grew and a terminal that can use the room: a grid still 80x24 in a 1280x752 window would
-    // satisfy every other line here.
-    session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2, work.3))?;
+    // **Two producers, one cause, so no order between them.** The shell logs the window's new
+    // origin when the compositor's geometry event reaches it; the client logs the size it took
+    // when the `Configure` reaches it. Both are downstream of the same apply and neither is
+    // downstream of the other, so on four vCPUs either can reach the console first. Asserted as
+    // a sequence this passed for two milestones and then failed in CI with both lines present
+    // and the *first* expect having scanned past the second (2026-08-31).
+    //
+    // The client's line says what it did with the size *and* what that came to in cells, which
+    // is the difference between a window that grew and a terminal that can use the room: a grid
+    // still 80x24 in a 1280x752 window would satisfy every other line here.
+    let moved = format!("desktop-shell: window {term_id} geometry {},{} ", work.0, work.1);
+    let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);
+    session.expect_all(&[&moved, &took])?;
     // And the committed geometry — the one the compositor reports and `/dev/draw/<id>/info`
     // answers with — is the work area exactly, not the work area rounded down to whole cells.
     session.expect(&format!(
@@ -2911,7 +2926,10 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
          2026-08-26 `input-server` carries the motion of an undeliverable batch forward instead \
          of discarding it, and `burst_holds_its_position` gates that — so a failure here is \
          more likely a mis-aimed click than lost movement. Check that gate's verdict first, \
-         then look for `input batch DROPPED (SYN_DROPPED)` in the transcript"
+         then look for `input batch DROPPED (SYN_DROPPED)` in the transcript. Loss on the \
+         *host* side leaves no such line at all: QEMU's PS/2 queue drops a whole packet it \
+         cannot fit, which is why the pin is drained before the walk and why three attempts \
+         failing means something other than a dropped motion"
     )
     .into())
 }
@@ -3185,13 +3203,6 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // deadline and says so. Waiting is not optional: a click sent before this *is* its first
     // phase's sentinel, so it wakes the client, which then creates that window and swallows
     // everything typed after the first character.
-    for _ in 0..20 {
-        qmp.send_motion(100, 100)?; // pin to the bottom-right corner (1279, 799)
-    }
-    for _ in 0..9 {
-        qmp.send_motion(-98, -56)?; // → about (397, 295)
-    }
-
     // **The phase-1 message specifically.** The client has two idle exits and they used to
     // print the same line: this one before the window phase, where nothing has been created
     // and acting immediately is safe, and one *after* the 2048×2048 window exists, where the
@@ -3201,30 +3212,29 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // terminal in one and on a screen-sized window in the other.
     session.expect("input-testclient: idle before the window phase")?;
 
-    // Click inside `nxterm` and clear of the reference windows above its top-left corner
-    // (the largest is 320×160).
+    // Click inside `nxterm`, past the right edge of the reference windows stacked above its
+    // top-left corner — they are 320 wide, and the aim is clear of them in x whatever their
+    // heights, which is what keeps this point stable as the reference picture grows.
     //
-    // **Pinned to a corner first, because injection is relative and the pointer is not where
-    // you left it.** `input-testclient` ends by driving it twelve times by (-120, -120), so it
-    // is at the top-left — a relative move computed from the screen centre lands nowhere near
-    // the intended point, and the first version of this gate clicked at (0, 0), which is
-    // inside the 64×32 scene window. Overshooting into the bottom-right corner clamps to a
-    // known position; everything after that is arithmetic.
-    // **In wire-sized steps.** A PS/2 mouse packet carries a 9-bit signed delta, so a single
-    // huge motion is not a big movement — it is a different, meaningless one. The first
-    // version of this sent (4000, 4000) and the cursor went somewhere unrelated.
-    qmp.send_button("left", true)?;
-    qmp.send_button("left", false)?;
-
-    // **Assert where the click went before asserting that it worked.** These two steps split
-    // a failure that used to be one opaque timeout into its two distinguishable causes: the
-    // pointer not being where the arithmetic above says it is, and the pointer being right
-    // while `nxterm` still does not receive the press. Before this, either produced the same
-    // bare `timed out waiting for "nxterm: clicked"` with nothing in the transcript to tell
-    // them apart — which is precisely what happened to the one observed failure of this gate,
-    // and why it is still unexplained. Measured over 40 loaded runs the position is
-    // bit-identical, so a change here is a real signal rather than noise.
-    session.expect("compositor: press at x=397 y=295")?;
+    // **Through `click_at`, which this gate hand-rolled the sequence for until 2026-08-31.**
+    // The pin and the walk are the same arithmetic it does — injection is relative, so the
+    // pointer is over-driven into a corner first and everything after that is subtraction; the
+    // first version of this gate clicked at (0, 0), inside the 64×32 scene window, and the
+    // version after that sent one motion of (4000, 4000), which a 9-bit PS/2 delta turns into a
+    // different, meaningless movement. What the helper adds is the retry, and the retry is what
+    // was missing: a dropped packet is not a lost pixel but a permanent offset, so asserting the
+    // position once turns one lost motion into a failed build.
+    //
+    // **Which is what happened, and the split assertion is why it can be said.** CI failed here
+    // with the press at (495, 351) — exactly one step of (-98, -56) short of its aim, the whole
+    // packet gone rather than a truncated one. The comment this replaces called the position
+    // "bit-identical over 40 loaded runs" and left the gate's one prior failure unexplained;
+    // both readings came from having no diagnosis to hang on it. It has one now: injection at
+    // this rate loses a packet occasionally, the guest cannot recover a relative delta it never
+    // received, and the drain in `move_pointer_to` is the half of the fix that stops it
+    // happening. The assertion is unchanged and still exact — a press that lands anywhere else
+    // is still a failure, and a systematic misplacement still fails all three attempts.
+    click_at(&mut qmp, &mut session, 397, 295)?;
 
     // **Wait for the click to land before typing.** Click-to-focus is what gives `nxterm` the
     // keyboard — it is created first and therefore bottom-most — and the raise is not
@@ -3306,10 +3316,11 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // states: it separates "the pointer was not there" from "the pointer was there and nothing
     // happened".
     let (cx, cy) = (px + pw as i32 / 2, py + ph as i32 / 4);
-    move_pointer_to(&mut qmp, cx, cy)?;
-    qmp.send_button("left", true)?;
-    qmp.send_button("left", false)?;
-    session.expect(&format!("compositor: press at x={cx} y={cy}"))?;
+    // The pointer is already at a *confirmed* position from the click above, so this walks a
+    // few motions rather than re-pinning — and a retry here is cheap for the same reason.
+    // Nothing dismisses this popup but choosing from it, so an attempt that lands elsewhere
+    // leaves it open for the next one.
+    click_at(&mut qmp, &mut session, cx, cy)?;
     session.expect("nxterm: menu chose Clear")?;
 
     let _ = session.child.kill();
@@ -4546,45 +4557,113 @@ impl Session {
                 }
             }
             if std::time::Instant::now() > deadline {
-                // **Distinguish "the guest said nothing" from "the guest stopped early".**
-                // They are the same line in the log and completely different faults: no
-                // output at all usually means QEMU never got as far as the guest — a disk
-                // held open by an orphaned instance, a missing image, bad firmware — while
-                // partial output is a real hang, and the tail says where.
-                let g = self.out.lock().map_err(|_| "transcript lock")?;
-                if g.trim().is_empty() {
-                    return Err(format!(
-                        "timed out after {TIMEOUT:?} waiting for {pat:?}, and the guest \
-                         produced NO output at all — this is usually QEMU failing to start \
-                         rather than a hang (a stale qemu-system-x86_64 holding \
-                         build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
-                    )
-                    .into());
-                }
-                let tail: String = g.chars().rev().take(400).collect::<Vec<_>>()
-                    .into_iter().rev().collect();
-                // **The whole transcript goes to a file, not just the tail.**
-                //
-                // The tail is what you read first and it is almost never enough: these gates
-                // fail *between* two things the guest said, so the interesting part is the
-                // hundred lines before the end. The transcript was already accumulated in
-                // full and only ever printed truncated, which cost three separate
-                // investigations in M5 and M6 — each one reduced to guessing at a guest whose
-                // log existed and was thrown away.
-                let path = build_cache().join(format!("guest-transcript-{}.log", self.gate));
-                let saved = fs::write(&path, g.as_str()).is_ok();
-                let where_ = if saved {
-                    format!("\n\nthe full transcript is at {}", path.display())
-                } else {
-                    String::new()
-                };
-                return Err(format!(
-                    "timed out after {TIMEOUT:?} waiting for {pat:?}; last output was:\n{tail}{where_}"
-                )
-                .into());
+                return Err(self.timeout_report(&format!("{pat:?}"), TIMEOUT)?.into());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Wait for **all** of `pats`, in whatever order the guest emits them.
+    ///
+    /// **For lines whose order is not the guest's to guarantee.** [`expect`](Self::expect)
+    /// consumes forward — a match moves the cursor past it — so a chain of them asserts a
+    /// *sequence*, and that is the right shape when one line causes the next. It is the wrong
+    /// shape when two processes react to the same event: they are scheduled independently on
+    /// four vCPUs and the order they reach the serial console in is not a property of the
+    /// system. Asserted as a sequence, the pair passes until the day the other one wins, and
+    /// then fails by scanning *past* the line it will ask for next — so the timeout names a
+    /// line that is sitting in the transcript, which reads like a lost message and is not one.
+    ///
+    /// Observed on 2026-08-31: maximising the terminal makes `desktop-shell` log the window's
+    /// new geometry and `nxterm` log the size it took, both downstream of one compositor apply
+    /// and neither downstream of the other.
+    ///
+    /// **This is not a licence to unorder an assertion that is merely inconvenient.** A pair
+    /// belongs here only when nothing in the system orders it — where one line's producer sends
+    /// the message that causes the other's, the sequence is the assertion. `configure_window`
+    /// logging before it sends is what makes every `… window N to …` → `nxterm: resized …` pair
+    /// in this file a genuine chain.
+    fn expect_all(&mut self, pats: &[&str]) -> R<()> {
+        for pat in pats {
+            if let Some(echoed) = echo_source(&self.sent_since_match, pat) {
+                return Err(format!(
+                    "expect_all({pat:?}) is satisfied by the guest's echo of the text just \
+                     typed ({echoed:?}) — see `expect`, which explains the whole trap."
+                )
+                .into());
+            }
+        }
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let found: Vec<(usize, &str)> = pats
+                    .iter()
+                    .filter_map(|p| g[self.cursor..].find(p).map(|i| (i + p.len(), *p)))
+                    .collect();
+                if found.len() == pats.len() {
+                    // **Past the last of them, not the first.** The cursor is what stops a
+                    // later step matching a line this one already accounted for, and the whole
+                    // point here is that which of these is last is not known in advance.
+                    let mut found = found;
+                    found.sort_by_key(|(end, _)| *end);
+                    for (_, p) in &found {
+                        println!("  ok: saw {p:?}");
+                    }
+                    self.cursor += found.last().map_or(0, |(end, _)| *end);
+                    self.sent_since_match.clear();
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                let missing: Vec<&str> =
+                    pats.iter().copied().filter(|p| !g[self.cursor..].contains(p)).collect();
+                drop(g);
+                // Naming the ones that *did* arrive is the point: an unordered wait that times
+                // out with one of two lines present is a different fault from one with neither.
+                let what = format!("all of {pats:?}, still missing {missing:?}");
+                return Err(self.timeout_report(&what, TIMEOUT)?.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// What a timed-out wait reports, and the transcript it saves on the way out.
+    ///
+    /// Shared so that every wait fails the same way, and **distinguishes "the guest said
+    /// nothing" from "the guest stopped early".** They are the same line in the log and
+    /// completely different faults: no output at all usually means QEMU never got as far as the
+    /// guest — a disk held open by an orphaned instance, a missing image, bad firmware — while
+    /// partial output is a real hang, and the tail says where.
+    ///
+    /// **The whole transcript goes to a file, not just the tail.** The tail is what you read
+    /// first and it is almost never enough: these gates fail *between* two things the guest
+    /// said, so the interesting part is the hundred lines before the end. The transcript was
+    /// already accumulated in full and only ever printed truncated, which cost three separate
+    /// investigations in M5 and M6 — each one reduced to guessing at a guest whose log existed
+    /// and was thrown away.
+    fn timeout_report(&self, waiting_for: &str, timeout: std::time::Duration) -> R<String> {
+        let g = self.out.lock().map_err(|_| "transcript lock")?;
+        if g.trim().is_empty() {
+            return Ok(format!(
+                "timed out after {timeout:?} waiting for {waiting_for}, and the guest \
+                 produced NO output at all — this is usually QEMU failing to start \
+                 rather than a hang (a stale qemu-system-x86_64 holding \
+                 build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
+            ));
+        }
+        let tail: String =
+            g.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+        let path = build_cache().join(format!("guest-transcript-{}.log", self.gate));
+        let saved = fs::write(&path, g.as_str()).is_ok();
+        let where_ = if saved {
+            format!("\n\nthe full transcript is at {}", path.display())
+        } else {
+            String::new()
+        };
+        Ok(format!("timed out after {timeout:?} waiting for {waiting_for}; last output was:\n{tail}{where_}"))
     }
 
     /// Send bytes with **no trailing newline** — for keys that are not a line.

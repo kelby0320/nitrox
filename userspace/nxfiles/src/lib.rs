@@ -359,13 +359,12 @@ impl App {
 
     /// The element tree for the current state.
     ///
-    /// **`&mut self`, because building the view scrolls the list.** `list_view` takes its state
-    /// by value and returns it scrolled to follow the selection, and a caller that drops the
-    /// return value re-derives the offset from zero on every frame — which parks the highlight
-    /// on the last visible row and scrolls the whole list under it on every arrow press. The
-    /// toolkit's other consumer returns the state to *its* caller; doing that here would move
-    /// the mistake rather than remove it, so the state is written back where it cannot be
-    /// forgotten (PR #257 review, blocking 1).
+    /// **`&mut self`, because building the view scrolls the list.** `list_view` scrolls its
+    /// state to follow the selection, and a view that did not keep the result would re-derive
+    /// the offset from zero on every frame — parking the highlight on the last visible row and
+    /// scrolling the whole list under it on every arrow press. That is what shipped in Part B,
+    /// when the widget still *returned* the state and this caller dropped it; it takes `&mut`
+    /// now, so the same mistake no longer compiles (PR #257 review, blocking 1).
     pub fn view(&mut self) -> Element<Msg> {
         let ui = UiPalette::default();
         let title = title_bar(
@@ -404,8 +403,7 @@ impl App {
             rows.push(ListRow { key: i as u64, label: l });
         }
         let h = self.list_h();
-        let (list, scrolled) = list_view(&rows, self.list, h, ROW_H, Msg::Activate, &ui);
-        self.list = scrolled;
+        let list = list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, &ui);
 
         let body = dock(
             alloc::vec![
@@ -524,11 +522,13 @@ mod tests {
 
     #[test]
     fn the_scroll_offset_persists_so_up_moves_the_selection_and_not_the_list() {
-        // **`list_view` returns its state scrolled, and a caller that drops it re-derives the
-        // offset from zero every frame.** The selection then sits on the *last visible row*
+        // **`list_view` scrolls the state it is handed, and a caller that keeps none re-derives
+        // the offset from zero every frame.** The selection then sits on the *last visible row*
         // for ever: press Up and the highlight does not move, the entire listing scrolls down
         // by one underneath it — and the whole list area repaints instead of two rows
-        // (PR #257 review, blocking 1).
+        // (PR #257 review, blocking 1). The signature took its state by value then and returned
+        // the scrolled copy; since Part C it takes `&mut`, so the drop this catches now needs a
+        // deliberate `&mut x.clone()` rather than a `_` in a pattern.
         let mut a = big();
         for _ in 0..19 {
             down(&mut a);
