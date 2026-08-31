@@ -755,7 +755,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // modifiers arrive on each event — so there is nothing to discard, and saying so
             // is the point: a client that silently ignored this would be wrong the moment it
             // started tracking anything.
-            WindowEvent::Dropped => kprint(b"nxterm: input dropped\n"),
+            // **A terminal declares no acceptor, so this never arrives** — the compositor
+            // matches before it highlights. The arm exists because the match is exhaustive, and
+            // that is the point: every client now has to decide what a drop means to it rather
+            // than inheriting a default. What a dropped file should do here — type its path? open
+            // it? — is a shell question this milestone deliberately does not answer.
+            WindowEvent::Drop { .. } => kprint(b"nxterm: a drop arrived; this window takes none\n"),
+            WindowEvent::InputLost => kprint(b"nxterm: input dropped\n"),
             // **Accepted, as of M9 Part D.** Declining stayed legal and this client did it for
             // three milestones — "a different problem, not a parameter of this one" — which
             // made maximise, snap and every other sized gesture a no-op on the only application

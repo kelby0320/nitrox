@@ -20310,3 +20310,89 @@ with the guard deleted; `Ctrl+1` is printable and does not. And the revision tes
 before typing, so the insert's own count was covered by the deletion of the selection. Both are
 the same recurring mistake: **a fixture chosen to illustrate the property rather than to reach
 the code that computes it.**
+
+## 2026-09-01 — M10 Part E: a drag is a third gesture, and one grab carries one
+
+Drag-and-drop between the two applications, which is what every part above it exists to make
+honest: two real windows, one payload, and no test client on either end.
+
+**It is the compositor's third gesture, and modelled as one.** `StartDrag` is refused exactly as
+`StartMove` and `StartResize` are — unless the caller holds the pointer grab — and the reason is
+sharper here than for either: a drag is an *offer to another application*, so a client that could
+start one at will could push a path into somebody else's window with nobody touching anything.
+
+**A test found the exclusion was written in one direction.** `start_move` and `start_resize` each
+refused while the other ran; both started happily while a drag was in flight. The window would
+have followed the pointer while a payload was in flight out of it, and the release would have
+meant two things at once — a drop *and* a snap. "One grab carries one gesture" was true of two
+gestures and asserted of three; it is enforced three ways now. The same sentence had already been
+found half-enforced once, in M9 Part E's review, which is what makes this a shape to check rather
+than an accident.
+
+**The payload is a path** — M10 decision 1, arriving where it was made for. A handle would have
+to belong to somebody while the gesture is in flight, and a refused transfer has no clean owner;
+a path is a name the receiver opens for itself and reports its own errors about in its own
+window. It rests on both ends resolving it, which holds because `desktop-shell` builds every
+application namespace with the same `/home` — the assumption's fourth load-bearing use.
+
+**An acceptor is a name, not a rectangle** — decision 2. The name is a port's name in waiting:
+when ports arrive, `/dev/draw/3/ports/in/document` is the same sink a drag addresses by ending
+over it, rather than a second mechanism that looks similar. Where on a window a drop is *allowed*
+is the client's (decision 3): the event carries the pointer position and `libui` routes it to the
+widget under that point, so `nxedit` takes a file on its text area and not on its title bar, and
+the compositor knows about neither.
+
+**Declared, not queried**, which the details pass had already corrected the composition model to
+say. The compositor matches a table it holds while the pointer moves; a round trip to every
+visible window at the start of every drag is the per-gesture traffic M9 spent three parts
+learning to avoid.
+
+**Two renames the mechanism forced, both worth the churn.** `WindowEvent::Dropped` became
+`InputLost`: two variants a client reads as "dropped" — one meaning *lost input*, one meaning
+*somebody handed you a file* — is a mistake waiting in every `match`, and the wire never named
+that one anyway. And `Outbound` and `WindowEvent` lost `Copy`, because a payload is text.
+
+**What the gate can see and what it cannot.** `check-login` step 9 drags a file from the browser
+onto the editor and asserts all four hops. The *highlight* is pixels drawn over the composed
+stack, and no gate boots a drag in front of `check-display` — so the plan says so, and the
+rectangle is asserted in host tests instead. Those host tests are also where Part E's two named
+controls live, which is stronger than driving them through the gate: a `dir` over a files-only
+editor and a drop over a window with no acceptor must each highlight nothing and deliver
+nothing, or "declares nothing" would quietly come to mean "takes everything".
+
+## 2026-09-01 — Part E's review: a cap on a record is a promise to the receiver
+
+The blocking finding was that the payload could not cross the wire at the size the protocol
+promised, and the gate passed by **one byte**.
+
+`Dropped` is the first Surface event that carries text. Every event before it was a handful of
+integers, so `libsurface` read them into a 64-byte buffer and nothing had ever noticed — and the
+real transport, meeting a body that does not fit, *shortened* it. A shortened length-prefixed
+record does not fail loudly: it either fails its own length check and vanishes with nothing
+logged anywhere in the client, or — worse — parses as a **different** record, because every
+variable-length field here is length-prefixed and a cut one describes something the sender never
+sent. The reviewer demonstrated both: a 33-byte path made the whole drop disappear, and a shorter
+one silently truncated the display name.
+
+**The gate could not have caught it, and that is the more useful half.** `check-login` drags
+`/home/papers/other.txt` onto an acceptor called `document`: `24 + 8 + 22 + 9 = 63`, one byte
+under the buffer. A gate fixture is a plausible example; a cap is a property, and pinning a
+property needs the maximum. The test that closes it hands `Session` a drop with every field at
+its cap, and a second one at the ordinary size — because the failure was *size-dependent*, so a
+test with one size proves one size.
+
+**Three fixes, in the three places the mistake could live.** The size is now one constant in
+`librsproto` (`MAX_EVENT_BODY`) that the compositor's send buffer and every client receive buffer
+are spelled from, so they cannot drift. A body that does not fit is a **loss** — reported through
+the mechanism this library already had for saying "events were discarded" — rather than a shorter
+body. And the mock transport models that, because a mock that truncates lets a test pass on a
+shape the real transport drops.
+
+**And the second finding is the same shape one layer up: bytes that are somebody else's.** The
+compositor logs a drag's display name, and three gates adjudicate by matching exact console
+lines — so a name containing a newline ends the server's line and starts one that appears to have
+come from the server. A *filename* with a newline reaches it with no malicious client involved.
+`libkern::debug::Line::untrusted` replaces control bytes with `?`, and every site that logs a
+string from the wire or the filesystem now uses it. Configuration strings deliberately do not:
+they are the image's own, read from a file the same build produced, and routing them through it
+would say they are somebody else's.

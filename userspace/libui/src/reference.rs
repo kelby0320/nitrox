@@ -201,7 +201,7 @@ fn reference_field() -> TextFieldState {
 /// M10 Part C it is expressed by the state being local rather than by a `_` in a pattern.
 fn reference_list(palette: &Palette) -> Element<Msg> {
     let mut state = ListState { selected: Some(1), offset: 0 };
-    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, palette);
+    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, palette);
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
     crate::element::sized(Size::new(0, LIST_H), e)

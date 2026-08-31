@@ -68,6 +68,13 @@ pub const STATUS_KEY: u64 = 6;
 /// The window's size in pixels at startup, before any manager places it.
 pub const START_SIZE: Size = Size::new(560, 420);
 
+/// What this window calls the acceptor it declares.
+///
+/// **A name rather than an index**, because it is a port in waiting (M10 decision 2): the same
+/// string is what a command line will address when ports arrive, and an editor that called its
+/// sink `0` would have to be re-specified to be addressed by anything but a pointer.
+pub const ACCEPTOR: &str = "document";
+
 /// The key that saves, with Ctrl held: `s`.
 ///
 /// **A literal, because `libkern::abi` names only the keys with no character** — the arrows,
@@ -132,6 +139,8 @@ pub enum Msg {
     Key(KeyEvent),
     /// Write the buffer to its path — the save control, or `Ctrl+S`.
     Save,
+    /// A drag was released over the text area — the payload is the binary's to hand over.
+    Dropped,
     /// The title bar was dragged.
     DragWindow,
     /// The resize grip was pressed, for these edges.
@@ -264,6 +273,32 @@ impl App {
         Some(self.text.text())
     }
 
+    /// Take `path` as the file to edit, if this buffer can be given up.
+    ///
+    /// **A modified buffer refuses**, which is the same rule the save path follows from the
+    /// other side: opening a dropped file would replace what is on screen, and an editor that
+    /// discarded unsaved work because something was dragged onto it is the failure mode this
+    /// application exists to not have. The status strip says so, because a drop that visibly
+    /// does nothing is indistinguishable from one that was not delivered.
+    ///
+    /// **And dropping the file already open is a no-op**, not a reload: it is the likeliest
+    /// accident with a browser beside an editor, and re-reading would be a way to lose an
+    /// unsaved buffer that this rule has just protected.
+    pub fn accept_drop(&mut self, path: &str) -> bool {
+        if path == self.path {
+            self.status = alloc::format!("{} is already open", libfs::basename_str(path));
+            return false;
+        }
+        if self.modified() {
+            self.status =
+                alloc::format!("not opening {} — save first", libfs::basename_str(path));
+            return false;
+        }
+        self.path = String::from(path);
+        self.name = libfs::basename_str(path).to_string();
+        true
+    }
+
     /// A save finished: `Ok(bytes written)`, or `Err(what went wrong)`.
     ///
     /// **A failure changes nothing but the message.** The buffer stays as it is and stays
@@ -286,6 +321,9 @@ impl App {
         match msg {
             Msg::Key(k) => self.key(k),
             Msg::Save => self.save_requested = true,
+            // Nothing here: the payload is in the event the binary is holding, and *which*
+            // widget took the drop is all the toolkit can say. The binary pairs them.
+            Msg::Dropped => {}
             Msg::DragWindow => self.move_requested = true,
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
             Msg::Close => self.closing = true,
@@ -405,7 +443,12 @@ impl App {
         ]);
 
         let h = self.area_h();
-        let area = text_area(&mut self.text, h, ROW_H, self.focused, &ui);
+        // **The text area takes drops; the chrome does not.** That distinction is the whole of
+        // what decision 3 buys — the compositor knows only that this window declared an
+        // acceptor, and *where* on the window a drop means something is decided here, by which
+        // element is under the point. Dropping a file on the title bar does nothing, which is
+        // the honest answer: the title bar is not where a document goes.
+        let area = text_area(&mut self.text, h, ROW_H, self.focused, &ui).on_drop(Msg::Dropped);
 
         let body = dock(
             alloc::vec![
@@ -541,6 +584,38 @@ mod tests {
         let mut b = App::new("/home/unix.txt");
         b.loaded("alpha\nbeta\n", b"alpha\nbeta\n");
         assert!(!b.modified());
+    }
+
+    #[test]
+    fn a_drop_is_refused_while_there_is_work_to_lose() {
+        // **The same rule the save path follows, from the other side.** Opening a dropped file
+        // replaces what is on screen, and an editor that discarded unsaved work because
+        // something was dragged onto it is the failure this application exists not to have.
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        assert!(a.modified(), "precondition: there is something to lose");
+
+        assert!(!a.accept_drop("/home/other.txt"));
+        assert_eq!(a.path(), "/home/notes.txt", "still editing what it was");
+        assert!(a.status().contains("save first"), "status was {:?}", a.status());
+
+        // Saved, and the same drop is taken.
+        a.update(Msg::Save);
+        let owed = a.take_save().unwrap();
+        a.saved(Ok(owed.len()));
+        assert!(a.accept_drop("/home/other.txt"));
+        assert_eq!(a.path(), "/home/other.txt");
+        assert_eq!(a.title(), "other.txt", "and the title follows the file");
+    }
+
+    #[test]
+    fn dropping_the_file_already_open_does_nothing() {
+        // The likeliest accident with a browser beside an editor — and re-reading would be a
+        // way to lose an unsaved buffer that the rule above has just protected.
+        let mut a = app();
+        assert!(!a.accept_drop("/home/notes.txt"));
+        assert!(a.status().contains("already open"), "status was {:?}", a.status());
+        assert_eq!(a.path(), "/home/notes.txt");
     }
 
     #[test]

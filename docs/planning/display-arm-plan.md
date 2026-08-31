@@ -2910,30 +2910,69 @@ them, which is the trigger §8 named.
 
 Everything above exists so that this part has two honest consumers rather than a test client.
 
-- [ ] **`Surface::DeclareAcceptor(name, kinds)`** — a client says what it takes, once. Bounded
-      per window like every other table the compositor holds, and cleared with the window.
+- [x] **`Surface::DeclareAcceptor(name, kinds)`** ✅ — a client says what it takes, once. Bounded
+      per window (`MAX_ACCEPTORS` = 4) and cleared with the window, because an acceptor describes
+      a *window* rather than a session. Re-declaring a name replaces it, as a snap zone id does; a
+      full table is refused rather than evicting one the client still believes in.
 
-- [ ] **`Surface::StartDrag(window, kind, path, name)`** — the same shape as `StartMove` and
-      `StartResize`, refused the same way: the grab is the authority, so a client can only start
-      a drag the user is already making. The compositor runs the gesture, highlights windows
-      whose acceptors match `kind`, and on release inside one sends
-      **`Surface::Dropped { acceptor, kind, path, name, x, y }`** to that window. Released
-      anywhere else, nothing is sent and the drag is over.
+- [x] **`Surface::StartDrag(window, kind, path, name)`** ✅ — the same shape as `StartMove` and
+      `StartResize`, refused the same way, and `Surface::Dropped` carries what the plan said it
+      would. Released anywhere else, nothing is sent and the drag is over.
 
-- [ ] **The highlight is the compositor's own drawing**, like the resize outline and for the same
-      reason: it is not chrome anybody has to lay out, it is a rectangle over the composed stack,
-      and its damage is the four edge strips M9 Part E already computes.
+      **The exclusion runs in every direction, and a test found that it did not.** `start_move`
+      and `start_resize` each refused while the *other* ran, and both happily started while a
+      drag was in flight — a window would have followed the pointer while a payload was in flight
+      out of it, and the release would have meant two things at once. One grab carries one
+      gesture; the compositor now says so three ways rather than two.
 
-- [ ] **`libui` gains `on_drop`**, routed by position like a press (decision 3), so the widget
-      under the pointer receives it and a window can accept a drop in one panel and not another
-      without the protocol knowing.
+- [x] **The highlight is the compositor's own drawing** ✅ — the same `Outline` a resize moves and
+      a snap zone previews, so its damage is the four edge strips M9 Part E already computes. It
+      outlines the window a drop would land on *right now*, and never the window the drag came
+      out of: a browser that also accepted drops would otherwise outline itself the instant a
+      drag began, which is a gesture nobody is making.
 
-- [ ] **Gate**: `check-login` drags a file from `nxfiles` onto `nxedit` and asserts the editor
-      opened it — read back the way Part D's is, from outside, with `open`. **Two controls**, and they are the
-      two halves of "structural": a `dir` dragged onto an editor that declares only `file` must
-      highlight nothing and deliver nothing, and a drop released over a window with **no**
-      acceptor must do the same. A mechanism that highlighted everything would pass the positive
-      assertion alone.
+      **One colour for all three**, which is a theming decision deferred rather than taken: M11
+      owns what a drop target looks like, and a second colour chosen here would be a guess made
+      in the wrong milestone.
+
+- [x] **`libui` gains `on_drop`** ✅ — `Router::drop_at`, routed by position like a press
+      (decision 3), walking up to a handler on an ancestor exactly as a press does. `nxedit`
+      takes a file on its **text area** and not on its title bar, which is the whole demonstration
+      that a region costs the protocol nothing.
+
+      **The message carries no payload**, deliberately: an `Option<Msg>` cannot be parameterised
+      by a value the toolkit does not have, and the payload is already in the event the
+      application is holding when it calls the router. What the toolkit answers is *which widget*.
+
+      `list_view` gained a press-**down** hook in the same part, because a drag out of a row is
+      decided when the button lands on it. The row a press landed on is a fact the widget has and
+      its caller would otherwise recompute from the pointer's y, the row height and the scroll
+      offset — three numbers to keep in step, which is how two implementations of "which row is
+      that" come to disagree.
+
+- [x] **Gate** ✅ — `check-login` step 9: the editor is snapped to the right half (M9 Part F's own
+      gesture, so the geometry is the work area's rather than a number the harness invented), the
+      browser is walked out and back into the directory so it lists a file the *serial* side just
+      made, and that row is dragged across and dropped on the editor's document area. Four
+      assertions in the order the mechanism goes: the browser says it is dragging, the compositor
+      says it took the gesture, the compositor says which window and acceptor the drop landed on,
+      and the editor says it opened the file.
+
+      **Both windows' positions are read from the shell's own geometry lines**, not computed:
+      re-deriving the placement cascade in the harness would be a second copy of a policy that is
+      the shell's to change.
+
+      **The two controls are host tests in `compositor::input`, which is stronger than a gate
+      run**: a `dir` dragged over an editor that declares only `file` highlights nothing and
+      delivers nothing, and a drop over a window with **no** acceptor does the same — so
+      "declares nothing" cannot come to mean "takes everything". Eight tests in all, including
+      the source window never highlighting itself, and every way a gesture can end without the
+      button coming up delivering nothing.
+
+      **What the gate cannot see is the highlight**, and the plan should not pretend otherwise:
+      it is pixels the compositor draws over the composed stack, and `check-display` boots a
+      `--selftest` image with no drag in it. The host tests assert the rectangle; the gate asserts
+      the delivery.
 
 ### Not a part: graduating `display-substrate.md`
 

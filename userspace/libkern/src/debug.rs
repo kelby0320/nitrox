@@ -132,6 +132,34 @@ impl Line {
         self
     }
 
+    /// Append bytes that came from somewhere else — a wire record, a filename, a client.
+    ///
+    /// **Because a console line is a claim about who said it, and these gates believe it.**
+    /// `check-login`, `check-terminal` and `check-input` adjudicate by matching on exact console
+    /// lines, so a string carrying a newline does not merely look untidy: it ends the server's
+    /// line and starts one that appears to have come from the server. A client dragging a file
+    /// called `x\ncompositor: drop win=2 on=document` forges a gate result, and a *filename*
+    /// containing a newline gets there with no malicious client involved (PR #260 review,
+    /// finding 2).
+    ///
+    /// **Not for strings the image itself carries** — a service name from `services.toml`, a
+    /// mount point from `init.toml`. Those are the system's own configuration, read from a file
+    /// the same build produced, and routing them through here would say they are somebody else's.
+    /// What this is for is text that crossed a trust boundary: a wire record, a filename, a name
+    /// a person typed into another program.
+    ///
+    /// Every byte below `0x20`, plus `0x7F`, becomes `?`. Not dropped — a name that is entirely
+    /// control characters would otherwise print as nothing at all, which reads as a missing
+    /// field rather than a strange one. Multi-byte UTF-8 passes through untouched: its
+    /// continuation bytes are all `0x80` and above, so nothing here can cut a character.
+    pub fn untrusted(&mut self, b: &[u8]) -> &mut Self {
+        for &c in b {
+            let c = if c < 0x20 || c == 0x7F { b'?' } else { c };
+            self.s(&[c]);
+        }
+        self
+    }
+
     /// Append an unsigned decimal.
     pub fn u(&mut self, v: u64) -> &mut Self {
         let mut digits = [0u8; 20];
@@ -198,6 +226,31 @@ mod tests {
             l.s(b"init: reaped pid=").u(7).s(b" code=").i(-1).finish(),
             b"init: reaped pid=7 code=-1\n"
         );
+    }
+
+    #[test]
+    fn untrusted_bytes_cannot_end_the_line_they_are_in() {
+        // **A console line is a claim about who said it**, and three gates adjudicate by
+        // matching exact lines — so a newline inside a client-supplied name forges one.
+        assert_eq!(
+            Line::new()
+                .s(b"compositor: drag name ")
+                .untrusted(b"x\ncompositor: drop win=2 on=document")
+                .finish(),
+            b"compositor: drag name x?compositor: drop win=2 on=document\n",
+            "one line out, whatever went in"
+        );
+        // A carriage return rewrites a line on a terminal without ending it, which hides the
+        // prefix instead of forging a new one — the same class, so the same answer.
+        assert_eq!(Line::new().untrusted(b"a\rb").finish(), b"a?b\n");
+        assert_eq!(Line::new().untrusted(b"a\x7fb").finish(), b"a?b\n", "and DEL");
+        // Replaced rather than dropped: a name that is entirely control characters must not
+        // print as an empty field, which reads as *missing* rather than strange.
+        assert_eq!(Line::new().untrusted(b"\n\n").finish(), b"??\n");
+        // Ordinary text, including multi-byte UTF-8, is untouched — its continuation bytes are
+        // all 0x80 and above, so nothing here can cut a character in half.
+        assert_eq!(Line::new().untrusted("notes-café.txt".as_bytes()).finish().len(), 16);
+        assert_eq!(Line::new().untrusted(b"plain.txt").finish(), b"plain.txt\n");
     }
 
     #[test]

@@ -19,7 +19,13 @@ const MSG_LEN: usize = 4096;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 /// Largest event body parked while waiting for a reply.
-const MAX_BODY: usize = 64;
+///
+/// **Sized from the protocol, not from what events happened to be.** This was 64 until M10 Part
+/// E, which was every event's size until `Dropped` carried a path — and a buffer smaller than a
+/// record the protocol permits does not fail loudly, it hands the client a shortened body that
+/// either parses as something else or does not parse at all. Eight of these is the cost, and a
+/// boxed transport already carries four kilobytes.
+const MAX_BODY: usize = librsproto::surface::MAX_EVENT_BODY;
 /// How many out-of-order messages can be parked while waiting for a reply.
 ///
 /// Overflow **never discards a `Release`**, and errors rather than doing so. A lost
@@ -37,7 +43,7 @@ const MAX_BODY: usize = 64;
 ///
 /// The line is drawn at recoverability, not at importance. A lost `FocusEvent` leaves a
 /// client wrong about whether it has the keyboard until the next focus change; a lost key or
-/// motion degrades an event stream `WindowEvent::Dropped` already warns about. A lost
+/// motion degrades an event stream `WindowEvent::InputLost` already warns about. A lost
 /// `Release` has no next anything — there is no resync op, and the buffer never comes back.
 ///
 /// **It is reachable, and `parked_len` never resets between requests.** It accumulates for
@@ -53,7 +59,7 @@ const MAX_PARKED: usize = 8;
 /// Whether a parked entry may be discarded to make room.
 ///
 /// Only `Release` may not. Everything else either supersedes itself (motion), degrades an
-/// event stream the client is already told about (`WindowEvent::Dropped`), or corrects itself
+/// event stream the client is already told about (`WindowEvent::InputLost`), or corrects itself
 /// on the next change (`FocusEvent`). A `Release` has no next: there is no resync op, and
 /// `Window::acquire` waits on it with no timeout.
 fn losable(entry: &(u16, [u8; MAX_BODY], usize)) -> bool {
@@ -245,7 +251,7 @@ impl ChannelTransport {
     /// describes the world as it is now.
     ///
     /// The loss is reported through [`took_loss`](libsurface::Transport::took_loss), so it
-    /// surfaces as a `WindowEvent::Dropped` rather than vanishing.
+    /// surfaces as a `WindowEvent::InputLost` rather than vanishing.
     ///
     /// Split out of `request` so it can be tested: everything around it issues syscalls and
     /// this does not. The shift arithmetic rested on the boot gate not hanging until it was
@@ -384,7 +390,13 @@ impl Transport for ChannelTransport {
 
             // Anything else — a `Release`, or a reply to a request we have given up on —
             // goes to the parked queue rather than being lost.
-            let n = m.body.len().min(MAX_BODY);
+            // Same rule as `poll_event`'s: a body too large to park is discarded whole and
+            // said out loud, rather than parked shortened and parsed as something else.
+            if m.body.len() > MAX_BODY {
+                self.lost = true;
+                continue;
+            }
+            let n = m.body.len();
             let mut body = [0u8; MAX_BODY];
             body[..n].copy_from_slice(&m.body[..n]);
             self.park(m.op, body, n)?;
@@ -422,9 +434,12 @@ impl Transport for ChannelTransport {
             let (op, body, n) = self.parked[0];
             self.parked.copy_within(1..self.parked_len, 0);
             self.parked_len -= 1;
-            let k = n.min(buf.len());
-            buf[..k].copy_from_slice(&body[..k]);
-            return Ok(Some((op, k)));
+            if n > buf.len() {
+                self.lost = true;
+                return Ok(None);
+            }
+            buf[..n].copy_from_slice(&body[..n]);
+            return Ok(Some((op, n)));
         }
         // Non-blocking: `WouldBlock` means no event is waiting, which is the common case
         // and not an error. Anything else is.
@@ -452,7 +467,17 @@ impl Transport for ChannelTransport {
         ]) as usize;
         let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
         let m = decode(req).map_err(|_| UiError::BadReply)?;
-        let n = m.body.len().min(buf.len());
+        // **A body that does not fit is a loss, not a shorter body.** Shortening it is the worst
+        // of the three possible answers: the record either fails to parse and the event vanishes
+        // with nothing said, or — worse — parses as a *different* event, because every
+        // variable-length field in this protocol is length-prefixed and a cut one describes
+        // something the sender never sent. Reported through the mechanism this library already
+        // has for saying "events were discarded" (PR #260 review, blocking 1).
+        if m.body.len() > buf.len() {
+            self.lost = true;
+            return Ok(None);
+        }
+        let n = m.body.len();
         buf[..n].copy_from_slice(&m.body[..n]);
         Ok(Some((m.op, n)))
     }
@@ -537,7 +562,7 @@ mod tests {
     #[test]
     fn a_drop_is_reported_once_and_then_cleared() {
         // `took_loss` is take-and-clear, because `Window::pump` folds it into a flag that
-        // produces exactly one `WindowEvent::Dropped`. Reporting on every call would emit a
+        // produces exactly one `WindowEvent::InputLost`. Reporting on every call would emit a
         // `Dropped` per pump for the rest of the window's life.
         let mut t = transport();
         for n in 0..(MAX_PARKED as u16 + 1) {

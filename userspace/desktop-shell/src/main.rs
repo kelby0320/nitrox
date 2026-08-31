@@ -422,7 +422,7 @@ fn modal_view(query: &TextFieldState, rows: &[ListRow<'_>], state: &mut ListStat
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, &palette);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
-    let list = list_view(rows, state, list_h, ROW_H, |_| (), &palette);
+    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, &palette);
     padding(
         Insets::all(8),
         column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
@@ -1896,7 +1896,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             }
                             Line::new()
                                 .s(b"desktop-shell: named this desktop ")
-                                .s(name.as_bytes())
+                                .untrusted(name.as_bytes())
                                 .end();
                             rename = false;
                             list_dirty = true;
@@ -1941,7 +1941,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             if rename {
                                 Line::new()
                                     .s(b"desktop-shell: name so far ")
-                                    .s(query.text().as_bytes())
+                                    .untrusted(query.text().as_bytes())
                                     .end();
                             }
                         }
@@ -3082,7 +3082,7 @@ fn serve_desktop_session(
             d.name.push_str(name);
             normalize_desktops(desktops, entries, current, next_id);
             ds_reply(ch, op, request_id, &[], 0, false);
-            Line::new().s(b"desktop-shell: served Name ").s(name.as_bytes()).end();
+            Line::new().s(b"desktop-shell: served Name ").untrusted(name.as_bytes()).end();
             true
         }
         OP_DESKTOP_OPEN => {
@@ -3116,7 +3116,7 @@ fn serve_desktop_session(
                 return bad(KError::Unsupported);
             }
             ds_reply(ch, op, request_id, &[], 0, false);
-            Line::new().s(b"desktop-shell: served Open ").s(path.as_bytes()).end();
+            Line::new().s(b"desktop-shell: served Open ").untrusted(path.as_bytes()).end();
             false
         }
         _ => bad(KError::Unsupported),
@@ -3306,7 +3306,7 @@ fn switch_desktop(
     *current = to;
     Line::new()
         .s(b"desktop-shell: switched to ")
-        .s(desktop_label(desktops, to).as_bytes())
+        .untrusted(desktop_label(desktops, to).as_bytes())
         .end();
     true
 }
@@ -3326,7 +3326,7 @@ fn log_window_list(shown: &[&WinEntry], label: &str, desktops: usize) {
     }
     for e in shown {
         l.s(b" [").u(e.id as u64).s(b":");
-        l.s(entry_label(e).as_bytes());
+        l.untrusted(entry_label(e).as_bytes());
         l.s(b"]");
     }
     l.end();

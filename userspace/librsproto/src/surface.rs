@@ -1114,6 +1114,118 @@ pub const RESIZE_BOTTOM: u32 = 1 << 3;
 /// edge at all, which would be a drag that changes nothing while holding a grab.
 pub const RESIZE_EDGES: u32 = RESIZE_LEFT | RESIZE_RIGHT | RESIZE_TOP | RESIZE_BOTTOM;
 
+/// `Surface::DeclareAcceptor` — this window takes drops of these kinds, under this name.
+///
+/// Body: `window` (u32), `kinds` (u32), then the acceptor's name as UTF-8 — at most
+/// [`MAX_ACCEPTOR_NAME`] bytes, with the body's own length giving it, as
+/// [`SetTitle`](OP_SET_TITLE) does.
+///
+/// **A name rather than a rectangle, and that is M10 decision 2.** An acceptor is a *port in
+/// waiting*: today it is addressed by a drag ending over the window, and when ports arrive the
+/// same name is what a command line addresses. A protocol that described a *region* instead
+/// would have to be re-specified to be addressed any other way — and regions are the client's
+/// anyway (decision 3), routed from the pointer position the drop carries, exactly as a press is.
+///
+/// **Declared once, not queried per drag.** The compositor holds the table and matches against
+/// it while the pointer moves; asking the client mid-gesture would put a round trip per motion
+/// on the path that has to stay cheap. It supersedes the composition model's `QueryCaps`.
+///
+/// Bounded per window like every other table the compositor holds ([`MAX_ACCEPTORS`]), and
+/// **cleared with the window** — an acceptor is a property of a window, not of a session, so a
+/// client that destroys and recreates a window declares again.
+///
+/// Re-declaring an existing name **replaces** it, for the reason a snap zone does: a set of
+/// acceptors is a description of what this window is currently able to take, and a client whose
+/// panel changed would otherwise have to remove one to change it.
+///
+/// `InvalidArgument` for an empty name, a name over the cap, one that is not UTF-8, or `kinds`
+/// naming nothing this protocol knows. `NoSuchWindow` for another session's window.
+/// `Unsupported` when the window's table is full.
+pub const OP_DECLARE_ACCEPTOR: u16 = 0x090E;
+
+/// `Surface::StartDrag` — the user is dragging this payload out of this window.
+///
+/// Body: `window` (u32), `kind` (u32), `path_len` (u32), then `path_len` bytes of path followed
+/// by the display name, both UTF-8.
+///
+/// **The same shape as [`StartMove`](OP_START_MOVE) and [`StartResize`](OP_START_RESIZE), and
+/// refused the same way**: unless the caller holds the pointer grab on that window. The grab is
+/// what makes "the user is dragging this" true — without the check a client could start a drag
+/// with nobody touching it, and a drag is an offer of a payload to whatever window it ends over.
+///
+/// **The payload is a path, which is M10 decision 1.** A handle would have to belong to somebody
+/// while the gesture is in flight, and a refused transfer has no clean owner; a path is a name
+/// the receiving program opens for itself, reporting its own errors in its own window. The
+/// consequence is that both ends must be able to resolve it, which is true here because
+/// `desktop-shell` binds `/home` identically into every application namespace it builds.
+///
+/// The compositor runs the gesture: it highlights windows whose acceptors take `kind`, and on
+/// release inside one sends [`Dropped`](OP_DROPPED) to that window. Released anywhere else
+/// **nothing is sent** and the drag is simply over — a drop on nothing is not an error, it is
+/// the ordinary way to change your mind.
+///
+/// `InvalidArgument` for an empty path, one over [`MAX_DROP_PATH`], a name over
+/// [`MAX_DROP_NAME`], bytes that are not UTF-8, or a `kind` that is not exactly one known kind.
+/// `NoSuchWindow` when the caller does not hold the grab, or a move or resize is already running.
+pub const OP_START_DRAG: u16 = 0x090F;
+
+/// `Surface::Dropped` — a drag ended over this window, on this acceptor.
+///
+/// Body: `window` (u32), `kind` (u32), `x` (i32), `y` (i32), `acceptor_len` (u32),
+/// `path_len` (u32), then the acceptor's name, the path, and the display name in that order.
+///
+/// **`x` and `y` are window-local, like a [`PointerEvent`]'s**, because that is what makes a
+/// client-side drop *region* possible without the protocol knowing about one: `libui` routes
+/// this to the widget under the point exactly as it routes a press, so a window can accept a
+/// drop in one panel and not another (decision 3).
+///
+/// **0x0930 rather than 0x0910**: the client block 0x0900–0x090F is full, and 0x0910–0x092F is
+/// the manager's. This begins the second client block rather than borrowing a number from a
+/// range that means something else.
+pub const OP_DROPPED: u16 = 0x0930;
+
+/// A drop payload that is one file.
+pub const DROP_KIND_FILE: u32 = 1 << 0;
+/// A drop payload that is one directory.
+pub const DROP_KIND_DIR: u32 = 1 << 1;
+/// Every kind this protocol knows; anything else is `InvalidArgument`.
+///
+/// **A mask, because an *acceptor* takes a set** — "files but not folders" is the distinction
+/// M10's details pass named as the thing a window must be able to draw. A *drag* carries exactly
+/// one bit: a payload is one thing, and a drag offering "file or directory" would be asking the
+/// receiver to guess.
+pub const DROP_KINDS_KNOWN: u32 = DROP_KIND_FILE | DROP_KIND_DIR;
+
+/// The longest acceptor name accepted, in bytes.
+pub const MAX_ACCEPTOR_NAME: usize = 32;
+
+/// How many acceptors one window may declare.
+///
+/// Small on purpose: an acceptor is a *sink* a window offers, not a widget. A window with four
+/// distinct kinds of drop target is already a design worth questioning, and the bound is what
+/// stops a client from making the compositor's per-window state unbounded.
+pub const MAX_ACCEPTORS: usize = 4;
+
+/// The longest path a drag may carry, in bytes.
+pub const MAX_DROP_PATH: usize = 512;
+
+/// The longest display name a drag may carry, in bytes.
+pub const MAX_DROP_NAME: usize = 64;
+
+/// The largest Surface **event** body, in bytes — what a client must be able to receive.
+///
+/// **A cap on a record is a promise to the receiver**, and until M10 Part E every event was a
+/// handful of integers, so `libsurface` read them into 64 bytes and nothing noticed. `Dropped`
+/// is the first record that can exceed that, and a client sized for the old maximum truncates
+/// the path — or fails to parse it at all, and the whole gesture vanishes with nothing logged
+/// (PR #260 review, blocking 1).
+///
+/// So the size lives here, beside the caps it is derived from, and both ends spell it the same
+/// way: the compositor's send buffer and every client receive buffer are this expression rather
+/// than a number that happened to agree.
+pub const MAX_EVENT_BODY: usize =
+    DroppedEvent::HEAD + MAX_ACCEPTOR_NAME + MAX_DROP_PATH + MAX_DROP_NAME;
+
 /// The longest window title accepted, in bytes.
 ///
 /// Bounded at the protocol edge for the reason [`MAX_STRUT_RESERVE`] is: it arrives off the wire
@@ -1507,6 +1619,206 @@ impl StartResize {
             && edges & !RESIZE_EDGES == 0
             && edges & (RESIZE_LEFT | RESIZE_RIGHT) != (RESIZE_LEFT | RESIZE_RIGHT)
             && edges & (RESIZE_TOP | RESIZE_BOTTOM) != (RESIZE_TOP | RESIZE_BOTTOM)
+    }
+}
+
+/// A [`DeclareAcceptor`](OP_DECLARE_ACCEPTOR) request: the fixed head, with the name following.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DeclareAcceptor {
+    /// The window declaring it. Must be one the caller owns.
+    pub window: u32,
+    /// The kinds this acceptor takes — a mask of [`DROP_KIND_FILE`] and friends.
+    pub kinds: u32,
+}
+
+impl DeclareAcceptor {
+    /// The fixed part's length; the name follows it.
+    pub const HEAD: usize = 8;
+
+    /// Serialise the head and `name` into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8], name: &[u8]) -> Option<usize> {
+        if name.len() > MAX_ACCEPTOR_NAME || out.len() < Self::HEAD + name.len() {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.kinds);
+        out[Self::HEAD..Self::HEAD + name.len()].copy_from_slice(name);
+        Some(Self::HEAD + name.len())
+    }
+
+    /// Parse a request body into the head and the name it carries.
+    ///
+    /// **The name is validated here rather than by each reader**, because there is exactly one
+    /// rule and two would eventually differ: non-empty, within the cap, and UTF-8.
+    pub fn read(b: &[u8]) -> Option<(Self, &str)> {
+        if b.len() < Self::HEAD {
+            return None;
+        }
+        let name = core::str::from_utf8(&b[Self::HEAD..]).ok()?;
+        if name.is_empty() || name.len() > MAX_ACCEPTOR_NAME {
+            return None;
+        }
+        let head = Self { window: get_u32(b, 0), kinds: get_u32(b, 4) };
+        // A declaration naming no kind this protocol knows accepts nothing, which is a window
+        // asking to be highlighted for drags it cannot take.
+        if head.kinds == 0 || head.kinds & !DROP_KINDS_KNOWN != 0 {
+            return None;
+        }
+        Some((head, name))
+    }
+}
+
+/// A [`StartDrag`](OP_START_DRAG) request: the fixed head, with the path and name following.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StartDrag {
+    /// The window the drag comes out of. Must hold the pointer grab.
+    pub window: u32,
+    /// What the payload is — exactly one of [`DROP_KIND_FILE`] and friends.
+    pub kind: u32,
+    /// How many bytes of the tail are the path; the rest is the display name.
+    pub path_len: u32,
+}
+
+impl StartDrag {
+    /// The fixed part's length; the path and name follow it.
+    pub const HEAD: usize = 12;
+
+    /// Serialise the head, `path` and `name` into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8], path: &[u8], name: &[u8]) -> Option<usize> {
+        if path.is_empty() || path.len() > MAX_DROP_PATH || name.len() > MAX_DROP_NAME {
+            return None;
+        }
+        let n = Self::HEAD + path.len() + name.len();
+        if out.len() < n {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.kind);
+        put_u32(out, 8, path.len() as u32);
+        out[Self::HEAD..Self::HEAD + path.len()].copy_from_slice(path);
+        out[Self::HEAD + path.len()..n].copy_from_slice(name);
+        Some(n)
+    }
+
+    /// Parse a request body into the head, the path and the display name.
+    ///
+    /// **`kind` must be exactly one bit**: a drag carries one payload, and one offering "file or
+    /// directory" would be asking whatever it lands on to guess.
+    pub fn read(b: &[u8]) -> Option<(Self, &str, &str)> {
+        if b.len() < Self::HEAD {
+            return None;
+        }
+        let head =
+            Self { window: get_u32(b, 0), kind: get_u32(b, 4), path_len: get_u32(b, 8) };
+        if head.kind == 0
+            || head.kind & !DROP_KINDS_KNOWN != 0
+            || !head.kind.is_power_of_two()
+        {
+            return None;
+        }
+        let len = head.path_len as usize;
+        // **The declared length must fit what arrived**, or a short body would slice past the
+        // end — the reader's half of the bound the writer already checks.
+        if len == 0 || len > MAX_DROP_PATH || Self::HEAD + len > b.len() {
+            return None;
+        }
+        let path = core::str::from_utf8(&b[Self::HEAD..Self::HEAD + len]).ok()?;
+        let name = core::str::from_utf8(&b[Self::HEAD + len..]).ok()?;
+        if name.len() > MAX_DROP_NAME {
+            return None;
+        }
+        Some((head, path, name))
+    }
+}
+
+/// A [`Dropped`](OP_DROPPED) event: the fixed head, with three names following.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DroppedEvent {
+    /// The window the drop landed on.
+    pub window: u32,
+    /// What the payload is — one of [`DROP_KIND_FILE`] and friends.
+    pub kind: u32,
+    /// Where the pointer was, **window-local** like a [`PointerEvent`]'s.
+    pub x: i32,
+    /// See [`x`](Self::x).
+    pub y: i32,
+    /// How many bytes of the tail are the acceptor's name.
+    pub acceptor_len: u32,
+    /// How many of the rest are the path; what follows that is the display name.
+    pub path_len: u32,
+}
+
+impl DroppedEvent {
+    /// The fixed part's length; the three names follow it.
+    pub const HEAD: usize = 24;
+
+    /// Serialise the head and the three names into `out`; returns the length written.
+    pub fn write(
+        &self,
+        out: &mut [u8],
+        acceptor: &[u8],
+        path: &[u8],
+        name: &[u8],
+    ) -> Option<usize> {
+        if acceptor.is_empty()
+            || acceptor.len() > MAX_ACCEPTOR_NAME
+            || path.is_empty()
+            || path.len() > MAX_DROP_PATH
+            || name.len() > MAX_DROP_NAME
+        {
+            return None;
+        }
+        let n = Self::HEAD + acceptor.len() + path.len() + name.len();
+        if out.len() < n {
+            return None;
+        }
+        put_u32(out, 0, self.window);
+        put_u32(out, 4, self.kind);
+        out[8..12].copy_from_slice(&self.x.to_le_bytes());
+        out[12..16].copy_from_slice(&self.y.to_le_bytes());
+        put_u32(out, 16, acceptor.len() as u32);
+        put_u32(out, 20, path.len() as u32);
+        let a = Self::HEAD;
+        let p = a + acceptor.len();
+        let m = p + path.len();
+        out[a..p].copy_from_slice(acceptor);
+        out[p..m].copy_from_slice(path);
+        out[m..n].copy_from_slice(name);
+        Some(n)
+    }
+
+    /// Parse an event body into the head, the acceptor, the path and the display name.
+    pub fn read(b: &[u8]) -> Option<(Self, &str, &str, &str)> {
+        if b.len() < Self::HEAD {
+            return None;
+        }
+        let head = Self {
+            window: get_u32(b, 0),
+            kind: get_u32(b, 4),
+            x: i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            y: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            acceptor_len: get_u32(b, 16),
+            path_len: get_u32(b, 20),
+        };
+        let a = head.acceptor_len as usize;
+        let p = head.path_len as usize;
+        // **Both lengths checked against what arrived, and their sum checked for overflow.**
+        // Two fields that each fit and together do not is exactly the shape a length-prefixed
+        // record gets wrong.
+        let end = Self::HEAD.checked_add(a)?.checked_add(p)?;
+        if a == 0 || a > MAX_ACCEPTOR_NAME || p == 0 || p > MAX_DROP_PATH || end > b.len() {
+            return None;
+        }
+        let acceptor = core::str::from_utf8(&b[Self::HEAD..Self::HEAD + a]).ok()?;
+        let path = core::str::from_utf8(&b[Self::HEAD + a..end]).ok()?;
+        let name = core::str::from_utf8(&b[end..]).ok()?;
+        if name.len() > MAX_DROP_NAME {
+            return None;
+        }
+        Some((head, acceptor, path, name))
     }
 }
 
@@ -2398,6 +2710,112 @@ mod tests {
         let mut small = [0u8; 4];
         let req = CreateWindowRequest::new(1, 1, Role::Normal);
         assert!(build_create_window_request(&mut small, &req).is_none());
+    }
+
+    // ---- drag and drop (M10 Part E) ----
+
+    #[test]
+    fn the_three_drop_records_round_trip() {
+        let mut b = [0u8; 256];
+
+        let n = DeclareAcceptor { window: 7, kinds: DROP_KIND_FILE }.write(&mut b, b"editor")
+            .unwrap();
+        let (head, name) = DeclareAcceptor::read(&b[..n]).unwrap();
+        assert_eq!((head.window, head.kinds, name), (7, DROP_KIND_FILE, "editor"));
+
+        let n = StartDrag { window: 3, kind: DROP_KIND_DIR, path_len: 0 }
+            .write(&mut b, b"/home/papers", b"papers")
+            .unwrap();
+        let (head, path, label) = StartDrag::read(&b[..n]).unwrap();
+        assert_eq!((head.window, head.kind), (3, DROP_KIND_DIR));
+        assert_eq!((path, label), ("/home/papers", "papers"));
+
+        let ev = DroppedEvent {
+            window: 9,
+            kind: DROP_KIND_FILE,
+            x: -4,
+            y: 11,
+            acceptor_len: 0,
+            path_len: 0,
+        };
+        let n = ev.write(&mut b, b"editor", b"/home/a.txt", b"a.txt").unwrap();
+        let (head, acceptor, path, label) = DroppedEvent::read(&b[..n]).unwrap();
+        assert_eq!((head.window, head.kind, head.x, head.y), (9, DROP_KIND_FILE, -4, 11));
+        assert_eq!((acceptor, path, label), ("editor", "/home/a.txt", "a.txt"));
+    }
+
+    #[test]
+    fn a_drag_carries_exactly_one_kind() {
+        // **A payload is one thing.** A drag offering "file or directory" asks whatever it lands
+        // on to guess, and an acceptor's mask is the only place a *set* belongs.
+        let mut b = [0u8; 64];
+        let head = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 0 };
+        let n = head.write(&mut b, b"/a", b"a").unwrap();
+        assert!(StartDrag::read(&b[..n]).is_some());
+
+        for bad in [0u32, DROP_KIND_FILE | DROP_KIND_DIR, 1 << 7] {
+            put_u32(&mut b, 4, bad);
+            assert!(StartDrag::read(&b[..n]).is_none(), "kind {bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_reader_refuses_lengths_a_writer_would_never_produce() {
+        // **Hand-built bytes, because a round trip only ever tests the writer.** Every case here
+        // is one a correct sender cannot emit and a hostile or broken one can.
+        let mut b = [0u8; 64];
+        let n = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 0 }
+            .write(&mut b, b"/a", b"a")
+            .unwrap();
+
+        put_u32(&mut b, 8, 0); // a path of nothing
+        assert!(StartDrag::read(&b[..n]).is_none());
+        put_u32(&mut b, 8, 99); // longer than the body that arrived
+        assert!(StartDrag::read(&b[..n]).is_none());
+        put_u32(&mut b, 8, u32::MAX); // and the overflow shape of the same mistake
+        assert!(StartDrag::read(&b[..n]).is_none());
+
+        let mut d = [0u8; 128];
+        let ev = DroppedEvent {
+            window: 1,
+            kind: DROP_KIND_FILE,
+            x: 0,
+            y: 0,
+            acceptor_len: 0,
+            path_len: 0,
+        };
+        let n = ev.write(&mut d, b"e", b"/a", b"a").unwrap();
+        // Each length fits on its own; together they run past the end.
+        put_u32(&mut d, 16, 20);
+        put_u32(&mut d, 20, 20);
+        assert!(DroppedEvent::read(&d[..n]).is_none(), "two lengths that only overflow together");
+        // And the sum that overflows the addition itself rather than the buffer.
+        put_u32(&mut d, 16, u32::MAX);
+        put_u32(&mut d, 20, u32::MAX);
+        assert!(DroppedEvent::read(&d[..n]).is_none());
+    }
+
+    #[test]
+    fn an_acceptor_must_name_itself_and_a_kind_that_exists() {
+        let mut b = [0u8; 64];
+        let n = DeclareAcceptor { window: 1, kinds: DROP_KINDS_KNOWN }.write(&mut b, b"e").unwrap();
+        assert!(DeclareAcceptor::read(&b[..n]).is_some(), "both known kinds is a fine acceptor");
+
+        // No name: nothing for a `Dropped` to say it landed on, and nothing for a port to be.
+        assert!(DeclareAcceptor::read(&b[..DeclareAcceptor::HEAD]).is_none());
+        // Kinds nobody defines — an acceptor that would be highlighted for drags it cannot take.
+        for bad in [0u32, 1 << 9, DROP_KIND_FILE | (1 << 9)] {
+            put_u32(&mut b, 4, bad);
+            assert!(DeclareAcceptor::read(&b[..n]).is_none(), "kinds {bad} was accepted");
+        }
+        // A name over the cap is refused rather than truncated: unlike a title, this one is
+        // matched against and answered with, so a shortened one names a different acceptor.
+        let long = [b'x'; MAX_ACCEPTOR_NAME + 1];
+        let mut wide = [0u8; 128];
+        assert_eq!(
+            DeclareAcceptor { window: 1, kinds: DROP_KIND_FILE }.write(&mut wide, &long),
+            None
+        );
     }
 }
 

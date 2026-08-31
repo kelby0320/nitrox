@@ -1339,6 +1339,7 @@ pub fn list_view<Msg>(
     height: u32,
     row_height: u32,
     activate: fn(u64) -> Msg,
+    grab: Option<fn(u64) -> Msg>,
     palette: &Palette,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -1367,7 +1368,21 @@ pub fn list_view<Msg>(
         let selected = state.selected == Some(i);
         let face = if selected { palette.face_hover } else { palette.track };
         let row_el = stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))]);
-        items.push(sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key)));
+        let mut item =
+            sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
+        // **A press *down* on a row, for the caller that needs the gesture rather than the
+        // click.** Dragging a row somewhere is decided the moment the button lands on it — by
+        // the time it comes up the drag is over — and the row a press landed on is a fact this
+        // widget has and its caller would otherwise recompute from the pointer's y, the row
+        // height and the scroll offset. Three numbers to keep in step with this function is how
+        // two implementations of "which row is that" come to disagree.
+        //
+        // `on_press` on the same element does **not** shadow it: the router's shadowing rule
+        // compares depth, and these are the same element (M10 Part E).
+        if let Some(f) = grab {
+            item = item.on_press_down(f(r.key));
+        }
+        items.push(item);
     }
 
     let list = column(items);
@@ -1405,7 +1420,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, &Palette::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -1415,7 +1430,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -1425,9 +1440,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -1439,11 +1454,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState { selected: Some(19), offset: 0 };
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, &Palette::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, &Palette::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, &Palette::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, &Palette::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -1467,7 +1482,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState { selected: Some(3), offset: 2 };
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, &Palette::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, &Palette::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -1527,7 +1542,7 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let p = Palette::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, &p);
+            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
@@ -1540,11 +1555,11 @@ mod list_view_tests {
         let p = Palette::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, &p);
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -1553,7 +1568,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, &Palette::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Palette::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -1562,7 +1577,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, &Palette::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, &Palette::default());
         assert_eq!(keys(&e).len(), 0);
     }
 

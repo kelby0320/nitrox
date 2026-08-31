@@ -106,6 +106,23 @@ impl Damage {
     }
 }
 
+/// One thing a window says it can take a drop of — `Surface::DeclareAcceptor`.
+///
+/// **A name and a set of kinds, and no rectangle.** Where on the window a drop is allowed is the
+/// client's to decide from the point the event carries (M10 decision 3), so the compositor holds
+/// only what it needs to answer "would this window take this drag?" while the pointer moves.
+///
+/// The name is what a [`Dropped`](librsproto::surface::OP_DROPPED) says it landed on — and what
+/// a port will address when ports arrive, which is decision 2's whole point in keeping this a
+/// name rather than an index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Acceptor {
+    /// What the client calls it.
+    pub name: alloc::string::String,
+    /// The kinds it takes — a mask of `DROP_KIND_FILE` and friends.
+    pub kinds: u32,
+}
+
 /// A window: an id, a fixed role, a position, and the buffer currently on screen.
 #[derive(Clone, Debug)]
 pub struct Window {
@@ -149,6 +166,14 @@ pub struct Window {
     /// window is still *on* its desktop: it restores there and it belongs in that desktop's
     /// window list. Folding the two would make restoring a guess about where it came from.
     pub minimized: bool,
+    /// What this window says it takes when something is dropped on it.
+    ///
+    /// **Per window, not per session**, which is what makes "cleared with the window" free: a
+    /// client that destroys and recreates a window declares again, and nothing here outlives
+    /// the thing it describes. Bounded at
+    /// [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS) for the reason the title is
+    /// bounded: it arrives off the wire and is held for the window's life (M10 Part E).
+    pub acceptors: Vec<Acceptor>,
     /// The last state this window's client asked the manager for.
     ///
     /// **Only to tell a repeat from a change.** The compositor does not act on a state request
@@ -213,6 +238,13 @@ pub enum StackError {
     TooManyWindows,
     /// [`STICKY_DESKTOP`] was given where a real desktop was required.
     StickyIsNotADesktop,
+    /// This window already holds [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS)
+    /// acceptors.
+    ///
+    /// **Refused rather than evicting the oldest**, which is the difference between a bounded
+    /// table and a lossy one: dropping an acceptor a client still believes in would stop the
+    /// window taking a drag it says it takes, silently and much later.
+    TooManyAcceptors,
     /// That window is being dragged by the user, so a manager may not place it.
     ///
     /// **Refused rather than silently overridden.** A `Place` that landed mid-drag would move the
@@ -601,6 +633,7 @@ impl WindowStack {
             // but-is-unassigned moment for anything to have to render.
             desktop: self.current_desktop,
             minimized: false,
+            acceptors: Vec::new(),
             state_requested: None,
         });
         Ok(id)
@@ -745,6 +778,43 @@ impl WindowStack {
         }
         w.state_requested = Some(state);
         true
+    }
+
+    /// Record that `window` takes drops of `kinds` under `name` — `Surface::DeclareAcceptor`.
+    ///
+    /// **Re-declaring a name replaces it**, for the reason a snap zone's id does: the set of
+    /// acceptors describes what this window can currently take, so a client whose panel changed
+    /// would otherwise have to remove one to change it — and there is no remove.
+    ///
+    /// `Err(NoSuchWindow)` if it has gone; `Err(TooManyAcceptors)` when the table is full, which is a
+    /// refusal rather than an eviction: dropping the *oldest* acceptor would silently stop a
+    /// window taking what it still says it takes.
+    pub fn declare_acceptor(
+        &mut self,
+        id: u32,
+        name: &str,
+        kinds: u32,
+    ) -> Result<(), StackError> {
+        let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
+        if let Some(a) = w.acceptors.iter_mut().find(|a| a.name == name) {
+            a.kinds = kinds;
+            return Ok(());
+        }
+        if w.acceptors.len() >= librsproto::surface::MAX_ACCEPTORS {
+            return Err(StackError::TooManyAcceptors);
+        }
+        w.acceptors.push(Acceptor { name: alloc::string::String::from(name), kinds });
+        Ok(())
+    }
+
+    /// The name of the first acceptor on `id` that takes `kind`, or `None`.
+    ///
+    /// **First rather than best**, in declaration order: the compositor has no way to choose
+    /// between two acceptors that both take the kind — where on the window the drop happened is
+    /// the client's question, and the event carries the point for it to answer with.
+    pub fn acceptor_for(&self, id: u32, kind: u32) -> Option<&str> {
+        let w = self.window(id)?;
+        w.acceptors.iter().find(|a| a.kinds & kind != 0).map(|a| a.name.as_str())
     }
 
     /// Forget what `id` last asked to be, because something else has changed it.

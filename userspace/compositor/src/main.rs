@@ -479,16 +479,24 @@ fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
 
 /// Log a routed record, up to [`MAX_LOGGED_ROUTES`] of them.
 fn log_route(rec: &Outbound) {
-    // SAFETY: single-threaded server; this counter is touched only from the serve loop.
-    let n = unsafe { ROUTES_LOGGED };
-    if n > MAX_LOGGED_ROUTES {
-        return;
-    }
-    // SAFETY: as above.
-    unsafe { ROUTES_LOGGED = n + 1 };
-    if n == MAX_LOGGED_ROUTES {
-        kprint(b"compositor: (further routed input not logged)\n");
-        return;
+    // **A drop is not part of the stream this cap exists for.** The cap bounds *input* —
+    // motion, keys, buttons — which arrives continuously and would fill a console on its own. A
+    // drop is one record per completed gesture, it is the only evidence outside the receiving
+    // client that a payload was handed over, and by the time a person has dragged anything the
+    // cap is long since spent. Excluded rather than raised: raising it would mean more motion
+    // logged for the sake of one line (M10 Part E).
+    if !matches!(rec, Outbound::Dropped { .. }) {
+        // SAFETY: single-threaded server; this counter is touched only from the serve loop.
+        let n = unsafe { ROUTES_LOGGED };
+        if n > MAX_LOGGED_ROUTES {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe { ROUTES_LOGGED = n + 1 };
+        if n == MAX_LOGGED_ROUTES {
+            kprint(b"compositor: (further routed input not logged)\n");
+            return;
+        }
     }
     let mut l = Line::new();
     match rec {
@@ -513,6 +521,17 @@ fn log_route(rec: &Outbound) {
         Outbound::CloseRequested { window } => {
             l.s(b"compositor: close-requested win=").u(*window as u64);
         }
+        Outbound::Dropped { window, acceptor, kind, name, x, y, .. } => {
+            // **The name, never the path.** What is being dragged is a path in somebody's home
+            // directory, and a console line naming it is a log of what they were doing with
+            // which file — the same reason the chord log carries the modifier and not the key
+            // beside it. The display name is what is already on screen under the pointer.
+            l.s(b"compositor: drop win=").u(*window as u64);
+            l.s(b" on=").untrusted(acceptor.as_bytes());
+            l.s(b" kind=").u(*kind as u64);
+            l.s(b" name=").untrusted(name.as_bytes());
+            l.s(b" at ").i(*x as i64).s(b",").i(*y as i64);
+        }
         Outbound::Configure { window, width, height, x, y } => {
             l.s(b"compositor: mgr-configure win=").u(*window as u64);
             l.s(b" ").u(*width as u64).s(b"x").u(*height as u64);
@@ -520,6 +539,24 @@ fn log_route(rec: &Outbound) {
         }
     }
     l.end();
+}
+
+/// Take an outline change and put it on screen: remember it, and repaint what it disturbed.
+///
+/// **Both rectangles, and only their edges.** The union of where an outline was and where it is
+/// is very nearly a window, and repainting that per motion is the recompose that starves input;
+/// the strips of where it *was* are what erase it, since an outline is drawn over the composed
+/// stack rather than being in it. `StartResize` has its own copy of this loop because
+/// `start_resize` hands back the rectangle rather than the change — the two shapes are worth
+/// merging the next time a third gesture draws one, and are not worth a signature change now.
+fn apply_outline(srv: &mut Server, fb: &mut RawFramebuffer, outline: Option<compositor::input::Outline>) {
+    let Some(o) = outline else { return };
+    srv.outline = o.now;
+    for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
+        if !r.is_empty() {
+            repaint_region(srv, fb, r);
+        }
+    }
 }
 
 /// Queue everything the router produced.
@@ -533,7 +570,7 @@ fn deliver(srv: &mut Server, out: &[Outbound]) {
             continue;
         };
         log_route(rec);
-        enqueue(srv, slot, *rec);
+        enqueue(srv, slot, rec.clone());
     }
 }
 
@@ -955,6 +992,31 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             match (librsproto::surface::WindowRef { window: *window }).write(&mut body) {
                 Some(n) => send_input(ch, librsproto::surface::OP_CLOSE_REQUESTED, &body[..n]),
                 None => true,
+            }
+        }
+        Outbound::Dropped { window, acceptor, kind, path, name, x, y } => {
+            use librsproto::surface::{DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
+            // **The same constant the client sizes its receive buffer from**, so the two cannot
+            // drift: a sender that can emit more than a receiver can take is a record that
+            // vanishes on delivery, which is what PR #260's review found here.
+            let mut body = [0u8; MAX_EVENT_BODY];
+            let ev = DroppedEvent {
+                window: *window,
+                kind: *kind,
+                x: *x,
+                y: *y,
+                acceptor_len: 0,
+                path_len: 0,
+            };
+            match ev.write(&mut body, acceptor.as_bytes(), path.as_bytes(), name.as_bytes()) {
+                Some(n) => send_input(ch, OP_DROPPED, &body[..n]),
+                // Unreachable with the caps enforced at both edges — and reported rather than
+                // silently dropped, because a drop that vanishes is a gesture the user made and
+                // the system forgot.
+                None => {
+                    kprint(b"compositor: a drop would not serialise\n");
+                    true
+                }
             }
         }
         Outbound::Configure { window, width, height, x, y } => {
@@ -2223,6 +2285,97 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                     })
                 }
             },
+        };
+        return match err {
+            Some(e) => reply_error_on_session(ch, op, request_id, e),
+            None => reply_on_session(ch, op, request_id, &[]),
+        };
+    }
+
+    // **A window says what it takes, once** — `Surface::DeclareAcceptor` (M10 Part E).
+    // (`apply_outline` is defined below, beside the other repaint helpers.) The
+    // compositor holds the table so it can answer "would this window take this drag?" per
+    // motion without a round trip to the client, which is the path that has to stay cheap.
+    if op == librsproto::surface::OP_DECLARE_ACCEPTOR {
+        if handle != 0 {
+            // SAFETY: closing a handle this process owns and will never interpret.
+            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        }
+        let err = match librsproto::surface::DeclareAcceptor::read(body) {
+            None => Some(KError::InvalidArgument),
+            Some((req, _)) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
+            Some((req, name)) => {
+                match srv.stack.declare_acceptor(req.window, name, req.kinds) {
+                    Ok(()) => {
+                        Line::new()
+                            .s(b"compositor: window ")
+                            .u(req.window as u64)
+                            .s(b" accepts ")
+                            .untrusted(name.as_bytes())
+                            .s(b" kinds ")
+                            .u(req.kinds as u64)
+                            .end();
+                        None
+                    }
+                    Err(compositor::StackError::TooManyAcceptors) => {
+                        Line::new()
+                            .s(b"compositor: window ")
+                            .u(req.window as u64)
+                            .s(b" has no room for another acceptor")
+                            .end();
+                        Some(KError::Unsupported)
+                    }
+                    Err(_) => Some(KError::NotFound),
+                }
+            }
+        };
+        return match err {
+            Some(e) => reply_error_on_session(ch, op, request_id, e),
+            None => reply_on_session(ch, op, request_id, &[]),
+        };
+    }
+
+    // **A drag is a gesture the compositor runs, like a move and a resize** — and refused the
+    // same way, because the grab is what makes "the user is dragging this" true. What differs is
+    // what it ends in: not a rectangle for the manager, but a payload for whatever window it was
+    // let go over.
+    if op == librsproto::surface::OP_START_DRAG {
+        if handle != 0 {
+            // SAFETY: closing a handle this process owns and will never interpret.
+            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        }
+        let err = match librsproto::surface::StartDrag::read(body) {
+            None => Some(KError::InvalidArgument),
+            Some((req, ..)) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
+            Some((req, path, name)) => {
+                match srv.router.start_drag(req.window, req.kind, path, name, &srv.stack) {
+                    Ok(outline) => {
+                        // The highlight is drawn at once for the reason a resize's outline is:
+                        // the pointer has already travelled during the round trip.
+                        apply_outline(srv, fb, outline);
+                        // **The kind and the display name, never the path.** What is being
+                        // dragged is a file in somebody's home directory; the console is not the
+                        // place for a record of which files they move around.
+                        Line::new()
+                            .s(b"compositor: drag from window ")
+                            .u(req.window as u64)
+                            .s(b" kind ")
+                            .u(req.kind as u64)
+                            .s(b" name ")
+                            .untrusted(name.as_bytes())
+                            .end();
+                        None
+                    }
+                    Err(_) => {
+                        Line::new()
+                            .s(b"compositor: refused a drag from window ")
+                            .u(req.window as u64)
+                            .s(b": the pointer is not holding it")
+                            .end();
+                        Some(KError::NotFound)
+                    }
+                }
+            }
         };
         return match err {
             Some(e) => reply_error_on_session(ch, op, request_id, e),

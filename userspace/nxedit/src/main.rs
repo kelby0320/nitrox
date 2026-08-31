@@ -89,7 +89,7 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
                 app.loaded(text, &bytes);
                 libkern::debug::Line::new()
                     .s(b"nxedit: opened ")
-                    .s(path.as_bytes())
+                    .untrusted(path.as_bytes())
                     .s(b" - ")
                     .u(bytes.len() as u64)
                     .s(b" bytes")
@@ -194,6 +194,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     let mut app = App::new(&path);
     open_into(&mut app, root_ns, &path);
+    // **The file being edited can change**, since a drop replaces it — so this is the binary's
+    // copy of `app.path()` rather than the argument it started from.
+    let mut editing = path.clone();
 
     let mut size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
@@ -214,6 +217,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         && w.set_title(libfs::basename_str(&path)).is_err()
     {
         kprint(b"nxedit: SetTitle refused\n");
+    }
+    // **What this window takes, said once** (M10 Part E). Files only: a directory has no
+    // contents to put in a buffer, and an editor that accepted one would have to invent an
+    // answer for it. The compositor matches against this while the pointer moves, so a drag
+    // carrying a folder is never highlighted over this window at all.
+    if let Some(mut w) = win.window(window_id)
+        && w.declare_acceptor(nxedit::ACCEPTOR, librsproto::surface::DROP_KIND_FILE).is_err()
+    {
+        kprint(b"nxedit: DeclareAcceptor refused\n");
     }
 
     let mut scratch = match compose_buffer(size) {
@@ -296,18 +308,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
         if let Some(text) = app.take_save() {
             let bytes = to_bytes(&text);
-            let result = save(root_ns, &path, &bytes);
+            let result = save(root_ns, &editing, &bytes);
             match result {
                 Ok(n) => libkern::debug::Line::new()
                     .s(b"nxedit: saved ")
-                    .s(path.as_bytes())
+                    .untrusted(editing.as_bytes())
                     .s(b" - ")
                     .u(n as u64)
                     .s(b" bytes")
                     .end(),
                 Err(why) => libkern::debug::Line::new()
                     .s(b"nxedit: save FAILED for ")
-                    .s(path.as_bytes())
+                    .untrusted(editing.as_bytes())
                     .s(b" - ")
                     .s(why.as_bytes())
                     .end(),
@@ -389,7 +401,30 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     kprint(b"nxedit: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }
-                WindowEvent::Dropped => kprint(b"nxedit: input dropped\n"),
+                // **Somebody dragged a file onto this window** (M10 Part E). Routed by position
+                // like a press, so the text area takes it and the title bar does not — and the
+                // buffer is only given up if there is nothing to lose.
+                WindowEvent::Drop { ref path, ref name, x, y, .. } => {
+                    let taken = router.drop_at(&tree, &ui, &l, x, y).is_some();
+                    libkern::debug::Line::new()
+                        .s(b"nxedit: drop of ")
+                        .untrusted(name.as_bytes())
+                        .s(if taken { b" on the document" as &[u8] } else { b" outside it" })
+                        .end();
+                    if taken && app.accept_drop(path) {
+                        open_into(&mut app, root_ns, path);
+                        // The path is the window's identity now: the title, and what a save
+                        // writes to. Both are read from `app`, so the one copy `main` keeps has
+                        // to follow — this was a `let` bound once at startup.
+                        editing = String::from(app.path());
+                        if let Some(mut w) = win.window(window_id)
+                            && w.set_title(libfs::basename_str(&editing)).is_err()
+                        {
+                            kprint(b"nxedit: SetTitle refused\n");
+                        }
+                    }
+                }
+                WindowEvent::InputLost => kprint(b"nxedit: input dropped\n"),
             }
         }
         if resized {
