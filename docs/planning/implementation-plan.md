@@ -115,12 +115,15 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     operations.
     **Built since: M8 — ✅ complete (2026-08-26)**, desktops, the overview and the bottom bar;
     **M9 — ✅ complete (2026-08-28)**, client-side decorations, interactive move, close,
-    `Configure` with real reflow, edge resize and snap. **M10 — 🚧 Parts A–D landed**:
+    `Configure` with real reflow, edge resize and snap. **M10 — ✅ complete (2026-09-01)**, in five parts:
     `libfs` (A), the file browser `nxfiles` (B), the text area the toolkit had deferred four
     times (C), the editor `nxedit` with `Desktop::Open` (D) — a client naming a *path* for the
     shell to open, because an application holds no authority to spawn — and **drag-and-drop
     between the two (E)**: `DeclareAcceptor`, `StartDrag`, `Dropped`, and a compositor that
-    highlights what would take a payload. Part F remains. (Desktops and the applications milestone — M8, and what is now M10 — were
+    highlights what would take a payload.
+    **There is no Part F**: the details pass counted six, and the sixth — graduating
+    `display-substrate.md` — was retired as "not a part" and paid off under M9's account on
+    2026-08-30, where the debt belonged. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
     Design in

@@ -20396,3 +20396,49 @@ come from the server. A *filename* with a newline reaches it with no malicious c
 string from the wire or the filesystem now uses it. Configuration strings deliberately do not:
 they are the image's own, read from a file the same build produced, and routing them through it
 would say they are somebody else's.
+
+## 2026-09-01 — M11's details pass: a theme is data, and the largest change is not a colour
+
+Milestone 11 planned now that M10 has closed, which is when its own trigger fired: there is
+something to polish. Six decisions settled, and two of them corrected the sketch.
+
+**The sketch expected the work to be collecting three sets of hardcoded colours.** It is not:
+every client already calls `Palette::default()` and `Theme::default()`, so the sharing is mostly
+plumbing a value through. What is genuinely scattered is smaller and more specific — the
+compositor's own chrome, which does not link `libui` at all, and `libterm`'s ANSI palette, which
+belongs to a terminal rather than to a desktop.
+
+**And the largest visible change in the milestone is not a colour.** The whole desktop renders in
+`DejaVuSansMono`, because it is the only font the image ships and `SYSTEM_FONT_PATH` is a
+constant every client loads. Every label in every window is monospaced. A proportional UI font is
+one asset, one licence and one theme field — and *two roles*, because `nxterm`'s grid needs a
+fixed advance and keeps the mono font.
+
+**The theme is data read at session start, not code and not a live protocol.** The shell reads a
+file and hands each application its values on the setup channel it already sends `HOME` on, so
+nothing new goes on the wire. The reasoning is what nothing *else* needs: polish iterations
+rebuild the image anyway, so a live push would be protocol work bought entirely for the control
+panel. Its trigger is exactly that, and the shape is known — a server-to-client event, the same
+as M10 Part E's `Dropped`.
+
+**Colour and type are themeable; chrome metrics are not**, and the reason is a gate rather than a
+principle. `check-login` clicks a title bar at `+13` and a close button at `-39`; making those
+theme values means gates that read a theme to know where to click. Only `check-display`'s
+reference moves, which is a gate built to move.
+
+**The compositor's three colours stay compiled in**, named rather than skipped: it is started by
+`init`, not by the session, so it never sees a setup record. The trigger is a control panel that
+wants to change the cursor or the drop highlight, and the mechanism would be a manager op on a
+channel the shell already holds.
+
+**A milestone about taste needs a stopping condition agreed before it starts.** The polish list is
+an *input* this plan does not contain — written while driving the system, one line per thing that
+looks wrong. M11 ends when that list is empty; anything found along the way goes to a second list
+for M12. Without that, "polish" has no last item.
+
+**And feel is not appearance.** "Moving a window is slow" is recompose and damage work, and shares
+nothing with a colour but the window it is noticed on. Its own list, and not this milestone.
+
+**One theme, built to hold a second.** Dark-and-light doubles every judgement and every review,
+and doubles the reference the display gate keeps. The mechanism carries a second; nothing ships
+one.

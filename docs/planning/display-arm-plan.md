@@ -3003,17 +3003,135 @@ That M10 Part E *adds* to the substrate is not a reason to have kept it in `desi
 
 ## Milestone 11 — themes and visual polish
 
-Sketched 2026-08-26, and named rather than left implicit. The shell is deliberately plain: M7
-and M8 build what a desktop *does*, and M9 gives windows the chrome they are interacted through.
-This is where how it *looks* becomes the work — a theme the shell, the toolkit and the
-decorations share, rather than three sets of hardcoded colours.
+**Details pass 2026-09-01.** Sketched 2026-08-26 and planned now that M10 has closed, which is
+when its own trigger fired: there is something to polish. Six parts, and the fifth is not like
+the others — it is open-ended by nature, and the plan says so rather than pretending a list of
+checkboxes can describe taste.
 
-**Its trigger is that there is something to polish.** Polishing earlier means restyling surfaces
-that are about to change shape, and a theme abstracted from one consumer is a guess; `libui`
-already carries a `Theme` and a `Palette`, so the question this milestone answers is whether
-those are the right seam once decorations and the bars are also consumers of them.
+**What the sketch got right and what it had backwards.** It expected the work to be "a theme the
+shell, the toolkit and the decorations share, rather than three sets of hardcoded colours". The
+seam turns out to be in better shape than that: every client already calls `Palette::default()`
+and `Theme::default()`, so the sharing is mostly plumbing a value through. What is actually
+scattered is smaller and more specific — the compositor's own chrome (cursor, drag outline,
+background), which does not link `libui` at all, and `libterm`'s ANSI palette, which is a
+terminal's own thing and not the desktop's.
 
-Deliberately unscheduled beyond that: it gates nothing, and nothing gates it.
+**And the largest visible change is not a colour.** The entire desktop renders in
+`DejaVuSansMono` — the only font the image ships — because `SYSTEM_FONT_PATH` is a constant every
+client loads. A proportional UI font is one asset and one theme field, and it changes every label
+in the system.
+
+### Governing decisions
+
+Settled with the maintainer 2026-09-01, so the parts below can be built rather than re-argued.
+
+**1. The theme is data read at session start — not code, and not a live protocol.** The shell
+reads a theme file and hands each application its values on the **setup channel it already sends
+`HOME` on**, so nothing new goes on the wire. A change takes effect when an application starts.
+
+The reasoning is that nothing *else* needs more than this: polish iterations rebuild the image
+anyway, so a live push would be protocol work bought entirely for the control panel. **Trigger
+for revisiting: a control panel that must show a change without a restart.** The shape it would
+take is already known — a server-to-client event, exactly M10 Part E's `Dropped`.
+
+**2. Colour and type are themeable; chrome metrics are not.** Font size and the palette move;
+padding, title-bar height and grip size stay constants. The consequence is named because it is
+the reason: `check-login` clicks a title bar at `+13` and a close button at `-39`, and gates that
+derive those from a theme would have to read one. Only `check-display`'s reference moves, which
+is a gate designed to move.
+
+**3. Two font roles, not one — and the UI role becomes proportional.** `nxterm`'s grid needs a
+fixed advance and keeps the mono font; every label in every other window does not. This is the
+single largest visible change in the milestone and it costs one asset, its licence, and a field.
+
+**4. One theme, built to hold a second.** Every polish decision is made once and `check-display`
+keeps one reference. Dark-and-light doubles both, and doubles the review it takes to land each
+batch. The mechanism carries a second theme; nothing ships one.
+
+**5. The polish list is an input this plan does not contain.** It is written by the maintainer
+while test-driving, one line per thing that looks or feels wrong, and Part E works from it.
+**M11 ends when that list is empty** — anything new found along the way goes to a second list for
+M12 rather than extending this one. A milestone about taste needs a stopping condition agreed
+before it starts, or it does not have one.
+
+**6. Feel is not appearance, and is not in this milestone.** "Moving a window is slow" (reported
+2026-08-28, on TCG) is recompose and damage work; it shares nothing with a colour but the window
+it is noticed on. Its own list, and its own milestone.
+
+### Part A — `xtask preview`, because it changes the cost of everything after it
+
+- [ ] **Render an arrangement of widgets to a viewable image on the host.** `xtask` already links
+      `libui`, `libdraw` and `libterm` and renders `libui::reference` here — that is how
+      `check-display` adjudicates — so this is a new entry point onto a renderer that exists and
+      is already trusted.
+
+      **First, because it is what makes the loop affordable.** Polish is a hundred small
+      judgements, and a judgement that costs a boot to see is a judgement not made. The same
+      renderer keeps it honest: what a preview shows is what `check-display` will demand of the
+      guest.
+
+- [ ] **Gate**: a host test that the preview of the reference arrangement is byte-identical to
+      the render `check-display` compares against. Two renderers that could disagree would make
+      the preview a *different* picture, which is worse than no preview.
+
+### Part B — one theme, with `libdraw` as the seam
+
+- [ ] **Collapse `Theme` and `Palette` into one theme, and give the compositor's chrome the same
+      source.** The compositor does not link `libui` and should not — it links `libdraw`, where
+      `Rgb` and the background already live, so that is where the theme's *type* belongs.
+
+- [ ] **The compositor's three colours stay compiled in**, and this is the one thing decision 1's
+      file does not reach: the compositor is started by `init`, not by the session, so it never
+      sees a setup record. Named rather than quietly skipped. **Trigger: a control panel that
+      wants to change the cursor or the drop highlight** — the mechanism is a manager op, and the
+      shell already holds that channel.
+
+- [ ] **Gate**: `check-display` green with its reference **unchanged**. A refactor that moves no
+      pixel is exactly what this part is, and the gate can say so.
+
+### Part C — the theme becomes data
+
+- [ ] **A theme file, read by the shell, handed to each application on the setup record.** Its
+      default is what the constants say today, so an image with no theme file renders exactly as
+      it does now.
+
+- [ ] **Gate**: `check-login`, plus a control that is the point of the part — **delete the file
+      and everything still renders**, at the defaults. A theme mechanism that a missing file can
+      break is worse than no mechanism.
+
+### Part D — the UI font stops being a terminal font
+
+- [ ] **A proportional UI font in the theme, and the mono font kept for the grid.** Two roles, one
+      asset each, licences beside them as DejaVu's already is.
+
+- [ ] **Gate**: `check-display`'s reference moves deliberately, and `check-terminal` proves the
+      grid still measures with a fixed advance. The reference render must load the font the
+      *theme* names, or the host and the guest are drawing with different fonts and the gate
+      compares nothing.
+
+### Part E — the polish passes
+
+- [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
+      behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
+      reference in the same commit, so the gate fails the moment pixels move without intent.
+      That is the whole regression story for a hundred small changes, and it is enough.
+
+- [ ] **No checkbox list here on purpose.** The items do not exist yet; they are written while
+      driving the system. What this part commits to is the *shape* — batch, preview, review,
+      apply — and the stopping condition in decision 5.
+
+### Part F — the control panel, allowed to slip
+
+- [ ] **Desktop settings a person can drive**: the theme file above, and the desktops
+      `/dev/desktop` already serves. Its scope is stated here so that slipping it is a decision
+      rather than a disappearance.
+
+- [ ] **Gate**: `check-login` drives it — change a setting, and read the *file* back the way Part
+      D of M10 reads a saved buffer back, from outside the application that wrote it.
+
+- [ ] **May move to M12.** Polish is what this milestone is for, and a settings application that
+      arrives instead of a finished polish list is the wrong trade.
+
 
 ## Milestone 12 — applications, deepened
 
