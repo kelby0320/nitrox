@@ -20132,3 +20132,40 @@ press-and-drag to be driven "through `Router` at laid-out coordinates". Mapping 
 and the application does the arithmetic — the same division `scrollbar`'s `offset_at` already uses.
 Routing a press *to* a widget is `Router`'s and is covered by `title_bar`'s tests; what is new here
 is what a press *means*, and that is state.
+
+## 2026-09-01 — The gate that asserted a position once: a lost PS/2 packet, and the drain that stops it
+
+`check-terminal` failed in CI on Part C's branch, and the failure is worth a record because the
+diagnosis closes a note the gate has carried since it was written.
+
+**What happened.** The gate aims a click at (397, 295) inside `nxterm`, and the compositor
+reported the press at (495, 351) — *exactly* one step of (-98, -56) short of the aim, the whole
+packet missing rather than a truncated one. The click itself worked: `nxterm` logged `clicked` and
+took focus. Only the position assertion failed, and it failed by a whole injected motion.
+
+**Why a whole one.** Injection is relative and unacknowledged, and QEMU's PS/2 queue is sixteen
+bytes that drops a packet it cannot fit rather than delivering part of it. The gate pinned the
+pointer by over-driving twenty motions into a corner and then walked nine exact steps to the aim,
+back to back, as fast as QMP would take them — so the queue was full when the part that had to
+arrive exactly was sent. **The pin can afford to lose a packet and the walk cannot**, and injecting
+them as one burst is what put the loss in the wrong half.
+
+This is host-side, and no guest change addresses it: `input-server` has carried the motion of an
+undeliverable batch forward since 2026-08-26 (and `burst_holds_its_position` gates that), but a
+delta that never reached the guest is not a delta the guest can carry. A loss here leaves no
+`input batch DROPPED` line, which is how the two are told apart.
+
+**Two fixes, at the two places they belong.** `move_pointer_to` now lets the pin drain before
+walking — the same 500 ms, for the same reason, that `burst_holds_its_position` already took after
+its own pin. And the gate's two clicks go through `click_at`, which has retried a press that
+misses its aim since PR #243 and which every click in `check-login` already used; `check-terminal`
+was the one place still hand-rolling the sequence, so it was the one place where a dropped packet
+was a failed build. The assertion is unchanged and still exact: a press anywhere else is still a
+failure, and a systematic misplacement still fails all three attempts.
+
+**And the note it closes.** The comment being replaced called this position "bit-identical over 40
+loaded runs" and recorded one earlier failure of this gate as "still unexplained". Both readings
+came of having no diagnosis to attach: a gate that asserts an exact position and never retries
+reads as stable right up until the run that loses a packet. The split assertion — position first,
+effect second — is what made the second occurrence legible in one line, which is the thing it was
+added for. Its own claim of stability was the part that needed correcting.

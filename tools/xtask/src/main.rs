@@ -1622,6 +1622,17 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
             for _ in 0..20 {
                 qmp.send_motion(100, 100)?; // pin to (1279, 799)
             }
+            // **Let the pin drain before walking, because the two are not equally forgiving.**
+            // The pin is over-driven — twenty motions to cross thirteen hundred pixels — so a
+            // packet it loses changes nothing. The walk is exact, and a packet it loses is a
+            // permanent offset. Injected back to back they are one burst, and QEMU's PS/2 queue
+            // is sixteen bytes that drops a *whole packet* which will not fit rather than
+            // truncating it — so the burst arrives full and the walk is the half that pays.
+            //
+            // Seen in CI on 2026-08-31: `check-terminal` aimed at (397, 295) and the press
+            // landed at (495, 351), exactly one step of (-98, -56) short. The same drain, for
+            // the same reason, as the one `burst_holds_its_position` takes after its own pin.
+            std::thread::sleep(std::time::Duration::from_millis(500));
             (1279, 799)
         }
     };
@@ -2911,7 +2922,10 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
          2026-08-26 `input-server` carries the motion of an undeliverable batch forward instead \
          of discarding it, and `burst_holds_its_position` gates that — so a failure here is \
          more likely a mis-aimed click than lost movement. Check that gate's verdict first, \
-         then look for `input batch DROPPED (SYN_DROPPED)` in the transcript"
+         then look for `input batch DROPPED (SYN_DROPPED)` in the transcript. Loss on the \
+         *host* side leaves no such line at all: QEMU's PS/2 queue drops a whole packet it \
+         cannot fit, which is why the pin is drained before the walk and why three attempts \
+         failing means something other than a dropped motion"
     )
     .into())
 }
@@ -3185,13 +3199,6 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // deadline and says so. Waiting is not optional: a click sent before this *is* its first
     // phase's sentinel, so it wakes the client, which then creates that window and swallows
     // everything typed after the first character.
-    for _ in 0..20 {
-        qmp.send_motion(100, 100)?; // pin to the bottom-right corner (1279, 799)
-    }
-    for _ in 0..9 {
-        qmp.send_motion(-98, -56)?; // → about (397, 295)
-    }
-
     // **The phase-1 message specifically.** The client has two idle exits and they used to
     // print the same line: this one before the window phase, where nothing has been created
     // and acting immediately is safe, and one *after* the 2048×2048 window exists, where the
@@ -3201,30 +3208,29 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // terminal in one and on a screen-sized window in the other.
     session.expect("input-testclient: idle before the window phase")?;
 
-    // Click inside `nxterm` and clear of the reference windows above its top-left corner
-    // (the largest is 320×160).
+    // Click inside `nxterm`, past the right edge of the reference windows stacked above its
+    // top-left corner — they are 320 wide, and the aim is clear of them in x whatever their
+    // heights, which is what keeps this point stable as the reference picture grows.
     //
-    // **Pinned to a corner first, because injection is relative and the pointer is not where
-    // you left it.** `input-testclient` ends by driving it twelve times by (-120, -120), so it
-    // is at the top-left — a relative move computed from the screen centre lands nowhere near
-    // the intended point, and the first version of this gate clicked at (0, 0), which is
-    // inside the 64×32 scene window. Overshooting into the bottom-right corner clamps to a
-    // known position; everything after that is arithmetic.
-    // **In wire-sized steps.** A PS/2 mouse packet carries a 9-bit signed delta, so a single
-    // huge motion is not a big movement — it is a different, meaningless one. The first
-    // version of this sent (4000, 4000) and the cursor went somewhere unrelated.
-    qmp.send_button("left", true)?;
-    qmp.send_button("left", false)?;
-
-    // **Assert where the click went before asserting that it worked.** These two steps split
-    // a failure that used to be one opaque timeout into its two distinguishable causes: the
-    // pointer not being where the arithmetic above says it is, and the pointer being right
-    // while `nxterm` still does not receive the press. Before this, either produced the same
-    // bare `timed out waiting for "nxterm: clicked"` with nothing in the transcript to tell
-    // them apart — which is precisely what happened to the one observed failure of this gate,
-    // and why it is still unexplained. Measured over 40 loaded runs the position is
-    // bit-identical, so a change here is a real signal rather than noise.
-    session.expect("compositor: press at x=397 y=295")?;
+    // **Through `click_at`, which this gate hand-rolled the sequence for until 2026-08-31.**
+    // The pin and the walk are the same arithmetic it does — injection is relative, so the
+    // pointer is over-driven into a corner first and everything after that is subtraction; the
+    // first version of this gate clicked at (0, 0), inside the 64×32 scene window, and the
+    // version after that sent one motion of (4000, 4000), which a 9-bit PS/2 delta turns into a
+    // different, meaningless movement. What the helper adds is the retry, and the retry is what
+    // was missing: a dropped packet is not a lost pixel but a permanent offset, so asserting the
+    // position once turns one lost motion into a failed build.
+    //
+    // **Which is what happened, and the split assertion is why it can be said.** CI failed here
+    // with the press at (495, 351) — exactly one step of (-98, -56) short of its aim, the whole
+    // packet gone rather than a truncated one. The comment this replaces called the position
+    // "bit-identical over 40 loaded runs" and left the gate's one prior failure unexplained;
+    // both readings came from having no diagnosis to hang on it. It has one now: injection at
+    // this rate loses a packet occasionally, the guest cannot recover a relative delta it never
+    // received, and the drain in `move_pointer_to` is the half of the fix that stops it
+    // happening. The assertion is unchanged and still exact — a press that lands anywhere else
+    // is still a failure, and a systematic misplacement still fails all three attempts.
+    click_at(&mut qmp, &mut session, 397, 295)?;
 
     // **Wait for the click to land before typing.** Click-to-focus is what gives `nxterm` the
     // keyboard — it is created first and therefore bottom-most — and the raise is not
@@ -3306,10 +3312,11 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // states: it separates "the pointer was not there" from "the pointer was there and nothing
     // happened".
     let (cx, cy) = (px + pw as i32 / 2, py + ph as i32 / 4);
-    move_pointer_to(&mut qmp, cx, cy)?;
-    qmp.send_button("left", true)?;
-    qmp.send_button("left", false)?;
-    session.expect(&format!("compositor: press at x={cx} y={cy}"))?;
+    // The pointer is already at a *confirmed* position from the click above, so this walks a
+    // few motions rather than re-pinning — and a retry here is cheap for the same reason.
+    // Nothing dismisses this popup but choosing from it, so an attempt that lands elsewhere
+    // leaves it open for the next one.
+    click_at(&mut qmp, &mut session, cx, cy)?;
     session.expect("nxterm: menu chose Clear")?;
 
     let _ = session.child.kill();
