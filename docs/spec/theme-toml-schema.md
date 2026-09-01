@@ -36,7 +36,7 @@ font_px = 16
 
 | Key | Type | What it colours |
 |---|---|---|
-| `background` | `"#RRGGBB"` | A window's ground, and the space between windows |
+| `background` | `"#RRGGBB"` | A window's ground (**not** the space between windows — see below) |
 | `foreground` | `"#RRGGBB"` | Text and other ink |
 | `face` | `"#RRGGBB"` | A button at rest |
 | `face_hover` | `"#RRGGBB"` | A button under the pointer |
@@ -50,7 +50,15 @@ font_px = 16
 | `cursor_body` | `"#RRGGBB"` | The pointer's fill |
 | `cursor_outline` | `"#RRGGBB"` | The pointer's outline |
 | `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target |
-| `font_px` | number, `6`–`96` | Text size in pixels per em |
+| `font_px` | number, `6`–`16` | Text size in pixels per em |
+
+**`font_px` shrinks and does not grow, and 16 is not an arbitrary ceiling.** Text measures
+exactly its em size, and the tightest fixed box in the system is a list row: 20 pixels with 2
+above and 2 below, leaving 16. The window bars are 24 with 4+4 of button padding, which lands on
+the same number. Larger text is clipped by the painter and overlapped by its neighbours, because
+**chrome metrics are not themeable** (M11's decision 2) — which is also why the gates can click a
+title bar at a fixed offset. Raising this means metrics that follow type, and that is the
+decision to revisit, not this number.
 
 **`cursor_body`, `cursor_outline` and `outline` are read but do not take effect.** They are drawn
 by the *compositor*, which `init` starts rather than the session — so it never sees a setup
@@ -58,6 +66,15 @@ record and uses the built-in values. They are listed because they are part of on
 file that omitted them would be describing a different thing than the type does. **Trigger for
 making them live: a control panel that wants to restyle the cursor** — the mechanism is a manager
 op on a channel the shell already holds.
+
+**And `background` is live for window interiors only**, for exactly the same reason. The ground
+*between* windows is the compositor's `scene::BACKGROUND`, a compile-time constant taken from the
+built-in theme — so a file that sets `background` recolours what windows draw on and leaves the
+desktop behind them as it was. Two consequences worth knowing before changing it: a window whose
+committed buffer is smaller than its frame shows a seam against the old ground, and `nxterm`'s
+grid draws on `libterm`'s own default background, which is the built-in value too. The type's own
+doc calls one ground "what a window's ground and the space between windows share"; today the file
+reaches only the first.
 
 ## What a broken file does
 
@@ -72,8 +89,9 @@ colours did not parse is a worse failure than any colour could be. Specifically:
   future key look identical and silence is what makes a typo take an afternoon.
 - **A value that cannot be read** leaves that one field at its default, and the rest of the file
   is still read.
-- **`font_px` outside 6–96** is refused: zero divides in the layout and a huge one puts a single
-  glyph in a window, which are both a text file that makes the machine unusable.
+- **`font_px` outside 6–16** is refused: zero divides in the layout, and anything above what the
+  fixed chrome holds is clipped and overlapped. Both are a text file that makes the machine
+  unusable, which is the one thing a theme must not be able to be.
 
 The shell names each bad line, with the line number an editor would show, up to a bound.
 

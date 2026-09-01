@@ -189,7 +189,14 @@ impl Theme {
                 continue;
             };
             let key = key.trim();
-            let value = value.trim().trim_matches('"');
+            // **Both forms are kept**, because one key cares which it was: a colour is a TOML
+            // string and `font_px` is a TOML number, so the quotes are part of the *type* rather
+            // than punctuation to strip on the way past.
+            let raw = value.trim();
+            let Some(value) = unquote(raw) else {
+                issues.push(Issue { line: n + 1, kind: IssueKind::BadValue });
+                continue;
+            };
             let ok = match key {
                 "background" => set(&mut t.background, value),
                 "foreground" => set(&mut t.foreground, value),
@@ -205,10 +212,15 @@ impl Theme {
                 "cursor_body" => set(&mut t.cursor_body, value),
                 "cursor_outline" => set(&mut t.cursor_outline, value),
                 "outline" => set(&mut t.outline, value),
+                // **Unquoted, because TOML types a quoted number as a string.** Accepting
+                // `font_px = "14"` would be accepting a file a real TOML reader disagrees with
+                // this one about.
+                "font_px" if raw.starts_with('"') => false,
                 "font_px" => match value.parse::<f32>() {
-                    // **A size, not a number.** Zero divides in the layout and a huge one makes
-                    // one glyph fill a window; both are a file that renders nothing usable, which
-                    // is the state a theme must not be able to reach.
+                    // **A size, not a number**, and bounded at both ends by what can be read:
+                    // zero divides in the layout, and anything above what the fixed chrome holds
+                    // is clipped by `paint` and overlapped by its neighbours. See
+                    // [`MAX_FONT_PX`], which is 16 because a list row is 20 with 4 of padding.
                     Ok(v) if (MIN_FONT_PX..=MAX_FONT_PX).contains(&v) => {
                         t.font_px = v;
                         true
@@ -235,26 +247,48 @@ impl Theme {
     /// and the wire (a shell's, complete, already validated).
     pub fn to_config(&self) -> alloc::string::String {
         use core::fmt::Write as _;
+        // **Destructured so the compiler enforces completeness.** A field-count assertion catches
+        // a line going missing and not a *field* being added — add one, forget it here, and every
+        // client silently falls back to a default for it, which is the "never receives a partial
+        // theme" property quietly gone (PR #263 review, optional 1). Adding a field to `Theme`
+        // now fails to compile until it is written out.
+        let Theme {
+            background,
+            foreground,
+            face,
+            face_hover,
+            face_pressed,
+            focus_ring,
+            track,
+            thumb,
+            selection,
+            title_active,
+            title_inactive,
+            cursor_body,
+            cursor_outline,
+            outline,
+            font_px,
+        } = *self;
         let mut s = alloc::string::String::new();
         for (k, c) in [
-            ("background", self.background),
-            ("foreground", self.foreground),
-            ("face", self.face),
-            ("face_hover", self.face_hover),
-            ("face_pressed", self.face_pressed),
-            ("focus_ring", self.focus_ring),
-            ("track", self.track),
-            ("thumb", self.thumb),
-            ("selection", self.selection),
-            ("title_active", self.title_active),
-            ("title_inactive", self.title_inactive),
-            ("cursor_body", self.cursor_body),
-            ("cursor_outline", self.cursor_outline),
-            ("outline", self.outline),
+            ("background", background),
+            ("foreground", foreground),
+            ("face", face),
+            ("face_hover", face_hover),
+            ("face_pressed", face_pressed),
+            ("focus_ring", focus_ring),
+            ("track", track),
+            ("thumb", thumb),
+            ("selection", selection),
+            ("title_active", title_active),
+            ("title_inactive", title_inactive),
+            ("cursor_body", cursor_body),
+            ("cursor_outline", cursor_outline),
+            ("outline", outline),
         ] {
             let _ = writeln!(s, "{k} = \"#{:02X}{:02X}{:02X}\"", c.r, c.g, c.b);
         }
-        let _ = writeln!(s, "font_px = {}", self.font_px);
+        let _ = writeln!(s, "font_px = {font_px}");
         s
     }
 }
@@ -265,8 +299,38 @@ impl Theme {
 /// is a theme that can make the machine unusable from a text file.
 pub const MIN_FONT_PX: f32 = 6.0;
 
-/// The largest, for the same reason from the other end: one glyph per window is not a desktop.
-pub const MAX_FONT_PX: f32 = 96.0;
+/// The largest, and it is **not a taste judgement — it is what the chrome holds**.
+///
+/// `text_size().h` is exactly the em size, and the tightest fixed box in the system is a list
+/// row: `ROW_H` is 20 pixels with `ROW_PAD` taking 2 above and 2 below, leaving 16. The window
+/// bars are 24 with 4+4 of button padding, which lands on the same number. That is why the
+/// system's text has always been 16 and not a coincidence anybody chose.
+///
+/// **So this knob shrinks and does not grow**, which is the honest consequence of M11's decision
+/// 2: colour and type are themeable, chrome metrics are not. Text larger than its box is clipped
+/// by `paint`, and rows keep their spacing, so glyphs overlap — a theme file that could ask for
+/// that is a theme file that can make the desktop unreadable, which is the same argument the
+/// lower bound rests on (PR #263 review, blocking 1).
+///
+/// **Trigger for raising it: metrics that follow type.** `ROW_H`, `BAR_H` and `TITLE_BAR_H`
+/// derived from `font_px` would let it grow — and would mean the gates computing their click
+/// points from a theme, which is exactly what decision 2 declined. It is a decision, not an
+/// oversight, and it belongs to whoever revisits that one.
+pub const MAX_FONT_PX: f32 = 16.0;
+
+/// A basic string's contents, or a bare value unchanged — `None` for a half-quoted one.
+///
+/// **Because `trim_matches('"')` accepts what TOML does not.** `"#102030` (one quote) and
+/// `#102030"` both parsed before, which made the doc's claim that every accepted file is valid
+/// TOML false in a way nobody would notice until a real parser read the same file back
+/// (PR #263 review, optional 3).
+fn unquote(value: &str) -> Option<&str> {
+    match (value.starts_with('"'), value.ends_with('"'), value.len()) {
+        (true, true, n) if n >= 2 => Some(&value[1..n - 1]),
+        (false, false, _) => Some(value),
+        _ => None,
+    }
+}
 
 /// Everything before an unquoted `#`.
 fn strip_comment(line: &str) -> &str {
@@ -309,10 +373,10 @@ mod tests {
     #[test]
     fn a_file_overrides_what_it_names_and_nothing_else() {
         let (t, issues) = Theme::from_config(
-            "# my theme\nbackground = \"#102030\"\n\nfont_px = 18.5   # bigger\n",
+            "# my theme\nbackground = \"#102030\"\n\nfont_px = 13.5   # smaller\n",
         );
         assert_eq!(t.background, Rgb::new(0x10, 0x20, 0x30));
-        assert_eq!(t.font_px, 18.5);
+        assert_eq!(t.font_px, 13.5);
         assert_eq!(t.face, Theme::dark().face, "a key the file did not name keeps its default");
         assert!(issues.is_empty(), "{issues:?}");
     }
@@ -353,15 +417,37 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_toml_would_read_differently_is_refused() {
+        // **The doc claims every file this accepts is also valid TOML and means the same thing**,
+        // and `trim_matches('"')` made that false in two ways nobody would notice until a real
+        // parser read the file back (PR #263 review, optional 3).
+        for bad in [
+            "background = \"#102030",   // one quote
+            "background = #102030\"",   // the other
+            "font_px = \"14\"",         // TOML types this as a string, not a number
+        ] {
+            let (t, issues) = Theme::from_config(bad);
+            assert_eq!(t, Theme::dark(), "{bad:?} changed something");
+            assert_eq!(issues.len(), 1, "{bad:?}");
+            assert_eq!(issues[0].kind, IssueKind::BadValue, "{bad:?}");
+        }
+        // Both forms TOML *does* accept still work: a quoted string and a bare number.
+        let (t, issues) = Theme::from_config("background = \"#102030\"\nfont_px = 14\n");
+        assert_eq!(t.background, Rgb::new(0x10, 0x20, 0x30));
+        assert_eq!(t.font_px, 14.0);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
     fn a_font_size_outside_the_readable_range_is_refused() {
         // Zero divides in the layout; a huge one puts a single glyph in a window. Both are a
         // theme file that renders nothing usable, which is the state this must not reach.
-        for bad in ["0", "-4", "0.5", "1000", "nan"] {
+        for bad in ["0", "-4", "0.5", "17", "1000", "nan"] {
             let (t, issues) = Theme::from_config(&alloc::format!("font_px = {bad}"));
             assert_eq!(t.font_px, Theme::dark().font_px, "font_px = {bad}");
             assert_eq!(issues.len(), 1, "font_px = {bad}");
         }
-        for good in ["6", "16", "18.5", "96"] {
+        for good in ["6", "10", "13.5", "16"] {
             let (_, issues) = Theme::from_config(&alloc::format!("font_px = {good}"));
             assert!(issues.is_empty(), "font_px = {good} should be accepted");
         }

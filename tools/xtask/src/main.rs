@@ -55,6 +55,14 @@ const ESP_SIZE_MIB: u64 = 48;
 const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
+
+/// The `font_px` the staged `theme.toml` carries — **deliberately not the built-in 16**.
+///
+/// A gate asserting the default proves nothing: a client that never received the theme reports
+/// the same number, so the assertion passes with the wire cut. This one can only have come from
+/// the file, through the shell, onto the setup record and into a window (PR #263 review,
+/// blocking 2). It is inside what the fixed chrome holds, which is what `MAX_FONT_PX` bounds.
+const THEME_FONT_PX: u8 = 14;
 const DEMO_SALT: [u8; 8] = [0x9e, 0x3f, 0xa2, 0x5c, 0x71, 0x0b, 0xd4, 0x86];
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -1777,7 +1785,17 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // Part C). It comes from the user's own subtree rather than `/etc`, because a session
     // namespace binds `/home` and has no `/etc` — no new authority, and the file is somewhere a
     // person can actually delete.
-    session.expect("desktop-shell: theme read from /home/theme.toml")?;
+    // **One line whichever way it went**, which is what lets the "delete the file" control run
+    // against this gate rather than needing this step edited out (PR #263 review, finding 4).
+    // What it takes from the line is the size the shell *resolved*; the client's own line is
+    // compared against it below.
+    session.expect("desktop-shell: theme ")?;
+    let theme_line = session.rest_of_line()?;
+    let shell_px = theme_line
+        .rsplit_once("font_px ")
+        .and_then(|(_, n)| n.trim().parse::<u32>().ok())
+        .ok_or_else(|| format!("no font_px in the shell's theme line: {theme_line:?}"))?;
+    println!("  ok: the shell resolved a theme ({})", theme_line.trim());
     // **The narrow bind, which is what closed the `manage-ungated` deferral.** The shell builds
     // an application namespace and checks it *before* launching into it: `/dev/draw/new`
     // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
@@ -2676,7 +2694,21 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // disk, through one reader in the shell, onto the setup record every launch already carries,
     // and into a window. It is asserted here because it is the first thing the client says — it
     // reads what the session told it before it reads a directory.
-    session.expect("nxfiles: theme font_px 16")?;
+    // **The same number at both ends**, which is what says the theme crossed the wire rather than
+    // each end reaching for its own default.
+    session.expect(&format!("nxfiles: theme font_px {shell_px}"))?;
+    // **And that it is the staged one**, which is what gates the *file*. `THEME_FONT_PX` is not
+    // the built-in size, so a shell that stopped putting the theme on the setup record — or a
+    // client that stopped reading it — reports 16 and fails here. **This is the one line the
+    // "delete the theme file" control removes**, because that control is about the run where no
+    // file exists.
+    if shell_px != u32::from(THEME_FONT_PX) {
+        return Err(format!(
+            "the session resolved font_px {shell_px}, but the image staged {THEME_FONT_PX} — \
+             the shell did not read the file the build wrote"
+        )
+        .into());
+    }
     // **It starts at `HOME`**, which is the binding the shell gave it and not a path compiled
     // in. The count is read rather than asserted: what is in a user's home is the image's
     // business, and a gate that pinned it would fail the first time anything else wrote there.
@@ -7838,7 +7870,11 @@ fn assemble_image(
     {
         let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n");
         text.push_str("# Colours are \"#RRGGBB\"; font_px is a size in pixels per em.\n\n");
-        text.push_str(&libdraw::theme::Theme::dark().to_config());
+        // Written from `Theme::dark()` so the file and the constants cannot drift — except for
+        // the one field the gate reads back, which is deliberately not the default.
+        let mut shipped = libdraw::theme::Theme::dark();
+        shipped.font_px = f32::from(THEME_FONT_PX);
+        text.push_str(&shipped.to_config());
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
     }

@@ -428,7 +428,15 @@ impl Record {
     pub fn with_str_field(mut self, name: &str, value: &str) -> Self {
         let v = Value::Str(String::from(value));
         match self.schema.fields.iter().position(|f| f.name == name) {
-            Some(i) => self.values[i] = v,
+            Some(i) => {
+                // **The tag moves with the value.** Overwriting a `List` field with a string and
+                // leaving the schema saying `List` is a record whose own description is wrong —
+                // harmless for `THEME`, which is always a string, and a trap for the first caller
+                // who replaces something else (PR #263 review, optional 4).
+                self.schema.fields[i].ty = TypeTag::String;
+                self.schema.fields[i].modifiers = TypeModifiers::NONE;
+                self.values[i] = v;
+            }
             None => {
                 self.schema = self.schema.field(name, TypeTag::String, TypeModifiers::NONE);
                 self.values.push(v);

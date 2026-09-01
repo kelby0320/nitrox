@@ -105,8 +105,6 @@ const BAR_H: u32 = 24;
 const SCREEN_H: i32 = 800;
 /// Bytes per row.
 const BAR_PITCH: usize = (SCREEN_W as usize) * 4;
-/// Text size, in pixels per em.
-const FONT_PX: f32 = 16.0;
 /// How many buffers the bar attaches.
 const BUFFERS: usize = 2;
 
@@ -401,7 +399,7 @@ fn render_window_bar(
     let mut fb = MemFramebuffer::new(geometry);
     let ui = window_bar_view(shown, label);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
@@ -421,10 +419,15 @@ const ROW_H: u32 = 20;
 /// The applications modal's element tree: a filter field over a list of `/bin` programs.
 ///
 /// **The theme is passed in rather than built here**, and that is not tidiness. This function
-/// builds widgets while its caller *paints* them, and the caller's theme is
-/// `Theme { font_px: FONT_PX, ..Theme::default() }` — equal to the default today only because
-/// `FONT_PX` happens to be `16.0`. Two themes in one frame is a thing the old two-type split made
-/// unwriteable and one type makes easy, so the fix is to have one (PR #262 review, optional 5).
+/// builds widgets while its caller *paints* them, and two themes in one frame is a thing the old
+/// `Theme`/`Palette` split made unwriteable and one type makes easy (PR #262 review, optional 5).
+///
+/// **The same mistake arrived a second time through the metrics**, which is worth stating here
+/// because this is where it was first argued: M11 Part C took the theme from a file and left
+/// every `layout()` measuring at a hardcoded 16, so text was laid out at one size and painted at
+/// another — clipped and overlapping for every size but the default. There is no size constant
+/// in this crate now; there is a theme, and both the measure and the paint come from it
+/// (PR #263 review, blocking 1).
 fn modal_view(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
@@ -459,7 +462,7 @@ fn render_modal(
     // it hands to every application, or it themes the windows and not the bars around them.
     let ui = modal_view(query, rows, state, theme);
     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
@@ -508,7 +511,7 @@ fn render_bar(theme: &Theme, font: &Font) -> MemFramebuffer {
     let mut fb = MemFramebuffer::new(geometry);
     let ui = bar_view();
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
@@ -1123,23 +1126,52 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
 /// desktop that shipped. A theme is decoration, and a desktop that will not start because its
 /// colours did not parse is a worse failure than any colour could be.
 fn read_theme(ns: u64) -> Theme {
-    let Ok(bytes) = libfs::read_file(ns, THEME_PATH.as_bytes()) else {
-        Line::new().s(b"desktop-shell: no ").s(THEME_PATH.as_bytes()).s(b"; using the built-in theme").end();
-        return Theme::default();
+    // **One line whatever happens, beginning the same way**, so a gate can assert that the shell
+    // *decided* about a theme without asserting which way it went — which is what makes "delete
+    // the file and everything still renders" a control that can be re-run against the committed
+    // gate rather than one that needs a step edited out (PR #263 review, finding 4).
+    let bytes = match libfs::read_file(ns, THEME_PATH.as_bytes()) {
+        Ok(b) => b,
+        Err(e) => {
+            // **Absent and unreadable are different**, and saying "no such file" about a file
+            // that is sitting there is how somebody spends an afternoon looking for it.
+            let why: &[u8] = match e {
+                libfs::FileError::NotFound => b" absent; using the built-in theme",
+                libfs::FileError::TooLarge => b" too large to read; using the built-in theme",
+                _ => b" could not be read; using the built-in theme",
+            };
+            let t = Theme::default();
+            Line::new()
+                .s(b"desktop-shell: theme ")
+                .s(THEME_PATH.as_bytes())
+                .s(why)
+                .s(b", font_px ")
+                .u(t.font_px as u64)
+                .end();
+            return t;
+        }
     };
     let Ok(text) = core::str::from_utf8(&bytes) else {
-        Line::new().s(b"desktop-shell: ").s(THEME_PATH.as_bytes()).s(b" is not UTF-8; using the built-in theme").end();
-        return Theme::default();
+        let t = Theme::default();
+        Line::new()
+            .s(b"desktop-shell: theme ")
+            .s(THEME_PATH.as_bytes())
+            .s(b" is not UTF-8; using the built-in theme, font_px ")
+            .u(t.font_px as u64)
+            .end();
+        return t;
     };
     let (theme, issues) = Theme::from_config(text);
     Line::new()
-        .s(b"desktop-shell: theme read from ")
+        .s(b"desktop-shell: theme ")
         .s(THEME_PATH.as_bytes())
+        .s(b" read")
         .s(b" (")
         .u(bytes.len() as u64)
         .s(b" bytes, ")
         .u(issues.len() as u64)
-        .s(b" ignored)")
+        .s(b" ignored), font_px ")
+        .u(theme.font_px as u64)
         .end();
     // **Each one named, up to a bound.** A person editing colours needs the line number, and a
     // file of a thousand bad lines must not become a thousand console lines.
@@ -2774,7 +2806,7 @@ fn render_overview(
         SIDE_W,
         SCREEN_H as u32 - BAR_H,
     );
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&side, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.

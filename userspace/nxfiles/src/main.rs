@@ -42,8 +42,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
-/// Text size, matching the toolkit's default theme.
-const FONT_PX: f32 = 16.0;
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
@@ -251,7 +249,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     loop {
         // ---- render ----
         let ui = app.view(&theme);
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, FONT_PX));
+        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
             // A malformed tree is a bug in `view`, not a runtime condition.

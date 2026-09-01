@@ -3144,13 +3144,19 @@ it is noticed on. Its own list, and its own milestone.
       number rather than a colour, because colours are pixels and this gate boots a release image
       with nothing rendered to read.
 
-      **Two controls, each run alone.** A file with `font_px = 21` makes the client report 21 and
-      fails the gate — so the value travels from disk, through one reader, onto the setup record
-      and into a window, rather than every end happening to agree on a default. And **the file
-      deleted entirely**: the shell logs `no /home/theme.toml; using the built-in theme` and the
-      *whole gate passes* — greeter, bars, work area, snap zones, the modal, the editor, the drag
-      and the drop. A theme mechanism a missing file can break is worse than no mechanism, and
-      that is checked rather than claimed.
+      **The staged file carries `font_px = 14`, which is not the built-in 16** — and that is the
+      gate rather than decoration. A gate asserting the default proves nothing: a client that
+      never received the theme reports the same number, so the assertion passes with the wire
+      cut. It also asserts the shell's resolved size and the client's *agree*, which holds
+      whichever way the theme came.
+
+      **Two controls, each run alone.** Delete the shell's `with_str_field` — the theme never
+      reaches the wire — and the shell says 14 while the client says 16, so the gate fails. And
+      **the file deleted entirely** (with the one staged-value check removed, which the code
+      names): the shell logs `theme /home/theme.toml absent; using the built-in theme, font_px 16`,
+      the client agrees at 16, and the *whole gate passes* — greeter, bars, work area, snap zones,
+      the modal, the editor, the drag and the drop. A theme mechanism a missing file can break is
+      worse than no mechanism, and that is checked rather than claimed.
 
       The absent-file *decision* is also a host test on `Theme::from_config`, where an empty
       file, a comment-only file and a file of typos are each exactly the built-in theme.
