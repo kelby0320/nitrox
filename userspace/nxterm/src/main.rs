@@ -22,7 +22,7 @@ mod backend;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
+use libdraw::text::{Font, load_mono, load_ui};
 use libkern::{exit, kprint};
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
@@ -104,11 +104,11 @@ impl Popup {
         parent: u32,
         anchor: Rect,
         app: &App,
-        font: &Font,
+        ui_font: &Font,
         theme: &Theme,
     ) -> Option<Self> {
         let menu = app.menu_view(theme);
-        let m = FontMetrics::new(font, theme.font_px);
+        let m = FontMetrics::new(ui_font, theme.font_px);
         let size = measure(&menu, Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &m);
         if size.w == 0 || size.h == 0 {
             return None;
@@ -163,18 +163,18 @@ impl Popup {
         &mut self,
         session: &mut Session<Box<ChannelTransport>>,
         app: &App,
-        font: &Font,
+        ui_font: &Font,
         theme: &Theme,
     ) -> bool {
         let menu = app.menu_view(theme);
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
-        let l = layout(&menu, bounds, &FontMetrics::new(font, theme.font_px));
+        let l = layout(&menu, bounds, &FontMetrics::new(ui_font, theme.font_px));
         match self.tree.update(&menu, &l) {
             Ok(None) => return true, // nothing changed; the frame on screen is still right
             Ok(Some(_)) => {}
             Err(_) => return false,
         }
-        paint(&mut self.scratch, font, theme, &menu, &l, bounds, &mut |_, _, _, _| {});
+        paint(&mut self.scratch, ui_font, theme, &menu, &l, bounds, &mut |_, _, _, _| {});
         let Some(mut w) = session.window(self.id) else { return false };
         let Ok(b) = self.pool.acquire(&mut w, self.size) else { return false };
         if !self.pool.write(b, self.scratch.bytes()) {
@@ -208,7 +208,8 @@ fn draw(
     app: &App,
     ui: &libui::element::Element<Msg>,
     l: &Layout,
-    font: &Font,
+    ui_font: &Font,
+    mono_font: &Font,
     theme: &Theme,
     damage: Rect,
 ) {
@@ -217,7 +218,7 @@ fn draw(
     let grid = &app.grid;
     let palette = app.palette;
     let top = app.view_line();
-    paint(fb, font, theme, ui, l, damage, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
+    paint(fb, ui_font, theme, ui, l, damage, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
         if kind != GRID_KIND {
             return;
         }
@@ -234,7 +235,7 @@ fn draw(
             fb.fill_rect(clip, palette.background);
         }
         let rows = rows_in(clip, origin, &m, grid.rows());
-        libterm::render::render_view(fb, grid, font, &m, &palette, origin, top, &rows);
+        libterm::render::render_view(fb, grid, mono_font, &m, &palette, origin, top, &rows);
     });
 }
 
@@ -322,16 +323,65 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // number and draw it with another.
     let theme = theme_of(&env);
 
+    // **Two fonts, and this is the one window in the system that needs both** (M11 Part D). The
+    // menu bar and its popup are widgets and take the proportional face; the grid takes the
+    // fixed-advance one, because `libterm` measures a cell from a single glyph's advance and a
+    // proportional font has no cell width at all. Loading one and using it for both is what the
+    // whole desktop did until this part, and here it would have been visible as a terminal whose
+    // columns did not line up.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
-        Ok(f) => f,
-        Err(_) => fail(b"nxterm: could not load the system font\n"),
+    let (ui_font, _) = match unsafe { load_ui(root_ns, &theme, b"nxterm") } {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            libkern::debug::Line::new().s(b"nxterm: the UI font ").s(e.why()).end();
+            fail(b"nxterm: font load FAILED\n");
+        }
+    };
+    // SAFETY: as above.
+    let (mono_font, mono_path) = match unsafe { load_mono(root_ns, &theme, b"nxterm") } {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            libkern::debug::Line::new().s(b"nxterm: the grid font ").s(e.why()).end();
+            fail(b"nxterm: font load FAILED\n");
+        }
     };
     // **The grid's cell size follows the theme like the chrome does.** A terminal whose window
     // frame drew at one size and whose cells drew at another would be two type scales in one
     // window — the same mistake as laying out with one size and painting with another, one
     // surface further in (PR #263 review, blocking 1).
-    let metrics = Metrics::new(&font, theme.font_px);
+    let metrics = Metrics::new(&mono_font, theme.font_px);
+    // **The cell, said out loud, because a grid drawn in the wrong font is not a crash.**
+    // `Metrics` takes a cell's width from one glyph's advance, so a proportional face here
+    // produces a plausible number and then draws every column at the wrong x. `check-terminal`
+    // recomputes this from the same face on the host and compares, which is a claim the pixels
+    // cannot make from inside the guest (M11 Part D).
+    //
+    // **`mono_path`, not `theme.font_mono`** — the path the load *returned*, which is the
+    // built-in one whenever the theme named a font that would not open. Naming the requested
+    // file here would put a font this process never read on a line the gate feeds straight back
+    // into `host_font` (PR #264 review, finding 1).
+    //
+    // **And the size as two integers**, because `.u()` truncates and the host re-measures at
+    // whatever this says: a grid drawn at 13.5 and reported as 13 is a cell a pixel short and a
+    // gate blaming the font for it. `from_config` rounds to a hundredth, so these two are the
+    // whole value.
+    let (px_whole, px_cents) = libdraw::theme::px_parts(theme.font_px);
+    libkern::debug::Line::new()
+        .s(b"nxterm: grid font ")
+        .s(mono_path.as_str().as_bytes())
+        .s(b", cell ")
+        .u(metrics.cell_w as u64)
+        .s(b"x")
+        .u(metrics.cell_h as u64)
+        .s(b" at ")
+        .u(px_whole)
+        .s(b".")
+        // Zero-padded: `.5` hundredths is `.05`, and a line reading `13.5` would be re-measured
+        // at 13.5 rather than the 13.05 it meant.
+        .s(if px_cents < 10 { &b"0"[..] } else { &b""[..] })
+        .u(px_cents)
+        .s(b"px")
+        .end();
     let mut app = App::new(COLS, ROWS, metrics);
 
     let size = app.window_size();
@@ -430,7 +480,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     loop {
         // ---- render ----
         let ui = app.view(&theme);
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+        let l = layout(&ui, bounds, &FontMetrics::new(&ui_font, theme.font_px));
         // The anchor for the next frame's popup. Read every frame rather than only when the
         // menu opens: the item's position is a fact about the layout, not about the menu.
         app.menu_anchor = locate(&ui, &l, MENU_ITEM_KEY);
@@ -444,7 +494,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // anchor computed just above rather than the one from when the menu was toggled.
         match (app.menu_open, popup.is_some(), app.menu_anchor) {
             (true, false, Some(anchor)) => {
-                popup = Popup::open(&mut win, window_id, anchor, &app, &font, &theme);
+                popup = Popup::open(&mut win, window_id, anchor, &app, &ui_font, &theme);
                 // **Where it is and how big**, because the gate has no other way to see a
                 // second window: it reads the serial log, and this is the only thing that
                 // says the menu became a window rather than a layer. The origin is in screen
@@ -476,7 +526,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             _ => {}
         }
         if let Some(p) = popup.as_mut()
-            && !p.present(&mut win, &app, &font, &theme)
+            && !p.present(&mut win, &app, &ui_font, &theme)
         {
             kprint(b"nxterm: the menu popup could not be drawn\n");
         }
@@ -512,7 +562,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
 
         if let Some(d) = damage {
-            draw(&mut scratch, &app, &ui, &l, &font, &theme, d);
+            draw(&mut scratch, &app, &ui, &l, &ui_font, &mono_font, &theme, d);
             let Some(mut w) = win.window(window_id) else {
                 fail(b"nxterm: our own window is gone\n");
             };
@@ -676,7 +726,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if popup.as_ref().is_some_and(|p| p.id == from) {
             let menu = app.menu_view(&theme);
             let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
-            let ml = layout(&menu, bounds, &FontMetrics::new(&font, theme.font_px));
+            let ml = layout(&menu, bounds, &FontMetrics::new(&ui_font, theme.font_px));
             let msgs: alloc::vec::Vec<Msg> = match event {
                 WindowEvent::Key(k) => popup
                     .as_mut()

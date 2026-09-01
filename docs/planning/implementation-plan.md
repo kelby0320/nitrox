@@ -123,7 +123,15 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     highlights what would take a payload.
     **There is no Part F**: the details pass counted six, and the sixth — graduating
     `display-substrate.md` — was retired as "not a part" and paid off under M9's account on
-    2026-08-30, where the debt belonged. (Desktops and the applications milestone — M8, and what is now M10 — were
+    2026-08-30, where the debt belonged.
+    **M11 — in progress (A–D of F landed 2026-09-01)**: `xtask preview`, which renders the
+    toolkit's reference on the host so a judgement about how something looks costs a second
+    rather than a boot (A); one `Theme` in `libdraw`, where the compositor and the toolkit can
+    both reach it (B); that theme read from `/home/theme.toml` and handed to each application on
+    the setup record it already gets (C); and **the UI font stopping being a terminal font** (D)
+    — two font roles, a proportional face for every label in the system and the fixed-advance one
+    kept for the grid. What remains is the polish passes (E), driven by a list the maintainer
+    writes while test-driving, and a control panel (F) that is allowed to slip to M12. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
     Design in

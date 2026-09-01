@@ -11,7 +11,7 @@
 //! not prove:
 //!
 //! - that a **font loaded from a file at runtime** rasterises the same glyphs as one compiled
-//!   into the host tool — the guest reads `/system/fonts/DejaVuSansMono.ttf` through
+//!   into the host tool — the guest reads `/system/fonts/DejaVuSans.ttf` through
 //!   `fs-server-ext4`, and until this existed nothing on the target had ever loaded a font;
 //! - that the toolkit behaves the same **compiled for the target** — different integer
 //!   widths in a layout calculation, a different float path in the rasterizer;
@@ -279,7 +279,7 @@ pub fn render(font: &Font) -> MemFramebuffer {
 mod tests {
     use super::*;
 
-    const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+    const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
     fn font() -> Font {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")

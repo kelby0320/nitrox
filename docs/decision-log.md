@@ -20631,3 +20631,167 @@ then reached for `git checkout <file>` to undo it — the one command this proje
 to use, because it destroys uncommitted work. It cost re-applying this session's `xtask` edits;
 nothing else, because the part was already committed. The rule stands and the reason it exists is
 now a second time: **copy the file aside, never check it out.**
+
+## 2026-09-01 — M11 Part D: two font roles, and a gate that compares two things that moved together
+
+The desktop drew itself in `DejaVuSansMono` because `SYSTEM_FONT_PATH` was one constant and
+every client loaded it. Every label, every button, every list row and every menu in the system
+was monospaced. This part is one asset, one licence stanza already present, and a field — and it
+changes every window there is.
+
+### Two constants, and the old name deleted
+
+`UI_FONT_PATH` and `MONO_FONT_PATH` replace `SYSTEM_FONT_PATH`, which is *removed* rather than
+kept as an alias. Keeping it would have left every existing call site compiling — which is to
+say, would have left every existing call site not having chosen. Deleting it turns the choice
+into a build error at each of the six programs that load a font, which is the whole content of
+the change: `desktop-shell`, `nxfiles`, `nxedit` and the greeter take the proportional face,
+`nxterm` takes **both**, and `ui-testclient` loads both because it presents one reference picture
+of each kind.
+
+`nxterm` is the interesting one and it is not a special case: its menu bar and its dropdown are
+widgets and its grid is not. A terminal that drew its menus in the grid's font would be the state
+this part exists to leave.
+
+### The theme names the file, so `Theme` needed a path it could hold in a `const`
+
+Part B made `Theme::dark()` a `const fn` so the compositor could keep `const CURSOR_BODY: Rgb =
+Theme::dark().cursor_body;`. A `String` field would have ended that, and a heap allocation cannot
+appear in a constant at all. So `FontPath` is a fixed 64-byte buffer with a length — `Copy`,
+`const`-constructible, zero-filled past its end so the derived equality compares *paths* rather
+than the debris of whatever longer path a slot held before.
+
+The bound is not a limitation reluctantly accepted. The theme travels to each application on the
+setup record, which is one 4 KiB IPC message carrying all of argv and the environment; a path a
+theme file could make arbitrarily long is a theme file that could stop applications from
+launching. 64 bytes holds `/system/fonts/` and a long family name with room to spare.
+
+Two constructors, and the split is the same one `font_px` has: `new` is `const` and panics, for
+literals, so the built-in theme's paths are checked when the crate compiles; `parse` answers
+`Option`, for the file.
+
+### Where the existence check goes, and why it is not with the others
+
+Every other bad value in a theme file is caught in `Theme::from_config` and leaves one field at
+its default. A font path cannot be: the shell parses the file, but the path resolves in the
+*application's* namespace, and two applications can legitimately answer differently. So the
+syntax is checked where the rest is and the existence is checked where the font is loaded —
+`load_ui` / `load_mono` fall back to the built-in face for that role, print the path and the
+reason, and carry on. A theme that names a font this machine does not have must not cost the
+desktop its text, which is the same stance as everything else in that schema.
+
+`LoadError::why()` came out of this: five programs had each spelled the five reasons out, so the
+same failure read differently depending on which one hit it.
+
+### The gate, and the thing it structurally cannot see
+
+`check-display` compares a host render against the guest's screen. Both sides moved here, which
+is the point — and it means the gate's central claim needs care, because **a change made on both
+sides at once stays green**. Rendering the toolkit's window in the terminal's font is exactly
+that shape: one constant, two consumers.
+
+Three things cover it, and each covers a different mistake:
+
+- The host renders each reference through `font_asset`, the *same* mapping the image build stages
+  with, from paths taken from `Theme::dark()`. So "the guest reads the file the host drew with"
+  is a property of the build rather than two lists somebody keeps equal. Point the theme at a
+  face nothing stages and the image, the previews and the gate fail together and say so.
+- `check-display` expects the guest to name both faces in the order it loads them. That catches a
+  *client* taking the wrong role — the half the pixels cannot see.
+- A host test asserts the two roles are **different files**. That catches the theme collapsing
+  them, which is the one-constant version of the same mistake, and is the state the system was in
+  before this part. Controlled: pointing `font_ui` at the mono path fails it.
+
+**And `check-terminal` recomputes the cell on the host.** Handing `libterm` a proportional face
+is not a crash — `Metrics` takes a cell's width from one glyph's advance, so it gets a plausible
+number and then draws every column at the wrong x. Every other assertion in that gate is about
+*cells*, so every one of them would still pass. The guest now says which face it measured with
+and what it got; the host measures the same file at the size the guest reports and compares.
+Controlled: measuring with the UI face fails with `the guest measured a 12x16 cell … the host
+makes it 9x16`.
+
+The size is taken from the guest's line rather than assumed, because the image stages a theme
+with a deliberately non-default `font_px` and pinning the number here would pin that file to this
+gate. What is *not* taken from the guest is the answer — the cell size is the font's, computed
+independently on the host, which is what makes it an assertion rather than a receipt.
+
+The property itself is a host test in `libterm`, and it now has the negative control it could not
+have before: "every glyph has the same advance" is a claim about a *file*, and until this part
+there was only one file in the system, so nothing could tell a test that checks the property from
+one that restates which font was loaded. The desktop's own face fails it, deliberately.
+
+### What did not move
+
+Chrome metrics, and that is decision 2 doing its job rather than luck. `check-login` clicks the
+apps button at (60, 12) inside a fixed 120-pixel button, window-list entries at a fixed 180, and
+title bars at `+13` — none of which is derived from text. Every one of those clicks landed
+unchanged with a proportional font under it. The one visible difference is that `nxterm`'s menu
+popup is now 59×52 rather than what a monospaced menu measured, and the gate reads that size from
+the line instead of asserting it, so it followed.
+
+`DejaVuSans.ttf` is 760 KiB, more than twice the mono face, and it lives on the root filesystem
+where fonts have always lived — nothing that draws text runs before the root is mounted. One
+licence file covers both: DejaVu's notice is a single `Files: *` stanza over the family, which is
+most of why this face rather than a nicer one from a different foundry.
+
+## 2026-09-01 — Part D's review: the path that was opened, and a size that survives a fraction
+
+No blocking findings. Three things worth fixing, and two of them are the same mistake at
+different distances from the wire: **a program reporting what it asked for rather than what it
+got.**
+
+### A fallback that nothing downstream could see
+
+`load_ui`/`load_mono` substitute the built-in face when a theme names a font that will not open —
+and returned only the `Font`, so every caller that wanted to *say* which font it was using had to
+name the path it had asked for. In four of the five that was a console line slightly out of step
+with reality. In `nxterm` it was worse, because that line is not decoration: `check-terminal`
+feeds the path straight back into `host_font` and re-measures with it. A theme naming an absent
+mono face would have had the guest measuring one file and the host another, and the gate would
+have reported a wrong font in a run where the fallback had worked correctly.
+
+They return `(Font, FontPath)` now — the path that was actually opened. Controlled: with
+`font_mono = "/home/NoSuchMono.ttf"` staged, `nxterm` reports
+`grid font /system/fonts/DejaVuSansMono.ttf, cell 8x14 at 14.00px`, which is the file it read.
+
+The same misattribution had reached `xtask`: `font_asset`'s error said "the built-in theme names
+…", which is true for the staging and the reference renders and false for the one caller whose
+path arrives off the guest's serial line. It no longer says where the path came from, because two
+callers supply it.
+
+### A number printed as an integer and read back as a float
+
+`nxterm` printed the size with `.u()`, which truncates; the gate parsed `f32` and re-measured at
+that number. The gate's whole design is to take the size *from the line* rather than pin it —
+pinning it would pin the staged theme to this gate — and that property held only while the size
+happened to be integral. At 13.5 the guest measures a 7x14 cell, the host recomputes 7x13, and
+the gate blames the font.
+
+Two changes, and the second is what makes the first exact. The line prints whole pixels and
+hundredths (`14.00px`, zero-padded, because `.5` hundredths is `.05`). And `Theme::from_config`
+now **rounds `font_px` to the nearest hundredth**, so every size the system can hold is a size
+that line can print without loss. That is a precision decision rather than a rounding accident: a
+hundredth of a pixel is far below what a rasteriser resolves, and what it buys is that "the size
+printed is the size used" is true by construction rather than by luck about which values people
+choose.
+
+### The rest
+
+`uiclient`'s module doc still said the toolkit window reads `DejaVuSansMono.ttf` — the identical
+sentence in `libui::reference` was updated in the same diff, so the two disagreed about one fact,
+in the file somebody reads before touching that gate.
+
+`load_themed` re-issued the failing load when there was nothing to fall back to; it returns the
+error it already has. `MAX_FONT_PATH` and `len: u8` are coupled by a `const` assertion now, so
+raising the bound past 255 is a build failure rather than a silent truncation.
+
+**And a quote in a font path escaped the claim the whole file rests on.** `usable` allowed
+`0x22`, so `font_ui = "/home/a"b.ttf"` round-tripped through *this* reader and would read as
+something else in any other TOML parser — the exact argument the unquoted-`font_px` rule rests
+on, applied to the other end of the string. Quotes and backslashes are refused.
+
+**One comment claimed coverage nothing could check.** The zero fill in `FontPath` was justified
+as defending against "a constructor that left a previous path's tail behind", and no constructor
+here can: both start from a fresh array. The reviewer's control — filling with `0xFF` instead —
+left every test in the file green. The test is not vacuous; its `as_str`/`Debug` half fails five
+ways if `len` stops bounding the slice. The comment now says which half bites.

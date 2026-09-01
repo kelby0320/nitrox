@@ -308,6 +308,10 @@ mod tests {
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
 
+    /// The *other* face the image ships — the desktop's, since M11 Part D. Here only as a
+    /// counterexample; nothing in this crate should ever draw with it.
+    const DEJAVU_SANS: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+
     fn font() -> Font {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
     }
@@ -363,6 +367,26 @@ mod tests {
         for c in ['i', 'M', 'W', '.', '0'] {
             assert_eq!(f.advance(c, 16.0), m.cell_w, "{c:?} has a different advance");
         }
+    }
+
+    #[test]
+    fn the_desktops_own_font_would_fail_the_test_above() {
+        // **The negative control for the assertion above, and it is the reason two fonts ship.**
+        // "Every glyph has the same advance" is a claim about the *file*, and until M11 Part D
+        // there was only one file in the system, so nothing could tell a test that checks the
+        // property from one that restates which font was loaded. Since Part D `nxterm` loads two
+        // — the proportional face for its menus, this one for its grid — and picking the wrong
+        // one is a live mistake rather than an impossible one.
+        //
+        // What it would look like is not a crash: `Metrics::new` takes `M`'s advance and every
+        // other glyph then draws at the wrong x, so the columns drift across the row and the
+        // damage rectangles stop matching the cells. Cheap to catch here, expensive to see.
+        let sans = Font::from_bytes(DEJAVU_SANS.to_vec()).expect("the vendored font parses");
+        let m = Metrics::new(&sans, 16.0);
+        assert!(
+            ['i', 'M', 'W', '.', '0'].iter().any(|&c| sans.advance(c, 16.0) != m.cell_w),
+            "a proportional font measured as though it had a cell width: {m:?}"
+        );
     }
 
     #[test]

@@ -2692,7 +2692,7 @@ mod tests {
         );
     }
 
-    const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+    const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
     fn font() -> libdraw::text::Font {
         libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")

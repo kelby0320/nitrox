@@ -104,10 +104,13 @@ pub struct NamespaceSpec<'a> {
     /// Bind `/system/fonts` into the session, read-only.
     ///
     /// **A graphical session needs a font and a constructed namespace has none.** Every GUI
-    /// client before M7 Part E ran with an inherited *root* namespace and read
-    /// `/system/fonts/DejaVuSansMono.ttf` from there; `desktop-shell` is the first to run in a
-    /// namespace someone built, and it could not find one — the symptom was a leader that
-    /// logged "up" and exited.
+    /// client before M7 Part E ran with an inherited *root* namespace and read its font from
+    /// there; `desktop-shell` is the first to run in a namespace someone built, and it could not
+    /// find one — the symptom was a leader that logged "up" and exited.
+    ///
+    /// The directory rather than a file, which is what let M11 Part D put a second face in it
+    /// without touching a session's authority: what a client loads is named by its theme, and
+    /// both faces are under this one bind.
     ///
     /// **A flag rather than always**, symmetric with [`bind_console`](Self::bind_console) and
     /// for the same reason: a serial session has no use for a font, and a member bound for

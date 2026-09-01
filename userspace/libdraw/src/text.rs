@@ -28,6 +28,9 @@
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "io")]
+use crate::theme::FontPath;
+
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
 
 use crate::format::Rgb;
@@ -169,13 +172,22 @@ impl Font {
     }
 }
 
-/// Where the system font is bound on the root filesystem.
+/// Where the proportional face is bound on the root filesystem — the desktop's own font.
 ///
 /// **On the root filesystem, not in the initramfs.** The boot image carries only what cannot
 /// come from a filesystem — see `docs/rationale/deferred-decisions.md`
 /// (`initramfs-minimisation`) — and nothing that draws text runs before the root is mounted.
-/// A 343 KiB font would have been larger than every program in the boot image put together.
-pub const SYSTEM_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
+/// A 343 KiB font would have been larger than every program in the boot image put together,
+/// and this one is larger still.
+pub const UI_FONT_PATH: &str = "/system/fonts/DejaVuSans.ttf";
+
+/// Where the fixed-advance face is bound — the terminal's.
+///
+/// **Two constants rather than one `SYSTEM_FONT_PATH`, which is the whole of M11 Part D at the
+/// bottom of the stack.** There was one path and every client loaded it, so every label in every
+/// window was monospaced. Deleting the old name rather than keeping it as an alias is the point:
+/// a call site that did not choose a role no longer compiles.
+pub const MONO_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
 
 /// The largest font file [`load`] will read.
 ///
@@ -197,6 +209,23 @@ pub enum LoadError {
     Unmappable,
     /// The bytes are not a font this rasteriser can parse.
     NotAFont,
+}
+
+#[cfg(feature = "io")]
+impl LoadError {
+    /// Why, in the words a console line wants.
+    ///
+    /// **One phrasing for every caller.** Five programs load fonts and each had spelled these
+    /// out itself, so the same failure read differently depending on which one hit it.
+    pub const fn why(self) -> &'static [u8] {
+        match self {
+            LoadError::NoBinding => b"did not resolve (is it staged into the rootfs?)",
+            LoadError::Unstattable => b"stat failed",
+            LoadError::ImpossibleSize(_) => b"is empty, or larger than the cap",
+            LoadError::Unmappable => b"could not be mapped",
+            LoadError::NotAFont => b"is not a parseable font",
+        }
+    }
 }
 
 /// Load a font from `path` in `root_ns`.
@@ -252,6 +281,89 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     let _ = obj.unmap(addr as *mut u8, size);
 
     Font::from_bytes(data).ok_or(LoadError::NotAFont)
+}
+
+/// Load the proportional face a theme names, falling back to the built-in one.
+///
+/// Returns the face **and the path it actually came from**, which is not always the one the
+/// theme asked for — see [`load_themed`]. A caller that reports which font it is using must
+/// report this one, or it names a file it never opened.
+///
+/// `who` prefixes the console line a fallback prints — the calling program's name, as every
+/// other line it writes is prefixed.
+///
+/// # Safety
+///
+/// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
+#[cfg(feature = "io")]
+pub unsafe fn load_ui(
+    root_ns: u64,
+    theme: &crate::theme::Theme,
+    who: &[u8],
+) -> Result<(Font, FontPath), LoadError> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { load_themed(root_ns, theme.font_ui, crate::theme::Theme::dark().font_ui, who) }
+}
+
+/// Load the fixed-advance face a theme names, falling back to the built-in one.
+///
+/// Returns the face and the path it came from, as [`load_ui`] does.
+///
+/// # Safety
+///
+/// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
+#[cfg(feature = "io")]
+pub unsafe fn load_mono(
+    root_ns: u64,
+    theme: &crate::theme::Theme,
+    who: &[u8],
+) -> Result<(Font, FontPath), LoadError> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::dark().font_mono, who) }
+}
+
+/// `wanted`, or `builtin` if `wanted` will not load — the rule written once for both roles, with
+/// the path that was actually opened.
+///
+/// **A theme that names a font this machine does not have must not cost the desktop its text.**
+/// That is the same stance the schema takes on every other field: a value that cannot be read
+/// leaves that one thing at its default and the rest of the file still counts. It cannot be
+/// enforced where the rest is, though — `Theme::from_config` runs in the shell, which has no way
+/// to know whether a path resolves in the *application's* namespace, and the answer can differ
+/// between two applications. So the check is here, at the only place that has the namespace.
+///
+/// The fallback is said out loud rather than swallowed: a desktop quietly ignoring the font it
+/// was asked for looks exactly like a theme that never arrived.
+#[cfg(feature = "io")]
+unsafe fn load_themed(
+    root_ns: u64,
+    wanted: FontPath,
+    builtin: FontPath,
+    who: &[u8],
+) -> Result<(Font, FontPath), LoadError> {
+    // SAFETY: forwarded from the caller's contract.
+    match unsafe { load(root_ns, wanted.as_str()) } {
+        Ok(f) => Ok((f, wanted)),
+        // The built-in path itself, so there is nothing to fall back *to*: hand back the error
+        // rather than retrying a lookup, stat and map that can only reach the same answer
+        // (PR #264 review, optional 1).
+        Err(e) if wanted == builtin => Err(e),
+        Err(e) => {
+            // `s` rather than `untrusted`: a `FontPath` cannot hold a control byte, which is
+            // most of why it validates at all.
+            libkern::debug::Line::new()
+                .s(who)
+                .s(b": theme font ")
+                .s(wanted.as_str().as_bytes())
+                .s(b" ")
+                .s(e.why())
+                .s(b"; using ")
+                .s(builtin.as_str().as_bytes())
+                .end();
+            // SAFETY: as above.
+            unsafe { load(root_ns, builtin.as_str()) }.map(|f| (f, builtin))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -40,9 +40,13 @@
 //!
 //! Since M4 Part C it also presents [`libui::reference`] in a window of its own, which is the
 //! only thing on the target that has ever loaded a font. Everything about the toolkit was
-//! host-tested against a font compiled into the test binary; this reads
-//! `/system/fonts/DejaVuSansMono.ttf` through `fs-server-ext4` and rasterises with it, and
-//! `check-display` compares the result against the same render performed on the host.
+//! host-tested against a font compiled into the test binary; this reads a real one through
+//! `fs-server-ext4` and rasterises with it, and `check-display` compares the result against the
+//! same render performed on the host.
+//!
+//! **Two faces since M11 Part D**, and which window gets which is part of what the gate checks:
+//! this window is the desktop's proportional font, the terminal's below is the fixed-advance
+//! one, and both paths come from `Theme::dark()` — the same place the host takes them from.
 //!
 //! **A connection per window, though neither thing that forced it is true any more.** Input
 //! records carry a window id (C3 part 1) and `Session` holds several windows on one connection
@@ -386,47 +390,79 @@ fn churn(root_ns: u64) -> bool {
     true
 }
 
-/// Present [`libui::reference`] in a window of its own, drawn with the font from the disk.
+/// Load one of the two faces the image ships, or die saying which and why.
 ///
-/// Returns the window **and the font**: the window must be kept alive — dropping it closes the
-/// channel, the compositor destroys the window, and the picture leaves the screen — and the
-/// font is handed on rather than loaded twice, so the two reference windows are provably drawn
-/// with the same bytes off the same disk.
+/// **Both are resolved through the namespace and demand-paged out of ext4** — this is still the
+/// only place on the target that reads a font at all, and since M11 Part D it reads two. Every
+/// failure is fatal to the run: a font that does not load is exactly the regression this exists
+/// to catch, because the files are staged into the ext4 root by the image build, so "it did not
+/// resolve" means the staging broke. Carrying on would leave a green boot with no text on screen.
 ///
-/// Every failure here is fatal to the run. A font that does not load is exactly the
-/// regression this exists to catch — the file is staged into the ext4 root by the image
-/// build, so "it did not resolve" means the staging broke, and carrying on would leave a
-/// green boot with no text on screen.
-fn present_reference_ui(
-    root_ns: u64,
-) -> (Win, libdraw::text::Font) {
-    use libdraw::text::{LoadError, SYSTEM_FONT_PATH, load};
+/// The theme is the built-in one. Nothing hands this client a setup record — `service-mgr`
+/// starts it — so the paths it loads are `Theme::dark()`'s, which is what makes them the same
+/// two files `xtask` renders the host's reference with.
+fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
+    use libdraw::theme::Theme;
 
-    // The font. Resolved through the namespace and demand-paged out of ext4 — the first time
-    // anything on the target has read one.
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
-        Ok(f) => f,
+    let theme = Theme::default();
+    let (wanted, loaded) = match face {
+        Face::Ui => (theme.font_ui, unsafe {
+            // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+            libdraw::text::load_ui(root_ns, &theme, b"ui-testclient")
+        }),
+        Face::Mono => (theme.font_mono, unsafe {
+            // SAFETY: as above.
+            libdraw::text::load_mono(root_ns, &theme, b"ui-testclient")
+        }),
+    };
+    match loaded {
+        // **The path that was opened, not the one that was asked for.** They are the same here —
+        // this client draws with the built-in theme, so there is nothing to fall back from — and
+        // reporting the request would still be reporting the wrong thing the day that changes,
+        // on a line `check-display` asserts against (PR #264 review, finding 1).
+        Ok((f, opened)) => {
+            Line::new().s(b"ui-testclient: font loaded ").s(opened.as_str().as_bytes()).end();
+            f
+        }
         Err(e) => {
-            let why: &[u8] = match e {
-                LoadError::NoBinding => b"did not resolve (is it staged into the rootfs?)",
-                LoadError::Unstattable => b"stat failed",
-                LoadError::ImpossibleSize(_) => b"empty, or larger than the cap",
-                LoadError::Unmappable => b"could not be mapped",
-                LoadError::NotAFont => b"is not a parseable font",
-            };
-            Line::new().s(b"ui-testclient: ").s(SYSTEM_FONT_PATH.as_bytes()).s(b" ").s(why).end();
+            Line::new()
+                .s(b"ui-testclient: ")
+                .s(wanted.as_str().as_bytes())
+                .s(b" ")
+                .s(e.why())
+                .end();
             fail(b"ui-testclient: font load FAILED\n");
         }
-    };
-    kprint(b"ui-testclient: font loaded from /system/fonts\n");
+    }
+}
 
+/// Which of the two faces a caller wants.
+///
+/// Named `Face` rather than `Role` because a window already has one of those, and the two would
+/// read as the same word for two unrelated things in one file.
+enum Face {
+    /// The desktop's, proportional — what the toolkit's reference is drawn with.
+    Ui,
+    /// The terminal's, fixed-advance — what the grid's reference is drawn with.
+    Mono,
+}
+
+/// Present [`libui::reference`] in a window of its own, drawn with `font` from the disk.
+///
+/// The window must be kept alive: dropping it closes the channel, the compositor destroys the
+/// window, and the picture leaves the screen.
+///
+/// Every failure here is fatal to the run, for the reason [`load_face`] gives.
+fn present_reference_ui(
+    root_ns: u64,
+    font: &libdraw::text::Font,
+) -> Win {
     let (w, h) = (libui::reference::WIDTH, libui::reference::HEIGHT);
     let pitch = libui::reference::PITCH;
     let len = pitch * h as usize;
     // Rendered once. `into_bytes` hands back the buffer at exactly this pitch, so the copy
     // below is a straight memcpy rather than the row-by-row translation the scene needs.
-    let picture = libui::reference::render(&font).into_bytes();
+    let picture = libui::reference::render(font).into_bytes();
     if picture.len() != len {
         fail(b"ui-testclient: reference UI is not the size it declares\n");
     }
@@ -470,7 +506,7 @@ fn present_reference_ui(
         .s(b"x")
         .u(h as u64)
         .end();
-    (win, font)
+    win
 }
 
 /// Present [`libterm::render::reference`] in a window of its own, drawn with `font`.
@@ -1263,8 +1299,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //    window off the screen.
     //
     //    The toolkit's is 320x160, the terminal's 180x96 and the scene's 64x32.
-    let (_ui_window, font) = present_reference_ui(root_ns);
-    let _term_window = present_reference_term(root_ns, &font);
+    //
+    //    **Two fonts since M11 Part D, and which picture gets which is the point.** The toolkit's
+    //    window is the desktop's proportional face and the terminal's is the fixed-advance one;
+    //    they used to share a single load, and the comment then said the two windows were
+    //    "provably drawn with the same bytes". Now the claim worth making is the opposite, and
+    //    `check-display` makes it: the host renders each reference with the same file the guest
+    //    read, so a client that loaded the wrong one fails against real pixels.
+    let ui_font = load_face(root_ns, Face::Ui);
+    let mono_font = load_face(root_ns, Face::Mono);
+    let _ui_window = present_reference_ui(root_ns, &ui_font);
+    let _term_window = present_reference_term(root_ns, &mono_font);
 
     // 1. A session. The compositor mints a channel per resolve of `/dev/draw/new`.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.

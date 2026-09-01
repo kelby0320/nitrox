@@ -20,7 +20,7 @@ extern crate alloc;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
+use libdraw::text::{Font, load_ui};
 use libkern::{exit, kprint};
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
@@ -199,9 +199,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     libkern::debug::Line::new().s(b"nxfiles: theme font_px ").u(theme.font_px as u64).end();
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
-        Ok(f) => f,
-        Err(_) => fail(b"nxfiles: could not load the system font\n"),
+    let (font, _) = match unsafe { load_ui(root_ns, &theme, b"nxfiles") } {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            libkern::debug::Line::new().s(b"nxfiles: the UI font ").s(e.why()).end();
+            fail(b"nxfiles: font load FAILED\n");
+        }
     };
 
     let mut app = App::new(&start);
