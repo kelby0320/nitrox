@@ -68,10 +68,13 @@ pub const SCREEN_PITCH: usize = 268;
 /// Not black, so a compositor that skips the clear entirely produces a different hash
 /// rather than one that happens to match a zeroed buffer.
 ///
-/// **Taken from the theme since M11 Part B**, so the ground between windows and the ground
-/// inside one are one value rather than two that agree today. A `const fn` constructor is what
-/// keeps this a constant.
-pub const BACKGROUND: Rgb = crate::theme::Theme::dark().background;
+/// **Taken from the theme since M11 Part B**, and from its `desktop` field rather than its
+/// `background` one since Part E. Part B made these one value on the argument that a window's
+/// ground and the ground between windows differing shows as a seam; a light theme ends that,
+/// because the two stopped being the same kind of thing — one is the paper an application draws
+/// on and the other is what a desktop shows when nothing is on it. Still one *source*: a
+/// `const fn` constructor is what keeps this a constant, and nothing here writes a literal.
+pub const BACKGROUND: Rgb = crate::theme::Theme::light().desktop;
 
 /// The scene's screen geometry.
 pub fn screen_geometry() -> Geometry {
@@ -171,7 +174,12 @@ pub fn render_reference() -> MemFramebuffer {
 /// Changing the scene changes this number. That is expected — but it should be a
 /// deliberate edit accompanied by a reason, never a value pasted in to make a red
 /// test go green.
-pub const REFERENCE_HASH: u64 = 0x5720_b2b9_f85b_c715;
+///
+/// **Moved 2026-09-01 (M11 Part E, batch 1): the desktop turned light.** The ground this scene
+/// is cleared to comes from the theme, and the theme's ground between windows went from
+/// `#0E141B` to `#2A5570` — so every pixel of the scene not covered by a surface changed. That
+/// is the reason, and it is the whole reason: no surface moved.
+pub const REFERENCE_HASH: u64 = 0xfbed_408c_1eae_50a5;
 
 /// Hash the reference scene.
 pub fn reference_hash() -> u64 {

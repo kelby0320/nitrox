@@ -3230,6 +3230,20 @@ it is noticed on. Its own list, and its own milestone.
       a file, and a place for the two kinds of thing that are *not* polish to go instead (feel,
       and M12 capability).
 
+- [ ] **Batch 1 — the palette turns light** ✅ (2026-09-01). One theme, and `Theme::light()`
+      *replaces* `Theme::dark()` rather than joining it: decision 4 applied, because two themes
+      double the reference pictures and double the judgement each polish item takes. Values are
+      measured from the maintainer's reference desktop rather than invented.
+
+      **Three things the light theme forced**, each recorded where it happened. `background` split
+      into two fields — it was also the ground *between* windows, on the argument that a seam
+      shows when a client's buffer is smaller than its frame, and a light theme ends that because
+      the two stopped being the same kind of thing. `outline` had to become saturated, being the
+      one colour composited over *both* grounds. And the terminal's grid keeps its own dark
+      ground: Part B tied it to the theme when there was one theme and it was dark, and turning
+      the desktop light is exactly the event that shows the tie was to the sixteen ANSI colours,
+      which are tuned for a dark ground and would put invisible text on a white one.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

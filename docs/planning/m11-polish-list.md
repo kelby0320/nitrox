@@ -37,7 +37,34 @@ ground between windows and how two windows sit next to each other.
 **Use `--grab` whenever you drive it yourself**: the guest has a relative pointing device, so an
 ungrabbed pointer and the guest's cursor drift apart permanently.
 
-----
+---
+
+## Settled before the first batch
+
+Four questions the list raised that had to be answered before any of it could be built
+(2026-09-01). Recorded here rather than only in the decision log, because each one is the reason
+a request is being met in a particular way.
+
+- **One theme, and it is light.** `Theme::light()` replaces `Theme::dark()` rather than joining
+  it — M11's decision 4, applied: one theme means one `check-display` reference and one judgement
+  per polish item, where two would double both. Dark comes back any day as a constructor; the
+  mechanism was built to hold a second and still does.
+- **The terminal's grid stays dark.** `libterm` carries its own two defaults again instead of
+  taking them from the theme. Part B tied them when there was one theme and it was dark, so the
+  tie cost nothing; making the desktop light is exactly the event that shows the tie was between
+  the grid and the *sixteen ANSI colours*, which are tuned for a dark ground. Bright white is
+  `#ECF0F4` and would be invisible on white.
+- **Gradients are one number.** A theme-wide bevel, lightening the top and darkening the bottom
+  of a gradient fill. Measured against the reference: its title bar is ±10 around its midpoint and
+  its menu selection ±14, so one number reproduces both — and a new palette needs one value rather
+  than eight kept coherent by hand.
+- **Image decoding is filed, not built here.** A gradient desktop ground and window buttons drawn
+  as shapes get most of the reference look with no asset pipeline. Real images — a wallpaper, an
+  icon set — share one dependency, and the design for it is written down rather than built: a
+  full-screen background **window owned by `desktop-shell`**, which already holds `/home` and a
+  theme, rather than the compositor, which holds neither.
+
+---
 
 ## Open
 

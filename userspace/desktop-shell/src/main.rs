@@ -400,7 +400,14 @@ fn render_window_bar(
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    //
+    // **On the panel face, not on a window's ground** (M11 Part E, batch 1). `paint` clears a
+    // damage rectangle to `background`, which since the theme turned light is the white an
+    // application draws on — and a bar is not paper: it is a face, the surface a button and a
+    // toolbar are made of. One substituted field rather than a new one; a panel wanting a colour
+    // of its own needs more evidence than one screenshot.
+    paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    });
     fb
 }
 
@@ -502,6 +509,14 @@ fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
 }
 
 /// Render the top bar.
+/// `theme`, with a bar's ground in place of a window's.
+///
+/// One place, so the two bars cannot disagree about what a panel is made of.
+fn panel(theme: &Theme) -> Theme {
+    Theme { background: theme.face, ..*theme }
+}
+
+/// The top bar's picture.
 fn render_bar(theme: &Theme, font: &Font) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .expect("the bar pitch is wide enough for a row");
@@ -512,7 +527,14 @@ fn render_bar(theme: &Theme, font: &Font) -> MemFramebuffer {
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    //
+    // **On the panel face, not on a window's ground** (M11 Part E, batch 1). `paint` clears a
+    // damage rectangle to `background`, which since the theme turned light is the white an
+    // application draws on — and a bar is not paper: it is a face, the surface a button and a
+    // toolbar are made of. One substituted field rather than a new one; a panel wanting a colour
+    // of its own needs more evidence than one screenshot.
+    paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    });
     fb
 }
 

@@ -31,15 +31,20 @@ use crate::format::Rgb;
 ///
 /// **A `const fn` constructor per theme**, which is what lets the compositor keep its cursor and
 /// outline colours as `const` items while still taking them from here: `const C: Rgb =
-/// Theme::dark().cursor_body;` is a constant expression. Without it the shared type would force
+/// Theme::light().cursor_body;` is a constant expression. Without it the shared type would force
 /// every consumer to a runtime lookup for a value that has not changed since boot.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Theme {
     // ---- surfaces ----
-    /// What a damaged region is cleared to, and what the compositor clears the screen to.
+    /// What a damaged region is cleared to — a window's own ground.
     ///
-    /// One value rather than two: a window's ground and the space between windows differing is
-    /// visible as a seam the moment a client's buffer is smaller than the window it fills.
+    /// **Two values rather than one, since M11 Part E.** This was also the ground *between*
+    /// windows, and the argument for one value was the seam: a client whose committed buffer is
+    /// smaller than the window it fills shows whatever is underneath. A light theme ends that,
+    /// because a window's ground and a desktop's are no longer the same kind of thing — one is
+    /// the paper an application draws on and the other is the surface a desktop shows when
+    /// nothing is on it. The seam is real and now visible during a resize; it is a compositing
+    /// question rather than a reason to make a desktop white. See [`desktop`](Self::desktop).
     pub background: Rgb,
     /// Text and other ink.
     pub foreground: Rgb,
@@ -87,6 +92,15 @@ pub struct Theme {
     /// a second colour chosen here would be a guess made before anything had been looked at.
     pub outline: Rgb,
 
+    /// The ground between windows — what a desktop shows when nothing is on it.
+    ///
+    /// **Read but not live**, like the cursor and for the same reason: the compositor clears the
+    /// screen to it, and the compositor is started by `init` rather than by a session, so it
+    /// never sees a theme file. `scene::BACKGROUND` takes its value from here so that the two
+    /// cannot drift, which is the arrangement M11 Part B built for a colour they *shared*; what
+    /// Part E changed is that they no longer share it.
+    pub desktop: Rgb,
+
     // ---- type ----
     /// Text size, in pixels per em.
     pub font_px: f32,
@@ -108,31 +122,49 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The dark theme — the only one that ships.
+    /// The light theme — the only one that ships.
     ///
     /// **Named rather than anonymous**, which is decision 4 of M11's details pass made visible in
     /// the code: every value is chosen once and `check-display` keeps one reference, while the
     /// *mechanism* can hold a second theme the day somebody wants one. A `Theme::light()` beside
-    /// this would be a constructor, not a redesign.
-    pub const fn dark() -> Self {
+    /// this would be a constructor, not a redesign — and there *was* one until M11 Part E's first
+    /// batch, which replaced it rather than joining it, for the reason decision 4 gives: two
+    /// themes double the reference pictures and double the judgement each polish item takes.
+    ///
+    /// **The values are measured rather than invented.** They come from a MATE desktop the
+    /// maintainer named as the reference, sampled pixel by pixel — see
+    /// `docs/planning/m11-polish-list.md`. Where this departs from it, it is because a value here
+    /// has to serve a surface MATE splits into two.
+    pub const fn light() -> Self {
         Self {
-            background: Rgb::new(0x0E, 0x14, 0x1B),
-            foreground: Rgb::new(0xE0, 0xE6, 0xEC),
+            background: Rgb::new(0xFF, 0xFF, 0xFF),
+            foreground: Rgb::new(0x2F, 0x2F, 0x2F),
 
-            face: Rgb::new(0x24, 0x2C, 0x36),
-            face_hover: Rgb::new(0x30, 0x3A, 0x46),
-            face_pressed: Rgb::new(0x18, 0x1E, 0x26),
-            focus_ring: Rgb::new(0x5A, 0x9F, 0xD4),
-            track: Rgb::new(0x18, 0x1E, 0x26),
-            thumb: Rgb::new(0x3A, 0x46, 0x54),
-            selection: Rgb::new(0x2A, 0x4A, 0x6A),
+            face: Rgb::new(0xED, 0xEC, 0xEB),
+            face_hover: Rgb::new(0xF6, 0xF5, 0xF4),
+            face_pressed: Rgb::new(0xDC, 0xDA, 0xD9),
+            focus_ring: Rgb::new(0x4B, 0x6E, 0x9B),
+            // **Between the reference's two.** It puts a list's ground at `#FCFCFC` and a
+            // scrollbar's groove at `#E6E4E3`; one field has to be both, so it is a near-white
+            // that separates a list from the window around it and still reads as a groove under
+            // the thumb. Splitting them is a field, and a field is worth more evidence than one
+            // screenshot.
+            track: Rgb::new(0xF0, 0xEF, 0xEE),
+            thumb: Rgb::new(0x8E, 0xB1, 0xDD),
+            selection: Rgb::new(0x93, 0xB5, 0xE0),
 
-            title_active: Rgb::new(0x2E, 0x3A, 0x4A),
-            title_inactive: Rgb::new(0x1C, 0x22, 0x2A),
+            title_active: Rgb::new(0xE0, 0xDE, 0xDC),
+            title_inactive: Rgb::new(0xD4, 0xD2, 0xD0),
 
             cursor_body: Rgb::new(0xFF, 0xFF, 0xFF),
             cursor_outline: Rgb::new(0x00, 0x00, 0x00),
-            outline: Rgb::new(0xE0, 0xE0, 0xE0),
+            // **Saturated, because it is the one colour drawn over both grounds.** A resize
+            // outline, a snap preview and a drop target are composited over the desktop *and*
+            // over the windows on it, and those are now a dark blue and a white — so the pale
+            // grey that read against a dark desktop would vanish over half the screen.
+            outline: Rgb::new(0x2C, 0x65, 0xAE),
+
+            desktop: Rgb::new(0x2A, 0x55, 0x70),
 
             font_px: 16.0,
             font_ui: FontPath::new(crate::text::UI_FONT_PATH),
@@ -143,7 +175,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::dark()
+        Self::light()
     }
 }
 
@@ -195,7 +227,7 @@ impl Theme {
     /// of a line — except inside the quotes of a value, which is the whole reason this is a
     /// parser rather than a `split('#')`.
     pub fn from_config(text: &str) -> (Self, alloc::vec::Vec<Issue>) {
-        let mut t = Self::dark();
+        let mut t = Self::light();
         let mut issues = alloc::vec::Vec::new();
         for (n, raw) in text.lines().enumerate() {
             let line = strip_comment(raw).trim();
@@ -230,6 +262,7 @@ impl Theme {
                 "cursor_body" => set(&mut t.cursor_body, value),
                 "cursor_outline" => set(&mut t.cursor_outline, value),
                 "outline" => set(&mut t.outline, value),
+                "desktop" => set(&mut t.desktop, value),
                 // **Unquoted, because TOML types a quoted number as a string.** Accepting
                 // `font_px = "14"` would be accepting a file a real TOML reader disagrees with
                 // this one about.
@@ -300,6 +333,7 @@ impl Theme {
             cursor_body,
             cursor_outline,
             outline,
+            desktop,
             font_px,
             font_ui,
             font_mono,
@@ -320,6 +354,7 @@ impl Theme {
             ("cursor_body", cursor_body),
             ("cursor_outline", cursor_outline),
             ("outline", outline),
+            ("desktop", desktop),
         ] {
             let _ = writeln!(s, "{k} = \"#{:02X}{:02X}{:02X}\"", c.r, c.g, c.b);
         }
@@ -335,7 +370,7 @@ impl Theme {
 /// The path to a font file, bounded so a [`Theme`] stays `Copy` and `const`-constructible.
 ///
 /// **A fixed-capacity path rather than a `String`**, and the reason is the same one that made
-/// `Theme::dark()` a `const fn`: the compositor keeps theme colours as `const` items, and a heap
+/// `Theme::light()` a `const fn`: the compositor keeps theme colours as `const` items, and a heap
 /// allocation cannot appear in a constant. The bound is not a limitation reluctantly accepted
 /// either — this value travels on the setup record, which is one 4 KiB IPC message for *all* of
 /// argv and the environment, so a path a person could make arbitrarily long is a theme file that
@@ -521,13 +556,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_is_the_dark_theme_and_is_available_in_a_const() {
+    fn the_default_is_the_light_theme_and_is_available_in_a_const() {
         // The `const fn` is the whole reason the compositor can take its cursor colour from here
         // and still declare it as a `const` — a runtime default would have forced every consumer
         // of a value that never changes into a lookup.
-        const CURSOR: Rgb = Theme::dark().cursor_body;
+        const CURSOR: Rgb = Theme::light().cursor_body;
         assert_eq!(CURSOR, Rgb::new(0xFF, 0xFF, 0xFF));
-        assert_eq!(Theme::default(), Theme::dark());
+        assert_eq!(Theme::default(), Theme::light());
     }
 
     #[test]
@@ -537,7 +572,7 @@ mod tests {
         );
         assert_eq!(t.background, Rgb::new(0x10, 0x20, 0x30));
         assert_eq!(t.font_px, 13.5);
-        assert_eq!(t.face, Theme::dark().face, "a key the file did not name keeps its default");
+        assert_eq!(t.face, Theme::light().face, "a key the file did not name keeps its default");
         assert!(issues.is_empty(), "{issues:?}");
     }
 
@@ -547,7 +582,7 @@ mod tests {
         // the desktop that shipped — not a black screen, not a partial theme.
         for text in ["", "\n\n", "# nothing but a comment\n"] {
             let (t, issues) = Theme::from_config(text);
-            assert_eq!(t, Theme::dark(), "{text:?}");
+            assert_eq!(t, Theme::light(), "{text:?}");
             assert!(issues.is_empty());
         }
     }
@@ -561,8 +596,8 @@ mod tests {
         let (t, issues) = Theme::from_config(
             "background = \"#zzzzzz\"\n             face\n             frobnicate = \"#112233\"\n             font_px = 0\n             foreground = \"#010203\"\n",
         );
-        assert_eq!(t.background, Theme::dark().background, "a bad colour keeps the default");
-        assert_eq!(t.font_px, Theme::dark().font_px, "and a size outside the readable range");
+        assert_eq!(t.background, Theme::light().background, "a bad colour keeps the default");
+        assert_eq!(t.font_px, Theme::light().font_px, "and a size outside the readable range");
         assert_eq!(t.foreground, Rgb::new(1, 2, 3), "the line after the bad ones was still read");
         assert_eq!(
             issues,
@@ -587,7 +622,7 @@ mod tests {
             "font_px = \"14\"",         // TOML types this as a string, not a number
         ] {
             let (t, issues) = Theme::from_config(bad);
-            assert_eq!(t, Theme::dark(), "{bad:?} changed something");
+            assert_eq!(t, Theme::light(), "{bad:?} changed something");
             assert_eq!(issues.len(), 1, "{bad:?}");
             assert_eq!(issues[0].kind, IssueKind::BadValue, "{bad:?}");
         }
@@ -604,7 +639,7 @@ mod tests {
         // theme file that renders nothing usable, which is the state this must not reach.
         for bad in ["0", "-4", "0.5", "17", "1000", "nan"] {
             let (t, issues) = Theme::from_config(&alloc::format!("font_px = {bad}"));
-            assert_eq!(t.font_px, Theme::dark().font_px, "font_px = {bad}");
+            assert_eq!(t.font_px, Theme::light().font_px, "font_px = {bad}");
             assert_eq!(issues.len(), 1, "font_px = {bad}");
         }
         for good in ["6", "10", "13.5", "16"] {
@@ -627,14 +662,14 @@ mod tests {
         // **Complete, which is what makes it safe to hand to another process**: a reader of this
         // never falls back to a default, because nothing is missing to fall back for. The round
         // trip is the cheap half; the field count is the half that matters.
-        let mut t = Theme::dark();
+        let mut t = Theme::light();
         t.background = Rgb::new(0x01, 0x02, 0x03);
         t.selection = Rgb::new(0xFE, 0xDC, 0xBA);
         t.font_px = 13.0;
         t.font_ui = FontPath::new("/home/Fancy.ttf");
 
         let text = t.to_config();
-        assert_eq!(text.lines().count(), 17, "fourteen colours, a size and two fonts");
+        assert_eq!(text.lines().count(), 18, "fifteen colours, a size and two fonts");
         let (back, issues) = Theme::from_config(&text);
         assert_eq!(back, t);
         assert!(issues.is_empty(), "{issues:?}");
@@ -649,7 +684,7 @@ mod tests {
     fn a_theme_names_two_fonts_and_the_defaults_are_where_the_image_stages_them() {
         // The built-in paths are the image's, not a second opinion about it: `xtask` stages
         // exactly these two names into `/system/fonts`, and its own test asserts that.
-        let t = Theme::dark();
+        let t = Theme::light();
         assert_eq!(t.font_ui.as_str(), crate::text::UI_FONT_PATH);
         assert_eq!(t.font_mono.as_str(), crate::text::MONO_FONT_PATH);
         // **And they are two different files.** The whole of Part D is that the desktop stopped
@@ -699,7 +734,7 @@ mod tests {
     fn a_font_key_takes_a_quoted_path_and_refuses_what_toml_reads_differently() {
         let (t, issues) = Theme::from_config("font_ui = \"/home/Fancy.ttf\"\n");
         assert_eq!(t.font_ui.as_str(), "/home/Fancy.ttf");
-        assert_eq!(t.font_mono, Theme::dark().font_mono, "the other role kept its default");
+        assert_eq!(t.font_mono, Theme::light().font_mono, "the other role kept its default");
         assert!(issues.is_empty(), "{issues:?}");
 
         // **Bare is refused**, the mirror of `font_px` refusing quotes: a path is a TOML string,
@@ -710,7 +745,7 @@ mod tests {
             "font_mono = \"\"\n",
         ] {
             let (t, issues) = Theme::from_config(bad);
-            assert_eq!(t, Theme::dark(), "{bad:?} left the theme alone");
+            assert_eq!(t, Theme::light(), "{bad:?} left the theme alone");
             assert_eq!(
                 issues,
                 [Issue { line: 1, kind: IssueKind::BadValue }],
@@ -753,7 +788,14 @@ mod tests {
         //
         // What this fails on is the re-divergence: somebody writing `BACKGROUND` out as a
         // literal again, which is how the two came to need an equality test in the first place.
-        let t = Theme::dark();
-        assert_eq!(t.background, crate::scene::BACKGROUND);
+        //
+        // **`desktop`, not `background`, since M11 Part E.** The two were one field until a light
+        // theme made them different kinds of thing; what did not change is that there is one
+        // source for the ground between windows.
+        let t = Theme::light();
+        assert_eq!(t.desktop, crate::scene::BACKGROUND);
+        // And the ground a *window* draws on is now a different colour, which is the whole point
+        // of the split: a test that passed while they were equal would say nothing.
+        assert_ne!(t.background, crate::scene::BACKGROUND);
     }
 }

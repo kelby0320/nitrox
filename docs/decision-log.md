@@ -20834,3 +20834,72 @@ grid metrics before the shell places its window, so an `expect` for the first pl
 second times out on output that was already there. This is the fourth time that shape has cost
 something in this codebase; the rule is that expectations go where the line *is*, not where the
 topic is.
+
+## 2026-09-01 — M11 Part E batch 1: the desktop turns light, and one colour turns out to be two
+
+The maintainer's polish list opens with the palette, and four questions had to be answered before
+any of it could be built. All four went the way the reasoning already in this log pointed.
+
+**One theme, and it is light.** `Theme::light()` *replaces* `Theme::dark()` rather than joining
+it. Decision 4 said one theme ships and the mechanism holds a second; shipping two would double
+the `check-display` reference pictures and double the judgement every polish item takes, which is
+precisely the cost that decision declined. Dark returns any day as a constructor.
+
+**The values are measured, not invented.** They come from a MATE desktop the maintainer named as
+the reference, sampled pixel by pixel: panels `#EDECEB`, window ground `#FFFFFF`, ink `#2F2F2F`,
+title bars `#E0DEDC`/`#D4D2D0`, thumb `#8EB1DD`, selection `#93B5E0`. Where this departs from it,
+it is because one field here has to serve a surface the reference splits in two — its list ground
+is `#FCFCFC` and its scrollbar groove `#E6E4E3`, and `track` is both.
+
+### `background` was two things wearing one name
+
+Part B made a window's ground and the ground *between* windows one field, and gave a reason: a
+client whose committed buffer is smaller than the window it fills shows what is underneath, and
+two values differing is a visible seam. That reasoning was sound and is now void, because a light
+theme makes the two different *kinds* of thing — one is the paper an application draws on, the
+other is what a desktop shows when nothing is on it. They cannot be the same colour.
+
+So there is a `desktop` field, and `scene::BACKGROUND` derives from it. The seam is real and now
+visible during a resize; it is a compositing question, and it is not a reason to make a desktop
+white.
+
+**And `outline` had to become saturated** for the same reason, one layer up. A resize outline, a
+snap preview and a drop target are composited over the desktop *and* over the windows on it —
+which are now a dark blue and a white — so the pale grey that read against a dark desktop would
+have vanished over half the screen. It is `#2C65AE`.
+
+**The bars paint on the panel face**, not on a window's ground. `paint` clears a damage rectangle
+to `background`, and a bar is not paper: it is a face, the surface a button and a toolbar are made
+of. One substituted field rather than a new one — a panel wanting a colour of its own needs more
+evidence than one screenshot.
+
+### The terminal's grid keeps its own ground, which reverses a Part B tie
+
+Part B read `libterm`'s two defaults from the theme, on the argument that a terminal whose ground
+differed from the chrome around it would flash against it. Turning the desktop light is the event
+that shows what that tie really was: those two belong with **the sixteen**, which are tuned for a
+dark ground. Bright white is `#ECF0F4`; on a white ground it is invisible, and bright yellow is
+unreadable. Following the theme would therefore mean retuning the sixteen — the one thing Part B's
+own rule forbids, because retheming a desktop must not retint `ls`. So a dark terminal sits on a
+light desktop, which is what most people's screens look like anyway.
+
+**The cross-crate test earned its place on the first run.** Rewritten to assert the new
+arrangement, it immediately failed: the first version of the grid's ground was `#1C222A`, which is
+`ansi[0]` — text in that colour would have been invisible. It now asserts three things, and the
+third is the decision's own evidence kept live: the grid's ground is not the desktop's, no cell
+colour equals the ground it is drawn on, and the brightest of the sixteen is within a hair of the
+desktop's white. If somebody ever retunes them for a light ground, that last one fails and says
+so, which is the moment to revisit this decision rather than to delete the assertion.
+
+### Two more answers, for batches that have not been built yet
+
+**Gradients will be one number.** A theme-wide bevel, lightening the top and darkening the bottom
+of a gradient fill. Measured against the reference: its title bar is ±10 around its midpoint and
+its menu selection ±14, so one number reproduces both — where explicit ends would be eight fields
+that every future palette has to keep coherent by hand.
+
+**Image decoding is filed rather than built.** A gradient ground and window buttons drawn as
+shapes get most of the reference look with no asset pipeline. A wallpaper and an icon set share
+one dependency, and the design for it is written down instead: a full-screen background **window
+owned by `desktop-shell`**, which already holds `/home` and a theme, rather than the compositor,
+which holds neither and would need a filesystem to draw wallpaper.

@@ -314,9 +314,9 @@ pub const CURSOR_H: u32 = 16;
 /// record a theme is handed on. Named rather than skipped; the trigger for changing it is a
 /// control panel that wants to restyle the cursor or the drop highlight, and the mechanism would
 /// be a manager op on a channel the shell already holds.
-pub const CURSOR_BODY: Rgb = Theme::dark().cursor_body;
+pub const CURSOR_BODY: Rgb = Theme::light().cursor_body;
 /// The cursor's outline colour (`.` in the sprite), so it stays visible against white.
-pub const CURSOR_OUTLINE: Rgb = Theme::dark().cursor_outline;
+pub const CURSOR_OUTLINE: Rgb = Theme::light().cursor_outline;
 
 /// The rectangle a cursor at `at` occupies.
 ///
@@ -356,7 +356,7 @@ pub const OUTLINE_W: u32 = 2;
 /// One colour for all three things an outline marks — a resize, a snap preview, a drop target —
 /// which is a decision deferred rather than taken: what a drop target should look like as
 /// distinct from a resize is a question for M11's polish passes.
-pub const OUTLINE_COLOUR: Rgb = Theme::dark().outline;
+pub const OUTLINE_COLOUR: Rgb = Theme::light().outline;
 
 /// The four edge strips of `rect`, which is what an outline occupies.
 ///

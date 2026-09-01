@@ -3914,7 +3914,7 @@ fn spawn_release_guest(accel: Accel, gate: &'static str, qmp_sock: &Path) -> R<(
 /// **The one place a guest font path becomes a host file**, used by the staging *and* by every
 /// host-side render. That is what makes the gate's central claim true rather than asserted: the
 /// picture drawn here is drawn with the same bytes the guest read off ext4, because both come
-/// from this function and both paths come from `Theme::dark()`. Point the built-in theme at a
+/// from this function and both paths come from `Theme::light()`. Point the built-in theme at a
 /// different face and the image, the previews and the gate all follow it — or, if nothing stages
 /// that face, all three fail together and say so.
 fn font_asset(guest_path: &str) -> R<PathBuf> {
@@ -3922,7 +3922,7 @@ fn font_asset(guest_path: &str) -> R<PathBuf> {
         // **Without saying where the path came from**, because two callers supply it: the
         // built-in theme, for the staging and the reference renders, and `check-terminal`, whose
         // path arrives off the guest's serial line and can therefore be a user's `theme.toml`.
-        // Naming the wrong one would send a reader to `Theme::dark()` for a value that is in a
+        // Naming the wrong one would send a reader to `Theme::light()` for a value that is in a
         // file on the disk (PR #264 review, finding 1).
         format!(
             "{guest_path:?} is not a file directly under {FONT_DIR} — the image build stages \
@@ -3949,10 +3949,10 @@ fn host_font(guest_path: &str) -> R<libdraw::text::Font> {
 /// **The built-in theme rather than the staged file**, and the difference matters: the file
 /// carries a deliberately non-default `font_px` for `check-login` to read back, while the guest
 /// client whose pictures this gate compares — `ui-testclient` — gets no setup record at all and
-/// draws with `Theme::dark()`. Rendering the host's reference from the file would compare two
+/// draws with `Theme::light()`. Rendering the host's reference from the file would compare two
 /// different themes and call the difference a display bug.
 fn host_faces() -> R<(libdraw::text::Font, libdraw::text::Font)> {
-    let t = libdraw::theme::Theme::dark();
+    let t = libdraw::theme::Theme::light();
     Ok((host_font(t.font_ui.as_str())?, host_font(t.font_mono.as_str())?))
 }
 
@@ -4085,13 +4085,13 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // one constant, two call sites — and it is what the system did before this part.
     //
     // These lines pin the guest's half. The host's is pinned by `host_faces`, which takes both
-    // paths from `Theme::dark()`, and by `libdraw`'s own test that the two are different files.
+    // paths from `Theme::light()`, and by `libdraw`'s own test that the two are different files.
     //
     // **First, because `expect` consumes forward.** Both are printed before `ui-testclient`
     // opens a window at all, so asserting them after any line further down the boot scans past
     // them and times out on output that was there — the failure mode PR #258's review named.
     {
-        let t = libdraw::theme::Theme::dark();
+        let t = libdraw::theme::Theme::light();
         session.expect(&format!("ui-testclient: font loaded {}", t.font_ui.as_str()))?;
         session.expect(&format!("ui-testclient: font loaded {}", t.font_mono.as_str()))?;
         println!("  ok: the guest loaded the desktop's face and the terminal's, in that order");
@@ -8120,13 +8120,13 @@ fn assemble_image(
     // not at all — a missing file is the built-in theme, which is what the host tests pin — and
     // a file naming every value is what makes the thing *discoverable*: a person who wants to
     // change a colour opens it and sees which colours there are. It is written from
-    // `Theme::dark()` rather than typed out, so the file and the constants cannot drift.
+    // `Theme::light()` rather than typed out, so the file and the constants cannot drift.
     {
         let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n");
         text.push_str("# Colours are \"#RRGGBB\"; font_px is a size in pixels per em.\n\n");
-        // Written from `Theme::dark()` so the file and the constants cannot drift — except for
+        // Written from `Theme::light()` so the file and the constants cannot drift — except for
         // the one field the gate reads back, which is deliberately not the default.
-        let mut shipped = libdraw::theme::Theme::dark();
+        let mut shipped = libdraw::theme::Theme::light();
         shipped.font_px = f32::from(THEME_FONT_PX);
         text.push_str(&shipped.to_config());
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
@@ -8195,7 +8195,7 @@ fn assemble_image(
     // is larger than every program in the boot image put together. A client resolves the path
     // its theme names and demand-pages the file in.
     //
-    // **Which files, from the theme rather than from a list here** (M11 Part D). `Theme::dark()`
+    // **Which files, from the theme rather than from a list here** (M11 Part D). `Theme::light()`
     // names a proportional face for the desktop and a fixed-advance one for the grid; staging
     // exactly those is what makes "the guest reads the font the host rendered with" a property
     // of the build instead of two lists somebody keeps equal. `font_asset` is the same mapping
@@ -8208,7 +8208,7 @@ fn assemble_image(
     {
         let fonts = staging.join("system").join("fonts");
         fs::create_dir_all(&fonts)?;
-        let theme = libdraw::theme::Theme::dark();
+        let theme = libdraw::theme::Theme::light();
         let mut faces: Vec<PathBuf> =
             vec![font_asset(theme.font_ui.as_str())?, font_asset(theme.font_mono.as_str())?];
         faces.dedup();
@@ -8935,35 +8935,39 @@ mod diag_tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// The terminal's ground is the desktop's ground, and no cell colour is invisible on it.
+    /// The terminal's ground is its own, and no cell colour is invisible on it.
     ///
-    /// **What this used to claim, and why that was unsound.** M11 Part B first asserted that no
-    /// ANSI colour equals a *chrome* colour — an attempt to encode "a theme must not retint what
-    /// programs print" as an inequality. It is the wrong encoding, and the palette this ships
-    /// contains the counterexample: `ansi[0]` and `title_inactive` are both `#1C222A`, because
-    /// both were chosen independently as the darkest tone in one scheme. The test passed only
-    /// because `title_inactive` was the one theme colour missing from its list — scoped around
-    /// its own counterexample (PR #262 review, blocking 1).
+    /// **What this used to claim, and why each version was replaced.** M11 Part B first asserted
+    /// that no ANSI colour equals a *chrome* colour — an attempt to encode "a theme must not
+    /// retint what programs print" as an inequality. It is the wrong encoding, and the palette
+    /// contained the counterexample: `ansi[0]` and `title_inactive` were both `#1C222A`, chosen
+    /// independently as the darkest tone in one scheme. It passed only because `title_inactive`
+    /// was the one theme colour missing from its list (PR #262 review, blocking 1). **Provenance
+    /// is not equality**, and a test comparing values cannot see provenance.
     ///
-    /// **Provenance is not equality.** What matters is that the sixteen are *not derived from*
-    /// the theme, and two independent choices coinciding says nothing about that. That property
-    /// is read in the code — `Palette::default`'s `ansi` is sixteen literals — and a test
-    /// comparing values cannot see it.
+    /// Its replacement asserted that the grid's two defaults *followed* the theme, which was
+    /// structural from Part B until Part E cut the tie. What is asserted now is the decision that
+    /// replaced it, and the evidence for it:
     ///
-    /// So what is asserted here is what a value comparison can actually establish:
-    ///
-    /// - **The two defaults follow the theme**, which is structural since Part B and fails if
-    ///   either is written out as a literal again.
-    /// - **No cell colour is the ground it is drawn on.** A cell painted in a colour equal to
-    ///   the background is text that cannot be read at all — the one legibility property with a
-    ///   sharp edge. (Nearly-equal is a judgement; ANSI black on a dark ground is dim
-    ///   everywhere, which is the convention rather than a bug.)
+    /// - **The grid's ground is not the desktop's**, which fails if somebody re-ties them.
+    /// - **No cell colour is the ground it is drawn on.** A cell painted in the background colour
+    ///   is text that cannot be read at all — the one legibility property with a sharp edge.
+    ///   (Nearly-equal is a judgement; ANSI black on a dark ground is dim everywhere, which is
+    ///   the convention rather than a bug.)
+    /// - **And the reason the tie was cut, as a live check**: the brightest of the sixteen is
+    ///   within a hair of the desktop's white. Following the theme would put invisible text on
+    ///   screen, and avoiding that would mean retuning the sixteen — the one thing the rule above
+    ///   forbids. If somebody ever does retune them for a light ground, this fails and says so,
+    ///   which is the moment to revisit the decision rather than to delete the assertion.
     #[test]
-    fn the_terminals_ground_follows_the_theme_and_no_cell_is_invisible_on_it() {
+    fn the_terminals_ground_is_its_own_and_no_cell_is_invisible_on_it() {
         let theme = libui::paint::Theme::default();
         let palette = libterm::cell::Palette::default();
-        assert_eq!(palette.background, theme.background, "one ground, from one place");
-        assert_eq!(palette.foreground, theme.foreground);
+
+        assert_ne!(
+            palette.background, theme.background,
+            "the grid's ground was re-tied to the desktop's (M11 Part E); see the assertion below"
+        );
 
         for (i, c) in palette.ansi.iter().enumerate() {
             assert_ne!(
@@ -8971,5 +8975,22 @@ mod diag_tests {
                 "ANSI colour {i} is the terminal's own background — text in it is invisible"
             );
         }
+
+        let gap = |a: libdraw::format::Rgb, b: libdraw::format::Rgb| {
+            (a.r.abs_diff(b.r)).max(a.g.abs_diff(b.g)).max(a.b.abs_diff(b.b))
+        };
+        let brightest = palette
+            .ansi
+            .iter()
+            .copied()
+            .max_by_key(|c| u32::from(c.r) + u32::from(c.g) + u32::from(c.b))
+            .expect("sixteen colours");
+        assert!(
+            gap(brightest, theme.background) <= 32,
+            "the brightest ANSI colour is {brightest:?}, no longer close to the desktop's ground \
+             {:?} — the sixteen may have been retuned for a light ground, which is the trigger \
+             for revisiting whether the grid should follow the theme after all",
+            theme.background
+        );
     }
 }
