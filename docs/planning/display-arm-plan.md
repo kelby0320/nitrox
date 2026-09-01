@@ -3303,6 +3303,31 @@ it is noticed on. Its own list, and its own milestone.
       hand. Giving it feedback means giving it a router first, which is a change to how it handles
       input rather than to how it looks.
 
+- [x] **Batch 4 — the applications menu, and two small things** ✅ (2026-09-01). Four reports with
+      one cause: the shell read pointer events for the overview's thumbnails, the applications
+      button and the taskbar, and **never for the modal's own window**. So its rows could not be
+      clicked, nothing under the cursor reacted, and a click aimed elsewhere was never seen at
+      all. It has a `Router` now — the modal's contents are a widget tree that filters and
+      scrolls, and hit-testing that by hand would be the toolkit's layout written twice.
+
+      Placement was separate and simpler: a popup created with `new` takes its parent's origin,
+      so the modal covered the bar it dropped from. `nxterm`'s menu has always used `at`.
+      Dismissal needed a signal — `InputLost` is queue overflow, not focus, and reading it as one
+      would close the modal on a burst of motion; `WindowEvent::Focus(false)` is the right one and
+      already reached clients.
+
+      **Three latent bugs surfaced on the way**, none of them in what was reported: two row
+      builders keyed the same row differently the moment a query was non-empty; the shell's
+      placement line hardcoded `at 0,` — a value written into the line that reports it, right
+      until the cascade moved; and `check-login` measured every title-bar button from a window's
+      *width*, which is its right edge only while windows start at x=0.
+
+      **No hover receipt for this one, deliberately.** `nxterm` reports its menu hover because a
+      gate has no other way to see it. This shell has zero build-mode `cfg` sites — the state the
+      test-path retrofit exists to preserve — and `check-login` boots the release image, so such a
+      line would be both a reintroduction and invisible to the gate wanting it. The click proves
+      the router; hover rides the same router.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

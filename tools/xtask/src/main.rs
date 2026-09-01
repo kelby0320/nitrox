@@ -1615,14 +1615,19 @@ fn parse_work_area(rest: &str) -> Option<(i32, i32, u32, u32, u32, u32)> {
 }
 
 /// Read `<id> at 0,<y>` — the tail of the shell's placement line. Returns `(id, y)`.
-fn parse_placement(rest: &str) -> Option<(u32, i32)> {
+fn parse_placement(rest: &str) -> Option<(u32, i32, i32)> {
     let mut it = rest.split_whitespace();
     let id = it.next()?.parse().ok()?;
     if it.next()? != "at" {
         return None;
     }
-    let (_, y) = it.next()?.split_once(',')?;
-    Some((id, y.parse().ok()?))
+    // **`x` as well as `y`, since M11 Part E batch 4.** It was discarded because the cascade
+    // always started at the left edge, so every button this gate aims at could be measured from
+    // the window's width alone. Insetting the cascade moved every one of them, and the gate went
+    // on clicking as though the window began at zero — landing on minimise where it meant
+    // maximise. A gate that assumes an origin is a gate that stops working when something moves.
+    let (x, y) = it.next()?.split_once(',')?;
+    Some((id, x.parse().ok()?, y.parse().ok()?))
 }
 
 /// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxterm`'s menu-popup line.
@@ -1893,7 +1898,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `<id> at 0,<y>`; nothing moves this window between here and there — a desktop change and a
     // minimise leave the origin alone — so this is its origin at that point.
     let placed = session.rest_of_line()?;
-    let (term_id, term_y) = parse_placement(&placed)
+    let (term_id, term_x, term_y) = parse_placement(&placed)
         .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // Its width, which the title bar's buttons are measured from — **before the window-list
     // line**, which follows it: an `expect` scans forward, so asserting the list first would
@@ -1918,8 +1923,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // slot left; the first run after that clicked *close* where it meant maximise, which is what
     // a coordinate constant hides and a changing layout exposes.
     let button_y = term_y + 13;
-    let maximise_at = (term_w as i32 - 39, button_y);
-    let minimise_at = (term_w as i32 - 65, button_y);
+    // Measured from the window's **right edge**, which is its origin plus its width — not from
+    // its width, which is the same number only while windows are placed at x=0.
+    let right = term_x + term_w as i32;
+    let maximise_at = (right - 39, button_y);
+    let minimise_at = (right - 65, button_y);
 
     // **Maximise here is asserted as far as the shell's answer** — that the ask reached it and
     // that it answered with the *work area* rather than the screen. What the client does with
@@ -2011,20 +2019,31 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("  ok: the taskbar asked, and the client closed itself");
     let first_term_id = term_id;
 
-    // Launch another, because everything below needs a terminal — the same sequence as the
-    // first launch, and the modal it opens is closed by the launch.
+    // Launch another, because everything below needs a terminal — and **by clicking the row this
+    // time**, which is the second launch path and did not exist until M11 Part E batch 4. The
+    // shell read pointer events for the overview, the applications button and the taskbar, and
+    // never for the modal's own window: its rows could not be clicked at all, and nothing under
+    // the cursor reacted. Everything after this step depends on the terminal, so a click that
+    // silently does nothing fails the rest of the gate rather than passing quietly.
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
+    // Filtered to one row first, so the row being clicked is known without the gate having to
+    // work out where `nxterm` sorts in the contents of `/bin`.
     for c in "nxterm".chars() {
         let mut qcode = String::new();
         qcode.push(c);
         press(&mut qmp, &qcode)?;
     }
-    press(&mut qmp, "ret")?;
+    // **The modal hangs from the button now**, at (0, `BAR_H`), rather than covering the bar it
+    // drops from — so the first row sits a field's height below the bar. `click_at` asserts the
+    // press position before anything downstream is checked, which is what separates "the pointer
+    // was not over the row" from "it was, and the click did nothing".
+    const ROW1: (i32, i32) = (60, 64);
+    click_at(&mut qmp, &mut session, ROW1.0, ROW1.1)?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: placed window ")?;
     let replaced = session.rest_of_line()?;
-    let (term_id, term_y) = parse_placement(&replaced).ok_or_else(|| {
+    let (term_id, term_x, term_y) = parse_placement(&replaced).ok_or_else(|| {
         format!("could not read the replacement terminal's placement from {replaced:?}")
     })?;
     session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
@@ -2060,8 +2079,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     the left — so (90, 788) is inside the first one.
 
     // Close the modal first: it is a popup on top, and a press meant for the bar would land in
-    // it. Escape is what the modal itself declines to type.
-    press(&mut qmp, "esc")?;
+    // it. **By clicking outside it rather than by pressing Escape** (M11 Part E batch 4) —
+    // Escape is covered by the launch step above, and dismissal-on-outside-click is what did not
+    // exist: this process never sees a press aimed at another window, so the modal stayed open
+    // over whatever was clicked. The compositor's focus event is the one signal that says the
+    // person went elsewhere, and it is what closes it now.
+    //
+    // Into the terminal's grid, which is focusable and present — clicking bare desktop moves
+    // focus nowhere, so it would prove nothing about the mechanism.
+    click_at(&mut qmp, &mut session, term_x + 200, term_y + 200)?;
     session.expect("desktop-shell: applications modal closed")?;
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
@@ -2385,9 +2411,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.pointer = Some((press_at.0 + DRAG_STEPS * DRAG_DX, press_at.1 + DRAG_STEPS * DRAG_DY));
     // The window ended up offset by exactly what was injected. One line for the gesture:
     // the compositor reports no geometry change per motion, deliberately.
+    // **From where it started, not from zero.** A drag moves a window by what was injected, and
+    // the destination is its origin plus that — which was the same number only while the cascade
+    // placed every window at x=0 (M11 Part E batch 4).
     session.expect(&format!(
         "desktop-shell: window {term_id} geometry {},{} ",
-        DRAG_STEPS * DRAG_DX,
+        term_x + DRAG_STEPS * DRAG_DX,
         term_y + DRAG_STEPS * DRAG_DY
     ))?;
     println!("  ok: the terminal moved with its own title bar, offset by where it was grabbed");
@@ -2404,9 +2433,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // reallocates and *commits* at the new size, and the geometry the shell reads back is the
     // committed one. A client that still declined would produce every line but the last.
     //
-    // The button is at the window's top-right, and the window has moved: its origin is
-    // `DRAG_STEPS * DRAG_DX` across and `term_y + DRAG_STEPS * DRAG_DY` down.
-    let moved_x = DRAG_STEPS * DRAG_DX;
+    // The button is at the window's top-right, and the window has moved: its origin is where it
+    // was placed plus what the drag injected.
+    let moved_x = term_x + DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
     click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 39, moved_y + 13)?;
     session.expect("nxterm: asked the shell for window state 2")?;

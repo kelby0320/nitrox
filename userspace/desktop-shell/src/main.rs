@@ -81,7 +81,9 @@ use librsproto::surface::{
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
+use libui::diff::Tree;
 use libui::layout::layout;
+use libui::route::Router;
 use libui::paint::{FontMetrics, Theme, paint};
 use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
@@ -132,13 +134,14 @@ const APPS_BUTTON_W: u32 = 120;
 
 /// The top bar's element tree.
 fn bar_view() -> Element<()> {
-    row(alloc::vec![
-        sized(
-            libdraw::geom::Size::new(APPS_BUTTON_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
-        ),
-        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("nitrox")),
-    ])
+    // **One thing, and it does something** (M11 Part E batch 4). There was a "nitrox" label
+    // beside the button — a word with no handler, which reads as a menu that does not open. A
+    // control that looks live and is not is the defect M8's overview shipped three of; a label
+    // that looks like a control is the same defect with less code behind it.
+    row(alloc::vec![sized(
+        libdraw::geom::Size::new(APPS_BUTTON_W, 0),
+        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
+    )])
 }
 
 /// One entry in the bottom bar's window list.
@@ -432,21 +435,33 @@ const ROW_H: u32 = 20;
 /// another — clipped and overlapping for every size but the default. There is no size constant
 /// in this crate now; there is a theme, and both the measure and the paint come from it
 /// (PR #263 review, blocking 1).
+/// What the applications modal can ask for.
+///
+/// **One variant, and it is still worth a type.** `Element<()>` was honest while nothing could be
+/// clicked; a message with a payload is what carries *which* row, and the unit type cannot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModalMsg {
+    /// Launch the program keyed by this index into the unfiltered program list.
+    Launch(u64),
+}
+
 fn modal_view(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
     state: &mut ListState,
+    hovered: Option<u64>,
     theme: &Theme,
-) -> Element<()> {
+) -> Element<ModalMsg> {
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
-    // **No hover here, and it is a shape rather than an omission** (M11 Part E batch 3). Hover
-    // comes from `Router::inside`, and this shell has no `Router`: it hit-tests the modal's
-    // coordinates by hand, so there is no widget id for it to report. Giving the modal pointer
-    // feedback means giving the shell a router first, which is a change to how it handles input
-    // rather than to how it looks.
-    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, None, theme);
+    // **Rows are clickable and they highlight** (M11 Part E batch 4). Until then this shell
+    // looked at pointer events for exactly three things — the overview's thumbnails, the
+    // applications button and the taskbar — and never at the modal's own window, so its rows
+    // could not be clicked at all and nothing under the cursor reacted. Both are the same gap:
+    // no router. The key is the row's index into the *unfiltered* list, which is what makes
+    // `ModalMsg::Launch` resolvable after a filter has reordered what is shown.
+    let list = list_view(rows, state, list_h, ROW_H, ModalMsg::Launch, None, hovered, theme);
     // **Framed, because a popup is the one surface with nothing behind it to define its edge**
     // (M11 Part E, batch 2). On a light theme this modal's face and the window it covers are
     // within a few units of each other, so without a line around it the two run together. Same
@@ -467,6 +482,8 @@ fn render_modal(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
     state: &mut ListState,
+    tree: &mut Tree,
+    hovered: Option<u64>,
 ) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(MODAL_W, MODAL_H, MODAL_PITCH, PixelFormat::XRGB8888)
         .expect("the modal pitch is wide enough for a row");
@@ -476,10 +493,15 @@ fn render_modal(
     // in one frame.
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    let ui = modal_view(query, rows, state, theme);
+    let ui = modal_view(query, rows, state, hovered, theme);
     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
+    // **The tree records what was painted**, which is what makes a click land on the row a
+    // person can see: the router hit-tests the retained tree, so a tree from a different frame
+    // is a hit test against a picture nobody is looking at. Updated here rather than at the
+    // call sites, so it cannot be forgotten at one of them.
+    let _ = tree.update(&ui, &l);
     paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
 }
@@ -489,10 +511,28 @@ fn render_modal(
 /// Substring rather than prefix: a launcher that only matched from the start would make
 /// "term" fail to find `nxterm`, which is the one thing anybody will type.
 fn filter<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<&'a str> {
+    programs.iter().map(|s| s.as_str()).filter(|name| matches(name, q)).collect()
+}
+
+/// Whether `name` is shown for query `q`.
+fn matches(name: &str, q: &str) -> bool {
+    q.is_empty() || name.contains(q)
+}
+
+/// The modal's rows: what `q` matches, **keyed by index into the unfiltered list**.
+///
+/// **One builder, because two of them disagreed.** `open_modal` keyed by the unfiltered index —
+/// with a comment explaining that the filtered index would pair row 2's widget with row 3's
+/// element the moment a character is typed — and the repaint site keyed by the filtered one. The
+/// two produced different keys for the same row as soon as the query was non-empty, which
+/// nothing noticed while a key was only ever used for diffing a modal that is repainted whole.
+/// A click resolves a key back to a program, so it notices now (M11 Part E batch 4).
+fn modal_rows<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<ListRow<'a>> {
     programs
         .iter()
-        .map(|s| s.as_str())
-        .filter(|name| q.is_empty() || name.contains(q))
+        .enumerate()
+        .filter(|(_, name)| matches(name, q))
+        .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
         .collect()
 }
 
@@ -1546,7 +1586,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // which is the only answer available to a desktop whose applications draw their own chrome
     // (M9 Part C).
     let mut closing: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
-    let mut next_origin = BAR_H as i32;
+    let mut next_origin = BAR_H as i32 + CASCADE_STEP;
 
     // Registered on the first pass of the loop, once the manager channel is known to exist.
     let mut hotkey_done = manager.is_none();
@@ -1599,6 +1639,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         .end();
     let mut modal: Option<u32> = None;
     let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    // **The modal's own routing state** (M11 Part E batch 4). Until now this shell read pointer
+    // events for three things it hit-tested by hand — the overview's thumbnails, the applications
+    // button, and the taskbar's entries — and never for the modal, whose contents are a widget
+    // tree rather than a fixed grid. Hand-testing a list that scrolls and filters would be the
+    // toolkit's layout re-derived in the shell; a router is what the toolkit already has.
+    let mut modal_tree = Tree::new();
+    let mut modal_router = Router::new();
     let mut query = TextFieldState::new();
     // **The modal serves two purposes and has to know which.** It is the applications launcher
     // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
@@ -1888,7 +1935,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         query.clear();
                         modal = open_modal(
                             &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query,
+                            &query, &mut modal_tree,
                         );
                         if let Some(id) = modal {
                             stick(m, id, b"the rename prompt");
@@ -2009,6 +2056,74 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // the property `check-terminal` relies on when it says "an open menu is a topmost
             // popup and takes the keyboard". The top bar could never receive these.
             if Some(w) == modal {
+                // **A click on a row launches it** (M11 Part E batch 4), routed through the
+                // toolkit rather than hit-tested here: the modal's contents are a widget tree
+                // that filters and scrolls, and re-deriving where its rows are would be the
+                // layout engine written twice. The tree is the one `render_modal` recorded when
+                // it painted, so a click lands on the row a person can see.
+                if let libsurface::WindowEvent::Pointer(p) = event {
+                    let rows = modal_rows(&programs, query.text());
+                    let mut list = ListState::default();
+                    let hovered = modal_router.hovered_key(&modal_tree);
+                    let ui = modal_view(&query, &rows, &mut list, hovered, &theme);
+                    let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
+                    let l = libui::layout::layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+                    let (msgs, _) = modal_router.pointer(&modal_tree, &ui, &l, p);
+                    // **Hover is a repaint even when nothing was clicked**, which is the whole
+                    // of the highlight: a pointer that merely moved produces no message and
+                    // still changes what the modal should look like.
+                    // **A repaint, and no receipt.** `nxterm` reports its menu hover because a
+                    // gate has no other way to see it; this shell must not, for a reason that
+                    // outranks the convenience: it has **no build-mode `cfg` sites at all**, and
+                    // `check-login` boots the *release* image, so a `test-harness` line here
+                    // would be both a reintroduction of what the test-path retrofit removed and
+                    // invisible to the gate that would want it. What proves this wiring is the
+                    // click below it: hover and clicking ride the same router, so a router that
+                    // hit-tests wrongly fails the launch.
+                    if modal_router.hovered_key(&modal_tree) != hovered {
+                        modal_dirty = true;
+                    }
+                    for msg in msgs {
+                        let ModalMsg::Launch(key) = msg;
+                        // The key is an index into the *unfiltered* list, which is what
+                        // `modal_rows` guarantees and what makes this resolvable at all.
+                        if let Some(name) = programs.get(key as usize) {
+                            if rename {
+                                // A rename prompt has rows for the same reason the launcher
+                                // does — it is the same widget — but choosing one is not
+                                // naming a desktop, so a click is ignored rather than
+                                // misinterpreted as one.
+                                kprint(b"desktop-shell: the name prompt takes typing, not clicks\n");
+                            } else {
+                                launcher.launch(name.as_str(), &[]);
+                                close_modal(
+                                    &mut session,
+                                    &mut modal,
+                                    &mut query,
+                                    "applications modal",
+                                    &mut modal_addrs,
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // **Losing the keyboard dismisses it**, which is what "click outside" means from
+                // in here: this process never sees a press aimed at another window, and the
+                // compositor's focus event is the one signal that says the person went
+                // elsewhere. `InputLost` is *not* this — that is queue overflow, and reading it
+                // as a focus change would close the modal on a burst of motion.
+                if let libsurface::WindowEvent::Focus(false) = event {
+                    rename = false;
+                    close_modal(
+                        &mut session,
+                        &mut modal,
+                        &mut query,
+                        "applications modal",
+                        &mut modal_addrs,
+                    );
+                    continue;
+                }
                 if let libsurface::WindowEvent::Key(k) = event {
                     if k.pressed != 0 {
                         if k.keycode == KEY_ESC {
@@ -2268,7 +2383,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     {
                         modal = open_modal(
                             &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query,
+                            &query, &mut modal_tree,
                         );
                         if let Some((m, id)) = manager.as_mut().zip(modal) {
                             stick(m, id, b"the applications modal");
@@ -2466,13 +2581,21 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // cannot see is not a filter.
         if modal_dirty {
             if let Some(id) = modal {
-                let filtered = filter(&programs, query.text());
-                let rows: alloc::vec::Vec<ListRow<'_>> = filtered
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| ListRow { key: i as u64, label: name })
-                    .collect();
-                present_modal(&mut session, id, &theme, &font, &query, &rows, &modal_addrs);
+                let rows = modal_rows(&programs, query.text());
+                // Read before the borrow: `present_modal` takes the tree mutably to record what
+                // it painted, and the hover it should paint *with* comes from the tree as it is.
+                let hovered = modal_router.hovered_key(&modal_tree);
+                present_modal(
+                    &mut session,
+                    id,
+                    &theme,
+                    &font,
+                    &query,
+                    &rows,
+                    &modal_addrs,
+                    &mut modal_tree,
+                    hovered,
+                );
             }
         }
     }
@@ -3693,11 +3816,17 @@ fn place_new_windows(
             desktop: current,
         });
         dirty = true;
-        let (x, y) = (0, *next_origin);
+        // **Inset from the left edge, not flush against it** (M11 Part E batch 4). The cascade
+        // stepped down from the bar and started at x=0, so a first window sat with its frame on
+        // the screen's border — which reads as a window that has been shoved rather than placed.
+        // One step in, so the offset matches the one the cascade already uses downward.
+        let (x, y) = (CASCADE_STEP, *next_origin);
         // Wrapped, or the 34th window is placed below an 800px screen and never seen.
         *next_origin += CASCADE_STEP;
         if *next_origin > SCREEN_H - CASCADE_STEP {
-            *next_origin = BAR_H as i32;
+            // Back to where the cascade starts, which is one step below the bar rather than
+            // against it — the same inset the first window gets.
+            *next_origin = BAR_H as i32 + CASCADE_STEP;
         }
         let place = MgrPlace { window: created.window, x, y };
         let mut body = [0u8; 12];
@@ -3712,10 +3841,17 @@ fn place_new_windows(
                 .end();
             continue;
         }
+        // **`x`, not a literal zero.** This said `at 0,` because the cascade always started at
+        // the left edge — a value hardcoded into the line that reports it, which is the shape
+        // that stays right until the thing it describes changes. Insetting the cascade made the
+        // shell log one origin and place another, and `check-login` parses this line to find the
+        // window it is about to click (M11 Part E batch 4).
         Line::new()
             .s(b"desktop-shell: placed window ")
             .u(created.window as u64)
-            .s(b" at 0,")
+            .s(b" at ")
+            .i(x as i64)
+            .s(b",")
             .i(y as i64)
             .end();
     }
@@ -3731,6 +3867,8 @@ fn present_modal(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
     addrs: &[*mut u8; BUFFERS],
+    tree: &mut Tree,
+    hovered: Option<u64>,
 ) {
     let len = MODAL_PITCH * MODAL_H as usize;
     // **A local, because the launcher keeps no selection.** Enter launches the filtered list's
@@ -3738,7 +3876,7 @@ fn present_modal(
     // and since M10 Part C that is said by the state being a throwaway here rather than by a
     // `_` in a pattern, which is what it looked like when the widget returned it.
     let mut list = ListState::default();
-    let fb = render_modal(theme, font, query, rows, &mut list);
+    let fb = render_modal(theme, font, query, rows, &mut list, tree, hovered);
     let bytes = fb.into_bytes();
     if bytes.len() != len {
         return;
@@ -3809,18 +3947,13 @@ fn open_modal(
     programs: &[alloc::string::String],
     addrs: &mut [*mut u8; BUFFERS],
     query: &TextFieldState,
+    tree: &mut Tree,
 ) -> Option<u32> {
-    let rows: alloc::vec::Vec<ListRow<'_>> = programs
-        .iter()
-        .enumerate()
-        // Keyed by index into the **unfiltered** list, which is what `ListRow::key`'s doc asks
-        // for: a filter reorders and shortens the rows, and an index into the filtered view
-        // would pair row 2's widget with row 3's element the moment a character is typed.
-        .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
-        .collect();
+    let rows = modal_rows(programs, query.text());
     // A throwaway for the reason `present_modal`'s is one: no selection is kept.
     let mut list = ListState::default();
-    let picture = render_modal(theme, font, query, &rows, &mut list);
+    // Nothing is hovered before the window exists.
+    let picture = render_modal(theme, font, query, &rows, &mut list, tree, None);
     let bytes = picture.into_bytes();
     let len = MODAL_PITCH * MODAL_H as usize;
     if bytes.len() != len {
@@ -3828,7 +3961,15 @@ fn open_modal(
         return None;
     }
     let role = Role::Popup { parent };
-    let id = match session.create(&CreateWindowRequest::new(MODAL_W, MODAL_H, role), BUFFERS) {
+    // **Hanging from the applications button, not sitting on top of it** (M11 Part E batch 4).
+    // A popup created with `new` takes its parent's origin, and the parent here is the top bar —
+    // so the modal covered the bar it dropped from, including the button that opened it.
+    // `nxterm`'s menu has always used `at`; this is the same call, with the button's left edge
+    // and the bar's height. A popup is clipped by the *screen* rather than by its parent, which
+    // is what lets it hang below a 24-pixel bar.
+    let id = match session
+        .create(&CreateWindowRequest::at(MODAL_W, MODAL_H, role, 0, BAR_H as i32), BUFFERS)
+    {
         Ok(id) => id,
         Err(_) => {
             kprint(b"desktop-shell: modal CreateWindow FAILED\n");

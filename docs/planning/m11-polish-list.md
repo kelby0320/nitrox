@@ -68,14 +68,19 @@ a request is being met in a particular way.
 
 ## Open
 
-- [] **Color Scheme** - We have defaulted to a dark theme. I want to default to a light theme.  Note we don't have any explicit support for light or dark themes I'm just describing the general color scheme we are using.  We can experiment with some different palettes but I've uploaded a screenshot of one of my laptops running MATE.  I like the look of it and I think it's a good starting point.  I will continue to reference it.  The file is build-cache/Screenshot at 2026-09-01 10-39-59.png
-- [] Slight gradient on title bars (and scrollbars?) See screenshot.
-- [] Small spacing on left, right, and bottom of windows.  See screenshot.
 - [] Real icons for minimize, maximize, and close buttons. (Icon support needed?)
-- [] Desktop top and bottom bars should be light rather than dark.  Exact colors are a theme question we can interate on.
-- [] build-cache/Screenshot at 2026-09-01 10-51-25.png show a similar desktop, but with a dropdown menu open.  This is a good reference for how a dropdown menu should look.  Note there are icons and keyboard shortcuts show on menu items.  These are nice to have, but we don't have to do them now.  I would like to highlight the selected item in the menu.  It is not only highlighted blue, but it has a thin dark blue border.  We should do something like this.  The menu itself also has a thin dark border around it.
 - [] **Desktop Background** - We can choose a default color that fits the theme.  Probably some shade of blue.  It would be nice to be able to have background image support.  Image support can be a stretch goal, but all real OS desktops have background image support.
 - [] **Stretch 1** - Drop shadow support around windows and menus.  Could be a good addition, but I don't know how difficult this will be.  Not critical.
+
+- [x] The open applications menu is positioned wrong.  It should be a drop down from the applications button.  It also doesn't close when you click outside of it.  Also, you can't click any of the menu items. Menu item hovering doesn't work either.
+      *(batch 4 — all four were one cause: the shell read pointer events for the overview, the
+      applications button and the taskbar, and never for the modal's own window.)*
+- [] Scrollbars don't appear to work.  You can't click and drag them.
+- [x] The default window position should be more right.  The left side of the window should not be on the border of the screen. *(batch 4)*
+- [x] The "nitrox" label next to "applications" on the top bar doesn't do anything.  It doesn't appear to be a drop down menu.  Recommend we remove it. *(batch 4 — removed)*
+- [] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
+- [] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
+- [] nxedit doesn't launch from the menu.
 
 ---
 
@@ -91,6 +96,11 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 4 — the applications menu, and two small things** (2026-09-01). The menu hangs from
+  its button, its rows can be clicked, it dismisses when focus leaves, and it highlights — all one
+  cause. Plus the dead "nitrox" label removed and the cascade inset from the screen edge. Found
+  three latent bugs on the way: two row builders that keyed the same row differently, a log line
+  that hardcoded the value it reported, and a gate that assumed windows start at x=0.
 - **Batch 3 — hover** (2026-09-01). The menu's highlighted item, and the discovery behind it:
   nothing in the system had ever reacted to the pointer being over it. Menu rows highlight like a
   selection; list rows get a quieter face. The applications modal still has none, because the

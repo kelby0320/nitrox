@@ -21075,3 +21075,62 @@ assumption: the guest has said where the pointer is.
 `desktop-shell`'s applications modal, and it is a shape rather than an omission: the shell has no
 `Router` at all — it hit-tests the modal's coordinates by hand. Giving it pointer feedback means
 giving it a router first, which is a change to how it handles input rather than to how it looks.
+
+## 2026-09-01 — M11 Part E batch 4: four reports, one cause, and three bugs nobody reported
+
+The maintainer's second pass opened with four complaints about the applications menu: wrongly
+positioned, does not close when you click outside, rows cannot be clicked, no hover. Three of the
+four are one cause.
+
+**`desktop-shell` read pointer events for exactly three things** — the overview's thumbnails, the
+applications button, and the taskbar's entries — each hit-tested by hand against a fixed grid. It
+never looked at the modal's own window at all. That is why nothing could be clicked and nothing
+highlighted, and it is why batch 3 left this surface out: hover comes from a router, and there was
+none.
+
+It has one now, and the reasoning is the same one that put a router in the toolkit: the modal's
+contents are a widget tree that filters and scrolls, so hand-testing where its rows are would be
+the layout engine re-derived in the shell. The tree the router hit-tests is the one `render_modal`
+recorded when it painted — updated inside that function rather than at its call sites, so a click
+lands on the row a person can see rather than on one from a previous frame.
+
+**Placement was separate and simpler.** A popup created with `CreateWindowRequest::new` takes its
+parent's origin, and the parent is the top bar — so the modal covered the bar it dropped from,
+button included. `nxterm`'s menu has always used `at`. Same call, with the button's left edge and
+the bar's height.
+
+**Dismissal needed a signal, and the obvious one is wrong.** From inside the shell there is no
+such event as "a click outside": this process never sees a press aimed at another window.
+`WindowEvent::InputLost` is *queue overflow*, not focus — reading it as a focus change would close
+the modal on a burst of pointer motion. `WindowEvent::Focus(false)` is the right signal and has
+reached clients since M6.
+
+### Three bugs that were not in the report
+
+**Two row builders keyed the same row differently.** `open_modal` keyed by index into the
+*unfiltered* program list, with a comment explaining that the filtered index would pair row 2's
+widget with row 3's element as soon as a character was typed; the repaint site keyed by the
+filtered index. They disagreed for every non-empty query, and nothing noticed while a key was only
+used to diff a modal that is repainted whole. A click resolves a key back to a program, so it
+would have launched the wrong thing. One builder now.
+
+**The shell's placement line hardcoded the value it reports.** `desktop-shell: placed window N at
+0,<y>` — the zero was a literal, correct only while the cascade started at the left edge.
+Insetting the cascade made the shell log one origin and place another.
+
+**And `check-login` measured every title-bar button from a window's width**, which is its right
+edge only while windows are placed at x=0. It clicked minimise where it meant maximise the moment
+the cascade moved. A gate that assumes an origin stops working when something moves — and it
+failed *loudly*, which is the good version of this.
+
+### What this batch deliberately does not have
+
+A hover receipt. `nxterm` prints one because a gate has no other way to see a highlight; this
+shell must not, and the reason outranks the convenience: it has **zero build-mode `cfg` sites**,
+which is the state `test-path-retrofit.md` exists to preserve, and `check-login` boots the
+*release* image — so a `test-harness` line here would be both a reintroduction of what that
+retrofit removed and invisible to the gate that wanted it.
+
+What proves the wiring instead is the launch: `check-login`'s second terminal is now started by
+**clicking its row**, and everything after that step depends on the terminal existing. Hover and
+clicking ride the same router, so a router that hit-tests wrongly fails the rest of the gate.
