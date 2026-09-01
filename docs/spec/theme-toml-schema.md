@@ -51,7 +51,10 @@ font_ui = "/system/fonts/DejaVuSans.ttf"
 | `cursor_body` | `"#RRGGBB"` | The pointer's fill |
 | `cursor_outline` | `"#RRGGBB"` | The pointer's outline |
 | `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target |
+| `border` | `"#RRGGBB"` | The line around a window, a menu, or anything with an edge |
+| `desktop` | `"#RRGGBB"` | The ground between windows |
 | `font_px` | number, `6`–`16` | Text size in pixels per em, read to the nearest hundredth |
+| `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens |
 | `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional |
 | `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
 
@@ -89,7 +92,12 @@ the same number. Larger text is clipped by the painter and overlapped by its nei
 title bar at a fixed offset. Raising this means metrics that follow type, and that is the
 decision to revisit, not this number.
 
-**`cursor_body`, `cursor_outline` and `outline` are read but do not take effect.** They are drawn
+**`bevel` is one number for every gradient in the system** — a title bar, a scrollbar's thumb, a
+selected row. The reference desktop's own gradients span ±10 and ±14 around their midpoints, so
+one amount reproduces both; two colours per gradient would be eight more values for a palette to
+keep coherent. `0` is flat, and is a theme somebody may legitimately want.
+
+**`cursor_body`, `cursor_outline`, `outline` and `desktop` are read but do not take effect.** They are drawn
 by the *compositor*, which `init` starts rather than the session — so it never sees a setup
 record and uses the built-in values. They are listed because they are part of one theme and a
 file that omitted them would be describing a different thing than the type does. **Trigger for

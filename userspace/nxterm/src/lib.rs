@@ -618,13 +618,16 @@ impl App {
 
     /// The popup's contents.
     fn menu(&self, ui: &UiTheme) -> Element<Msg> {
-        use libui::element::{column, fill};
+        use libui::element::column;
         let items = column(vec![
             button("Clear", Msg::Clear, WidgetState::default(), ui),
             button("Reset", Msg::Reset, WidgetState::default(), ui),
         ]);
-        // A backing fill under the items, so the menu is opaque over whatever it covers.
-        stack(vec![fill(ui.face), padding(Insets::all(2), items)])
+        // A backing fill under the items, so the menu is opaque over whatever it covers — and a
+        // border around it, because on a light theme the face and the window underneath are
+        // within a few units of each other (M11 Part E, batch 2). `popup_frame` supplies both,
+        // and is what the applications modal uses too.
+        libui::widget::popup_frame(padding(Insets::all(2), items), ui)
     }
 }
 

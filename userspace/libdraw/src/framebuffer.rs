@@ -172,6 +172,35 @@ pub trait Framebuffer {
         }
     }
 
+    /// Fill `rect` with a vertical gradient — `mid` lightened at the top, darkened at the
+    /// bottom by `bevel` — painting only inside `clip`.
+    ///
+    /// **Two rectangles rather than one, and that is the whole subtlety.** The gradient's stops
+    /// are fixed by `rect`, which is the shape being drawn; `clip` is how much of it this frame
+    /// repaints. Computing the ramp from the clip instead would make a partial repaint draw a
+    /// *different* picture from a full one — the class of bug that only shows when a damage
+    /// rectangle happens to be small, which is to say the one that reaches a screenshot last.
+    ///
+    /// A one-pixel-high rect is `mid` exactly: there is no top and bottom to span.
+    fn fill_rect_bevel(&mut self, rect: Rect, clip: Rect, mid: Rgb, bevel: u8) {
+        let Some(paint) = rect.intersect(&clip) else { return };
+        if rect.size.h <= 1 || bevel == 0 {
+            self.fill_rect(paint, mid);
+            return;
+        }
+        let span = (rect.size.h - 1) as i32;
+        let top = bevel as i32;
+        for row in 0..paint.size.h {
+            let y = paint.origin.y + row as i32;
+            // Linear from +bevel at the rect's top row to -bevel at its last, rounded to
+            // nearest so the two halves are symmetric about the middle.
+            let t = y - rect.origin.y;
+            let delta = top - (2 * top * t + span / 2) / span;
+            let line = Rect::new(paint.origin.x, y, paint.size.w, 1);
+            self.fill_rect(line, mid.shade(delta as i16));
+        }
+    }
+
     /// Fill the entire visible area.
     fn clear(&mut self, colour: Rgb) {
         let bounds = self.geometry().bounds();
@@ -330,6 +359,49 @@ mod tests {
             let pad = &fb.bytes()[row * 24 + 16..row * 24 + 24];
             assert!(pad.iter().all(|&b| b == 0), "row {row} padding was written");
         }
+    }
+
+    #[test]
+    fn a_bevel_ramps_from_lighter_to_darker_and_a_partial_repaint_agrees() {
+        let mut fb = MemFramebuffer::new(Geometry::packed(4, 9, PixelFormat::XRGB8888));
+        let r = Rect::new(0, 0, 4, 9);
+        let mid = Rgb::new(0x80, 0x80, 0x80);
+        fb.fill_rect_bevel(r, r, mid, 8);
+        assert_eq!(fb.get_pixel(0, 0), Some(mid.shade(8)), "the top row is the light end");
+        assert_eq!(fb.get_pixel(0, 4), Some(mid), "the middle row is the colour itself");
+        assert_eq!(fb.get_pixel(0, 8), Some(mid.shade(-8)), "the last row is the dark end");
+
+        // **A partial repaint must draw the same picture.** The ramp is fixed by the shape, not
+        // by how much of it this frame touches — get that wrong and a small damage rectangle
+        // silently paints a different gradient from a full one.
+        let mut part = MemFramebuffer::new(Geometry::packed(4, 9, PixelFormat::XRGB8888));
+        for band in 0..9 {
+            part.fill_rect_bevel(r, Rect::new(0, band, 4, 1), mid, 8);
+        }
+        assert_eq!(part.into_bytes(), fb.into_bytes(), "nine one-row repaints equal one full one");
+    }
+
+    #[test]
+    fn a_bevel_of_zero_and_a_one_row_bevel_are_flat_fills() {
+        // Both are real cases: a theme may set the bevel to nothing, and a scrollbar thumb at
+        // its smallest is one row. Dividing by `h - 1` would panic on the second.
+        for (h, bevel) in [(9u32, 0u8), (1, 12)] {
+            let mut fb = MemFramebuffer::new(Geometry::packed(2, h, PixelFormat::XRGB8888));
+            let r = Rect::new(0, 0, 2, h);
+            let mid = Rgb::new(0x40, 0x50, 0x60);
+            fb.fill_rect_bevel(r, r, mid, bevel);
+            for y in 0..h {
+                assert_eq!(fb.get_pixel(0, y), Some(mid), "h={h} bevel={bevel} row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bevel_clamps_rather_than_wrapping_at_both_ends() {
+        // Near-white lightened and near-black darkened both saturate; wrapping would put a dark
+        // band across the top of a light title bar.
+        assert_eq!(Rgb::new(0xFA, 0xFA, 0xFA).shade(12), Rgb::new(0xFF, 0xFF, 0xFF));
+        assert_eq!(Rgb::new(4, 4, 4).shade(-12), Rgb::BLACK);
     }
 
     #[test]

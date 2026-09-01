@@ -3244,6 +3244,30 @@ it is noticed on. Its own list, and its own milestone.
       the desktop light is exactly the event that shows the tie was to the sixteen ANSI colours,
       which are tuned for a dark ground and would put invisible text on a white one.
 
+- [ ] **Batch 2a — the chrome grows a third dimension** ✅ (2026-09-01). Gradients, drawn window
+      controls, and a line around anything with an edge.
+
+      **One bevel number for every gradient**, not a pair of colours per surface: the reference's
+      own gradients span ±10 and ±14 around their midpoints, so one amount reproduces both, and a
+      palette keeps one value coherent rather than eight. `Node::Bevel` is a second fill rather
+      than a flag on the first, because the two differ in what they need to know — a flat fill is
+      correct from the clip alone and a gradient is only correct from the node's rect, so a
+      one-row repaint of a gradient must draw the same picture as a full one. That is a host test.
+
+      **The window controls are drawn, not typed.** `_`, `[]` and `X` were three characters
+      standing in for three controls on a bar already full of text. Shapes cost a paint arm;
+      images would cost a decoder, an asset path and a size convention — filed, per the settled
+      decision, and the trade is worth revisiting when something needs an icon that is not three
+      strokes.
+
+      **And a selection is blue with a darker edge**, which is the second half of the request and
+      the half that matters: without the border, two adjacent selected rows read as one block.
+
+- [ ] **Batch 2b — the window frame.** Spacing on a window's left, right and bottom, with the
+      title bar flush at the top. Held back from 2a because it moves geometry: three applications
+      compute their content height from the window's, `nxterm` maps clicks to grid cells through
+      its origin, and all of that has to move together.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

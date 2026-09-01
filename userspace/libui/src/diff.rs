@@ -57,6 +57,10 @@ pub enum Fingerprint {
     Padding(Insets),
     /// [`Node::Sized`], with its size.
     Sized(libdraw::geom::Size),
+    /// [`Node::Bevel`], with its colour — like a fill, a recolour repaints.
+    Bevel(libdraw::format::Rgb),
+    /// [`Node::Icon`], with which glyph it is.
+    Icon(crate::element::IconKind),
     /// [`Node::Fill`], with its colour — a recolour repaints, it does not rebuild.
     Fill(libdraw::format::Rgb),
     /// [`Node::Offset`].
@@ -83,6 +87,8 @@ impl Fingerprint {
             Node::Padding { insets, .. } => Fingerprint::Padding(*insets),
             Node::Sized { size, .. } => Fingerprint::Sized(*size),
             Node::Fill(c) => Fingerprint::Fill(*c),
+            Node::Bevel(c) => Fingerprint::Bevel(*c),
+            Node::Icon(k) => Fingerprint::Icon(*k),
             Node::Offset { .. } => Fingerprint::Offset,
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }

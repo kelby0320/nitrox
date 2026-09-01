@@ -127,7 +127,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
         // Nothing caught it because every widget test lays *one* widget into a fixed
         // rectangle, where a greedy measure and a correct one give the same answer. Composing
         // the widget set into one UI (`reference::view`) is what surfaced it.
-        Node::Fill(_) => Size::new(0, 0),
+        Node::Fill(_) | Node::Bevel(_) | Node::Icon(_) => Size::new(0, 0),
         Node::Custom { size, .. } => *size,
         // An offset child measures as itself: the shift moves it, it does not resize it. What
         // the *parent* sees is the child's size plus the shift, so a `Stack` that sized itself
@@ -234,7 +234,11 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
         _ => rect,
     };
     let children = match &e.node {
-        Node::Text(_) | Node::Fill(_) | Node::Custom { .. } => Vec::new(),
+        Node::Text(_)
+        | Node::Fill(_)
+        | Node::Bevel(_)
+        | Node::Icon(_)
+        | Node::Custom { .. } => Vec::new(),
 
         Node::Padding { insets, child } => {
             let inner = Rect::new(

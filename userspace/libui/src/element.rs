@@ -96,6 +96,17 @@ pub struct Docked<Msg> {
     pub element: Element<Msg>,
 }
 
+/// Which window control an [`Icon`](Node::Icon) draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IconKind {
+    /// A bar along the bottom of the glyph box.
+    Minimise,
+    /// An empty square.
+    Maximise,
+    /// Two crossed strokes.
+    Close,
+}
+
 /// What an element *is*.
 ///
 /// Deliberately short. `docs/architecture/widget-toolkit.md` §1's rule is that anything Milestone
@@ -169,6 +180,23 @@ pub enum Node<Msg> {
     /// It measures to nothing and takes what it is given — a colour has no natural size, and
     /// a caller that wants one wraps it in [`sized`].
     Fill(Rgb),
+    /// A face with the theme's bevel: the colour lightened at the top and darkened at the
+    /// bottom of the node's own box.
+    ///
+    /// **A second fill rather than a flag on the first**, because the two differ in what they
+    /// need to know: a flat fill is correct from the clip alone, and a gradient is only correct
+    /// from the node's rect — the ramp is fixed by the shape, not by how much of it a frame
+    /// repaints. Keeping them separate is what stops that distinction being a parameter somebody
+    /// passes wrongly.
+    Bevel(Rgb),
+    /// One of the three window-control glyphs, drawn rather than typed.
+    ///
+    /// **Drawn, so there is no icon format yet** (M11 Part E, batch 2). A minimise is a bar, a
+    /// maximise is a square and a close is two strokes; expressing them as shapes costs a paint
+    /// arm, where expressing them as images costs a decoder, an asset path in the image build and
+    /// a size convention. That trade is worth revisiting the day something needs an icon that is
+    /// not three strokes — see the polish list's filed image-support item.
+    Icon(IconKind),
     /// A child shifted within its parent, taking its own measured size.
     ///
     /// **The one place absolute positioning exists, and it exists for overlays.** §5 rules it
@@ -345,7 +373,11 @@ impl<Msg> Element<Msg> {
         // consumes them in and the order they are painted.
         let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) =
             match &self.node {
-            Node::Text(_) | Node::Fill(_) | Node::Custom { .. } => (&[], None, None),
+            Node::Text(_)
+            | Node::Fill(_)
+            | Node::Bevel(_)
+            | Node::Icon(_)
+            | Node::Custom { .. } => (&[], None, None),
             Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
                 (children.as_slice(), None, None)
             }
@@ -408,6 +440,19 @@ pub fn sized<Msg>(size: Size, child: Element<Msg>) -> Element<Msg> {
 /// A rectangle of flat colour, filling whatever it is given.
 pub fn fill<Msg>(colour: Rgb) -> Element<Msg> {
     Element::new(Node::Fill(colour))
+}
+
+/// A face drawn with the theme's bevel — see [`Node::Bevel`].
+pub fn bevel<Msg>(colour: Rgb) -> Element<Msg> {
+    Element::new(Node::Bevel(colour))
+}
+
+/// A window-control glyph — see [`Node::Icon`].
+///
+/// It measures to nothing, like a fill: the button around it decides its size, and the glyph is
+/// drawn centred in whatever box it lands in.
+pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
+    Element::new(Node::Icon(kind))
 }
 
 /// A child shifted `(dx, dy)` from its parent's origin, at its own measured size.

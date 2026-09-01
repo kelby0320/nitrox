@@ -92,6 +92,15 @@ pub struct Theme {
     /// a second colour chosen here would be a guess made before anything had been looked at.
     pub outline: Rgb,
 
+    /// The line drawn around a window, a menu and anything else that has an edge.
+    ///
+    /// **One grey for all of them**, where the reference desktop uses three within a few units
+    /// of each other (`#817E7B` around a window, `#8D8C8B` around a menu, `#ACA9A6` inside the
+    /// frame). Three fields would be three decisions to keep coherent in every future palette,
+    /// and the difference between them is not visible at a glance — which is the test a polish
+    /// milestone should apply to a field.
+    pub border: Rgb,
+
     /// The ground between windows — what a desktop shows when nothing is on it.
     ///
     /// **Read but not live**, like the cursor and for the same reason: the compositor clears the
@@ -104,6 +113,18 @@ pub struct Theme {
     // ---- type ----
     /// Text size, in pixels per em.
     pub font_px: f32,
+
+    /// How far a gradient's top is lightened and its bottom darkened, per channel.
+    ///
+    /// **One number rather than a pair per gradient** (M11 Part E, batch 2). A title bar, a
+    /// scrollbar's thumb and a selected row are all one colour with a bevel, and the reference
+    /// desktop's own gradients span ±10 and ±14 around their midpoints — close enough that one
+    /// amount is the model rather than a simplification of one. Zero is flat, and is a theme a
+    /// person may legitimately want.
+    ///
+    /// Not `font_px`-like in one respect worth stating: it has no lower bound to enforce,
+    /// because zero is meaningful. The upper bound is [`MAX_BEVEL`].
+    pub bevel: u8,
     /// The font every label, button and list row is drawn with.
     ///
     /// **Proportional, and a different file from [`font_mono`](Self::font_mono)** — M11's
@@ -164,9 +185,11 @@ impl Theme {
             // grey that read against a dark desktop would vanish over half the screen.
             outline: Rgb::new(0x2C, 0x65, 0xAE),
 
+            border: Rgb::new(0x8D, 0x8C, 0x8B),
             desktop: Rgb::new(0x2A, 0x55, 0x70),
 
             font_px: 16.0,
+            bevel: 12,
             font_ui: FontPath::new(crate::text::UI_FONT_PATH),
             font_mono: FontPath::new(crate::text::MONO_FONT_PATH),
         }
@@ -262,10 +285,20 @@ impl Theme {
                 "cursor_body" => set(&mut t.cursor_body, value),
                 "cursor_outline" => set(&mut t.cursor_outline, value),
                 "outline" => set(&mut t.outline, value),
+                "border" => set(&mut t.border, value),
                 "desktop" => set(&mut t.desktop, value),
                 // **Unquoted, because TOML types a quoted number as a string.** Accepting
                 // `font_px = "14"` would be accepting a file a real TOML reader disagrees with
                 // this one about.
+                // Unquoted for the same reason `font_px` is: both are TOML numbers.
+                "bevel" if raw.starts_with('"') => false,
+                "bevel" => match value.parse::<u8>() {
+                    Ok(v) if v <= MAX_BEVEL => {
+                        t.bevel = v;
+                        true
+                    }
+                    _ => false,
+                },
                 "font_px" if raw.starts_with('"') => false,
                 "font_px" => match value.parse::<f32>() {
                     // **A size, not a number**, and bounded at both ends by what can be read:
@@ -333,8 +366,10 @@ impl Theme {
             cursor_body,
             cursor_outline,
             outline,
+            border,
             desktop,
             font_px,
+            bevel,
             font_ui,
             font_mono,
         } = *self;
@@ -354,11 +389,13 @@ impl Theme {
             ("cursor_body", cursor_body),
             ("cursor_outline", cursor_outline),
             ("outline", outline),
+            ("border", border),
             ("desktop", desktop),
         ] {
             let _ = writeln!(s, "{k} = \"#{:02X}{:02X}{:02X}\"", c.r, c.g, c.b);
         }
         let _ = writeln!(s, "font_px = {font_px}");
+        let _ = writeln!(s, "bevel = {bevel}");
         // Quoted, because that is the form `from_config` accepts — a writer whose output its own
         // reader refuses is a round trip that only works by accident.
         let _ = writeln!(s, "font_ui = \"{}\"", font_ui.as_str());
@@ -476,6 +513,14 @@ pub fn px_parts(px: f32) -> (u64, u64) {
     let whole = px as u64;
     (whole, libm::roundf((px - whole as f32) * 100.0) as u64)
 }
+
+/// The largest bevel a theme may ask for.
+///
+/// **A limit on taste rather than on correctness** — `shade` clamps, so nothing breaks at any
+/// value. What breaks is legibility: past about a quarter of the range a "gradient" is two
+/// colours with a seam, and a title bar's text crosses both. 64 is generous enough that nobody
+/// hits it by accident and small enough that the file cannot produce a stripe.
+pub const MAX_BEVEL: u8 = 64;
 
 /// The smallest text this system will render at, in pixels per em.
 ///
@@ -669,7 +714,7 @@ mod tests {
         t.font_ui = FontPath::new("/home/Fancy.ttf");
 
         let text = t.to_config();
-        assert_eq!(text.lines().count(), 18, "fifteen colours, a size and two fonts");
+        assert_eq!(text.lines().count(), 20, "sixteen colours, a size, a bevel and two fonts");
         let (back, issues) = Theme::from_config(&text);
         assert_eq!(back, t);
         assert!(issues.is_empty(), "{issues:?}");
@@ -751,6 +796,19 @@ mod tests {
                 [Issue { line: 1, kind: IssueKind::BadValue }],
                 "{bad:?} was named as a bad value"
             );
+        }
+    }
+
+    #[test]
+    fn a_bevel_is_a_number_and_is_bounded() {
+        let (t, issues) = Theme::from_config("bevel = 0\n");
+        assert_eq!(t.bevel, 0, "flat is a theme somebody may want");
+        assert!(issues.is_empty(), "{issues:?}");
+
+        for bad in ["bevel = \"12\"\n", "bevel = 65\n", "bevel = -4\n", "bevel = 12.5\n"] {
+            let (t, issues) = Theme::from_config(bad);
+            assert_eq!(t.bevel, Theme::light().bevel, "{bad:?} left the default");
+            assert_eq!(issues, [Issue { line: 1, kind: IssueKind::BadValue }], "{bad:?}");
         }
     }
 

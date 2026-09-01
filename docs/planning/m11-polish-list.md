@@ -83,7 +83,14 @@ a request is being met in a particular way.
 
 Batches land here as they go, so the record of what changed and why is beside the request.
 
-*(nothing yet)*
+- **Batch 1 — the palette turns light** (2026-09-01). One theme, `Theme::light()`, replacing
+  dark. Values measured from the reference. Two colours had to split off: `desktop` (the ground
+  between windows, which stopped being the same kind of thing as a window's ground) and a
+  saturated `outline` (the one colour composited over both). The terminal's grid keeps its own
+  dark ground.
+- **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
+  every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
+  darker edge on a selected row.
 
 ---
 

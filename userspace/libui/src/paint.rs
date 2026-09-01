@@ -25,7 +25,7 @@ use libdraw::framebuffer::Framebuffer;
 use libdraw::geom::{Point, Rect};
 use libdraw::text::Font;
 
-use crate::element::{Element, Node};
+use crate::element::{Element, IconKind, Node};
 use crate::layout::{Layout, Metrics};
 
 /// The theme everything is drawn from — **`libdraw`'s, since M11 Part B**.
@@ -90,6 +90,54 @@ pub fn paint<F, Msg, C>(
     draw(fb, font, theme, element, layout, damage, custom);
 }
 
+/// Draw a window control inside `rect`, clipped to `clip`.
+///
+/// **Centred in a square derived from the box** rather than sized in pixels, so the glyphs stay
+/// proportionate if the title bar's height ever changes — which it will, the day chrome metrics
+/// follow the type scale. The strokes are two pixels so they read at the sizes this chrome
+/// actually uses; one pixel disappears against a bevelled face.
+fn draw_icon<F: Framebuffer + ?Sized>(
+    fb: &mut F,
+    kind: IconKind,
+    rect: Rect,
+    clip: Rect,
+    ink: libdraw::format::Rgb,
+) {
+    const STROKE: u32 = 2;
+    // A square glyph box, a little under half the smaller dimension, centred.
+    let side = (rect.size.w.min(rect.size.h) * 4 / 10).max(STROKE * 2);
+    let x = rect.origin.x + (rect.size.w.saturating_sub(side) / 2) as i32;
+    let y = rect.origin.y + (rect.size.h.saturating_sub(side) / 2) as i32;
+    let mut bar = |r: Rect| {
+        if let Some(c) = r.intersect(&clip) {
+            fb.fill_rect(c, ink);
+        }
+    };
+    match kind {
+        // A bar along the bottom — the window going down.
+        IconKind::Minimise => {
+            bar(Rect::new(x, y + (side - STROKE) as i32, side, STROKE));
+        }
+        // An empty square: the outline of a window at full size.
+        IconKind::Maximise => {
+            bar(Rect::new(x, y, side, STROKE));
+            bar(Rect::new(x, y + (side - STROKE) as i32, side, STROKE));
+            bar(Rect::new(x, y, STROKE, side));
+            bar(Rect::new(x + (side - STROKE) as i32, y, STROKE, side));
+        }
+        // Two strokes. Drawn as a run of short horizontal bars stepping across, which is a
+        // line-drawing routine written the once rather than a primitive this crate does not
+        // otherwise need — the glyph is a dozen pixels on a side.
+        IconKind::Close => {
+            for i in 0..side {
+                let step = i as i32;
+                bar(Rect::new(x + step, y + step, STROKE, 1));
+                bar(Rect::new(x + step, y + (side - 1) as i32 - step, STROKE, 1));
+            }
+        }
+    }
+}
+
 fn draw<F, Msg, C>(
     fb: &mut F,
     font: &Font,
@@ -127,6 +175,10 @@ fn draw<F, Msg, C>(
             );
         }
         Node::Fill(colour) => fb.fill_rect(clip, *colour),
+        // **The node's own rect, not the clip.** The ramp is a property of the shape being
+        // drawn; passing the clip would make a one-row repaint paint a one-row gradient.
+        Node::Bevel(colour) => fb.fill_rect_bevel(l.rect, clip, *colour, theme.bevel),
+        Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, theme.foreground),
         Node::Custom { kind, .. } => custom(*kind, l.rect, clip, fb),
         // Containers draw nothing of their own; their children are the picture. Painted in
         // `children()` order, so a `Stack`'s last layer lands on top — the reverse of the

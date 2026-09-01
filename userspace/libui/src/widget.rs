@@ -25,7 +25,10 @@ use libdraw::geom::Size;
 // they all share; `libui::paint::Theme` names the same type for the painting half.
 pub use libdraw::theme::Theme;
 
-use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, text};
+use crate::element::{
+    Element, IconKind, Insets, bevel, column, fill, icon, padding, row, sized,
+    stack, text,
+};
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
 // thing that can disagree about a key. The same argument the `libinput` dependency is
@@ -87,6 +90,26 @@ pub fn button<Msg>(
     layers.push(padding(BUTTON_PAD, text(label)));
     stack(layers).on_press(msg).focusable()
 }
+
+/// A popup's backing: a one-pixel border, and the face inside it.
+///
+/// **Because a popup is the one surface with nothing behind it to define its edge.** A window has
+/// a frame and a bar has the screen's edge; a menu is a rectangle floating over whatever it
+/// covers, and without a line around it the light face bleeds into a light window underneath. The
+/// reference desktop draws exactly this, and it is the only reason `border` is a theme colour.
+///
+/// One helper, so the applications modal and a menu cannot disagree about what a popup looks
+/// like — they are the same kind of thing seen twice.
+pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    stack(alloc::vec![
+        fill(theme.border),
+        padding(Insets::all(POPUP_BORDER), fill(theme.face)),
+        padding(Insets::all(POPUP_BORDER), content),
+    ])
+}
+
+/// How thick a popup's border is.
+const POPUP_BORDER: u32 = 1;
 
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;
@@ -195,7 +218,7 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
             fill(theme.track),
             column(alloc::vec![
                 sized(Size::new(0, pos), fill(theme.track)),
-                sized(Size::new(0, len), fill(theme.thumb)),
+                sized(Size::new(0, len), bevel(theme.thumb)),
                 // The remainder, so the thumb does not stretch to the bottom.
                 fill(theme.track).flex(1),
             ]),
@@ -256,10 +279,13 @@ pub fn title_bar<Msg: Clone>(
     theme: &Theme,
 ) -> Element<Msg> {
     let face = if focused { theme.title_active } else { theme.title_inactive };
-    let btn = |label: &str, msg: Msg| {
+    // **A glyph, not a letter** (M11 Part E, batch 2). These were `_`, `[]` and `X` — three
+    // characters standing in for three controls, which read as text on a bar full of text. They
+    // are drawn now, and the button keeps its size, so nothing a gate clicks has moved.
+    let btn = |glyph: IconKind, msg: Msg| {
         sized(
             Size::new(TITLE_BUTTON_W, TITLE_BAR_H),
-            stack(alloc::vec![padding(BUTTON_PAD, text(label))]).on_press(msg),
+            stack(alloc::vec![icon(glyph)]).on_press(msg),
         )
     };
     // **A button a caller has no message for is not drawn.** The alternative is a button that
@@ -269,13 +295,13 @@ pub fn title_bar<Msg: Clone>(
     let mut controls = alloc::vec::Vec::with_capacity(4);
     controls.push(padding(TITLE_PAD, text(title)).flex(1));
     if let Some(m) = buttons.minimise {
-        controls.push(btn("_", m));
+        controls.push(btn(IconKind::Minimise, m));
     }
     if let Some(m) = buttons.maximise {
-        controls.push(btn("[]", m));
+        controls.push(btn(IconKind::Maximise, m));
     }
     if let Some(m) = buttons.close {
-        controls.push(btn("X", m));
+        controls.push(btn(IconKind::Close, m));
     }
     // **The drag is on the bar itself, not on the face underneath the label.** Dispatch walks
     // *up* from whatever was hit to the nearest handler, and the label spans the bar — so a
@@ -1317,8 +1343,19 @@ pub fn list_view<Msg>(
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
         let selected = state.selected == Some(i);
-        let face = if selected { theme.face_hover } else { theme.track };
-        let row_el = stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))]);
+        // **A selection is blue with a darker edge**, not a lighter grey (M11 Part E, batch 2).
+        // The reference draws a one-pixel border in the same blue the focus ring uses and fills
+        // the inside with a gradient, and that border is what separates a selected row from the
+        // row above it — without it two adjacent selections would merge into one block.
+        let row_el = if selected {
+            stack(alloc::vec![
+                fill(theme.focus_ring),
+                padding(Insets::all(1), bevel(theme.selection)),
+                padding(ROW_PAD, text(r.label)),
+            ])
+        } else {
+            stack(alloc::vec![fill(theme.track), padding(ROW_PAD, text(r.label))])
+        };
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
         // **A press *down* on a row, for the caller that needs the gesture rather than the
@@ -1421,7 +1458,7 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_faces(&e).iter().any(|f| *f == Theme::default().face_hover),
+            row_bevels(&e).iter().any(|f| *f == Some(Theme::default().selection)),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -1498,7 +1535,15 @@ mod list_view_tests {
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
-        assert_eq!(faces[1], p.face_hover, "the selected row is not the selected colour");
+        // **Two layers, and both are the claim** (M11 Part E, batch 2): a one-pixel border in
+        // the focus blue, and the selection colour bevelled inside it. Asserting only the fill
+        // would pass for a selection with no edge, which is the thing that makes two adjacent
+        // selected rows read as one block.
+        assert_eq!(faces[1], p.focus_ring, "the selected row has no border");
+        assert_eq!(faces[0], p.track, "an unselected row is the list's own ground");
+        let bevels = row_bevels(&e);
+        assert_eq!(bevels[1], Some(p.selection), "the selected row is not the selection colour");
+        assert_eq!(bevels[0], None, "an unselected row is a flat fill, not a gradient");
     }
 
     /// A scrollbar that is always there wastes width; one that never appears strands rows.
@@ -1556,6 +1601,27 @@ mod list_view_tests {
             if let Some(m) = n.on_press {
                 out.push(m);
             }
+        });
+        out
+    }
+
+    /// The bevelled fill each row carries, if any — the visible face of a selected row since
+    /// M11 Part E, where `row_faces` now reports the one-pixel border drawn behind it.
+    fn row_bevels<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<Rgb>> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if n.key.is_none() {
+                return;
+            }
+            let mut found = None;
+            walk(n, &mut |c| {
+                if found.is_none()
+                    && let Node::Bevel(rgb) = &c.node
+                {
+                    found = Some(*rgb);
+                }
+            });
+            out.push(found);
         });
         out
     }

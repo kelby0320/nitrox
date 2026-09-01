@@ -83,7 +83,7 @@ use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, padding, row, sized, text};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, text_field};
+use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
@@ -442,9 +442,16 @@ fn modal_view(
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
     let list = list_view(rows, state, list_h, ROW_H, |_| (), None, theme);
-    padding(
-        Insets::all(8),
-        column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
+    // **Framed, because a popup is the one surface with nothing behind it to define its edge**
+    // (M11 Part E, batch 2). On a light theme this modal's face and the window it covers are
+    // within a few units of each other, so without a line around it the two run together. Same
+    // helper `nxterm`'s menu uses — they are the same kind of thing seen twice.
+    popup_frame(
+        padding(
+            Insets::all(8),
+            column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
+        ),
+        theme,
     )
 }
 

@@ -20903,3 +20903,66 @@ shapes get most of the reference look with no asset pipeline. A wallpaper and an
 one dependency, and the design for it is written down instead: a full-screen background **window
 owned by `desktop-shell`**, which already holds `/home` and a theme, rather than the compositor,
 which holds neither and would need a filesystem to draw wallpaper.
+
+## 2026-09-01 — M11 Part E batch 2a: one number for every gradient, and a fill that needs to know its shape
+
+Three of the polish list's four chrome items: gradients, real window controls, and a line around
+anything with an edge. The fourth — spacing inside a window's frame — is held back, because it
+moves geometry that three applications and two gates compute from.
+
+### `Node::Bevel` is a second fill, not a flag on the first
+
+A flat fill is correct from the clip alone: whatever rectangle this frame repaints, filling it
+with one colour gives the same picture as filling the whole thing. A gradient is not. Its ramp is
+fixed by the *node's* rect, and the clip is only how much of it is being repainted — so a fill
+that took a "gradient?" flag would have one argument whose correctness depends on which of two
+rectangles the caller passed, which is the sort of thing that is right until a damage rectangle
+happens to be small. Two node kinds keep the distinction structural.
+
+`fill_rect_bevel` takes both rectangles for exactly that reason, and the host test is the one
+worth having: nine one-row repaints must produce the same buffer as one full paint.
+
+### One bevel, measured rather than assumed
+
+The theme carries a single `bevel` — how far a gradient's top lightens and its bottom darkens —
+rather than a pair of colours per surface. The number came from the reference desktop: its title
+bar spans ±10 around its midpoint and its menu selection ±14. One amount reproduces both closely
+enough that it is the honest model rather than a simplification of one, and a palette then keeps
+one value coherent instead of eight.
+
+`Rgb::shade` clamps rather than wrapping, which is not a detail: wrapping would put a dark band
+across the top of a light title bar, and a light theme is where that first becomes reachable.
+
+### The window controls are drawn
+
+`_`, `[]` and `X` were three characters standing in for three controls, on a bar already full of
+text. They are shapes now — a bar, a square, two strokes — which costs a paint arm. Images would
+cost a decoder, an asset path in the image build and a size convention, which is the settled
+decision to file rather than build. The trade is worth revisiting the day something needs an icon
+that is not three strokes.
+
+The button keeps its size, so nothing a gate clicks moved.
+
+### A `border` colour, and why one grey and not three
+
+The reference uses three within a few units of each other — `#817E7B` around a window, `#8D8C8B`
+around a menu, `#ACA9A6` inside the frame. Three fields would be three decisions to keep coherent
+in every future palette, and the difference is not visible at a glance, which is the test a polish
+milestone should apply to a field.
+
+It exists because of popups specifically. A window has a frame and a bar has the screen's edge; a
+menu is a rectangle floating over whatever it covers, and on a light theme its face and the window
+underneath are within a few units — so without a line around it the two run together. `popup_frame`
+is one helper for the applications modal and `nxterm`'s menu, which are the same kind of thing
+seen twice.
+
+### And a selection is blue with a darker edge
+
+A selected list row was `face_hover` — a slightly lighter grey. It is now the selection colour,
+bevelled, inside a one-pixel border in the focus blue. **The border is the half that matters**:
+without it two adjacent selected rows read as one block, which is what the maintainer's reference
+draws and why they asked for it specifically.
+
+The test that pinned the old behaviour asserted one colour differing from another. It asserts both
+layers now — the border and the bevelled fill, and that an unselected row has neither — which is a
+stronger claim than the one it replaced.
