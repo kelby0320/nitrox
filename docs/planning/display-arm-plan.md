@@ -3408,6 +3408,26 @@ it is noticed on. Its own list, and its own milestone.
       compositor placed it at the origin, then the encoder zeroed it, then the parser would have.
       Each had its own comment explaining that the offset was a popup's.
 
+- [x] **Batch 9 — a clock on the top bar** ✅ (2026-09-01), the first of the three stretches.
+
+      **No timer object.** `sys_wait` already takes an absolute monotonic deadline and the shell
+      already computes one for the close it may have to insist on; the clock's next change is one
+      more candidate for the same minimum. A bar that ticks costs one wake a minute and no new
+      kernel object. The alignment is read from the *wall* clock and the deadline is *monotonic*,
+      which is not a mix-up — one says how far into the minute we are, the other is what the wait
+      counts.
+
+      **`YYYY-MM-DD HH:MM`, UTC, and no month names.** There is no timezone database and no
+      locale, so a localised form would be a fiction — the reason `date` emits fields and prints
+      UTC — and it means the bar and the command agree about what time it is. **Empty when the
+      clock is unset**, rather than 1970: the kernel reports the RTC as unreadable rather than
+      inventing an epoch, and a bar showing a fabricated date would undo that one layer up.
+
+      **The calendar arithmetic moved below both consumers**, from `coreutils::time` to a new
+      `libtime`. That is `userspace/CLAUDE.md`'s rule applied on the day it triggered: a helper
+      with one consumer belongs to that consumer, a helper with two belongs below both — and the
+      shell reaching into `coreutils` for it is the shape that rule exists to catch.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

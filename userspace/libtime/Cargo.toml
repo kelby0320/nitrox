@@ -1,0 +1,21 @@
+[package]
+name = "libtime"
+version = "0.1.0"
+edition = "2024"
+
+# Calendar arithmetic: an epoch instant to a civil date, and back to a string.
+#
+# **Here rather than in `coreutils` because it has two consumers now.** It was
+# `coreutils::time`, written for `date` and `sleep`, and `desktop-shell` wants the same
+# conversion for the clock on its top bar (M11 Part E batch 9). `userspace/CLAUDE.md`'s
+# rule is the reason it moved rather than being reached into: a helper with one consumer
+# belongs to that consumer, a helper with two belongs below both — and an application
+# reaching into another application's crate is the shape that rule exists to catch.
+#
+# `core + alloc`, no dependencies, like `libcrypto` beside it: this is arithmetic, and it
+# touches no syscall. Every test runs on the host.
+[dependencies]
+
+[lib]
+name = "libtime"
+path = "src/lib.rs"

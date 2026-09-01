@@ -81,7 +81,9 @@ a request is being met in a particular way.
       frames.)*
 - [x] The default window position should be more right.  The left side of the window should not be on the border of the screen. *(batch 4)*
 - [x] The "nitrox" label next to "applications" on the top bar doesn't do anything.  It doesn't appear to be a drop down menu.  Recommend we remove it. *(batch 4 — removed)*
-- [] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
+- [x] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
+      *(batch 9 — `YYYY-MM-DD HH:MM`, UTC, centred on the screen. No timezone database and no
+      locale, so a localised form would be a fiction; it also agrees with what `date` prints.)*
 - [] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
 - [x] nxedit doesn't launch from the menu. *(batch 7 — it launched and exited: it required
       `argv[1]` and the modal passes none. It opens untitled now and asks for a name on save.)*
@@ -103,6 +105,9 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 9 — a clock on the top bar** (2026-09-01). Ticks off the wait's existing deadline
+  rather than a timer object. The calendar arithmetic moved out of `coreutils` into `libtime`,
+  because it grew a second consumer.
 - **Batch 8 — taskbar buttons, and a greeter that can be centred** (2026-09-01). Entries are
   bordered boxes now. Centring the login prompt turned out to need a protocol fix: a `normal`
   window's requested origin was written and read as zero, so a client running before any manager

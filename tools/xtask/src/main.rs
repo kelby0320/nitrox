@@ -1797,6 +1797,16 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // asking the kernel for its own endpoint would block it waiting for its own answer. The
     // bind's success is what it can report; the `desktop` command below is what proves the
     // binding is reachable (M8 Part F).
+    // **The clock read the wall clock** (M11 Part E batch 9), which is the one thing about it a
+    // gate can see: its value changes every minute, and this boot has no reference render of a
+    // bar to compare pixels against. What the line distinguishes is a clock absent because the
+    // RTC was unreadable from a bar that failed to draw one — the *formatting* is a host test in
+    // `libtime`, where it belongs.
+    //
+    // Immediately after the theme, because that is where it is: the shell reads both before it
+    // draws anything, and an expectation placed beside its topic rather than its position in the
+    // stream scans past output that was there.
+    session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
     session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
@@ -3964,6 +3974,11 @@ fn cmd_shot(what: &str, accel: Accel) -> R<()> {
     // for a design decision rather than a broken boot. In the order the shell prints them —
     // `expect` scans forward, so a pair asserted by topic rather than by position in the stream
     // times out on output that was there.
+    // **The clock read the wall clock**, which is the one thing about it a gate can see: its
+    // value changes every minute and the bar is pixels this boot has no reference render of. The
+    // line distinguishes a clock that is absent because the RTC was unreadable from a bar that
+    // failed to draw one — and the *formatting* is a host test in `libtime`, where it belongs.
+    session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: top bar presented, window ")?;
     session.expect("desktop-shell: bottom bar placed at 0,776")?;
     capture!("desktop");

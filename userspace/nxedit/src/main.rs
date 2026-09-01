@@ -228,10 +228,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     if !path.is_empty() {
         open_into(&mut app, root_ns, &path);
     }
-    // **The file being edited can change**, since a drop replaces it — so this is the binary's
-    // copy of `app.path()` rather than the argument it started from.
-    let mut editing = path.clone();
-
     let mut size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
@@ -346,7 +342,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // as a drop does. The binary's copy is a cache of the application's answer, and a
             // save that used the stale one would write the buffer to the file it was *not*
             // just named.
-            editing = alloc::string::String::from(app.path());
+            // **Read from the application, not tracked beside it.** The path changes twice —
+            // a drop replaces the file, and naming an untitled buffer gives it one — and a copy
+            // `main` kept would be a second answer that has to be updated at both. There was
+            // one, and it was a `let` bound once at startup that a drop had to remember to
+            // refresh (M11 Part E batch 9).
+            let editing = alloc::string::String::from(app.path());
             let bytes = to_bytes(&text);
             let result = save(root_ns, &editing, &bytes);
             match result {
@@ -458,7 +459,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // The path is the window's identity now: the title, and what a save
                         // writes to. Both are read from `app`, so the one copy `main` keeps has
                         // to follow — this was a `let` bound once at startup.
-                        editing = String::from(app.path());
+                        let editing = String::from(app.path());
                         if let Some(mut w) = win.window(window_id)
                             && w.set_title(window_title(&editing)).is_err()
                         {

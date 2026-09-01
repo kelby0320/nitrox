@@ -19,6 +19,10 @@ edition = "2024"
 # The `/dev/desktop` binding that would let an application talk back is
 # `TODO(desktop-endpoint)` — deferred until something resolves it.
 [dependencies]
+# Calendar arithmetic for the clock on the top bar (M11 Part E batch 9). It was
+# `coreutils::time` until it had two consumers; see `userspace/CLAUDE.md` on where a helper
+# lives once it does.
+libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
 # `io` for `session::Dir`: the modal reads /bin as a forwarded directory.
 librsproto = { path = "../librsproto", features = ["io"] }

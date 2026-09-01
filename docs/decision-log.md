@@ -21331,3 +21331,50 @@ gate passes today only because the windows created after it cover that region". 
 clear of all three reference windows — so it is now *visible* in a region the gate does not
 compare, rather than hidden in one it does. The gate passes either way; the comment explaining why
 did not, and a wrong explanation of why a gate passes is worse than none.
+
+## 2026-09-01 — M11 Part E batch 9: a clock, and a module that grew a second consumer
+
+The first of the three stretches: a date and time centred on the top bar.
+
+**No timer object, because there was already a deadline.** `sys_wait` takes an absolute monotonic
+deadline and `desktop-shell` already computes one — the close it may have to insist on. The
+clock's next change is one more candidate for that minimum, so the bar ticks for one wake a minute
+and no new kernel object. `SYS_TIMER_CREATE` exists and would have been the obvious reach; the
+loop's existing shape is better.
+
+The alignment is read from the **wall** clock and the deadline is **monotonic**. That is not a
+mix-up: one answers "how far into the minute are we", the other is what the wait counts. Mixing
+them the other way — a wall-clock deadline — is what makes a clock that stops when the time is
+stepped.
+
+**`YYYY-MM-DD HH:MM`, UTC.** No timezone database and no locale exist, so a localised form would
+be a fiction — the same reason `date` emits fields and prints UTC — and this way the bar and the
+command agree about what time it is, which is worth more here than resembling somebody else's
+desktop. Seconds are dropped: a bar that counted them would repaint sixty times a minute to show
+something nobody reads at that resolution.
+
+**Empty when the clock is unset**, rather than 1970. The kernel keeps `CLOCK_REALTIME` unsupported
+when the RTC could not be read at boot rather than inventing an epoch; a bar that showed a
+fabricated date would undo that decision one layer up. One console line at startup says which it
+is, because an absent clock and a bar that failed to draw one look identical on screen.
+
+**Centred on the screen, not on what is left of it.** Two equal flexible gaps centre the middle
+child *between them*, so without a balancing slot opposite the applications button the clock would
+sit half a button off centre. The slot is empty and exists to make the arithmetic symmetric.
+
+### `coreutils::time` became `libtime`
+
+The calendar arithmetic had one consumer and now has two. `userspace/CLAUDE.md` states the rule
+and this is the day it triggered: *a helper with one consumer belongs to that consumer; a helper
+with two belongs below both* — and an application reaching into another application's crate is
+the shape that rule exists to catch. So it is a crate beside `libcrypto`: `core + alloc`, no
+dependencies, every test on the host. `coreutils::time` is a re-export, so nothing in the
+utilities churned.
+
+### And the top bar became repaintable
+
+It was rendered once at startup and never again, which was true while it held one static label.
+Keeping its buffer mappings is what a clock needs — and the repaint uses `acquire` rather than an
+index it keeps itself, for the reason the bottom bar's repaint already records: a counter advanced
+unconditionally inverts its phase on any iteration where the commit did not go out, and every
+repaint after that writes into the buffer being displayed.

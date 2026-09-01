@@ -91,6 +91,60 @@ use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
+/// The wall clock as the top bar shows it, or empty when there is none.
+///
+/// **`YYYY-MM-DD HH:MM`, and no month names** (M11 Part E batch 9). There is no timezone database
+/// and no locale, so a localised form would be a fiction — the same reason `date` emits fields and
+/// prints UTC. It also means the bar and the command agree about what time it is, which is worth
+/// more here than looking like somebody else's desktop.
+///
+/// **Empty when the clock is unset**, rather than 1970. The kernel reports `Unsupported` when the
+/// RTC could not be read at boot rather than inventing an epoch, and a bar that showed a
+/// fabricated date would be undoing that decision one layer up.
+fn clock_text() -> alloc::string::String {
+    let mut nanos = 0u64;
+    // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
+    let r = unsafe {
+        libkern::syscall2(
+            libkern::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_REALTIME,
+            (&raw mut nanos) as u64,
+        )
+    };
+    if r < 0 {
+        return alloc::string::String::new();
+    }
+    let c = libtime::civil_from_unix(nanos);
+    // `format_civil` is `YYYY-MM-DD HH:MM:SS`; a bar that counted seconds would repaint sixty
+    // times a minute to show something nobody reads at that resolution.
+    let full = libtime::format_civil(&c);
+    alloc::string::String::from(full.get(..16).unwrap_or(full.as_str()))
+}
+
+/// When the displayed minute next changes, as a monotonic deadline.
+///
+/// **Aligned to the minute rather than "a minute from now"**, so the bar changes when the clock
+/// does. The alignment is read from the *wall* clock and the deadline is *monotonic*, which is
+/// not a mix-up: one says how far into the minute we are, the other is what `sys_wait` counts.
+fn next_minute(now: u64) -> u64 {
+    let mut nanos = 0u64;
+    // SAFETY: as above.
+    let r = unsafe {
+        libkern::syscall2(
+            libkern::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_REALTIME,
+            (&raw mut nanos) as u64,
+        )
+    };
+    const MINUTE: u64 = 60 * 1_000_000_000;
+    if r < 0 {
+        // No clock to follow. Wake in a minute anyway, so a clock that is set later appears
+        // without a restart.
+        return now.saturating_add(MINUTE);
+    }
+    now.saturating_add(MINUTE - nanos % MINUTE)
+}
+
 /// The screen's width, which the top bar spans.
 ///
 /// Fixed rather than queried: the compositor has no "what size is the screen" op, and adding
@@ -133,15 +187,25 @@ fn fail(msg: &[u8]) -> ! {
 const APPS_BUTTON_W: u32 = 120;
 
 /// The top bar's element tree.
-fn bar_view() -> Element<()> {
+fn bar_view(clock: &str) -> Element<()> {
     // **One thing, and it does something** (M11 Part E batch 4). There was a "nitrox" label
     // beside the button — a word with no handler, which reads as a menu that does not open. A
     // control that looks live and is not is the defect M8's overview shipped three of; a label
     // that looks like a control is the same defect with less code behind it.
-    row(alloc::vec![sized(
-        libdraw::geom::Size::new(APPS_BUTTON_W, 0),
-        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
-    )])
+    row(alloc::vec![
+        sized(
+            libdraw::geom::Size::new(APPS_BUTTON_W, 0),
+            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
+        ),
+        // **Centred on the screen, not on what is left of it.** Two equal flexible gaps put the
+        // clock in the middle of the space *between* them, so without the balancing slot on the
+        // right it would sit half the button's width off centre. The slot is empty; it exists to
+        // make the arithmetic symmetric (M11 Part E batch 9).
+        sized(libdraw::geom::Size::new(0, 0), text("")).flex(1),
+        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(clock)),
+        sized(libdraw::geom::Size::new(0, 0), text("")).flex(1),
+        sized(libdraw::geom::Size::new(APPS_BUTTON_W, 0), text("")),
+    ])
 }
 
 /// One entry in the bottom bar's window list.
@@ -601,11 +665,11 @@ fn panel(theme: &Theme) -> Theme {
 }
 
 /// The top bar's picture.
-fn render_bar(theme: &Theme, font: &Font) -> MemFramebuffer {
+fn render_bar(theme: &Theme, font: &Font, clock: &str) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .expect("the bar pitch is wide enough for a row");
     let mut fb = MemFramebuffer::new(geometry);
-    let ui = bar_view();
+    let ui = bar_view(clock);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
@@ -1403,7 +1467,26 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         Err(_) => fail(b"desktop-shell: top bar CreateWindow FAILED\n"),
     };
 
-    let picture = render_bar(&theme, &font).into_bytes();
+    // **Kept, because the top bar is repainted now** (M11 Part E batch 9). It was drawn once at
+    // startup and never again — true while it held one static label, and the clock on it changes
+    // every minute.
+    let mut top_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let mut shown_clock = clock_text();
+    // **Said once, because an absent clock is otherwise indistinguishable from a broken bar.**
+    // The kernel reports the wall clock as unsupported when the RTC could not be read at boot,
+    // and the bar's answer to that is to show nothing — which looks identical to a clock that
+    // failed to draw. One line at startup tells the two apart.
+    {
+        let mut l = Line::new();
+        l.s(b"desktop-shell: clock ");
+        if shown_clock.is_empty() {
+            l.s(b"unset");
+        } else {
+            l.s(shown_clock.as_bytes());
+        }
+        l.end();
+    }
+    let picture = render_bar(&theme, &font, &shown_clock).into_bytes();
     let len = BAR_PITCH * BAR_H as usize;
     if picture.len() != len {
         fail(b"desktop-shell: top bar render is not the size it declares\n");
@@ -1412,6 +1495,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         let Some((handle, addr)) = shared_buffer(len) else {
             fail(b"desktop-shell: top bar buffer alloc FAILED\n");
         };
+        top_addrs[i] = addr;
         // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
         // regions are distinct allocations, so they cannot overlap.
         unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
@@ -1704,6 +1788,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let ev = session.wait_handle();
     // Set whenever a manager request goes out; see the deadline below.
     let mut sent_request = false;
+    // **The clock's next change, as a wait deadline** (M11 Part E batch 9). No timer handle is
+    // needed: `sys_wait` already takes an absolute monotonic deadline, and the shell already
+    // computes one for the close it may have to insist on. This is one more candidate for the
+    // same minimum — a bar that ticks costs one wake a minute and no new kernel object.
+    let mut next_tick = now_ns().map(next_minute).unwrap_or(u64::MAX);
     loop {
         // Both channels in one wait: the session's events and the manager's. Polling one
         // while blocked on the other would make a held window wait for a keystroke.
@@ -1719,7 +1808,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         let deadline = if sent_request {
             0
         } else {
-            closing.iter().map(|&(_, at)| at).min().unwrap_or(u64::MAX)
+            closing.iter().map(|&(_, at)| at).min().unwrap_or(u64::MAX).min(next_tick)
         };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
@@ -2572,6 +2661,39 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     closing = still;
                 }
                 _ => closing.clear(),
+            }
+        }
+
+        // **The clock, when the minute it shows has changed.** Compared as text rather than by
+        // the deadline having passed: an unset clock formats to nothing every time, so this
+        // repaints zero times instead of once a minute forever — and a wake that finds the same
+        // string costs nothing but the comparison.
+        if let Some(now) = now_ns()
+            && now >= next_tick
+        {
+            next_tick = next_minute(now);
+            let want = clock_text();
+            if want != shown_clock {
+                shown_clock = want;
+                let picture = render_bar(&theme, &font, &shown_clock).into_bytes();
+                let len = BAR_PITCH * BAR_H as usize;
+                // `acquire`, for the reason the bottom bar's repaint gives: a buffer index this
+                // code kept itself would invert its phase on any iteration where the commit did
+                // not go out, and every repaint after that would write into what is on screen.
+                if picture.len() == len
+                    && let Some(mut w) = session.window(window)
+                    && let Ok(b) = w.acquire()
+                    && !top_addrs[b as usize].is_null()
+                {
+                    // SAFETY: the destination maps `len` writable bytes and `picture` holds
+                    // exactly `len`; the two are distinct allocations.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(picture.as_ptr(), top_addrs[b as usize], len)
+                    };
+                    if w.commit(b, (0, 0, SCREEN_W, BAR_H)).is_err() {
+                        kprint(b"desktop-shell: top bar Commit failed\n");
+                    }
+                }
             }
         }
 
