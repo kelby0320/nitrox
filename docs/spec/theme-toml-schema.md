@@ -51,7 +51,7 @@ font_ui = "/system/fonts/DejaVuSans.ttf"
 | `cursor_body` | `"#RRGGBB"` | The pointer's fill |
 | `cursor_outline` | `"#RRGGBB"` | The pointer's outline |
 | `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target |
-| `font_px` | number, `6`–`16` | Text size in pixels per em |
+| `font_px` | number, `6`–`16` | Text size in pixels per em, read to the nearest hundredth |
 | `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional |
 | `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
 
@@ -60,8 +60,10 @@ font_ui = "/system/fonts/DejaVuSans.ttf"
 its menus are widgets and its cells are not. Before Part D there was a single path constant and
 every client loaded it, so every label in the system was monospaced.
 
-A path is **absolute, at most 64 bytes, and free of control characters**; a longer or relative
-one leaves that role at its default. The bound is not arbitrary: the theme travels to each
+A path is **absolute, at most 64 bytes, and free of control characters, `"` and `\`**; a longer
+or relative one leaves that role at its default. The last two are refused for the reason the
+whole file is a TOML file: a path holding a quote would round-trip through *this* reader and read
+as something else in any other one. The bound is not arbitrary: the theme travels to each
 application on the setup record, which is one 4 KiB message carrying all of argv and the
 environment, so a path a file could make arbitrarily long is a theme that could stop applications
 from launching.
@@ -72,6 +74,12 @@ glyph's advance, so a proportional face yields a plausible number and then draws
 the wrong x. It is stated here instead. The two shipped faces are `DejaVuSans.ttf` and
 `DejaVuSansMono.ttf`, both under `/system/fonts`, which is the only directory a session binds for
 them.
+
+**Read to the nearest hundredth of a pixel**, which is finer than a rasteriser resolves and is
+not about precision: whatever draws with a size reports it to the console, and `check-terminal`
+recomputes a character cell from that number on the host. A size the line cannot print exactly is
+a size the two sides can disagree about, and the gate would blame the font. Rounding here makes
+"the size printed is the size used" true by construction.
 
 **`font_px` shrinks and does not grow, and 16 is not an arbitrary ceiling.** Text measures
 exactly its em size, and the tightest fixed box in the system is a list row: 20 pixels with 2

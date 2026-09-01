@@ -199,8 +199,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // down, next to the first thing drawn with it.
     let theme = theme_of(&env);
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let font = match unsafe { load_ui(root_ns, &theme, b"nxedit") } {
-        Ok(f) => f,
+    let (font, _) = match unsafe { load_ui(root_ns, &theme, b"nxedit") } {
+        Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"nxedit: the UI font ").s(e.why()).end();
             fail(b"nxedit: font load FAILED\n");

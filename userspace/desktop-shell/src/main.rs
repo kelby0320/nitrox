@@ -1269,8 +1269,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // is where `/dev/draw` was bound. That is the whole point — an application's namespace
     // will get a *narrower* bind, and the difference is what gates the manager channel.
     // SAFETY: `session_ns` is this process's namespace, live for its whole run.
-    let font = match unsafe { libdraw::text::load_ui(session_ns, &theme, b"desktop-shell") } {
-        Ok(f) => f,
+    let (font, _) = match unsafe { libdraw::text::load_ui(session_ns, &theme, b"desktop-shell") } {
+        Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"desktop-shell: the UI font ").s(e.why()).end();
             fail(b"desktop-shell: font load FAILED (is /system readable in the session?)\n");

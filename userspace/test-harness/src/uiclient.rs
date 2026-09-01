@@ -40,9 +40,13 @@
 //!
 //! Since M4 Part C it also presents [`libui::reference`] in a window of its own, which is the
 //! only thing on the target that has ever loaded a font. Everything about the toolkit was
-//! host-tested against a font compiled into the test binary; this reads
-//! `/system/fonts/DejaVuSansMono.ttf` through `fs-server-ext4` and rasterises with it, and
-//! `check-display` compares the result against the same render performed on the host.
+//! host-tested against a font compiled into the test binary; this reads a real one through
+//! `fs-server-ext4` and rasterises with it, and `check-display` compares the result against the
+//! same render performed on the host.
+//!
+//! **Two faces since M11 Part D**, and which window gets which is part of what the gate checks:
+//! this window is the desktop's proportional font, the terminal's below is the fixed-advance
+//! one, and both paths come from `Theme::dark()` — the same place the host takes them from.
 //!
 //! **A connection per window, though neither thing that forced it is true any more.** Input
 //! records carry a window id (C3 part 1) and `Session` holds several windows on one connection
@@ -401,7 +405,7 @@ fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
     use libdraw::theme::Theme;
 
     let theme = Theme::default();
-    let (path, loaded) = match face {
+    let (wanted, loaded) = match face {
         Face::Ui => (theme.font_ui, unsafe {
             // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
             libdraw::text::load_ui(root_ns, &theme, b"ui-testclient")
@@ -412,14 +416,18 @@ fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
         }),
     };
     match loaded {
-        Ok(f) => {
-            Line::new().s(b"ui-testclient: font loaded ").s(path.as_str().as_bytes()).end();
+        // **The path that was opened, not the one that was asked for.** They are the same here —
+        // this client draws with the built-in theme, so there is nothing to fall back from — and
+        // reporting the request would still be reporting the wrong thing the day that changes,
+        // on a line `check-display` asserts against (PR #264 review, finding 1).
+        Ok((f, opened)) => {
+            Line::new().s(b"ui-testclient: font loaded ").s(opened.as_str().as_bytes()).end();
             f
         }
         Err(e) => {
             Line::new()
                 .s(b"ui-testclient: ")
-                .s(path.as_str().as_bytes())
+                .s(wanted.as_str().as_bytes())
                 .s(b" ")
                 .s(e.why())
                 .end();

@@ -3203,6 +3203,13 @@ it is noticed on. Its own list, and its own milestone.
       `the guest measured a 12x16 cell … the host makes it 9x16`. The property itself is a host
       test in `libterm`, where the negative control is that the desktop's own font fails it.
 
+      **Two refinements from the review, both about a program reporting what it asked for rather
+      than what it got.** The themed loaders return the path they actually *opened*, because a
+      fallback is invisible otherwise — and `nxterm`'s line is not decoration, the gate feeds it
+      back into `host_font`. And the size is printed as whole pixels and hundredths rather than
+      truncated, with `from_config` rounding there, so "the size printed is the size used" holds
+      for every value the system can carry rather than only integral ones.
+
 ### Part E — the polish passes
 
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is

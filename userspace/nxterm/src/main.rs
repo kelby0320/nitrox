@@ -330,16 +330,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // whole desktop did until this part, and here it would have been visible as a terminal whose
     // columns did not line up.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let ui_font = match unsafe { load_ui(root_ns, &theme, b"nxterm") } {
-        Ok(f) => f,
+    let (ui_font, _) = match unsafe { load_ui(root_ns, &theme, b"nxterm") } {
+        Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"nxterm: the UI font ").s(e.why()).end();
             fail(b"nxterm: font load FAILED\n");
         }
     };
     // SAFETY: as above.
-    let mono_font = match unsafe { load_mono(root_ns, &theme, b"nxterm") } {
-        Ok(f) => f,
+    let (mono_font, mono_path) = match unsafe { load_mono(root_ns, &theme, b"nxterm") } {
+        Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"nxterm: the grid font ").s(e.why()).end();
             fail(b"nxterm: font load FAILED\n");
@@ -355,15 +355,31 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // produces a plausible number and then draws every column at the wrong x. `check-terminal`
     // recomputes this from the same face on the host and compares, which is a claim the pixels
     // cannot make from inside the guest (M11 Part D).
+    //
+    // **`mono_path`, not `theme.font_mono`** — the path the load *returned*, which is the
+    // built-in one whenever the theme named a font that would not open. Naming the requested
+    // file here would put a font this process never read on a line the gate feeds straight back
+    // into `host_font` (PR #264 review, finding 1).
+    //
+    // **And the size as two integers**, because `.u()` truncates and the host re-measures at
+    // whatever this says: a grid drawn at 13.5 and reported as 13 is a cell a pixel short and a
+    // gate blaming the font for it. `from_config` rounds to a hundredth, so these two are the
+    // whole value.
+    let (px_whole, px_cents) = libdraw::theme::px_parts(theme.font_px);
     libkern::debug::Line::new()
         .s(b"nxterm: grid font ")
-        .s(theme.font_mono.as_str().as_bytes())
+        .s(mono_path.as_str().as_bytes())
         .s(b", cell ")
         .u(metrics.cell_w as u64)
         .s(b"x")
         .u(metrics.cell_h as u64)
         .s(b" at ")
-        .u(theme.font_px as u64)
+        .u(px_whole)
+        .s(b".")
+        // Zero-padded: `.5` hundredths is `.05`, and a line reading `13.5` would be re-measured
+        // at 13.5 rather than the 13.05 it meant.
+        .s(if px_cents < 10 { &b"0"[..] } else { &b""[..] })
+        .u(px_cents)
         .s(b"px")
         .end();
     let mut app = App::new(COLS, ROWS, metrics);

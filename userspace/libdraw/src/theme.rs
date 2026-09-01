@@ -240,7 +240,15 @@ impl Theme {
                     // is clipped by `paint` and overlapped by its neighbours. See
                     // [`MAX_FONT_PX`], which is 16 because a list row is 20 with 4 of padding.
                     Ok(v) if (MIN_FONT_PX..=MAX_FONT_PX).contains(&v) => {
-                        t.font_px = v;
+                        // **To the nearest hundredth of a pixel**, which is a precision decision
+                        // rather than a rounding accident. A size is reported to a console by
+                        // whatever draws with it, and `check-terminal` recomputes a cell from
+                        // that number — so a value the line cannot print exactly is a value the
+                        // host and the guest can disagree about, and the gate would report a
+                        // wrong font (PR #264 review, finding 2). A hundredth of a pixel is far
+                        // below anything a rasteriser resolves; what it buys is that "the size
+                        // printed is the size used" is true by construction.
+                        t.font_px = round_px(v);
                         true
                     }
                     _ => false,
@@ -334,8 +342,12 @@ impl Theme {
 /// could stop applications from launching.
 ///
 /// A path is absolute, non-empty, at most [`MAX_FONT_PATH`] bytes, and free of control
-/// characters — the last because it is logged when it fails to load, and a font path is one of
-/// the few pieces of a theme file that reaches a console.
+/// characters, `"` and `\` — the control bytes because it is logged when it fails to load and a
+/// font path is one of the few pieces of a theme file that reaches a console, the other two
+/// because the value is written back out as a TOML basic string. A path holding a quote would
+/// round-trip through *this* reader and mean something else to a real one, which is the same
+/// argument the unquoted-`font_px` rule rests on, applied to the other end of the string
+/// (PR #264 review, optional 4).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FontPath {
     /// Zero-filled past `len`, so the derived equality compares paths rather than the debris of
@@ -390,9 +402,10 @@ const fn usable(b: &[u8]) -> bool {
     }
     let mut i = 0;
     while i < b.len() {
-        // Control bytes only. Everything above is allowed, including the high halves of UTF-8:
-        // the input is a `&str`, and a font whose name is not ASCII is a font all the same.
-        if b[i] < 0x20 || b[i] == 0x7F {
+        // Control bytes, and the two characters a TOML basic string cannot carry unescaped.
+        // Everything else is allowed, including the high halves of UTF-8: the input is a `&str`,
+        // and a font whose name is not ASCII is a font all the same.
+        if b[i] < 0x20 || b[i] == 0x7F || b[i] == b'"' || b[i] == b'\\' {
             return false;
         }
         i += 1;
@@ -400,11 +413,34 @@ const fn usable(b: &[u8]) -> bool {
     true
 }
 
+// `len` is a `u8`, and it is only wide enough to hold what `usable` admits while the bound below
+// fits in one. Raising it past 255 would truncate silently and `as_str` would hand back a short
+// path with nothing anywhere reporting it (PR #264 review, optional 3).
+const _: () = assert!(MAX_FONT_PATH <= u8::MAX as usize);
+
 /// The longest font path a theme can name.
 ///
 /// Enough for `/system/fonts/` plus a long family name, and small enough that two of them on the
 /// setup record are noise beside the 4 KiB it holds.
 pub const MAX_FONT_PATH: usize = 64;
+
+/// A size rounded to the precision [`px_parts`] can print without loss.
+fn round_px(v: f32) -> f32 {
+    libm::roundf(v * 100.0) / 100.0
+}
+
+/// `px` as whole pixels and hundredths, for a console line that has to be exact.
+///
+/// **Because a truncated size is a wrong answer somewhere else.** `nxterm` prints the size it
+/// measured its grid at and `check-terminal` re-measures the same font at that number on the
+/// host; printing `13` for `13.5` makes the two disagree by a pixel and the gate blames the font.
+/// Every size the system can hold is exact to a hundredth — [`Theme::from_config`] rounds there —
+/// so these two integers are the whole value.
+pub fn px_parts(px: f32) -> (u64, u64) {
+    let px = round_px(px).max(0.0);
+    let whole = px as u64;
+    (whole, libm::roundf((px - whole as f32) * 100.0) as u64)
+}
 
 /// The smallest text this system will render at, in pixels per em.
 ///
@@ -631,6 +667,11 @@ mod tests {
         assert_eq!(FontPath::parse(""), None, "empty");
         assert_eq!(FontPath::parse("DejaVuSans.ttf"), None, "relative");
         assert_eq!(FontPath::parse("/home/a\nb.ttf"), None, "a path with a newline is not a path");
+        // **A quote and a backslash, because the value is written back as a TOML basic string.**
+        // `/home/a"b.ttf` would round-trip through this reader and read as something else in any
+        // other TOML parser, which is the claim the schema makes about every file it accepts.
+        assert_eq!(FontPath::parse("/home/a\"b.ttf"), None, "a quote would escape the string");
+        assert_eq!(FontPath::parse("/home/a\\b.ttf"), None, "a backslash would be an escape");
         let long = alloc::format!("/home/{}.ttf", "x".repeat(MAX_FONT_PATH));
         assert_eq!(FontPath::parse(&long), None, "longer than the record can carry");
         // The bound is inclusive, and the test says which side of it: exactly MAX is fine.
@@ -640,10 +681,13 @@ mod tests {
 
     #[test]
     fn a_font_path_compares_as_a_path_and_not_as_its_buffer() {
-        // The zero fill is load-bearing: `FontPath` derives `PartialEq` over a 64-byte array, so
-        // a constructor that left a previous path's tail behind would make two equal paths
-        // unequal. Nothing else in the file would notice — the theme would simply stop
-        // round-tripping.
+        // **What this actually pins is `len`**, and the comment used to claim more. `FontPath`
+        // derives `PartialEq` over a 64-byte array, so the zero fill is what makes that equality
+        // mean "the same path" — but no constructor here can leave a previous path's tail
+        // behind, because both start from a fresh array, so nothing in this crate can produce
+        // the case the fill defends against. Filling with `0xFF` instead leaves every test in
+        // this file green (PR #264 review, optional 2). The half that does bite is below: stop
+        // slicing at `len` in `as_str` and five tests fail, this one included.
         let a = FontPath::new("/system/fonts/DejaVuSans.ttf");
         let b = FontPath::parse("/system/fonts/DejaVuSans.ttf").expect("a usable path");
         assert_eq!(a, b);
@@ -672,6 +716,31 @@ mod tests {
                 [Issue { line: 1, kind: IssueKind::BadValue }],
                 "{bad:?} was named as a bad value"
             );
+        }
+    }
+
+    #[test]
+    fn a_size_is_read_to_a_hundredth_and_prints_back_as_itself() {
+        // **The property `check-terminal` rests on**: whatever draws with a size reports it to a
+        // console as two integers, and the host re-measures the font at that number. So every
+        // size the system can hold must survive the trip — `13.5` printed as `13` is a cell a
+        // pixel short and a gate blaming the font (PR #264 review, finding 2).
+        for (text, want, parts) in [
+            ("font_px = 13.5\n", 13.5, (13, 50)),
+            ("font_px = 13.05\n", 13.05, (13, 5)),
+            ("font_px = 16\n", 16.0, (16, 0)),
+            // Beyond a hundredth the file is rounded rather than kept, which is what makes the
+            // two integers the whole value instead of most of it.
+            ("font_px = 13.333\n", 13.33, (13, 33)),
+        ] {
+            let (t, issues) = Theme::from_config(text);
+            assert!(issues.is_empty(), "{text:?} {issues:?}");
+            assert_eq!(t.font_px, want, "{text:?}");
+            assert_eq!(px_parts(t.font_px), parts, "{text:?}");
+            // And the two integers reassemble into the size that was used, exactly — the step
+            // the gate performs on the other side of the serial line.
+            let (whole, cents) = parts;
+            assert_eq!(whole as f32 + cents as f32 / 100.0, t.font_px, "{text:?}");
         }
     }
 

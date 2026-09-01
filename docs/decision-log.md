@@ -20733,3 +20733,65 @@ the line instead of asserting it, so it followed.
 where fonts have always lived — nothing that draws text runs before the root is mounted. One
 licence file covers both: DejaVu's notice is a single `Files: *` stanza over the family, which is
 most of why this face rather than a nicer one from a different foundry.
+
+## 2026-09-01 — Part D's review: the path that was opened, and a size that survives a fraction
+
+No blocking findings. Three things worth fixing, and two of them are the same mistake at
+different distances from the wire: **a program reporting what it asked for rather than what it
+got.**
+
+### A fallback that nothing downstream could see
+
+`load_ui`/`load_mono` substitute the built-in face when a theme names a font that will not open —
+and returned only the `Font`, so every caller that wanted to *say* which font it was using had to
+name the path it had asked for. In four of the five that was a console line slightly out of step
+with reality. In `nxterm` it was worse, because that line is not decoration: `check-terminal`
+feeds the path straight back into `host_font` and re-measures with it. A theme naming an absent
+mono face would have had the guest measuring one file and the host another, and the gate would
+have reported a wrong font in a run where the fallback had worked correctly.
+
+They return `(Font, FontPath)` now — the path that was actually opened. Controlled: with
+`font_mono = "/home/NoSuchMono.ttf"` staged, `nxterm` reports
+`grid font /system/fonts/DejaVuSansMono.ttf, cell 8x14 at 14.00px`, which is the file it read.
+
+The same misattribution had reached `xtask`: `font_asset`'s error said "the built-in theme names
+…", which is true for the staging and the reference renders and false for the one caller whose
+path arrives off the guest's serial line. It no longer says where the path came from, because two
+callers supply it.
+
+### A number printed as an integer and read back as a float
+
+`nxterm` printed the size with `.u()`, which truncates; the gate parsed `f32` and re-measured at
+that number. The gate's whole design is to take the size *from the line* rather than pin it —
+pinning it would pin the staged theme to this gate — and that property held only while the size
+happened to be integral. At 13.5 the guest measures a 7x14 cell, the host recomputes 7x13, and
+the gate blames the font.
+
+Two changes, and the second is what makes the first exact. The line prints whole pixels and
+hundredths (`14.00px`, zero-padded, because `.5` hundredths is `.05`). And `Theme::from_config`
+now **rounds `font_px` to the nearest hundredth**, so every size the system can hold is a size
+that line can print without loss. That is a precision decision rather than a rounding accident: a
+hundredth of a pixel is far below what a rasteriser resolves, and what it buys is that "the size
+printed is the size used" is true by construction rather than by luck about which values people
+choose.
+
+### The rest
+
+`uiclient`'s module doc still said the toolkit window reads `DejaVuSansMono.ttf` — the identical
+sentence in `libui::reference` was updated in the same diff, so the two disagreed about one fact,
+in the file somebody reads before touching that gate.
+
+`load_themed` re-issued the failing load when there was nothing to fall back to; it returns the
+error it already has. `MAX_FONT_PATH` and `len: u8` are coupled by a `const` assertion now, so
+raising the bound past 255 is a build failure rather than a silent truncation.
+
+**And a quote in a font path escaped the claim the whole file rests on.** `usable` allowed
+`0x22`, so `font_ui = "/home/a"b.ttf"` round-tripped through *this* reader and would read as
+something else in any other TOML parser — the exact argument the unquoted-`font_px` rule rests
+on, applied to the other end of the string. Quotes and backslashes are refused.
+
+**One comment claimed coverage nothing could check.** The zero fill in `FontPath` was justified
+as defending against "a constructor that left a previous path's tail behind", and no constructor
+here can: both start from a fresh array. The reviewer's control — filling with `0xFF` instead —
+left every test in the file green. The test is not vacuous; its `as_str`/`Debug` half fails five
+ways if `len` stops bounding the slice. The comment now says which half bites.

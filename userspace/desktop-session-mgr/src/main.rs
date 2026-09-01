@@ -414,8 +414,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // The font, before the window: a greeter that cannot draw text has nothing to show, and
     // failing here reports the real cause rather than an empty window.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let font = match unsafe { libdraw::text::load_ui(root_ns, &Theme::default(), b"desktop-session-mgr") } {
-        Ok(f) => f,
+    let theme = Theme::default();
+    let (font, _) = match unsafe { libdraw::text::load_ui(root_ns, &theme, b"desktop-session-mgr") }
+    {
+        Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"desktop-session-mgr: the UI font ").s(e.why()).end();
             fail(b"desktop-session-mgr: font load FAILED\n");

@@ -28,6 +28,9 @@
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "io")]
+use crate::theme::FontPath;
+
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
 
 use crate::format::Rgb;
@@ -282,6 +285,10 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
 
 /// Load the proportional face a theme names, falling back to the built-in one.
 ///
+/// Returns the face **and the path it actually came from**, which is not always the one the
+/// theme asked for — see [`load_themed`]. A caller that reports which font it is using must
+/// report this one, or it names a file it never opened.
+///
 /// `who` prefixes the console line a fallback prints — the calling program's name, as every
 /// other line it writes is prefixed.
 ///
@@ -293,12 +300,14 @@ pub unsafe fn load_ui(
     root_ns: u64,
     theme: &crate::theme::Theme,
     who: &[u8],
-) -> Result<Font, LoadError> {
+) -> Result<(Font, FontPath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { load_themed(root_ns, theme.font_ui.as_str(), UI_FONT_PATH, who) }
+    unsafe { load_themed(root_ns, theme.font_ui, crate::theme::Theme::dark().font_ui, who) }
 }
 
 /// Load the fixed-advance face a theme names, falling back to the built-in one.
+///
+/// Returns the face and the path it came from, as [`load_ui`] does.
 ///
 /// # Safety
 ///
@@ -308,12 +317,13 @@ pub unsafe fn load_mono(
     root_ns: u64,
     theme: &crate::theme::Theme,
     who: &[u8],
-) -> Result<Font, LoadError> {
+) -> Result<(Font, FontPath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { load_themed(root_ns, theme.font_mono.as_str(), MONO_FONT_PATH, who) }
+    unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::dark().font_mono, who) }
 }
 
-/// `wanted`, or `builtin` if `wanted` will not load — the rule written once for both roles.
+/// `wanted`, or `builtin` if `wanted` will not load — the rule written once for both roles, with
+/// the path that was actually opened.
 ///
 /// **A theme that names a font this machine does not have must not cost the desktop its text.**
 /// That is the same stance the schema takes on every other field: a value that cannot be read
@@ -327,33 +337,31 @@ pub unsafe fn load_mono(
 #[cfg(feature = "io")]
 unsafe fn load_themed(
     root_ns: u64,
-    wanted: &str,
-    builtin: &str,
+    wanted: FontPath,
+    builtin: FontPath,
     who: &[u8],
-) -> Result<Font, LoadError> {
+) -> Result<(Font, FontPath), LoadError> {
     // SAFETY: forwarded from the caller's contract.
-    match unsafe { load(root_ns, wanted) } {
-        Ok(f) => Ok(f),
-        Err(_) if wanted == builtin => {
-            // The built-in path itself. Nothing to fall back to, and the caller says so with the
-            // error — a second attempt at the same path would only print the same failure twice.
-            // SAFETY: as above.
-            unsafe { load(root_ns, builtin) }
-        }
+    match unsafe { load(root_ns, wanted.as_str()) } {
+        Ok(f) => Ok((f, wanted)),
+        // The built-in path itself, so there is nothing to fall back *to*: hand back the error
+        // rather than retrying a lookup, stat and map that can only reach the same answer
+        // (PR #264 review, optional 1).
+        Err(e) if wanted == builtin => Err(e),
         Err(e) => {
             // `s` rather than `untrusted`: a `FontPath` cannot hold a control byte, which is
             // most of why it validates at all.
             libkern::debug::Line::new()
                 .s(who)
                 .s(b": theme font ")
-                .s(wanted.as_bytes())
+                .s(wanted.as_str().as_bytes())
                 .s(b" ")
                 .s(e.why())
                 .s(b"; using ")
-                .s(builtin.as_bytes())
+                .s(builtin.as_str().as_bytes())
                 .end();
             // SAFETY: as above.
-            unsafe { load(root_ns, builtin) }
+            unsafe { load(root_ns, builtin.as_str()) }.map(|f| (f, builtin))
         }
     }
 }

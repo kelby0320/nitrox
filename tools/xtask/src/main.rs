@@ -3763,10 +3763,14 @@ fn cmd_preview(what: &str) -> R<()> {
 /// that face, all three fail together and say so.
 fn font_asset(guest_path: &str) -> R<PathBuf> {
     let name = guest_path.strip_prefix(FONT_DIR).filter(|n| !n.contains('/')).ok_or_else(|| {
+        // **Without saying where the path came from**, because two callers supply it: the
+        // built-in theme, for the staging and the reference renders, and `check-terminal`, whose
+        // path arrives off the guest's serial line and can therefore be a user's `theme.toml`.
+        // Naming the wrong one would send a reader to `Theme::dark()` for a value that is in a
+        // file on the disk (PR #264 review, finding 1).
         format!(
-            "the built-in theme names {guest_path:?}, which is not a file directly under \
-             {FONT_DIR} — the image build stages that directory and nothing else, so the host \
-             has no way to render with it"
+            "{guest_path:?} is not a file directly under {FONT_DIR} — the image build stages \
+             that directory and nothing else, so the host has no way to render with it"
         )
     })?;
     Ok(repo_root().join("assets/fonts").join(name))

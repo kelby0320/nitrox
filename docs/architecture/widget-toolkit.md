@@ -12,8 +12,9 @@ per-buffer damage accumulation (`damage.rs`), event routing with implicit captur
 (`route.rs`), painting within a damage rectangle (`paint.rs`), and the widget set —
 `button`, `scrollbar`, `menu_bar`, and the `custom` escape hatch (`widget.rs`). Text is real
 TrueType through `libdraw::text`, rasterised from a font read off the root filesystem at
-runtime — the proportional face the theme names (§11), since M11 Part D. `reference.rs` is the fixed picture `cargo xtask check-display` renders on the host
-and compares against the guest's screen pixel for pixel.
+runtime — the proportional face the theme names (§11), since M11 Part D. `reference.rs` is
+the fixed picture `cargo xtask check-display` renders on the host and compares against the
+guest's screen pixel for pixel.
 
 **What is specified here and not built**, each with its reason in place: the **application
 runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
