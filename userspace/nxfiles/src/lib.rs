@@ -34,8 +34,8 @@ use libui::element::{
     Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
 };
 use libui::widget::{
-    GRIP_W, ListRow, ListState, Theme as UiTheme, TITLE_BAR_H, TitleButtons, WidgetState,
-    button, list_view, resize_grip, title_bar,
+    GRIP_W, ListRow, ListState, Theme as UiTheme, TITLE_BAR_H, TitleButtons, WINDOW_FRAME_H,
+    WidgetState, button, list_view, resize_grip, title_bar, window_frame,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -475,7 +475,11 @@ impl App {
     /// is the topmost layer and takes any press under it, so a row there would be a row that
     /// cannot be clicked.
     pub fn list_h(&self) -> u32 {
-        self.window.h.saturating_sub(TITLE_BAR_H + PATH_H + GRIP_W)
+        // **`WINDOW_FRAME_H` too, since M11 Part E batch 2b.** `window_frame` insets the content
+        // below the title bar, so a list built for the old height would be laid out three pixels
+        // shorter — one row of arithmetic off, which this method's own reason for existing is to
+        // prevent.
+        self.window.h.saturating_sub(TITLE_BAR_H + PATH_H + GRIP_W + WINDOW_FRAME_H)
     }
 
     /// The element tree for the current state.
@@ -542,17 +546,18 @@ impl App {
         let list =
             list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, Some(Msg::Grab), &ui);
 
-        let body = dock(
-            alloc::vec![
-                docked(Edge::Top, title),
-                docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
-            ],
+        let body = window_frame(
+            title,
+            dock(
+                alloc::vec![docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY))],
             // **Sized to the height it was built for.** `list_view` does not size itself, and
             // the dock's flex child otherwise gets everything left over — so the widget would
             // build rows for one height and be drawn at another, leaving `visible` off by one
             // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
             // wrapper as the reliable way to keep the two in step.
-            sized(Size::new(0, h), list).key(LIST_KEY),
+                sized(Size::new(0, h), list).key(LIST_KEY),
+            ),
+            &ui,
         );
 
         // The grip over the bottom-right corner, as `nxterm` places its own.

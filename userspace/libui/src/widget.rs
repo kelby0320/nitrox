@@ -26,7 +26,7 @@ use libdraw::geom::Size;
 pub use libdraw::theme::Theme;
 
 use crate::element::{
-    Element, IconKind, Insets, bevel, column, fill, icon, padding, row, sized,
+    Edge, Element, IconKind, Insets, bevel, column, dock, docked, fill, icon, padding, row, sized,
     stack, text,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
@@ -110,6 +110,61 @@ pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
 
 /// How thick a popup's border is.
 const POPUP_BORDER: u32 = 1;
+
+/// A window's own frame: an edge, and a margin between its content and that edge.
+///
+/// **The title bar is flush and the content is not**, which is what the reference desktop does
+/// and is not arbitrary: a title bar is the window's edge — it is what you grab to move it — and
+/// insetting it would put a strip of frame above a bar that already reads as one. The content
+/// below is what wants breathing room.
+///
+/// Takes the title and the rest separately rather than wrapping a finished tree, because those
+/// two are exactly the parts that are treated differently. An application that wants no frame
+/// simply does not call this; the greeter does not, having no title bar to be flush with.
+pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    // **Both children wrapped, and the zero-inset one is not decoration.** The diff requires a
+    // container's children to be all keyed or all unkeyed, and every caller keys its title bar —
+    // so docking the title directly beside an unkeyed content pane is a `MixedKeying` error at
+    // the first frame. Wrapping both puts the keys one level down, inside their own parents,
+    // where they still do their job; the alternative was for this helper to invent a key in the
+    // application's own namespace.
+    let inner = dock(
+        alloc::vec![docked(Edge::Top, padding(Insets::all(0), title))],
+        padding(
+            Insets { top: 0, right: WINDOW_FRAME, bottom: WINDOW_FRAME, left: WINDOW_FRAME },
+            content,
+        ),
+    );
+    stack(alloc::vec![
+        fill(theme.border),
+        padding(Insets::all(WINDOW_BORDER), fill(theme.face)),
+        padding(Insets::all(WINDOW_BORDER), inner),
+    ])
+}
+
+/// How thick the line around a window is.
+pub const WINDOW_BORDER: u32 = 1;
+
+/// How much frame shows between a window's content and its edge.
+pub const WINDOW_FRAME: u32 = 3;
+
+/// What [`window_frame`] takes off a window's width before its content sees it.
+///
+/// **Published because applications compute their own content size**, and they have to compute
+/// the same one this draws — a widget built for one height and laid out at another is the bug
+/// each of their `*_h()` methods already carries a comment about. Three constants rather than
+/// three open-coded sums.
+pub const WINDOW_FRAME_W: u32 = 2 * (WINDOW_BORDER + WINDOW_FRAME);
+
+/// What it takes off the height, *in addition* to the title bar: the top border, and the frame
+/// and border below the content.
+pub const WINDOW_FRAME_H: u32 = WINDOW_BORDER * 2 + WINDOW_FRAME;
+
+/// Where a framed window's content starts, horizontally.
+pub const WINDOW_CONTENT_X: u32 = WINDOW_BORDER + WINDOW_FRAME;
+
+/// Where it starts vertically — this, plus [`TITLE_BAR_H`].
+pub const WINDOW_CONTENT_Y: u32 = WINDOW_BORDER;
 
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;

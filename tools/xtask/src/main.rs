@@ -2848,15 +2848,27 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_button("left", true)?;
     // **Past the slop, then across.** The browser turns a press into a drag once it has
     // travelled, which is what keeps a click a click.
+    //
+    // **The slop counts toward where the pointer is**, and it did not until M11 Part E batch 2b
+    // found out. Injection is relative: these six motions move the guest's pointer 600 across
+    // and 240 down, and the walk below started its arithmetic from `row1` as though they had
+    // not happened — so every step was 600 too far right, and the pointer ended clamped against
+    // the screen's right edge instead of at `onto`.
+    //
+    // It passed for a month because the editor's text area reached the window's last pixel
+    // column, so a drop at the extreme edge landed on it anyway. Giving the window a frame moved
+    // the content in by four pixels and the drop started landing on the frame — a real gate bug,
+    // surfaced by a change that had nothing to do with it.
+    let mut at = row1;
     for _ in 0..6 {
         qmp.send_motion(100, 40)?;
+        at = (at.0 + 100, at.1 + 40);
     }
     session.expect("nxfiles: dragging other.txt")?;
     session.expect("compositor: drag from window ")?;
     // Into the editor's document area — below its title bar and status strip, and well inside
     // the half of the screen it now occupies.
     let onto = (work.0 + work.2 as i32 * 3 / 4, work.1 + work.3 as i32 / 2);
-    let mut at = row1;
     while at != onto {
         let step = (
             (onto.0 - at.0).clamp(-100, 100),

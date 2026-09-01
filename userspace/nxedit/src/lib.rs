@@ -37,8 +37,8 @@ use libui::element::{
     Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
 };
 use libui::widget::{
-    GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TitleButtons, WidgetState, button,
-    resize_grip, text_area, title_bar,
+    GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TitleButtons, WINDOW_FRAME_H,
+    WidgetState, button, resize_grip, text_area, title_bar, window_frame,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
@@ -395,7 +395,8 @@ impl App {
 
     /// The height the text area is laid out at — the window less its chrome and the grip.
     pub fn area_h(&self) -> u32 {
-        self.window.h.saturating_sub(TITLE_BAR_H + STATUS_H + GRIP_W)
+        // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`.
+        self.window.h.saturating_sub(TITLE_BAR_H + STATUS_H + GRIP_W + WINDOW_FRAME_H)
     }
 
     /// What the title bar shows: the file's name, marked when the buffer differs from the disk.
@@ -456,15 +457,16 @@ impl App {
         // the honest answer: the title bar is not where a document goes.
         let area = text_area(&mut self.text, h, ROW_H, self.focused, &ui).on_drop(Msg::Dropped);
 
-        let body = dock(
-            alloc::vec![
-                docked(Edge::Top, title),
-                docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
-            ],
+        let body = window_frame(
+            title,
+            dock(
+                alloc::vec![docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY))],
             // Sized to the height it was built for, like every scrolling widget in this tree:
             // the dock's flex child otherwise gets whatever is left, and the widget would build
             // rows for one height and be drawn at another.
-            sized(Size::new(0, h), area).key(AREA_KEY),
+                sized(Size::new(0, h), area).key(AREA_KEY),
+            ),
+            &ui,
         );
 
         let grip = offset(

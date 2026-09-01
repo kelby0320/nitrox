@@ -20966,3 +20966,50 @@ draws and why they asked for it specifically.
 The test that pinned the old behaviour asserted one colour differing from another. It asserts both
 layers now — the border and the bevelled fill, and that an unselected row has neither — which is a
 stronger claim than the one it replaced.
+
+## 2026-09-01 — M11 Part E batch 2b: a frame, and the gate bug four pixels exposed
+
+The last of the polish list's chrome items: spacing between a window's content and its edge. Held
+back from 2a on purpose, because it is the only one of the four that moves geometry.
+
+**The title bar is flush and the content is not**, which is what the reference desktop does and is
+not a stylistic coin-flip: a title bar *is* the window's edge — it is the thing you grab to move
+the window — so insetting it would put a strip of frame above a bar that already reads as one.
+`window_frame` therefore takes the title and the rest separately, because those two are exactly
+the parts treated differently.
+
+**What it costs is published, because three applications compute their own content size.** Each
+already had a `list_h()` / `area_h()` carrying a comment about why a widget built for one height
+and laid out at another is a bug; the frame is a fourth term in each of those sums.
+`nxterm` needed more: `resize` fits the cells, `grid_origin` places them and `track_h` sizes the
+scrollbar, and all three had open-coded `BAR_H + TITLE_BAR_H`. They agreed only because nothing
+had ever been added between a window's edge and its content. They read one pair of constants now.
+
+**The grid origin is the one that would have been silent.** It maps a pointer to a cell, so a
+frame it did not know about would offset every click by four pixels — invisible until a click near
+a cell boundary landed one column over. It is asserted directly now, against the sum rather than
+against a number.
+
+### The frame's dock wraps both its children
+
+The diff requires a container's children to be all keyed or all unkeyed, and every caller keys its
+title bar — so docking a keyed title beside an unkeyed content pane is a `MixedKeying` error on
+the first frame. Both are wrapped, which puts the keys one level down inside their own parents
+where they still do their job. The alternative was for the toolkit to invent a key in the
+application's own namespace, which is worse than a wrapper node.
+
+### And a gate bug that had nothing to do with any of this
+
+`check-login`'s drag-and-drop step sends six motions to get past the browser's drag slop, then
+walks the pointer to a target. Injection is relative, and the walk started its arithmetic as
+though the slop had not happened — so every step was 600 pixels too far right and the pointer
+ended clamped against the screen's edge rather than at the target.
+
+**It passed for a month because the editor's text area reached the window's last pixel column**, so
+a drop at the extreme edge landed on it anyway. Four pixels of frame moved the content in, and the
+drop started landing on the frame. The gate now counts the slop toward where the pointer is.
+
+That is the second time in this milestone that a change has been blamed for a failure it only
+revealed. Worth stating as a habit rather than an anecdote: when a visual change breaks a gate
+that clicks at a computed point, check what the point was actually hitting before assuming the
+change moved it.

@@ -3263,10 +3263,25 @@ it is noticed on. Its own list, and its own milestone.
       **And a selection is blue with a darker edge**, which is the second half of the request and
       the half that matters: without the border, two adjacent selected rows read as one block.
 
-- [ ] **Batch 2b — the window frame.** Spacing on a window's left, right and bottom, with the
-      title bar flush at the top. Held back from 2a because it moves geometry: three applications
-      compute their content height from the window's, `nxterm` maps clicks to grid cells through
-      its origin, and all of that has to move together.
+- [x] **Batch 2b — the window frame** ✅ (2026-09-01). A one-pixel edge, three pixels of frame on
+      the left, right and bottom, and the title bar flush at the top — which is what the reference
+      does and is not arbitrary: a title bar *is* the window's edge, the thing you grab to move
+      it, and insetting it would put a strip of frame above a bar that already reads as one.
+
+      **Held back from 2a because it moves geometry.** `window_frame` publishes what it costs, and
+      three applications subtract it; `nxterm` needed one pair of constants where it had three
+      open-coded sums of `BAR_H + TITLE_BAR_H` that agreed only because nothing had ever been
+      added between a window's edge and its content.
+
+      **The frame's dock wraps both children**, because the diff requires a container's children
+      to be all keyed or all unkeyed and every caller keys its title bar. The alternative was for
+      the toolkit to invent a key in the application's namespace.
+
+      **And it surfaced a gate bug that had nothing to do with it.** `check-login`'s drag ignored
+      the six slop motions when computing its walk, so the pointer ended clamped against the
+      screen's right edge rather than at the target — which landed on the editor's text area
+      anyway, because the area reached the window's last pixel column. Four pixels of frame moved
+      the content in and the drop started landing on the frame.
 
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s

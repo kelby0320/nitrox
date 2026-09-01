@@ -35,7 +35,10 @@ use librsproto::surface::{
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
-use libui::widget::{GRIP_W, TITLE_BAR_H, TitleButtons, resize_grip, title_bar};
+use libui::widget::{
+    GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip,
+    title_bar, window_frame,
+};
 use libui::widget::{Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
 /// The `custom` node the grid is drawn into.
@@ -81,6 +84,18 @@ pub const TITLE: &str = "nxterm";
 
 /// Width of the scrollbar, in pixels.
 pub const SCROLL_W: u32 = 12;
+
+/// What the chrome costs the grid horizontally: the scrollbar, and the window's frame.
+///
+/// **One pair of constants, because three places compute this** — `resize` fits the cells,
+/// `grid_origin` places them, and `track_h` sizes the scrollbar against the same content box.
+/// They were three open-coded sums of `BAR_H + TITLE_BAR_H`, which agreed only because nothing
+/// had ever been added between the window's edge and its content. M11 Part E batch 2b added
+/// something (PR #265).
+const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W;
+
+/// And vertically: the title bar, the menu bar, and the frame.
+const CHROME_H: u32 = BAR_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
 
 /// What the chrome can ask the terminal to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -235,7 +250,9 @@ impl App {
     pub fn new(cols: usize, rows: usize, metrics: Metrics) -> App {
         let g = metrics.pixel_size(cols, rows);
         App {
-            window: Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H),
+            // The same two sums `resize` subtracts, so the window this opens at is a window
+            // whose grid is exactly `cols` x `rows` — and stays so after the first `Configure`.
+            window: Size::new(g.w + CHROME_W, g.h + CHROME_H),
             maximized: false,
             grid: Grid::new(cols, rows),
             parser: Parser::new(),
@@ -288,9 +305,8 @@ impl App {
             return None;
         }
         self.window = size;
-        let cols = (size.w.saturating_sub(SCROLL_W) / self.metrics.cell_w).max(1) as usize;
-        let rows = (size.h.saturating_sub(BAR_H + TITLE_BAR_H) / self.metrics.cell_h).max(1)
-            as usize;
+        let cols = (size.w.saturating_sub(CHROME_W) / self.metrics.cell_w).max(1) as usize;
+        let rows = (size.h.saturating_sub(CHROME_H) / self.metrics.cell_h).max(1) as usize;
         let reflow = self.grid.resize(cols, rows);
         // **Through the map, not around it.** `view_top` is an absolute line number and the
         // rewrap changed how many lines exist above it.
@@ -301,7 +317,10 @@ impl App {
 
     /// Where the grid's top-left sits inside the window.
     pub fn grid_origin(&self) -> libdraw::geom::Point {
-        libdraw::geom::Point::new(0, (BAR_H + TITLE_BAR_H) as i32)
+        libdraw::geom::Point::new(
+            WINDOW_CONTENT_X as i32,
+            (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H) as i32,
+        )
     }
 
     /// Feed bytes from the program on the other end.
@@ -512,7 +531,7 @@ impl App {
         // cannot be pressed. That is not hypothetical: `MIN_THUMB` is 16 and a following view
         // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
         // its thumb *entirely* under the grip.
-        self.window.h.saturating_sub(BAR_H + TITLE_BAR_H + GRIP_W)
+        self.window.h.saturating_sub(CHROME_H + GRIP_W)
     }
 
     /// The element tree for the current state.
@@ -557,9 +576,10 @@ impl App {
             &ui,
         )
         .key(TITLE_KEY);
-        let body = dock(
-            vec![
-                docked(Edge::Top, title),
+        let body = window_frame(
+            title,
+            dock(
+                vec![
                 docked(Edge::Top, bar.key(BAR_KEY)),
                 docked(
                     Edge::Right,
@@ -576,8 +596,10 @@ impl App {
                     )
                     .key(SCROLLBAR_KEY),
                 ),
-            ],
-            custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
+                ],
+                custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
+            ),
+            &ui,
         );
 
         // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
@@ -979,8 +1001,9 @@ mod tests {
             };
             assert_eq!(layers.len(), 2, "open={open}: the body and the grip, and nothing else");
             assert!(
-                matches!(layers[0].node, libui::element::Node::Dock { .. }),
-                "open={open}: the body is the dock"
+                matches!(layers[0].node, libui::element::Node::Stack { .. }),
+                "open={open}: the body is the framed window — a border, a face and the dock \
+                 inside them, since M11 Part E batch 2b"
             );
         }
     }
@@ -1003,9 +1026,16 @@ mod tests {
         a.menu_open = true;
 
         // The popup hangs from the item's left edge, immediately below it. The menu bar sits
-        // *under* the title bar since M9 Part A, so "inside the bar" is measured from there.
-        assert!(item.origin.y >= TITLE_BAR_H as i32, "the item is below the title bar");
-        assert!(item.bottom() <= (TITLE_BAR_H + BAR_H) as i64, "the item is inside the menu bar");
+        // *under* the title bar since M9 Part A, so "inside the bar" is measured from there —
+        // and inside the window's frame since M11 Part E batch 2b, which moves both bars down by
+        // the top border. Written as the sum rather than a number, so the next thing added to
+        // the chrome moves this with it.
+        let bar_top = (WINDOW_CONTENT_Y + TITLE_BAR_H) as i32;
+        assert!(item.origin.y >= bar_top, "the item is below the title bar");
+        assert!(
+            item.bottom() <= (bar_top as u32 + BAR_H) as i64,
+            "the item is inside the menu bar"
+        );
 
         // And the menu it will hold has a real size to be created at — measured, not guessed,
         // because a popup window needs its extent before it exists.
@@ -1030,8 +1060,26 @@ mod tests {
         // that costs the user a row of text.
         let a = app();
         let g = a.metrics.pixel_size(20, 6);
-        assert_eq!(a.window_size(), Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H));
-        assert_eq!(a.grid_origin().y, (BAR_H + TITLE_BAR_H) as i32, "the grid starts below both");
+        assert_eq!(a.window_size(), Size::new(g.w + CHROME_W, g.h + CHROME_H));
+        // **And the grid starts inside the frame**, not at the window's edge: the origin is what
+        // maps a pointer to a cell, so a frame the origin did not know about would offset every
+        // click by four pixels — invisible until a click near a cell boundary lands one column
+        // over (M11 Part E batch 2b).
+        assert_eq!(
+            a.grid_origin(),
+            libdraw::geom::Point::new(
+                WINDOW_CONTENT_X as i32,
+                (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H) as i32
+            ),
+            "the grid starts below the bars and inside the frame"
+        );
+        // The window is the grid plus chrome, and the chrome is *all* of it — a test that added
+        // up only the parts it remembered would pass for a frame that took space from the grid.
+        assert_eq!(
+            a.window_size().h - a.grid_origin().y as u32 - g.h,
+            libui::widget::WINDOW_BORDER + libui::widget::WINDOW_FRAME,
+            "what is left below the grid is the frame and the border, and nothing else"
+        );
     }
 
     #[test]
