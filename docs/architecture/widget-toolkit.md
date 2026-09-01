@@ -661,6 +661,14 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   `SYSTEM_FONT_PATH` and every client loaded it, so every label in every window was monospaced.
   `nxterm` is the one program that loads both: its menus are widgets and its grid is not.
 
+  **And widgets react to the pointer**, since M11 Part E batch 3 — which is later than it
+  sounds: `Router::inside` has reported the widget under the cursor since M4 and
+  `WidgetState::hovered` has existed just as long, and no application ever connected the two, so
+  nothing in this system had ever responded to a pointer that was merely *over* it.
+  `Router::hovered_key` is what an application asks, and the distinction is load-bearing:
+  `inside` is a **diff-tree id** and `.key(…)` is the application's own numbering, so comparing
+  one to the other compiles and gives a stable wrong answer.
+
   A path a theme names is resolved in the *application's* namespace, so whether it loads is not
   something the shell could have checked when it parsed the file — an unloadable path falls back
   to the built-in face for that role and says so on the console, which is the same stance the

@@ -124,9 +124,37 @@ impl Router {
         self.capture
     }
 
-    /// The widget the cursor is inside, if any.
+    /// The widget the cursor is inside, if any — as a **diff-tree id**.
+    ///
+    /// Note the space this is in: ids are the tree's, assigned by [`Tree`] as widgets are
+    /// created, and they are not the keys an application writes. For "is the thing I keyed `K`
+    /// under the cursor?" use [`hovered_key`](Self::hovered_key), which is the question
+    /// applications actually have.
     pub fn inside(&self) -> Option<u64> {
         self.inside
+    }
+
+    /// The **key** of the widget under the cursor, if it has one.
+    ///
+    /// **Two id spaces meet here, and mixing them is a bug that looks like it works.** The
+    /// router hit-tests the retained tree, whose ids are the diff's own counter; an application
+    /// names its widgets with `.key(…)`, which it chooses. Comparing one to the other compiles,
+    /// and produced a stable wrong answer the first time hover was wired up — a menu item keyed
+    /// `2` reported as `4`, because 4 was its node's position in the tree's numbering (M11
+    /// Part E batch 3, caught by `check-terminal`).
+    ///
+    /// The nearest *keyed* ancestor, not only the exact node: a widget built from a stack of
+    /// layers carries its key on the outside, and the cursor is inside one of the layers.
+    pub fn hovered_key(&self, tree: &Tree) -> Option<u64> {
+        fn find(w: &Widget, id: u64, carried: Option<u64>) -> Option<Option<u64>> {
+            let carried = w.key.or(carried);
+            if w.id == id {
+                return Some(carried);
+            }
+            w.children.iter().find_map(|c| find(c, id, carried))
+        }
+        let id = self.inside?;
+        find(tree.root()?, id, None).flatten()
     }
 
     /// Whether the compositor says this window has the keyboard.
@@ -623,6 +651,46 @@ mod tests {
         let mut t = Tree::new();
         t.update(e, &l).expect("a clean frame");
         (t, l)
+    }
+
+    #[test]
+    fn hovered_key_reports_the_applications_key_and_not_the_trees_id() {
+        // **Two id spaces, and the bug is that mixing them compiles.** The router hit-tests the
+        // retained tree, whose ids are the diff's own counter; `.key(…)` is the application's
+        // own numbering. Wiring hover up the first time compared one to the other and got a
+        // stable wrong answer — a menu item keyed 2 reported as 4 — which no host test caught,
+        // because every host test built a tree where the two happened to line up.
+        //
+        // So this builds one where they *cannot*: a key far outside anything the tree's counter
+        // will reach, on a widget deep enough that its own id is not 1.
+        const FAR: u64 = 9_000;
+        let e: Element<Msg> = column(alloc::vec![
+            sized(Size::new(640, 100), text("above")).key(FAR - 1),
+            sized(Size::new(640, 100), stack(alloc::vec![text("target")])).key(FAR),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        r.pointer(&t, &e, &l, motion(10, 150));
+
+        let id = r.inside().expect("the cursor is inside something");
+        assert_ne!(id, FAR, "the tree's id happened to equal the key — pick a different key");
+        assert_eq!(r.hovered_key(&t), Some(FAR), "the key, not the id");
+
+        // And the nearest *keyed ancestor*, because a widget carries its key on the outside
+        // while the cursor is inside one of its layers — which is the shape every widget in
+        // `widget.rs` has.
+        assert!(id != FAR, "the hit was a descendant, which is the case worth covering");
+    }
+
+    #[test]
+    fn nothing_is_hovered_once_the_cursor_leaves() {
+        let e: Element<Msg> = sized(Size::new(100, 100), text("x")).key(7);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        r.pointer(&t, &e, &l, motion(10, 10));
+        assert_eq!(r.hovered_key(&t), Some(7));
+        r.pointer(&t, &e, &l, motion(400, 400));
+        assert_eq!(r.hovered_key(&t), None, "a highlight that never clears is a stuck highlight");
     }
 
     fn press(x: i32, y: i32) -> PointerEvent {

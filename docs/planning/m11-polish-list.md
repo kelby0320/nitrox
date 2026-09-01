@@ -91,6 +91,10 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 3 — hover** (2026-09-01). The menu's highlighted item, and the discovery behind it:
+  nothing in the system had ever reacted to the pointer being over it. Menu rows highlight like a
+  selection; list rows get a quieter face. The applications modal still has none, because the
+  shell has no router.
 - **Batch 2b — the window frame** (2026-09-01). A one-pixel edge and three pixels of frame on the
   left, right and bottom, with the title bar flush at the top. Found a `check-login` bug on the
   way: its drag was landing on the window's last pixel column by accident.

@@ -275,7 +275,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
         }
         // ---- render ----
-        let ui = app.view(&theme);
+        // The widget under the pointer, from the router that has always known and that nothing
+        // had ever asked (M11 Part E batch 3).
+        let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,

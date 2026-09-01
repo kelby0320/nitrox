@@ -39,7 +39,9 @@ use libui::widget::{
     GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip,
     title_bar, window_frame,
 };
-use libui::widget::{Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, scrollbar};
+use libui::widget::{
+    Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, menu_item, scrollbar,
+};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -47,6 +49,14 @@ pub const GRID_KIND: u32 = 0x4772_6964;
 /// The key on the menu bar's one item, so [`libui::layout::locate`] can find where it landed
 /// and the popup can be placed under it.
 pub const MENU_ITEM_KEY: u64 = 1;
+
+/// The popup's rows, keyed so the router can say which one the cursor is inside.
+///
+/// **Keys are what make hover possible**: `Router::inside` reports the id of the keyed widget
+/// under the pointer, so an unkeyed item is one the router cannot name (M11 Part E batch 3).
+pub const MENU_CLEAR_KEY: u64 = 2;
+/// See [`MENU_CLEAR_KEY`].
+pub const MENU_RESET_KEY: u64 = 3;
 
 /// The key on the grid, so the window can give it the keyboard on its first frame.
 ///
@@ -541,13 +551,18 @@ impl App {
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
-    pub fn view(&self, ui: &UiTheme) -> Element<Msg> {
+    pub fn view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let grid_px = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
 
         let bar = menu_bar(
             vec![
-                button("Terminal", Msg::ToggleMenu, WidgetState::default(), &ui)
+                button(
+                    "Terminal",
+                    Msg::ToggleMenu,
+                    WidgetState { hovered: hovered == Some(MENU_ITEM_KEY), ..Default::default() },
+                    &ui,
+                )
                     .key(MENU_ITEM_KEY),
             ],
             BAR_H,
@@ -634,16 +649,21 @@ impl App {
     /// **The theme is the caller's**, like [`view`](Self::view)'s: the popup is painted by the
     /// binary, and a menu built from one theme beside a window painted with another is the same
     /// two-themes mistake one surface further out.
-    pub fn menu_view(&self, ui: &UiTheme) -> Element<Msg> {
-        self.menu(ui)
+    pub fn menu_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        self.menu(ui, hovered)
     }
 
     /// The popup's contents.
-    fn menu(&self, ui: &UiTheme) -> Element<Msg> {
+    fn menu(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         use libui::element::column;
+        // **`menu_item`, not `button`** (M11 Part E batch 3): a menu row highlights the way a
+        // selected list row does, because they are the same thing seen twice — the item that
+        // would happen if you acted now. `hovered` comes from the popup's own router.
         let items = column(vec![
-            button("Clear", Msg::Clear, WidgetState::default(), ui),
-            button("Reset", Msg::Reset, WidgetState::default(), ui),
+            menu_item("Clear", Msg::Clear, hovered == Some(MENU_CLEAR_KEY), ui)
+                .key(MENU_CLEAR_KEY),
+            menu_item("Reset", Msg::Reset, hovered == Some(MENU_RESET_KEY), ui)
+                .key(MENU_RESET_KEY),
         ]);
         // A backing fill under the items, so the menu is opaque over whatever it covers — and a
         // border around it, because on a light theme the face and the window underneath are
@@ -699,7 +719,7 @@ mod tests {
         }
         assert!(a.scroll().scrollable(), "precondition: there is a thumb to press");
 
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar is keyed");
@@ -732,7 +752,7 @@ mod tests {
         // must reach the grip rather than the title bar's drag or the grid's keys.
         let mut a = app();
         let (t, l, mut r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let g = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
         let p = PointerEvent {
             window: 1,
@@ -996,7 +1016,7 @@ mod tests {
             // menu is a *window*, so opening it adds nothing here. Since M9 Part E the root is
             // a stack of two — the body and the resize grip over its corner — rather than the
             // dock alone, and that is still fixed.
-            let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default()).node else {
+            let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default(), None).node else {
                 panic!("open={open}: the window's tree is the body under its grip");
             };
             assert_eq!(layers.len(), 2, "open={open}: the body and the grip, and nothing else");
@@ -1019,7 +1039,7 @@ mod tests {
         let cell = FixedCell { w: 8, h: 16 };
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
 
-        let view = a.view(&UiTheme::default());
+        let view = a.view(&UiTheme::default(), None);
         let l = layout(&view, bounds, &cell);
         let item = locate(&view, &l, MENU_ITEM_KEY).expect("the menu item is keyed");
         a.menu_anchor = Some(item);
@@ -1039,7 +1059,7 @@ mod tests {
 
         // And the menu it will hold has a real size to be created at — measured, not guessed,
         // because a popup window needs its extent before it exists.
-        let menu = a.menu_view(&UiTheme::default());
+        let menu = a.menu_view(&UiTheme::default(), None);
         let size = libui::layout::measure(
             &menu,
             libui::layout::Constraints::loose(bounds.size),
@@ -1270,7 +1290,7 @@ mod tests {
     /// The tree, layout and router of a live window, with the grid focused as `main` does it.
     fn window(a: &App) -> (libui::diff::Tree, libui::layout::Layout, libui::route::Router) {
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let mut t = libui::diff::Tree::new();
         t.update(&e, &l).expect("a clean frame");
@@ -1289,7 +1309,7 @@ mod tests {
     fn click_maximise(a: &mut App) {
         use libui::widget::TITLE_BUTTON_W;
         let (t, l, mut r) = window(a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let x = a.window_size().w as i32 - (TITLE_BUTTON_W as i32 + TITLE_BUTTON_W as i32 / 2);
         let y = TITLE_BAR_H as i32 / 2;
         let mut msgs = alloc::vec::Vec::new();
@@ -1319,7 +1339,7 @@ mod tests {
         // line, so this is the difference between a demo and a terminal.
         let mut a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
 
         for msg in [
             r.key(&t, &e, key_ev(35, KEY_DOWN)),   // h, pressed
@@ -1339,7 +1359,7 @@ mod tests {
         // down, so acting on the release too doubles every character typed.
         let mut a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         a.update(r.key(&t, &e, key_ev(35, KEY_DOWN)).unwrap());
         a.update(r.key(&t, &e, key_ev(35, KEY_UP)).unwrap());
         assert_eq!(a.take_outbox(), b"h", "the release typed as well");
@@ -1353,7 +1373,7 @@ mod tests {
         // with the pointer, and `route`'s bubbling is there for a keyboard menu that M6 owns.
         let a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         assert!(matches!(r.key(&t, &e, key_ev(35, KEY_DOWN)), Some(Msg::Key(_))));
     }
 

@@ -441,7 +441,12 @@ fn modal_view(
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme);
     // The list is given the space left after the field, so `visible` matches what is drawn.
     let list_h = MODAL_H.saturating_sub(40);
-    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, theme);
+    // **No hover here, and it is a shape rather than an omission** (M11 Part E batch 3). Hover
+    // comes from `Router::inside`, and this shell has no `Router`: it hit-tests the modal's
+    // coordinates by hand, so there is no widget id for it to report. Giving the modal pointer
+    // feedback means giving the shell a router first, which is a change to how it handles input
+    // rather than to how it looks.
+    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, None, theme);
     // **Framed, because a popup is the one surface with nothing behind it to define its edge**
     // (M11 Part E, batch 2). On a light theme this modal's face and the window it covers are
     // within a few units of each other, so without a line around it the two run together. Same

@@ -423,7 +423,7 @@ impl App {
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
-    pub fn view(&mut self, ui: &UiTheme) -> Element<Msg> {
+    pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let title = title_bar(
             &self.title(),
@@ -444,7 +444,13 @@ impl App {
 
         // The status strip: the one control, and what the last thing that happened was.
         let strip = row(alloc::vec![
-            button("save", Msg::Save, WidgetState::default(), &ui).key(SAVE_KEY),
+            button(
+                "save",
+                Msg::Save,
+                WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                &ui,
+            )
+            .key(SAVE_KEY),
             padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.status.clone()))
                 .key(STATUS_KEY),
         ]);

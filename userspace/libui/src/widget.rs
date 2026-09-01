@@ -166,6 +166,38 @@ pub const WINDOW_CONTENT_X: u32 = WINDOW_BORDER + WINDOW_FRAME;
 /// Where it starts vertically — this, plus [`TITLE_BAR_H`].
 pub const WINDOW_CONTENT_Y: u32 = WINDOW_BORDER;
 
+/// One row of a dropdown menu: a label that highlights under the pointer.
+///
+/// **The same treatment a selected list row gets** — the selection colour bevelled inside a
+/// one-pixel border in the focus blue — because they are the same thing seen twice: the item
+/// that would happen if you acted now. The reference desktop draws them identically.
+///
+/// **Hover is state the caller passes in**, as it is for every widget here. What is new is that
+/// somebody finally passes it: `Router::inside` has reported the widget under the cursor since
+/// M4 and `WidgetState::hovered` has existed just as long, and until M11 Part E batch 3 no
+/// application ever connected the two — so nothing in this system had ever reacted to the
+/// pointer moving over it.
+pub fn menu_item<Msg: Clone>(
+    label: &str,
+    msg: Msg,
+    hovered: bool,
+    theme: &Theme,
+) -> Element<Msg> {
+    let mut layers = alloc::vec::Vec::with_capacity(3);
+    if hovered {
+        layers.push(fill(theme.focus_ring));
+        layers.push(padding(Insets::all(1), bevel(theme.selection)));
+    }
+    layers.push(padding(MENU_ITEM_PAD, text(label)));
+    stack(layers).on_press(msg)
+}
+
+/// The space around a menu item's label.
+///
+/// Wider than a button's, because a menu is a column of text rather than a control: the reading
+/// is horizontal and the eye needs the gutter.
+const MENU_ITEM_PAD: Insets = Insets { top: 3, right: 10, bottom: 3, left: 10 };
+
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;
 
@@ -1372,6 +1404,7 @@ pub fn list_view<Msg>(
     row_height: u32,
     activate: fn(u64) -> Msg,
     grab: Option<fn(u64) -> Msg>,
+    hovered: Option<u64>,
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -1402,6 +1435,10 @@ pub fn list_view<Msg>(
         // The reference draws a one-pixel border in the same blue the focus ring uses and fills
         // the inside with a gradient, and that border is what separates a selected row from the
         // row above it — without it two adjacent selections would merge into one block.
+        //
+        // **Hover is quieter than selection and loses to it** (batch 3). Two highlights of equal
+        // weight on one list is two answers to "what happens if I act now"; the keyboard's
+        // selection is the one that would, so the pointer's gets the face and not the blue.
         let row_el = if selected {
             stack(alloc::vec![
                 fill(theme.focus_ring),
@@ -1409,7 +1446,8 @@ pub fn list_view<Msg>(
                 padding(ROW_PAD, text(r.label)),
             ])
         } else {
-            stack(alloc::vec![fill(theme.track), padding(ROW_PAD, text(r.label))])
+            let ground = if hovered == Some(r.key) { theme.face_hover } else { theme.track };
+            stack(alloc::vec![fill(ground), padding(ROW_PAD, text(r.label))])
         };
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
@@ -1464,7 +1502,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -1474,7 +1512,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -1484,9 +1522,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -1498,11 +1536,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState { selected: Some(19), offset: 0 };
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -1526,7 +1564,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState { selected: Some(3), offset: 2 };
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, &Theme::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -1580,13 +1618,83 @@ mod list_view_tests {
         assert_eq!(s.selected, Some(2));
     }
 
+    #[test]
+    fn a_menu_item_highlights_under_the_pointer_and_is_flat_otherwise() {
+        let p = Theme::default();
+        let hot: Element<u8> = menu_item("Clear", 1, true, &p);
+        let cold: Element<u8> = menu_item("Clear", 1, false, &p);
+
+        let fills = |e: &Element<u8>| {
+            let mut out = alloc::vec::Vec::new();
+            walk(e, &mut |n| {
+                if let Node::Fill(c) = &n.node {
+                    out.push(*c);
+                }
+            });
+            out
+        };
+        let bevels = |e: &Element<u8>| {
+            let mut out = alloc::vec::Vec::new();
+            walk(e, &mut |n| {
+                if let Node::Bevel(c) = &n.node {
+                    out.push(*c);
+                }
+            });
+            out
+        };
+
+        // The same two layers a selected list row gets: a border in the focus blue, and the
+        // selection colour bevelled inside it.
+        assert_eq!(fills(&hot), alloc::vec![p.focus_ring], "no border on the hovered item");
+        assert_eq!(bevels(&hot), alloc::vec![p.selection], "no selection fill on the hovered item");
+
+        // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
+        // an item that paints a face when it is not hovered is a menu with every row lit.
+        assert!(fills(&cold).is_empty() && bevels(&cold).is_empty(), "an idle item drew a face");
+    }
+
+    #[test]
+    fn a_hovered_row_is_quieter_than_a_selected_one_and_loses_to_it() {
+        let p = Theme::default();
+        let data = [(1u64, "a"), (2, "b")];
+        // Row 1 selected, row 0 hovered: two different highlights, and they must not be the
+        // same weight — two answers to "what happens if I act now" is one too many.
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &mut ListState { selected: Some(1), offset: 0 },
+            100,
+            20,
+            |k| k,
+            None,
+            Some(1),
+            &p,
+        );
+        let faces = row_faces(&e);
+        assert_eq!(faces[0], p.face_hover, "the hovered row did not react");
+        assert_eq!(faces[1], p.focus_ring, "the selected row lost its border");
+        assert_eq!(row_bevels(&e)[1], Some(p.selection), "the selected row lost its fill");
+
+        // And hovering the *selected* row leaves it selected rather than downgrading it.
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &mut ListState { selected: Some(1), offset: 0 },
+            100,
+            20,
+            |k| k,
+            None,
+            Some(2),
+            &p,
+        );
+        assert_eq!(row_faces(&e)[1], p.focus_ring, "selection lost to hover");
+    }
+
     /// The selected row paints differently, or selection is invisible.
     #[test]
     fn the_selected_row_is_painted_differently() {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, &p);
+            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
@@ -1607,11 +1715,11 @@ mod list_view_tests {
         let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, &p);
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -1620,7 +1728,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -1629,7 +1737,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 

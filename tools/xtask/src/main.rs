@@ -3598,6 +3598,32 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // few motions rather than re-pinning — and a retry here is cheap for the same reason.
     // Nothing dismisses this popup but choosing from it, so an attempt that lands elsewhere
     // leaves it open for the next one.
+    // **Hover before the click, and it has to be in that order** (M11 Part E batch 3). Hover is
+    // the first thing in this system that reacts to the pointer without a button held, and it is
+    // invisible to a gate: the highlight is pixels, and this boot has no reference render of a
+    // menu to compare against. So the client says which item it is over — `MENU_CLEAR_KEY`, the
+    // one the click then activates.
+    //
+    // Moving and clicking as one step does not show it: choosing `Clear` closes the menu, and
+    // the popup is destroyed at the top of the next iteration *before* it would have painted
+    // itself hovered. So the pointer arrives first and the receipt is waited for.
+    //
+    // **It is a claim about the path, not the widget.** `menu_item` painting a highlight when
+    // told to is a host test; that `Router::inside` is fed by real PS/2 motion, through the
+    // compositor, into a popup's own router, and reaches the view, is only observable here — and
+    // it had never happened before this batch, because nothing asked the router.
+    move_pointer_to(&mut qmp, cx, cy)?;
+    session.expect("nxterm: menu hover 2")?;
+    // **The receipt is also the position proof**, which is why the tracked position is set here
+    // rather than assumed. `move_pointer_to` deliberately does not record where it went — only a
+    // *confirmed* press does, because injection is relative and an unacknowledged move leaves
+    // the host believing something it cannot check. Here the guest has just said it is over the
+    // item, so the position is known by evidence rather than by assertion.
+    //
+    // Skipping this cost an afternoon: the click below then walked its delta from the position
+    // the *previous* click had confirmed, doubling the movement, landing at the corner, and
+    // dismissing the menu — after which the retry pressed on the terminal underneath.
+    qmp.pointer = Some((cx, cy));
     click_at(&mut qmp, &mut session, cx, cy)?;
     session.expect("nxterm: menu chose Clear")?;
 

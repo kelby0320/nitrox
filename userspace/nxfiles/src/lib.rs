@@ -496,7 +496,7 @@ impl App {
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
-    pub fn view(&mut self, ui: &UiTheme) -> Element<Msg> {
+    pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let title = title_bar(
             TITLE,
@@ -523,7 +523,13 @@ impl App {
 
         // The path strip: where you are, and the one control that leaves it.
         let strip = row(alloc::vec![
-            button("^", Msg::Up, WidgetState::default(), &ui).key(UP_KEY),
+            button(
+                "^",
+                Msg::Up,
+                WidgetState { hovered: hovered == Some(UP_KEY), ..Default::default() },
+                &ui,
+            )
+            .key(UP_KEY),
             padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.path.clone()))
                 .key(PATH_KEY),
             padding(
@@ -544,7 +550,7 @@ impl App {
         // a press that never moves produces a click and opens what was pressed, and one that
         // moves has already told the compositor it is carrying something.
         let list =
-            list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, Some(Msg::Grab), &ui);
+            list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, Some(Msg::Grab), hovered, &ui);
 
         let body = window_frame(
             title,
@@ -662,7 +668,7 @@ mod tests {
         let cell = FixedCell { w: 8, h: 16 };
         let mut tree = Tree::new();
         for frame in 0..3 {
-            let e = a.view(&UiTheme::default());
+            let e = a.view(&UiTheme::default(), None);
             let l = layout(&e, bounds(a.window_size()), &cell);
             tree.update(&e, &l).unwrap_or_else(|err| panic!("frame {frame}: {err:?}"));
         }
@@ -699,13 +705,13 @@ mod tests {
         for _ in 0..19 {
             down(&mut a);
         }
-        let _ = a.view(&UiTheme::default());
+        let _ = a.view(&UiTheme::default(), None);
         let scrolled = a.list.offset;
         assert!(scrolled > 0, "precondition: 19 rows down has scrolled the list");
         assert_eq!(a.list.selected, Some(19));
 
         up(&mut a);
-        let _ = a.view(&UiTheme::default());
+        let _ = a.view(&UiTheme::default(), None);
         assert_eq!(
             a.list.offset, scrolled,
             "the selection moved up inside the visible rows, so the list must not have moved"
@@ -755,16 +761,16 @@ mod tests {
         a.update(Msg::Activate(2));
         let path = a.take_open().unwrap();
         a.opened(&path, true);
-        let ui: Element<Msg> = a.view(&UiTheme::default());
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
         assert!(labelled(&ui, NOTICE_KEY).contains("opening a.txt"), "the strip says so");
 
         a.opened(&path, false);
-        let ui: Element<Msg> = a.view(&UiTheme::default());
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
         assert!(labelled(&ui, NOTICE_KEY).contains("could not open a.txt"));
 
         // And a new listing supersedes it: the notice is about a press, not about the directory.
         a.show("/home", alloc::vec![Entry::file("a.txt")]);
-        let ui: Element<Msg> = a.view(&UiTheme::default());
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
         assert_eq!(labelled(&ui, NOTICE_KEY), "", "a listing clears it");
     }
 

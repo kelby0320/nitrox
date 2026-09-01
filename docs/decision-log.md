@@ -21013,3 +21013,65 @@ That is the second time in this milestone that a change has been blamed for a fa
 revealed. Worth stating as a habit rather than an anecdote: when a visual change breaks a gate
 that clicks at a computed point, check what the point was actually hitting before assuming the
 change moved it.
+
+## 2026-09-01 — M11 Part E batch 3: the pointer starts meaning something, and two id spaces meet
+
+The polish list asked for the selected item in a dropdown menu to be highlighted. Building it
+turned up something larger: **nothing in this system had ever reacted to the pointer being over
+it.** `Router::inside` has reported the widget under the cursor since M4 and
+`WidgetState::hovered` has existed exactly as long, and no application had ever connected the two
+— so every button, every list row and every menu item painted its resting face whatever the
+pointer did. The accessor was already public. Nothing had asked.
+
+### A menu row highlights the way a selected list row does
+
+They are the same thing seen twice: the item that would happen if you acted now. So `menu_item`
+draws the selection colour bevelled inside a one-pixel border in the focus blue, which is what
+batch 2a gave a selected list row and what the reference desktop draws for both.
+
+**A hovered list row is quieter and loses to the selection.** A list has two of these at once —
+the keyboard's selection and the pointer's hover — and two highlights of equal weight are two
+answers to one question. The selection is the one that would actually happen, so it keeps the
+blue and hover gets the face.
+
+### `Router::hovered_key`, because comparing the wrong two numbers compiles
+
+`inside` is a **diff-tree id**: the counter `Tree` assigns as widgets are created. `.key(…)` is
+the application's own numbering, chosen by the application. They are different spaces, and the
+first version of this wiring compared one to the other — `hovered == Some(MENU_CLEAR_KEY)` where
+`hovered` was a tree id.
+
+It did not crash and it was not random: the item keyed 2 reported as 4, stably, because 4 was its
+node's position in the tree's numbering. Every host test would have passed — they build small
+trees where the two spaces happen to line up. **`check-terminal` caught it**, because the guest
+prints the number and the gate asserts which item the pointer is over.
+
+`hovered_key` maps one to the other, taking the nearest *keyed ancestor* rather than the exact
+node, because every widget in this toolkit carries its key on the outside of a stack of layers
+and the cursor is inside one of the layers. The host test for it now builds a tree where the two
+spaces provably cannot coincide, and the control — returning `inside` directly — fails it.
+
+### What the gate had to be shaped around
+
+**Hover is invisible to a gate**: the highlight is pixels, and this boot has no reference render
+of a menu to compare against. So the client reports which item it is over — a key, which is a
+number the program chose, not a label and not anything a person typed — and `check-terminal`
+asserts it.
+
+**And the pointer has to arrive before the click, in that order.** Choosing an item closes the
+menu, and the popup is destroyed at the top of the next iteration *before* it would have painted
+itself hovered — so moving and clicking as one step shows nothing.
+
+**Which exposed a rule about the host's idea of where the pointer is.** `move_pointer_to` does not
+record the position it moved to; only a *confirmed* press does, because injection is relative and
+an unacknowledged move leaves the host believing something it cannot check. A bare move followed
+by a click made the click walk its delta from the *previous* confirmed position, doubling the
+movement, landing at the corner, and dismissing the menu — after which the retry pressed on the
+terminal underneath. The hover receipt is now the position proof, which is a better one than an
+assumption: the guest has said where the pointer is.
+
+### The one surface still without hover
+
+`desktop-shell`'s applications modal, and it is a shape rather than an omission: the shell has no
+`Router` at all — it hit-tests the modal's coordinates by hand. Giving it pointer feedback means
+giving it a router first, which is a change to how it handles input rather than to how it looks.

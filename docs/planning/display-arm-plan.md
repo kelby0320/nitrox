@@ -3283,6 +3283,26 @@ it is noticed on. Its own list, and its own milestone.
       anyway, because the area reached the window's last pixel column. Four pixels of frame moved
       the content in and the drop started landing on the frame.
 
+- [x] **Batch 3 — the pointer starts meaning something** ✅ (2026-09-01). The second half of the
+      menu request, and it turned out to be the whole system: **nothing had ever reacted to the
+      pointer being over it.** `Router::inside` has reported the widget under the cursor since M4
+      and `WidgetState::hovered` has existed just as long; no application had ever connected them,
+      so every button, row and menu item painted its resting face whatever the pointer did.
+
+      A menu row now highlights the way a selected list row does — they are the same thing seen
+      twice, the item that would happen if you acted now — and a hovered list row gets the face
+      rather than the blue, because two highlights of equal weight is two answers to one question.
+
+      **`Router::hovered_key` exists because two id spaces meet here.** `inside` is a diff-tree id
+      and `.key(…)` is the application's own numbering; comparing one to the other compiles and
+      returns a stable wrong answer. That is what shipped first, and `check-terminal` caught it —
+      a menu item keyed 2 reporting as 4.
+
+      **The shell's modal is the one surface still without hover**, and it is a shape rather than
+      an omission: `desktop-shell` has no `Router` at all, hit-testing the modal's coordinates by
+      hand. Giving it feedback means giving it a router first, which is a change to how it handles
+      input rather than to how it looks.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.
