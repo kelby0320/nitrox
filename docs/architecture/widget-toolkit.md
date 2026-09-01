@@ -647,9 +647,12 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   `+13` and close buttons at `-39`, and a gate that had to read a theme to know where to click
   could disagree with the thing it is checking (M11 decision 2).
 
-  What is *not* here yet is where the values come from — Part C reads them from a file at session
-  start. Until then a theme is one `const fn` with one constructor, `Theme::dark()`, named so that
-  a second is a constructor rather than a redesign.
+  **Where the values come from is a file**, since M11 Part C: `/home/theme.toml`, read once by
+  the shell and handed to every application on the setup record
+  ([`theme-toml-schema.md`](../spec/theme-toml-schema.md)). A missing or broken file is the
+  built-in theme, `Theme::dark()` — named so that a second is a constructor rather than a
+  redesign, and nothing ships one. A change takes effect when an application starts; pushing one
+  to running windows is protocol work whose trigger is a control panel.
 - **Accessibility.** No accessible tree, no screen-reader surface. Worth stating plainly as
   a gap rather than leaving it unmentioned; retrofitting one is substantially harder than
   designing it in, and this is a deliberate deferral rather than an oversight.

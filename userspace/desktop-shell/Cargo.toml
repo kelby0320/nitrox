@@ -29,6 +29,9 @@ libheap = { path = "../libheap" }
 # The Tier-1 setup message: the shell receives one and hands a derived one to every
 # application it launches, so a program in a window starts the same way a pipeline stage does.
 libstream = { path = "../libstream", features = ["io"] }
+# Whole-file reads, for the session's theme: the shell opens `/home/theme.toml` once and hands
+# every application the result on the environment record it already forwards (M11 Part C).
+libfs = { path = "../libfs" }
 
 [[bin]]
 name = "desktop-shell"

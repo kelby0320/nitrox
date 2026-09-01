@@ -105,8 +105,6 @@ const BAR_H: u32 = 24;
 const SCREEN_H: i32 = 800;
 /// Bytes per row.
 const BAR_PITCH: usize = (SCREEN_W as usize) * 4;
-/// Text size, in pixels per em.
-const FONT_PX: f32 = 16.0;
 /// How many buffers the bar attaches.
 const BUFFERS: usize = 2;
 
@@ -391,6 +389,7 @@ fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str) -> Element<()> {
 
 /// Render the bottom bar for the windows on `current`, with the desktop indicator.
 fn render_window_bar(
+    theme: &Theme,
     font: &Font,
     shown: &[&WinEntry],
     label: &str,
@@ -400,10 +399,11 @@ fn render_window_bar(
     let mut fb = MemFramebuffer::new(geometry);
     let ui = window_bar_view(shown, label);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
-    paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    // The session's theme, read once in `_start` — the shell's own chrome follows the file
+    // it hands to every application, or it themes the windows and not the bars around them.
+    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
 }
 
@@ -419,10 +419,15 @@ const ROW_H: u32 = 20;
 /// The applications modal's element tree: a filter field over a list of `/bin` programs.
 ///
 /// **The theme is passed in rather than built here**, and that is not tidiness. This function
-/// builds widgets while its caller *paints* them, and the caller's theme is
-/// `Theme { font_px: FONT_PX, ..Theme::default() }` — equal to the default today only because
-/// `FONT_PX` happens to be `16.0`. Two themes in one frame is a thing the old two-type split made
-/// unwriteable and one type makes easy, so the fix is to have one (PR #262 review, optional 5).
+/// builds widgets while its caller *paints* them, and two themes in one frame is a thing the old
+/// `Theme`/`Palette` split made unwriteable and one type makes easy (PR #262 review, optional 5).
+///
+/// **The same mistake arrived a second time through the metrics**, which is worth stating here
+/// because this is where it was first argued: M11 Part C took the theme from a file and left
+/// every `layout()` measuring at a hardcoded 16, so text was laid out at one size and painted at
+/// another — clipped and overlapping for every size but the default. There is no size constant
+/// in this crate now; there is a theme, and both the measure and the paint come from it
+/// (PR #263 review, blocking 1).
 fn modal_view(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
@@ -441,6 +446,7 @@ fn modal_view(
 
 /// Render the modal.
 fn render_modal(
+    theme: &Theme,
     font: &Font,
     query: &TextFieldState,
     rows: &[ListRow<'_>],
@@ -452,12 +458,13 @@ fn render_modal(
     // **Built once and used for both**, which is the whole of optional 5: this function lays the
     // tree out and paints it, and a tree built from one theme painted with another is two themes
     // in one frame.
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
-    let ui = modal_view(query, rows, state, &theme);
+    // The session's theme, read once in `_start` — the shell's own chrome follows the file
+    // it hands to every application, or it themes the windows and not the bars around them.
+    let ui = modal_view(query, rows, state, theme);
     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
-    paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
 }
 
@@ -498,16 +505,17 @@ fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
 }
 
 /// Render the top bar.
-fn render_bar(font: &Font) -> MemFramebuffer {
+fn render_bar(theme: &Theme, font: &Font) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .expect("the bar pitch is wide enough for a row");
     let mut fb = MemFramebuffer::new(geometry);
     let ui = bar_view();
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
-    paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    // The session's theme, read once in `_start` — the shell's own chrome follows the file
+    // it hands to every application, or it themes the windows and not the bars around them.
+    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
 }
 
@@ -1104,6 +1112,89 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     true
 }
 
+/// Read the session's theme from `THEME_PATH`, falling back to the built-in one.
+///
+/// **In the user's home rather than in `/etc`**, and that is a namespace decision rather than a
+/// filing preference. A session namespace binds `/home`, `/bin`, `/dev/tty` and — for a
+/// graphical one — `/system/fonts`; it has no `/etc`, and `session-mgr/CLAUDE.md` says adding a
+/// member is a design decision each time. A theme is *a user's*, so the subtree a user already
+/// owns is where it belongs, and no new authority is needed to read it. It is also what makes
+/// the missing-file case testable from a prompt: the file is somewhere the person can delete.
+///
+/// **Every failure lands on the default**, silently as far as the screen is concerned: no file,
+/// an unreadable one, bytes that are not UTF-8, or a file of nothing but typos all produce the
+/// desktop that shipped. A theme is decoration, and a desktop that will not start because its
+/// colours did not parse is a worse failure than any colour could be.
+fn read_theme(ns: u64) -> Theme {
+    // **One line whatever happens, beginning the same way**, so a gate can assert that the shell
+    // *decided* about a theme without asserting which way it went — which is what makes "delete
+    // the file and everything still renders" a control that can be re-run against the committed
+    // gate rather than one that needs a step edited out (PR #263 review, finding 4).
+    let bytes = match libfs::read_file(ns, THEME_PATH.as_bytes()) {
+        Ok(b) => b,
+        Err(e) => {
+            // **Absent and unreadable are different**, and saying "no such file" about a file
+            // that is sitting there is how somebody spends an afternoon looking for it.
+            let why: &[u8] = match e {
+                libfs::FileError::NotFound => b" absent; using the built-in theme",
+                libfs::FileError::TooLarge => b" too large to read; using the built-in theme",
+                _ => b" could not be read; using the built-in theme",
+            };
+            let t = Theme::default();
+            Line::new()
+                .s(b"desktop-shell: theme ")
+                .s(THEME_PATH.as_bytes())
+                .s(why)
+                .s(b", font_px ")
+                .u(t.font_px as u64)
+                .end();
+            return t;
+        }
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        let t = Theme::default();
+        Line::new()
+            .s(b"desktop-shell: theme ")
+            .s(THEME_PATH.as_bytes())
+            .s(b" is not UTF-8; using the built-in theme, font_px ")
+            .u(t.font_px as u64)
+            .end();
+        return t;
+    };
+    let (theme, issues) = Theme::from_config(text);
+    Line::new()
+        .s(b"desktop-shell: theme ")
+        .s(THEME_PATH.as_bytes())
+        .s(b" read")
+        .s(b" (")
+        .u(bytes.len() as u64)
+        .s(b" bytes, ")
+        .u(issues.len() as u64)
+        .s(b" ignored), font_px ")
+        .u(theme.font_px as u64)
+        .end();
+    // **Each one named, up to a bound.** A person editing colours needs the line number, and a
+    // file of a thousand bad lines must not become a thousand console lines.
+    for issue in issues.iter().take(MAX_LOGGED_THEME_ISSUES) {
+        Line::new()
+            .s(b"desktop-shell: theme line ")
+            .u(issue.line as u64)
+            .s(match issue.kind {
+                libdraw::theme::IssueKind::Malformed => b" is not `key = value`" as &[u8],
+                libdraw::theme::IssueKind::UnknownKey => b" names a key this version does not know",
+                libdraw::theme::IssueKind::BadValue => b" has a value this version cannot read",
+            })
+            .end();
+    }
+    theme
+}
+
+/// Where the session's theme lives, in the user's own subtree.
+const THEME_PATH: &str = "/home/theme.toml";
+
+/// How many bad theme lines are named before the rest are counted only.
+const MAX_LOGGED_THEME_ISSUES: usize = 8;
+
 /// Where a placed window's top-left goes: below the top bar, cascading so two launches do not
 /// land on top of each other.
 ///
@@ -1149,6 +1240,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         Some(Ok(s)) => (s.argv, s.env),
         _ => (alloc::vec::Vec::new(), libstream::wire::Record::default()),
     };
+    // **The theme, read once and carried on the environment every application already gets**
+    // (M11 Part C). One reader in the session rather than one per application: a client that
+    // opened this file itself would need it in its namespace and would repeat the parse, and a
+    // client launched before the file existed would disagree with one launched after.
+    let theme = read_theme(session_ns);
+    let env = env.with_str_field("THEME", &theme.to_config());
     // `argv[1]` is the user's real home, e.g. `/home/alice` — see `spawn_leader`'s `argv_rest`.
     // Empty means an application's `/home` cannot be scoped, so it is left unbound rather than
     // bound to something wider than the session's own.
@@ -1200,7 +1297,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         Err(_) => fail(b"desktop-shell: top bar CreateWindow FAILED\n"),
     };
 
-    let picture = render_bar(&font).into_bytes();
+    let picture = render_bar(&theme, &font).into_bytes();
     let len = BAR_PITCH * BAR_H as usize;
     if picture.len() != len {
         fail(b"desktop-shell: top bar render is not the size it declares\n");
@@ -1756,7 +1853,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     if modal.is_none() {
                         query.clear();
                         modal = open_modal(
-                            &mut session, window, &font, &programs, &mut modal_addrs, &query,
+                            &mut session, window, &theme, &font, &programs, &mut modal_addrs,
+                            &query,
                         );
                         if let Some(id) = modal {
                             stick(m, id, b"the rename prompt");
@@ -2134,7 +2232,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         && p.x >= 0
                         && (p.x as u32) < APPS_BUTTON_W
                     {
-                        modal = open_modal(&mut session, window, &font, &programs, &mut modal_addrs, &query);
+                        modal = open_modal(
+                            &mut session, window, &theme, &font, &programs, &mut modal_addrs,
+                            &query,
+                        );
                         if let Some((m, id)) = manager.as_mut().zip(modal) {
                             stick(m, id, b"the applications modal");
                         }
@@ -2167,8 +2268,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         sent_request = true;
                         recapture(m, &entries, current_desktop, &mut shots);
                         overview = open_overview(
-                            &mut session, window, &font, &shots, &desktops, current_desktop,
-                            &mut over_addrs,
+                            &mut session, window, &theme, &font, &shots, &desktops,
+                            current_desktop, &mut over_addrs,
                         );
                         if let Some(id) = overview {
                             stick(m, id, b"the overview");
@@ -2277,7 +2378,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             let shown = visible_entries(&entries, current_desktop);
             let label = desktop_label(&desktops, current_desktop);
             log_window_list(&shown, &label, desktops.len());
-            let picture = render_window_bar(&font, &shown, &label).into_bytes();
+            let picture = render_window_bar(&theme, &font, &shown, &label).into_bytes();
             let len = BAR_PITCH * BAR_H as usize;
             // **`acquire`, not an index this code keeps itself.** The first version alternated
             // a counter and advanced it unconditionally while the commit's result was
@@ -2315,7 +2416,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 sent_request = true;
                 recapture(m, &entries, current_desktop, &mut shots);
                 present_overview(
-                    &mut session, id, &font, &shots, &desktops, current_desktop, &over_addrs,
+                    &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
+                    &over_addrs,
                 );
                 Line::new()
                     .s(b"desktop-shell: overview now showing ")
@@ -2336,7 +2438,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     .enumerate()
                     .map(|(i, name)| ListRow { key: i as u64, label: name })
                     .collect();
-                present_modal(&mut session, id, &font, &query, &rows, &modal_addrs);
+                present_modal(&mut session, id, &theme, &font, &query, &rows, &modal_addrs);
             }
         }
     }
@@ -2668,6 +2770,7 @@ fn minimize_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
 /// moment the overview opened, which is accepted deliberately.
 
 fn render_overview(
+    theme: &Theme,
     font: &Font,
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
@@ -2703,10 +2806,11 @@ fn render_overview(
         SIDE_W,
         SCREEN_H as u32 - BAR_H,
     );
-    let metrics = FontMetrics::new(font, FONT_PX);
+    let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&side, bounds, &metrics);
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
-    paint(&mut fb, font, &theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    // The session's theme, read once in `_start` — the shell's own chrome follows the file
+    // it hands to every application, or it themes the windows and not the bars around them.
+    paint(&mut fb, font, theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
 
     // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
     // toolkit to lay out and a element per pixel would be absurd.
@@ -2764,6 +2868,7 @@ fn recapture(
 fn open_overview(
     session: &mut Session<ChannelTransport>,
     parent: u32,
+    theme: &Theme,
     font: &Font,
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
@@ -2809,7 +2914,7 @@ fn open_overview(
         kprint(b"desktop-shell: overview buffers FAILED\n");
         return None;
     }
-    present_overview(session, id, font, shots, desktops, current, addrs);
+    present_overview(session, id, theme, font, shots, desktops, current, addrs);
     Some(id)
 }
 
@@ -2817,6 +2922,7 @@ fn open_overview(
 fn present_overview(
     session: &mut Session<ChannelTransport>,
     id: u32,
+    theme: &Theme,
     font: &Font,
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
@@ -2824,7 +2930,7 @@ fn present_overview(
     addrs: &[*mut u8; BUFFERS],
 ) {
     let len = OVER_PITCH * SCREEN_H as usize;
-    let bytes = render_overview(font, shots, desktops, current).into_bytes();
+    let bytes = render_overview(theme, font, shots, desktops, current).into_bytes();
     if bytes.len() != len {
         return;
     }
@@ -3586,6 +3692,7 @@ fn place_new_windows(
 fn present_modal(
     session: &mut Session<ChannelTransport>,
     id: u32,
+    theme: &Theme,
     font: &Font,
     query: &TextFieldState,
     rows: &[ListRow<'_>],
@@ -3597,7 +3704,7 @@ fn present_modal(
     // and since M10 Part C that is said by the state being a throwaway here rather than by a
     // `_` in a pattern, which is what it looked like when the widget returned it.
     let mut list = ListState::default();
-    let fb = render_modal(font, query, rows, &mut list);
+    let fb = render_modal(theme, font, query, rows, &mut list);
     let bytes = fb.into_bytes();
     if bytes.len() != len {
         return;
@@ -3663,6 +3770,7 @@ fn close_modal(
 fn open_modal(
     session: &mut Session<ChannelTransport>,
     parent: u32,
+    theme: &Theme,
     font: &Font,
     programs: &[alloc::string::String],
     addrs: &mut [*mut u8; BUFFERS],
@@ -3678,7 +3786,7 @@ fn open_modal(
         .collect();
     // A throwaway for the reason `present_modal`'s is one: no selection is kept.
     let mut list = ListState::default();
-    let picture = render_modal(font, query, &rows, &mut list);
+    let picture = render_modal(theme, font, query, &rows, &mut list);
     let bytes = picture.into_bytes();
     let len = MODAL_PITCH * MODAL_H as usize;
     if bytes.len() != len {

@@ -46,8 +46,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
-/// Text size, matching the toolkit's default theme.
-const FONT_PX: f32 = 16.0;
 
 /// The suffix a save's temporary carries.
 ///
@@ -162,6 +160,15 @@ fn wait_one(h: u64) {
     };
 }
 
+/// The theme the shell handed this application, or the built-in one.
+///
+/// **Absent is normal rather than an error**: a client started outside a graphical session — by
+/// `init`, or by a test harness — gets no setup record at all, and a desktop that refused to draw
+/// without one would be a client that cannot be run on its own.
+fn theme_of(env: &libstream::wire::Record) -> Theme {
+    env.field_str("THEME").map(|s| Theme::from_config(s).0).unwrap_or_default()
+}
+
 /// Entry point.
 ///
 /// # Safety
@@ -171,12 +178,13 @@ fn wait_one(h: u64) {
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxedit: up\n");
 
-    // **`argv` and nothing else from the setup message.** `nxfiles` reads `HOME` from the
-    // environment because a browser with no argument still has somewhere to start; an editor
-    // with no file has nothing to edit, so the path is the whole of what this program is told.
-    let argv = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
-        Some(Ok(s)) => s.argv,
-        _ => Vec::new(),
+    // **`argv` for the file and the environment for the theme.** Until M11 Part C this took
+    // `argv` alone — `nxfiles` reads `HOME` because a browser with no argument still has
+    // somewhere to start, while an editor with no file has nothing to edit. The theme is the
+    // second thing the session tells every client, and it arrives on the same record.
+    let (argv, env) = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
+        Some(Ok(s)) => (s.argv, s.env),
+        _ => (Vec::new(), libstream::wire::Record::default()),
     };
     // **`argv[1]` or nothing.** An editor with no file has nothing to save to, and an untitled
     // buffer would be a promise this application cannot keep: there is no save-as, because there
@@ -242,7 +250,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+    // **From the environment, not from a default** (M11 Part C). The shell read the session's
+    // theme once and put it on the record every application is launched with; `font_px` comes
+    // with it, so this no longer overrides one.
+    let theme = theme_of(&env);
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
@@ -262,7 +273,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         // ---- render ----
         let ui = app.view(&theme);
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, FONT_PX));
+        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
             // A malformed tree is a bug in `view`, not a runtime condition.

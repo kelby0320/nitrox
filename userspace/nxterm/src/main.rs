@@ -49,8 +49,6 @@ const BUFFERS: usize = 2;
 const COLS: usize = 80;
 const ROWS: usize = 24;
 
-/// Text size, matching the toolkit's default theme so the chrome and the grid agree.
-const FONT_PX: f32 = 16.0;
 
 /// A private framebuffer of `size` to compose a frame into.
 ///
@@ -110,7 +108,7 @@ impl Popup {
         theme: &Theme,
     ) -> Option<Self> {
         let menu = app.menu_view(theme);
-        let m = FontMetrics::new(font, FONT_PX);
+        let m = FontMetrics::new(font, theme.font_px);
         let size = measure(&menu, Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &m);
         if size.w == 0 || size.h == 0 {
             return None;
@@ -170,7 +168,7 @@ impl Popup {
     ) -> bool {
         let menu = app.menu_view(theme);
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
-        let l = layout(&menu, bounds, &FontMetrics::new(font, FONT_PX));
+        let l = layout(&menu, bounds, &FontMetrics::new(font, theme.font_px));
         match self.tree.update(&menu, &l) {
             Ok(None) => return true, // nothing changed; the frame on screen is still right
             Ok(Some(_)) => {}
@@ -286,6 +284,15 @@ fn wait_two(a: u64, b: u64) {
     };
 }
 
+/// The theme the shell handed this application, or the built-in one.
+///
+/// **Absent is normal rather than an error**: a client started outside a graphical session — by
+/// `init`, or by a test harness — gets no setup record at all, and a desktop that refused to draw
+/// without one would be a client that cannot be run on its own.
+fn theme_of(env: &libstream::wire::Record) -> Theme {
+    env.field_str("THEME").map(|s| Theme::from_config(s).0).unwrap_or_default()
+}
+
 /// Entry point.
 ///
 /// # Safety
@@ -309,12 +316,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         None => libstream::wire::Record::default(),
     };
 
+    // **From the environment, not from a default, and read here** — beside the other thing the
+    // session tells this program, and before anything is sized with it (M11 Part C). The grid's
+    // cells are built from `font_px` below, so a theme read later would size the window from one
+    // number and draw it with another.
+    let theme = theme_of(&env);
+
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
         Ok(f) => f,
         Err(_) => fail(b"nxterm: could not load the system font\n"),
     };
-    let metrics = Metrics::new(&font, FONT_PX);
+    // **The grid's cell size follows the theme like the chrome does.** A terminal whose window
+    // frame drew at one size and whose cells drew at another would be two type scales in one
+    // window — the same mistake as laying out with one size and painting with another, one
+    // surface further in (PR #263 review, blocking 1).
+    let metrics = Metrics::new(&font, theme.font_px);
     let mut app = App::new(COLS, ROWS, metrics);
 
     let size = app.window_size();
@@ -370,7 +387,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
@@ -414,7 +430,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     loop {
         // ---- render ----
         let ui = app.view(&theme);
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, FONT_PX));
+        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         // The anchor for the next frame's popup. Read every frame rather than only when the
         // menu opens: the item's position is a fact about the layout, not about the menu.
         app.menu_anchor = locate(&ui, &l, MENU_ITEM_KEY);
@@ -660,7 +676,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if popup.as_ref().is_some_and(|p| p.id == from) {
             let menu = app.menu_view(&theme);
             let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
-            let ml = layout(&menu, bounds, &FontMetrics::new(&font, FONT_PX));
+            let ml = layout(&menu, bounds, &FontMetrics::new(&font, theme.font_px));
             let msgs: alloc::vec::Vec<Msg> = match event {
                 WindowEvent::Key(k) => popup
                     .as_mut()

@@ -407,6 +407,45 @@ pub struct Record {
     pub values: Vec<Value>,
 }
 
+impl Record {
+    /// The string value of the field called `name`, if there is one.
+    ///
+    /// **Because `schema.fields.iter().position(…)` is written in nine places**, in `nxsh`'s
+    /// evaluator, its ops, and every graphical client that reads `HOME` off its setup message.
+    /// Each copy is three lines and each one has to remember that the schema and the values are
+    /// positionally aligned; a caller reaching for a field by name should not have to know that
+    /// (M11 Part C).
+    pub fn field_str(&self, name: &str) -> Option<&str> {
+        let i = self.schema.fields.iter().position(|f| f.name == name)?;
+        self.values.get(i)?.as_str()
+    }
+
+    /// This record with `name` set to `value` — replacing it if the field is already there.
+    ///
+    /// **Appended rather than inserted**, so a reader that walks fields positionally sees what it
+    /// saw before with one more at the end. Used by `desktop-shell` to hand each application the
+    /// theme on the environment record it already forwards.
+    pub fn with_str_field(mut self, name: &str, value: &str) -> Self {
+        let v = Value::Str(String::from(value));
+        match self.schema.fields.iter().position(|f| f.name == name) {
+            Some(i) => {
+                // **The tag moves with the value.** Overwriting a `List` field with a string and
+                // leaving the schema saying `List` is a record whose own description is wrong —
+                // harmless for `THEME`, which is always a string, and a trap for the first caller
+                // who replaces something else (PR #263 review, optional 4).
+                self.schema.fields[i].ty = TypeTag::String;
+                self.schema.fields[i].modifiers = TypeModifiers::NONE;
+                self.values[i] = v;
+            }
+            None => {
+                self.schema = self.schema.field(name, TypeTag::String, TypeModifiers::NONE);
+                self.values.push(v);
+            }
+        }
+        self
+    }
+}
+
 /// A **table value**: a schema and its rows — the in-memory form of a whole TSM1 stream
 /// (header + data records + terminator). Persistent: shared via [`Value::Table`]'s `Arc`.
 /// Unlike [`Value::List`]/[`Value::Record`] a table is a *stream*, not a nested cell: it

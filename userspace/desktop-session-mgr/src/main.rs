@@ -53,8 +53,6 @@ const GREETER_H: u32 = 200;
 /// Bytes per row. `WIDTH * 4` exactly: nothing here needs the padded pitch the reference UI
 /// uses to catch stride bugs, and an unpadded one keeps the buffer copy a memcpy.
 const GREETER_PITCH: usize = (GREETER_W as usize) * 4;
-/// Text size, in pixels per em.
-const FONT_PX: f32 = 16.0;
 /// How many buffers the greeter attaches.
 const BUFFERS: usize = 2;
 
@@ -207,11 +205,14 @@ impl Greeter {
         let geometry = Geometry::with_pitch(GREETER_W, GREETER_H, GREETER_PITCH, PixelFormat::XRGB8888)
             .expect("the greeter pitch is wide enough for a row");
         let mut fb = MemFramebuffer::new(geometry);
-        // Built once and used for both: the tree and the paint see the same theme.
-        let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+        // **The built-in theme, and the greeter is the one surface that cannot have another.**
+        // A theme lives in a user's home (M11 Part C) and this runs *before* there is a user —
+        // asking who they are is what this window is for. Built once and used for both the tree
+        // and the paint, so one frame is never two themes.
+        let theme = Theme::default();
         let ui = self.view(&theme);
         let bounds = Rect::new(0, 0, GREETER_W, GREETER_H);
-        let metrics = FontMetrics::new(font, FONT_PX);
+        let metrics = FontMetrics::new(font, theme.font_px);
         let l = layout(&ui, bounds, &metrics);
         paint(&mut fb, font, &theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
         fb

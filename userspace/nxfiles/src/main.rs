@@ -42,8 +42,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
-/// Text size, matching the toolkit's default theme.
-const FONT_PX: f32 = 16.0;
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
@@ -166,6 +164,15 @@ fn wait_one(h: u64) {
     };
 }
 
+/// The theme the shell handed this application, or the built-in one.
+///
+/// **Absent is normal rather than an error**: a client started outside a graphical session — by
+/// `init`, or by a test harness — gets no setup record at all, and a desktop that refused to draw
+/// without one would be a client that cannot be run on its own.
+fn theme_of(env: &libstream::wire::Record) -> Theme {
+    env.field_str("THEME").map(|s| Theme::from_config(s).0).unwrap_or_default()
+}
+
 /// Entry point.
 ///
 /// # Safety
@@ -180,6 +187,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         _ => libstream::wire::Record::default(),
     };
     let start = home_of(&env);
+    // **From the environment, not from a default** (M11 Part C), and read *here* — beside the
+    // other thing the session tells this program — rather than at the point it is first drawn
+    // with. A value logged where it is learned appears in the order a reader expects it, which
+    // is what an assertion about it can be placed against.
+    let theme = theme_of(&env);
+    // **Said out loud because a theme that arrives is otherwise invisible to a gate.** Colours
+    // are pixels and `check-login` boots a release image with no rendered grid to read; the size
+    // is one number that came from a file, and printing it is what makes the whole path — disk,
+    // shell, setup record, client — assertable from a console.
+    libkern::debug::Line::new().s(b"nxfiles: theme font_px ").u(theme.font_px as u64).end();
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
@@ -224,7 +241,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
@@ -233,7 +249,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     loop {
         // ---- render ----
         let ui = app.view(&theme);
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, FONT_PX));
+        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
             // A malformed tree is a bug in `view`, not a runtime condition.
