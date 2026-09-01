@@ -80,7 +80,9 @@ use librsproto::surface::{
 };
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, bevel, column, fill, padding, row, sized, stack, text};
+use libui::element::{
+    Element, Insets, bevel, column, fill, offset, padding, row, sized, stack, text,
+};
 use libui::diff::Tree;
 use libui::layout::layout;
 use libui::route::Router;
@@ -420,7 +422,6 @@ fn visible_entries(entries: &[WinEntry], current: u32) -> alloc::vec::Vec<&WinEn
     entries.iter().filter(|e| e.desktop == current).take(MAX_ENTRIES).collect()
 }
 
-/// The bottom bar's element tree: one button per window, then the desktop indicator.
 /// One taskbar entry: a bordered button, marked when its window holds the keyboard.
 ///
 /// **A box rather than a run of text** (M11 Part E batch 8). The entries were labels on a flat
@@ -439,6 +440,7 @@ fn entry_cell(e: &WinEntry, theme: &Theme) -> Element<()> {
     ])
 }
 
+/// The bottom bar's element tree: one button per window, then the desktop indicator.
 fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str, theme: &Theme) -> Element<()> {
     let mut cells: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
     for e in shown {
@@ -657,6 +659,20 @@ fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
 }
 
 /// Render the top bar.
+/// `theme`, as the overview's sidebar wears it: the desktop's own ground, darkened, with the
+/// window ground as ink.
+///
+/// **Not a colour of its own.** Everything here is derived from two the theme already has, so a
+/// new palette needs no extra decision — and the sidebar stays related to the desktop it sits
+/// over rather than being a third surface.
+fn sidebar(theme: &Theme) -> Theme {
+    Theme {
+        background: theme.desktop.shade(-24),
+        foreground: theme.background,
+        ..*theme
+    }
+}
+
 /// `theme`, with a bar's ground in place of a window's.
 ///
 /// One place, so the two bars cannot disagree about what a panel is made of.
@@ -2564,7 +2580,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         recapture(m, &entries, current_desktop, &mut shots);
                         overview = open_overview(
                             &mut session, window, &theme, &font, &shots, &desktops,
-                            current_desktop, &mut over_addrs,
+                            current_desktop, &entries, &mut over_addrs,
                         );
                         if let Some(id) = overview {
                             stick(m, id, b"the overview");
@@ -2745,7 +2761,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 recapture(m, &entries, current_desktop, &mut shots);
                 present_overview(
                     &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
-                    &over_addrs,
+                    &entries, &over_addrs,
                 );
                 Line::new()
                     .s(b"desktop-shell: overview now showing ")
@@ -3112,6 +3128,7 @@ fn render_overview(
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
     current: u32,
+    entries: &[WinEntry],
 ) -> MemFramebuffer {
     let geometry =
         Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::XRGB8888)
@@ -3133,7 +3150,10 @@ fn render_overview(
         label.push_str(&desktop_label(desktops, d.id));
         rows.push(sized(
             libdraw::geom::Size::new(SIDE_W, SIDE_ROW_H),
-            padding(Insets { top: 8, right: 8, bottom: 8, left: 8 }, text(label)),
+            row(alloc::vec![
+                padding(Insets::all(MINI_PAD), desktop_preview(entries, d.id, theme)),
+                padding(Insets { top: 8, right: 8, bottom: 8, left: 0 }, text(label)),
+            ]),
         ));
     }
     let side = column(rows);
@@ -3145,9 +3165,14 @@ fn render_overview(
     );
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&side, bounds, &metrics);
-    // The session's theme, read once in `_start` — the shell's own chrome follows the file
-    // it hands to every application, or it themes the windows and not the bars around them.
-    paint(&mut fb, font, theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    // **A dark panel over the ground, not a white sheet on it** (M11 Part E batch 10). `paint`
+    // clears to `background`, which since the theme turned light is the white an application
+    // draws on — so the sidebar was a white column down the side of a blue desktop, which is
+    // what the request called out. Translucency is what it asked for and that waits on an alpha
+    // channel; a dark panel with light ink is what reads as deliberate without one.
+    let side_theme = sidebar(theme);
+    paint(&mut fb, font, &side_theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    });
 
     // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
     // toolkit to lay out and a element per pixel would be absurd.
@@ -3210,6 +3235,7 @@ fn open_overview(
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
     current: u32,
+    entries: &[WinEntry],
     addrs: &mut [*mut u8; BUFFERS],
 ) -> Option<u32> {
     let len = OVER_PITCH * SCREEN_H as usize;
@@ -3251,7 +3277,7 @@ fn open_overview(
         kprint(b"desktop-shell: overview buffers FAILED\n");
         return None;
     }
-    present_overview(session, id, theme, font, shots, desktops, current, addrs);
+    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs);
     Some(id)
 }
 
@@ -3264,10 +3290,11 @@ fn present_overview(
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
     current: u32,
+    entries: &[WinEntry],
     addrs: &[*mut u8; BUFFERS],
 ) {
     let len = OVER_PITCH * SCREEN_H as usize;
-    let bytes = render_overview(theme, font, shots, desktops, current).into_bytes();
+    let bytes = render_overview(theme, font, shots, desktops, current, entries).into_bytes();
     if bytes.len() != len {
         return;
     }
@@ -3306,10 +3333,65 @@ fn close_overview(
     }
 }
 
+/// A miniature of one desktop: its ground, with a box where each of its windows is.
+///
+/// **Rectangles rather than scaled window contents** (M11 Part E batch 10). The maintainer named
+/// both and said "whatever is easy"; the difference is not effort but *availability*. A thumbnail
+/// is a capture, and the compositor can only capture what it composites — the windows on the
+/// desktop being shown. A sidebar is a row per desktop that is *not* being shown, so there is
+/// nothing to capture, and asking the compositor to composite an off-screen desktop to photograph
+/// it is a different feature from drawing where its windows are.
+///
+/// What the shell does have is every window's origin, size and desktop, which it keeps for the
+/// taskbar. So this is arithmetic, not pixels: it needs no capture, no scaling, and no image
+/// decoding — which is what the same request looked like it needed.
+///
+/// **Bordered boxes rather than filled ones**, so two overlapping windows read as two.
+fn desktop_preview(entries: &[WinEntry], desktop: u32, theme: &Theme) -> Element<()> {
+    // The screen's proportions, so the miniature is the shape of the thing it stands for.
+    let (iw, ih) = (MINI_W - 2, MINI_H - 2);
+    let mut layers = alloc::vec::Vec::with_capacity(4);
+    layers.push(fill(theme.border));
+    layers.push(padding(Insets::all(1), fill(theme.desktop)));
+    for e in entries.iter().filter(|e| e.desktop == desktop && !e.minimized) {
+        // Scaled by the same ratio in both axes as the screen, and clamped into the interior: a
+        // window dragged partly off-screen must not draw outside the miniature that stands for
+        // the screen.
+        let sx = (e.origin.0.max(0) as u32 * iw / SCREEN_W).min(iw.saturating_sub(1));
+        let sy = (e.origin.1.max(0) as u32 * ih / SCREEN_H as u32).min(ih.saturating_sub(1));
+        // At least two pixels, or the border and the face have nowhere to go and a window
+        // vanishes rather than being small.
+        let sw = (e.size.0 * iw / SCREEN_W).max(2).min(iw - sx);
+        let sh = (e.size.1 * ih / SCREEN_H as u32).max(2).min(ih - sy);
+        let face = if e.focused { theme.face_hover } else { theme.face };
+        layers.push(offset(
+            1 + sx as i32,
+            1 + sy as i32,
+            sized(
+                libdraw::geom::Size::new(sw, sh),
+                stack(alloc::vec![fill(theme.border), padding(Insets::all(1), fill(face))]),
+            ),
+        ));
+    }
+    sized(libdraw::geom::Size::new(MINI_W, MINI_H), stack(layers))
+}
+
+/// A sidebar miniature's size — the screen's 16:10, small enough for a row.
+const MINI_W: u32 = 96;
+/// See [`MINI_W`].
+const MINI_H: u32 = 60;
+/// Space around a miniature inside its row.
+const MINI_PAD: u32 = 6;
+
 /// The overview's sidebar width, at the right-hand edge.
 const SIDE_W: u32 = 200;
 /// One desktop row in the sidebar.
-const SIDE_ROW_H: u32 = 40;
+///
+/// **Tall enough for a miniature** since M11 Part E batch 10: `MINI_H` plus `MINI_PAD` on each
+/// side. `check-login` clicks a row by index and computes the same arithmetic, so this number is
+/// in two places and the gate names which (that is the cost of a click point a gate can aim at,
+/// and M11's decision 2 chose it deliberately).
+const SIDE_ROW_H: u32 = MINI_H + MINI_PAD * 2;
 /// A thumbnail's size in the overview's grid.
 const THUMB_W: u32 = 240;
 /// See [`THUMB_W`].

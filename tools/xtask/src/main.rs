@@ -2247,7 +2247,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // The first thumbnail sits at (16, 40) and is 240x150 — see `thumb_rect`. Press inside it,
     // release over the second sidebar row, which is desktop 2.
     const THUMB: (i32, i32) = (100, 100);
-    let side_row = |i: i32| (1180, 24 + i * 40 + 20);
+    // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
+    // padding — and this is the second place that number lives. Half a row down, so the aim is
+    // clear of both edges.
+    let side_row = |i: i32| (1180, 24 + i * 72 + 36);
     // **The drag starts from a position already verified — by the click that opened this.** A
     // drag cannot check its own start: there is no press receipt until the button goes down, and
     // by then it has begun. `click_at(1200, 788)` above asserted where it landed and left the
@@ -2360,7 +2363,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     // Then the sidebar click, with no drag in flight. Row 1 is the second desktop — `cli`,
     // which is where the terminal is — so the refresh must find it again.
-    let side_row = |i: i32| (1180, 24 + i * 40 + 20);
+    // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
+    // padding — and this is the second place that number lives. Half a row down, so the aim is
+    // clear of both edges.
+    let side_row = |i: i32| (1180, 24 + i * 72 + 36);
     let (sx, sy) = side_row(1);
     click_at(&mut qmp, &mut session, sx, sy)?;
     session.expect("desktop-shell: switched to cli")?;
@@ -3923,7 +3929,7 @@ fn cmd_preview(what: &str) -> R<()> {
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be
 /// mistaken for a design opinion.
 fn cmd_shot(what: &str, accel: Accel) -> R<()> {
-    const MOMENTS: [&str; 4] = ["greeter", "desktop", "apps", "windows"];
+    const MOMENTS: [&str; 5] = ["greeter", "desktop", "apps", "windows", "overview"];
     if what != "all" && !MOMENTS.contains(&what) {
         return Err(format!(
             "no shot called {what:?} — try `all` or one of: {}",
@@ -4011,6 +4017,22 @@ fn cmd_shot(what: &str, accel: Accel) -> R<()> {
     // an `expect` for one of them scans past output that was already there.
     move_pointer_to(&mut qmp, 900, 500)?;
     capture!("windows");
+
+    // 5. **The overview**, which is the one surface with no other way to be looked at: it is
+    //    opened from the desktop indicator, it covers the screen, and it is where the sidebar's
+    //    desktop miniatures live (M11 Part E batch 10).
+    //    **Pressed by hand rather than through `click_at`**, because the shell logs the open
+    //    while it routes the press and the compositor logs the press when it *delivers* the
+    //    routed record — so the open comes first, and `click_at`'s own position assertion scans
+    //    past it. Nothing is lost: a press that misses simply does not open the overview, and the
+    //    wait below fails.
+    const OVERVIEW_AT: (i32, i32) = (1200, 788);
+    move_pointer_to(&mut qmp, OVERVIEW_AT.0, OVERVIEW_AT.1)?;
+    qmp.send_button("left", true)?;
+    qmp.send_button("left", false)?;
+    session.expect("desktop-shell: overview open, window ")?;
+    qmp.pointer = Some(OVERVIEW_AT);
+    capture!("overview");
 
     let _ = fs::remove_file(&qmp_sock);
     println!("\nxtask: shots written to {}", work.display());

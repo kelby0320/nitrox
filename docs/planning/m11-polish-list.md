@@ -68,8 +68,11 @@ a request is being met in a particular way.
 
 ## Open
 
-- [] Real icons for minimize, maximize, and close buttons. (Icon support needed?)
-- [] **Desktop Background** - We can choose a default color that fits the theme.  Probably some shade of blue.  It would be nice to be able to have background image support.  Image support can be a stretch goal, but all real OS desktops have background image support.
+- [ ] Real icons for minimize, maximize, and close buttons. (Icon support needed?)
+      *(drawn as shapes in batch 2a. Real image icons wait on the filed image item — see M12.)*
+- [ ] **Desktop Background** - We can choose a default color that fits the theme.  Probably some shade of blue.  It would be nice to be able to have background image support.  Image support can be a stretch goal, but all real OS desktops have background image support.
+      *(the colour landed in batch 1. The image half is filed for M12, with three options costed
+      in the plan — it is a format, an asset pipeline and a size budget, not a batch.)*
 - [] **Stretch 1** - Drop shadow support around windows and menus.  Could be a good addition, but I don't know how difficult this will be.  Not critical.
 
 - [x] The open applications menu is positioned wrong.  It should be a drop down from the applications button.  It also doesn't close when you click outside of it.  Also, you can't click any of the menu items. Menu item hovering doesn't work either.
@@ -84,7 +87,7 @@ a request is being met in a particular way.
 - [x] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
       *(batch 9 — `YYYY-MM-DD HH:MM`, UTC, centred on the screen. No timezone database and no
       locale, so a localised form would be a fiction; it also agrees with what `date` prints.)*
-- [] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
+- [~] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
 - [x] nxedit doesn't launch from the menu. *(batch 7 — it launched and exited: it required
       `argv[1]` and the modal passes none. It opens untitled now and asks for a name on save.)*
 - [x] Open windows on the bottom bar should have a border around them.  See the screenshots for an example. *(batch 8)*
@@ -105,6 +108,11 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 10 — desktop previews in the overview's sidebar** (2026-09-01). Rectangles, not
+  captures: a sidebar row is a desktop that is *not* being composited, so there is nothing to
+  photograph — but the shell already knows every window's origin, size and desktop. Needed no
+  image decoding at all, which is what the request looked like it needed. The sidebar is a dark
+  panel rather than a white sheet; translucency still waits on an alpha channel.
 - **Batch 9 — a clock on the top bar** (2026-09-01). Ticks off the wait's existing deadline
   rather than a timer object. The calendar arithmetic moved out of `coreutils` into `libtime`,
   because it grew a second consumer.

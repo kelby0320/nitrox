@@ -21378,3 +21378,45 @@ Keeping its buffer mappings is what a clock needs — and the repaint uses `acqu
 index it keeps itself, for the reason the bottom bar's repaint already records: a counter advanced
 unconditionally inverts its phase on any iteration where the commit did not go out, and every
 repaint after that writes into the buffer being displayed.
+
+## 2026-09-01 — M11 Part E batch 10: a request that looked like it needed a decoder
+
+The polish list's third stretch asks for desktop previews in the overview's sidebar, and the
+maintainer's question was whether it needed the image support two other items are waiting on. It
+does not, and the reason is worth writing down because the answer generalises.
+
+**A sidebar row is a desktop that is not being composited.** The overview's existing thumbnails
+are *captures* — `desktop-shell.md` §6 chose asking the compositor for a snapshot over compositing
+live windows with a scale transform — and the compositor can only capture what it composites,
+which is the desktop being shown. A row per *other* desktop has nothing to photograph. Asking the
+compositor to composite an off-screen desktop in order to photograph it is a different feature,
+and a bigger one than the request.
+
+**What the shell already has is the geometry.** `WinEntry` carries every window's origin, size and
+desktop because the taskbar needs them. So a miniature is arithmetic: the desktop's ground, with a
+bordered box where each window is, scaled by the screen's own ratio and clamped into the interior.
+No capture, no pixel scaling, and no decoding — the thing the request appeared to need.
+
+Bordered boxes rather than filled ones, so two overlapping windows read as two.
+
+### The sidebar had a second problem, and it is the one that was reported first
+
+"Instead of a solid white sidebar" — and it *was* solid white, because `paint` clears its damage
+rectangle to `background`, which since the theme turned light is the white an application draws
+on. The bars solved this in batch 1 by painting on the panel face; a sidebar over the desktop
+wants something else again, so it is the desktop's own ground darkened, with the window ground as
+ink. Both derived from colours the theme already has, so a new palette needs no extra decision and
+the sidebar stays related to the surface it sits over.
+
+**Translucency is what was actually asked for**, and it still waits on the alpha channel that
+`libdraw` says in as many words it does not have. A dark panel is what reads as deliberate without
+one; it is not the same thing and the plan says so.
+
+### And images are filed for M12
+
+Not because any one option is large — a build-time P6 conversion is a 40-line reader — but because
+it is not one change: a format decision, an asset pipeline in the image build, a size budget, a
+place in the layering, and for the wallpaper the shell-owned background window. Three options are
+costed in the plan so that whoever takes it starts from numbers rather than from scratch. M11's
+decision 5 is what sends it there: what is found along the way goes to another list rather than
+extending this one.

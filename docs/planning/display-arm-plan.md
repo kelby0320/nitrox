@@ -3428,6 +3428,26 @@ it is noticed on. Its own list, and its own milestone.
       with one consumer belongs to that consumer, a helper with two belongs below both — and the
       shell reaching into `coreutils` for it is the shape that rule exists to catch.
 
+- [x] **Batch 10 — desktop previews, and an image subsystem that turned out not to be needed** ✅
+      (2026-09-01). The request read as "this needs image support"; it does not.
+
+      **A sidebar row is a desktop that is not being composited**, so there is nothing to
+      photograph — the overview's existing thumbnails are captures of the *current* desktop's
+      windows, and the compositor can only capture what it composites. What the shell does have is
+      every window's origin, size and desktop, kept for the taskbar. So a miniature is arithmetic:
+      the desktop's ground, with a bordered box where each of its windows is, scaled by the
+      screen's own ratio. No capture, no scaling of pixels, no decoder.
+
+      **The sidebar stopped being a white sheet.** `paint` clears to `background`, which since the
+      theme turned light is the white an application draws on — so the sidebar was a white column
+      down the side of a blue desktop, which is what the request called out first. It is the
+      desktop's own ground darkened, with the window ground as ink: derived from two colours the
+      theme already has, so a new palette needs no extra decision. **Translucency is what was
+      asked for and it still waits on an alpha channel** — that decision is unchanged.
+
+      `cargo xtask shot` gained a fifth moment, because the overview is the one surface with no
+      other way to be looked at.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.
@@ -3460,6 +3480,25 @@ Both applications ship thin in M10 and both want to be real: **tabs** in each, *
 the confirmation dialogs they imply), and **drag-and-drop within** a window. None of it is
 designed here; what this entry does is exist, so the line M10 draws is a line rather than an
 omission.
+
+**And images** — filed here on 2026-09-01, out of M11's polish list, because it is a subsystem
+rather than a batch. Two of that list's items want it: a background image, and window controls
+drawn from an icon set rather than as three strokes. What it is *not* wanted for is the desktop
+previews, which turned out to need only geometry the shell already holds (M11 Part E batch 10).
+
+Four options were costed, and the choice is deliberately not made here:
+
+| | Guest cost | Build cost | Disk, 1280×800 |
+|---|---|---|---|
+| Raw pixels staged at build time (P6) | ~40-line reader; the *writer* in `libdraw::ppm` is 10 | `xtask` converts with the `png` crate it already has | 3.0 MB, uncompressed |
+| QOI | ~250–300 lines, no dependency | ~200-line encoder, or the `qoi` crate host-side | ~400 KB–1 MB |
+| PNG in the guest | inflate (~400+ lines), unfiltering, refuse interlaced — or vet a `no_std` crate's whole tree | none | ~300–800 KB |
+
+The cost that makes it a milestone item is not any one of those: it is a **format decision, an
+asset pipeline in the image build, a size budget, and a place in the layering** — plus, for the
+wallpaper specifically, the **shell-owned background window** M11's settled decisions sketched
+(the shell holds `/home` and a theme; the compositor holds neither and should not gain a
+filesystem to draw wallpaper).
 
 **Its trigger is M10 landing**, and its ordering against M11 (themes and visual polish) is open —
 polish wants something finished to polish, and these are the two applications that will most show
