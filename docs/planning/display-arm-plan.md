@@ -3448,20 +3448,35 @@ it is noticed on. Its own list, and its own milestone.
       `cargo xtask shot` gained a fifth moment, because the overview is the one surface with no
       other way to be looked at.
 
-- [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
-      behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
-      reference in the same commit, so the gate fails the moment pixels move without intent.
-      That is the whole regression story for a hundred small changes, and it is enough.
+- [x] **Batches, from the maintainer's list, each ending in a preview and — where the item is
+      behaviour rather than appearance — a boot.** ✅ Ten of them, in three passes of feedback,
+      recorded above and in [`m11-polish-list.md`](m11-polish-list.md).
 
-- [ ] **No checkbox list here on purpose.** The items do not exist yet; they are written while
-      driving the system. What this part commits to is the *shape* — batch, preview, review,
-      apply — and the stopping condition in decision 5.
+- [x] **No checkbox list here on purpose.** ✅ The shape held: batch, look, review, apply. What it
+      produced that the plan did not anticipate is that **most of the second and third passes were
+      defects rather than taste** — a menu whose rows could not be clicked, a scrollbar with no
+      pointer handler, an editor that exited when launched, a window that could not ask to be
+      centred. Polish is where a system is used for the first time in the way a person would use
+      it, and that is what finds those.
 
-### Part F — the control panel, allowed to slip
+- [x] **The stopping condition, and what "empty" turned out to mean** ✅ (2026-09-01). Decision 5
+      says M11 ends when the list is empty. It is not literally empty; what is true is that
+      **nothing left on it is polish**: real icons and a background image wait on the images item
+      filed for M12, and transparency waits on an alpha channel `libdraw` rules out today. Drop
+      shadows are the third, and they are held for a reason worth keeping — a shadow makes every
+      window's damage region larger than the window, and the compositor clears before it draws
+      straight into the scanned-out framebuffer, so shadows would make the flicker they sit on top
+      of worse. They belong after the feel work, not before it.
 
-- [ ] **Desktop settings a person can drive**: the theme file above, and the desktops
+### Part F — the control panel, slipped to M12 (2026-09-01)
+
+- [~] **Desktop settings a person can drive**: the theme file above, and the desktops
       `/dev/desktop` already serves. Its scope is stated here so that slipping it is a decision
-      rather than a disappearance.
+      rather than a disappearance — **and it slipped**. The details pass allowed exactly this, and
+      the reason it is the right call rather than the convenient one is decision 5's other half:
+      polish is what this milestone is for, and a settings application arriving *instead of* a
+      finished polish list was named as the wrong trade before either existed. The list is
+      finished; this is not started. It moves whole, with its gate.
 
 - [ ] **Gate**: `check-login` drives it — change a setting, and read the *file* back the way Part
       D of M10 reads a saved buffer back, from outside the application that wrote it.

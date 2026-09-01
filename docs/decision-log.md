@@ -21420,3 +21420,58 @@ place in the layering, and for the wallpaper the shell-owned background window. 
 costed in the plan so that whoever takes it starts from numbers rather than from scratch. M11's
 decision 5 is what sends it there: what is found along the way goes to another list rather than
 extending this one.
+
+## 2026-09-01 — M11 closes at five parts, and Part F slips
+
+The polish list is finished, so Milestone 11 is done: `preview` (A), one `Theme` (B), the theme as
+a file (C), two font roles (D), and ten batches of polish over three rounds of feedback (E).
+
+**"Empty" turned out to need saying precisely.** Decision 5 set the stopping condition as the
+maintainer's list going empty, and it is not literally empty — what is true is that **nothing left
+on it is polish**. Real icons and a background image wait on the images item now filed for M12;
+transparency waits on an alpha channel `libdraw` states it does not have; and drop shadows are
+held for a reason worth keeping rather than for convenience: a shadow makes every window's damage
+region larger than the window, and the compositor clears before it draws directly into the
+scanned-out framebuffer — so shadows would enlarge the flicker they sit on top of. They belong
+after the feel work.
+
+**Part F, the control panel, slips to M12.** The details pass allowed it and asked that slipping
+be a decision rather than a disappearance, so: the list finished and this had not started, and
+decision 5's other half named the trade in advance — "a settings application that arrives instead
+of a finished polish list is the wrong trade". It moves whole, with its gate.
+
+### What the polish passes found, which the plan did not anticipate
+
+Part E committed to a *shape* — batch, look, review, apply — and no checkbox list, because the
+items did not exist yet. The shape held. What it produced that nobody predicted is that **most of
+the second and third rounds were defects rather than taste**:
+
+- an applications menu whose rows could not be clicked, because the shell read pointer events for
+  three surfaces and never for the modal's own window;
+- a scrollbar with no pointer handler at all, in the widget three surfaces build theirs from;
+- an editor that printed "no file to edit" and exited when launched from the menu;
+- a login window with no way to ask where on the screen it should appear, because a `normal`
+  window's requested origin was discarded through three layers.
+
+None of those is a colour. They are what happens the first time a system is driven the way a
+person would drive it rather than the way its gates drive it — and every one was found by the
+maintainer using it, not by a test. That is an argument for the *existence* of a polish pass
+independent of how anything looks, and it is worth carrying into whatever milestone comes next.
+
+### And the flicker has a diagnosis, which the feel work should start from
+
+Reported while driving: window movement flickers, under KVM, with speed otherwise fine. The cause
+is in `libdraw::compose::compose` — for each damage rectangle it fills with the background and
+*then* blits the surfaces back, and the framebuffer it does that in is the real aperture, which is
+being scanned out continuously. So every motion of a drag paints the union of the old and new
+rectangles background-first, and the scanout catches it. `blit_clipped` is per-pixel by design (a
+surface need not share the screen's channel order), which makes that window long, and the union
+grows with drag speed. Under KVM more frames are processed per second, so the flash is *more*
+visible, not less — speed improving and flicker worsening are the same fact.
+
+The fix is a shadow buffer: compose into RAM and copy the finished damage rectangle to the
+aperture in one pass, so the aperture never holds an intermediate state and the worst case
+degrades from a background flash to tearing. Cost is ~4 MB for 1280×800 and one extra copy of the
+damaged pixels per frame; it may also be *faster*, since the per-pixel work moves off MMIO into
+cached RAM, but that is a measurement to take rather than a claim to make. Recorded here so the
+feel milestone starts from evidence rather than from a symptom.

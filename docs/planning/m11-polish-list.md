@@ -1,6 +1,6 @@
 # Nitrox: The M11 polish list
 
-**Status: open, and this is Part E's only input.** Written by the maintainer while driving the
+**Status: finished 2026-09-01, and kept as the record of what a polish pass finds.** Written by the maintainer while driving the
 system; [`display-arm-plan.md`](display-arm-plan.md) Milestone 11 Part E works from it in
 batches. **M11 ends when the Open section is empty** — that is decision 5, and it is the
 stopping condition a milestone about taste needs agreed before it starts.
@@ -150,6 +150,18 @@ Batches land here as they go, so the record of what changed and why is beside th
 Performance and responsiveness. Decision 6: its own list, its own milestone.
 
 - **Moving a window is slow** (reported 2026-08-28, on TCG). Recompose and damage work.
+- **Moving a window flickers** (reported 2026-09-01, on KVM, with speed otherwise fine). Diagnosed
+  the same day and almost certainly the same root cause: `libdraw::compose::compose` fills each
+  damage rectangle with the background and *then* blits the surfaces back, into the framebuffer
+  being scanned out. Every motion of a drag paints the union of the old and new rectangles
+  background-first and the scanout catches it. Under KVM more frames are processed per second, so
+  it is *more* visible — the speed improving and the flicker worsening are one fact.
+
+  **The fix is a shadow buffer**: compose into RAM, copy the finished damage rectangle to the
+  aperture in one pass. ~4 MB for 1280×800 and one extra copy per frame; possibly faster too,
+  since the per-pixel work moves off MMIO into cached RAM — a measurement to take, not a claim.
+  **Drop shadows wait behind it**, because a shadow enlarges every window's damage region and
+  would make this worse.
 
 ---
 
