@@ -3212,6 +3212,24 @@ it is noticed on. Its own list, and its own milestone.
 
 ### Part E — the polish passes
 
+- [x] **A way to look at the whole desktop** ✅ — `cargo xtask shot`, which is the half Part A's
+      command said it could not be. `preview` renders the toolkit's own surfaces on the host in a
+      second; its doc names what that structurally cannot show — the cursor, the drag outline, the
+      ground between windows, and how real windows sit next to each other. So this **photographs**
+      rather than renders: it boots the release image, drives it to four moments (the greeter, the
+      bare desktop, the applications modal, two real windows) and writes what QEMU says is on the
+      display. A photograph adds no second renderer to keep in step with the first, which is the
+      trap `preview_frames` exists to avoid.
+
+      Several moments per boot, because the boot is the cost. It is a tool and not a gate: it
+      asserts only enough to know the picture is of a working desktop rather than a blank screen,
+      that being the one failure that would otherwise be read as a design opinion.
+
+- [ ] **The list itself** — [`m11-polish-list.md`](m11-polish-list.md), the maintainer's, written
+      while driving. Decision 5 says this plan does not contain it; what this box does is give it
+      a file, and a place for the two kinds of thing that are *not* polish to go instead (feel,
+      and M12 capability).
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

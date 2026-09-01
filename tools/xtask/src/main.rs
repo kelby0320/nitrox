@@ -205,6 +205,12 @@ fn main() -> ExitCode {
         Some("preview") => cmd_preview(
             qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
         ),
+        // Same positional-argument rule as `preview`, and for the same reason: `--kvm` in the
+        // name slot would be reported as "no shot called `--kvm`".
+        Some("shot") => cmd_shot(
+            qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
+            accel,
+        ),
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
@@ -250,6 +256,8 @@ fn print_help() {
            \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
+           shot              boot the release image and photograph the desktop;\n  \
+           \x20                `shot all|greeter|desktop|apps|windows`\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
@@ -1717,35 +1725,13 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
 fn cmd_check_login(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
-    let ovmf = locate_ovmf()?;
 
-    let work = repo_root().join("tools/build-cache");
+    let work = build_cache();
     fs::create_dir_all(&work).ok();
     let qmp_sock = work.join("qmp-login.sock");
-    let _ = fs::remove_file(&qmp_sock);
-
-    let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
-    cmd.arg("-drive")
-        .arg(format!("format=raw,file={}", image_path().display()))
-        .arg("-display")
-        .arg("none")
-        .arg("-qmp")
-        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
-        .arg("-chardev")
-        .arg("stdio,id=hostserial,signal=off")
-        .arg("-serial")
-        .arg("chardev:hostserial")
-        .arg("-smp")
-        .arg("4")
-        .arg("-no-reboot")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
 
     println!("xtask: graphical login gate — booting the release image…\n");
-    let mut session = Session::spawn(cmd, "check-login")?;
-    let mut qmp = Qmp::connect(&qmp_sock)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock)?;
 
     // 1. The greeter is up before anyone has authenticated. That is the claim Part D's second
     //    box makes, and in a release image nothing else has drawn anything.
@@ -3751,6 +3737,176 @@ fn cmd_preview(what: &str) -> R<()> {
         println!("xtask: {} ({w}x{h})", path.display());
     }
     Ok(())
+}
+
+/// `cargo xtask shot [all|greeter|desktop|apps|windows]` — photograph the running desktop.
+///
+/// **The other half of `preview`, and the half it said it could not be.** Part A's command
+/// renders the toolkit's own surfaces on the host in about a second, and its doc names what that
+/// structurally cannot show: anything the *compositor* draws — the cursor, the drag outline, the
+/// ground between windows — and the arrangement of real windows on a real screen. Those are
+/// composed in the guest by clients that have to run, so the only honest way to look at them is
+/// to boot and take the picture.
+///
+/// **A photograph, not a render**, which is what keeps this out of the "two sources for one
+/// answer" trap that `preview_frames` exists to avoid: nothing here draws anything. It boots the
+/// **release** image — the one a person would use, with no `--selftest` clients on the screen —
+/// drives it to each moment worth looking at, and writes what QEMU says is on the display.
+///
+/// **Several moments per boot**, because the boot is the cost. One run gives the greeter, the
+/// bare desktop, the applications modal and a screen with real windows on it; a polish list is
+/// written against all four.
+///
+/// It is a tool and not a gate: it asserts only enough to know the picture is of a working
+/// desktop rather than of a blank screen, which is the one failure that would otherwise be
+/// mistaken for a design opinion.
+fn cmd_shot(what: &str, accel: Accel) -> R<()> {
+    const MOMENTS: [&str; 4] = ["greeter", "desktop", "apps", "windows"];
+    if what != "all" && !MOMENTS.contains(&what) {
+        return Err(format!(
+            "no shot called {what:?} — try `all` or one of: {}",
+            MOMENTS.join(", ")
+        )
+        .into());
+    }
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::Normal)?;
+
+    let work = build_cache();
+    fs::create_dir_all(&work).ok();
+    let dump = work.join("shot.ppm");
+    let qmp_sock = work.join("qmp-shot.sock");
+    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock)?;
+
+    // A closure would borrow both halves for the rest of the function, so the capture is a
+    // statement each time — four lines, and no plumbing to read past.
+    macro_rules! capture {
+        ($name:expr) => {
+            if what == "all" || what == $name {
+                let ppm = settle_and_capture(&mut qmp, &dump)?;
+                let (w, h, rgb) = parse_ppm(&ppm)?;
+                let path = work.join(concat!("shot-", $name, ".png"));
+                write_png(&path, w, h, &rgb)?;
+                println!("  shot: {} ({w}x{h})", path.display());
+            }
+        };
+    }
+
+    println!("xtask: booting the release image to photograph it…\n");
+
+    // 1. **The greeter**, which in a release image is the only window there is.
+    session.expect("desktop-session-mgr: greeter presented")?;
+    // The pointer somewhere a person would leave it, so the cursor is in the picture. Without
+    // this it sits whereever QEMU starts it, which is the top-left corner and under the window.
+    move_pointer_to(&mut qmp, 640, 400)?;
+    capture!("greeter");
+
+    // 2. **A session.** No wrong password here — that is `check-login`'s claim to make, and a
+    //    tool that took twice as long to produce the same pictures would be a tool used less.
+    type_at_greeter(&mut qmp, &mut session, DEMO_USER)?;
+    press(&mut qmp, "tab")?;
+    type_at_greeter(&mut qmp, &mut session, DEMO_PASSWORD)?;
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: up (graphical session leader)")?;
+    // Both bars, because a desktop missing one is exactly the picture that would be mistaken
+    // for a design decision rather than a broken boot. In the order the shell prints them —
+    // `expect` scans forward, so a pair asserted by topic rather than by position in the stream
+    // times out on output that was there.
+    session.expect("desktop-shell: top bar presented, window ")?;
+    session.expect("desktop-shell: bottom bar placed at 0,776")?;
+    capture!("desktop");
+
+    // 3. **The applications modal**, the one piece of chrome with no window of its own: a popup
+    //    over the desktop, which is where the toolkit's list rows are seen at their real size.
+    click_at(&mut qmp, &mut session, 60, 12)?;
+    session.expect("desktop-shell: applications modal open")?;
+    capture!("apps");
+
+    // 4. **Real windows.** Two applications rather than one, because half of what a desktop
+    //    looks like is how two windows sit next to each other — and one of each kind: a
+    //    proportional-font application and the terminal, which is the only grid on the screen.
+    launch_from_modal(&mut qmp, &mut session, "nxfiles")?;
+    // **Escape before aiming at the button again**, the precondition `check-login` states for
+    // the same click: `click_at` retries a press that did not land, and an abandoned attempt
+    // still pressed *somewhere* — if that somewhere was the applications button the modal is
+    // already open, the aimed click opens no second one, and the wait below never ends.
+    press(&mut qmp, "esc")?;
+    session.skip_to_end()?;
+    click_at(&mut qmp, &mut session, 60, 12)?;
+    session.expect("desktop-shell: applications modal open")?;
+    // And drawn, before a keystroke is aimed at it.
+    let _ = settle_and_capture(&mut qmp, &dump)?;
+    launch_from_modal(&mut qmp, &mut session, "nxterm")?;
+    // The shell cascades what it places, so the two land offset rather than stacked.
+    //
+    // **No wait here**: `launch_from_modal` already waited for the shell to place the window,
+    // which is the stronger receipt — and the terminal's own startup lines come *before* that, so
+    // an `expect` for one of them scans past output that was already there.
+    move_pointer_to(&mut qmp, 900, 500)?;
+    capture!("windows");
+
+    let _ = fs::remove_file(&qmp_sock);
+    println!("\nxtask: shots written to {}", work.display());
+    Ok(())
+}
+
+/// Type a program's name into the open applications modal and launch it.
+///
+/// The modal is a `popup`, so it holds the keyboard — the same property `check-login` relies on.
+fn launch_from_modal(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<()> {
+    for c in program.chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(qmp, &qcode)?;
+    }
+    press(qmp, "ret")?;
+    session.expect(&format!("desktop-shell: launched {program} into its own namespace"))?;
+    session.expect("desktop-shell: applications modal closed")?;
+    // **And wait until its window is on screen**, which is not the same claim and is the one the
+    // next step needs. A launch returns when the *shell* has spawned the program; the program
+    // then starts, creates a window, and the compositor focuses it — after the modal for the
+    // *next* launch has already opened. Typing into that modal put the second program's name
+    // into the first program, and in a file browser Enter means "open the selected row", so the
+    // shot ended up with an editor on `theme.toml` instead of a terminal.
+    session.expect("desktop-shell: placed window ")?;
+    Ok(())
+}
+
+/// Boot the **release** image headless with a QMP socket and the serial on stdio.
+///
+/// Shared by `check-login` and `shot`, which are the two things that boot the image a person
+/// would actually use — every other gate boots `--selftest`. The three that do build this
+/// command themselves and differ from each other in the image mode and the flags; these two are
+/// identical, and two identical copies of a boot are how the second one quietly stops matching.
+fn spawn_release_guest(accel: Accel, gate: &'static str, qmp_sock: &Path) -> R<(Session, Qmp)> {
+    let ovmf = locate_ovmf()?;
+    // Removed rather than reused: a socket left by a killed run is a file `Qmp::connect` will
+    // open and never get an answer from. The *caller* owns the path, because it is also what
+    // gets cleaned up at the end of a gate.
+    let _ = fs::remove_file(qmp_sock);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let session = Session::spawn(cmd, gate)?;
+    let qmp = Qmp::connect(qmp_sock)?;
+    Ok((session, qmp))
 }
 
 /// The repository file the image build stages at `guest_path`.

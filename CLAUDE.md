@@ -54,6 +54,7 @@ cargo xtask test           # host-side unit tests
 cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
 cargo xtask test-interactive # boot the RELEASE image and drive a real login + shell
 cargo xtask preview        # render the toolkit on the host to a PNG — no boot, no QEMU
+cargo xtask shot           # boot the release image and photograph the whole desktop
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
@@ -119,6 +120,14 @@ display arm exists for a person rather than for a test: everything else display-
 bottom-most — `service-mgr` brings the login chain up before declared services, which is what
 keeps `check-display`'s reference windows undisturbed — so it holds no keyboard and nothing
 typed reaches it.
+
+`cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
+release image and driving it to four moments — the greeter, the bare desktop, the applications
+modal, and two real windows — then writing what QEMU says is on the display to
+`tools/build-cache/shot-*.png`. It costs a boot, and it is the only way to see the things
+`preview` cannot: the cursor, the window frames, the ground between windows, and how two windows
+sit next to each other. A tool rather than a gate — it asserts only enough to know the picture is
+of a working desktop.
 
 `cargo xtask preview` writes `tools/build-cache/preview-{ui,term}.png` — the same renders
 `check-display` compares the guest against, drawn here and made viewable. **It exists so that a

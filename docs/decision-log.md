@@ -20795,3 +20795,42 @@ as defending against "a constructor that left a previous path's tail behind", an
 here can: both start from a fresh array. The reviewer's control — filling with `0xFF` instead —
 left every test in the file green. The test is not vacuous; its `as_str`/`Debug` half fails five
 ways if `len` stops bounding the slice. The comment now says which half bites.
+
+## 2026-09-01 — M11 Part E: a picture of the whole desktop, photographed rather than rendered
+
+Part A's `preview` renders the toolkit's own surfaces on the host in about a second, and its own
+doc names what that structurally cannot show: anything the *compositor* draws — the cursor, the
+drag outline, the ground between windows — and the arrangement of real windows on a real screen.
+Those are composed in the guest by clients that have to run. Part E needs a polish list, a polish
+list needs somebody looking at the desktop, and that sentence was the reason they could not.
+
+`cargo xtask shot` is the other half, and the design decision is in the word: it **photographs**.
+
+**Not a second renderer**, which is the trap `preview_frames` exists to avoid — one source per
+expected answer, because two call sites that obviously build the same thing is how drift starts.
+A host-composed desktop would have meant a second description of what the desktop looks like,
+including an *arrangement* invented in `xtask` and true of nothing. A screendump describes
+nothing; it reports.
+
+**The release image**, so the picture has no `--selftest` clients on it, and **several moments per
+boot**, because the boot is the cost: the greeter, the bare desktop, the applications modal, and a
+screen with two real windows. A polish list is written against all four.
+
+**A tool, not a gate.** It asserts only enough to know the picture is of a working desktop rather
+than a blank screen — the one failure that would otherwise be read as a design opinion. It shares
+its boot with `check-login`, the only other thing that runs the image a person would use.
+
+### Two races it had to learn, both about what a receipt means
+
+**A launch returns when the shell has spawned the program, not when its window exists.** The
+launched application creates its window and takes focus *after* the modal for the next launch has
+already opened — so the second program's name was typed into the first program, and in a file
+browser Enter means "open the selected row". The shot came out with an editor on `theme.toml`
+instead of a terminal. The fix is to wait for the shell to place the window, which is the receipt
+that actually says what the next step needs.
+
+**And a line that arrives before another line cannot be asserted after it.** `nxterm` prints its
+grid metrics before the shell places its window, so an `expect` for the first placed after the
+second times out on output that was already there. This is the fourth time that shape has cost
+something in this codebase; the rule is that expectations go where the line *is*, not where the
+topic is.
