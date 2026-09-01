@@ -413,7 +413,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // rather than a destruction is *for* — and this one has no dialog to ask in.
                 // Naming the gap is the honest half; the confirmation belongs with the rest of
                 // the editor's second pass, which M12 owns.
-                WindowEvent::CloseRequested => {
+                // A dismissal is a popup's event; this window is not one.
+            WindowEvent::Dismissed => {}
+            WindowEvent::CloseRequested => {
                     kprint(b"nxedit: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }

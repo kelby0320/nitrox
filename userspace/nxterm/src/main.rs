@@ -765,6 +765,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
         // dropped rather than routed into the terminal.
         if popup.as_ref().is_some_and(|p| p.id == from) {
+            // **A press landed outside the menu, so it goes away** (M11 Part E batch 5). This is
+            // the one thing a popup's owner cannot work out for itself: it never sees a press
+            // aimed at another window, and until the compositor said so a menu stayed open over
+            // whatever was clicked next.
+            if matches!(event, WindowEvent::Dismissed) {
+                app.menu_open = false;
+                continue;
+            }
             let menu =
                 app.menu_view(&theme, popup.as_ref().and_then(|p| p.router.hovered_key(&p.tree)));
             let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
@@ -856,6 +864,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // **The shell asking, answered the same way the close button is.** There is nothing
             // to refuse with and nothing to save: what a client with unsaved work would do here
             // is open a dialog, which is why this arrives as a request rather than a destruction.
+            // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
+            WindowEvent::Dismissed => {}
             WindowEvent::CloseRequested => {
                 kprint(b"nxterm: asked to close, exiting\n");
                 app.update(Msg::Close);

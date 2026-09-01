@@ -96,6 +96,10 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 5 — the blue highlight, and dismissal for real** (2026-09-01). Both reported as still
+  broken after batch 4, both correctly: hover took the quiet branch because that list keeps no
+  selection, and `Focus(false)` only fires when something raises — so clicking bare desktop or a
+  panel left the menu up. A new `Surface::Dismissed` op carries the half a client cannot see.
 - **Batch 4 — the applications menu, and two small things** (2026-09-01). The menu hangs from
   its button, its rows can be clicked, it dismisses when focus leaves, and it highlights — all one
   cause. Plus the dead "nitrox" label removed and the cascade inset from the screen edge. Found

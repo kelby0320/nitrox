@@ -485,7 +485,13 @@ fn log_route(rec: &Outbound) {
     // client that a payload was handed over, and by the time a person has dragged anything the
     // cap is long since spent. Excluded rather than raised: raising it would mean more motion
     // logged for the sake of one line (M10 Part E).
-    if !matches!(rec, Outbound::Dropped { .. }) {
+    //
+    // **A dismissal is excluded for the same three reasons** (M11 Part E batch 5): one record per
+    // popup, the only evidence outside the client that the compositor said anything, and it
+    // happens long after the cap is spent — which is exactly how it was found. The mechanism
+    // worked and the line was silently suppressed, so the gate asserting it timed out on a
+    // system that was behaving correctly.
+    if !matches!(rec, Outbound::Dropped { .. } | Outbound::Dismissed { .. }) {
         // SAFETY: single-threaded server; this counter is touched only from the serve loop.
         let n = unsafe { ROUTES_LOGGED };
         if n > MAX_LOGGED_ROUTES {
@@ -520,6 +526,9 @@ fn log_route(rec: &Outbound) {
         }
         Outbound::CloseRequested { window } => {
             l.s(b"compositor: close-requested win=").u(*window as u64);
+        }
+        Outbound::Dismissed { window } => {
+            l.s(b"compositor: dismissed win=").u(*window as u64);
         }
         Outbound::Dropped { window, acceptor, kind, name, x, y, .. } => {
             // **The name, never the path.** What is being dragged is a path in somebody's home
@@ -994,6 +1003,13 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
                 None => true,
             }
         }
+        Outbound::Dismissed { window } => {
+            let mut body = [0u8; 4];
+            match (librsproto::surface::WindowRef { window: *window }).write(&mut body) {
+                Some(n) => send_input(ch, librsproto::surface::OP_DISMISSED, &body[..n]),
+                None => true,
+            }
+        }
         Outbound::Dropped { window, acceptor, kind, path, name, x, y } => {
             use librsproto::surface::{DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
             // **The same constant the client sizes its receive buffer from**, so the two cannot
@@ -1179,6 +1195,20 @@ fn route_one_batch(
                     for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
                         damage.push(r);
                     }
+                }
+                // **A press landed outside a popup, so its owner is told** (M11 Part E batch 5).
+                // Reported rather than acted on, like the resize below: the window is the
+                // client's, and whether a dismissal ends what it was offering is the client's to
+                // decide. What only this side can know is that the press happened elsewhere.
+                if let Some(window) = routed.dismissed
+                    && let Some(slot) = srv.session_of(window)
+                {
+                    // `log_route` *and* `enqueue`, which is the pair every other site here uses:
+                    // enqueuing alone delivers the event and logs nothing, so the mechanism works
+                    // and no gate can see it.
+                    let rec = Outbound::Dismissed { window };
+                    log_route(&rec);
+                    enqueue(srv, slot, rec);
                 }
                 // **One event for the gesture, at the release.** The compositor does not resize
                 // the client — that is the manager's, so there is one path to a window's

@@ -3328,6 +3328,28 @@ it is noticed on. Its own list, and its own milestone.
       line would be both a reintroduction and invisible to the gate wanting it. The click proves
       the router; hover rides the same router.
 
+- [x] **Batch 5 — the highlight is blue, and a press outside really does dismiss** ✅
+      (2026-09-01). Both were reported as still broken after batch 4, and both were right.
+
+      **The highlight** was batch 3's rule applied to a list that has no selection: hover was
+      "quieter than the selection and loses to it", and the applications modal keeps no selection
+      at all, so every hover took the quiet branch. The rule is still one primary highlight —
+      where there is no selection to compete with, the pointer's is not competing.
+
+      **The dismissal** needed a protocol op. Batch 4 used `Focus(false)`, which arrives when
+      something *raises* — so clicking another window worked and clicking the desktop or a panel
+      did not, because focus here is a consequence of stacking and neither raises anything. The
+      gate proved only the case that worked, having noted the other in a comment. `Dismissed`
+      (`0x0931`) is the compositor saying a press landed elsewhere, which is the half a client
+      cannot see: a popup's owner never receives a press aimed at another window.
+
+      **Its own op, not a second meaning for `CloseRequested`** — that one may deserve a "save
+      first?" and this deserves nothing but going away, and two things read as "close" in one arm
+      is what `Dropped`/`InputLost` had to be renamed out of. **And no parent exemption**: a first
+      version spared the popup's parent to protect the button that opened it, which was wrong
+      twice — the parent is the whole bar, and dismissing is what makes clicking that button again
+      close what it opened.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

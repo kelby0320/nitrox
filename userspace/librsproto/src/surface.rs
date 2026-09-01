@@ -165,6 +165,24 @@ impl Role {
         !matches!(self, Role::Panel { .. })
     }
 
+    /// Whether this is a popup — a window a press elsewhere dismisses.
+    pub const fn is_popup(&self) -> bool {
+        matches!(self, Role::Popup { .. })
+    }
+
+    /// The window this one hangs from, for the roles that have one.
+    ///
+    /// **A popup's parent is not a stacking relationship here** — the compositor stacks by
+    /// creation order and clips a popup to the *screen* — but it is the one thing that makes
+    /// "outside this popup" answerable without also meaning "outside the button that opened it"
+    /// (M11 Part E batch 5).
+    pub const fn parent(&self) -> Option<u32> {
+        match self {
+            Role::Popup { parent } | Role::Dialog { parent } => Some(*parent),
+            _ => None,
+        }
+    }
+
     /// The edge and size this role reserves, if any.
     pub const fn strut(&self) -> Option<(Edge, u32)> {
         match self {
@@ -1184,6 +1202,29 @@ pub const OP_START_DRAG: u16 = 0x090F;
 /// range that means something else.
 pub const OP_DROPPED: u16 = 0x0930;
 
+/// `Surface::Dismissed` — **server → client. Unsolicited, `request_id` 0, no reply.**
+///
+/// Body, 4 bytes: `window` (u32). A press landed somewhere that is not this popup, so whatever it
+/// was offering is no longer what the person is doing. **A request, like
+/// [`CloseRequested`](OP_CLOSE_REQUESTED), and refusable the same way**: the client destroys the
+/// window, and one that ignores this simply stays open.
+///
+/// **Its own op rather than a second meaning for an existing one.** `CloseRequested` says
+/// somebody asked this window to close; this says the pointer went elsewhere. Two things a client
+/// reads as "close" in one match arm is the mistake `Dropped`/`InputLost` had to be renamed out
+/// of — and the difference is real, because a client may well answer them differently: an editor
+/// asks "save first?" when *closed* and a menu just goes away when dismissed.
+///
+/// **Why the compositor has to say it at all.** A popup's owner never sees a press aimed at
+/// another window, so "click outside to dismiss" is not something a client can implement. Focus
+/// almost covers it and does not: focus here is a consequence of stacking, so clicking a *window*
+/// raises it and the popup hears about it — but clicking the desktop or a panel raises nothing,
+/// changes no focus, and left every popup in the system open (M11 Part E batch 5).
+///
+/// **Sent for a press outside the popup and outside its parent**, so the button that opened a
+/// menu can close it by its own rules rather than racing a dismissal.
+pub const OP_DISMISSED: u16 = 0x0931;
+
 /// A drop payload that is one file.
 pub const DROP_KIND_FILE: u32 = 1 << 0;
 /// A drop payload that is one directory.
@@ -1446,7 +1487,7 @@ impl MgrDesktop {
     }
 }
 
-/// One window, by id — [`CloseRequested`](OP_CLOSE_REQUESTED).
+/// One window, by id — [`CloseRequested`](OP_CLOSE_REQUESTED) and [`Dismissed`](OP_DISMISSED).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct WindowRef {

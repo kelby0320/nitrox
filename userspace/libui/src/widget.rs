@@ -1436,10 +1436,14 @@ pub fn list_view<Msg>(
         // the inside with a gradient, and that border is what separates a selected row from the
         // row above it — without it two adjacent selections would merge into one block.
         //
-        // **Hover is quieter than selection and loses to it** (batch 3). Two highlights of equal
-        // weight on one list is two answers to "what happens if I act now"; the keyboard's
-        // selection is the one that would, so the pointer's gets the face and not the blue.
-        let row_el = if selected {
+        // **Hover is quieter than selection and loses to it** (batch 3) — *unless nothing is
+        // selected*, in which case it is the answer and gets the blue (batch 5). The rule is
+        // still "one primary highlight": two of equal weight is two answers to "what happens if
+        // I act now", and where there is no keyboard selection to compete with, the pointer's is
+        // not competing. The applications modal is exactly that list — it keeps no selection at
+        // all, so every hover landed on the quiet branch and the menu highlighted in grey.
+        let primary = selected || (hovered == Some(r.key) && state.selected.is_none());
+        let row_el = if primary {
             stack(alloc::vec![
                 fill(theme.focus_ring),
                 padding(Insets::all(1), bevel(theme.selection)),
@@ -1651,6 +1655,21 @@ mod list_view_tests {
         // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
         // an item that paints a face when it is not hovered is a menu with every row lit.
         assert!(fills(&cold).is_empty() && bevels(&cold).is_empty(), "an idle item drew a face");
+    }
+
+    #[test]
+    fn with_nothing_selected_the_hovered_row_is_the_highlight() {
+        // **The applications modal is this list**, and it keeps no selection at all — Enter takes
+        // the first filtered entry — so before batch 5 every hover landed on the quiet branch and
+        // a menu that is nothing *but* hover highlighted in grey. One primary highlight is the
+        // rule; where there is no selection to compete with, the pointer's is not competing.
+        let p = Theme::default();
+        let data = [(1u64, "a"), (2, "b")];
+        let e: Element<u64> =
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, Some(2), &p);
+        assert_eq!(row_faces(&e)[1], p.focus_ring, "the hovered row has no border");
+        assert_eq!(row_bevels(&e)[1], Some(p.selection), "the hovered row is not the blue");
+        assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
     }
 
     #[test]

@@ -21134,3 +21134,69 @@ retrofit removed and invisible to the gate that wanted it.
 What proves the wiring instead is the launch: `check-login`'s second terminal is now started by
 **clicking its row**, and everything after that step depends on the terminal existing. Hover and
 clicking ride the same router, so a router that hit-tests wrongly fails the rest of the gate.
+
+## 2026-09-01 — M11 Part E batch 5: two things reported fixed that were not
+
+The maintainer came back with the same two complaints after batch 4: the menu highlight is not
+blue, and clicking off the menu does not close it. Both were right, and both are worth recording
+because of *how* they survived a batch that claimed them.
+
+### The highlight: a rule applied where its premise did not hold
+
+Batch 3 gave list rows a hover treatment and a rule for it — hover is quieter than the selection
+and loses to it — with the reasoning that two highlights of equal weight are two answers to "what
+happens if I act now". Sound. But the applications modal **keeps no selection at all**: Enter
+launches the first filtered entry, and the `ListState` is a throwaway. So every hover took the
+quiet branch, and a list that is *nothing but* hover highlighted in grey.
+
+The rule is unchanged and its premise is now checked: where nothing is selected, the hovered row
+*is* the answer and gets the blue. One primary highlight either way.
+
+### The dismissal: a gate that proved the case that worked
+
+Batch 4 closed the modal on `WindowEvent::Focus(false)`, and the gate clicked into the terminal
+and passed. Focus here is a **consequence of stacking** — `focus_candidate` is the topmost window
+that takes focus — so clicking a *window* raises it, the popup stops being topmost, and it hears
+about it. Clicking the desktop raises nothing. Clicking a panel raises nothing, because a panel
+does not take focus. In both cases no focus changes and the popup stays up, which is exactly what
+was reported.
+
+**The gate's own comment named the untested case**: "clicking bare desktop moves focus nowhere, so
+it would prove nothing about the mechanism". That sentence is a description of the bug, written
+while choosing not to test it. The lesson is not new — assert where the implementations differ —
+but the shape is worth keeping: *when a comment explains why a case is not being tested, check
+whether it is explaining why the case is broken.*
+
+### `Surface::Dismissed` (`0x0931`)
+
+A popup's owner never sees a press aimed at another window, so "click outside to dismiss" cannot
+be implemented by a client. The compositor now reports it, and **reports rather than acts** — as
+it does for close requests and resizes: the window is the client's, and whether a dismissal ends
+what the popup was offering is the client's to decide.
+
+**Its own op rather than a second meaning for `CloseRequested`.** That one is somebody asking a
+window to close and may deserve a "save first?"; this is the pointer having gone elsewhere and
+deserves nothing but going away. A client may answer them differently, and two things read as
+"close" in one match arm is the mistake `Dropped` and `InputLost` had to be renamed out of.
+
+**No parent exemption.** The first version spared a press on the popup's parent, meaning to keep
+the button that opened a menu from racing a dismissal. Wrong twice: a popup's parent is the whole
+*bar* rather than the button, so clicking the bar left the menu up — and the handler it was
+protecting is inert while a modal is open, so dismissing is precisely what makes clicking that
+button a second time close what it opened. Caught by the host test written for the rule.
+
+### Two smaller findings on the way
+
+**A log line that was never printed.** The dismissal was enqueued without a `log_route` call —
+every other site pairs them — so the mechanism worked and no gate could see it. Then it was
+printed and still invisible, because `log_route`'s rate cap suppressed it: the cap bounds *input*,
+which by then had long spent it. Excluded now, on the same three grounds as a drop — one record
+per popup, the only evidence outside the client, and it happens late.
+
+**And the dismissal is logged before the press it came from**, because the dismissal is decided
+while routing and the `press at` line is written when the routed record is delivered. So the gate
+checks it against the whole transcript rather than in sequence, which is the rule this gate
+already applies to lines whose order is an implementation detail.
+
+The control is stronger than the assertion: cutting the dismissal does not merely lose the log
+line, it stops the modal closing at all, so the ordered expectation fails first.

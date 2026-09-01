@@ -2085,10 +2085,26 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // over whatever was clicked. The compositor's focus event is the one signal that says the
     // person went elsewhere, and it is what closes it now.
     //
-    // Into the terminal's grid, which is focusable and present — clicking bare desktop moves
-    // focus nowhere, so it would prove nothing about the mechanism.
-    click_at(&mut qmp, &mut session, term_x + 200, term_y + 200)?;
+    // **Onto bare desktop, which is the case that was broken.** Clicking another *window* raises
+    // it, and a raise is a focus change the popup hears about — so the first version of this step
+    // clicked into the terminal and passed while the reported bug survived: a press on the
+    // desktop or on a panel raises nothing, changes no focus, and left the modal open over it.
+    // The compositor sends `Surface::Dismissed` for that press now, which is the half a client
+    // cannot see for itself.
+    //
+    // **The bottom bar's dead space**, between the last window-list entry and the desktop
+    // indicator. A panel never takes focus, so a press there raises nothing and produces no focus
+    // change *whatever else is on screen* — which is what makes it the honest test. Aiming at
+    // bare desktop instead would depend on the terminal not being maximised at this point in the
+    // gate, and it is.
+    click_at(&mut qmp, &mut session, 600, 788)?;
     session.expect("desktop-shell: applications modal closed")?;
+    // **That the compositor *said* so is checked against the whole transcript below**, not here.
+    // The dismissal is logged while the press is being routed and the `press at` line is logged
+    // when the routed record is delivered — so the dismissal comes *first*, and `click_at`'s own
+    // position assertion has already scanned past it. Same rule this gate applies to every line
+    // whose order is an implementation detail rather than a claim.
+
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
     session.expect("desktop-shell: minimized window ")?;
@@ -3002,6 +3018,22 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // the machinery was there (`libstream` documents `PeerClosed` as "stop producing, exit")
     // and the gate now says so out loud. Order-independent: the child notices its master go at
     // whatever moment the tty-server gets there.
+    // **The modal was dismissed by the compositor, not by a focus change** (M11 Part E batch 5).
+    // The distinction is the whole of the fix: clicking another *window* raises it, and a raise
+    // is a focus change the popup hears about — which is why the first version of this step
+    // passed while the reported bug survived. A press on a panel raises nothing.
+    if !transcript.contains("compositor: dismissed win=") {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err(format!(
+            "the applications modal closed, but the compositor never sent a dismissal — so it \
+             closed on a focus change, which is the half of this that already worked. A press on \
+             a panel raises no window and changes no focus, so nothing but `Surface::Dismissed` \
+             can have closed it.\n\nthe transcript is at {}",
+            path.display()
+        )
+        .into());
+    }
     if !transcript.contains("nxsh: terminal closed") {
         let path = build_cache().join("guest-transcript-check-login.log");
         let _ = fs::write(&path, &transcript);

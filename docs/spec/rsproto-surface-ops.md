@@ -1266,7 +1266,7 @@ nothing is how somebody changes their mind.
 
 **`0x0930` rather than `0x0910`**: the client block `0x0900`–`0x090F` is full and `0x0910`–`0x092F`
 is the manager's, so this begins a second client block rather than borrowing a number from a
-range that means something else.
+range that means something else. `Dismissed` (`0x0931`) continues it.
 
 **Delivered only for a gesture the user finished** — the button coming up. A grab taken away, or
 a `SYN_DROPPED` from the input stream, cancels: the pointer's position is then a guess, and a
@@ -1283,6 +1283,32 @@ a gesture the user completed was silently forgotten. **A cap on a record is a pr
 receiver**: a sender that can emit more than a receiver can take is a record that disappears on
 delivery. The compositor's send buffer and `libsurface`'s receive buffers are both this constant,
 spelled the same way, so the two cannot drift (PR #260 review).
+
+
+### `Dismissed` (`0x0931`, server → client)
+
+| Field | Bytes | Notes |
+|---|---|---|
+| `window` | 4 | the popup a press landed outside of |
+
+**A request, like `CloseRequested`, and refusable the same way**: the client destroys the window,
+and one that ignores it stays open. **Its own op rather than a second meaning for
+`CloseRequested`** — that one is somebody asking a window to close and may deserve a "save
+first?"; this is the pointer having gone elsewhere and deserves nothing but going away. Two things
+a client reads as "close" in one match arm is the mistake `Dropped` and `InputLost` had to be
+renamed out of.
+
+**Why the compositor has to say it.** A popup's owner never sees a press aimed at another window,
+so "click outside to dismiss" is not something a client can implement. Focus almost covers it and
+does not: focus is a consequence of stacking, so clicking a *window* raises it and the popup hears
+about the focus change — while clicking the desktop or a panel raises nothing, changes no focus,
+and left every popup in the system open (M11 Part E batch 5).
+
+**Sent for a press anywhere that is not the popup itself — its parent included.** A first version
+exempted the parent, meaning to protect the button that opened a menu; that was wrong twice, since
+a popup's parent is the whole *bar* rather than the button, and dismissing is exactly what makes
+clicking that button a second time close what it opened. The opening press cannot dismiss: the
+popup does not exist when it is routed.
 
 ## See also
 

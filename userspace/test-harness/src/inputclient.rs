@@ -582,6 +582,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 // This client declares no acceptor, so nothing can be dropped on it.
                 WindowEvent::Drop { .. } => b"drop",
                 WindowEvent::CloseRequested => b"close",
+                // This client creates no popup, so it can never be dismissed.
+                WindowEvent::Dismissed => b"dismissed",
                 // Not this client's business: its window is fixed-size and it never moves.
                 WindowEvent::Configure { .. } => b"configure",
             };
@@ -663,6 +665,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // the run with it. A client is free to ignore a close request — that is the whole
             // reason it is a request — and this one is the case a shell has to insist on.
             WindowEvent::CloseRequested => kprint(b"input-testclient: asked to close, staying\n"),
+            // A dismissal is a popup's event, and this client has no popup.
+            WindowEvent::Dismissed => {}
             // Ignored deliberately: a fixed-size window declining a resize is legal, and this
             // one is 2048×2048 on purpose.
             WindowEvent::Configure { .. } => {}
@@ -709,6 +713,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // the run with it. A client is free to ignore a close request — that is the whole
             // reason it is a request — and this one is the case a shell has to insist on.
             WindowEvent::CloseRequested => kprint(b"input-testclient: asked to close, staying\n"),
+            // A dismissal is a popup's event, and this client has no popup.
+            WindowEvent::Dismissed => {}
             // Ignored deliberately: a fixed-size window declining a resize is legal, and this
             // one is 2048×2048 on purpose.
             WindowEvent::Configure { .. } => {}

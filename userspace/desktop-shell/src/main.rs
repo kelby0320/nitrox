@@ -2108,12 +2108,23 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                     continue;
                 }
-                // **Losing the keyboard dismisses it**, which is what "click outside" means from
-                // in here: this process never sees a press aimed at another window, and the
-                // compositor's focus event is the one signal that says the person went
-                // elsewhere. `InputLost` is *not* this — that is queue overflow, and reading it
-                // as a focus change would close the modal on a burst of motion.
-                if let libsurface::WindowEvent::Focus(false) = event {
+                // **A press outside it dismisses it, and losing the keyboard does too.**
+                //
+                // Two signals rather than one, because neither covers the other. `Focus(false)`
+                // arrives when something *raises* — clicking another window, or a chord that
+                // restacks — and it was all this had at first, which turned out to cover only
+                // half the case: focus here is a consequence of stacking, so a press on the
+                // desktop or on a panel raises nothing and changed no focus, and the modal
+                // stayed open over the click (reported by the maintainer; M11 Part E batch 5).
+                // `Dismissed` is the compositor saying the press landed elsewhere, which is the
+                // half a client cannot see for itself.
+                //
+                // `InputLost` is neither of these — that is queue overflow, and reading it as
+                // one would close the modal on a burst of pointer motion.
+                if matches!(
+                    event,
+                    libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
+                ) {
                     rename = false;
                     close_modal(
                         &mut session,
