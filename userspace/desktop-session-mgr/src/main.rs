@@ -41,6 +41,16 @@ use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
+/// The screen the greeter centres itself on.
+///
+/// **Fixed rather than queried**, the same trade `desktop-shell` makes for its bars and for the
+/// same reason: the compositor has no op that reports the screen's size, and adding one to place
+/// one window would be a protocol change made for a stub's convenience. `check-display` hardcodes
+/// the same 1280x800.
+const SCREEN_W: u32 = 1280;
+/// See [`SCREEN_W`].
+const SCREEN_H: u32 = 800;
+
 /// The greeter window's size. Fixed rather than screen-relative: the compositor places it at
 /// the origin today, and a greeter that resized itself would be the first client to have a
 /// placement opinion — which is `desktop-shell`'s job from Part E.
@@ -563,14 +573,27 @@ fn open_greeter(
     addrs: &mut [*mut u8; BUFFERS],
     len: usize,
 ) -> Option<u32> {
-    // **This window lands at the origin, and is created before every other client's.**
-    // `service-mgr` brings the login chain up before it starts declared services, so the
-    // greeter is bottom-most and the reference windows `check-display` and `check-terminal`
-    // depend on stack above it. That is load-bearing rather than incidental: a greeter created
-    // *after* them would cover the regions those gates compare, and the failure would read as
-    // a compositing regression.
+    // **Centred, and created before every other client's window.** `service-mgr` brings the login
+    // chain up before it starts declared services, so the greeter is bottom-most and the
+    // reference windows `check-display` and `check-terminal` depend on stack above it. That is
+    // load-bearing rather than incidental: a greeter created *after* them would cover the regions
+    // those gates compare, and the failure would read as a compositing regression.
+    //
+    // **The centre is computed from constants, not queried** (M11 Part E batch 8), which is the
+    // same trade `desktop-shell` makes for its bars: the compositor has no "what size is the
+    // screen" op, and adding one so a login box can centre itself would be a protocol change made
+    // for one window's convenience. If the screen is ever a different size this lands off-centre,
+    // which is a visible and harmless wrong rather than a silent one.
+    //
+    // **It asks rather than being placed.** Nothing is managing windows yet — the shell that
+    // would is what this window exists to let somebody start — so a `normal` window's origin is
+    // its own request, honoured when the compositor gives up waiting for a manager.
+    let (x, y) = (
+        (SCREEN_W.saturating_sub(GREETER_W) / 2) as i32,
+        (SCREEN_H.saturating_sub(GREETER_H) / 2) as i32,
+    );
     let window = session
-        .create(&CreateWindowRequest::new(GREETER_W, GREETER_H, Role::Normal), BUFFERS)
+        .create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS)
         .ok()?;
     for i in 0..BUFFERS {
         let (handle, addr) = shared_buffer(len)?;

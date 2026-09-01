@@ -3386,6 +3386,28 @@ it is noticed on. Its own list, and its own milestone.
       launch — the shell said the same thing before, and the editor exited before creating a
       window. Then Ctrl+S, a name, and the file written into the session's `/home`.
 
+- [x] **Batch 8 — taskbar buttons, and a greeter that could not be centred** ✅ (2026-09-01). Two
+      small requests, one of which was not small underneath.
+
+      **The taskbar entries are bordered boxes.** They were labels on a flat bar, so two windows
+      read as one line with a gap in it; the focused one is filled as well as marked, from the
+      same flag the glyph comes from.
+
+      **The login prompt could not be centred, and finding out why is the batch.** A `normal`
+      window's requested origin was discarded — zeroed by the encoder, ignored by the parser, and
+      overwritten by the compositor — on the rule that a manager places it. True, and it leaves no
+      answer for a window that exists *before* any manager: the greeter is what somebody uses to
+      start the process that would place it.
+
+      So the offset is now a **preference** for `normal` and `dialog`: the first configure is
+      still held for a manager, so with one attached nothing changes, and it is the window's
+      origin only when nobody is managing. A `panel` still discards it — its role already names
+      the edge it docks to.
+
+      **Three layers had to agree**, which is why the first two attempts changed nothing: the
+      compositor placed it at the origin, then the encoder zeroed it, then the parser would have.
+      Each had its own comment explaining that the offset was a popup's.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

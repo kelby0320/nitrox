@@ -80,7 +80,7 @@ use librsproto::surface::{
 };
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, column, padding, row, sized, text};
+use libui::element::{Element, Insets, bevel, column, fill, padding, row, sized, stack, text};
 use libui::diff::Tree;
 use libui::layout::layout;
 use libui::route::Router;
@@ -357,13 +357,28 @@ fn visible_entries(entries: &[WinEntry], current: u32) -> alloc::vec::Vec<&WinEn
 }
 
 /// The bottom bar's element tree: one button per window, then the desktop indicator.
-fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str) -> Element<()> {
+/// One taskbar entry: a bordered button, marked when its window holds the keyboard.
+///
+/// **A box rather than a run of text** (M11 Part E batch 8). The entries were labels on a flat
+/// bar, so two windows read as one line with a gap in it — the reference desktop draws each as a
+/// button, and the border is what says where one ends and the next begins.
+///
+/// **The focused one is filled, the rest are the bar's own face.** The list already marks focus
+/// with a leading glyph; a filled face says it at a glance, and the two agree because they are
+/// built from the same flag.
+fn entry_cell(e: &WinEntry, theme: &Theme) -> Element<()> {
+    let face = if e.focused { theme.face_hover } else { theme.face };
+    stack(alloc::vec![
+        fill(theme.border),
+        padding(Insets::all(1), bevel(face)),
+        padding(Insets { top: 3, right: 7, bottom: 3, left: 7 }, text(entry_label(e))),
+    ])
+}
+
+fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str, theme: &Theme) -> Element<()> {
     let mut cells: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
     for e in shown {
-        cells.push(sized(
-            libdraw::geom::Size::new(ENTRY_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(entry_label(e))),
-        ));
+        cells.push(sized(libdraw::geom::Size::new(ENTRY_W, 0), entry_cell(e, theme)));
     }
     if cells.is_empty() {
         // An empty row lays out to nothing and commits a blank bar, which reads as a broken
@@ -397,7 +412,7 @@ fn render_window_bar(
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .unwrap_or_else(|| fail(b"desktop-shell: bad bottom bar geometry\n"));
     let mut fb = MemFramebuffer::new(geometry);
-    let ui = window_bar_view(shown, label);
+    let ui = window_bar_view(shown, label, theme);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);

@@ -387,10 +387,18 @@ impl CreateWindowRequest {
         Self { width, height, role, offset_x: 0, offset_y: 0 }
     }
 
-    /// A popup at `(x, y)` from its parent's origin.
+    /// A window at `(x, y)` — from its parent's origin for a popup, from the screen's otherwise.
     ///
-    /// The offset is ignored — written and read as zero — for every other role, `dialog`
-    /// included, so this says what it means rather than being the general constructor.
+    /// **What it means depends on the role, and that is the point.** A popup's offset is where it
+    /// hangs from the item that opened it, and only its creator knows that. A `normal` or
+    /// `dialog` window's is a **preference**: the compositor holds such a window's first
+    /// configure until a manager places it, so with a manager attached this is never seen, and
+    /// without one it is the only answer there is (M11 Part E batch 8). A `panel` ignores it —
+    /// its role already says which edge it docks to.
+    ///
+    /// Before that batch every role but `popup` landed at the origin, which meant a client that
+    /// runs *before* the window manager — the login greeter, which exists so that the manager can
+    /// be started — could only ever appear in the corner.
     pub const fn at(width: u32, height: u32, role: Role, x: i32, y: i32) -> Self {
         Self { width, height, role, offset_x: x, offset_y: y }
     }
@@ -413,12 +421,16 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     };
     put_u16(out, 10, aux16);
     put_u32(out, 12, aux32);
-    // Zero for every role but `popup` — `dialog` included, which has a parent but is placed by
-    // a manager — for the same reason the aux words are zeroed: two identical requests must
-    // produce identical bytes.
+    // **Zero for a `panel` only**, since M11 Part E batch 8. A panel's role already says which
+    // edge it docks to, so an offset would be a second answer to that question — and the aux
+    // words are zeroed for the same reason: two identical requests must produce identical bytes.
+    //
+    // The others carry it. For a popup it is where the menu hangs from the item that opened it;
+    // for a `normal` or `dialog` it is a *preference*, which a manager overrides and which is the
+    // only answer there is when nothing is managing — the case the login greeter lives in.
     let (ox, oy) = match req.role {
-        Role::Popup { .. } => (req.offset_x, req.offset_y),
-        Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => (0, 0),
+        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (req.offset_x, req.offset_y),
+        Role::Panel { .. } => (0, 0),
     };
     put_u32(out, 16, ox as u32);
     put_u32(out, 20, oy as u32);
@@ -447,12 +459,14 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
         ROLE_DIALOG => Role::Dialog { parent: aux32 },
         _ => return None,
     };
-    // **Only a `popup`.** Having a parent is not the test: a `dialog` has one and is still placed
-    // by a manager, so reading these words for it would invent an offset the client is not
-    // entitled to send — and the spec says they are read as zero, not merely written as zero.
+    // **Read for every role but `panel`**, matching what the writer sends. Reading a word the
+    // writer zeroes is harmless; *not* reading one it sends is a request silently discarded,
+    // which is what a centred greeter ran into.
     let (offset_x, offset_y) = match role {
-        Role::Popup { .. } => (get_u32(body, 16) as i32, get_u32(body, 20) as i32),
-        Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => (0, 0),
+        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => {
+            (get_u32(body, 16) as i32, get_u32(body, 20) as i32)
+        }
+        Role::Panel { .. } => (0, 0),
     };
     Some(CreateWindowRequest { width, height, role, offset_x, offset_y })
 }
@@ -2253,35 +2267,42 @@ mod tests {
 
     /// **Only a `popup` carries an offset.** Every other role, `dialog` included, sends zero.
     ///
-    /// A `dialog` names a parent, but the parent carries its desktop membership and its
-    /// lifetime — not its position. It is an ordinary listed window and a manager places it, so
-    /// a client-supplied offset would be redundant with what `MgrWindowCreated` already tells
-    /// the manager, and would compete with the placement the manager chose. Nothing asserted
-    /// this either way before, so the encoder could have started carrying it and no test would
-    /// have noticed.
+    /// **Only a `panel` discards it, since M11 Part E batch 8.** A panel's role already says which
+    /// edge it docks to, so an offset would be a second answer to that question. A `normal` or
+    /// `dialog` window's offset is a *preference* the compositor honours until a manager
+    /// overrides it — which was previously discarded on the wire, so a client that runs before
+    /// any manager exists could only ever appear at the origin.
     #[test]
-    fn only_a_popup_carries_an_offset_on_the_wire() {
-        for role in [
-            Role::Normal,
-            Role::Panel { dock: Edge::Top, reserve: 4 },
-            Role::Dialog { parent: 9 },
-        ] {
-            let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
-            build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, 88))
-                .expect("encodes");
-            assert_eq!(&buf[16..24], &[0u8; 8], "{role:?} must not put an offset on the wire");
+    fn a_panel_discards_an_offset_and_the_other_roles_carry_it() {
+        let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
+        let panel = Role::Panel { dock: Edge::Top, reserve: 4 };
+        build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, panel, 77, 88))
+            .expect("encodes");
+        assert_eq!(&buf[16..24], &[0u8; 8], "a panel put an offset on the wire");
 
-            // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
-            // zeroed asserts nothing: it holds for a parser that reads those words too, because
-            // there is nothing in them to read. The reader is a separate arm and needs a body
-            // that would betray it (PR #220 review, finding 1).
-            put_u32(&mut buf, 16, 77);
-            put_u32(&mut buf, 20, 88);
+        // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
+        // zeroed asserts nothing: it holds for a parser that reads those words too, because
+        // there is nothing in them to read. The reader is a separate arm and needs a body
+        // that would betray it (PR #220 review, finding 1).
+        put_u32(&mut buf, 16, 77);
+        put_u32(&mut buf, 20, 88);
+        let back = parse_create_window_request(&buf).expect("parses");
+        assert_eq!(
+            (back.offset_x, back.offset_y),
+            (0, 0),
+            "a panel took an offset that was on the wire"
+        );
+
+        // And the roles that carry one, round-tripped.
+        for role in [Role::Normal, Role::Dialog { parent: 9 }] {
+            let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
+            build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, -88))
+                .expect("encodes");
             let back = parse_create_window_request(&buf).expect("parses");
             assert_eq!(
                 (back.offset_x, back.offset_y),
-                (0, 0),
-                "{role:?} must discard an offset even when one is on the wire"
+                (77, -88),
+                "{role:?} lost the origin it asked for"
             );
         }
 

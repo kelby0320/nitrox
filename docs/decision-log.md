@@ -21284,3 +21284,50 @@ cannot see is a gate asserting the wrong thing — it passed only once it agreed
 The step's proof is the **placement**, not the launch: the shell logged "launched nxedit" before
 this change too, and the editor exited before ever creating a window. A window that gets placed is
 a window that exists.
+
+## 2026-09-01 — M11 Part E batch 8: a window that runs before the window manager
+
+Two more items, one of which was not what it looked like.
+
+**The taskbar entries are bordered boxes.** They were labels on a flat bar, so two open windows
+read as one line with a gap in it. The focused one is filled as well as marked with its leading
+glyph — the two agree because they are built from the same flag.
+
+### The login prompt could not be centred, and why is the interesting part
+
+`desktop-session-mgr` creates a 420×200 window and it appeared in the corner. Asking for a
+position did nothing, through **three layers each of which had its own reason**:
+
+- `WindowStack::create` placed every `Role::Normal` at `(0, 0)`, commented "a manager places it".
+- `build_create_window_request` zeroed the offset words for every role but `popup`, commented
+  "two identical requests must produce identical bytes".
+- `parse_create_window_request` discarded them for the same roles, commented "reading these words
+  would invent an offset the client is not entitled to send".
+
+Each was right about the case it was written for and none had considered this one: **a window that
+exists before any window manager does.** The greeter is exactly that — its whole purpose is to let
+somebody start the session leader that would place windows. Nothing was managing, so the origin
+was the only answer available, and there was no way to ask for another.
+
+**The rule now is that the offset is a preference.** The compositor holds a `normal` or `dialog`
+window's first configure until a manager answers, so with a manager attached the requested origin
+is never seen and placement remains entirely the manager's; it is the window's origin only when
+the deadline fires with nobody having answered. `new` asks for `(0, 0)` and gets exactly what it
+always got, so nothing that exists moved. A `panel` still discards it: its role names the edge it
+docks to, and an offset would be a second answer to that question.
+
+That is the X11 rule, arrived at from the other end — a client's geometry is a request, and a
+window manager overrides it.
+
+**The centre is computed from constants**, the same trade `desktop-shell` makes for its bars: the
+compositor has no op that reports the screen's size, and adding one so a login box can centre
+itself would be a protocol change made for one window. On a different screen this lands
+off-centre, which is a visible and harmless wrong rather than a silent one.
+
+### And the gate's own reasoning needed correcting
+
+`display.yml` said the greeter "creates a 420x200 window at the origin in *every* boot, and the
+gate passes today only because the windows created after it cover that region". Centred, it sits
+clear of all three reference windows — so it is now *visible* in a region the gate does not
+compare, rather than hidden in one it does. The gate passes either way; the comment explaining why
+did not, and a wrong explanation of why a gate passes is worse than none.

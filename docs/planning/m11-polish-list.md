@@ -85,7 +85,10 @@ a request is being met in a particular way.
 - [] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
 - [x] nxedit doesn't launch from the menu. *(batch 7 — it launched and exited: it required
       `argv[1]` and the modal passes none. It opens untitled now and asks for a name on save.)*
-
+- [x] Open windows on the bottom bar should have a border around them.  See the screenshots for an example. *(batch 8)*
+- [x] The login prompt should be centered on the screen rather than in the upper left corner.
+      *(batch 8 — it could not be: a `normal` window's requested origin was discarded on the wire,
+      so a client that runs before any window manager could only appear in the corner.)*
 ---
 
 ## Done
@@ -100,6 +103,10 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 8 — taskbar buttons, and a greeter that can be centred** (2026-09-01). Entries are
+  bordered boxes now. Centring the login prompt turned out to need a protocol fix: a `normal`
+  window's requested origin was written and read as zero, so a client running before any manager
+  had no way to ask.
 - **Batch 7 — nxedit opens untitled** (2026-09-01). It required `argv[1]` and the applications
   modal passes none, so it started and exited. It opens empty now, asks for a name in its own
   status strip when there is something to save, and writes into the session's `/home`.

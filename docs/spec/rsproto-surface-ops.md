@@ -280,7 +280,7 @@ Request, 24 bytes:
 | 8 | 2 | `role` tag |
 | 10 | 2 | role aux16 — a panel's `dock` edge; otherwise **zero** |
 | 12 | 4 | role aux32 — a panel's `reserve`, or a popup/dialog's `parent`; otherwise **zero** |
-| 16 | 4 | `offset_x`, signed — a **popup's** offset from its parent's origin; otherwise **zero** |
+| 16 | 4 | `offset_x`, signed — a **popup's** offset from its parent's origin, a `normal` or `dialog`'s requested origin on the screen; **zero** for a `panel` |
 | 20 | 4 | `offset_y`, signed — likewise |
 
 **A popup is placed by its creator, and the offset is how.** Only the client knows where the
@@ -288,8 +288,19 @@ menu item its popup drops from was drawn, so a manager does not place popups —
 exempt from the initial-configure hold below, because there is nobody to wait for.
 
 **A `dialog` is not.** It names a parent, but the parent carries its desktop membership and its
-lifetime — not its position. In placement terms a dialog is an ordinary listed window: it lands
-at the compositor's default origin, a manager places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
+lifetime — not its position. In placement terms a dialog is an ordinary listed window: a manager
+places it, and it is held like a `normal`.
+
+**A `normal` or `dialog` window's offset is a preference, not a placement** (M11 Part E batch 8).
+The compositor holds such a window's first configure until a manager answers, so with a manager
+attached the requested origin is never seen — placement remains entirely the manager's. It is the
+window's origin only when *nobody is managing*, which the deadline below releases into. Before
+that batch these words were written and read as zero, which meant a client that runs before any
+manager exists — the login greeter, whose whole purpose is to let somebody start the thing that
+manages windows — could only ever appear at the origin.
+
+**A `panel` still discards it.** Its role names the edge it docks to and how much it reserves; an
+offset would be a second answer to that question.
 
 A manager needs nothing **from the client** to place one: `WindowCreated` carries the parent id
 and the requested size, and the manager already tracks where the parent is from the geometry
