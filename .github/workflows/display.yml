@@ -58,6 +58,11 @@ on:
       - 'userspace/libkern/src/abi.rs'
       - 'userspace/libos/**'
       - 'tools/xtask/src/main.rs'
+      # The two font files themselves, since M11 Part D. A *swap* would not fail this gate —
+      # host and guest render from the same bytes, so they move together — but a truncated or
+      # corrupt file would, on the guest side only, as a font that does not parse. That is the
+      # break this entry is here for.
+      - 'assets/fonts/**'
       - '.github/workflows/display.yml'
   pull_request:
     branches: [main]

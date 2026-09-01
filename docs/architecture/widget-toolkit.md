@@ -12,7 +12,7 @@ per-buffer damage accumulation (`damage.rs`), event routing with implicit captur
 (`route.rs`), painting within a damage rectangle (`paint.rs`), and the widget set —
 `button`, `scrollbar`, `menu_bar`, and the `custom` escape hatch (`widget.rs`). Text is real
 TrueType through `libdraw::text`, rasterised from a font read off the root filesystem at
-runtime. `reference.rs` is the fixed picture `cargo xtask check-display` renders on the host
+runtime — the proportional face the theme names (§11), since M11 Part D. `reference.rs` is the fixed picture `cargo xtask check-display` renders on the host
 and compares against the guest's screen pixel for pixel.
 
 **What is specified here and not built**, each with its reason in place: the **application
@@ -653,6 +653,17 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   built-in theme, `Theme::dark()` — named so that a second is a constructor rather than a
   redesign, and nothing ships one. A change takes effect when an application starts; pushing one
   to running windows is protocol work whose trigger is a control panel.
+
+  **And the theme names the font**, since M11 Part D — two of them. `font_ui` is what this
+  toolkit draws with and is *proportional*; `font_mono` is the fixed-advance face
+  [`libterm`](../../userspace/libterm) measures a cell from. Until that part there was one
+  `SYSTEM_FONT_PATH` and every client loaded it, so every label in every window was monospaced.
+  `nxterm` is the one program that loads both: its menus are widgets and its grid is not.
+
+  A path a theme names is resolved in the *application's* namespace, so whether it loads is not
+  something the shell could have checked when it parsed the file — an unloadable path falls back
+  to the built-in face for that role and says so on the console, which is the same stance the
+  schema takes on every other unreadable value.
 - **Accessibility.** No accessible tree, no screen-reader surface. Worth stating plainly as
   a gap rather than leaving it unmentioned; retrofitting one is substantially harder than
   designing it in, and this is a deliberate deferral rather than an oversight.

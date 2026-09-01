@@ -89,9 +89,6 @@ use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Where the font comes from — the same path every other graphical client reads.
-const SYSTEM_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
-
 /// The screen's width, which the top bar spans.
 ///
 /// Fixed rather than queried: the compositor has no "what size is the screen" op, and adding
@@ -1272,9 +1269,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // is where `/dev/draw` was bound. That is the whole point — an application's namespace
     // will get a *narrower* bind, and the difference is what gates the manager channel.
     // SAFETY: `session_ns` is this process's namespace, live for its whole run.
-    let font = match unsafe { libdraw::text::load(session_ns, SYSTEM_FONT_PATH) } {
+    let font = match unsafe { libdraw::text::load_ui(session_ns, &theme, b"desktop-shell") } {
         Ok(f) => f,
-        Err(_) => fail(b"desktop-shell: font load FAILED (is /system readable in the session?)\n"),
+        Err(e) => {
+            libkern::debug::Line::new().s(b"desktop-shell: the UI font ").s(e.why()).end();
+            fail(b"desktop-shell: font load FAILED (is /system readable in the session?)\n");
+        }
     };
 
     // SAFETY: `session_ns` is live for this process's whole run.

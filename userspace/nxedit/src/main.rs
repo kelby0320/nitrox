@@ -24,7 +24,7 @@ extern crate alloc;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
+use libdraw::text::{Font, load_ui};
 use libkern::{exit, kprint};
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
@@ -194,10 +194,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         exit(2);
     };
 
+    // **From the environment, not from a default** (M11 Part C), and read *before* the font,
+    // because since M11 Part D the theme is what names the file to load. It used to sit further
+    // down, next to the first thing drawn with it.
+    let theme = theme_of(&env);
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
+    let font = match unsafe { load_ui(root_ns, &theme, b"nxedit") } {
         Ok(f) => f,
-        Err(_) => fail(b"nxedit: could not load the system font\n"),
+        Err(e) => {
+            libkern::debug::Line::new().s(b"nxedit: the UI font ").s(e.why()).end();
+            fail(b"nxedit: font load FAILED\n");
+        }
     };
 
     let mut app = App::new(&path);
@@ -250,10 +257,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    // **From the environment, not from a default** (M11 Part C). The shell read the session's
-    // theme once and put it on the record every application is launched with; `font_px` comes
-    // with it, so this no longer overrides one.
-    let theme = theme_of(&env);
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();

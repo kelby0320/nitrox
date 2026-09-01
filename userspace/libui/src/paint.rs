@@ -155,7 +155,7 @@ mod tests {
 
     type Msg = ();
 
-    const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
+    const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
     const W: u32 = 200;
     const H: u32 = 100;
 

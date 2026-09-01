@@ -5,7 +5,7 @@ The colours and text size a graphical session draws itself in. Read once by
 application it launches; see [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 11
 Part C.
 
-**Built as of M11 Part C.** What is not here yet: any way to change a theme without restarting
+**Built as of M11 Part D.** What is not here yet: any way to change a theme without restarting
 what draws with it. That is deliberate — see "Not a live protocol" below.
 
 ## Where it lives
@@ -32,6 +32,7 @@ of a value — which matters, because every colour begins with `#`.
 background = "#0E141B"
 foreground = "#E0E6EC"
 font_px = 16
+font_ui = "/system/fonts/DejaVuSans.ttf"
 ```
 
 | Key | Type | What it colours |
@@ -51,6 +52,26 @@ font_px = 16
 | `cursor_outline` | `"#RRGGBB"` | The pointer's outline |
 | `outline` | `"#RRGGBB"` | A resize outline, a snap preview, a drop target |
 | `font_px` | number, `6`–`16` | Text size in pixels per em |
+| `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional |
+| `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
+
+**Two fonts because a grid is not a label** (M11 Part D). Everything the toolkit draws takes
+`font_ui`; `nxterm`'s grid takes `font_mono`, and `nxterm` is the one program that loads both —
+its menus are widgets and its cells are not. Before Part D there was a single path constant and
+every client loaded it, so every label in the system was monospaced.
+
+A path is **absolute, at most 64 bytes, and free of control characters**; a longer or relative
+one leaves that role at its default. The bound is not arbitrary: the theme travels to each
+application on the setup record, which is one 4 KiB message carrying all of argv and the
+environment, so a path a file could make arbitrarily long is a theme that could stop applications
+from launching.
+
+**Naming a proportional face in `font_mono` is a theme breaking its own terminal**, and it is not
+refused, because nothing that reads the file can tell: `libterm` takes a cell's width from one
+glyph's advance, so a proportional face yields a plausible number and then draws every column at
+the wrong x. It is stated here instead. The two shipped faces are `DejaVuSans.ttf` and
+`DejaVuSansMono.ttf`, both under `/system/fonts`, which is the only directory a session binds for
+them.
 
 **`font_px` shrinks and does not grow, and 16 is not an arbitrary ceiling.** Text measures
 exactly its em size, and the tightest fixed box in the system is a list row: 20 pixels with 2
@@ -92,6 +113,15 @@ colours did not parse is a worse failure than any colour could be. Specifically:
 - **`font_px` outside 6–16** is refused: zero divides in the layout, and anything above what the
   fixed chrome holds is clipped and overlapped. Both are a text file that makes the machine
   unusable, which is the one thing a theme must not be able to be.
+- **A font path that does not load** falls back to the built-in face for that role, and the
+  application says so on the console: `nxfiles: theme font /home/Fancy.ttf did not resolve (is it
+  staged into the rootfs?); using /system/fonts/DejaVuSans.ttf`.
+
+  **This one check is not where the others are**, and the reason is worth knowing: the shell
+  parses the file, but a path resolves in the *application's* namespace, and two applications can
+  answer differently. So the syntax is checked when the file is read and the existence is checked
+  where the font is loaded — a desktop with no text is exactly the failure this whole section
+  exists to prevent.
 
 The shell names each bad line, with the line number an editor would show, up to a bound.
 

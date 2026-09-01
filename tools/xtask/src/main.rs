@@ -3431,6 +3431,43 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     let mut session = Session::spawn(cmd, "check-terminal")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
 
+    // **The grid's cell, recomputed on the host from the same file** (M11 Part D). Since the
+    // desktop's font became proportional, `nxterm` is the one program that loads two — and
+    // handing the wrong one to `libterm` does not fail: `Metrics` takes a cell's width from a
+    // single glyph's advance, so a proportional face yields a plausible number and then draws
+    // every column at the wrong x. Everything else this gate checks would still pass, because
+    // the grid the harness reports is cells and not pixels.
+    //
+    // So the guest says which face it measured with and what it got, and the host measures the
+    // same file at the same size and compares. The size is taken from the line rather than
+    // assumed: the image stages a theme with a deliberately non-default `font_px`, and pinning
+    // the number here would be pinning the theme file to this gate.
+    {
+        session.expect("nxterm: grid font ")?;
+        let line = session.rest_of_line()?;
+        let (path, rest) = line.trim().split_once(", cell ").ok_or_else(|| {
+            format!("nxterm's grid line is not in the form this gate reads: {line:?}")
+        })?;
+        let (dims, px) = rest.split_once(" at ").ok_or_else(|| {
+            format!("nxterm's grid line has no size: {line:?}")
+        })?;
+        let (w, h) = dims.split_once('x').ok_or_else(|| format!("no cell size: {line:?}"))?;
+        let (w, h): (u32, u32) = (w.parse()?, h.parse()?);
+        let px: f32 = px.trim_end_matches("px").parse()?;
+        let want = libterm::render::Metrics::new(&host_font(path)?, px);
+        if (want.cell_w, want.cell_h) != (w, h) {
+            return Err(format!(
+                "the guest measured a {w}x{h} cell from {path} at {px}px; the host makes it \
+                 {}x{} from the same file. Either the guest loaded a different font from the \
+                 one it named — the proportional face is the live mistake here — or the two \
+                 sides disagree about rasterisation, which no other gate would notice",
+                want.cell_w, want.cell_h
+            )
+            .into());
+        }
+        println!("  ok: the grid measures a {w}x{h} cell from {path}, as the host does");
+    }
+
     // The shell is up in the window: its banner reached the grid, which means the whole
     // output direction already works before a key is injected.
     session.expect("nxterm: grid> nxsh: interactive shell")?;
@@ -3690,10 +3727,10 @@ fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
 /// real windows on a real screen. Those are composed in the guest by clients that have to run.
 /// What this covers is the toolkit's own surfaces, which is where most of the polish lives.
 fn cmd_preview(what: &str) -> R<()> {
-    let font = host_font()?;
+    let faces = host_faces()?;
     let dir = build_cache();
     fs::create_dir_all(&dir).ok();
-    let frames = preview_frames(&font);
+    let frames = preview_frames(&faces);
     let names: Vec<&str> = frames.iter().map(|(n, _)| *n).collect();
     if what != "all" && !names.contains(&what) {
         // Checked before anything is drawn: the first version reported this by rendering both
@@ -3716,14 +3753,47 @@ fn cmd_preview(what: &str) -> R<()> {
     Ok(())
 }
 
-/// The font every host-side render uses — the same file the image build stages at
-/// `/system/fonts/`, so a picture drawn here is drawn with the font the guest will read.
-fn host_font() -> R<libdraw::text::Font> {
-    let path = repo_root().join("assets/fonts/DejaVuSansMono.ttf");
+/// The repository file the image build stages at `guest_path`.
+///
+/// **The one place a guest font path becomes a host file**, used by the staging *and* by every
+/// host-side render. That is what makes the gate's central claim true rather than asserted: the
+/// picture drawn here is drawn with the same bytes the guest read off ext4, because both come
+/// from this function and both paths come from `Theme::dark()`. Point the built-in theme at a
+/// different face and the image, the previews and the gate all follow it — or, if nothing stages
+/// that face, all three fail together and say so.
+fn font_asset(guest_path: &str) -> R<PathBuf> {
+    let name = guest_path.strip_prefix(FONT_DIR).filter(|n| !n.contains('/')).ok_or_else(|| {
+        format!(
+            "the built-in theme names {guest_path:?}, which is not a file directly under \
+             {FONT_DIR} — the image build stages that directory and nothing else, so the host \
+             has no way to render with it"
+        )
+    })?;
+    Ok(repo_root().join("assets/fonts").join(name))
+}
+
+/// Where the image build binds the fonts, and therefore where a themeable path starts.
+const FONT_DIR: &str = "/system/fonts/";
+
+/// One host-side face, loaded from the path a theme names.
+fn host_font(guest_path: &str) -> R<libdraw::text::Font> {
+    let path = font_asset(guest_path)?;
     libdraw::text::Font::from_bytes(
         fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?,
     )
-    .ok_or_else(|| "the vendored font did not parse on the host".into())
+    .ok_or_else(|| format!("{} did not parse on the host", path.display()).into())
+}
+
+/// Both faces the built-in theme names, in the order [`preview_frames`] wants them.
+///
+/// **The built-in theme rather than the staged file**, and the difference matters: the file
+/// carries a deliberately non-default `font_px` for `check-login` to read back, while the guest
+/// client whose pictures this gate compares — `ui-testclient` — gets no setup record at all and
+/// draws with `Theme::dark()`. Rendering the host's reference from the file would compare two
+/// different themes and call the difference a display bug.
+fn host_faces() -> R<(libdraw::text::Font, libdraw::text::Font)> {
+    let t = libdraw::theme::Theme::dark();
+    Ok((host_font(t.font_ui.as_str())?, host_font(t.font_mono.as_str())?))
 }
 
 /// One reference render by name, for the gate that compares it against a guest.
@@ -3733,10 +3803,10 @@ fn host_font() -> R<libdraw::text::Font> {
 /// adding a preview are one change, and a preview that stopped being the gate's picture fails
 /// against the guest instead of quietly becoming a picture of nothing (PR #261 review, finding 2).
 fn reference_frame(
-    font: &libdraw::text::Font,
+    faces: &(libdraw::text::Font, libdraw::text::Font),
     name: &str,
 ) -> R<libdraw::framebuffer::MemFramebuffer> {
-    preview_frames(font)
+    preview_frames(faces)
         .into_iter()
         .find(|(n, _)| *n == name)
         .map(|(_, f)| f)
@@ -3748,12 +3818,15 @@ fn reference_frame(
 /// **The one place either the preview or the display gate builds a reference picture.** Both used
 /// to construct their own; the comment claiming they were the same renders was true and unenforced
 /// until it was tested, and a solid rectangle at the right size passed everything.
+/// **Each arrangement takes the face its guest counterpart loads** (M11 Part D): the toolkit's
+/// window is the desktop's proportional font and the terminal's is the fixed-advance one. They
+/// took one font between them until Part D, because the system had only one.
 fn preview_frames(
-    font: &libdraw::text::Font,
+    (ui, mono): &(libdraw::text::Font, libdraw::text::Font),
 ) -> Vec<(&'static str, libdraw::framebuffer::MemFramebuffer)> {
     vec![
-        ("ui", libui::reference::render(font)),
-        ("term", libterm::render::reference::render_with(font)),
+        ("ui", libui::reference::render(ui)),
+        ("term", libterm::render::reference::render_with(mono)),
     ]
 }
 
@@ -3843,6 +3916,27 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // client sharing memory with the compositor — rather than being written straight to
     // the aperture. The client emits this only after a `Release` acknowledges its final
     // commit, so the frame is composited by the time we capture.
+    // **Which two faces the guest read, in the order it reads them** (M11 Part D).
+    //
+    // The pixel comparison below cannot make this claim on its own, and the reason is worth
+    // stating because it is the trap this whole gate is shaped around: it checks that the host
+    // and the guest *agree*, so a swap that happened on both sides at once would still be green.
+    // Rendering the toolkit's window in the terminal's font is exactly that kind of change —
+    // one constant, two call sites — and it is what the system did before this part.
+    //
+    // These lines pin the guest's half. The host's is pinned by `host_faces`, which takes both
+    // paths from `Theme::dark()`, and by `libdraw`'s own test that the two are different files.
+    //
+    // **First, because `expect` consumes forward.** Both are printed before `ui-testclient`
+    // opens a window at all, so asserting them after any line further down the boot scans past
+    // them and times out on output that was there — the failure mode PR #258's review named.
+    {
+        let t = libdraw::theme::Theme::dark();
+        session.expect(&format!("ui-testclient: font loaded {}", t.font_ui.as_str()))?;
+        session.expect(&format!("ui-testclient: font loaded {}", t.font_mono.as_str()))?;
+        println!("  ok: the guest loaded the desktop's face and the terminal's, in that order");
+    }
+
     // **The deadline that keeps a held configure from becoming a lost window (M6 B4).**
     //
     // Asserted from the compositor's own log because the client cannot see *why* it was
@@ -3982,7 +4076,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The font both reference renders are drawn with here — the same file the image build
     // stages at `/system/fonts/`, against a guest render made from the bytes it read off the
     // disk. This is the only check anywhere that a font loads on the target at all.
-    let font = host_font()?;
+    let faces = host_faces()?;
 
     // **The terminal's picture**, between the two. Same construction and the same argument as
     // the toolkit's: `libterm` on the host renders the fixed reference stream, the guest renders
@@ -3997,7 +4091,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // comment. One source means the drift is not possible, and a wrong source fails here —
     // against a real guest, which is the only thing that can tell a render from a picture.
     let (uw, uh) = (libui::reference::WIDTH, libui::reference::HEIGHT);
-    let term = reference_frame(&font, "term")?;
+    let term = reference_frame(&faces, "term")?;
     // The terminal's size comes from the frame rather than from `reference::size`, for the same
     // reason: two answers to one question are two answers that can differ. The host test still
     // compares them, so the agreement is asserted somewhere.
@@ -4046,7 +4140,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // Compared everywhere *except* the rectangles of the windows above it. That exclusion is
     // not a weakening: a compositor that stacked them the other way would fail the comparisons
     // above, so the ordering is still covered.
-    let ui = reference_frame(&font, "ui")?;
+    let ui = reference_frame(&faces, "ui")?;
     let mut ui_mismatches = 0usize;
     let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     let mut ui_compared = 0usize;
@@ -4134,7 +4228,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
             "display gate FAILED: {ui_mismatches} of {ui_compared} toolkit pixels differ.\n  \
              first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
              the capture is at {} — if the whole region is the background colour the guest \
-             never loaded /system/fonts/DejaVuSansMono.ttf or never presented its window; if \
+             never loaded the UI font or never presented its window; if \
              only the glyphs differ, the target rasterised differently from the host",
             shot.display()
         )
@@ -7934,28 +8028,38 @@ fn assemble_image(
         );
     }
 
-    // `/system/fonts` — the system font, and its licence beside it.
+    // `/system/fonts` — the two faces the desktop draws with, and their licence beside them.
     //
     // **Here and not in the initramfs**, which the plan settled before the code was written:
-    // nothing that draws text runs before the root is mounted, and at 343 KiB the file is
-    // larger than every program in the boot image put together. A client resolves
-    // `libdraw::text::SYSTEM_FONT_PATH` and demand-pages it in.
+    // nothing that draws text runs before the root is mounted, and at 343 KiB the smaller file
+    // is larger than every program in the boot image put together. A client resolves the path
+    // its theme names and demand-pages the file in.
     //
-    // The licence ships with it because the font is redistributed: DejaVu's terms are
-    // permissive but require the notice to travel with the files. Staged from the same source
-    // file the host tests `include_bytes!`, so the gate cannot pass against a different font
-    // from the one on the disk.
+    // **Which files, from the theme rather than from a list here** (M11 Part D). `Theme::dark()`
+    // names a proportional face for the desktop and a fixed-advance one for the grid; staging
+    // exactly those is what makes "the guest reads the font the host rendered with" a property
+    // of the build instead of two lists somebody keeps equal. `font_asset` is the same mapping
+    // the previews and the display gate use.
+    //
+    // The licence ships with them because the fonts are redistributed: DejaVu's terms are
+    // permissive but require the notice to travel with the files. One notice covers both — its
+    // `Files: *` stanza is the DejaVu family, which is also why the second face cost no new
+    // licence question.
     {
         let fonts = staging.join("system").join("fonts");
         fs::create_dir_all(&fonts)?;
-        let src = repo_root().join("assets/fonts");
+        let theme = libdraw::theme::Theme::dark();
+        let mut faces: Vec<PathBuf> =
+            vec![font_asset(theme.font_ui.as_str())?, font_asset(theme.font_mono.as_str())?];
+        faces.dedup();
+        faces.push(repo_root().join("assets/fonts").join("LICENSE-DejaVu.txt"));
         let mut total = 0u64;
-        for name in ["DejaVuSansMono.ttf", "LICENSE-DejaVu.txt"] {
-            let from = src.join(name);
-            total += fs::copy(&from, fonts.join(name))
+        for from in &faces {
+            let name = from.file_name().ok_or("a font asset with no file name")?;
+            total += fs::copy(from, fonts.join(name))
                 .map_err(|e| format!("stage {}: {e}", from.display()))?;
         }
-        println!("xtask: seeded /system/fonts ({total} bytes)");
+        println!("xtask: seeded /system/fonts ({} files, {total} bytes)", faces.len());
     }
 
     let rootfs = work.join("rootfs.ext4");
@@ -8179,14 +8283,14 @@ mod tests {
     #[test]
     fn a_preview_is_the_picture_the_display_gate_demands() {
         use libdraw::framebuffer::Framebuffer;
-        let font = host_font().expect("the vendored font");
-        let frames = preview_frames(&font);
+        let faces = host_faces().expect("the vendored fonts");
+        let frames = preview_frames(&faces);
 
         let sizes: Vec<(&str, u32, u32)> = frames
             .iter()
             .map(|(n, f)| (*n, f.geometry().width, f.geometry().height))
             .collect();
-        let term = libterm::render::reference::size(&font);
+        let term = libterm::render::reference::size(&faces.1);
         assert_eq!(
             sizes,
             [

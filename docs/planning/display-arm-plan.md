@@ -3163,13 +3163,45 @@ it is noticed on. Its own list, and its own milestone.
 
 ### Part D — the UI font stops being a terminal font
 
-- [ ] **A proportional UI font in the theme, and the mono font kept for the grid.** Two roles, one
-      asset each, licences beside them as DejaVu's already is.
+- [x] **A proportional UI font in the theme, and the mono font kept for the grid** ✅ — two keys,
+      `font_ui` and `font_mono`, holding paths rather than one `SYSTEM_FONT_PATH` every client
+      loaded. The old constant is *deleted* rather than aliased, so a call site that did not
+      choose a role does not compile; `nxterm` is the one program that loads both, because its
+      menus are widgets and its grid is not.
 
-- [ ] **Gate**: `check-display`'s reference moves deliberately, and `check-terminal` proves the
-      grid still measures with a fixed advance. The reference render must load the font the
-      *theme* names, or the host and the guest are drawing with different fonts and the gate
-      compares nothing.
+      **One asset and no new licence question**: `DejaVuSans.ttf` beside the mono face it already
+      ships with, and DejaVu's notice covers the family in one `Files: *` stanza. 760 KiB on the
+      root filesystem, where the font has always lived — nothing that draws text runs before the
+      root is mounted.
+
+      **A path, not a name, and bounded at 64 bytes** so a `Theme` stays `Copy` and
+      `const`-constructible — the compositor keeps theme colours as `const` items and a heap
+      allocation cannot appear in a constant. The bound is also what keeps a theme file from
+      overflowing the 4 KiB setup record it travels on. A path that does not load falls back to
+      the built-in face for its role and says so, because whether a path resolves is a question
+      only the *application's* namespace can answer, not the shell that parsed the file.
+
+- [x] **Gate** ✅ — `check-display`'s reference moved and both sides moved with it: the host now
+      renders each reference with the file `Theme::dark()` names for that role, through the same
+      mapping the image build stages with, so "the guest reads the font the host drew with" is a
+      property of the build rather than two lists kept equal by hand.
+
+      **The pixel comparison cannot make the claim on its own**, which is the trap this part had
+      to be built around: it checks that the host and the guest *agree*, so a swap on both sides
+      at once stays green. Two assertions cover what it cannot. `check-display` expects the guest
+      to name both faces, in the order it loads them — that catches a client taking the wrong
+      role. And a host test asserts the two roles are *different files* — that catches the theme
+      collapsing them, which is the one-constant version of the same mistake and the state the
+      system was in before this part.
+
+      **`check-terminal` proves the grid still measures with a fixed advance**, by recomputing
+      the cell on the host from the same file at the size the guest reports, and comparing.
+      Handing `libterm` a proportional face is not a crash: it takes a cell's width from one
+      glyph's advance, so it gets a plausible number and then draws every column at the wrong x —
+      and every other assertion in that gate is about cells rather than pixels, so all of them
+      would still pass. Controlled: measuring with the UI face fails with
+      `the guest measured a 12x16 cell … the host makes it 9x16`. The property itself is a host
+      test in `libterm`, where the negative control is that the desktop's own font fails it.
 
 ### Part E — the polish passes
 
