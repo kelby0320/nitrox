@@ -21227,3 +21227,60 @@ position at all.
 **The control is the `None` case.** A test asserting that the bar carries a pointer handler passes
 for a widget that attaches one unconditionally, which is a different bug; the pair — `Some` gives
 exactly one handler, `None` gives none — is what pins the thing that was actually missing.
+
+## 2026-09-01 — M11 Part E batch 7: the editor opens untitled, and asks rather than invents
+
+"nxedit doesn't launch from the menu" was true in the most literal way. It required `argv[1]`, the
+applications modal passes no arguments, so it printed "no file to edit" and exited — a launch that
+looked like nothing happening.
+
+**The refusal had a reason and it was a good one.** M10 Part D declined an untitled buffer in as
+many words: "an untitled buffer would be a promise this application cannot keep: there is no
+save-as, because there is no file dialog and no way to ask for a name." The answer is not to drop
+the standard, it is to be able to ask.
+
+### In the editor rather than through the shell
+
+The details pass offered two shapes and the maintainer chose "untitled buffer, name it on save",
+with a parenthetical about reusing the shell's name-prompt modal — one shell op. Building it
+showed that parenthetical was the wrong half of the choice:
+
+- A `Desktop::Prompt` would make **the shell a dialog provider for arbitrary clients**, which is an
+  authority question `graphical-session.md` §3 would have to answer — the shell is already the one
+  process that both serves a resource and holds `BIND_NAMESPACE`, and widening what it does for
+  clients widens the trusted set.
+- It would need a **blocking exchange over an async protocol**: ask, wait, receive a string.
+- And the editor already had the shape. Its key path carries a note from PR #259's review that the
+  router branch is a placeholder "kept because the first widget that wants a key (a find field)
+  needs exactly this shape". A save-as field is that widget.
+
+So the outcome is what was chosen and the mechanism is smaller: a `TextFieldState` in the editor's
+own status strip, no protocol, no new authority.
+
+### Naming is a mode, and it is the editor's first
+
+While a name is being typed the keys are the field's — buffer *and* chords. A `Ctrl+S` there would
+ask to save the thing that has no name yet, which is what is already being answered. The strip
+shows the field **instead of** the status rather than beside it: a name being typed is what last
+happened, and showing both makes a person read two things to find which one wants an answer.
+
+An empty name is refused and leaves the prompt open, because it would write to the directory
+itself. Escape abandons it, leaving the buffer untitled and unwritten.
+
+**`Ctrl+S` goes through `update` rather than setting the flag directly**, so the chord and the
+button take the same path — a control that answered twice differently would be the same control
+disagreeing with itself.
+
+### Two things the gate found
+
+**The window had no title.** The taskbar showed `window 20` — the compositor's fallback — because
+the title was `basename("")`. An empty title reads as a program that failed to say what it is.
+
+**And `/home` *is* the user's subtree from inside a session.** The gate first asserted
+`/home/alice/scratch`, which is the *host's* name for it; a session namespace binds the user's
+directory at `/home`, which is what scopes it. A gate asserting the host's view of a path the guest
+cannot see is a gate asserting the wrong thing — it passed only once it agreed with the namespace.
+
+The step's proof is the **placement**, not the launch: the shell logged "launched nxedit" before
+this change too, and the editor exited before ever creating a window. A window that gets placed is
+a window that exists.

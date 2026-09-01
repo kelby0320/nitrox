@@ -83,7 +83,8 @@ a request is being met in a particular way.
 - [x] The "nitrox" label next to "applications" on the top bar doesn't do anything.  It doesn't appear to be a drop down menu.  Recommend we remove it. *(batch 4 — removed)*
 - [] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
 - [] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
-- [] nxedit doesn't launch from the menu.
+- [x] nxedit doesn't launch from the menu. *(batch 7 — it launched and exited: it required
+      `argv[1]` and the modal passes none. It opens untitled now and asks for a name on save.)*
 
 ---
 
@@ -99,6 +100,9 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 7 — nxedit opens untitled** (2026-09-01). It required `argv[1]` and the applications
+  modal passes none, so it started and exited. It opens empty now, asks for a name in its own
+  status strip when there is something to save, and writes into the session's `/home`.
 - **Batch 6 — a scrollbar you can drag** (2026-09-01). `list_view`'s bar had no pointer handler
   at all; the arithmetic was there and shared with `nxterm` all along. The launcher's list also
   stopped being rebuilt from zero every frame, so `/bin`'s 26 entries are all reachable.

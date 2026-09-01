@@ -3365,6 +3365,27 @@ it is noticed on. Its own list, and its own milestone.
       **The control is the `None` case.** Asserting that the bar carries a handler would pass for
       a widget that attached one unconditionally, which is a different bug.
 
+- [x] **Batch 7 — the editor opens untitled** ✅ (2026-09-01). "nxedit doesn't launch from the
+      menu" was true in the most literal way: it required `argv[1]`, the applications modal passes
+      none, so it printed "no file to edit" and exited. The refusal had a reason — M10 Part D
+      declined an untitled buffer because there was no way to ask for a name — and the answer is
+      to ask.
+
+      **In the editor, not through the shell.** The details pass offered a `Desktop` op that would
+      have the shell collect a name; that would make the shell a dialog provider for arbitrary
+      clients, which is an authority question, and would need a blocking exchange over an async
+      protocol. A field in the editor's own status strip is no protocol at all — and this crate's
+      key path already carried a note that "the first widget that wants a key needs exactly this
+      shape". This is that widget.
+
+      **Naming is a mode**, the editor's first: while a name is being typed the keys are the
+      field's, buffer and chords included, and the strip shows the field instead of the status. An
+      empty name is refused rather than treated as one, because it would write to the directory.
+
+      Gated end to end: launched from the menu, and the *placement* is the proof rather than the
+      launch — the shell said the same thing before, and the editor exited before creating a
+      window. Then Ctrl+S, a name, and the file written into the session's `/home`.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

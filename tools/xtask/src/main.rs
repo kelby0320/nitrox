@@ -2932,6 +2932,59 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxedit: opened /home/papers/other.txt - 0 bytes")?;
     println!("  ok: a file dragged from the browser opened in the editor");
 
+    // 10. **An editor launched from the menu, which is a launch with no file** (M11 Part E
+    //     batch 7). `nxedit` required `argv[1]` and the applications modal passes none, so it
+    //     printed "no file to edit" and exited — reported as "nxedit doesn't launch from the
+    //     menu", and true in the most literal way. It opens untitled now and asks for a name when
+    //     there is something to save.
+    press(&mut qmp, "esc")?;
+    session.skip_to_end()?;
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+    for c in "nxedit".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    // **Enter, not a click on the row.** Clicking a row is proved above, where the terminal every
+    // later step depends on is launched that way; what this step is about is what happens *after*
+    // a launch that carries no file, so it takes the shortest route to one.
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxedit into its own namespace")?;
+    // **The placement is the proof**, not the launch: the shell said the same thing before this
+    // change, and the editor then exited before it ever created a window. A window that gets
+    // placed is a window that exists.
+    session.expect("desktop-shell: placed window ")?;
+    let untitled = session.rest_of_line()?;
+    let (untitled_id, _, _) = parse_placement(&untitled)
+        .ok_or_else(|| format!("could not read the untitled editor's placement from {untitled:?}"))?;
+    println!("  ok: the editor launched from the menu and stayed up (window {untitled_id})");
+
+    // **Wait for it to reach the screen before typing at it.** "Placed" says the shell put the
+    // window somewhere, not that the compositor has moved the keyboard to it — the same race that
+    // sent a launch's keystrokes into the wrong program in batch 4. Settling the screen is the
+    // property that actually has to hold.
+    let _ = settle_and_capture(&mut qmp, &build_cache().join("check-login.ppm"))?;
+
+    // Ctrl+S with nothing named asks for a name rather than writing one nobody chose.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    // Then the name, one key at a time — the same discipline every typed sequence here uses.
+    for c in "scratch".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    // **`/home`, which *is* the user's subtree from inside the session.** A session namespace
+    // binds the user's directory at `/home` — that is what scopes it — so an untitled buffer
+    // named here lands in the place the session owns, and a path mentioning `alice` would be
+    // this gate asserting the host's view of a name the guest cannot see. An empty buffer is
+    // zero bytes: the newline the editor adds is per line, and there are none.
+    session.expect("nxedit: saved /home/scratch - 0 bytes")?;
+    println!("  ok: an untitled buffer was named and written into the session's home");
+
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
     // **Every check below writes the transcript on failure.** `expect` saves it on its own
