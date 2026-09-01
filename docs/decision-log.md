@@ -21200,3 +21200,30 @@ already applies to lines whose order is an implementation detail.
 
 The control is stronger than the assertion: cutting the dismissal does not merely lose the log
 line, it stops the modal closing at all, so the ordered expectation fails first.
+
+## 2026-09-01 — M11 Part E batch 6: the scrollbar was decoration
+
+"Scrollbars don't appear to work. You can't click and drag them." The arithmetic was never the
+problem — `ScrollState::offset_at` has been right since M5, and `nxterm` has dragged its grid with
+it ever since. `list_view` built a scrollbar and gave it **no pointer handler at all**, so a list
+showed its position and the events never left the router.
+
+That is the defect this toolkit's own notes keep naming from the other side: a control that looks
+live and is not. It reached three surfaces — the file browser, the launcher, and the toolkit's own
+reference render — because the widget that builds them all never offered the hook.
+
+**The conversion lives on `ListState`, not in each caller.** The widget knows the geometry and the
+caller only knows the numbers it passed in; putting `drag_to` beside the state means a list's
+thumb and a terminal's answer the same question the same way. Callers hand back the same `height`,
+`row_height` and row count they gave `list_view` — a drag converted against a different geometry
+from the one drawn puts the thumb where the pointer is not.
+
+**The launcher needed a second fix to make the first one useful.** Its `ListState` was built fresh
+in every render, on the stated argument that the launcher keeps no selection. True — and it also
+meant the scroll *offset* reset every frame, so `/bin`'s 26 entries were ten reachable rows and a
+filter. The state is persistent now, which is what a draggable bar needs to be able to hold a
+position at all.
+
+**The control is the `None` case.** A test asserting that the bar carries a pointer handler passes
+for a widget that attaches one unconditionally, which is a different bug; the pair — `Some` gives
+exactly one handler, `None` gives none — is what pins the thing that was actually missing.

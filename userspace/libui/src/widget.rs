@@ -25,6 +25,8 @@ use libdraw::geom::Size;
 // they all share; `libui::paint::Theme` names the same type for the painting half.
 pub use libdraw::theme::Theme;
 
+use librsproto::surface::PointerEvent;
+
 use crate::element::{
     Edge, Element, IconKind, Insets, bevel, column, dock, docked, fill, icon, padding, row, sized,
     stack, text,
@@ -1359,6 +1361,24 @@ impl ListState {
 /// How much space a row's label gets around it.
 const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 
+impl ListState {
+    /// Move the offset to where a drag on the scrollbar's track points.
+    ///
+    /// **The conversion belongs here, not in each caller**, because the widget already knows the
+    /// arithmetic and the caller only knows the numbers it passed in. `nxterm` does the same
+    /// conversion with the same [`ScrollState::offset_at`], from a grid's coordinates — this is
+    /// that for a list, so the two cannot drift apart on rounding.
+    ///
+    /// Takes the same `height`, `row_height` and row count [`list_view`] was given: a drag
+    /// converted against a different geometry from the one drawn puts the thumb where the pointer
+    /// is not (M11 Part E batch 6).
+    pub fn drag_to(&mut self, height: u32, row_height: u32, total: usize, y: i32) {
+        let visible = if row_height == 0 { 0 } else { height / row_height };
+        let bar = ScrollState { offset: self.offset as u32, visible, total: total as u32 };
+        self.offset = bar.offset_at(height, y) as usize;
+    }
+}
+
 /// A scrolling list of rows, with one selected.
 ///
 /// **The one model-backed widget** `desktop-shell.md` §5 settles on — "an explicit toolkit
@@ -1404,6 +1424,7 @@ pub fn list_view<Msg>(
     row_height: u32,
     activate: fn(u64) -> Msg,
     grab: Option<fn(u64) -> Msg>,
+    scroll: Option<fn(PointerEvent) -> Msg>,
     hovered: Option<u64>,
     theme: &Theme,
 ) -> Element<Msg> {
@@ -1477,10 +1498,16 @@ pub fn list_view<Msg>(
             visible: visible as u32,
             total: rows.len() as u32,
         };
-        row(alloc::vec![
-            list.flex(1),
-            scrollbar(bar, SCROLLBAR_W, height, theme),
-        ])
+        // **The bar takes the pointer when the caller has somewhere to send it** (M11 Part E
+        // batch 6). It was built without a handler, so a list's scrollbar showed a position and
+        // could not be dragged — a control that looks live and is not, which is the defect this
+        // toolkit's own notes keep naming. `nxterm` builds its scrollbar directly and has always
+        // wired this; a list's was simply never offered.
+        let mut bar_el = scrollbar(bar, SCROLLBAR_W, height, theme);
+        if let Some(f) = scroll {
+            bar_el = bar_el.on_pointer(f);
+        }
+        row(alloc::vec![list.flex(1), bar_el])
     } else {
         list
     };
@@ -1506,7 +1533,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -1516,7 +1543,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -1526,9 +1553,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -1540,11 +1567,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState { selected: Some(19), offset: 0 };
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -1568,7 +1595,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState { selected: Some(3), offset: 2 };
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -1658,6 +1685,63 @@ mod list_view_tests {
     }
 
     #[test]
+    fn the_scrollbar_takes_the_pointer_only_when_the_caller_offered_somewhere_to_send_it() {
+        // **The missing half was the handler, not the arithmetic.** `ScrollState::offset_at` has
+        // been right since M5 and `nxterm` has always dragged with it; a *list's* bar was built
+        // without an `on_pointer` at all, so the events never left the router. This asserts the
+        // wiring, and the `None` case is the control — without it the test would pass for a
+        // widget that attached a handler unconditionally, which is a different bug.
+        let p = Theme::default();
+        let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
+        let handlers = |e: &Element<u64>| {
+            let mut n = 0;
+            walk(e, &mut |c| {
+                if c.on_pointer.is_some() {
+                    n += 1;
+                }
+            });
+            n
+        };
+        let with: Element<u64> = list_view(
+            &rows(&many),
+            &mut ListState::default(),
+            100,
+            20,
+            |k| k,
+            None,
+            Some(|_| 0),
+            None,
+            &p,
+        );
+        assert_eq!(handlers(&with), 1, "the scrollbar took no pointer handler");
+        let without: Element<u64> =
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+        assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
+    }
+
+    #[test]
+    fn a_drag_on_the_track_moves_the_offset_and_a_release_does_not() {
+        // **The scrollbar was decoration.** `list_view` built one and gave it no pointer handler,
+        // so a list showed its position and could not be dragged — a control that looks live and
+        // is not, which is the defect this crate's own notes keep naming. `nxterm` builds its
+        // scrollbar directly and has always wired this (M11 Part E batch 6).
+        let mut st = ListState::default();
+        // Twenty rows of 20px in a 100px viewport: five visible, fifteen of travel.
+        st.drag_to(100, 20, 20, 100);
+        assert!(st.offset > 0, "a drag to the bottom of the track moved nothing");
+        let bottom = st.offset;
+        st.drag_to(100, 20, 20, 0);
+        assert_eq!(st.offset, 0, "a drag to the top did not come back");
+        assert!(bottom <= 15, "the offset ran past the last full screen of rows");
+
+        // A list that fits has nowhere to go, and must not be moved by a drag on a track that is
+        // not drawn — the case `offset_at` returns zero for.
+        let mut st = ListState::default();
+        st.drag_to(100, 20, 3, 100);
+        assert_eq!(st.offset, 0, "a list shorter than its viewport scrolled");
+    }
+
+    #[test]
     fn with_nothing_selected_the_hovered_row_is_the_highlight() {
         // **The applications modal is this list**, and it keeps no selection at all — Enter takes
         // the first filtered entry — so before batch 5 every hover landed on the quiet branch and
@@ -1666,7 +1750,7 @@ mod list_view_tests {
         let p = Theme::default();
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, Some(2), &p);
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), &p);
         assert_eq!(row_faces(&e)[1], p.focus_ring, "the hovered row has no border");
         assert_eq!(row_bevels(&e)[1], Some(p.selection), "the hovered row is not the blue");
         assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
@@ -1685,6 +1769,7 @@ mod list_view_tests {
             20,
             |k| k,
             None,
+            None,
             Some(1),
             &p,
         );
@@ -1701,6 +1786,7 @@ mod list_view_tests {
             20,
             |k| k,
             None,
+            None,
             Some(2),
             &p,
         );
@@ -1713,7 +1799,7 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, &p);
+            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
@@ -1734,11 +1820,11 @@ mod list_view_tests {
         let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, &p);
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -1747,7 +1833,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -1756,7 +1842,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 

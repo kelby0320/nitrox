@@ -443,6 +443,13 @@ const ROW_H: u32 = 20;
 enum ModalMsg {
     /// Launch the program keyed by this index into the unfiltered program list.
     Launch(u64),
+    /// The scrollbar is being dragged.
+    ///
+    /// **Which is why the modal's list state had to stop being a throwaway.** It was built fresh
+    /// in `render_modal` on the argument that the launcher keeps no selection — true, and it also
+    /// meant an offset that reset to zero every frame, so `/bin` was 26 entries of which ten were
+    /// reachable and the rest only by typing a filter (M11 Part E batch 6).
+    Scroll(librsproto::surface::PointerEvent),
 }
 
 fn modal_view(
@@ -461,7 +468,17 @@ fn modal_view(
     // could not be clicked at all and nothing under the cursor reacted. Both are the same gap:
     // no router. The key is the row's index into the *unfiltered* list, which is what makes
     // `ModalMsg::Launch` resolvable after a filter has reordered what is shown.
-    let list = list_view(rows, state, list_h, ROW_H, ModalMsg::Launch, None, hovered, theme);
+    let list = list_view(
+        rows,
+        state,
+        list_h,
+        ROW_H,
+        ModalMsg::Launch,
+        None,
+        Some(ModalMsg::Scroll),
+        hovered,
+        theme,
+    );
     // **Framed, because a popup is the one surface with nothing behind it to define its edge**
     // (M11 Part E, batch 2). On a light theme this modal's face and the window it covers are
     // within a few units of each other, so without a line around it the two run together. Same
@@ -1646,6 +1663,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // toolkit's layout re-derived in the shell; a router is what the toolkit already has.
     let mut modal_tree = Tree::new();
     let mut modal_router = Router::new();
+    // **Persistent, since M11 Part E batch 6.** It was a throwaway in each render on the argument
+    // that the launcher keeps no selection — which was true and also meant the scroll offset
+    // reset every frame, so `/bin`'s 26 entries were ten reachable rows and a filter.
+    let mut modal_list = ListState::default();
     let mut query = TextFieldState::new();
     // **The modal serves two purposes and has to know which.** It is the applications launcher
     // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
@@ -1935,7 +1956,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         query.clear();
                         modal = open_modal(
                             &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query, &mut modal_tree,
+                            &query, &mut modal_tree, &mut modal_list,
                         );
                         if let Some(id) = modal {
                             stick(m, id, b"the rename prompt");
@@ -2063,9 +2084,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // it painted, so a click lands on the row a person can see.
                 if let libsurface::WindowEvent::Pointer(p) = event {
                     let rows = modal_rows(&programs, query.text());
-                    let mut list = ListState::default();
                     let hovered = modal_router.hovered_key(&modal_tree);
-                    let ui = modal_view(&query, &rows, &mut list, hovered, &theme);
+                    let ui = modal_view(&query, &rows, &mut modal_list, hovered, &theme);
                     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
                     let l = libui::layout::layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
                     let (msgs, _) = modal_router.pointer(&modal_tree, &ui, &l, p);
@@ -2084,7 +2104,18 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         modal_dirty = true;
                     }
                     for msg in msgs {
-                        let ModalMsg::Launch(key) = msg;
+                        // The drag converts through the widget's own arithmetic, which is what
+                        // keeps a list's thumb and a terminal's agreeing about where a y points.
+                        let ModalMsg::Launch(key) = msg else {
+                            if let ModalMsg::Scroll(p) = msg
+                                && p.buttons != 0
+                            {
+                                let h = MODAL_H.saturating_sub(40);
+                                modal_list.drag_to(h, ROW_H, rows.len(), p.y);
+                                modal_dirty = true;
+                            }
+                            continue;
+                        };
                         // The key is an index into the *unfiltered* list, which is what
                         // `modal_rows` guarantees and what makes this resolvable at all.
                         if let Some(name) = programs.get(key as usize) {
@@ -2394,7 +2425,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     {
                         modal = open_modal(
                             &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query, &mut modal_tree,
+                            &query, &mut modal_tree, &mut modal_list,
                         );
                         if let Some((m, id)) = manager.as_mut().zip(modal) {
                             stick(m, id, b"the applications modal");
@@ -2606,6 +2637,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     &modal_addrs,
                     &mut modal_tree,
                     hovered,
+                    &mut modal_list,
                 );
             }
         }
@@ -3880,14 +3912,10 @@ fn present_modal(
     addrs: &[*mut u8; BUFFERS],
     tree: &mut Tree,
     hovered: Option<u64>,
+    list: &mut ListState,
 ) {
     let len = MODAL_PITCH * MODAL_H as usize;
-    // **A local, because the launcher keeps no selection.** Enter launches the filtered list's
-    // first entry (see the `KEY_ENTER` arm), so there is nothing to persist between frames —
-    // and since M10 Part C that is said by the state being a throwaway here rather than by a
-    // `_` in a pattern, which is what it looked like when the widget returned it.
-    let mut list = ListState::default();
-    let fb = render_modal(theme, font, query, rows, &mut list, tree, hovered);
+    let fb = render_modal(theme, font, query, rows, list, tree, hovered);
     let bytes = fb.into_bytes();
     if bytes.len() != len {
         return;
@@ -3959,12 +3987,11 @@ fn open_modal(
     addrs: &mut [*mut u8; BUFFERS],
     query: &TextFieldState,
     tree: &mut Tree,
+    list: &mut ListState,
 ) -> Option<u32> {
     let rows = modal_rows(programs, query.text());
-    // A throwaway for the reason `present_modal`'s is one: no selection is kept.
-    let mut list = ListState::default();
     // Nothing is hovered before the window exists.
-    let picture = render_modal(theme, font, query, &rows, &mut list, tree, None);
+    let picture = render_modal(theme, font, query, &rows, list, tree, None);
     let bytes = picture.into_bytes();
     let len = MODAL_PITCH * MODAL_H as usize;
     if bytes.len() != len {

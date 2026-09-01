@@ -75,7 +75,10 @@ a request is being met in a particular way.
 - [x] The open applications menu is positioned wrong.  It should be a drop down from the applications button.  It also doesn't close when you click outside of it.  Also, you can't click any of the menu items. Menu item hovering doesn't work either.
       *(batch 4 — all four were one cause: the shell read pointer events for the overview, the
       applications button and the taskbar, and never for the modal's own window.)*
-- [] Scrollbars don't appear to work.  You can't click and drag them.
+- [x] Scrollbars don't appear to work.  You can't click and drag them. *(batch 6 — `list_view`
+      built one and gave it no pointer handler, so a list's bar showed a position and could not be
+      dragged; `nxterm`'s was always wired. The launcher's list also kept no offset between
+      frames.)*
 - [x] The default window position should be more right.  The left side of the window should not be on the border of the screen. *(batch 4)*
 - [x] The "nitrox" label next to "applications" on the top bar doesn't do anything.  It doesn't appear to be a drop down menu.  Recommend we remove it. *(batch 4 — removed)*
 - [] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
@@ -96,6 +99,9 @@ Batches land here as they go, so the record of what changed and why is beside th
 - **Batch 2a — gradients, drawn window controls, borders** (2026-09-01). One `bevel` number for
   every gradient; `_`/`[]`/`X` became shapes; a `border` colour, with a line around popups and a
   darker edge on a selected row.
+- **Batch 6 — a scrollbar you can drag** (2026-09-01). `list_view`'s bar had no pointer handler
+  at all; the arithmetic was there and shared with `nxterm` all along. The launcher's list also
+  stopped being rebuilt from zero every frame, so `/bin`'s 26 entries are all reachable.
 - **Batch 5 — the blue highlight, and dismissal for real** (2026-09-01). Both reported as still
   broken after batch 4, both correctly: hover took the quiet branch because that list keeps no
   selection, and `Focus(false)` only fires when something raises — so clicking bare desktop or a

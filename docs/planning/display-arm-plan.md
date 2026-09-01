@@ -3350,6 +3350,21 @@ it is noticed on. Its own list, and its own milestone.
       twice — the parent is the whole bar, and dismissing is what makes clicking that button again
       close what it opened.
 
+- [x] **Batch 6 — a scrollbar you can drag** ✅ (2026-09-01). The arithmetic was never the
+      problem: `ScrollState::offset_at` has been right since M5 and `nxterm` has dragged its grid
+      with it ever since. `list_view` built a scrollbar and gave it **no pointer handler at all**,
+      so a list showed its position and could not be moved — a control that looks live and is not,
+      which is the defect this toolkit's own notes keep naming.
+
+      The conversion lives on `ListState` rather than in each caller, so a list's thumb and a
+      terminal's cannot drift apart on rounding. Two consumers wired it, and the launcher needed a
+      second fix to go with it: its list state was rebuilt every frame — true to "the launcher
+      keeps no selection", and it also meant the scroll offset reset every frame, so `/bin`'s 26
+      entries were ten reachable rows and a filter.
+
+      **The control is the `None` case.** Asserting that the bar carries a handler would pass for
+      a widget that attached one unconditionally, which is a different bug.
+
 - [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
       behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
       reference in the same commit, so the gate fails the moment pixels move without intent.

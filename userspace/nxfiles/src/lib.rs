@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{
@@ -200,6 +200,8 @@ pub enum Msg {
     Grab(u64),
     /// The "up" control was pressed.
     Up,
+    /// The scrollbar is being dragged — see [`ListState::drag_to`].
+    Scroll(PointerEvent),
     /// A key reached the window.
     Key(KeyEvent),
     /// The title bar was dragged.
@@ -321,6 +323,15 @@ impl App {
                 // Resolved here, while the listing this index came from is still the listing.
                 self.pressed =
                     self.entries.get(i as usize).map(|e| (e.name.clone(), 0, 0));
+            }
+            // **The drag converts through the widget's own arithmetic** — `ListState::drag_to`,
+            // the same `ScrollState::offset_at` `nxterm` uses for its grid — so a list and a
+            // terminal cannot disagree about where a thumb points (M11 Part E batch 6).
+            Msg::Scroll(p) => {
+                if p.buttons != 0 {
+                    let (h, total) = (self.list_h(), self.entries.len());
+                    self.list.drag_to(h, ROW_H, total, p.y);
+                }
             }
             Msg::Up => {
                 let up = parent(&self.path);
@@ -549,8 +560,17 @@ impl App {
         // lands on a row; by the time it comes up the gesture is over. The two do not fight —
         // a press that never moves produces a click and opens what was pressed, and one that
         // moves has already told the compositor it is carrying something.
-        let list =
-            list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, Some(Msg::Grab), hovered, &ui);
+        let list = list_view(
+            &rows,
+            &mut self.list,
+            h,
+            ROW_H,
+            Msg::Activate,
+            Some(Msg::Grab),
+            Some(Msg::Scroll),
+            hovered,
+            &ui,
+        );
 
         let body = window_frame(
             title,
