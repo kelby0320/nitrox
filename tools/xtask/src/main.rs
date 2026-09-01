@@ -1771,6 +1771,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // something ran. `test-interactive` already pins the `libsession` line for the serial
     // column, where it is ordered against a prompt rather than against another process.
     session.expect("desktop-shell: up (graphical session leader)")?;
+    // **The theme, read before anything is drawn** — which is also where this assertion has to
+    // sit: the shell reads it in `_start`, before its first bar exists, so an expectation placed
+    // beside the *topic* rather than beside its position in the stream scans past it (M11
+    // Part C). It comes from the user's own subtree rather than `/etc`, because a session
+    // namespace binds `/home` and has no `/etc` — no new authority, and the file is somewhere a
+    // person can actually delete.
+    session.expect("desktop-shell: theme read from /home/theme.toml")?;
     // **The narrow bind, which is what closed the `manage-ungated` deferral.** The shell builds
     // an application namespace and checks it *before* launching into it: `/dev/draw/new`
     // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
@@ -2665,12 +2672,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     }
     press(&mut qmp, "ret")?;
     session.expect("desktop-shell: launched nxfiles into its own namespace")?;
+    // **The theme reached the application** (M11 Part C): a value that travelled from a file on
+    // disk, through one reader in the shell, onto the setup record every launch already carries,
+    // and into a window. It is asserted here because it is the first thing the client says — it
+    // reads what the session told it before it reads a directory.
+    session.expect("nxfiles: theme font_px 16")?;
     // **It starts at `HOME`**, which is the binding the shell gave it and not a path compiled
     // in. The count is read rather than asserted: what is in a user's home is the image's
     // business, and a gate that pinned it would fail the first time anything else wrote there.
     session.expect("nxfiles: listed /home - ")?;
     let listed = session.rest_of_line()?;
     println!("  ok: nxfiles started at HOME and listed it ({})", listed.trim());
+
 
     // **Where the shell put it**, read after the listing rather than before it: a client lists
     // its directory *then* creates its window, so the shell's geometry line comes second — and
@@ -7814,9 +7827,22 @@ fn assemble_image(
         fs::write(staging.join("system").join("users"), users.as_bytes())?;
     }
     // The demo user's home directory — the writable session root a login constructs
-    // (auth Part E). Empty for now; the user shell writes a file into it.
+    // (auth Part E). The user shell writes into it, and since M11 Part C it arrives holding
+    // the session's theme.
     fs::create_dir_all(staging.join(DEMO_HOME.trim_start_matches('/')))?;
-    println!("xtask: seeded /system/users + {DEMO_HOME}");
+    // **The theme, shipped with every field written out** (M11 Part C). It could ship empty or
+    // not at all — a missing file is the built-in theme, which is what the host tests pin — and
+    // a file naming every value is what makes the thing *discoverable*: a person who wants to
+    // change a colour opens it and sees which colours there are. It is written from
+    // `Theme::dark()` rather than typed out, so the file and the constants cannot drift.
+    {
+        let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n");
+        text.push_str("# Colours are \"#RRGGBB\"; font_px is a size in pixels per em.\n\n");
+        text.push_str(&libdraw::theme::Theme::dark().to_config());
+        let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
+        fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
+    }
+    println!("xtask: seeded /system/users + {DEMO_HOME} (with a theme)");
     // The content-addressed store, pre-built read-only into the ext4 root. Each package
     // lives at /store/<hash>-<name>-<version>/bin/<prog> — a demand-paged file the profile
     // server projects into /bin. heartbeat is the first package. The store path (hash) is

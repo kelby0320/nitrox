@@ -83,6 +83,7 @@ name = "desktop-shell"
 version = "0.1.0"
 dependencies = [
  "libdraw",
+ "libfs",
  "libheap",
  "libkern",
  "librsproto",

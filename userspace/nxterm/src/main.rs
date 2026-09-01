@@ -286,6 +286,15 @@ fn wait_two(a: u64, b: u64) {
     };
 }
 
+/// The theme the shell handed this application, or the built-in one.
+///
+/// **Absent is normal rather than an error**: a client started outside a graphical session — by
+/// `init`, or by a test harness — gets no setup record at all, and a desktop that refused to draw
+/// without one would be a client that cannot be run on its own.
+fn theme_of(env: &libstream::wire::Record) -> Theme {
+    env.field_str("THEME").map(|s| Theme::from_config(s).0).unwrap_or_default()
+}
+
 /// Entry point.
 ///
 /// # Safety
@@ -370,7 +379,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    let theme = Theme { font_px: FONT_PX, ..Theme::default() };
+    // **From the environment, not from a default** (M11 Part C). The shell read the session's
+    // theme once and put it on the record every application is launched with; `font_px` comes
+    // with it, so this no longer overrides one.
+    let theme = theme_of(&env);
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();

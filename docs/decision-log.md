@@ -20553,3 +20553,42 @@ unchanged" cannot be shown by `check-display`: it compares the host's render aga
 screen, and a theme change moves both together, so it would stay green. What says no pixel moved
 is the picture itself — `git worktree add` of `main`, `cargo xtask preview` in each, `md5sum`.
 Both PNGs match. That is the first time the preview paid for itself, one part after it landed.
+
+## 2026-09-01 — M11 Part C: the theme is a file in the user's home, and where an assertion goes
+
+The session's theme is data now: `/home/theme.toml`, read once by `desktop-shell` at session
+start and handed to every application on the environment record each launch already carries.
+
+**In the user's home rather than `/etc`, and the reason is the namespace.** A session namespace
+binds `/home`, `/bin`, `/dev/tty` and — for a graphical one — `/system/fonts`. It has no `/etc`,
+and `session-mgr/CLAUDE.md` requires adding a member to be a design decision each time. Rather
+than take that decision, the theme went where a *user's* theme belongs: a subtree they already
+own, reachable with no new authority. The side effect is the better gate — the file is somewhere
+a person can delete, so "delete it and everything still renders" is a thing that can be run
+rather than a claim.
+
+**One reader, not one per client.** A client opening the file itself would need it in its
+namespace, would repeat the parse, and — worse — one launched before the file changed would
+disagree with one launched after. The shell reads it, normalises it, and serialises *every* field
+back onto the wire, so an application never receives a partial theme and never falls back.
+
+**The reader is a focused one, in the house style.** Flat `key = value`, no tables, living beside
+the type it produces — as `init`'s `toml_lite` and `service-mgr`'s `service_toml` each live beside
+theirs, each saying how it differs. What it accepts is valid TOML, so the file is a TOML file.
+
+**Every failure lands on the built-in theme**, and that is the design rather than a convenience:
+a desktop that will not start because its colours did not parse is a worse failure than any
+colour could be. Missing, empty, not UTF-8, or full of typos all render exactly what shipped; a
+bad line costs its own field and the rest of the file is still read; and `font_px` outside 6–96 is
+refused, because zero divides in the layout and a huge one puts one glyph in a window — a text
+file that makes the machine unusable is the one thing a theme must not be able to be.
+
+**And a process lesson, because I made the same mistake three times in one part.** Each assertion
+about the theme went in beside its *topic* and had to be moved to where the line actually appears
+in the stream: the shell reads the theme before it presents a bar, and `nxfiles` was reading its
+directory before its environment. The durable fix was not to reorder the gate a third time but to
+**log the value where the program learns it** — beside the other thing the session tells it —
+after which the order a reader expects and the order the stream has are the same. `expect`
+consumes forward, so an assertion placed by subject rather than by position scans past the line it
+is waiting for, and the failure reads as "the guest never said this" when the guest said it
+already.

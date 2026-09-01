@@ -3124,13 +3124,36 @@ it is noticed on. Its own list, and its own milestone.
 
 ### Part C — the theme becomes data
 
-- [ ] **A theme file, read by the shell, handed to each application on the setup record.** Its
-      default is what the constants say today, so an image with no theme file renders exactly as
-      it does now.
+- [x] **A theme file, read by the shell, handed to each application on the setup record** ✅ —
+      `/home/theme.toml`, parsed once at session start and put on the environment record every
+      launch already carries. Schema: [`theme-toml-schema.md`](../spec/theme-toml-schema.md).
 
-- [ ] **Gate**: `check-login`, plus a control that is the point of the part — **delete the file
-      and everything still renders**, at the defaults. A theme mechanism that a missing file can
-      break is worse than no mechanism.
+      **In the user's home rather than `/etc`, which is a namespace decision.** A session
+      namespace binds `/home`, `/bin`, `/dev/tty` and `/system/fonts` and has no `/etc`, and
+      `session-mgr/CLAUDE.md` requires that adding a member be decided each time. A theme is a
+      *user's*: the subtree they already own needs no new authority, and it is somewhere a person
+      can actually delete — which is what makes the control below a real one rather than an
+      assertion. A system default under `/etc` merged beneath it is the obvious next step;
+      trigger is a second user, or a control panel offering "reset to system".
+
+      **The shell's own bars follow it too**, not just the applications it launches — otherwise
+      the file themes the windows and not the chrome around them.
+
+- [x] **Gate** ✅ — `check-login` asserts the whole path in the order it happens: the shell reads
+      the file before it draws anything, and `nxfiles` reports the `font_px` that reached it. One
+      number rather than a colour, because colours are pixels and this gate boots a release image
+      with nothing rendered to read.
+
+      **Two controls, each run alone.** A file with `font_px = 21` makes the client report 21 and
+      fails the gate — so the value travels from disk, through one reader, onto the setup record
+      and into a window, rather than every end happening to agree on a default. And **the file
+      deleted entirely**: the shell logs `no /home/theme.toml; using the built-in theme` and the
+      *whole gate passes* — greeter, bars, work area, snap zones, the modal, the editor, the drag
+      and the drop. A theme mechanism a missing file can break is worse than no mechanism, and
+      that is checked rather than claimed.
+
+      The absent-file *decision* is also a host test on `Theme::from_config`, where an empty
+      file, a comment-only file and a file of typos are each exactly the built-in theme.
 
 ### Part D — the UI font stops being a terminal font
 
