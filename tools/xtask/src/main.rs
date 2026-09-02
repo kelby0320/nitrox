@@ -2907,9 +2907,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // 8b. **Undo, redo, and find** (M12 Part C). The grouping is the decision this part makes,
     //     and the gate asserts it the only way that cannot be argued with: **by byte count, from
     //     outside**. Two characters typed together are one group, so one undo takes both — seven
-    //     bytes on disk rather than eight — and a redo brings both back. An implementation that
-    //     grouped per *keystroke* would leave nine, and one that grouped per *save* would leave
-    //     seven after the redo as well.
+    //     bytes on disk rather than eight — and a redo brings both back to nine. An
+    //     implementation that grouped per *keystroke* would leave **eight** here; nine is what an
+    //     undo that took nothing leaves; and one that grouped per *save* would leave seven after
+    //     the redo as well. (This paragraph said nine for the per-keystroke case, twice, two
+    //     lines after getting it right — PR #269 review, worth fixing 4.)
     for c in "ab".chars() {
         let mut qcode = String::new();
         qcode.push(c);
@@ -2926,8 +2928,8 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_key("ctrl", true)?;
     press(&mut qmp, "s")?;
     qmp.send_key("ctrl", false)?;
-    // Seven: `nitrox` and the newline the editor adds. Nine would mean the undo took one
-    // character; the group is a word.
+    // Seven: `nitrox` and the newline the editor adds. Eight would mean the undo took one
+    // character rather than the group; nine would mean it took nothing.
     session.expect("nxedit: saved /home/papers/notes.txt - 7 bytes")?;
     session.send("open ./papers/notes.txt")?;
     session.expect(TYPED)?;
@@ -2962,8 +2964,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     }
     press(&mut qmp, "ret")?;
     session.expect("nxedit: find hit at line 0")?;
-    // Escape ends the mode and gives the keys back to the buffer — asserted by the next thing
-    // typed reaching it, which is step 9's drag and everything after.
+    // Escape ends the mode. **Not asserted here, and this comment used to say it was** — nothing
+    // types into this editor again: step 9 drags its title bar with the pointer, and the click
+    // after that hands the keyboard to the browser, so a find field left open would change
+    // nothing any later step can see (PR #269 review, worth fixing 3). What covers it is
+    // `nxedit`'s own `ctrl_f_opens_a_find_field_and_enter_walks_the_matches`, which fails when
+    // `Esc` stops closing a find field. The press is kept because leaving the editor in a mode
+    // the rest of the run does not expect is worse than a keystroke nobody checks.
     press(&mut qmp, "esc")?;
     println!("  ok: find took the keys, matched, and gave them back");
 

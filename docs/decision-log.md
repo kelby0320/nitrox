@@ -21975,3 +21975,35 @@ cursor. That lands inside a multi-byte character whenever the cursor is on one, 
 range starting there yields `None`, the rest of the line was silently skipped, and find appeared to
 go *backwards* — wrapping to a match behind the cursor. The test that caught it was the one written
 for a property rather than for a path: "find does not split a multi-byte character".
+
+## 2026-09-02 — what #269's review caught: two guards that could not fire, and one that had to
+
+No blocking findings, and the interesting part is what happened when I acted on an *optional* one.
+
+**Two guards that could not fire.** The `Ctrl+F` re-open check is unreachable — a field takes the
+keys before the chord match is reached, so `Ctrl+F` while finding is swallowed by the field — and
+the comment above it described carrying the needle across an `Esc`, which the editor does not do.
+That is the same shape PR #258's review removed from `with_text`, and its note still applies: *a
+guard that cannot fire reads as protecting an invariant it does not.*
+
+**And one that had to.** The reviewer also noted, as an optional, that the new no-op guards at the
+top of `backspace` and `delete` made their inner repeats unreachable. Removing the inner ones by
+restructuring looked obviously safe — and broke something within seconds, because
+`delete_selection` does **two** jobs: it removes a selection, *and* it clears an anchor the cursor
+has walked back onto. Calling it only when `selection().is_some()` skipped the second job and
+brought back PR #258's blocking 1 — an anchor that survives the edit and names a byte past the end
+of a line it has just shortened. `a_collapsed_selection_leaves_no_anchor_behind_an_edit`, written
+for that bug a milestone earlier, failed immediately.
+
+Two things worth keeping. **A function whose name describes one job may be doing two**, and the
+second is usually the one with no test of its own until it breaks — here it was named in a comment
+and I read past it. And a test written *where a bug was* keeps earning: this one has now caught the
+same defect twice, from two completely different directions, a milestone apart.
+
+**Also fixed**: `Msg::Save` on an untitled buffer was a silent no-op while the find field was open
+— "already asking" was written when naming was the only field there could be, and the save button
+stayed clickable and did nothing, which is the exact failure this application's own tests exist to
+catch. Escaping a search no longer blanks the strip, which was a control answering with nothing.
+Two gate comments overclaimed: the byte count that discriminates per-keystroke grouping is eight
+rather than nine, and the `Esc` after a search is not asserted by anything downstream, because
+nothing types into that editor again.

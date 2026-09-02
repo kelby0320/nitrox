@@ -1456,7 +1456,7 @@ reach for first — and the maintainer asked the question that produced this ent
 assuming an answer (2026-09-02).
 
 **Undo keeps whole copies rather than deltas — `TODO(undo-deltas)`.** `TextAreaState`'s history
-is [`MAX_UNDO`] snapshots of the whole buffer, which is the depth bound and the memory bound at
+is `MAX_UNDO` snapshots of the whole buffer, which is the depth bound and the memory bound at
 once. A delta stack costs the size of the *change* instead, and costs a separate inverse for every
 kind of edit — an insert, a join, a split, and a replace that is two of those at once. Each is a
 way to be subtly wrong and none of them is checkable by reading; a copy cannot be wrong about what

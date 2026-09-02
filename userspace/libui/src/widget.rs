@@ -1192,36 +1192,46 @@ impl TextAreaState {
     /// Delete backwards: the selection if there is one, else the character before the cursor,
     /// else join with the previous line.
     pub fn backspace(&mut self) -> bool {
-        // **The guard comes before the group**, so a `Backspace` that cannot do anything does not
-        // leave an undo step that visibly does nothing.
-        if self.selection().is_none() && self.col == 0 && self.line == 0 {
-            return false;
-        }
-        self.begin(EditKind::Deleting);
-        if self.delete_selection() {
-            // Replacing a selection is its own thing, not a run of deletions: whatever comes
-            // next — usually the character being typed over it — starts a group of its own.
+        // **A selection first, and it is its own kind of edit.** Replacing one is not a run of
+        // deletions: whatever comes next — usually the character being typed over it — starts a
+        // group of its own.
+        if self.selection().is_some() {
+            self.begin(EditKind::Deleting);
+            self.delete_selection();
             self.group = None;
             return true;
         }
+        // **And `delete_selection` still has work to do with no selection**, which is the reason
+        // this call is here and not folded into the branch above. It does two jobs: it removes a
+        // selection, and it clears an anchor the cursor has *walked back onto* — one that leaves
+        // no selection but would otherwise survive this edit and name a byte past the end of a
+        // line it has just shortened. That is PR #258's blocking 1, and skipping this call
+        // brought it straight back; the test written for it then is what caught that.
+        self.delete_selection();
+        // **One guard, before the group**, so a `Backspace` that cannot do anything leaves no
+        // undo step that visibly does nothing — and so that everything below can rely on there
+        // being something behind the cursor. It is load-bearing twice, which is why the inner
+        // repeats of it are gone: they could not fire, and a guard that cannot fire reads as
+        // protecting an invariant it does not (PR #269 review, optional 2).
+        if self.col == 0 && self.line == 0 {
+            return false;
+        }
+        self.begin(EditKind::Deleting);
         self.goal = None;
         if self.col > 0 {
             let prev = self.prev_boundary();
             self.lines[self.line].remove(prev);
             self.col = prev;
-            self.revision += 1;
-            return true;
+        } else {
+            // **Joining is the case a single-line field never has**, and the cursor lands where
+            // the join happened rather than at the start of the merged line — which is where the
+            // text the person was deleting towards now is. `col == 0` here, and the guard above
+            // ruled out `line == 0`, so there is a line before this one.
+            let cur = self.lines.remove(self.line);
+            self.line -= 1;
+            self.col = self.lines[self.line].len();
+            self.lines[self.line].push_str(&cur);
         }
-        if self.line == 0 {
-            return false;
-        }
-        // **Joining is the case a single-line field never has**, and the cursor lands where the
-        // join happened rather than at the start of the merged line — which is where the text
-        // the person was deleting towards now is.
-        let cur = self.lines.remove(self.line);
-        self.line -= 1;
-        self.col = self.lines[self.line].len();
-        self.lines[self.line].push_str(&cur);
         self.revision += 1;
         true
     }
@@ -1229,29 +1239,27 @@ impl TextAreaState {
     /// Delete forwards: the selection, else the character after the cursor, else join with the
     /// next line.
     pub fn delete(&mut self) -> bool {
-        // As in `backspace`: nothing to remove is not an undo step.
-        if self.selection().is_none()
-            && self.col >= self.lines[self.line].len()
-            && self.line + 1 >= self.lines.len()
-        {
-            return false;
-        }
-        self.begin(EditKind::Deleting);
-        if self.delete_selection() {
+        // The mirror of `backspace`, with the same one guard and for the same two reasons.
+        if self.selection().is_some() {
+            self.begin(EditKind::Deleting);
+            self.delete_selection();
             self.group = None;
             return true;
         }
+        // As in `backspace`: this clears a collapsed anchor and reports that it deleted nothing.
+        self.delete_selection();
+        if self.col >= self.lines[self.line].len() && self.line + 1 >= self.lines.len() {
+            return false;
+        }
+        self.begin(EditKind::Deleting);
         self.goal = None;
         if self.col < self.lines[self.line].len() {
             self.lines[self.line].remove(self.col);
-            self.revision += 1;
-            return true;
+        } else {
+            // At the end of a line that is not the last: the guard above says so.
+            let next = self.lines.remove(self.line + 1);
+            self.lines[self.line].push_str(&next);
         }
-        if self.line + 1 >= self.lines.len() {
-            return false;
-        }
-        let next = self.lines.remove(self.line + 1);
-        self.lines[self.line].push_str(&next);
         self.revision += 1;
         true
     }
@@ -2824,6 +2832,25 @@ mod tests {
         a.end(false);
         assert!(!a.delete(), "nothing after it");
         assert!(!a.undo());
+    }
+
+    #[test]
+    fn placing_the_cursor_ends_a_group() {
+        // **The fifth boundary, and the one with no test until PR #269's review said so.** A
+        // click is a movement and closes a group for the same reason an arrow key does — and it
+        // is forward-looking here: nothing outside this crate's own tests wires a press to
+        // `place` yet, so the editor cannot reach it. That is a reason for a test rather than
+        // against one: the day `text_area` grows click-to-place, this rule has to already hold.
+        let mut a = TextAreaState::with_text("ab");
+        a.end(false);
+        a.insert('X');
+        a.place(0, 0);
+        a.insert('Y');
+        assert_eq!(a.text(), "YabX");
+        assert!(a.undo());
+        assert_eq!(a.text(), "abX", "only the edit after the click");
+        assert!(a.undo());
+        assert_eq!(a.text(), "ab");
     }
 
     #[test]

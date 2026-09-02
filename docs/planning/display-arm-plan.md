@@ -3920,6 +3920,25 @@ The two taken before this pass — the clipboard's owner and the image format �
       the redo as well. Then `Ctrl+F`, a needle typed with a receipt per character, and the line
       the match landed on.
 
+- [x] **What the review found, and one regression it led me into** ✅ (PR #269, no blockers).
+      Two were controls that could not fire: the `Ctrl+F` re-open guard is unreachable — a field
+      takes the keys before the chord match is looked at — and its comment described a
+      needle-across-`Esc` behaviour the editor does not have. And `Msg::Save` on an untitled
+      buffer was a **silent no-op while the find field was open**, because "already asking" was
+      written when naming was the only field there could be: the save button stayed clickable and
+      did nothing.
+
+      **Removing two unreachable guards broke something the existing suite caught.**
+      `delete_selection` does *two* jobs — it removes a selection, and it clears an anchor the
+      cursor has walked back onto — and restructuring `backspace` to call it only when there *is*
+      a selection brought PR #258's stale-anchor bug straight back. The test written for that bug
+      a milestone ago failed within seconds. It is the best argument in this part for writing the
+      test where the bug was rather than where the code is.
+
+      Plus two gate comments that overclaimed: the byte count discriminating per-*keystroke*
+      grouping is eight and not nine, and the `Esc` after a search is **not** asserted by anything
+      downstream — nothing types into that editor again.
+
       **Thirteen host tests in `libui` and six in `nxedit`**, thirteen of them run alone against a
       broken implementation: no separator boundary, no movement boundary, deletions sharing a kind
       with typing, a no-op edit opening a group, an edit keeping the way forward, find starting one

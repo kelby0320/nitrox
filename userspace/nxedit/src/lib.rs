@@ -218,7 +218,7 @@ pub struct App {
     /// because the two name different windows: an interactive move is a request on one window
     /// id, and one flag would have moved whichever window the binary happened to pass.
     confirm_move_requested: bool,
-    /// A name being typed for a buffer that has never had one.
+    /// Text being typed into the status strip's field, and what it is for.
     ///
     /// **`Some` is a mode**, and it is the first one this editor has: while a name is being typed
     /// the keys belong to it rather than to the buffer, and the status strip shows the field
@@ -488,7 +488,12 @@ impl App {
             // yet, and inventing a path would be a file somebody did not choose.
             Msg::Save => {
                 if self.path.is_empty() {
-                    if self.field.is_none() {
+                    // **Any field but a naming one is replaced**, not treated as "already
+                    // asking" (PR #269 review, worth fixing 2). `field.is_none()` was right
+                    // when naming was the only mode; once find joined it, clicking *save* with
+                    // the find field open did nothing at all — a control that looks live and is
+                    // not, in an application whose own tests exist to catch exactly that.
+                    if self.field_kind() != Some(Field::Naming) {
                         self.field = Some((Field::Naming, TextFieldState::new()));
                         self.status = String::from("name it, then Enter");
                     }
@@ -552,10 +557,13 @@ impl App {
             match k.keycode {
                 NAME_CANCEL => {
                     self.field = None;
-                    self.status = String::from(match which {
-                        Field::Naming => "not saved",
-                        Field::Finding => "",
-                    });
+                    // **Naming says what it did not do; find leaves the strip alone.** Blanking
+                    // it was a control answering with nothing, and what it would have erased is
+                    // the answer to the last search — which is still the most recent thing that
+                    // happened (PR #269 review, optional 3).
+                    if which == Field::Naming {
+                        self.status = String::from("not saved");
+                    }
                 }
                 NAME_CONFIRM => match which {
                     Field::Naming => {
@@ -612,12 +620,17 @@ impl App {
                         "nothing to redo"
                     });
                 }
-                // **Opening the field does not clear it**, so `Ctrl+F` twice in a row is a way
-                // back to the search you were running rather than a way to lose it.
+                // **Reached only when no field is open**, because a field takes the keys
+                // before this match is looked at — so `Ctrl+F` while finding is swallowed by
+                // the field (the keymap folds it to a control byte, which `apply` declines) and
+                // never arrives here. The first version guarded against re-opening, and that
+                // guard could not fire: a guard that cannot fire reads as protecting an
+                // invariant it does not, which is the note PR #258's review left on the same
+                // shape (PR #269 review, worth fixing 1). The field therefore always starts
+                // empty; carrying the last needle across an `Esc` would be a feature, and is
+                // not one anybody has asked for.
                 FIND_KEYCODE => {
-                    if self.field_kind() != Some(Field::Finding) {
-                        self.field = Some((Field::Finding, TextFieldState::new()));
-                    }
+                    self.field = Some((Field::Finding, TextFieldState::new()));
                     self.status = String::from("find, then Enter");
                 }
                 // **Every other chord is swallowed, not passed on.** `Ctrl+X` folding to a
@@ -655,9 +668,14 @@ impl App {
         self.confirming
     }
 
-    /// How many characters have been typed into the name field, or `None` when it is not open.
+    /// How many characters have been typed into the strip's field, or `None` when none is open.
     ///
-    /// **The receipt for the one thing typed here that is not the buffer.** `revision` covers
+    /// **Either field** — a name or a search — since M12 Part C, which is why the receipt that
+    /// reports it says *which*: [`Field::label`], read through [`field_kind`](Self::field_kind).
+    /// A caller that assumed this was only ever a name would build a line a gate waits on for
+    /// ever while somebody types a search.
+    ///
+    /// **The receipt for the things typed here that are not the buffer.** `revision` covers
     /// edits; naming an untitled buffer changes nothing the revision counter can see, and a
     /// gate driving a release image has no rendered field to read — so seven injected
     /// keystrokes were seven chances to lose one and discover it as a file called `scrath`.
@@ -1293,6 +1311,46 @@ mod tests {
 
         key(&mut a, libkern::abi::KEY_ESC, 0);
         assert_eq!(a.field_kind(), None, "and Escape ends it");
+    }
+
+    #[test]
+    fn save_while_finding_asks_for_a_name_rather_than_doing_nothing() {
+        // **The save button stays in the strip and stays clickable while a search is open**, and
+        // "already asking" was written when naming was the only field there could be. With find
+        // beside it, pressing save did nothing at all and the strip did not change — a control
+        // that looks live and is not, one test over from the one that exists to catch that
+        // (PR #269 review, worth fixing 2).
+        let mut a = App::new("", "/home");
+        a.absent();
+        key(&mut a, FIND_KEYCODE, MOD_CTRL);
+        assert_eq!(a.field_kind(), Some(Field::Finding));
+
+        a.update(Msg::Save);
+        assert_eq!(a.field_kind(), Some(Field::Naming), "the search gives way to the question");
+        assert!(a.status().contains("name it"), "status was {:?}", a.status());
+
+        // And a second save while *naming* is still "already asking", which is what that guard
+        // was for: it must not throw away what has been typed so far.
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Save);
+        assert_eq!(a.naming_len(), Some(1), "the name survives a second press");
+    }
+
+    #[test]
+    fn escaping_a_search_leaves_the_strip_saying_what_last_happened() {
+        // Blanking it was a control answering with nothing, and what it erased was the answer to
+        // the search being escaped — still the most recent thing that happened.
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("one two", b"one two\n");
+        key(&mut a, FIND_KEYCODE, MOD_CTRL);
+        for code in [20u16, 17, 24] {
+            key(&mut a, code, 0);
+        }
+        key(&mut a, libkern::abi::KEY_ENTER, 0);
+        let after_find = String::from(a.status());
+        assert!(after_find.contains("found"));
+        key(&mut a, libkern::abi::KEY_ESC, 0);
+        assert_eq!(a.status(), after_find, "escaping a search erases nothing");
     }
 
     #[test]

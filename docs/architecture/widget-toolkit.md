@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-01), and this document describes what
+**Status: built (2026-08-11, last checked 2026-09-02), and this document describes what
 exists.** M12 Part A added `window::Child` — the toolkit's first module that is not a function of
 values, and the one that closes §11's multi-window deferral for the windows an application opens
 beside its main one. M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
