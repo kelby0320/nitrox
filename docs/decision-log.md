@@ -21620,3 +21620,32 @@ knowing.
 **The wallpaper fits or centres**, using the box downscale that exists and explicitly refuses to
 scale up; scaling to fill is deferred as a *mode* rather than dropped, so the theme key is designed
 with room for one beside the path and only one mode ships.
+
+## 2026-09-01 — the kill ring's cursor, pinned down by a question about two applications
+
+M12's details pass said the clipboard's ring is the server's and the cursor into it is the
+client's, and left it at "a client remembers which entry it last pasted and asks for the next".
+The maintainer asked what that does to the ordinary case — copy in one application, paste in
+another.
+
+**It does nothing to it**, because an ordinary paste never consults a cursor: it takes the newest
+entry, whoever copied it. But the question is a good one, because the sentence it was aimed at
+describes *persistent* client state, and persistent state goes stale — paste, cycle back two,
+have another application copy, and the next paste comes from a position that now points at
+something else.
+
+So the rule is written down properly, and it is Emacs's:
+
+- **A paste takes the newest entry.** Index 0, always.
+- **Cycling is a continuation of a paste, not state.** Valid only immediately after one, replacing
+  what was just inserted, and ended by any other action — typing, a copy, focus moving. That is
+  what makes a stale cursor *unreachable* rather than merely unlikely: the position exists inside
+  one uninterrupted gesture, and everything that could invalidate it has already ended it.
+- **And where it can still go stale, the server says so.** Decision 4 put the clipboard on a path,
+  so something not being driven by the person can push while they are mid-cycle. Entries carry the
+  ring's serial and a cycle request carries the one it saw; a ring that moved underneath produces a
+  restart from the newest rather than a silently wrong paste. One `u64`.
+
+Worth noting how this arrived: the design was sound and its *description* was not, and the gap was
+found by asking what it did to the most ordinary thing somebody would do with it. A decision
+record that cannot answer that question has not been written down yet.

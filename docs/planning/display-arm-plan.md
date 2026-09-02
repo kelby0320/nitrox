@@ -3713,8 +3713,29 @@ with a kill ring exists to avoid. So the server keeps the last N entries, most r
 The division is the interesting half: **the ring is shared and the position in it is not.** A
 "paste the one before that" gesture is a property of the editing somebody is doing right now, not
 of the machine — two applications cycling at once would fight over one cursor, and a cursor that
-one client advanced would move under another. So a client remembers which entry it last pasted and
-asks for the next; the server answers by index and holds no per-client state.
+one client advanced would move under another. So the server answers by index and holds no
+per-client state.
+
+**A paste always takes the newest entry, and never consults a cursor.** That is the ordinary case
+and the one that matters: copy in one application, paste in another. The client asks for index 0
+and gets what was last copied, whoever copied it.
+
+**Cycling is a continuation of a paste, not state a client keeps.** It is valid only immediately
+after one — it *replaces* what was just inserted — and any other action ends the sequence:
+typing, a copy, focus moving away. That is Emacs's rule for `M-y`, and it is the rule rather than
+an implementation detail, because it is what makes a stale cursor unreachable: the position exists
+only inside one uninterrupted gesture, and anything that could invalidate it has already ended it.
+
+**Where it can still go stale, the server says so.** Decision 4 makes the clipboard reachable from
+a pipeline, so something *not* being driven by the person can push while they are mid-cycle. Each
+entry therefore comes back with the ring's serial, and a cycle request carries the serial it last
+saw; if the ring has moved under it the server says so and the client starts again from the
+newest. One `u64`, and it turns a silent wrong paste into a visible restart.
+
+(The under-specified version of this said only that "a client remembers which entry it last pasted
+and asks for the next", which reads as persistent state — the maintainer asked what that does to a
+copy between two applications, and the answer is nothing, but the question is what produced the
+three rules above.)
 
 **4. It is reachable as a path, and usable from a pipeline.** `/dev/clipboard`, bound into the
 session namespace the way `/dev/tty` and `/dev/draw` are. There is no generic read/write verb in
