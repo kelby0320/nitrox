@@ -2908,6 +2908,67 @@ mod tests {
         }
     }
 
+    // ---- paste and its range (M12 Part E) ----
+
+    #[test]
+    fn insert_text_returns_the_range_it_occupies() {
+        // **The return value is what makes cycling possible at all.** M12 decision 3 says a
+        // cycle *replaces what was just inserted*, so the caller has to be told where that is —
+        // and deriving it at the call site from the cursor and the text's shape would be the
+        // same arithmetic done somewhere with less to check it against.
+        let mut a = area();
+        a.apply(KEY_RIGHT, 0); // between `a` and `bc`
+        let (from, to) = a.insert_text("XY");
+        assert_eq!(a.text(), "aXYbc\nde\nfghi");
+        assert_eq!(from, (0, 1));
+        assert_eq!(to, (0, 3), "one line, so the range is columns 1..3");
+
+        // …and a multi-line paste ends on the line it made, not the one it started on.
+        let mut a = area();
+        let (from, to) = a.insert_text("one\ntwo");
+        assert_eq!(from, (0, 0));
+        assert_eq!(to, (1, 3));
+        assert_eq!(a.text(), "one\ntwoabc\nde\nfghi", "and the tail followed it down");
+    }
+
+    #[test]
+    fn select_range_then_insert_text_is_the_cycle() {
+        // The two halves together are what `nxedit::App::cycled` does. Doing it here as well
+        // pins the *primitives*: `nxedit`'s own test would pass against a `select_range` that
+        // selected nothing, because `insert_text` inserts at the cursor either way.
+        let mut a = area();
+        let (from, to) = a.insert_text("FIRST");
+        assert_eq!(a.text(), "FIRSTabc\nde\nfghi");
+        a.select_range(from, to);
+        assert_eq!(a.selected_text().as_deref(), Some("FIRST"), "the range names what went in");
+        a.insert_text("SECOND");
+        assert_eq!(a.text(), "SECONDabc\nde\nfghi", "which the next paste replaced");
+    }
+
+    #[test]
+    fn select_range_clamps_a_stale_range_rather_than_panicking() {
+        // **The guard is documented and was not covered** (PR #271 review, optional 7). A range
+        // is only valid until the next edit, and a cycle that arrived after one would otherwise
+        // index out of the buffer — in an editor holding somebody's unsaved work. Clamping
+        // makes a stale range select something harmless instead.
+        let mut a = area();
+        a.select_range((99, 99), (99, 99));
+        assert_eq!(a.selected_text(), None, "collapsed onto the end of the last line");
+        assert_eq!(a.cursor(), (2, 4), "and the cursor is inside the buffer");
+        assert_eq!(a.text(), "abc\nde\nfghi", "nothing was changed by asking");
+    }
+
+    #[test]
+    fn select_range_lands_on_a_character_boundary() {
+        // Columns are byte offsets, and a stale one can point into the middle of a multi-byte
+        // character — where every `String` operation below panics. Clamping walks back to the
+        // boundary rather than trusting the number.
+        let mut a = TextAreaState::with_text("aéb");
+        // `é` is two bytes, so 2 is inside it.
+        a.select_range((0, 0), (0, 2));
+        assert_eq!(a.selected_text().as_deref(), Some("a"));
+    }
+
     // ---- undo and redo (M12 Part C) ----
 
     #[test]

@@ -159,8 +159,14 @@ All three are in [`deferred-decisions.md`](../rationale/deferred-decisions.md).
   because `nxterm` in a release image does not report its grid, and because a paste that delivered
   the wrong bytes makes a differently-named file rather than a matching count.
 - Host tests: the ring in `clipboard-server`, the codec in `librsproto::clipboard`, selection and
-  reflow in `libterm::grid`, the paste primitive in `libui::widget`, and the chords and the cycling
-  discipline in `nxedit` and `nxterm`.
+  reflow in `libterm::grid`, **the highlight in `libterm::render`**, the paste primitive and
+  `select_range`'s clamp in `libui::widget`, and the chords and the cycling discipline in `nxedit`
+  and `nxterm`.
+
+  Two of those exist because the review asked where the coverage actually was and found it absent:
+  the selection **highlight** had none at all — no host test, and no gate drags a pointer over a
+  grid, so it could have been deleted with the tree still green — and this list named `libui`
+  before anything was tested there.
 
 [`CLIP_RING`]: ../../userspace/librsproto/src/clipboard.rs
 [`MAX_CLIP_BYTES`]: ../../userspace/librsproto/src/clipboard.rs

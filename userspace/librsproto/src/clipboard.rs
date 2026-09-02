@@ -522,9 +522,33 @@ mod tests {
         // of what arrived — the whole class the `read` bound exists for. Handing the reader
         // bytes a correct writer would never produce is the only way to test it: a round-trip
         // test cannot, because the writer and the reader would agree about the lie.
+        //
+        // **The length has to be *inside* the cap**, or this tests the wrong half. `read`
+        // refuses on two conditions — over `MAX_CLIP_BYTES`, and past what arrived — and a
+        // stamped 4000 trips the first, so the arrival bound this test is named for was never
+        // reached and could be deleted with the suite still green (PR #271 review, blocking 2).
+        // 100 is a legal entry length and twenty bytes is not a hundred.
         let mut buf = [0u8; CLIP_ENTRY_HEAD + 4];
         ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
-        put_u32(&mut buf, 10, 4000);
+        put_u32(&mut buf, 10, 100);
+        assert!(100 < MAX_CLIP_BYTES, "the cap must not be what refuses this");
+        assert_eq!(ClipEntry::read(&buf), None);
+    }
+
+    #[test]
+    fn a_declared_length_over_the_cap_is_refused_too() {
+        // The other half, kept separate so neither can stand in for the other — **and the
+        // buffer really has to be long enough to hold what it claims**, or the arrival bound
+        // refuses it first and this tests nothing. The first version of this test used a
+        // twenty-byte buffer and passed with the cap check deleted; the control caught it,
+        // which is the same lesson the review had just delivered one test along.
+        let mut buf = [0u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1];
+        ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
+        put_u32(&mut buf, 10, (MAX_CLIP_BYTES + 1) as u32);
+        assert!(
+            buf.len() >= CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1,
+            "the arrival bound must not be what refuses this"
+        );
         assert_eq!(ClipEntry::read(&buf), None);
     }
 

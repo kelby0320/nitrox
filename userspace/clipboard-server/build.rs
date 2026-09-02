@@ -1,12 +1,11 @@
-//! Pass the absolute path to `user.ld` as a `-T` link arg. Cargo runs the linker
-//! from the target directory, so a relative path in `.cargo/config.toml` would not
-//! resolve — this mirrors `kernel/build.rs`.
+//! Pass the absolute path to `user.ld` as a `-T` link arg. Cargo runs the linker from the
+//! target directory, so a relative path in `.cargo/config.toml` would not resolve — this
+//! mirrors `kernel/build.rs`.
 //!
-//! Like init, profile-server is also a **library** with host unit tests
-//! (`cargo test -p profile-server --lib`). The fixed-address bare-target script must
-//! NOT reach that host link (it corrupts it — the linker errors), so we use
-//! `rustc-link-arg-bins`, which applies only to the `[[bin]]`, never to the lib
-//! test binary.
+//! `clipboard-server` is a **library** with host unit tests (`cargo test -p clipboard-server
+//! --lib`) as well as a bare-target binary. The fixed-address link script must NOT reach that
+//! host link — it corrupts it, and the linker errors — so this uses `rustc-link-arg-bins`,
+//! which applies only to the `[[bin]]` and never to the lib test binary.
 
 use std::env;
 use std::path::PathBuf;

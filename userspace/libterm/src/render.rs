@@ -457,6 +457,58 @@ mod tests {
     }
 
     #[test]
+    fn a_selected_cell_is_drawn_inverted_and_its_neighbour_is_not() {
+        // **The highlight had no test at all** (PR #271 review, worth fixing 3): `cursor ||
+        // selected` could be reduced to `cursor` and all 164 host tests stayed green, and no
+        // guest gate drags a pointer over a grid — `check-display` never types, `check-terminal`
+        // types but never drags, and step 9d asserts the paste through the filesystem. A person
+        // would have swept across the terminal and seen nothing.
+        let f = font();
+        let m = Metrics::new(&f, 16.0);
+        let p = Palette::default();
+        let mut g = Grid::new(4, 1);
+        g.apply_all(&[Op::Print('a'), Op::Print('b'), Op::Print('c')]);
+        // Columns 0 and 1, half-open at the head — so `c` in column 2 is outside it.
+        g.select_from(0, 0);
+        g.extend(0, 2);
+        let mut fb = fb_for(&m, 4, 1);
+        render(&mut fb, &g, &f, &m, &p, Point::new(0, 0));
+
+        assert!(is_inverted(&fb, m.cell_rect(0, 0), &p), "column 0 is selected");
+        assert!(is_inverted(&fb, m.cell_rect(0, 1), &p), "column 1 is selected");
+        assert!(
+            !is_inverted(&fb, m.cell_rect(0, 2), &p),
+            "column 2 is past the head and must not be highlighted"
+        );
+    }
+
+    #[test]
+    fn the_cursor_still_reads_as_the_cursor_inside_a_selection() {
+        // **Inverting twice is not inverting.** A cursor inside a selection drawn by both rules
+        // would come out as a *hole* in the highlight — the one cell that looks unselected being
+        // the one the person is about to type at. The cursor wins, so it stays inverted and the
+        // cell is indistinguishable from its selected neighbours, which is the intended answer:
+        // the row reads as one highlighted run.
+        let f = font();
+        let m = Metrics::new(&f, 16.0);
+        let p = Palette::default();
+        let mut g = Grid::new(4, 1);
+        g.apply_all(&[Op::Print('a'), Op::Print('b')]); // the cursor is on column 2
+        assert_eq!(g.cursor(), (0, 2));
+        g.select_from(0, 0);
+        g.extend(0, 4);
+        let mut fb = fb_for(&m, 4, 1);
+        render(&mut fb, &g, &f, &m, &p, Point::new(0, 0));
+
+        for col in 0..3 {
+            assert!(
+                is_inverted(&fb, m.cell_rect(0, col), &p),
+                "column {col} is inside the selection and the cursor must not punch a hole in it"
+            );
+        }
+    }
+
+    #[test]
     fn only_the_rows_asked_for_are_drawn() {
         // The whole point of per-row damage. A render that ignored its row list would repaint
         // the window on every keystroke, undoing the toolkit's diff one layer up.

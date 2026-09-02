@@ -22256,3 +22256,37 @@ where the two spaces coincide and the bug is invisible. What made it findable wa
 one had been written down *next to the field*, so adding a caller who damages the grid meant
 reading a paragraph about exactly this. A comment naming a class rather than an instance is the
 thing that pays here.
+
+## 2026-09-02 — what #271's review caught: two tests that answered for both versions
+
+No blocking finding in the code. Both were **tests that passed against a deliberately broken
+implementation**, which the reviewer established by breaking thirteen production lines and running
+the targeted suite each time rather than by reading them.
+
+**A guard tested in a state where a different guard answers.**
+`motion_with_no_button_held_does_not_select` sent motion with no button held and asserted nothing
+was selected. It never *pressed* — so there was no anchor, and `Grid::extend`'s own no-anchor guard
+returned early for the correct version and for one with `nxterm`'s `buttons` check deleted. What it
+pinned was `libterm`'s guard, which `libterm` already tests. The discriminating state is *after a
+release*: a release does not clear the anchor, so a pointer crossing the grid afterwards drags the
+head along with it. `left: Some("hello wor")` against `right: Some("hello")`.
+
+**A bound tested with a value the other bound refuses first.** `ClipEntry::read` refuses on two
+conditions — over `MAX_CLIP_BYTES`, and past what actually arrived. The test named for the second
+stamped a length of 4000, which is over the cap, so the first refused it and the second could be
+deleted with the suite green. They are two tests now, and each needed its own arrangement: the
+arrival one stamps a length *inside* the cap, and the cap one needs a buffer **long enough to hold
+what it claims**, or the arrival bound refuses it first. The first version of that second test made
+exactly the mistake it was written to fix, and its control caught it one command later.
+
+**The general shape, four for four this milestone.** A test reaches the answer without going
+through the code that computes it. #270's version was a rule re-stated in a local closure; this
+one is a *second guard* standing in for the one under test. The check that finds both is the same:
+break the line, run the suite, see whether anything goes red.
+
+**And one thing with no test at all**, which the same method surfaced: the selection **highlight**.
+`cursor || selected` reduced to `cursor` left all 164 host tests green, and no gate drags a pointer
+over a grid — `check-display` never types, `check-terminal` types but never drags, and Part E's own
+gate asserts the paste through the filesystem. Two lines of rendering, stated as behaviour in an
+architecture document, deletable in silence. `libterm::render` now pins the highlight and the
+cursor-wins precedence, using the `is_inverted` helper the cursor's own test has had since M5.

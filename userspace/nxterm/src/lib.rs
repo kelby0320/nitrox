@@ -882,14 +882,29 @@ mod tests {
     }
 
     #[test]
-    fn motion_with_no_button_held_does_not_select() {
-        // The router delivers motion whether or not a button is down, so without this check the
-        // pointer merely crossing the grid on its way to the scrollbar would select.
+    fn motion_after_a_release_does_not_go_on_selecting() {
+        // The router delivers motion whether or not a button is down, so without
+        // `grid_pointer`'s `buttons` check the pointer crossing the grid on its way to the
+        // scrollbar would drag the head of a finished selection along with it.
+        //
+        // **It has to select first.** A version of this that only sent motion passed against the
+        // guard *and* against its removal: with no anchor, `Grid::extend` returns early either
+        // way, so what it pinned was `libterm`'s own no-anchor guard rather than this one
+        // (PR #271 review, blocking 1). A release does not clear the anchor — that is what makes
+        // the state after one the discriminating case.
         let mut a = app();
         a.feed(b"hello world");
         let (w, h) = (a.metrics.cell_w as i32, a.metrics.cell_h as i32);
-        a.update(Msg::GridPointer(ptr(POINTER_MOTION, 0, 0, 5 * w, h / 2)));
-        assert_eq!(a.grid.selection(), None);
+        a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
+        a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
+        a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 0, 0, 5 * w, h / 2)));
+        assert_eq!(a.grid.selected_text().as_deref(), Some("hello"), "the drag selected");
+        a.update(Msg::GridPointer(ptr(POINTER_MOTION, 0, 0, 9 * w, h / 2)));
+        assert_eq!(
+            a.grid.selected_text().as_deref(),
+            Some("hello"),
+            "and a pointer merely passing over it afterwards did not extend it"
+        );
     }
 
     #[test]

@@ -4105,6 +4105,27 @@ The two taken before this pass — the clipboard's owner and the image format �
       `close_retained_endpoints` had been closing three of what were four endpoints since the
       compositor's was added, leaking it on a failed `service-mgr` spawn.
 
+- [x] **Review fixes** ✅ (PR #271, and no blocking finding in the *code*). The reviewer ran
+      thirteen negative controls rather than reading them, and **two produced no failure** — both
+      tests rather than production lines. `motion_with_no_button_held_does_not_select` never
+      pressed, so `Grid::extend`'s own no-anchor guard answered for the correct and the broken
+      version alike; it selects and releases first now, and its control reports
+      `left: Some("hello wor")`. And the codec's arrival bound was tested with a stamped length
+      *over the cap*, so the cap refused it and the bound the test is named for was never reached
+      — two tests now, each with a control the other cannot pass.
+
+      **The highlight had no test at all**, which is the one that would have been visible: a
+      person dragging across the terminal would have seen nothing, and `cursor || selected` could
+      have been reduced to `cursor` with 164 host tests still green. `libterm::render` pins both
+      the highlight and the cursor-wins precedence, using the `is_inverted` helper the cursor's
+      own test already had.
+
+      Plus four smaller ones: `libinput` moved to `[dev-dependencies]` in `nxterm`, a comment
+      describing a selection as "dropped" on a reflow when it is clamped, a `build.rs` doc still
+      naming the crate it was copied from, and `libui` gaining the paste-primitive tests this
+      plan's gate list had already claimed — including `select_range`'s clamp, which was
+      documented as a guard against a stale range and covered by nothing.
+
 ### Part F — images and the wallpaper
 
 - [ ] **PNG decoded in the guest** — inflate, unfiltering, no interlacing. Decision 2 above.

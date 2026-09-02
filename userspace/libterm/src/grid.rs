@@ -663,9 +663,15 @@ impl Grid {
         self.row = line_index.saturating_sub(screen_start).min(rows - 1);
         self.col = cursor_col;
 
-        // 5b. **The selection follows too**, or is dropped if it named text the ring evicted.
-        //     A selection is a pair of absolute positions, exactly like the viewport's anchor
-        //     and for the same reason (see [`Selection`]).
+        // 5b. **The selection follows too** — a pair of absolute positions, exactly like the
+        //     viewport's anchor and for the same reason (see [`Selection`]).
+        //
+        //     **It is not dropped when it names evicted text**, and this comment said it was
+        //     (PR #271 review, optional 5). `map_position` clamps an out-of-range old line to
+        //     the nearest one it maps, so such a selection survives pointing somewhere
+        //     `selected_text` finds nothing for — which is harmless, because `view_cell`
+        //     answers `None` there and the read stops. Saying it was dropped described a branch
+        //     that does not exist, which is what the next reader would have gone looking for.
         self.selection = self.selection.map(|sel| Selection {
             anchor: reflow.map_position(sel.anchor.0, sel.anchor.1),
             head: reflow.map_position(sel.head.0, sel.head.1),
