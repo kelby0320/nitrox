@@ -1815,6 +1815,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // tree rather than a fixed grid. Hand-testing a list that scrolls and filters would be the
     // toolkit's layout re-derived in the shell; a router is what the toolkit already has.
     let mut modal_tree = Tree::new();
+    // The hover the modal's retained tree was last built with — see where it is resampled.
+    let mut modal_hover: Option<u64> = None;
     let mut modal_router = Router::new();
     // **Persistent, since M11 Part E batch 6.** It was a throwaway in each render on the argument
     // that the launcher keeps no selection — which was true and also meant the scroll offset
@@ -2257,7 +2259,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // it painted, so a click lands on the row a person can see.
                 if let libsurface::WindowEvent::Pointer(p) = event {
                     let rows = modal_rows(&programs, query.text());
-                    let hovered = modal_router.hovered_key(&modal_tree);
+                    let hovered = modal_hover;
                     let ui = modal_view(&query, &rows, &mut modal_list, hovered, &theme);
                     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
                     let l = libui::layout::layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
@@ -2273,8 +2275,19 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     // invisible to the gate that would want it. What proves this wiring is the
                     // click below it: hover and clicking ride the same router, so a router that
                     // hit-tests wrongly fails the launch.
-                    if modal_router.hovered_key(&modal_tree) != hovered {
-                        modal_dirty = true;
+                    // **Resampled only between gestures** (M12 Part B). A capture is a *tree
+                    // id* of the deepest node under the cursor, and a hovered row draws more
+                    // layers than a quiet one — so repainting with a *different* hover between a
+                    // press and its release gives that node a new id, `path_to_id` finds nothing
+                    // and the click is silently lost. It presents as a launcher row that can be
+                    // clicked and does nothing, once in every few runs, which is what this gate
+                    // failed on three times before the cause was found in `libui`.
+                    if !modal_router.grabbed() {
+                        let now = modal_router.hovered_key(&modal_tree);
+                        if now != modal_hover {
+                            modal_hover = now;
+                            modal_dirty = true;
+                        }
                     }
                     for msg in msgs {
                         // The drag converts through the widget's own arithmetic, which is what
@@ -2299,6 +2312,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 kprint(b"desktop-shell: the name prompt takes typing, not clicks\n");
                             } else {
                                 launcher.launch(name.as_str(), &[]);
+                                modal_hover = None;
                                 close_modal(
                                     &mut session,
                                     &mut modal,
@@ -2329,6 +2343,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
                 ) {
                     rename = false;
+                    modal_hover = None;
                     close_modal(
                         &mut session,
                         &mut modal,
@@ -2824,7 +2839,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 let rows = modal_rows(&programs, query.text());
                 // Read before the borrow: `present_modal` takes the tree mutably to record what
                 // it painted, and the hover it should paint *with* comes from the tree as it is.
-                let hovered = modal_router.hovered_key(&modal_tree);
+                let hovered = modal_hover;
                 present_modal(
                     &mut session,
                     id,

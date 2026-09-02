@@ -119,6 +119,21 @@ impl Router {
         self.focus
     }
 
+    /// Whether a button is being held on a widget — a gesture is in progress.
+    ///
+    /// **What a caller needs it for is the shape of its own tree.** A capture is a *tree id*, and
+    /// this toolkit's widgets change shape under the pointer: a hovered `menu_item` draws three
+    /// layers where a quiet one draws one, so the deepest node under the cursor — which is what
+    /// `hit_test` and therefore the capture names — is a different node with a different id. Then
+    /// `path_to_id` finds nothing on release and the click is silently lost.
+    ///
+    /// So a caller that retains a tree must not rebuild it with a *different* hover while this is
+    /// true. [`crate::window::Child`] does that for the windows it owns; a main window's loop has
+    /// to do it itself, which is what this is published for (M12 Part B).
+    pub fn grabbed(&self) -> bool {
+        self.capture.is_some()
+    }
+
     /// The widget holding the pointer capture, if a button is down.
     pub fn capture(&self) -> Option<u64> {
         self.capture

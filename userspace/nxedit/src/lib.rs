@@ -40,7 +40,8 @@ use libui::element::{
 use libui::widget::{
     GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState, TitleButtons,
     WINDOW_FRAME_H,
-    WidgetState, button, resize_grip, text_area, text_field, title_bar, window_frame,
+    WidgetState, button, dialog_frame, resize_grip, text_area, text_field, title_bar,
+    window_frame,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
@@ -78,58 +79,26 @@ pub const CONFIRM_TITLE_KEY: u64 = 10;
 /// The element key on the dialog's question.
 pub const CONFIRM_TEXT_KEY: u64 = 11;
 /// The element key on the dialog's button strip.
+///
+/// **Unused since `dialog_frame` took the strip** (M12 Part B) — the helper builds it and does
+/// not key it, wrapping both of the dock's children so the caller's keys sit one level down.
+/// Kept because the numbers below are spent and reusing this one would put two meanings on it.
 pub const CONFIRM_STRIP_KEY: u64 = 12;
 /// The element key on the dialog's *discard* button.
 pub const CONFIRM_DISCARD_KEY: u64 = 13;
 /// The element key on the dialog's *keep editing* button.
 pub const CONFIRM_KEEP_KEY: u64 = 14;
 
-/// The confirmation dialog's width in pixels.
+/// The confirmation dialog's geometry, **which is `libui`'s** since M12 Part B.
 ///
-/// **A size, not a measurement**, which is the opposite of what a menu does — and the reason is
-/// the gate. `check-login` has to press two buttons in this window, and it aims with arithmetic
-/// off the origin the shell logs; buttons that resized with the name of the file being edited
-/// would move under it. `widget-toolkit.md` §11's "chrome metrics are not themeable" is the same
-/// argument one level up (M11 decision 2), and the two buttons below share the width equally so
-/// that "a quarter across and three quarters across" is all the gate has to know.
-pub const CONFIRM_W: u32 = 340;
-/// Its height in pixels.
-pub const CONFIRM_H: u32 = 132;
-/// The margin between the dialog's frame and the button strip inside it.
-pub const CONFIRM_PAD: u32 = 12;
-/// The gap between the dialog's two buttons.
-pub const CONFIRM_GAP: u32 = 8;
-/// How tall each of the dialog's buttons is.
-pub const CONFIRM_BUTTON_H: u32 = 26;
-
-/// How wide each of them is — half of what is left after the frame, the margins and the gap.
-///
-/// **Published, with the three below, because `check-login` presses these buttons and cannot
-/// link this crate.** It is a host tool in another workspace, so it hardcodes coordinates the
-/// way it already hardcodes `TITLE_BAR_H` and a list's row height — and the test beside these
-/// constants is what pins the numbers it hardcodes to the tree that is actually built. Deriving
-/// them here rather than writing four literals means a change to the padding moves the gate's
-/// target and the test that guards it together.
-pub const CONFIRM_BUTTON_W: u32 =
-    (CONFIRM_W - libui::widget::WINDOW_FRAME_W - 2 * CONFIRM_PAD - CONFIRM_GAP) / 2;
-
-/// The centre of the *discard* button, in the dialog window's own coordinates.
-pub const CONFIRM_DISCARD_CX: i32 =
-    (libui::widget::WINDOW_CONTENT_X + CONFIRM_PAD + CONFIRM_BUTTON_W / 2) as i32;
-
-/// The centre of the *keep editing* button, likewise.
-pub const CONFIRM_KEEP_CX: i32 = (libui::widget::WINDOW_CONTENT_X
-    + CONFIRM_PAD
-    + CONFIRM_BUTTON_W
-    + CONFIRM_GAP
-    + CONFIRM_BUTTON_W / 2) as i32;
-
-/// The vertical centre of both, measured up from the dialog's bottom edge.
-pub const CONFIRM_BUTTON_CY: i32 = (CONFIRM_H
-    - libui::widget::WINDOW_BORDER
-    - libui::widget::WINDOW_FRAME
-    - CONFIRM_PAD
-    - CONFIRM_BUTTON_H / 2) as i32;
+/// It was published from here for `check-login` to aim at, and `nxfiles` then grew a
+/// confirmation of its own — so the five metrics, the four aim points and the measurable frame
+/// moved down to [`libui::widget`] where both dialogs share one table. What stays here is what
+/// this dialog *says*.
+pub use libui::widget::{
+    DIALOG_BUTTON_CY as CONFIRM_BUTTON_CY, DIALOG_H as CONFIRM_H, DIALOG_LEFT_CX,
+    DIALOG_RIGHT_CX, DIALOG_W as CONFIRM_W,
+};
 
 /// The window's size in pixels at startup, before any manager places it.
 pub const START_SIZE: Size = Size::new(560, 420);
@@ -798,7 +767,7 @@ impl App {
 
         let name = if self.name.is_empty() { "untitled" } else { self.name.as_str() };
         let question = padding(
-            Insets::all(CONFIRM_PAD),
+            Insets::all(libui::widget::DIALOG_PAD),
             column(alloc::vec![
                 text("Discard unsaved changes?"),
                 text(String::from(name)),
@@ -806,9 +775,10 @@ impl App {
         )
         .key(CONFIRM_TEXT_KEY);
 
-        // **Two buttons sharing the width equally**, so that where they are is arithmetic
-        // anybody can do: a quarter across and three quarters across, at a fixed height off the
-        // bottom. `check-login` presses both, and it aims from the origin the shell logs.
+        // **Two buttons sharing the width equally**, which is what the published aim points
+        // name: a quarter across and three quarters across, at a fixed height off the bottom.
+        // `dialog_frame` supplies the strip and the fixed size; the labels, the messages and the
+        // keys are this application's.
         //
         // **Two answers and not three** — `TODO(dialog-save-answer)`. *Save and close* is the
         // obvious third, and it is not a button: an untitled buffer has nowhere to save to, so
@@ -823,25 +793,14 @@ impl App {
             .key(key)
             .flex(1)
         };
-        let strip = sized(
-            Size::new(0, CONFIRM_BUTTON_H + CONFIRM_PAD),
-            padding(
-                Insets { top: 0, right: CONFIRM_PAD, bottom: CONFIRM_PAD, left: CONFIRM_PAD },
-                with_spacing(
-                    row(alloc::vec![
-                        answer("discard", Msg::Discard, CONFIRM_DISCARD_KEY),
-                        answer("keep editing", Msg::KeepEditing, CONFIRM_KEEP_KEY),
-                    ]),
-                    CONFIRM_GAP,
-                ),
-            ),
-        )
-        .key(CONFIRM_STRIP_KEY);
-
-        sized(
-            Size::new(CONFIRM_W, CONFIRM_H),
-            window_frame(title, dock(alloc::vec![docked(Edge::Bottom, strip)], question), ui),
-        )
+        let buttons = with_spacing(
+            row(alloc::vec![
+                answer("discard", Msg::Discard, CONFIRM_DISCARD_KEY),
+                answer("keep editing", Msg::KeepEditing, CONFIRM_KEEP_KEY),
+            ]),
+            libui::widget::DIALOG_GAP,
+        );
+        dialog_frame(title, question, buttons, ui)
     }
 }
 
@@ -1259,45 +1218,13 @@ mod tests {
     const CELL: libui::layout::FixedCell = libui::layout::FixedCell { w: 8, h: 16 };
 
     #[test]
-    fn the_dialog_measures_to_exactly_the_size_it_declares() {
-        // **What lets it be a window at all.** `libui::window::Child::open` sizes a child window
-        // from what its tree measures, and `Node::Dock` measures as *everything it is offered* —
-        // deliberately, since a dock's job is to divide a given area. `window_frame` contains
-        // one, so without the fixed `sized` wrapper this tree measures to the constraint's
-        // maximum and `Child::open` refuses it. Delete the wrapper and this fails naming a
-        // number in the hundreds of millions.
-        let a = app();
-        let ui = a.confirm_view(&UiTheme::default(), None);
-        let got = libui::layout::measure(
-            &ui,
-            libui::layout::Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)),
-            &CELL,
-        );
-        assert_eq!(got, Size::new(CONFIRM_W, CONFIRM_H));
-    }
-
-    #[test]
-    fn the_published_button_centres_are_where_the_buttons_are() {
-        // **This is what `check-login` aims at.** The gate cannot link this crate, so it
-        // hardcodes these four numbers the way it already hardcodes a title bar's height — and
-        // this test is what stops them being four numbers nothing checks. A press *and* a
-        // release, because a click is the release: pressing alone proves only that something is
-        // under the point.
-        // **The literals `check-login` actually types, asserted here.** Deriving the constants
-        // from `CONFIRM_PAD` and then comparing them against a tree built from the same
-        // `CONFIRM_PAD` pins nothing: both sides move together, and the gate's own table —
-        // which cannot import this crate — is linked to them by nothing at all. With
-        // `CONFIRM_PAD` at 40 every test in this file passed while the gate went on clicking
-        // `y = 103` at buttons spanning 62..88, failing after a three-minute boot, which is
-        // exactly the outcome the doc comment on `CONFIRM_BUTTON_W` says is prevented (PR #267
-        // review, finding 2). These four numbers are that table.
-        assert_eq!(
-            (CONFIRM_DISCARD_CX, CONFIRM_KEEP_CX, CONFIRM_BUTTON_CY),
-            (91, 249, 103),
-            "check-login hardcodes these three; change the dialog's metrics and change them there"
-        );
-        assert_eq!((CONFIRM_W, CONFIRM_H), (340, 132), "and these two, as the size it checks");
-
+    fn the_left_answer_discards_and_the_right_one_keeps() {
+        // **Which button means what, which is all that is left here.** The dialog's geometry —
+        // that it measures to exactly its declared size, and that the two aim points are the
+        // buttons' centres — moved into `libui` with `dialog_frame` when `nxfiles` grew the
+        // second confirmation, and is tested there against a tree built the same way. What this
+        // application still decides is which message each half carries, and getting *that* the
+        // wrong way round is a click that discards a buffer when it was asked to keep it.
         let a = app();
         let ui = a.confirm_view(&UiTheme::default(), None);
         let l = libui::layout::layout(&ui, Rect::new(0, 0, CONFIRM_W, CONFIRM_H), &CELL);
@@ -1320,34 +1247,12 @@ mod tests {
         };
 
         assert_eq!(
-            click(&mut router, CONFIRM_DISCARD_CX, CONFIRM_BUTTON_CY),
+            click(&mut router, DIALOG_LEFT_CX, CONFIRM_BUTTON_CY),
             alloc::vec![Msg::Discard],
         );
         assert_eq!(
-            click(&mut router, CONFIRM_KEEP_CX, CONFIRM_BUTTON_CY),
+            click(&mut router, DIALOG_RIGHT_CX, CONFIRM_BUTTON_CY),
             alloc::vec![Msg::KeepEditing],
-        );
-        // And the two are not the same button: a layout that collapsed one of them would make
-        // both presses land on whichever survived, and both assertions above would still pass.
-        assert!(CONFIRM_KEEP_CX - CONFIRM_DISCARD_CX >= CONFIRM_BUTTON_W as i32);
-
-        // **The aim point is the button's *centre*, not merely a point inside it** (PR #267
-        // review, optional 6). Padding the strip on all four sides instead of three halves the
-        // buttons — 26 pixels to 14 — and every assertion above still passes, because a centre
-        // stays inside a box that shrank around it. So the row's own height is bracketed: one
-        // pixel inside each edge hits, and a point a full button above it does not.
-        let half = CONFIRM_BUTTON_H as i32 / 2;
-        for edge in [CONFIRM_BUTTON_CY - half + 1, CONFIRM_BUTTON_CY + half - 1] {
-            assert_eq!(
-                click(&mut router, CONFIRM_DISCARD_CX, edge),
-                alloc::vec![Msg::Discard],
-                "the button does not reach {edge}, so {CONFIRM_BUTTON_CY} is not its centre"
-            );
-        }
-        assert!(
-            click(&mut router, CONFIRM_DISCARD_CX, CONFIRM_BUTTON_CY - CONFIRM_BUTTON_H as i32)
-                .is_empty(),
-            "a whole button above the aim point is not the button"
         );
     }
 

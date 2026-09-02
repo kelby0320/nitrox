@@ -168,6 +168,81 @@ pub const WINDOW_CONTENT_X: u32 = WINDOW_BORDER + WINDOW_FRAME;
 /// Where it starts vertically — this, plus [`TITLE_BAR_H`].
 pub const WINDOW_CONTENT_Y: u32 = WINDOW_BORDER;
 
+/// A confirmation dialog's width in pixels.
+///
+/// **A size, not a measurement**, which is the opposite of what a menu does, and the reason is
+/// the gate. `check-login` presses buttons in these windows and aims with arithmetic off the
+/// origin the shell logs; buttons that resized with the name of the file being asked about would
+/// move under it. §11's "chrome metrics are not themeable" is the same argument one level up.
+///
+/// **Here rather than in an application** since M12 Part B, when `nxfiles` grew the second one.
+/// `nxedit` published these five and derived four aim points from them; a browser repeating the
+/// arithmetic would give the gate two tables to keep in step, which is the shape that goes wrong
+/// silently. The [`dialog_frame`] below is the other half — the measurable frame — and the test
+/// beside it is what pins the aim points to a tree that is actually built.
+pub const DIALOG_W: u32 = 340;
+/// A confirmation dialog's height in pixels.
+pub const DIALOG_H: u32 = 132;
+/// The margin between a dialog's frame and the button strip inside it.
+pub const DIALOG_PAD: u32 = 12;
+/// The gap between a dialog's two buttons.
+pub const DIALOG_GAP: u32 = 8;
+/// How tall each of a dialog's buttons is.
+pub const DIALOG_BUTTON_H: u32 = 26;
+/// How wide each is — half of what is left after the frame, the margins and the gap.
+pub const DIALOG_BUTTON_W: u32 = (DIALOG_W - WINDOW_FRAME_W - 2 * DIALOG_PAD - DIALOG_GAP) / 2;
+/// The centre of a dialog's **left** button, in the dialog window's own coordinates.
+pub const DIALOG_LEFT_CX: i32 = (WINDOW_CONTENT_X + DIALOG_PAD + DIALOG_BUTTON_W / 2) as i32;
+/// The centre of its **right** button, likewise.
+pub const DIALOG_RIGHT_CX: i32 =
+    (WINDOW_CONTENT_X + DIALOG_PAD + DIALOG_BUTTON_W + DIALOG_GAP + DIALOG_BUTTON_W / 2) as i32;
+/// The vertical centre of both, measured up from the dialog's bottom edge.
+pub const DIALOG_BUTTON_CY: i32 =
+    (DIALOG_H - WINDOW_BORDER - WINDOW_FRAME - DIALOG_PAD - DIALOG_BUTTON_H / 2) as i32;
+
+/// A confirmation dialog's whole face: a title bar, a question, and two answers.
+///
+/// **Sized rather than measured**, which is what lets it be a [`Child`](crate::window::Child) at
+/// all: `Node::Dock` measures as *everything it is offered* — deliberately, since a dock's job is
+/// to divide a given area — so a tree containing one has no natural size and `Child::open`
+/// refuses it. The fixed wrapper here is what makes the measurement exact.
+///
+/// `buttons` must be a `row` of exactly two children, **each `.flex(1)`**, or the published
+/// centres above name nothing. That contract is not a comment: `dialog_buttons_land_where_the_
+/// constants_say` builds one and presses both, so a caller that breaks it fails a host test
+/// rather than a three-minute boot.
+///
+/// Keys stay the caller's. This helper invents none, for the reason [`window_frame`] does not:
+/// a key is the application's own numbering, and a widget that assigned one would be reaching
+/// into it.
+pub fn dialog_frame<Msg>(
+    title: Element<Msg>,
+    question: Element<Msg>,
+    buttons: Element<Msg>,
+    theme: &Theme,
+) -> Element<Msg> {
+    let strip = sized(
+        Size::new(0, DIALOG_BUTTON_H + DIALOG_PAD),
+        padding(
+            Insets { top: 0, right: DIALOG_PAD, bottom: DIALOG_PAD, left: DIALOG_PAD },
+            buttons,
+        ),
+    );
+    // **Both dock children wrapped, and the zero-inset one is not decoration** — the same rule
+    // [`window_frame`] states and for the same reason: the diff requires a container's children
+    // to be all keyed or all unkeyed, and a caller keys its question. Docking the strip this
+    // helper built beside it is a `MixedKeying` error on the first frame, which in a client like
+    // this means the dialog never appears at all.
+    sized(
+        Size::new(DIALOG_W, DIALOG_H),
+        window_frame(
+            title,
+            dock(alloc::vec![docked(Edge::Bottom, strip)], padding(Insets::all(0), question)),
+            theme,
+        ),
+    )
+}
+
 /// One row of a dropdown menu: a label that highlights under the pointer.
 ///
 /// **The same treatment a selected list row gets** — the selection colour bevelled inside a
@@ -3030,5 +3105,97 @@ mod tests {
 
     fn font() -> libdraw::text::Font {
         libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
+    }
+
+    #[test]
+    fn dialog_buttons_land_where_the_constants_say() {
+        // **The four numbers `check-login` types**, asserted against a tree that is actually
+        // built. They were `nxedit`'s until `nxfiles` grew a second confirmation; deriving them
+        // beside the frame and checking them *here* is what stops two applications and one gate
+        // drifting apart in three separate places.
+        //
+        // The literals matter as much as the derivation. Comparing derived constants against a
+        // tree built from the same constants pins nothing — both sides move together, and the
+        // gate's own table is linked to neither (PR #267 review, finding 2).
+        assert_eq!((DIALOG_W, DIALOG_H), (340, 132));
+        assert_eq!((DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), (91, 249, 103));
+
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Left,
+            Right,
+            Drag,
+        }
+        let theme = Theme::default();
+        let answer = |label: &str, msg: M, key: u64| {
+            button(label, msg, WidgetState::default(), &theme).key(key).flex(1)
+        };
+        let ui: Element<M> = dialog_frame(
+            title_bar(
+                "Question",
+                true,
+                M::Drag,
+                TitleButtons { minimise: None, maximise: None, close: None },
+                &theme,
+            )
+            .key(1),
+            padding(Insets::all(DIALOG_PAD), text("Really?")).key(2),
+            crate::element::with_spacing(
+                row(alloc::vec![answer("yes", M::Left, 3), answer("no", M::Right, 4)]),
+                DIALOG_GAP,
+            )
+            .key(5),
+            &theme,
+        );
+
+        // **It measures to exactly what it declares**, which is what lets it be a `Child`:
+        // `Node::Dock` measures as everything it is offered, so without the fixed wrapper this
+        // is a window a thousand screens wide and `Child::open` refuses it.
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        assert_eq!(
+            crate::layout::measure(
+                &ui,
+                crate::layout::Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)),
+                &cell,
+            ),
+            Size::new(DIALOG_W, DIALOG_H)
+        );
+
+        let l = crate::layout::layout(&ui, Rect::new(0, 0, DIALOG_W, DIALOG_H), &cell);
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&ui, &l).expect("a dialog is diffable");
+        let mut router = crate::route::Router::new();
+        let click = |r: &mut crate::route::Router, x: i32, y: i32| {
+            let at = |flags: u16, buttons: u16| PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons,
+                flags,
+                x,
+                y,
+                ..Default::default()
+            };
+            r.pointer(&tree, &ui, &l, at(librsproto::surface::POINTER_PRESSED, 1));
+            r.pointer(&tree, &ui, &l, at(0, 0)).0
+        };
+        assert_eq!(click(&mut router, DIALOG_LEFT_CX, DIALOG_BUTTON_CY), alloc::vec![M::Left]);
+        assert_eq!(click(&mut router, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), alloc::vec![M::Right]);
+
+        // **And the aim point is the button's *centre*, not merely a point inside it.** Padding
+        // the strip on four sides instead of three halves the buttons, and a centre stays inside
+        // a box that shrank around it — so the row's own height is bracketed here.
+        let half = DIALOG_BUTTON_H as i32 / 2;
+        for edge in [DIALOG_BUTTON_CY - half + 1, DIALOG_BUTTON_CY + half - 1] {
+            assert_eq!(
+                click(&mut router, DIALOG_LEFT_CX, edge),
+                alloc::vec![M::Left],
+                "the button does not reach {edge}, so {DIALOG_BUTTON_CY} is not its centre"
+            );
+        }
+        assert!(
+            click(&mut router, DIALOG_LEFT_CX, DIALOG_BUTTON_CY - DIALOG_BUTTON_H as i32)
+                .is_empty(),
+            "a whole button above the aim point is not the button"
+        );
     }
 }

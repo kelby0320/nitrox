@@ -738,8 +738,10 @@ pub enum TreeError {
     OpenDir,
     /// A directory could not be enumerated.
     ReadDir,
-    /// A destination directory could not be created.
-    MakeDir,
+    /// A directory could not be created. The payload is the server's `KError`, so a caller
+    /// can tell an occupied name from anything else without a confirming round trip — the
+    /// same reason [`TreeError::Rmdir`] carries one.
+    MakeDir(i32),
     /// A file copy failed.
     Copy(FileError),
     /// An entry could not be unlinked.
@@ -808,16 +810,14 @@ fn copy_tree_at(
         return Ok(());
     }
 
-    // Create the destination directory through its parent's session: directory ops are
-    // name-addressed, so making `/a/b` means opening `/a` and asking for `b`.
+    // Create the destination directory. **Through [`mkdir`] rather than open-coded**: this was
+    // the same three lines a third time — open the parent, ask it for the basename, close — and
+    // the browser's *new folder* made it a fourth (M12 Part B). An existing directory is allowed
+    // through under `force`, which is this walk's rule rather than `mkdir`'s.
+    if let Err(e) = mkdir(ns, dst)
+        && !(force && is_dir(ns, dst))
     {
-        let mut pbuf = [0u8; 4096];
-        let mut pdir = Dir::open(ns, parent(dst), &mut pbuf).map_err(|_| TreeError::OpenDir)?;
-        let made = pdir.mkdir(basename(dst));
-        pdir.close();
-        if made.is_err() && !(force && is_dir(ns, dst)) {
-            return Err(TreeError::MakeDir);
-        }
+        return Err(e);
     }
 
     for e in &children(ns, src)? {
@@ -866,6 +866,35 @@ fn remove_tree_at(
     rmdir_at(ns, path)?;
     on_entry(path, true);
     Ok(())
+}
+
+/// Create the directory named by `path`, via its parent's session.
+///
+/// **The sibling of [`unlink_at`]**, and it moved down here when a second consumer arrived
+/// (M12 Part B): `mkdir`'s `make_one` was the only caller until `nxfiles` grew a *new folder*
+/// command, and a browser open-coding the same three lines would be the second implementation
+/// of "which directory does this name live in" — which is the rule `libfs` exists to keep in one
+/// place. The `--parents` walk stays in `mkdir`, because creating intermediates is that
+/// program's flag rather than a fact about making a directory.
+///
+/// [`TreeError::MakeDir`] carries the server's `KError`, so a caller can tell an occupied name from
+/// anything else without a confirming round trip — the same reason [`rmdir_at`] carries one.
+pub fn mkdir(ns: u64, path: &[u8]) -> Result<(), TreeError> {
+    let name = basename(path);
+    if name.is_empty() {
+        // The root has no parent to create it in, and `basename` of `/` is empty rather than
+        // an error — so this is the one path that cannot be made.
+        return Err(TreeError::MakeDir(0));
+    }
+    let mut buf = [0u8; 4096];
+    let mut dir = Dir::open(ns, parent(path), &mut buf).map_err(|_| TreeError::OpenDir)?;
+    let r = dir.mkdir(name);
+    dir.close();
+    match r {
+        Ok(()) => Ok(()),
+        Err(DirError::Server(k)) => Err(TreeError::MakeDir(k)),
+        Err(_) => Err(TreeError::MakeDir(0)),
+    }
 }
 
 /// `unlink` the entry named by `path`, via its parent's session.

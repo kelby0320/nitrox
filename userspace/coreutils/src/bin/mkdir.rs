@@ -41,6 +41,7 @@ use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
 use libkern::{exit, kprint};
+use libfs::TreeError;
 use librsproto::session::{Dir, DirError};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
@@ -115,24 +116,24 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Create `path`, whose parent must already exist. Diverges on failure.
 fn make_one(stage: &Stage, path: &[u8]) -> bool {
-    let parent = libfs::parent(path);
-    let name = libfs::basename(path);
-    if name.is_empty() {
+    // **Checked here as well as in `libfs::mkdir`**, because the two answers differ: this
+    // program exits with a *usage* status and a sentence about the root, where the library has
+    // only an error to return and no idea what the caller was trying to do.
+    if libfs::basename(path).is_empty() {
         stage.die(b"mkdir: cannot create the root directory\n", EXIT_USAGE);
     }
-    let mut buf = [0u8; 4096];
-    let mut dir = match Dir::open(stage.namespace, parent, &mut buf) {
-        Ok(d) => d,
-        Err(_) => stage.die(b"mkdir: parent directory does not exist\n", EXIT_FAILURE),
-    };
-    let r = dir.mkdir(name);
-    dir.close();
-    match r {
+    // **Through `libfs::mkdir` since M12 Part B**, when `nxfiles` grew a *new folder* command
+    // and became the second consumer of these three lines. What stays here is this program's:
+    // the `--parents` walk below, and turning a failure into an exit status and a message.
+    match libfs::mkdir(stage.namespace, path) {
         Ok(()) => true,
         // The server says the name is taken, so the message can say so without a
-        // confirming round trip — which is the whole point of the error existing.
-        Err(e) if is_already_exists(&e) => {
+        // confirming round trip — which is the whole point of the error carrying it.
+        Err(TreeError::MakeDir(k)) if k == KError::AlreadyExists.as_i32() => {
             stage.die(b"mkdir: path already exists (use --parents to allow it)\n", EXIT_FAILURE)
+        }
+        Err(TreeError::OpenDir) => {
+            stage.die(b"mkdir: parent directory does not exist\n", EXIT_FAILURE)
         }
         Err(_) => stage.die(b"mkdir: cannot create directory\n", EXIT_FAILURE),
     }

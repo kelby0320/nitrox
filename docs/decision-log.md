@@ -21808,3 +21808,128 @@ not stand is the causal story: an intermittent failure ran through a bisect and 
 deterministic, and the conclusion survived three runs of confirmation because it was never tested
 against the hypothesis it displaced. When a fix and a flake are the same shape, the fix has to be
 justified by reading the code, and the flake by a receipt that says which half went missing.
+
+## 2026-09-02 — M12 Part B: the browser acts, and a drag that never leaves the client
+
+Five operations, two menus, and the one gesture M10 left for this milestone. Four decisions came
+out of it; the maintainer settled the first two.
+
+**1. A File menu and an Edit menu, not a toolbar and not shortcuts.** Buttons crowd a path strip
+in a 560-pixel window and the path is the first thing to be elided; shortcuts leave nothing on
+screen saying the operations exist, which is the discoverability M11 spent a milestone on. The
+maintainer's own division: *File* makes and unmakes things — new file, new folder, rename, delete
+— and *Edit* acts on what is selected. It is the split every file browser draws.
+
+**2. Cut and paste are not in it, and that is the answer to a question rather than an omission.**
+The maintainer asked how cut should work. It is a *pair*, and a pair that holds something between
+two gestures is a clipboard however it is spelled — so a private one-slot path buffer in the
+browser would be a second clipboard shipped weeks before the real one. M12 decision 1 makes the
+clipboard a resource server precisely so that what you last copied is not readable by everything
+running, and Part E's scope already leaves the hook: "the type tag exists so a later image or a
+typed stream is a second kind rather than a second clipboard". A file path is that second kind.
+Nothing is missing meanwhile, because moving a file into a folder is a drag.
+
+**3. A drop inside the window is a move, and the compositor could not have carried it anyway.**
+This reads like an implementation note and is a constraint: `compositor::input::highlight_target`
+skips the *source* window when it looks for a drop target, deliberately, because dropping a thing
+back where it came from is a no-op. So an intra-window drag has no route through the compositor
+and has to be the client's own — which is what M10 meant by "a drag inside one window is the
+toolkit's and is M12's".
+
+The interesting part is where the two drags meet. A press past the slop starts an **internal**
+drag; the payload reaches the compositor only when the pointer **leaves the window**. That
+boundary is the last moment the client can decide anything, because `StartDrag` hands over the
+grab and the client stops seeing motion for the rest of the gesture. Before this the handoff
+happened at the slop, so there was no window in which an internal drop could exist at all.
+
+**4. Three helpers went down a layer, and one of them had been open-coded three times.**
+`libfs::mkdir` — `mkdir`'s `make_one`, `copy_tree`'s destination, and now the browser's *new
+folder* were the same three lines: open the parent, ask it for the basename, close. And
+`libui::widget::dialog_frame` plus the `DIALOG_*` metrics, because a second confirmation would
+otherwise have given `check-login` two tables of aim points to keep in step — which is exactly the
+shape PR #267's review caught going wrong silently with one.
+
+**What the tests caught that a person would not have.** A rejected name leaves the prompt open so
+it can be corrected, and the explanation was being written into the notice slot *the prompt had
+replaced*: the answer existed and was never drawn. The test asserted the message rather than the
+absence of an operation, which is the difference between checking that nothing happened and
+checking that the person was told why.
+
+## 2026-09-02 — the lost click: a capture is a tree id, and hovered widgets change shape
+
+`check-login` failed in CI on the browser's new menu: the press reached the popup and produced no
+message. It reproduced locally about one run in two, which made it cheap to instrument, and the
+probe answered it in one line — the press routed with hover `none` and the release with hover
+`14`, and the release produced nothing.
+
+**The mechanism.** `Router` records a capture on press as a *tree id*, and `hit_test` returns the
+**deepest** node under the cursor — inside a `menu_item`, that is the padding around its label.
+A hovered `menu_item` draws three layers where a quiet one draws one, so rebuilding the tree with
+a different hover puts two new layers ahead of that node and gives it a different id. On release
+`path_to_id` finds the recorded id gone, the whole dispatch block is skipped, and the click
+vanishes. It is intermittent because it depends on whether a frame happened to be presented
+between the press and the release.
+
+**The fix is a rule, not a special case**: a widget may change under the pointer, but not while a
+button is held on it. `Child` now samples its hover only between gestures and hands the same value
+to both `present` and `route`, so the tree those two share keeps its shape for the whole gesture.
+`Router::grabbed` is published for main-window loops, which own their own trees and have to do the
+same — `desktop-shell`'s applications modal does now.
+
+**And this is very probably the launcher-row flake**, which cost three CI failures across two
+parts and which I attributed twice to something else: first to the close timer (a bisect over an
+intermittent step, which measures nothing), then to an unacknowledged burst of injected keystrokes
+(a real hazard, named in the shell's own source, and worth fixing on its own). The modal's rows
+are `list_view` rows and change shape with hover exactly as a menu row does; the receipts I added
+made the gate wait between keystrokes, which changes when frames are presented, which is why it
+went quiet. **I am recording this as the likely cause rather than the proven one** — what is
+proven is the mechanism, reproduced in a host test whose control loses the click — because the
+last two attributions were confident and wrong, and the third does not get a free pass for being
+better evidenced.
+
+The lesson worth keeping is narrower than "test more". Both wrong attributions came from reasoning
+about *timing* around an intermittent failure; the one that held came from asking the guest what
+it actually routed. An instrument that names the input and the output of the step in doubt is
+worth more than any amount of inference about what else changed.
+
+## 2026-09-02 — what #268's review caught: an operation whose target moved under it
+
+Three blocking findings, and the reviewer's own summary is the useful part: *an operation's target
+is recomputed from state that can move between the gesture that chose it and the gesture that
+confirms it.* One bug wearing three hats, and worth recording as a shape rather than three fixes.
+
+Every operation in the browser is **two gestures** — choose it from a menu, then answer a prompt or
+a question — and the first version composed its paths at the *second*, out of `self.path` and
+`self.list.selected`. Both move while a prompt or a dialog is up, and there is nothing to stop
+them: the compositor has no input-exclusive window (`TODO(dialog-modality)`, filed in Part A), and
+the prompt is a *keyboard* mode only, so a click on a row still navigates or re-selects. So a
+delete answered after walking into another directory removed a file **there** with the same name —
+one the person was never asked about, while the dialog's own text still named the one they chose.
+Silent and harmless when the two directories do not share a name, destructive exactly when they do,
+which is the case least likely to be noticed.
+
+The third was the same shape one layer down: `row_at` bounded a drop against `entries.len()`
+rather than against the rows `list_view` actually draws, so the band below the last row — still
+inside the window, still under the pointer grab — mapped to an entry that was never on screen and
+never highlighted.
+
+**The fix is to resolve the target when it is chosen**, plus dropping the prompt and the question
+whenever a new listing arrives. The two overlap only partly and the code says so: a listing is the
+only thing that changes the directory, so for delete either alone would do — but the selection
+moves without one, and there the captured target is the only thing between a rename and the wrong
+file. The test for the delete case is written to say it does *not* pin the capture, because it
+passes against the version that composes the path late; the rename's is the one that discriminates.
+
+**And a separate finding worth its own note: three of four "that name is taken" arms were
+unreachable, and the fourth was worse than that.** `libfs::create_file` is documented *idempotent*
+— `fs-server-ext4` resolves with `RESOLVE_CREATE`, discards "already exists" and grows the file to
+zero — so *new file* onto an existing name **succeeded**, destroyed nothing, and told the person a
+new empty file existed while the old one and its contents still did. And `libfs::rename`'s error
+mapping deliberately does not distinguish an occupied destination, its own doc saying a caller that
+cares should test with `file_size` first. So the refusals were correct and the sentences were not.
+The destination is tested before every mutation now, which puts "nothing overwrites" in this
+program rather than in what a server happens to return.
+
+The generalisation: **a promise about what an operation will not do belongs where the operation is,
+not in an error arm that assumes the layer below reports what you hoped.** Reading the callee's
+documentation is what settles which of those you have written.

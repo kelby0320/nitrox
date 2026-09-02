@@ -149,7 +149,7 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
             stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE)
         }
         Err(TreeError::Copy(e)) => stage.die(describe(src, dst, e).as_bytes(), EXIT_FAILURE),
-        Err(TreeError::MakeDir) => {
+        Err(TreeError::MakeDir(_)) => {
             stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE)
         }
         Err(TreeError::OpenDir) => {

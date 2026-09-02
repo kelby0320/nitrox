@@ -26,10 +26,13 @@ use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libui::diff::Tree;
-use libui::layout::{Layout, layout};
+use libui::layout::{Layout, layout, locate};
 use libui::paint::{FontMetrics, Theme, paint};
 use libui::route::Router;
-use nxfiles::{App, Entry, Msg, TITLE};
+use libui::window::Child;
+use nxfiles::{
+    App, EDIT_MENU_KEY, Entry, FILE_MENU_KEY, FileOp, Gesture, Menu, Msg, TITLE,
+};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -42,6 +45,109 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
+
+/// Carry out a filesystem operation, and say in one line what happened.
+///
+/// **The browser performs these itself.** It holds `/home` — the session bound it there — and
+/// that binding *is* the authority these need; routing them through `desktop-shell` would be
+/// asking a supervisor to do what the application is already entitled to do, which is the
+/// opposite of the argument that keeps `Desktop::Open` on the shell's side. Opening a *program*
+/// needs `/bin` and a namespace, and this has neither; renaming a file in a directory it can
+/// already list needs nothing it does not hold.
+///
+/// The returned string is what the strip shows, so it is written for the person looking at the
+/// window rather than for a log.
+fn perform(ns: u64, op: &FileOp) -> &'static str {
+    // **The destination is tested first, and that is what makes "nothing overwrites" true.**
+    // Three of the four refusals this used to claim were unreachable, and one of them was worse
+    // than unreachable (PR #268 review, worth fixing 1):
+    //
+    // - `libfs::create_file` is documented *idempotent* — `fs-server-ext4` resolves with
+    //   `RESOLVE_CREATE`, discards "already exists" and grows the file to zero, which is a
+    //   no-op. So *new file* onto an existing name **succeeded**, destroyed nothing, and told
+    //   the person a new empty file was there while the old one and its contents still were.
+    // - `libfs::rename`'s `map_rename_error` deliberately does not distinguish an occupied
+    //   destination — its own doc says a caller that cares should test with `file_size` first,
+    //   which is what the `copy` coreutil does. So a refused rename or move was correct and
+    //   reported "could not rename it", which reads like a fault rather than an answer.
+    //
+    // Testing here gives all of them the sentence written for them, and puts the promise in this
+    // program rather than in what a server happens to return.
+    let taken = |path: &String| {
+        libfs::file_size(ns, path.as_bytes()).is_some() || libfs::is_dir(ns, path.as_bytes())
+    };
+    match op {
+        FileOp::Create { path, dir } => {
+            if taken(path) {
+                return "that name is taken";
+            }
+            let made = if *dir {
+                libfs::mkdir(ns, path.as_bytes()).is_ok()
+            } else {
+                libfs::create_file(ns, path.as_bytes()).is_ok()
+            };
+            if made { "created" } else { "could not create it" }
+        }
+        // **Never `replace`**, for rename, copy and move alike: overwriting is a second
+        // question, and a browser that answered it silently would be one whose most ordinary
+        // mistake — typing a name that is already there — destroys a file.
+        FileOp::Rename { from, to } => {
+            if taken(to) {
+                return "that name is taken";
+            }
+            match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
+                Ok(()) => "renamed",
+                Err(_) => "could not rename it",
+            }
+        }
+        FileOp::MoveInto { from, to } => {
+            if taken(to) {
+                return "there is one there already";
+            }
+            match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
+                Ok(()) => "moved",
+                Err(_) => "could not move it",
+            }
+        }
+        // **`copy_file`, which maps both sides and copies between the mappings** with no heap at
+        // all, bounded by `libfs::MAX_COPY`. `read_file` is the one function here that allocates
+        // a whole file, and the wrong one for a copy to call. A *folder* takes `copy_tree`, which
+        // was always there — `copy_file` on one merely fails.
+        FileOp::Copy { from, to, dir } => {
+            if taken(to) {
+                return "that name is taken";
+            }
+            if *dir {
+                return match libfs::copy_tree(ns, from.as_bytes(), to.as_bytes(), false, &mut |_, _, _| {})
+                {
+                    Ok(()) => "copied",
+                    Err(_) => "could not copy it",
+                };
+            }
+            match libfs::copy_file(ns, from.as_bytes(), to.as_bytes(), false) {
+                Ok(_) => "copied",
+                Err(libfs::FileError::TooLarge) => "too large to copy",
+                Err(_) => "could not copy it",
+            }
+        }
+        FileOp::Delete { path, dir } => {
+            let r = if *dir {
+                libfs::remove_tree(ns, path.as_bytes(), &mut |_, _| {}).is_ok()
+            } else {
+                libfs::unlink_at(ns, path.as_bytes()).is_ok()
+            };
+            if r { "deleted" } else { "could not delete it" }
+        }
+    }
+}
+
+/// The path an operation acts on, for the line that reports it.
+fn subject(op: &FileOp) -> &str {
+    match op {
+        FileOp::Create { path, .. } | FileOp::Delete { path, .. } => path,
+        FileOp::Rename { to, .. } | FileOp::Copy { to, .. } | FileOp::MoveInto { to, .. } => to,
+    }
+}
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
@@ -247,7 +353,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
+    // The open menu's window, and which menu it is showing — two things because the *same*
+    // popup cannot serve both: choosing `Edit` while `File` is open has to replace the window,
+    // not redraw it at the other anchor.
+    let mut menu: Option<Child> = None;
+    let mut menu_shown: Option<Menu> = None;
+    let mut menu_hovered: Option<u64> = None;
+    // The delete question's window, alive only while one is being asked (M12 Part A's shape).
+    let mut confirm: Option<Child> = None;
+    let mut confirm_hovered: Option<u64> = None;
     let ev = win.wait_handle();
+    // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
+    let mut reported_prompt = app.prompt_len();
 
     loop {
         // ---- render ----
@@ -255,6 +372,25 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // had ever asked (M11 Part E batch 3).
         let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+        // **One line per character typed into the name prompt.** Injection is relative and
+        // unacknowledged, so without a receipt a gate types at whatever speed it likes and finds
+        // out about a dropped keystroke as a wrong filename several steps later. A count, not
+        // the text — what somebody is naming a file is theirs, and the listing shows it anyway.
+        let typed = app.prompt_len();
+        if typed != reported_prompt {
+            reported_prompt = typed;
+            if let Some(n) = typed {
+                libkern::debug::Line::new()
+                    .s(b"nxfiles: name so far ")
+                    .u(n as u64)
+                    .s(b" chars")
+                    .end();
+            }
+        }
+        // Where each menu drops from, read every frame rather than when one opens: a bar item's
+        // position is a fact about the layout, and before the first one there is nowhere to put
+        // a popup at all.
+        app.menu_anchor = [locate(&ui, &l, FILE_MENU_KEY), locate(&ui, &l, EDIT_MENU_KEY)];
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
             // A malformed tree is a bug in `view`, not a runtime condition.
@@ -294,6 +430,149 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             && w.request_state(state).is_err()
         {
             kprint(b"nxfiles: the state request was refused\n");
+        }
+        // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
+        // window id, so this cannot share the branch above.
+        if app.take_confirm_move()
+            && let Some(c) = confirm.as_ref()
+            && let Some(mut w) = win.window(c.id())
+            && w.start_move().is_err()
+        {
+            kprint(b"nxfiles: the compositor refused the dialog's move\n");
+        }
+
+        // ---- the menu's window ----
+        //
+        // Opened and destroyed with the menu, because `popup` is a transient role: the
+        // compositor takes it with its parent, it holds the keyboard while it is up, and a
+        // hidden one would still be a window in the stack.
+        if menu_shown != app.menu() {
+            if let Some(m) = menu.take() {
+                m.close(&mut win);
+            }
+            menu_hovered = None;
+            menu_shown = app.menu();
+            if let Some(which) = menu_shown {
+                let anchor = app.menu_anchor[usize::from(which != Menu::File)];
+                match anchor {
+                    Some(a) => {
+                        let view = app.menu_view(which, &theme, None);
+                        menu = Child::open(
+                            &mut win,
+                            Role::Popup { parent: window_id },
+                            (a.origin.x, a.bottom() as i32),
+                            &view,
+                            &font,
+                            &theme,
+                            BUFFERS,
+                        );
+                    }
+                    None => menu = None,
+                }
+                match menu.as_ref() {
+                    // **Where it is and how big, unconditionally.** `check-login` boots the
+                    // release image, so a `test-harness` line would not exist in the binary it
+                    // runs — and this is the only thing that says the menu became a window. The
+                    // gate divides the height by the number of rows rather than deriving one
+                    // from the theme's text size, which is the metric that is *not* fixed.
+                    Some(m) => {
+                        let o = win
+                            .window(m.id())
+                            .and_then(|w| w.configured())
+                            .map_or((0, 0), |c| (c.x, c.y));
+                        libkern::debug::Line::new()
+                            .s(b"nxfiles: menu popup ")
+                            .u(m.id() as u64)
+                            .s(b" at ")
+                            .i(o.0 as i64)
+                            .s(b",")
+                            .i(o.1 as i64)
+                            .s(b" ")
+                            .u(m.size().w as u64)
+                            .s(b"x")
+                            .u(m.size().h as u64)
+                            .end();
+                    }
+                    // Not fatal: the browser is usable without its menu, and saying so beats a
+                    // window that silently never appears.
+                    None => {
+                        kprint(b"nxfiles: could not open the menu\n");
+                        app.dismiss_menu();
+                        menu_shown = None;
+                    }
+                }
+            }
+        }
+        if let Some(m) = menu.as_mut() {
+            let now = m.hovered_key();
+            menu_hovered = now;
+            let view = menu_shown.map(|w| app.menu_view(w, &theme, now));
+            if let Some(view) = view
+                && !m.present(&mut win, &view, &font, &theme)
+            {
+                kprint(b"nxfiles: the menu could not be drawn\n");
+            }
+        }
+
+        // ---- the question's window ----
+        match (app.confirming().is_some(), confirm.is_some()) {
+            (true, false) => {
+                // **Said before the window is asked for.** A dialog's first `Configure` is held
+                // for the manager, so a line printed after `Child::open` returned would be
+                // downstream of the shell and racing it to the console (M12 Part A, PR #267).
+                kprint(b"nxfiles: asking before deleting\n");
+                let ask = app.confirm_view(&theme, None);
+                confirm = Child::open(
+                    &mut win,
+                    Role::Dialog { parent: window_id },
+                    // (0, 0): this client does not know where it is on screen, and a dialog's
+                    // offset is a preference the manager overrides anyway.
+                    (0, 0),
+                    &ask,
+                    &font,
+                    &theme,
+                    BUFFERS,
+                );
+                if confirm.is_none() {
+                    kprint(b"nxfiles: could not open the confirmation dialog\n");
+                    app.confirm_failed();
+                }
+            }
+            (false, true) => {
+                if let Some(c) = confirm.take() {
+                    c.close(&mut win);
+                }
+                confirm_hovered = None;
+            }
+            _ => {}
+        }
+        if let Some(c) = confirm.as_mut() {
+            let now = c.hovered_key();
+            confirm_hovered = now;
+            let ask = app.confirm_view(&theme, now);
+            if !c.present(&mut win, &ask, &font, &theme) {
+                kprint(b"nxfiles: the confirmation dialog could not be drawn\n");
+            }
+        }
+
+        // **The filesystem work, here because it is syscalls.** `update` produced a value saying
+        // what should happen; this is where it happens, and the listing is read again afterwards
+        // so that what the person sees is what is on disk rather than what was asked for.
+        if let Some(op) = app.take_op() {
+            let said = perform(root_ns, &op);
+            libkern::debug::Line::new()
+                .s(b"nxfiles: ")
+                .s(said.as_bytes())
+                .s(b" ")
+                .untrusted(subject(&op).as_bytes())
+                .end();
+            app.operated(said);
+            let here = String::from(app.path());
+            navigate(&mut app, root_ns, &here);
+            // The notice `navigate` cleared is the answer to what just happened, so it is put
+            // back after the listing rather than before it.
+            app.operated(said);
+            continue;
         }
         // **The listing is read here, not in `update`.** `update` is a function of values; a
         // directory read is a syscall, and the application says where it wants to be rather
@@ -338,6 +617,59 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         let mut resized = false;
         for (from, event) in events {
+            // **The menu's window routes through the menu's tree.** Same `App`, so a row's `Msg`
+            // updates the same state a click in the list does; a different tree and router,
+            // because they describe a different window.
+            if menu.as_ref().is_some_and(|m| m.id() == from) {
+                // A press landed outside the menu, so it goes away — the one thing a popup's
+                // owner cannot work out for itself, because it never sees a press aimed
+                // elsewhere (M11 Part E batch 5).
+                if matches!(event, WindowEvent::Dismissed) {
+                    app.dismiss_menu();
+                    continue;
+                }
+                let msgs = match (menu_shown, menu.as_mut()) {
+                    (Some(which), Some(m)) => {
+                        let view = app.menu_view(which, &theme, menu_hovered);
+                        m.route(&view, &font, &theme, &event)
+                    }
+                    _ => Vec::new(),
+                };
+                for msg in msgs {
+                    app.update(msg);
+                }
+                continue;
+            }
+            if confirm.as_ref().is_some_and(|c| c.id() == from) {
+                let ask = app.confirm_view(&theme, confirm_hovered);
+                let mut msgs = confirm
+                    .as_mut()
+                    .map(|c| c.route(&ask, &font, &theme, &event))
+                    .unwrap_or_default();
+                match event {
+                    // `Esc` is the dialog's, and nothing else is: no key deletes.
+                    WindowEvent::Key(k) => msgs.extend(app.confirm_key(k)),
+                    WindowEvent::Focus(f) => app.confirm_focused = f,
+                    // A dialog is not dismissed by a press elsewhere — that is a popup's event,
+                    // and a question stays until it is answered.
+                    WindowEvent::Dismissed => {}
+                    // A manager asking the *dialog* to close means the same as its own close
+                    // button: the question goes away and the entry does not.
+                    WindowEvent::CloseRequested => msgs.push(Msg::KeepIt),
+                    _ => {}
+                }
+                for msg in msgs {
+                    // Unconditional, because `check-login` boots the release image: these two
+                    // lines are the only outside sign of which answer was given.
+                    match msg {
+                        Msg::ConfirmDelete => kprint(b"nxfiles: confirmed the delete\n"),
+                        Msg::KeepIt => kprint(b"nxfiles: delete cancelled\n"),
+                        _ => {}
+                    }
+                    app.update(msg);
+                }
+                continue;
+            }
             if from != window_id {
                 continue;
             }
@@ -361,26 +693,37 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // and what makes a press a *drag* is how far it has travelled since — so the
                     // application reads the record it already has. `buttons` is on every pointer
                     // record for exactly this reason (M10 Part E).
-                    if app.pointer_moved(p.x, p.y, p.buttons)
-                        && let Some((entry, path)) = app.take_drag()
-                    {
-                        let kind = if entry.is_dir {
-                            librsproto::surface::DROP_KIND_DIR
-                        } else {
-                            librsproto::surface::DROP_KIND_FILE
-                        };
-                        if let Some(mut w) = win.window(window_id) {
-                            match w.start_drag(kind, &path, &entry.name) {
-                                Ok(()) => libkern::debug::Line::new()
-                                    .s(b"nxfiles: dragging ")
-                                    .untrusted(entry.name.as_bytes())
-                                    .end(),
-                                // Refused means the pointer is not holding this window — the
-                                // press ended between the motion and this request, which is
-                                // ordinary rather than an error.
-                                Err(_) => kprint(b"nxfiles: the compositor refused the drag\n"),
+                    // **A drag is this window's until it leaves it** (M12 Part B). Past the
+                    // slop the browser tracks the row under the pointer itself and the payload
+                    // never reaches the compositor; only a pointer that goes outside hands the
+                    // gesture over. The compositor could not have delivered an internal drop
+                    // anyway — it skips the source window when it looks for a target.
+                    match app.pointer_moved(p.x, p.y, p.buttons) {
+                        Gesture::HandOff => {
+                            if let Some((entry, path)) = app.take_drag() {
+                                let kind = if entry.is_dir {
+                                    librsproto::surface::DROP_KIND_DIR
+                                } else {
+                                    librsproto::surface::DROP_KIND_FILE
+                                };
+                                if let Some(mut w) = win.window(window_id) {
+                                    match w.start_drag(kind, &path, &entry.name) {
+                                        Ok(()) => libkern::debug::Line::new()
+                                            .s(b"nxfiles: dragging ")
+                                            .untrusted(entry.name.as_bytes())
+                                            .end(),
+                                        // Refused means the pointer is not holding this window
+                                        // — the press ended between the motion and this
+                                        // request, which is ordinary rather than an error.
+                                        Err(_) => {
+                                            kprint(b"nxfiles: the compositor refused the drag\n")
+                                        }
+                                    }
+                                }
                             }
                         }
+                        // The op is taken below, with every other one.
+                        Gesture::Dropped | Gesture::Moved | Gesture::None => {}
                     }
                 }
                 WindowEvent::Focus(f) => {

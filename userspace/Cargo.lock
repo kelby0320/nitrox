@@ -299,6 +299,7 @@ dependencies = [
  "libdraw",
  "libfs",
  "libheap",
+ "libinput",
  "libkern",
  "librsproto",
  "libstream",

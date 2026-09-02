@@ -1540,6 +1540,15 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
+/// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxfiles`' menu-popup line.
+fn parse_menu_popup(tail: &str) -> Option<(u32, i32, i32, u32, u32)> {
+    let (id, rest) = tail.trim().split_once(" at ")?;
+    let (origin, size) = rest.split_once(' ')?;
+    let (x, y) = origin.split_once(',')?;
+    let (w, h) = size.trim().split_once('x')?;
+    Some((id.parse().ok()?, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
+}
+
 /// Read `<id> of window <parent> at <x>,<y> <w>x<h>` — the tail of the shell's dialog placement.
 ///
 /// A line of its own rather than the `placed window` one every other placement uses, because a
@@ -2953,7 +2962,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     const TITLE_BAR_H: i32 = 26;
     const PATH_H: i32 = 24;
     const ROW_H: i32 = 20;
-    let row1 = (fx + 120, fy + TITLE_BAR_H + PATH_H + ROW_H + ROW_H / 2);
+    // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
+    // height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
+    // missed the change would press one row high and drag the wrong file.
+    const MENU_BAR_H: i32 = 24;
+    let row1 = (fx + 120, fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + ROW_H + ROW_H / 2);
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
@@ -2997,6 +3010,61 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxedit: drop of other.txt on the document")?;
     session.expect("nxedit: opened /home/papers/other.txt - 0 bytes")?;
     println!("  ok: a file dragged from the browser opened in the editor");
+
+    // 9b. **The browser renames a file, and the shell reads the new name back** (M12 Part B).
+    //     The same two-session fact steps 7 and 8 use, a third time: the graphical side does
+    //     something to the filesystem and the *serial* side is what says it happened. Asking the
+    //     browser to re-list would be asking the accused — it would answer from the listing it
+    //     holds, which is the thing in doubt.
+    //
+    //     The browser is showing `/home/papers` and a fresh listing selects row 0, which is
+    //     `notes.txt` — directories sort first and then by name, and this directory has none.
+    //     Nothing has moved the selection since: a *press* on a row starts a drag and only a
+    //     click activates one, which is what step 9 relied on too.
+    //
+    //     **Clicking the bar item, not a keyboard route**, because a menu that cannot be opened
+    //     by pointing at it is a menu nobody will find. The item sits at the content's left
+    //     edge, one bar below the title.
+    let file_menu = (fx + 20, fy + 1 + TITLE_BAR_H + MENU_BAR_H / 2);
+    click_at(&mut qmp, &mut session, file_menu.0, file_menu.1)?;
+    session.expect("nxfiles: menu popup ")?;
+    let popup = session.rest_of_line()?;
+    let (_, px, py, _pw, ph) = parse_menu_popup(&popup)
+        .ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
+
+    // **The row height is divided out of the popup rather than derived from the theme.** A menu
+    // row is text plus padding, so its height follows `font_px` — which a theme file sets, and
+    // which M11's decision 2 keeps *out* of the metrics a gate is allowed to assume. Four rows,
+    // and the frame is a one-pixel border with two of padding on each side.
+    const MENU_FRAME: i32 = 3;
+    const FILE_MENU_ROWS: i32 = 4;
+    let row_h = (ph as i32 - 2 * MENU_FRAME) / FILE_MENU_ROWS;
+    // `rename` is the third row: new file, new folder, rename, delete.
+    let rename_at = (px + 20, py + MENU_FRAME + row_h * 2 + row_h / 2);
+    click_at(&mut qmp, &mut session, rename_at.0, rename_at.1)?;
+
+    // **A receipt per character**, the discipline every typed sequence in this gate follows —
+    // and `nxfiles` grew the line to make it possible, for the reason the launcher's filter did
+    // one part earlier: an unacknowledged burst is a dropped keystroke discovered as a wrong
+    // filename several steps later.
+    for (i, c) in "renamed".chars().enumerate() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxfiles: name so far {} chars", i + 1))?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("nxfiles: renamed /home/papers/renamed")?;
+    session.expect("nxfiles: listed /home/papers - 2 entries")?;
+    println!("  ok: the browser's File menu renamed a file");
+
+    // **And the serial session reads it back**, which is what makes this a rename rather than a
+    // browser that redrew a label. The content is step 8's, so a rename that had copied or
+    // truncated shows up here as well.
+    session.send("open ./papers/renamed")?;
+    session.expect(TYPED)?;
+    session.expect("/home>")?;
+    println!("  ok: and the shell found the new name, with the old contents");
 
     // 10. **An editor launched from the menu, which is a launch with no file** (M11 Part E
     //     batch 7). `nxedit` required `argv[1]` and the applications modal passes none, so it
@@ -3058,10 +3126,16 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //
     //     **The dialog's geometry is hardcoded here**, the way this gate already hardcodes a
     //     title bar's height and a list's row height, because it cannot link the crate that
-    //     defines them. `nxedit::CONFIRM_DISCARD_CX` and its three siblings are the source, and
-    //     `the_published_button_centres_are_where_the_buttons_are` is the host test that pins
-    //     these four numbers to the tree that is actually built — so a change to the dialog's
-    //     padding fails there, beside the change, rather than here after a three-minute boot.
+    //     defines them. `libui::widget::DIALOG_LEFT_CX` and its siblings are the source — they
+    //     were `nxedit`'s until M12 Part B moved them down beside `dialog_frame`, when a second
+    //     confirmation would otherwise have given this gate two tables to keep in step — and
+    //     `libui::widget::tests::dialog_buttons_land_where_the_constants_say` is the host test
+    //     that pins these numbers to a tree that is actually built, so a change to `DIALOG_PAD`
+    //     fails there, beside the change, rather than here after a three-minute boot.
+    //
+    //     (This paragraph named two symbols that same part deleted — PR #268 review, worth
+    //     fixing 2 — which is the drift the move was made to prevent, in the one place a
+    //     compiler cannot see.)
     const CONFIRM_W: i32 = 340;
     const CONFIRM_H: i32 = 132;
     const CONFIRM_DISCARD_CX: i32 = 91;

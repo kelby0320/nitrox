@@ -733,6 +733,14 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   keystroke, and that presenting must be gated on the diff or a third commit blocks in `acquire`
   inside the render half of a loop that then stops pumping anything else.
 
+  **A `Child`'s hover does not move while a button is held**, and that is a correctness rule
+  rather than a nicety (M12 Part B). `Router` records a capture as a **tree id**, and `hit_test`
+  names the *deepest* node under the cursor; a hovered `menu_item` draws three layers where a
+  quiet one draws one, so a frame presented between a press and its release gives that node a new
+  id, `path_to_id` finds nothing, and the click is silently lost. A caller that retains a tree
+  must therefore not rebuild it with a different hover mid-gesture — `Child` does that for the
+  windows it owns, and `Router::grabbed` is published so a main window's loop can do the same.
+
   **A `Child` is one of the two parented roles**, `popup` and `dialog` — the pair the compositor's
   own `parent_of` matches and the spec calls "transient, parented". Its size is fixed at creation
   and measured from its tree, so a tree containing a `dock` is refused: `Dock` measures as
@@ -747,6 +755,16 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   **This is also the one thing in this crate that is not a function of values.** `libui` gained a
   `libsurface` dependency for it, which the layering in §10 always allowed and nothing had needed.
   Nothing else here can reach a syscall, and that is the property to protect.
+
+  **And a confirmation's *frame* is here too**, since M12 Part B: `dialog_frame` plus the
+  `DIALOG_*` metrics and the four aim points derived from them. A dialog is fixed-size rather than
+  measured — a gate presses its buttons and aims from the origin a shell logs, so buttons that
+  resized with the question would move under it — and the wrapper is also what lets the tree be a
+  `Child` at all, since `Dock` measures as everything it is offered and a tree containing one has
+  no natural size. It moved down when `nxfiles` grew the second confirmation: two applications
+  deriving the same four numbers would have given `check-login` two tables to keep in step, which
+  is the shape that goes wrong silently. Keys stay the caller's, for the reason `window_frame`
+  invents none.
 
 ---
 
