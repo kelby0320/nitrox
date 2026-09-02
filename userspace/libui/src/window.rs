@@ -369,7 +369,7 @@ mod tests {
         // Row 1 is the second `menu_item`, which is 20 tall in this metric.
         let row1_y = 30;
 
-        let mut step = |ev: PointerEvent, hover: &mut Option<u64>, tree: &mut Tree, router: &mut Router| {
+        let step = |ev: PointerEvent, hover: &mut Option<u64>, tree: &mut Tree, router: &mut Router| {
             let ui = menu(*hover);
             let l = crate::layout::layout(&ui, bounds, &cell);
             tree.update(&ui, &l).expect("diffable");

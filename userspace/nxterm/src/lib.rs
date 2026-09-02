@@ -30,9 +30,11 @@ use libterm::cell::Palette;
 use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
+use libkern::abi::BTN_LEFT;
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
-    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, POINTER_BUTTON, POINTER_MOTION,
+    POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED,
+    WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
 use libui::widget::{
@@ -107,6 +109,17 @@ const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W;
 /// And vertically: the title bar, the menu bar, and the frame.
 const CHROME_H: u32 = BAR_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
 
+/// The key that copies the selection, with **Ctrl and Shift** held: `c`.
+///
+/// **Shift is not decoration here** — M12 decision 6. `Ctrl+C` means *interrupt* in a terminal
+/// and always will; it is the one binding this system cannot take for copy, and the reason
+/// every real terminal emulator spells the pair with Shift. A literal for the reason
+/// `nxedit::SAVE_KEYCODE` is one, and pinned against `libinput`'s table by a test rather than
+/// by this comment.
+pub const COPY_KEYCODE: u16 = 46;
+/// The key that pastes: `v`, with Ctrl and Shift — see [`COPY_KEYCODE`].
+pub const PASTE_KEYCODE: u16 = 47;
+
 /// What the chrome can ask the terminal to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Msg {
@@ -146,6 +159,32 @@ pub enum Msg {
     /// with it but pass it on: which of them a button means is the *bar's* business, and this
     /// crate would only be re-deciding it.
     RequestState(u32),
+    /// The pointer did something over the grid — a selection gesture, or motion that is not one.
+    ///
+    /// Raw for [`Scroll`](Msg::Scroll)'s reason: most of what arrives here is not a selection,
+    /// because the router delivers motion whether or not a button is held, and a grid that
+    /// selected on hover would be unusable.
+    GridPointer(PointerEvent),
+}
+
+/// What the terminal wants done with the clipboard, which only `main` can do.
+///
+/// **An outbox, like every other syscall this crate does not make.** `update` is a function of
+/// values; talking to `/dev/clipboard` is IPC, so the app records what it wants and the binary
+/// that owns the namespace performs it — the same shape `nxedit`'s `take_save` has.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ClipRequest {
+    /// Push this text onto the ring.
+    Copy(alloc::string::String),
+    /// Fetch the newest entry and type it at the shell.
+    ///
+    /// **There is no cycle here, and that is a decision rather than an omission.** M12 decision
+    /// 3 makes cycling a *continuation* of a paste that **replaces what was just inserted** — and
+    /// a terminal cannot: a paste is bytes already sent down the pty to a program that has read
+    /// them. Taking them back would mean sending backspaces to something that may not be a line
+    /// editor at all. So cycling lives in the editor, where the buffer is the client's own, and
+    /// `Ctrl+Shift+V` here always pastes the newest.
+    Paste,
 }
 
 /// What a [`resize`](App::resize) did, beyond changing the size.
@@ -244,7 +283,9 @@ pub struct App {
     /// for in each axis, so "the window is the work area" would be false by a rounding error
     /// and the shell's own geometry log would say so.
     window: Size,
-    /// The viewport moved, so all of it repaints.
+    /// What the terminal owes the clipboard — see [`ClipRequest`].
+    clip_request: Option<ClipRequest>,
+    /// The whole viewport repaints — it moved, or the selection changed.
     ///
     /// **Not [`Grid::damage_all`], which was the first attempt** and is wrong for a reason
     /// worth keeping: the grid's dirty flags name *screen* rows, and a view scrolled far
@@ -252,6 +293,11 @@ pub struct App {
     /// every row the grid could name and not one row the user could see — the screen stayed on
     /// the old page under a thumb that had moved. The two damage spaces meet in
     /// [`damage_rows`](App::damage_rows) and nowhere else, so this is the half that lives here.
+    ///
+    /// **A selection change is the second cause, since M12 Part E**, and it is the *same*
+    /// mistake seen from a new direction: `Grid::select_from` damages every screen row, which
+    /// for a view scrolled back into the history is every row but the ones being looked at. A
+    /// drag in the scrollback would have highlighted nothing.
     view_moved: bool,
 }
 
@@ -282,6 +328,7 @@ impl App {
             closing: false,
             view_top: None,
             view_moved: false,
+            clip_request: None,
         }
     }
 
@@ -465,7 +512,69 @@ impl App {
             }
             Msg::Scroll(p) => self.scroll_to(p),
             Msg::Key(k) => self.key(k),
+            Msg::GridPointer(p) => self.grid_pointer(p),
         }
+    }
+
+    /// What the terminal owes the clipboard, taken exactly once.
+    pub fn take_clip_request(&mut self) -> Option<ClipRequest> {
+        self.clip_request.take()
+    }
+
+    /// Deliver what a paste fetched: type it at the shell.
+    ///
+    /// **Sent as input, not printed into the grid.** What is on screen is the *program's*
+    /// output, and a terminal that drew pasted text itself would show something the shell never
+    /// received. Sending it down the pty is what makes a pasted command a command.
+    pub fn pasted(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.send(text.as_bytes());
+    }
+
+    /// A pointer event over the grid: press to anchor, drag to extend, release to end.
+    ///
+    /// **Only the left button, and only while it is held.** The router delivers motion and
+    /// crossings unconditionally — `scroll_to` makes the same check for the same reason — so a
+    /// grid that extended on every motion would select whatever the pointer passed over on its
+    /// way to the scrollbar.
+    fn grid_pointer(&mut self, p: PointerEvent) {
+        let Some((line, col)) = self.cell_at(p.x, p.y) else { return };
+        if p.kind == POINTER_BUTTON && p.button == BTN_LEFT {
+            if p.flags & POINTER_PRESSED != 0 {
+                // A press with no drag selects nothing and *clears* what was selected — which
+                // is what a click anywhere else in the window means too.
+                self.grid.select_from(line, col);
+                // **The viewport, not the screen** — see [`view_moved`](Self::view_moved).
+                self.view_moved = true;
+            }
+            return;
+        }
+        if p.kind == POINTER_MOTION && p.buttons & 1 != 0 {
+            self.grid.extend(line, col);
+            self.view_moved = true;
+        }
+    }
+
+    /// The absolute `(line, column)` a grid-local pixel falls in, or `None` outside it.
+    ///
+    /// **Absolute, because a selection is** — see [`libterm::grid::Selection`]. The conversion
+    /// is here rather than at the call site for `rows_in`'s reason: two places doing this
+    /// arithmetic is two places to disagree about which cell a pixel is in.
+    pub fn cell_at(&self, x: i32, y: i32) -> Option<(u64, usize)> {
+        if x < 0 || y < 0 || self.metrics.cell_w == 0 || self.metrics.cell_h == 0 {
+            return None;
+        }
+        let col = (x as u32 / self.metrics.cell_w) as usize;
+        let row = (y as u32 / self.metrics.cell_h) as usize;
+        if row >= self.grid.rows() {
+            return None;
+        }
+        // Clamped rather than refused: a drag that runs off the right edge means "to the end of
+        // the line", which is what every text selection does and what a `None` here would turn
+        // into a gesture that stops moving.
+        Some((self.view_line() + row as u64, col.min(self.grid.cols())))
     }
 
     /// Type what a key produced, if it is a key that types.
@@ -477,6 +586,40 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return;
+        }
+        // **The clipboard chords are taken before anything is encoded**, which is the whole
+        // reason they carry Shift: `libterm::encode` folds `Ctrl+C` to `0x03`, the interrupt,
+        // and a terminal that copied on it would have taken the one binding a terminal cannot
+        // give away (M12 decision 6). Checked here rather than in `update` for the reason the
+        // two applications settled in Part D: a chord that acts on the *window* is the
+        // window's, and typing is what the grid does with everything else.
+        const CLIP_MODS: u16 = MOD_CTRL | MOD_SHIFT;
+        if k.modifiers & CLIP_MODS == CLIP_MODS {
+            match k.keycode {
+                COPY_KEYCODE => {
+                    // **Nothing selected is not a request.** A copy that pushed an empty entry
+                    // would move the ring's serial under every client that was mid-cycle, for a
+                    // gesture that had nothing to copy.
+                    if let Some(text) = self.grid.selected_text() {
+                        self.clip_request = Some(ClipRequest::Copy(text));
+                    }
+                    return;
+                }
+                PASTE_KEYCODE => {
+                    self.clip_request = Some(ClipRequest::Paste);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // **Typing clears the selection.** It is the same rule the kill ring's cycle follows —
+        // any other action ends the gesture — and without it a highlight stays on screen over
+        // text that has since scrolled away under it.
+        //
+        // The return value is the repaint: clearing nothing must not damage the viewport, or
+        // every keystroke in a terminal with no selection would repaint every row.
+        if self.grid.clear_selection() {
+            self.view_moved = true;
         }
         let mut out = [0u8; libterm::encode::MAX_ENCODED];
         let n = libterm::encode::encode(k.keycode, k.modifiers, &mut out);
@@ -612,7 +755,12 @@ impl App {
                     .key(SCROLLBAR_KEY),
                 ),
                 ],
-                custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
+                custom(GRID_KIND, grid_px)
+                    .key(GRID_KEY)
+                    .on_key(|k| Some(Msg::Key(k)))
+                    // **The grid takes the pointer since M12 Part E.** It had none: nothing in
+                    // the terminal reacted to the pointer except the scrollbar and the chrome.
+                    .on_pointer(Msg::GridPointer),
             ),
             &ui,
         );
@@ -703,6 +851,120 @@ mod tests {
     fn app() -> App {
         let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
         App::new(20, 6, Metrics::new(&f, 16.0))
+    }
+
+    // --- selection and the clipboard (M12 Part E) ---------------------------
+
+    /// A pointer event over the grid, in grid-local pixels.
+    fn ptr(kind: u16, buttons: u16, flags: u16, x: i32, y: i32) -> PointerEvent {
+        PointerEvent { kind, button: BTN_LEFT, buttons, flags, x, y, ..Default::default() }
+    }
+
+    /// A key press, as the compositor delivers one.
+    fn press(a: &mut App, keycode: u16, modifiers: u16) {
+        a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN as u16, modifiers)));
+    }
+
+    #[test]
+    fn a_drag_over_the_grid_selects_and_a_copy_asks_for_that_text() {
+        let mut a = app();
+        a.feed(b"hello world");
+        let (w, h) = (a.metrics.cell_w as i32, a.metrics.cell_h as i32);
+        a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
+        a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
+        press(&mut a, COPY_KEYCODE, MOD_CTRL | MOD_SHIFT);
+        assert_eq!(
+            a.take_clip_request(),
+            Some(ClipRequest::Copy(alloc::string::String::from("hello")))
+        );
+        // …and the chord did not reach the shell as an interrupt.
+        assert!(a.take_outbox().is_empty(), "the chord was consumed, not typed");
+    }
+
+    #[test]
+    fn motion_with_no_button_held_does_not_select() {
+        // The router delivers motion whether or not a button is down, so without this check the
+        // pointer merely crossing the grid on its way to the scrollbar would select.
+        let mut a = app();
+        a.feed(b"hello world");
+        let (w, h) = (a.metrics.cell_w as i32, a.metrics.cell_h as i32);
+        a.update(Msg::GridPointer(ptr(POINTER_MOTION, 0, 0, 5 * w, h / 2)));
+        assert_eq!(a.grid.selection(), None);
+    }
+
+    #[test]
+    fn copying_nothing_is_not_a_request() {
+        // A copy that pushed an empty entry would move the ring's serial under every client
+        // that was mid-cycle, for a gesture that had nothing to copy.
+        let mut a = app();
+        a.feed(b"hello");
+        press(&mut a, COPY_KEYCODE, MOD_CTRL | MOD_SHIFT);
+        assert_eq!(a.take_clip_request(), None);
+    }
+
+    #[test]
+    fn ctrl_c_without_shift_is_still_the_interrupt() {
+        // **The one binding a terminal cannot give away** — M12 decision 6, and the reason the
+        // copy chord carries Shift at all. Without the modifier check this chord would copy,
+        // and nothing would be able to interrupt a running program.
+        let mut a = app();
+        a.feed(b"hello");
+        a.grid.select_from(0, 0);
+        a.grid.extend(0, 5);
+        press(&mut a, COPY_KEYCODE, MOD_CTRL);
+        assert_eq!(a.take_clip_request(), None, "a plain Ctrl+C is not a copy");
+        assert_eq!(a.take_outbox(), alloc::vec![0x03], "it is the interrupt byte");
+    }
+
+    #[test]
+    fn a_paste_is_typed_at_the_shell_rather_than_drawn() {
+        // What is on screen is the *program's* output. A terminal that drew pasted text itself
+        // would show something the shell never received.
+        let mut a = app();
+        a.pasted("ls\n");
+        assert_eq!(a.take_outbox(), alloc::vec![b'l', b's', b'\n']);
+    }
+
+    #[test]
+    fn typing_clears_the_selection() {
+        // The same rule the kill ring's cycle follows: any other action ends the gesture.
+        // Without it a highlight stays on screen over text that has scrolled away under it.
+        let mut a = app();
+        a.feed(b"hello");
+        a.grid.select_from(0, 0);
+        a.grid.extend(0, 5);
+        press(&mut a, 30, 0); // `a`
+        assert_eq!(a.grid.selection(), None);
+    }
+
+    #[test]
+    fn a_selection_made_in_the_scrollback_repaints_what_is_being_looked_at() {
+        // **The two damage spaces, from a new direction** (M12 Part E). `Grid::select_from`
+        // damages every *screen* row; a view scrolled back into the history is showing none of
+        // them, and `damage_rows` filters what does not map. So a drag in the scrollback
+        // highlighted nothing, exactly as scrolling once painted nothing — the bug
+        // `view_moved` was added for.
+        let mut a = app();
+        for i in 0..40 {
+            a.feed(alloc::format!("line {i}\r\n").as_bytes());
+        }
+        a.scroll_to_line(a.grid.oldest_line());
+        let _ = a.damage_rows();
+        let h = a.metrics.cell_h as i32;
+        a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
+        let rows = a.damage_rows();
+        assert!(
+            rows.contains(&0),
+            "the top viewport row is scrollback and has to repaint; got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_copy_and_paste_keycodes_are_the_letters_they_claim() {
+        // Pinned against `libinput`'s table rather than against the constants' own comments —
+        // the same check `nxedit`'s chords get.
+        assert_eq!(libinput::keymap::to_char(COPY_KEYCODE, 0), Some(b'c'));
+        assert_eq!(libinput::keymap::to_char(PASTE_KEYCODE, 0), Some(b'v'));
     }
 
     #[test]

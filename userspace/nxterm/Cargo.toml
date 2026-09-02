@@ -14,7 +14,10 @@ libterm = { path = "../libterm" }
 libui = { path = "../libui" }
 libdraw = { path = "../libdraw", features = ["io"] }
 libsurface = { path = "../libsurface" }
-librsproto = { path = "../librsproto" }
+librsproto = { path = "../librsproto", features = ["io"] }
+# The keymap, for the chord constants' tests only: `COPY_KEYCODE` claims to be `c`, and the
+# table is what says so — a comment cannot.
+libinput = { path = "../libinput" }
 libkern = { path = "../libkern" }
 libstream = { path = "../libstream", features = ["io"] }
 libheap = { path = "../libheap" }

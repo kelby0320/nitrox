@@ -97,6 +97,15 @@ pub struct NamespaceSpec<'a> {
     pub profile_endpoint: u64,
     /// The tty-server endpoint, bound at `/dev/tty`.
     pub tty_endpoint: u64,
+    /// The clipboard-server endpoint, bound at `/dev/clipboard`. `0` binds nothing.
+    ///
+    /// **Both columns get it, and that makes it the odd one out.** `/dev/draw` goes only to
+    /// the graphical session because a serial one has no compositor; the clipboard is
+    /// reachable as a *path* precisely so a pipeline can use it (M12 decision 4), and a
+    /// pipeline runs in either. So this is a `u64` rather than a `bool` flag beside
+    /// [`bind_fonts`](Self::bind_fonts): what varies is whether the endpoint exists at all —
+    /// a boot where `clipboard-server` did not start — not which column asked for it.
+    pub clipboard_endpoint: u64,
     /// The user's home directory, as the subtree base for `/home`.
     pub home: &'a [u8],
     /// The user's name, snapshotted at `/session/user`.
@@ -211,6 +220,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         fs_endpoint,
         profile_endpoint,
         tty_endpoint,
+        clipboard_endpoint,
         home,
         user,
         bind_fonts,
@@ -262,6 +272,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     let mut has_bin = false;
     let mut has_tty = false;
     let mut has_console = false;
+    let mut has_clipboard = false;
     if profile_endpoint != 0 {
         let bin = b"/bin";
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no subtree
@@ -314,6 +325,36 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
             kprint(b"libsession: /dev/tty bind FAIL\n");
         }
         has_tty = tr == 0;
+    }
+
+    // `/dev/clipboard` → the clipboard server, so anything in the session can copy and paste
+    // — and, because it is a path, so a *pipeline* can (M12 decision 4).
+    //
+    // **This binding is the authority**, which is the whole of M12 decision 1: there is no
+    // ambient clipboard, so a session built without this line has none, and an endpoint
+    // attenuated to `RIGHT_SEND` before it reaches here would be a session that can copy and
+    // not read. The forwarding endpoint, for `/dev/tty`'s reason — a client resolving this
+    // gets its own session channel, and binding a *minted* one would produce an entry that
+    // answers `Namespace::Resolve` with `Unsupported`.
+    if clipboard_endpoint != 0 {
+        let dev = b"/dev/clipboard";
+        // SAFETY: valid namespace handle, path pointer, and endpoint handle; no base.
+        let cr = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                dev.as_ptr() as u64,
+                dev.len() as u64,
+                clipboard_endpoint,
+                0,
+                0,
+            )
+        };
+        if cr != 0 {
+            // Non-fatal: the session exists, copy and paste do nothing in it.
+            kprint(b"libsession: /dev/clipboard bind FAIL (no copy and paste)\n");
+        }
+        has_clipboard = cr == 0;
     }
 
     // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
@@ -373,6 +414,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         SESSION_HAS_BIN = has_bin;
         SESSION_HAS_TTY = has_tty;
         SESSION_HAS_CONSOLE = has_console;
+        SESSION_HAS_CLIPBOARD = has_clipboard;
     }
     ns
 }
@@ -397,6 +439,19 @@ pub fn session_has_console() -> bool {
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe { SESSION_HAS_CONSOLE }
 }
+
+/// Whether the last [`build_namespace`] bound `/dev/clipboard`.
+///
+/// **Reported rather than assumed**, for [`session_has_console`]'s reason — which is not a
+/// hypothetical here either: that one was a hardcoded string for three weeks and its gate's
+/// assertion passed against a build that bound the opposite.
+pub fn session_has_clipboard() -> bool {
+    // SAFETY: single-threaded supervisor; one namespace is built at a time.
+    unsafe { SESSION_HAS_CLIPBOARD }
+}
+
+/// Set by [`build_namespace`]; see [`session_has_clipboard`].
+static mut SESSION_HAS_CLIPBOARD: bool = false;
 
 /// See [`session_has_console`].
 static mut SESSION_HAS_CONSOLE: bool = false;

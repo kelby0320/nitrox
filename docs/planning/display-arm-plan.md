@@ -4030,20 +4030,80 @@ The two taken before this pass — the clipboard's owner and the image format �
       field, while the buffer chords stay the field's. A comment justifying that ordering with a
       reason the reviewer disproved was replaced rather than kept.
 
-### Part E — copy and paste
+### Part E — copy and paste ✅ complete (2026-09-02)
 
-- [ ] **A clipboard server**, endpoint bound per session, storing rather than brokering. Decision 1
-      above.
+- [x] **A clipboard server** ✅, endpoint bound per session, storing rather than brokering.
+      Decision 1 above, and the architecture is [`clipboard.md`](../architecture/clipboard.md).
 
-- [ ] **A kill ring, not a slot** — see decision 3.
+      `init` spawns it from `/bin` and binds `/dev/clipboard`, non-critical-path beside the tty
+      server; the endpoint travels `init` → `service-mgr` → **both** session columns. That last
+      part makes it the first endpoint neither display-specific nor console-specific — `/dev/draw`
+      goes only to the graphical column, and this goes to both because decision 4's pipeline runs
+      in either. `desktop-shell` binds it into every application namespace it constructs, for
+      `/dev/desktop`'s reason: the session namespace is the shell's own and nothing else runs in
+      it.
 
-- [ ] **Reachable as a path**, `/dev/clipboard`, and usable from a pipeline — decision 4.
+      **The binding is the authority**, so granting it is a capability decision each time, and the
+      mechanism for narrowing it needs no protocol change: an endpoint attenuated to `RIGHT_SEND`
+      is an application that can copy and not read.
 
-- [ ] **Selection in the terminal grid**, which `libterm` has never had: M5 deferred it in the same
-      breath as the clipboard. What a selection *is* across a reflow is the question inside it.
+- [x] **A kill ring, not a slot** ✅ — decision 3, with its three rules built rather than
+      paraphrased. A paste takes index 0 and consults no cursor; a cycle is a *continuation* that
+      replaces what was just inserted and is ended by any other action; and where it can still go
+      stale — a pipeline pushing mid-cycle — every entry carries the ring's serial and the server
+      refuses a cycle that carries an old one.
 
-- [ ] **Gate**: copy in the editor, paste in the terminal, and the shell prints what was copied —
-      one gesture crossing two applications and a server, which is the whole point.
+      **A terminal does not cycle**, which the part settled: a paste there is bytes already sent
+      down the pty, and taking them back would mean sending backspaces to something that may not
+      be a line editor. Cycling lives where the buffer is the client's own.
+
+- [x] **Reachable as a path** ✅, `/dev/clipboard`, and usable from a pipeline — decision 4, as the
+      `clip` coreutil: `clip`, `clip N`, `clip --list`, `… | clip --copy`.
+
+      **And it found that the pipe could not carry text at all.** `"hello" | clip --copy` was
+      refused — only a `Table` could be piped into a program — while `StreamFlags::TEXT_FALLBACK`,
+      the "Unix floor" the spec defines for exactly this, had been written by `libstream` and read
+      by **nothing** for four milestones. Both ends now exist: the shell wraps a `String` (or a
+      list of them) as one, and `display` renders one as the text it is rather than printing
+      `line` above somebody's clipboard.
+
+- [x] **Selection in the terminal grid** ✅, which `libterm` had never had. The question inside it
+      is answered rather than avoided: a **logical line's text is invariant across a rewrap** — the
+      exact property `Line::wrapped` was added for in M9 Part D — so a selection is a pair of
+      absolute `(line, column)` positions and a reflow maps them by re-dividing the offset by the
+      new width. `Reflow::map_position` does it and **the cursor's own remap now goes through the
+      same function**, so the two cannot disagree about where a character went.
+
+      Clearing the selection on resize was the alternative, and is what several real terminals do.
+      Not taken: the mechanism already existed, because the scrolled-back viewport's anchor had to
+      survive a rewrap a milestone earlier.
+
+- [x] **Gate** ✅, in two halves, because the crossing has two halves.
+
+      `check-login` step 9d is the graphical one: the editor copies a **selection** (a find, so no
+      keystroke changes the buffer and steps 11 and 12 find it as step 9c left it), a terminal
+      launched for the purpose pastes it into `touch ./` + a typed `.clip` suffix, and the
+      **serial** session lists `nitrox.clip`. Asserted through the filesystem rather than a log
+      line: `nxterm` in a release image does not report its grid, and a paste that delivered the
+      wrong bytes makes a differently-named file rather than a matching count.
+
+      `test-interactive` step 19c is the other: a pipeline pushes, `clip` reads it back, and
+      **index 1 is still the entry before it** — the property a single slot fails while passing
+      everything above it. From a process with no window at all, which is the half a windowed test
+      cannot see.
+
+- [x] **Three bugs the part found, two of them latent for a milestone** ✅. A drag in the
+      *scrollback* would have highlighted nothing: `Grid::select_from` damages every **screen**
+      row, and a view scrolled back into the history is showing none of them — the same
+      two-damage-spaces mistake `nxterm::view_moved` was added for in M9, arriving from a new
+      direction. Caught by reading the damage path rather than by a gate, and pinned by a test
+      whose control reports `got []`. And: A control channel of
+      depth 4 carrying five `NOBLOCK` handoffs drops the fifth **silently** — the graphical
+      session came up with no `/dev/clipboard` and the send reported success. `libsession` carries
+      a comment about the identical failure from M7 Part F, which is what named this one on sight;
+      both ring depths now state that the number bounds the send count. And `init`'s
+      `close_retained_endpoints` had been closing three of what were four endpoints since the
+      compositor's was added, leaking it on a failed `service-mgr` spawn.
 
 ### Part F — images and the wallpaper
 

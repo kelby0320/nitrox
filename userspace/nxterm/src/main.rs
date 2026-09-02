@@ -23,7 +23,9 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_mono, load_ui};
+use libkern::debug::Line;
 use libkern::{exit, kprint};
+use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
@@ -192,6 +194,38 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 /// # Safety
 ///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments.
+/// Push `bytes` onto the kill ring.
+///
+/// **Connects per operation rather than holding a session open**, and that is deliberate: a
+/// terminal copies once every few minutes at most, a session costs the server a wait-set slot,
+/// and this endpoint has more clients than any other in a graphical session. The cost is one
+/// resolve per copy, which is a round trip nobody is waiting on.
+fn clipboard_copy(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+    let r = clip.copy(CLIP_KIND_TEXT, bytes).map(|_| ());
+    clip.close();
+    r.map_err(|_| "the clipboard refused it")
+}
+
+/// Read the newest entry into `out`; returns how many bytes it wrote.
+///
+/// **The newest, with no serial** — see [`nxterm::ClipRequest::Paste`] for why a terminal does
+/// not cycle.
+fn clipboard_paste(ns: u64, out: &mut [u8]) -> Result<usize, &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+    let r = clip.paste(0, CLIP_ANY_SERIAL, out);
+    clip.close();
+    match r {
+        Ok((_, _, len)) => Ok(len.min(out.len())),
+        // An empty ring is not a failure — nobody has copied anything yet, so there is nothing
+        // to type and nothing to report.
+        Err(e) if e.is_empty() => Ok(0),
+        Err(_) => Err("the clipboard refused it"),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxterm: up\n");
@@ -578,6 +612,46 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 Err(_) => kprint(b"nxterm: the state request was refused\n"),
             }
+        }
+
+        // ---- the clipboard ----
+        //
+        // **Here rather than in `update`**, for the reason every other syscall in this loop is:
+        // `App::update` is a function of values, and `/dev/clipboard` is IPC. A copy is one
+        // round trip; a paste is one round trip and then the bytes go down the pty exactly as
+        // if they had been typed.
+        if let Some(req) = app.take_clip_request() {
+            match req {
+                nxterm::ClipRequest::Copy(text) => match clipboard_copy(root_ns, text.as_bytes()) {
+                    // **A length, never the text** — this is a terminal, and what a person
+                    // selected is as much theirs as what they typed.
+                    Ok(()) => Line::new()
+                        .s(b"nxterm: copied ")
+                        .u(text.len() as u64)
+                        .s(b" bytes")
+                        .end(),
+                    Err(why) => Line::new().s(b"nxterm: the copy failed: ").s(why.as_bytes()).end(),
+                },
+                nxterm::ClipRequest::Paste => {
+                    let mut got = [0u8; MAX_CLIP_BYTES];
+                    match clipboard_paste(root_ns, &mut got) {
+                        Ok(n) => {
+                            if let Ok(text) = core::str::from_utf8(&got[..n]) {
+                                app.pasted(text);
+                                Line::new()
+                                    .s(b"nxterm: pasted ")
+                                    .u(n as u64)
+                                    .s(b" bytes")
+                                    .end();
+                            } else {
+                                kprint(b"nxterm: the clipboard entry is not text\n");
+                            }
+                        }
+                        Err(why) => Line::new().s(b"nxterm: the paste failed: ").s(why.as_bytes()).end(),
+                    }
+                }
+            }
+            continue; // round again: a paste has put bytes in the outbox
         }
 
         // ---- the tty ----

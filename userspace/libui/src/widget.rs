@@ -935,6 +935,13 @@ enum EditKind {
     Typing,
     /// Characters coming out.
     Deleting,
+    /// A whole insertion arriving at once — a paste.
+    ///
+    /// **Its own kind so it is its own undo step.** Grouped with `Typing` a paste would merge
+    /// into whatever word was being typed before it, and one undo would take back both. A
+    /// person who pastes and then undoes means "not that", and the text they had typed is not
+    /// part of "that".
+    Pasting,
 }
 
 /// A buffer and a cursor, as they were before a group of edits.
@@ -1144,6 +1151,68 @@ impl TextAreaState {
         if !c.is_alphanumeric() {
             self.group = None;
         }
+    }
+
+    /// Insert `text` at the cursor, replacing any selection, as **one** undo step.
+    ///
+    /// The paste primitive (M12 Part E). `insert` per character would be usable and wrong in two
+    /// ways: a newline is not a character it accepts, and the undo grouping would break the
+    /// pasted text into words.
+    ///
+    /// Returns the range it occupies afterwards, `(line, col)` to `(line, col)` — which is what
+    /// makes **cycling** possible at all: M12 decision 3 says a cycle *replaces what was just
+    /// inserted*, so the caller has to be told where that is. Deriving it from the cursor and
+    /// the text's shape at the call site is the same arithmetic done in a place with less to
+    /// check it against.
+    pub fn insert_text(&mut self, text: &str) -> ((usize, usize), (usize, usize)) {
+        self.begin(EditKind::Pasting);
+        self.delete_selection();
+        let from = (self.line, self.col);
+        // The tail of the current line moves to the end of what is being inserted, exactly as
+        // `newline` moves it — a paste ending mid-line must not swallow what was after it.
+        let tail = self.lines[self.line].split_off(self.col);
+        let mut parts = text.split('\n');
+        // `split` always yields at least one piece, so this cannot be `None`.
+        let first = parts.next().unwrap_or("");
+        self.lines[self.line].push_str(first);
+        self.col += first.len();
+        for part in parts {
+            self.line += 1;
+            self.lines.insert(self.line, String::from(part));
+            self.col = part.len();
+        }
+        let to = (self.line, self.col);
+        self.lines[self.line].push_str(&tail);
+        self.goal = None;
+        self.revision += 1;
+        // **A paste is a complete step**, so the next keystroke starts a new group rather than
+        // being undone together with it.
+        self.group = None;
+        (from, to)
+    }
+
+    /// Select from `from` to `to`, putting the cursor at `to`.
+    ///
+    /// **Total, and clamped**, because the caller's coordinates may be stale: the range a paste
+    /// returned is only valid until the next edit, and a cycle that arrived after one would
+    /// otherwise index out of the buffer. Clamping means a stale range selects something
+    /// harmless rather than panicking in an editor holding somebody's unsaved work.
+    pub fn select_range(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let clamp = |(line, col): (usize, usize), lines: &Vec<String>| {
+            let line = line.min(lines.len() - 1);
+            let mut col = col.min(lines[line].len());
+            while col > 0 && !lines[line].is_char_boundary(col) {
+                col -= 1;
+            }
+            (line, col)
+        };
+        let from = clamp(from, &self.lines);
+        let to = clamp(to, &self.lines);
+        self.anchor = Some(from);
+        self.line = to.0;
+        self.col = to.1;
+        self.goal = None;
+        self.group = None;
     }
 
     /// Split the line at the cursor, replacing any selection.

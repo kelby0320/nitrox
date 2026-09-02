@@ -15,6 +15,7 @@
 //!   is a ring with a bound.
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -71,9 +72,17 @@ pub struct Line {
 pub struct Reflow {
     /// The absolute number of the oldest line this maps.
     base: u64,
-    /// The new absolute number of each old line, from `base` upward. Empty for a resize that
-    /// moved nothing, where the mapping is the identity.
-    to: Vec<u64>,
+    /// Where each old line's text begins in the new layout: which **logical** line, and how
+    /// far into it. Empty for a resize that moved nothing, where the mapping is the identity.
+    ///
+    /// **A logical line's text is invariant across a rewrap** — that is the whole reason
+    /// [`Line::wrapped`] exists — so an offset into one is the coordinate that survives, and
+    /// every mapping below is that offset re-divided by the new width.
+    at: Vec<(usize, usize)>,
+    /// Where each logical line starts in the new row numbering, and how many rows it takes.
+    lines: Vec<(usize, usize)>,
+    /// The new width, which is what turns an offset back into a row and a column.
+    cols: usize,
     /// Logical lines the bounded scrollback dropped during this resize. See
     /// [`evicted_lines`](Reflow::evicted_lines).
     evicted: usize,
@@ -86,11 +95,32 @@ impl Reflow {
     /// that still exists — the scrollback evicts, and a caller holding a number from before an
     /// eviction is the ordinary case [`clamp_view`](Grid::clamp_view) already exists for.
     pub fn map_line(&self, old: u64) -> u64 {
-        if self.to.is_empty() {
-            return old;
+        self.map_position(old, 0).0
+    }
+
+    /// Where the *cell* at old `(line, col)` is now.
+    ///
+    /// **The generalisation of [`map_line`](Self::map_line), and the reason a selection can
+    /// survive a resize at all** (M12 Part E). A view is anchored to a line and does not care
+    /// which column, so the line map was enough for it; a selection is a pair of *positions*,
+    /// and re-breaking a paragraph at a new width moves a character across rows as well as
+    /// down them.
+    ///
+    /// The arithmetic is exactly what [`Grid::resize`] already did for the cursor — an offset
+    /// into the logical line, re-divided by the new width — which is why the cursor's own
+    /// remap is now this function rather than a second copy of it.
+    pub fn map_position(&self, line: u64, col: usize) -> (u64, usize) {
+        if self.at.is_empty() {
+            return (line, col);
         }
-        let i = old.saturating_sub(self.base) as usize;
-        self.to[i.min(self.to.len() - 1)]
+        let i = (line.saturating_sub(self.base) as usize).min(self.at.len() - 1);
+        let (li, into) = self.at[i];
+        let (start, height) = self.lines[li];
+        let off = into + col;
+        // The segment the character landed in, clamped to the line's last row: a column past
+        // the trimmed text belongs at the end of the text rather than off the bottom of it.
+        let seg = (off / self.cols).min(height.saturating_sub(1));
+        (self.base + (start + seg) as u64, (off - seg * self.cols).min(self.cols - 1))
     }
 
     /// How many logical lines the bounded scrollback dropped during this resize.
@@ -103,6 +133,72 @@ impl Reflow {
     /// (PR #252 review, finding 2).
     pub fn evicted_lines(&self) -> usize {
         self.evicted
+    }
+}
+
+/// A range of text a person has swept out with the pointer.
+///
+/// **A pair of absolute `(line, column)` positions**, which is the same coordinate the
+/// scrolled-back viewport is anchored to and is chosen for the same reason: a selection made in
+/// the history must go on naming the same *text* while output arrives below it. Screen-relative
+/// coordinates would slide up a row per line printed, so a selection would drift under the
+/// person who made it.
+///
+/// **An anchor and a head rather than a start and an end**, matching
+/// `libui::widget::TextAreaState`: a selection is *directional* while it is being made, so
+/// dragging back past where the button went down selects the other way. Normalising is
+/// [`ordered`](Selection::ordered)'s job, once, rather than every reader's.
+///
+/// ## What a selection is across a reflow — the question inside this part
+///
+/// M5 deferred selection "in the same breath as the clipboard", and
+/// `display-arm-plan.md` M12 Part E names the reflow as the open question in it. The answer is
+/// that a **logical line's text is invariant** across a rewrap — that is exactly what
+/// [`Line::wrapped`] was added for in M9 Part D — so a position expressed as an offset into a
+/// logical line survives, and re-dividing that offset by the new width is the whole mapping.
+/// [`Reflow::map_position`] does it, and the cursor now goes through the same function, so the
+/// two cannot disagree about where a character went.
+///
+/// The alternative was to **clear the selection on resize**, which is what several real
+/// terminals do. It was not taken because the mechanism already existed: the viewport's anchor
+/// had to survive a rewrap for the same reason a milestone earlier, and a selection that
+/// vanished when a window was nudged would be the visible half of a decision made to save
+/// twenty lines.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Selection {
+    /// Where the gesture started: absolute line, and column.
+    pub anchor: (u64, usize),
+    /// Where the pointer is now.
+    pub head: (u64, usize),
+}
+
+impl Selection {
+    /// `(first, last)` in reading order, whichever way the drag went.
+    pub fn ordered(&self) -> ((u64, usize), (u64, usize)) {
+        if (self.head.0, self.head.1) < (self.anchor.0, self.anchor.1) {
+            (self.head, self.anchor)
+        } else {
+            (self.anchor, self.head)
+        }
+    }
+
+    /// Whether the range covers no cells at all.
+    ///
+    /// A press with no drag is this: the two ends are one position, and there is nothing
+    /// between them. It is not *nothing* — a gesture is in progress — which is why this is a
+    /// question about the range rather than the selection being `None`.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Whether the cell at absolute `(line, col)` falls inside the range.
+    ///
+    /// **Half-open at the end**, like every other range here: the head is where the pointer is,
+    /// and the cell *under* the pointer is not yet swept. Inclusive would make a press with no
+    /// drag select one character, which is not what a click means anywhere.
+    pub fn contains(&self, line: u64, col: usize) -> bool {
+        let (first, last) = self.ordered();
+        (line, col) >= first && (line, col) < last
     }
 }
 
@@ -150,6 +246,13 @@ pub struct Grid {
     /// It counts *lines produced*, not lines retained, so it does not move when the bounded
     /// scrollback evicts its oldest line. [`oldest_line`](Grid::oldest_line) is the other end.
     scrolled: u64,
+    /// The range a person has swept out, if any. See [`Selection`].
+    ///
+    /// **The grid's rather than the client's**, because two of the three things that can
+    /// invalidate it are the grid's own: a reflow moves the text under it, and the bounded
+    /// scrollback evicts the lines it names. A client holding it would have to be told about
+    /// both, which is a protocol between a client and its own data structure.
+    selection: Option<Selection>,
 }
 
 /// Drop the run of untouched cells at the end of a logical line.
@@ -190,6 +293,7 @@ impl Grid {
             dirty: vec![true; rows],
             cursor_drawn: (0, 0),
             scrolled: 0,
+            selection: None,
         }
     }
 
@@ -285,6 +389,108 @@ impl Grid {
         (row < self.rows as u64).then_some((row as usize, self.col))
     }
 
+    /// The range a person has swept out, if any.
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// Begin a selection at absolute `(line, col)` — a press.
+    ///
+    /// Both ends start here, so a press with no drag selects nothing. [`extend`](Self::extend)
+    /// is what moves the head.
+    pub fn select_from(&mut self, line: u64, col: usize) {
+        self.selection = Some(Selection { anchor: (line, col), head: (line, col) });
+        self.damage_all();
+    }
+
+    /// Move the head of an in-progress selection — a drag.
+    ///
+    /// **Does nothing without an anchor**, which is what keeps a motion with no button held
+    /// from selecting: the caller decides when a gesture starts, and this cannot start one.
+    pub fn extend(&mut self, line: u64, col: usize) {
+        if let Some(sel) = self.selection.as_mut() {
+            if sel.head == (line, col) {
+                return;
+            }
+            sel.head = (line, col);
+            self.damage_all();
+        }
+    }
+
+    /// Drop the selection, if there is one. Returns whether anything changed.
+    ///
+    /// **The return value is the repaint**, and it is why this reports rather than being a
+    /// plain setter: clearing nothing must not damage the whole grid, or every keystroke in a
+    /// terminal with no selection would repaint every row.
+    pub fn clear_selection(&mut self) -> bool {
+        if self.selection.take().is_some() {
+            self.damage_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The selected text, or `None` when nothing is selected.
+    ///
+    /// **Trailing blanks are dropped per line**, exactly as [`resize`](Self::resize) drops them
+    /// when it joins: a grid is a rectangle and the cells past the end of a line were never
+    /// written, so keeping them would paste a screen's width of spaces after every line. What
+    /// they are *not* is a coloured region a program drew — `Cell::BLANK` is the one value that
+    /// means "never written", and this compares against it for that reason.
+    ///
+    /// **A soft wrap does not become a newline.** A line that ran past the right margin is one
+    /// line of text that the terminal happened to break; pasting it with a newline in the
+    /// middle would insert a break the program never wrote. [`Line::wrapped`] is what says
+    /// which is which — the same flag the rewrap rests on.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let (first, last) = sel.ordered();
+        let mut out = String::new();
+        let mut line = first.0;
+        while line <= last.0 {
+            let from = if line == first.0 { first.1 } else { 0 };
+            let to = if line == last.0 { last.1 } else { self.cols };
+            let mut row = String::new();
+            for col in from..to.min(self.cols) {
+                match self.view_cell(line, 0, col) {
+                    Some(c) => row.push(c.ch),
+                    // Past the end of the history: the anchor named a line the ring evicted.
+                    None => break,
+                }
+            }
+            while row.ends_with(' ') {
+                row.pop();
+            }
+            out.push_str(&row);
+            // The wrap flag belongs to the line being left, and only a *hard* end is a newline.
+            if line < last.0 && !self.line_wrapped(line) {
+                out.push('\n');
+            }
+            line += 1;
+        }
+        Some(out)
+    }
+
+    /// Whether absolute `line`'s text continues on the line below — history or screen.
+    ///
+    /// [`row_wrapped`](Self::row_wrapped) answers this for a *screen* row;
+    /// [`Line::wrapped`] holds it for a scrollback line. This is the one accessor that spans
+    /// both, which is what a selection reaching from the history onto the screen needs.
+    pub fn line_wrapped(&self, line: u64) -> bool {
+        if line >= self.scrolled {
+            self.row_wrapped((line - self.scrolled) as usize)
+        } else {
+            match line.checked_sub(self.oldest_line()) {
+                Some(i) => self.scrollback.get(i as usize).is_some_and(|l| l.wrapped),
+                None => false,
+            }
+        }
+    }
+
     /// Which rows changed since this was last called, and clear the record.
     ///
     /// **Per row, not one rectangle.** A keystroke dirties one row, and the render unions what
@@ -349,7 +555,13 @@ impl Grid {
     pub fn resize(&mut self, cols: usize, rows: usize) -> Reflow {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if cols == self.cols && rows == self.rows {
-            return Reflow { base: self.oldest_line(), to: Vec::new(), evicted: 0 };
+            return Reflow {
+                base: self.oldest_line(),
+                at: Vec::new(),
+                lines: Vec::new(),
+                cols,
+                evicted: 0,
+            };
         }
         let base = self.oldest_line();
 
@@ -408,16 +620,14 @@ impl Grid {
             height.push(lines.len() - start[start.len() - 1]);
         }
 
-        // Where each old line's first character now is. A line whose text was trimmed away maps
-        // to the last row its logical line produced, which is where that text now ends.
+        // **The map is kept as offsets rather than resolved to rows here.** Resolving loses the
+        // column, and a selection is a pair of *positions* — see [`Reflow::map_position`], which
+        // is where the division by the new width now lives, once, for the cursor and for a
+        // selection alike.
         let screen_start = lines.len().saturating_sub(rows);
-        let to: Vec<u64> = pos
-            .iter()
-            .map(|&(li, off)| {
-                let seg = (off / cols).min(height[li].saturating_sub(1));
-                base + (start[li] + seg) as u64
-            })
-            .collect();
+        let at = pos.clone();
+        let line_spans: Vec<(usize, usize)> =
+            start.iter().zip(height.iter()).map(|(&s, &h)| (s, h)).collect();
 
         // 4. The bottom `rows` become the screen; the rest is history.
         self.cells = vec![blank; cols * rows];
@@ -445,13 +655,21 @@ impl Grid {
             }
         }
 
-        // 5. The cursor follows the character it was on.
-        let (cl, coff) = pos.get(cursor_row).copied().unwrap_or((0, 0));
-        let off = coff + self.col;
-        let seg = (off / cols).min(height.get(cl).copied().unwrap_or(1).saturating_sub(1));
-        let line_index = start.get(cl).copied().unwrap_or(0) + seg;
+        // 5. The cursor follows the character it was on — **through the same map a selection
+        //    uses**, rather than a second copy of the arithmetic beside it.
+        let reflow = Reflow { base, at, lines: line_spans, cols, evicted: 0 };
+        let (cursor_line, cursor_col) = reflow.map_position(base + cursor_row as u64, self.col);
+        let line_index = (cursor_line - base) as usize;
         self.row = line_index.saturating_sub(screen_start).min(rows - 1);
-        self.col = off.saturating_sub(seg * cols).min(cols - 1);
+        self.col = cursor_col;
+
+        // 5b. **The selection follows too**, or is dropped if it named text the ring evicted.
+        //     A selection is a pair of absolute positions, exactly like the viewport's anchor
+        //     and for the same reason (see [`Selection`]).
+        self.selection = self.selection.map(|sel| Selection {
+            anchor: reflow.map_position(sel.anchor.0, sel.anchor.1),
+            head: reflow.map_position(sel.head.0, sel.head.1),
+        });
 
         self.cols = cols;
         self.rows = rows;
@@ -460,7 +678,7 @@ impl Grid {
         self.cursor_drawn = (self.row, self.col);
         self.dirty = vec![true; rows];
 
-        Reflow { base, to, evicted }
+        Reflow { evicted, ..reflow }
     }
 
     /// How many *logical* lines the terminal holds — history and screen, wraps not counted.
@@ -1435,5 +1653,148 @@ mod tests {
         assert_eq!(g.cols(), 1);
         assert_eq!(g.rows(), 1);
         assert_eq!(g.cursor(), (0, 0));
+    }
+
+    // --- selection (M12 Part E) ---------------------------------------------
+
+    #[test]
+    fn a_press_selects_nothing_until_it_is_dragged() {
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "hello world");
+        g.select_from(0, 0);
+        assert!(g.selection().is_some(), "the gesture is in progress");
+        // **A click is not a one-character selection.** The range is half-open at the head, so
+        // a press with no motion covers no cells at all.
+        assert_eq!(g.selected_text(), None);
+        g.extend(0, 5);
+        assert_eq!(g.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn dragging_backwards_selects_the_same_text() {
+        // The anchor is where the button went down, and it may be *after* the head. A stored
+        // (start, end) range would need normalising at every write instead of every read.
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "hello world");
+        g.select_from(0, 5);
+        g.extend(0, 0);
+        assert_eq!(g.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_selection_across_a_hard_break_keeps_the_newline() {
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "one\r\ntwo");
+        g.select_from(0, 0);
+        g.extend(1, 3);
+        assert_eq!(g.selected_text().as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn a_soft_wrap_does_not_become_a_newline() {
+        // **The distinction the whole rewrap rests on, seen from the other side.** A line that
+        // ran past the right margin is one line of text the terminal broke; pasting it with a
+        // newline in the middle inserts a break the program never wrote.
+        let mut g = Grid::new(4, 4);
+        feed(&mut g, "abcdefgh");
+        assert!(g.row_wrapped(0), "precondition: the first row is a soft wrap");
+        g.select_from(0, 0);
+        g.extend(1, 4);
+        assert_eq!(g.selected_text().as_deref(), Some("abcdefgh"));
+    }
+
+    #[test]
+    fn trailing_blanks_are_not_selected() {
+        // A grid is a rectangle; the cells past the end of a line were never written. Keeping
+        // them would paste a screen's width of spaces after every line.
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "hi\r\nthere");
+        g.select_from(0, 0);
+        g.extend(1, 5);
+        assert_eq!(g.selected_text().as_deref(), Some("hi\nthere"));
+    }
+
+    #[test]
+    fn a_selection_in_the_history_names_the_same_text_as_output_arrives() {
+        // **Absolute positions, for the viewport anchor's reason.** Screen-relative ones would
+        // slide up a row per line printed, so a selection made in the history would drift under
+        // the person who made it while a program was still writing.
+        let mut g = Grid::new(20, 2);
+        feed(&mut g, "first\r\nsecond\r\nthird\r\n");
+        let top = g.top_line();
+        g.select_from(top - 2, 0);
+        g.extend(top - 2, 5);
+        assert_eq!(g.selected_text().as_deref(), Some("first"));
+        feed(&mut g, "fourth\r\nfifth\r\n");
+        assert_eq!(
+            g.selected_text().as_deref(),
+            Some("first"),
+            "two more lines scrolled past and the selection still names the same text"
+        );
+    }
+
+    #[test]
+    fn a_selection_survives_a_rewrap() {
+        // **The question M12 Part E names, tested where the two answers differ.** A logical
+        // line's *text* is invariant across a rewrap, so a selection expressed as an offset
+        // into one survives; a selection expressed as a row and a column does not, because
+        // re-breaking a paragraph moves a character across rows as well as down them.
+        //
+        // "abcdefgh" at width 4 is two rows; at width 3 it is three. The word "defg" begins in
+        // row 1 at width 4 and in row 1 at width 3 — at a *different column* — which is exactly
+        // what `map_position` exists to follow and what `map_line` alone cannot.
+        let mut g = Grid::new(4, 4);
+        feed(&mut g, "abcdefgh");
+        g.select_from(0, 3);
+        g.extend(1, 3);
+        assert_eq!(g.selected_text().as_deref(), Some("defg"));
+        g.resize(3, 4);
+        assert_eq!(
+            g.selected_text().as_deref(),
+            Some("defg"),
+            "the same characters, at a width where they sit in different cells"
+        );
+    }
+
+    #[test]
+    fn clearing_a_selection_that_is_not_there_damages_nothing() {
+        // The return value *is* the repaint. A `clear` that damaged unconditionally would
+        // repaint every row of the grid on every keystroke.
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "hello");
+        let _ = g.take_damage();
+        assert!(!g.clear_selection());
+        assert!(g.take_damage().is_empty(), "nothing was selected, so nothing changed");
+        g.select_from(0, 0);
+        g.extend(0, 3);
+        let _ = g.take_damage();
+        assert!(g.clear_selection());
+        assert!(!g.take_damage().is_empty(), "the highlight has to be painted out");
+    }
+
+    #[test]
+    fn extending_without_an_anchor_selects_nothing() {
+        // A terminal is delivered motion whether or not a button is held. This is what keeps
+        // the pointer merely crossing the grid from selecting.
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "hello");
+        g.extend(0, 3);
+        assert_eq!(g.selection(), None);
+        assert_eq!(g.selected_text(), None);
+    }
+
+    #[test]
+    fn a_selection_reaching_past_the_history_stops_at_what_exists() {
+        // The scrollback is a ring, so an anchor can name a line that has been evicted. Total
+        // rather than panicking, for `view_cell`'s reason.
+        let mut g = Grid::new(10, 2);
+        for i in 0..(SCROLLBACK + 10) {
+            feed(&mut g, "x\r\n");
+            let _ = i;
+        }
+        g.select_from(0, 0);
+        g.extend(2, 1);
+        // Whatever comes back, it came back — the point is that asking did not panic.
+        let _ = g.selected_text();
     }
 }

@@ -25,7 +25,9 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_ui};
+use libkern::debug::Line;
 use libkern::{exit, kprint};
+use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
@@ -185,6 +187,43 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 /// # Safety
 ///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments.
+/// Push `bytes` onto the kill ring.
+///
+/// **Connects per operation rather than holding a session open**, like `nxterm`'s: a person
+/// copies a handful of times a minute at most, and a held session costs the server a wait-set
+/// slot in a set every application in the window system is in.
+fn clip_copy(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+    let r = clip.copy(CLIP_KIND_TEXT, bytes).map(|_| ());
+    clip.close();
+    r.map_err(|_| "the clipboard refused it")
+}
+
+/// Read ring entry `index`, continuing from `expect` — see `librsproto::clipboard::ClipPaste`.
+///
+/// `Ok(None)` is "there is no entry there", which is not a failure: an empty ring, or a cycle
+/// that has walked off the end of it. `Err` carries a sentence the status strip can show, and
+/// **the stale case gets its own**, because a client's answer to it is to start again rather
+/// than to stop.
+fn clip_read(
+    ns: u64,
+    index: u32,
+    expect: u64,
+    out: &mut [u8],
+) -> Result<Option<(u64, usize)>, &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+    let r = clip.paste(index, expect, out);
+    clip.close();
+    match r {
+        Ok((serial, _, len)) => Ok(Some((serial, len.min(out.len())))),
+        Err(e) if e.is_empty() => Ok(None),
+        Err(e) if e.is_stale() => Err("the clipboard changed"),
+        Err(_) => Err("the clipboard refused"),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxedit: up\n");
@@ -487,6 +526,75 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         {
             kprint(b"nxedit: the state request was refused\n");
         }
+        // ---- the clipboard ----
+        //
+        // **Here rather than in `update`**, for the save's reason below: `App::update` is a
+        // function of values and `/dev/clipboard` is IPC.
+        if let Some(req) = app.take_clip_request() {
+            match req {
+                nxedit::ClipRequest::Copy(text) => match clip_copy(root_ns, text.as_bytes()) {
+                    // **A count, never the text.** An editor's buffer is a person's document
+                    // and the serial console is a log file — the same rule the compositor
+                    // follows for keystrokes.
+                    Ok(()) => Line::new()
+                        .s(b"nxedit: copied ")
+                        .u(text.len() as u64)
+                        .s(b" bytes")
+                        .end(),
+                    Err(why) => Line::new().s(b"nxedit: the copy failed: ").s(why.as_bytes()).end(),
+                },
+                // A plain paste always takes the newest, with no serial — decision 3's ordinary
+                // case: copy in one application, paste in another.
+                nxedit::ClipRequest::Paste => {
+                    let mut got = [0u8; MAX_CLIP_BYTES];
+                    match clip_read(root_ns, 0, CLIP_ANY_SERIAL, &mut got) {
+                        Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
+                            Ok(text) => {
+                                app.pasted(text, 0, serial);
+                                Line::new().s(b"nxedit: pasted ").u(n as u64).s(b" bytes").end();
+                            }
+                            Err(_) => app.cycle_ended("the clipboard is not text"),
+                        },
+                        Ok(None) => app.cycle_ended("the clipboard is empty"),
+                        Err(why) => {
+                            app.cycle_ended("the clipboard refused");
+                            Line::new().s(b"nxedit: the paste failed: ").s(why.as_bytes()).end();
+                        }
+                    }
+                }
+                // **A cycle carries the serial it last saw** — decision 3. If the ring moved
+                // under it (a pipeline pushed while somebody was mid-cycle) the server refuses
+                // and the sequence ends here, visibly, rather than pasting a different entry.
+                nxedit::ClipRequest::Cycle => match app.cycling() {
+                    None => app.cycle_ended("nothing to cycle"),
+                    Some(c) => {
+                        let mut got = [0u8; MAX_CLIP_BYTES];
+                        let next = c.index + 1;
+                        match clip_read(root_ns, next, c.serial, &mut got) {
+                            Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
+                                Ok(text) => {
+                                    app.cycled(text, next, serial);
+                                    Line::new()
+                                        .s(b"nxedit: cycled to entry ")
+                                        .u(next as u64)
+                                        .end();
+                                }
+                                Err(_) => app.cycle_ended("that entry is not text"),
+                            },
+                            Ok(None) => app.cycle_ended("no older entry"),
+                            Err(why) => {
+                                app.cycle_ended(why);
+                                kprint(b"nxedit: the cycle ended\n");
+                            }
+                        }
+                    }
+                },
+            }
+            // Round again rather than waiting: the buffer or the status strip has changed and
+            // nothing else is going to arrive to prompt a redraw.
+            continue;
+        }
+
         // **The write happens here, not in `update`.** `update` is a function of values; writing
         // a file is a syscall, so the application says it wants to save and the `main` that owns
         // the namespace performs it — the same outbox `nxfiles` uses for a directory read.

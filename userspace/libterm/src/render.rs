@@ -88,15 +88,17 @@ fn draw_cell<F: Framebuffer + ?Sized>(
     row: usize,
     col: usize,
     cell: Cell,
-    cursor: bool,
+    invert: bool,
 ) {
     let r = m.cell_rect(row, col);
     let rect = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
     let (fg, bg) = cell.attrs.resolve(palette);
     // **The cursor is the cell drawn inverted**, not a shape drawn over it. That is what makes
     // the character under it stay readable, and it needs no colour of its own — a cursor with
-    // its own colour is a third thing to keep in step with a theme.
-    let (fg, bg) = if cursor { (bg, fg) } else { (fg, bg) };
+    // its own colour is a third thing to keep in step with a theme. Since M12 Part E a
+    // *selected* cell arrives here the same way, which is why the parameter is `invert` rather
+    // than `cursor`: this function draws an inverted cell and does not need to know why.
+    let (fg, bg) = if invert { (bg, fg) } else { (fg, bg) };
 
     fb.fill_rect(rect, bg);
     if cell.ch != ' ' {
@@ -169,11 +171,25 @@ fn render_each<F: Framebuffer + ?Sized>(
     rows: impl Iterator<Item = usize>,
 ) {
     let cursor_at = grid.view_cursor(top);
+    let selection = grid.selection();
     for row in rows {
         for col in 0..grid.cols() {
             let Some(cell) = grid.view_cell(top, row, col) else { continue };
             let cursor = cursor_at == Some((row, col));
-            draw_cell(fb, font, m, palette, origin, row, col, cell, cursor);
+            // **A selected cell is drawn inverted, exactly as the cursor is** (M12 Part E).
+            // That reuses the mechanism rather than adding a colour, for the reason
+            // [`draw_cell`] gives for the cursor: a highlight with its own colour is a third
+            // thing to keep in step with a theme, and `libterm` deliberately carries its own
+            // two defaults rather than the desktop's (M11's settled decision 2).
+            //
+            // **The cursor wins where they overlap** — inverting twice is not inverting, so a
+            // cursor inside a selection would appear as a hole in it. The cursor is the more
+            // urgent of the two: it says where typing goes.
+            let selected = !cursor
+                && selection.is_some_and(|s| {
+                    top.checked_add(row as u64).is_some_and(|l| s.contains(l, col))
+                });
+            draw_cell(fb, font, m, palette, origin, row, col, cell, cursor || selected);
         }
     }
 }

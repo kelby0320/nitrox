@@ -168,6 +168,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
+    // The clipboard server's forwarding endpoint (M12 Part E). **The serial column gets one
+    // too**: M12 decision 4 makes the clipboard reachable as a path so a pipeline can use it,
+    // and this is the column where pipelines are typed.
+    let clipboard_endpoint = recv_handoff(control);
     // **The auth channel is resolved, not couriered** (M7 Part C). **`init`** binds
     // `auth-service` at `/svc/auth` — not `service-mgr`, which spawned it and cannot bind,
     // because a declared service holds an inherited LOOKUP-only root — and every supervisor
@@ -221,6 +225,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 fs_endpoint,
                 profile_endpoint,
                 tty_endpoint,
+                clipboard_endpoint,
                 home: &home[..hl],
                 user: &user[..ul],
                 // A serial session renders no text, so it takes no fonts.
