@@ -132,9 +132,9 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     font roles, a proportional face for every label and the fixed-advance one kept for the grid;
     and **the polish passes** (E) — ten batches over three rounds of maintainer feedback, from a
     light palette measured off a reference desktop to desktop previews in the overview. **Part F,
-    the control panel, slipped to M12** as the details pass allowed: the list finished and it had
-    not started, and a settings application arriving instead of a finished polish list was named
-    as the wrong trade before either existed.
+    the control panel, was not built** — the list finished and it had not started, and a settings
+    application arriving instead of a finished polish list was named as the wrong trade before
+    either existed. It is **trigger-gated** rather than rescheduled; see below.
 
     **What the polish passes actually found**: most of rounds two and three were *defects*, not
     taste — an applications menu whose rows could not be clicked, a scrollbar built with no
@@ -144,7 +144,8 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 
     **M12 and M13 were scoped 2026-09-01**, when M11's list emptied into things that were not
     polish. **M12 — applications, deepened**: application depth (tabs, undo/redo, find, file
-    operations and the confirmation dialogs that make it the first consumer of `Role::Dialog`),
+    operations and the confirmation dialogs that make it the first *application* to create a
+    `Role::Dialog`),
     **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
     because "anything running may read what you last copied" is ambient authority — and
     **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather

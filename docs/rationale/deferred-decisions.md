@@ -1400,6 +1400,52 @@ place without changing its length.
 
 ### Userspace
 
+**A control panel — `TODO(control-panel)` <!-- check-deferrals: no-code-site -->.** Desktop
+settings a person can drive: the theme file, and the desktops `/dev/desktop` already serves. It
+was M11 Part F, "allowed to slip", and slipped — and rather than move it into M12 it became
+trigger-gated, because a part deferred twice is a part nobody has needed. **Trigger: the settings
+outgrow a hand-edited file.** The maintainer's judgement after living with `theme.toml` for a
+milestone: "the file is fine. A control panel will be needed when we have a lot more settings and
+the file becomes cumbersome." Its scope and its gate are kept in
+[`display-arm-plan.md`](../planning/display-arm-plan.md) M11 Part F.
+
+**This is the first use of the `no-code-site` escape hatch**, which until now had only a unit test
+— it belongs to no milestone and has no code to hang a marker on, which is the case that hatch was
+written for.
+
+**An icon set — `TODO(icon-set)` <!-- check-deferrals: no-code-site -->.** The window controls are
+drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming
+convention, a size convention and a lookup path, which is a second decision after the one that
+makes images possible at all. **Trigger: something needs an icon that is not three strokes** — a
+toolbar, a file-type glyph in the browser. M12 Part F builds the PNG decoder and deliberately does
+not build this on top of it.
+
+**Focus-gated clipboard reads — `TODO(clipboard-focus)` <!-- check-deferrals: no-code-site -->.**
+M12's clipboard is a resource server whose *binding* is the authority: anything holding the
+endpoint can read the ring whenever it likes. Modern desktops instead gate a read on the reader
+holding the keyboard, which closes background scraping *within* a session — at the cost of a
+dependency between the clipboard server and the compositor, and a read that fails for reasons its
+caller cannot see. **Trigger: an application inside a session that the person does not trust**,
+which is the day profiles stop being a build-time idea.
+
+**Chunked clipboard transfers — `TODO(clipboard-chunking)` <!-- check-deferrals: no-code-site -->.**
+The first cut caps an entry at what one IPC payload carries (4008 bytes — about two screens of
+terminal text). **Trigger: the first thing somebody cannot copy.** Recorded as *expected* rather
+than hypothetical, on the maintainer's own judgement when the cap was chosen. A shared memory
+object was the alternative and was declined: M10 rejected handle transfer for drops because a
+refused handle has no clean owner.
+
+**A wallpaper scaled to fill — `TODO(wallpaper-fill)` <!-- check-deferrals: no-code-site -->.**
+M12 Part F fits a too-large picture and centres a smaller one, using the box downscale that exists
+and explicitly refuses to scale up. Filling needs an upscaler and a decision about interpolation.
+**Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
+both as options eventually, so the theme key is designed with room for a mode beside the path.
+
+**`form` is now eligible and still filed.** Designed since v1 and never built; its own stated
+condition was "after the toolkit and the first applications", which M10 and M11 satisfied. It is
+left filed rather than scheduled for the same reason the control panel is: nothing has asked for
+it. See [`display-arm-plan.md`](../planning/display-arm-plan.md) → "What this unblocks".
+
 **Nothing bounds `Desktop::Open` — `TODO(open-amplification)`.** Before M10 Part D an application
 could not cause a spawn at all: its namespace holds no `/bin` and no `BIND_NAMESPACE`, and the
 applications modal needs a person to click. `Open` is the **first machine-drivable spawn path**,

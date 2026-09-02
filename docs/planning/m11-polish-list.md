@@ -69,7 +69,9 @@ a request is being met in a particular way.
 ## Open
 
 - [ ] Real icons for minimize, maximize, and close buttons. (Icon support needed?)
-      *(drawn as shapes in batch 2a. Real image icons wait on the filed image item — see M12.)*
+      *(drawn as shapes in batch 2a. Real image icons wait on an icon set — a naming convention, a
+      size convention and a lookup path — which stays filed behind M12's PNG decoder rather than
+      arriving with it.)*
 - [ ] **Desktop Background** - We can choose a default color that fits the theme.  Probably some shade of blue.  It would be nice to be able to have background image support.  Image support can be a stretch goal, but all real OS desktops have background image support.
       *(the colour landed in batch 1. The image half is filed for M12, with three options costed
       in the plan — it is a format, an asset pipeline and a size budget, not a batch.)*

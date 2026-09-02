@@ -3468,7 +3468,7 @@ it is noticed on. Its own list, and its own milestone.
       straight into the scanned-out framebuffer, so shadows would make the flicker they sit on top
       of worse. They belong after the feel work, not before it.
 
-### Part F — the control panel, slipped to M12 (2026-09-01)
+### Part F — the control panel, not built and no longer scheduled (2026-09-01)
 
 - [~] **Desktop settings a person can drive**: the theme file above, and the desktops
       `/dev/desktop` already serves. Its scope is stated here so that slipping it is a decision
@@ -3476,13 +3476,18 @@ it is noticed on. Its own list, and its own milestone.
       the reason it is the right call rather than the convenient one is decision 5's other half:
       polish is what this milestone is for, and a settings application arriving *instead of* a
       finished polish list was named as the wrong trade before either existed. The list is
-      finished; this is not started. It moves whole, with its gate.
+      finished; this is not started.
 
-- [ ] **Gate**: `check-login` drives it — change a setting, and read the *file* back the way Part
-      D of M10 reads a saved buffer back, from outside the application that wrote it.
+- [~] **It did not move to M12 either — it became a trigger**: *when the settings outgrow a
+      hand-edited file*, on the maintainer's judgement after living with the theme file for a
+      milestone. A part deferred twice is a part nobody has needed, and a schedule slot would be
+      the third deferral rather than the first delivery. Recorded in
+      [`deferred-decisions.md`](../rationale/deferred-decisions.md) with the rest, since it now
+      belongs to no milestone.
 
-- [ ] **May move to M12.** Polish is what this milestone is for, and a settings application that
-      arrives instead of a finished polish list is the wrong trade.
+- [ ] **Gate, kept with it**: `check-login` drives it — change a setting, and read the *file* back
+      the way Part D of M10 reads a saved buffer back, from outside the application that wrote
+      it.
 
 
 ## Milestone 12 — applications, deepened
@@ -3497,8 +3502,10 @@ designed here; what this entry does is exist, so the line M10 draws is a line ra
 omission.
 
 **And images** — filed here on 2026-09-01, out of M11's polish list, because it is a subsystem
-rather than a batch. Two of that list's items want it: a background image, and window controls
-drawn from an icon set rather than as three strokes. What it is *not* wanted for is the desktop
+rather than a batch. Two of that list's items wanted it: a background image, which M12 Part F
+builds, and window controls drawn from an icon set, which it does **not** — an icon set is a
+naming convention, a size convention and a lookup path, and stays filed behind the decoder that
+would make it possible. What it is *not* wanted for is the desktop
 previews, which turned out to need only geometry the shell already holds (M11 Part E batch 10).
 
 Four options were costed, and the choice is deliberately not made here:
@@ -3524,15 +3531,17 @@ it.
 M11's close is what forced this: the polish list emptied into things that were not polish, and
 they needed somewhere to go that was not "M12, eventually".
 
-- **Part A — application depth.** Tabs in each, undo/redo and find in the editor, file operations
-  in the browser (rename, delete, copy, new folder). Its confirmation dialogs make this the first
-  real consumer of `Role::Dialog` — worth naming, because that role's placement semantics changed
-  in M11 Part E batch 8 and nothing exercises them.
-- **Part B — copy and paste.** The largest part, and the one that needed a decision before it
-  could be scoped. See below.
-- **Part C — images.** The decoder, the asset path, and the wallpaper as a shell-owned background
-  window. See below.
-- **Drag-and-drop *within* a window** — filed with the application depth it belongs to.
+**Three strands, and the parts that carry them are in the details pass below** — this list is
+what the milestone is *for*, not how it is cut up. (It assigned its own A/B/C before the details
+pass existed, which left two incompatible letterings dated the same day; PR #266 review, finding
+2.)
+
+- **Application depth.** Tabs in each, undo/redo and find in the editor, file operations in the
+  browser (rename, delete, copy, new folder), and drag-and-drop *within* a window. Its
+  confirmation dialogs make this the first *application* to create a `Role::Dialog`.
+- **Copy and paste.** The largest strand, and the one that needed a decision before it could be
+  scoped.
+- **Images.** The decoder, the asset path, and the wallpaper as a shell-owned background window.
 
 **What moved out.** The compositor work is [Milestone 13](#milestone-13--the-compositors-feel):
 different work, driven by measurement rather than by use, and a milestone holding both cannot say
@@ -3555,7 +3564,7 @@ rather than scheduled, for the same reason.
 
 ### Decision 1 — the clipboard is a resource server, and a binding is the authority
 
-Settled with the maintainer 2026-09-01, so Part B can be built rather than re-argued.
+Settled with the maintainer 2026-09-01, so Part E can be built rather than re-argued.
 
 **Its own process, with its endpoint bound per session.** A clipboard is shared mutable state
 between mutually untrusting programs, and "anything running may read what you last copied" is
@@ -3623,11 +3632,21 @@ The two taken before this pass — the clipboard's owner and the image format �
 
 ### Part A — dialogs, and the second window
 
-- [ ] **`Role::Dialog` gets its first consumer, and the toolkit grows a dimension.** The role has
-      existed since M6 and nothing has ever created one; its placement semantics changed in M11
-      Part E batch 8 and are exercised by nothing at all. `widget-toolkit.md` §11 named the
-      trigger — "Multi-window applications. One `App` drives one window. Trigger: dialogs that are
-      real windows rather than `stack` overlays" — and this is that day.
+- [ ] **`Role::Dialog` gets its first *application*, and the toolkit grows a dimension.** The
+      role has existed since M2 Part A and is created today by exactly one thing: `ui-testclient`,
+      which makes one deliberately so that the held-configure and ignored-offset halves of its
+      contract are asserted — added because a reviewer asked for it (PR #220, finding 2), and
+      watched by `check-display`. Its placement change in M11 Part E batch 8 is covered by a host
+      test named for that batch.
+
+      So the gap is not coverage, it is *use*: no program a person runs has ever created one, and
+      `widget-toolkit.md` §11 named exactly that as the trigger — "Multi-window applications. One
+      `App` drives one window. Trigger: dialogs that are real windows rather than `stack`
+      overlays". This is that day.
+
+      (The first version of this said the role had "no consumer at all" and was "exercised by
+      nothing", which was false twice over and would have sent the building session looking for
+      coverage that exists — PR #266 review, blocking 1.)
 
 - [ ] **Gate**: `check-login` drives a confirmation to both answers. A dialog that only ever gets
       "yes" is half a control.
@@ -3639,9 +3658,15 @@ The two taken before this pass — the clipboard's owner and the image format �
       and routing them through the shell would be asking a supervisor to do what the application
       is already entitled to.
 
-- [ ] **Copy is the one with a size**, and `libfs::read_file` maps whole files — so a copy of
-      something large is a heap problem before it is a feature. Either it streams or it names a
-      bound; deciding that is the part's, not this pass's.
+- [ ] **Copy goes through `libfs::copy_file`**, which maps source and destination and copies
+      between the mappings with no heap at all, bounded by `MAX_COPY` (8 MiB) — a bound whose own
+      doc settles the question, since "the pages themselves are demand-paged, so this bounds VA,
+      not RAM", and which names a windowed copy as the refinement if a real workload exceeds it.
+      It is what `copy_tree` and the `copy` coreutil already use.
+
+      (An earlier draft re-opened streaming-versus-bound as though it were open, and pointed at
+      `read_file` — the one function here that *does* allocate the whole file, and the wrong one
+      for a copy to call. PR #266 review, finding 4.)
 
 - [ ] **Drag-and-drop within a window** — the half M10 Part E did not build, where the compositor
       is not involved because the payload never leaves the client.
@@ -3663,8 +3688,9 @@ The two taken before this pass — the clipboard's owner and the image format �
 
 ### Part D — tabs, in both applications
 
-- [ ] **A tab strip is a widget**, and the toolkit has none. It arrives here because two
-      applications want it, which is the rule §8 has applied to every widget it holds.
+- [ ] **A tab strip is a widget**, and the toolkit has none. §8's rule is that an application
+      needed it, so it exists — `scrollbar` and `text_area` each arrived for one. Two wanting it
+      clears that bar with room to spare rather than being it.
 
 - [ ] **Gate**: two buffers in one window, switched, and the right one saved.
 
