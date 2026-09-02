@@ -240,6 +240,16 @@ pub enum WindowEvent {
     /// the wire never named this one anyway: it is `libsurface`'s own marker, derived from a
     /// per-window `lost` flag.
     InputLost,
+    /// A press landed outside this popup — `Surface::Dismissed`.
+    ///
+    /// **A request, not a fact**: the window is still up, still focused and still yours. Destroy
+    /// it if what it was offering is over, which is what a menu does; ignore it if it is not.
+    ///
+    /// **Distinct from [`CloseRequested`](Self::CloseRequested) on purpose.** That one is
+    /// somebody asking this window to close and may deserve a "save first?"; this one is the
+    /// pointer having gone elsewhere and deserves nothing but going away. Reading them in one arm
+    /// is the mistake `Dropped` and `InputLost` had to be renamed out of.
+    Dismissed,
     /// Somebody dragged a payload onto this window and let go — `Surface::Dropped`.
     ///
     /// **Only for a window that declared an acceptor** ([`WindowRef::declare_acceptor`]) whose
@@ -562,6 +572,13 @@ impl<T: Transport> Session<T> {
                     && let Some(i) = self.idx(r.window)
                 {
                     self.enqueue(i, WindowEvent::CloseRequested);
+                }
+            }
+            librsproto::surface::OP_DISMISSED => {
+                if let Some(r) = librsproto::surface::WindowRef::read(body)
+                    && let Some(i) = self.idx(r.window)
+                {
+                    self.enqueue(i, WindowEvent::Dismissed);
                 }
             }
             OP_CONFIGURE => {

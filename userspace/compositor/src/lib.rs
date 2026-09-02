@@ -314,9 +314,9 @@ pub const CURSOR_H: u32 = 16;
 /// record a theme is handed on. Named rather than skipped; the trigger for changing it is a
 /// control panel that wants to restyle the cursor or the drop highlight, and the mechanism would
 /// be a manager op on a channel the shell already holds.
-pub const CURSOR_BODY: Rgb = Theme::dark().cursor_body;
+pub const CURSOR_BODY: Rgb = Theme::light().cursor_body;
 /// The cursor's outline colour (`.` in the sprite), so it stays visible against white.
-pub const CURSOR_OUTLINE: Rgb = Theme::dark().cursor_outline;
+pub const CURSOR_OUTLINE: Rgb = Theme::light().cursor_outline;
 
 /// The rectangle a cursor at `at` occupies.
 ///
@@ -356,7 +356,7 @@ pub const OUTLINE_W: u32 = 2;
 /// One colour for all three things an outline marks — a resize, a snap preview, a drop target —
 /// which is a decision deferred rather than taken: what a drop target should look like as
 /// distinct from a resize is a question for M11's polish passes.
-pub const OUTLINE_COLOUR: Rgb = Theme::dark().outline;
+pub const OUTLINE_COLOUR: Rgb = Theme::light().outline;
 
 /// The four edge strips of `rect`, which is what an outline occupies.
 ///
@@ -620,7 +620,10 @@ impl WindowStack {
         // **A `dialog` is not placed this way, though it also names a parent.** Its parent
         // carries desktop membership and lifetime — not its position (`display-substrate.md`
         // §4a, `ui-composition-model.md` §6). In placement terms it is an ordinary listed
-        // window, so it lands at the origin and a manager places it, exactly like a `normal`.
+        // window that a manager places, exactly like a `normal` — which since M11 Part E batch 8
+        // means it starts where it *asked* rather than at the origin, a preference the manager
+        // then overrides. The arm below says so; this paragraph used to say "lands at the
+        // origin" and was left behind by that change (PR #265 review, finding 3).
         let origin = match req.role {
             Role::Popup { parent } => {
                 // The parent is known to exist: checked directly above, and nothing between
@@ -628,7 +631,21 @@ impl WindowStack {
                 let base = self.window(parent).expect("checked above").origin;
                 Point::new(base.x.saturating_add(req.offset_x), base.y.saturating_add(req.offset_y))
             }
-            Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => Point::new(0, 0),
+            // **A `normal` or `dialog` window starts where it asked, and a manager overrides
+            // it** (M11 Part E batch 8). The configure is *held* until the manager answers, so
+            // with one attached this origin is never seen — placement is still entirely the
+            // manager's. What changes is the case where nobody is managing: the compositor
+            // released such a window at (0, 0) and there was no way for a client to say
+            // otherwise, so the login greeter — which exists precisely so that the thing that
+            // would manage windows can be started — could only ever appear in the corner.
+            //
+            // A preference, not a placement. `CreateWindowRequest::new` asks for (0, 0) and gets
+            // exactly what it always got.
+            Role::Normal | Role::Dialog { .. } => Point::new(req.offset_x, req.offset_y),
+            // **A panel is docked, not positioned.** Its `strut` says which edge it reserves
+            // space on, and the shell places it there; an offset here would be a second answer
+            // to a question the role already answers.
+            Role::Panel { .. } => Point::new(0, 0),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -2674,32 +2691,55 @@ mod tests {
         );
     }
 
-    /// Only a `popup` is offset from its parent. A `dialog` lands where a `normal` does.
+    /// Only a `popup` is offset **from its parent**; the others ask the screen, and a panel does
+    /// not ask at all.
     ///
     /// The two parented roles share a wire shape and were treated as one placement rule, which
     /// they are not: a `dialog`'s parent carries its desktop membership and its lifetime — not
-    /// its position. In placement terms it is an ordinary listed window and a manager places it.
+    /// its position. What changed in M11 Part E batch 8 is the *other* half — a `normal` or
+    /// `dialog` window's requested origin is now a preference the compositor honours until a
+    /// manager overrides it, instead of being discarded. The configure is held for the manager
+    /// either way, so this is only ever visible when nobody is managing.
     #[test]
-    fn only_a_popup_is_offset_from_its_parent() {
+    fn a_popup_is_offset_from_its_parent_and_the_rest_from_the_screen() {
         let mut s = WindowStack::new();
         let parent = shown(&mut s, &CreateWindowRequest::new(50, 50, Role::Normal));
         let _ = s.place(parent, Point::new(60, 70)).unwrap();
 
-        // `at` on a `normal` is a caller mistake; it must not move the window.
+        // **Absolute, not relative to anything.** A `normal` window has no parent to be relative
+        // to, and this one is created while another sits at (60, 70).
         let plain = s.create(&CreateWindowRequest::at(10, 10, Role::Normal, 77, 88)).unwrap();
-        assert_eq!(s.window(plain).unwrap().origin, Point::new(0, 0), "a manager places this one");
+        assert_eq!(s.window(plain).unwrap().origin, Point::new(77, 88), "the request was dropped");
 
-        // A dialog names a parent and is still placed by a manager, from the origin.
+        // A dialog names a parent and is still not placed relative to it.
         let dlg = s
             .create(&CreateWindowRequest::at(10, 10, Role::Dialog { parent }, 77, 88))
             .unwrap();
         assert_eq!(
             s.window(dlg).unwrap().origin,
-            Point::new(0, 0),
-            "a dialog is not offset from its parent, however parented it is"
+            Point::new(77, 88),
+            "a dialog was offset from its parent, which is the popup rule leaking"
         );
 
-        // A popup is.
+        // **A panel ignores it**: its role says which edge it docks to, and an offset would be a
+        // second answer to that question.
+        let bar = s
+            .create(&CreateWindowRequest::at(
+                10,
+                10,
+                Role::Panel { dock: Edge::Top, reserve: 10 },
+                77,
+                88,
+            ))
+            .unwrap();
+        assert_eq!(s.window(bar).unwrap().origin, Point::new(0, 0), "a panel took an offset");
+
+        // **And the default is unchanged**, which is what keeps every existing caller where it
+        // was: `new` asks for (0, 0) and gets it.
+        let plain0 = s.create(&CreateWindowRequest::new(10, 10, Role::Normal)).unwrap();
+        assert_eq!(s.window(plain0).unwrap().origin, Point::new(0, 0));
+
+        // A popup is offset from its parent, and still is.
         let menu = s
             .create(&CreateWindowRequest::at(10, 10, Role::Popup { parent }, 5, 6))
             .unwrap();

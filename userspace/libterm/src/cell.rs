@@ -114,12 +114,21 @@ pub struct Palette {
 impl Default for Palette {
     /// A conventional dark palette.
     ///
-    /// **The sixteen are the terminal's; the two defaults are the desktop's.** `ansi` is what a
-    /// program addresses with `ESC[31m` — a vocabulary defined by what programs expect, which is
-    /// why retheming a desktop must not retheme `ls` output. `foreground` and `background` are
-    /// what `Colour::Default` means, and a terminal whose ground differed from the chrome around
-    /// it would flash against it — so those two are **read from the shared theme** rather than
-    /// written out again (M11 Part B).
+    /// **All eighteen are the terminal's.** `ansi` is what a program addresses with `ESC[31m` — a
+    /// vocabulary defined by what programs expect, which is why retheming a desktop must not
+    /// retheme `ls` output. `foreground` and `background` are what `Colour::Default` means.
+    ///
+    /// **Those two were read from the shared theme from M11 Part B until Part E**, on the
+    /// argument that a terminal whose ground differed from the chrome around it would flash
+    /// against it. The desktop turning light is the event that showed what the tie really was:
+    /// these two belong with *the sixteen*, which are tuned for a dark ground. Bright white is
+    /// `#ECF0F4`; on a white ground it is invisible, and bright yellow is unreadable. Following
+    /// the theme would therefore mean retuning the sixteen, which is the one thing the paragraph
+    /// above says not to do — so the grid keeps its own ground and a dark terminal sits on a
+    /// light desktop, which is what most people's screens look like anyway.
+    ///
+    /// The desktop's own values are still one source: they are `Theme`'s, and nothing here is a
+    /// second opinion about them — these are a *different* pair, for a different surface.
     ///
     /// **That replaces an assertion with a fact.** From A5 until Part B this equality was a pair
     /// of literals in two crates, enforced by a host test in `xtask` — the one place that links
@@ -148,8 +157,13 @@ impl Default for Palette {
                 Rgb::new(0x60, 0xC8, 0xC8), // bright cyan
                 Rgb::new(0xEC, 0xF0, 0xF4), // bright white
             ],
-            foreground: libdraw::theme::Theme::dark().foreground,
-            background: libdraw::theme::Theme::dark().background,
+            // The dark theme's own two, carried here when the desktop turned light rather than
+            // re-chosen: the grid looked like this for four milestones and nothing about it was
+            // the thing being changed. **Not `ansi[0]`**, which is a different colour for a
+            // reason — a ground equal to a cell colour is text nobody can read, and the first
+            // attempt at this line used it (caught by `xtask`'s own cross-crate test).
+            foreground: Rgb::new(0xE0, 0xE6, 0xEC),
+            background: Rgb::new(0x0E, 0x14, 0x1B),
         }
     }
 }

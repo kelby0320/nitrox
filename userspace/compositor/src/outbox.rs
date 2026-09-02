@@ -89,6 +89,16 @@ pub enum Outbound {
         /// Requested origin, y.
         y: i32,
     },
+    /// A `Surface::Dismissed` — a press landed outside this popup.
+    ///
+    /// Queued like every other server-initiated record, and for the same reason as the close
+    /// request below: sent directly with `NOBLOCK` it would be lost against a client whose ring
+    /// is briefly full, and a dismissal that vanishes leaves a menu on screen that the person has
+    /// already walked away from.
+    Dismissed {
+        /// The popup a press landed outside of.
+        window: u32,
+    },
     /// A `Surface::CloseRequested` — somebody with the manager channel is asking this window to
     /// close.
     ///
@@ -136,6 +146,7 @@ impl Outbound {
             | Outbound::Focus { window, .. }
             | Outbound::Configure { window, .. }
             | Outbound::Dropped { window, .. }
+            | Outbound::Dismissed { window }
             | Outbound::CloseRequested { window } => *window,
         }
     }

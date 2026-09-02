@@ -78,6 +78,31 @@ impl Rgb {
     /// Black.
     pub const BLACK: Rgb = Rgb::new(0, 0, 0);
 
+    /// `self` moved `delta` units toward white or black, per channel, clamped at both ends.
+    ///
+    /// **The whole of the theme's bevel** (M11 Part E, batch 2): a gradient here is one colour
+    /// lightened at the top and darkened at the bottom by the same amount, so a face needs one
+    /// value rather than two, and a new palette needs one number rather than one pair per
+    /// gradient. Measured against the reference desktop, whose title bar spans ±10 around its
+    /// midpoint and whose menu selection spans ±14 — close enough that a single amount is the
+    /// honest model rather than a simplification of one.
+    ///
+    /// Per channel and not in a perceptual space, deliberately: the difference at these
+    /// amplitudes is invisible, and a colour space is a dependency and a decision.
+    pub const fn shade(self, delta: i16) -> Rgb {
+        const fn one(c: u8, d: i16) -> u8 {
+            let v = c as i16 + d;
+            if v < 0 {
+                0
+            } else if v > 255 {
+                255
+            } else {
+                v as u8
+            }
+        }
+        Rgb::new(one(self.r, delta), one(self.g, delta), one(self.b, delta))
+    }
+
     /// `self` composited over `under` at `coverage`, where 0 is invisible and 255 is opaque.
     ///
     /// **There is no alpha channel anywhere in this crate**, and this is not the beginning of

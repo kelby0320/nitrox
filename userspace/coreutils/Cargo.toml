@@ -13,6 +13,9 @@ edition = "2024"
 # Tier-1 stage prologue, the same GNU-style argument parsing, and the same TSM1 stdout
 # plumbing, and that shared surface is the point of keeping them together.
 [dependencies]
+# Calendar arithmetic, which used to be this crate's `time` module and moved below it when
+# `desktop-shell` became a second consumer (M11 Part E batch 9).
+libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 librsproto = { path = "../librsproto", features = ["io"] }

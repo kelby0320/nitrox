@@ -22,7 +22,14 @@ extern crate alloc;
 
 pub mod args;
 pub mod stage;
-pub mod time;
+/// Calendar arithmetic and duration parsing.
+///
+/// **Moved out to [`libtime`] in M11 Part E batch 9** and re-exported here, because it grew a
+/// second consumer: `desktop-shell` formats the same instant for the clock on its top bar.
+/// `userspace/CLAUDE.md`'s rule is what moved it — a helper with one consumer belongs to that
+/// consumer, a helper with two belongs below both — and the shell reaching into this crate for it
+/// is exactly the shape that rule exists to catch.
+pub use libtime as time;
 
 pub use args::{ArgError, Args, Flag, parse};
 pub use stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};

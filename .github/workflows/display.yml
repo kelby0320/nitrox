@@ -28,10 +28,12 @@ on:
       # to fire PASS and QEMU still exits 33. This gate's expect timeout is the only thing
       # that sees it (PR #175 review, finding 3).
       - 'userspace/test-harness/**'
-      # **The greeter is a client in the image this gate compares**, as of M7 Part D. It
-      # creates a 420x200 window at the origin in *every* boot, and the gate passes today only
-      # because the windows created after it cover that region. A change to its size, its
-      # `Role`, or its ability to present at all changes what the guest composites — so
+      # **The greeter is a client in the image this gate compares**, as of M7 Part D. It creates
+      # a 420x200 window in *every* boot — **centred since M11 Part E batch 8**, where it used to
+      # be at the origin and the gate passed only because the reference windows covered it.
+      # Centred it sits clear of all three, so it is now visible in a region the gate does not
+      # compare rather than hidden in one it does. Either way a change to its size, its `Role`,
+      # its position, or its ability to present at all changes what the guest composites — so
       # without these two entries that break would surface later, on an unrelated PR that
       # happened to touch a filtered path, looking like a compositing regression.
       #

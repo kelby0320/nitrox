@@ -80,14 +80,72 @@ use librsproto::surface::{
 };
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, column, padding, row, sized, text};
+use libui::element::{
+    Element, Insets, bevel, column, fill, offset, padding, row, sized, stack, text,
+};
+use libui::diff::Tree;
 use libui::layout::layout;
+use libui::route::Router;
 use libui::paint::{FontMetrics, Theme, paint};
-use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, text_field};
+use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
+
+/// The wall clock as the top bar shows it, or empty when there is none.
+///
+/// **`YYYY-MM-DD HH:MM`, and no month names** (M11 Part E batch 9). There is no timezone database
+/// and no locale, so a localised form would be a fiction — the same reason `date` emits fields and
+/// prints UTC. It also means the bar and the command agree about what time it is, which is worth
+/// more here than looking like somebody else's desktop.
+///
+/// **Empty when the clock is unset**, rather than 1970. The kernel reports `Unsupported` when the
+/// RTC could not be read at boot rather than inventing an epoch, and a bar that showed a
+/// fabricated date would be undoing that decision one layer up.
+fn clock_text() -> alloc::string::String {
+    let mut nanos = 0u64;
+    // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
+    let r = unsafe {
+        libkern::syscall2(
+            libkern::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_REALTIME,
+            (&raw mut nanos) as u64,
+        )
+    };
+    if r < 0 {
+        return alloc::string::String::new();
+    }
+    let c = libtime::civil_from_unix(nanos);
+    // `format_civil` is `YYYY-MM-DD HH:MM:SS`; a bar that counted seconds would repaint sixty
+    // times a minute to show something nobody reads at that resolution.
+    let full = libtime::format_civil(&c);
+    alloc::string::String::from(full.get(..16).unwrap_or(full.as_str()))
+}
+
+/// When the displayed minute next changes, as a monotonic deadline.
+///
+/// **Aligned to the minute rather than "a minute from now"**, so the bar changes when the clock
+/// does. The alignment is read from the *wall* clock and the deadline is *monotonic*, which is
+/// not a mix-up: one says how far into the minute we are, the other is what `sys_wait` counts.
+fn next_minute(now: u64) -> u64 {
+    let mut nanos = 0u64;
+    // SAFETY: as above.
+    let r = unsafe {
+        libkern::syscall2(
+            libkern::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_REALTIME,
+            (&raw mut nanos) as u64,
+        )
+    };
+    const MINUTE: u64 = 60 * 1_000_000_000;
+    if r < 0 {
+        // No clock to follow. Wake in a minute anyway, so a clock that is set later appears
+        // without a restart.
+        return now.saturating_add(MINUTE);
+    }
+    now.saturating_add(MINUTE - nanos % MINUTE)
+}
 
 /// The screen's width, which the top bar spans.
 ///
@@ -131,13 +189,24 @@ fn fail(msg: &[u8]) -> ! {
 const APPS_BUTTON_W: u32 = 120;
 
 /// The top bar's element tree.
-fn bar_view() -> Element<()> {
+fn bar_view(clock: &str) -> Element<()> {
+    // **One thing, and it does something** (M11 Part E batch 4). There was a "nitrox" label
+    // beside the button — a word with no handler, which reads as a menu that does not open. A
+    // control that looks live and is not is the defect M8's overview shipped three of; a label
+    // that looks like a control is the same defect with less code behind it.
     row(alloc::vec![
         sized(
             libdraw::geom::Size::new(APPS_BUTTON_W, 0),
             padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
         ),
-        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("nitrox")),
+        // **Centred on the screen, not on what is left of it.** Two equal flexible gaps put the
+        // clock in the middle of the space *between* them, so without the balancing slot on the
+        // right it would sit half the button's width off centre. The slot is empty; it exists to
+        // make the arithmetic symmetric (M11 Part E batch 9).
+        sized(libdraw::geom::Size::new(0, 0), text("")).flex(1),
+        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(clock)),
+        sized(libdraw::geom::Size::new(0, 0), text("")).flex(1),
+        sized(libdraw::geom::Size::new(APPS_BUTTON_W, 0), text("")),
     ])
 }
 
@@ -353,14 +422,29 @@ fn visible_entries(entries: &[WinEntry], current: u32) -> alloc::vec::Vec<&WinEn
     entries.iter().filter(|e| e.desktop == current).take(MAX_ENTRIES).collect()
 }
 
+/// One taskbar entry: a bordered button, marked when its window holds the keyboard.
+///
+/// **A box rather than a run of text** (M11 Part E batch 8). The entries were labels on a flat
+/// bar, so two windows read as one line with a gap in it — the reference desktop draws each as a
+/// button, and the border is what says where one ends and the next begins.
+///
+/// **The focused one is filled, the rest are the bar's own face.** The list already marks focus
+/// with a leading glyph; a filled face says it at a glance, and the two agree because they are
+/// built from the same flag.
+fn entry_cell(e: &WinEntry, theme: &Theme) -> Element<()> {
+    let face = if e.focused { theme.face_hover } else { theme.face };
+    stack(alloc::vec![
+        fill(theme.border),
+        padding(Insets::all(1), bevel(face)),
+        padding(Insets { top: 3, right: 7, bottom: 3, left: 7 }, text(entry_label(e))),
+    ])
+}
+
 /// The bottom bar's element tree: one button per window, then the desktop indicator.
-fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str) -> Element<()> {
+fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str, theme: &Theme) -> Element<()> {
     let mut cells: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
     for e in shown {
-        cells.push(sized(
-            libdraw::geom::Size::new(ENTRY_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(entry_label(e))),
-        ));
+        cells.push(sized(libdraw::geom::Size::new(ENTRY_W, 0), entry_cell(e, theme)));
     }
     if cells.is_empty() {
         // An empty row lays out to nothing and commits a blank bar, which reads as a broken
@@ -394,13 +478,20 @@ fn render_window_bar(
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .unwrap_or_else(|| fail(b"desktop-shell: bad bottom bar geometry\n"));
     let mut fb = MemFramebuffer::new(geometry);
-    let ui = window_bar_view(shown, label);
+    let ui = window_bar_view(shown, label, theme);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    //
+    // **On the panel face, not on a window's ground** (M11 Part E, batch 1). `paint` clears a
+    // damage rectangle to `background`, which since the theme turned light is the white an
+    // application draws on — and a bar is not paper: it is a face, the surface a button and a
+    // toolbar are made of. One substituted field rather than a new one; a panel wanting a colour
+    // of its own needs more evidence than one screenshot.
+    paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    });
     fb
 }
 
@@ -412,6 +503,34 @@ const MODAL_H: u32 = 240;
 const MODAL_PITCH: usize = (MODAL_W as usize) * 4;
 /// How tall one entry is.
 const ROW_H: u32 = 20;
+
+/// What the applications modal can ask for.
+///
+/// **One variant, and it is still worth a type.** `Element<()>` was honest while nothing could be
+/// clicked; a message with a payload is what carries *which* row, and the unit type cannot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModalMsg {
+    /// Launch the program keyed by this index into the unfiltered program list.
+    Launch(u64),
+    /// The scrollbar is being dragged.
+    ///
+    /// **Which is why the modal's list state had to stop being a throwaway.** It was built fresh
+    /// in `render_modal` on the argument that the launcher keeps no selection — true, and it also
+    /// meant an offset that reset to zero every frame, so `/bin` was 26 entries of which ten were
+    /// reachable and the rest only by typing a filter (M11 Part E batch 6).
+    Scroll(librsproto::surface::PointerEvent),
+}
+
+/// The height the modal's list is laid out at — the space left after the filter field.
+///
+/// **One place, because two things have to agree about it** (PR #265 review, optional 10): the
+/// view lays the list out at this height, and `ListState::drag_to` converts a pointer's y against
+/// it. Open-coded at both, changing one would leave the thumb tracking a track that is not the
+/// one drawn — which is the failure `drag_to`'s own doc names. `nxfiles` routes both through
+/// `App::list_h`, and this is that shape.
+fn modal_list_h() -> u32 {
+    MODAL_H.saturating_sub(40)
+}
 
 /// The applications modal's element tree: a filter field over a list of `/bin` programs.
 ///
@@ -429,15 +548,38 @@ fn modal_view(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
     state: &mut ListState,
+    hovered: Option<u64>,
     theme: &Theme,
-) -> Element<()> {
+) -> Element<ModalMsg> {
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme);
-    // The list is given the space left after the field, so `visible` matches what is drawn.
-    let list_h = MODAL_H.saturating_sub(40);
-    let list = list_view(rows, state, list_h, ROW_H, |_| (), None, theme);
-    padding(
-        Insets::all(8),
-        column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
+    let list_h = modal_list_h();
+    // **Rows are clickable and they highlight** (M11 Part E batch 4). Until then this shell
+    // looked at pointer events for exactly three things — the overview's thumbnails, the
+    // applications button and the taskbar — and never at the modal's own window, so its rows
+    // could not be clicked at all and nothing under the cursor reacted. Both are the same gap:
+    // no router. The key is the row's index into the *unfiltered* list, which is what makes
+    // `ModalMsg::Launch` resolvable after a filter has reordered what is shown.
+    let list = list_view(
+        rows,
+        state,
+        list_h,
+        ROW_H,
+        ModalMsg::Launch,
+        None,
+        Some(ModalMsg::Scroll),
+        hovered,
+        theme,
+    );
+    // **Framed, because a popup is the one surface with nothing behind it to define its edge**
+    // (M11 Part E, batch 2). On a light theme this modal's face and the window it covers are
+    // within a few units of each other, so without a line around it the two run together. Same
+    // helper `nxterm`'s menu uses — they are the same kind of thing seen twice.
+    popup_frame(
+        padding(
+            Insets::all(8),
+            column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
+        ),
+        theme,
     )
 }
 
@@ -448,6 +590,8 @@ fn render_modal(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
     state: &mut ListState,
+    tree: &mut Tree,
+    hovered: Option<u64>,
 ) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(MODAL_W, MODAL_H, MODAL_PITCH, PixelFormat::XRGB8888)
         .expect("the modal pitch is wide enough for a row");
@@ -457,10 +601,15 @@ fn render_modal(
     // in one frame.
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    let ui = modal_view(query, rows, state, theme);
+    let ui = modal_view(query, rows, state, hovered, theme);
     let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
+    // **The tree records what was painted**, which is what makes a click land on the row a
+    // person can see: the router hit-tests the retained tree, so a tree from a different frame
+    // is a hit test against a picture nobody is looking at. Updated here rather than at the
+    // call sites, so it cannot be forgotten at one of them.
+    let _ = tree.update(&ui, &l);
     paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
     fb
 }
@@ -470,10 +619,28 @@ fn render_modal(
 /// Substring rather than prefix: a launcher that only matched from the start would make
 /// "term" fail to find `nxterm`, which is the one thing anybody will type.
 fn filter<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<&'a str> {
+    programs.iter().map(|s| s.as_str()).filter(|name| matches(name, q)).collect()
+}
+
+/// Whether `name` is shown for query `q`.
+fn matches(name: &str, q: &str) -> bool {
+    q.is_empty() || name.contains(q)
+}
+
+/// The modal's rows: what `q` matches, **keyed by index into the unfiltered list**.
+///
+/// **One builder, because two of them disagreed.** `open_modal` keyed by the unfiltered index —
+/// with a comment explaining that the filtered index would pair row 2's widget with row 3's
+/// element the moment a character is typed — and the repaint site keyed by the filtered one. The
+/// two produced different keys for the same row as soon as the query was non-empty, which
+/// nothing noticed while a key was only ever used for diffing a modal that is repainted whole.
+/// A click resolves a key back to a program, so it notices now (M11 Part E batch 4).
+fn modal_rows<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<ListRow<'a>> {
     programs
         .iter()
-        .map(|s| s.as_str())
-        .filter(|name| q.is_empty() || name.contains(q))
+        .enumerate()
+        .filter(|(_, name)| matches(name, q))
+        .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
         .collect()
 }
 
@@ -501,18 +668,46 @@ fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
     names
 }
 
+/// `theme`, as the overview's sidebar wears it: the desktop's own ground, darkened, with the
+/// window ground as ink.
+///
+/// **Not a colour of its own.** Everything here is derived from two the theme already has, so a
+/// new palette needs no extra decision — and the sidebar stays related to the desktop it sits
+/// over rather than being a third surface.
+fn sidebar(theme: &Theme) -> Theme {
+    Theme {
+        background: theme.desktop.shade(-24),
+        foreground: theme.background,
+        ..*theme
+    }
+}
+
+/// `theme`, with a bar's ground in place of a window's.
+///
+/// One place, so the two bars cannot disagree about what a panel is made of.
+fn panel(theme: &Theme) -> Theme {
+    Theme { background: theme.face, ..*theme }
+}
+
 /// Render the top bar.
-fn render_bar(theme: &Theme, font: &Font) -> MemFramebuffer {
+fn render_bar(theme: &Theme, font: &Font, clock: &str) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .expect("the bar pitch is wide enough for a row");
     let mut fb = MemFramebuffer::new(geometry);
-    let ui = bar_view();
+    let ui = bar_view(clock);
     let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    //
+    // **On the panel face, not on a window's ground** (M11 Part E, batch 1). `paint` clears a
+    // damage rectangle to `background`, which since the theme turned light is the white an
+    // application draws on — and a bar is not paper: it is a face, the surface a button and a
+    // toolbar are made of. One substituted field rather than a new one; a panel wanting a colour
+    // of its own needs more evidence than one screenshot.
+    paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    });
     fb
 }
 
@@ -1297,7 +1492,26 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         Err(_) => fail(b"desktop-shell: top bar CreateWindow FAILED\n"),
     };
 
-    let picture = render_bar(&theme, &font).into_bytes();
+    // **Kept, because the top bar is repainted now** (M11 Part E batch 9). It was drawn once at
+    // startup and never again — true while it held one static label, and the clock on it changes
+    // every minute.
+    let mut top_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let mut shown_clock = clock_text();
+    // **Said once, because an absent clock is otherwise indistinguishable from a broken bar.**
+    // The kernel reports the wall clock as unsupported when the RTC could not be read at boot,
+    // and the bar's answer to that is to show nothing — which looks identical to a clock that
+    // failed to draw. One line at startup tells the two apart.
+    {
+        let mut l = Line::new();
+        l.s(b"desktop-shell: clock ");
+        if shown_clock.is_empty() {
+            l.s(b"unset");
+        } else {
+            l.s(shown_clock.as_bytes());
+        }
+        l.end();
+    }
+    let picture = render_bar(&theme, &font, &shown_clock).into_bytes();
     let len = BAR_PITCH * BAR_H as usize;
     if picture.len() != len {
         fail(b"desktop-shell: top bar render is not the size it declares\n");
@@ -1306,6 +1520,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         let Some((handle, addr)) = shared_buffer(len) else {
             fail(b"desktop-shell: top bar buffer alloc FAILED\n");
         };
+        top_addrs[i] = addr;
         // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
         // regions are distinct allocations, so they cannot overlap.
         unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
@@ -1512,7 +1727,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // which is the only answer available to a desktop whose applications draw their own chrome
     // (M9 Part C).
     let mut closing: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
-    let mut next_origin = BAR_H as i32;
+    let mut next_origin = BAR_H as i32 + CASCADE_STEP;
 
     // Registered on the first pass of the loop, once the manager channel is known to exist.
     let mut hotkey_done = manager.is_none();
@@ -1565,6 +1780,17 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         .end();
     let mut modal: Option<u32> = None;
     let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    // **The modal's own routing state** (M11 Part E batch 4). Until now this shell read pointer
+    // events for three things it hit-tested by hand — the overview's thumbnails, the applications
+    // button, and the taskbar's entries — and never for the modal, whose contents are a widget
+    // tree rather than a fixed grid. Hand-testing a list that scrolls and filters would be the
+    // toolkit's layout re-derived in the shell; a router is what the toolkit already has.
+    let mut modal_tree = Tree::new();
+    let mut modal_router = Router::new();
+    // **Persistent, since M11 Part E batch 6.** It was a throwaway in each render on the argument
+    // that the launcher keeps no selection — which was true and also meant the scroll offset
+    // reset every frame, so `/bin`'s 26 entries were ten reachable rows and a filter.
+    let mut modal_list = ListState::default();
     let mut query = TextFieldState::new();
     // **The modal serves two purposes and has to know which.** It is the applications launcher
     // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
@@ -1587,6 +1813,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let ev = session.wait_handle();
     // Set whenever a manager request goes out; see the deadline below.
     let mut sent_request = false;
+    // **The clock's next change, as a wait deadline** (M11 Part E batch 9). No timer handle is
+    // needed: `sys_wait` already takes an absolute monotonic deadline, and the shell already
+    // computes one for the close it may have to insist on. This is one more candidate for the
+    // same minimum — a bar that ticks costs one wake a minute and no new kernel object.
+    let mut next_tick = now_ns().map(next_minute).unwrap_or(u64::MAX);
     loop {
         // Both channels in one wait: the session's events and the manager's. Polling one
         // while blocked on the other would make a held window wait for a keystroke.
@@ -1602,7 +1833,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         let deadline = if sent_request {
             0
         } else {
-            closing.iter().map(|&(_, at)| at).min().unwrap_or(u64::MAX)
+            closing.iter().map(|&(_, at)| at).min().unwrap_or(u64::MAX).min(next_tick)
         };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
@@ -1854,7 +2085,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         query.clear();
                         modal = open_modal(
                             &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query,
+                            &query, &mut modal_tree, &mut modal_list,
                         );
                         if let Some(id) = modal {
                             stick(m, id, b"the rename prompt");
@@ -1975,6 +2206,94 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // the property `check-terminal` relies on when it says "an open menu is a topmost
             // popup and takes the keyboard". The top bar could never receive these.
             if Some(w) == modal {
+                // **A click on a row launches it** (M11 Part E batch 4), routed through the
+                // toolkit rather than hit-tested here: the modal's contents are a widget tree
+                // that filters and scrolls, and re-deriving where its rows are would be the
+                // layout engine written twice. The tree is the one `render_modal` recorded when
+                // it painted, so a click lands on the row a person can see.
+                if let libsurface::WindowEvent::Pointer(p) = event {
+                    let rows = modal_rows(&programs, query.text());
+                    let hovered = modal_router.hovered_key(&modal_tree);
+                    let ui = modal_view(&query, &rows, &mut modal_list, hovered, &theme);
+                    let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
+                    let l = libui::layout::layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+                    let (msgs, _) = modal_router.pointer(&modal_tree, &ui, &l, p);
+                    // **Hover is a repaint even when nothing was clicked**, which is the whole
+                    // of the highlight: a pointer that merely moved produces no message and
+                    // still changes what the modal should look like.
+                    // **A repaint, and no receipt.** `nxterm` reports its menu hover because a
+                    // gate has no other way to see it; this shell must not, for a reason that
+                    // outranks the convenience: it has **no build-mode `cfg` sites at all**, and
+                    // `check-login` boots the *release* image, so a `test-harness` line here
+                    // would be both a reintroduction of what the test-path retrofit removed and
+                    // invisible to the gate that would want it. What proves this wiring is the
+                    // click below it: hover and clicking ride the same router, so a router that
+                    // hit-tests wrongly fails the launch.
+                    if modal_router.hovered_key(&modal_tree) != hovered {
+                        modal_dirty = true;
+                    }
+                    for msg in msgs {
+                        // The drag converts through the widget's own arithmetic, which is what
+                        // keeps a list's thumb and a terminal's agreeing about where a y points.
+                        let ModalMsg::Launch(key) = msg else {
+                            if let ModalMsg::Scroll(p) = msg
+                                && p.buttons != 0
+                            {
+                                modal_list.drag_to(modal_list_h(), ROW_H, rows.len(), p.y);
+                                modal_dirty = true;
+                            }
+                            continue;
+                        };
+                        // The key is an index into the *unfiltered* list, which is what
+                        // `modal_rows` guarantees and what makes this resolvable at all.
+                        if let Some(name) = programs.get(key as usize) {
+                            if rename {
+                                // A rename prompt has rows for the same reason the launcher
+                                // does — it is the same widget — but choosing one is not
+                                // naming a desktop, so a click is ignored rather than
+                                // misinterpreted as one.
+                                kprint(b"desktop-shell: the name prompt takes typing, not clicks\n");
+                            } else {
+                                launcher.launch(name.as_str(), &[]);
+                                close_modal(
+                                    &mut session,
+                                    &mut modal,
+                                    &mut query,
+                                    "applications modal",
+                                    &mut modal_addrs,
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // **A press outside it dismisses it, and losing the keyboard does too.**
+                //
+                // Two signals rather than one, because neither covers the other. `Focus(false)`
+                // arrives when something *raises* — clicking another window, or a chord that
+                // restacks — and it was all this had at first, which turned out to cover only
+                // half the case: focus here is a consequence of stacking, so a press on the
+                // desktop or on a panel raises nothing and changed no focus, and the modal
+                // stayed open over the click (reported by the maintainer; M11 Part E batch 5).
+                // `Dismissed` is the compositor saying the press landed elsewhere, which is the
+                // half a client cannot see for itself.
+                //
+                // `InputLost` is neither of these — that is queue overflow, and reading it as
+                // one would close the modal on a burst of pointer motion.
+                if matches!(
+                    event,
+                    libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
+                ) {
+                    rename = false;
+                    close_modal(
+                        &mut session,
+                        &mut modal,
+                        &mut query,
+                        "applications modal",
+                        &mut modal_addrs,
+                    );
+                    continue;
+                }
                 if let libsurface::WindowEvent::Key(k) = event {
                     if k.pressed != 0 {
                         if k.keycode == KEY_ESC {
@@ -2234,7 +2553,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     {
                         modal = open_modal(
                             &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query,
+                            &query, &mut modal_tree, &mut modal_list,
                         );
                         if let Some((m, id)) = manager.as_mut().zip(modal) {
                             stick(m, id, b"the applications modal");
@@ -2269,7 +2588,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         recapture(m, &entries, current_desktop, &mut shots);
                         overview = open_overview(
                             &mut session, window, &theme, &font, &shots, &desktops,
-                            current_desktop, &mut over_addrs,
+                            current_desktop, &entries, &mut over_addrs,
                         );
                         if let Some(id) = overview {
                             stick(m, id, b"the overview");
@@ -2369,6 +2688,39 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
 
+        // **The clock, when the minute it shows has changed.** Compared as text rather than by
+        // the deadline having passed: an unset clock formats to nothing every time, so this
+        // repaints zero times instead of once a minute forever — and a wake that finds the same
+        // string costs nothing but the comparison.
+        if let Some(now) = now_ns()
+            && now >= next_tick
+        {
+            next_tick = next_minute(now);
+            let want = clock_text();
+            if want != shown_clock {
+                shown_clock = want;
+                let picture = render_bar(&theme, &font, &shown_clock).into_bytes();
+                let len = BAR_PITCH * BAR_H as usize;
+                // `acquire`, for the reason the bottom bar's repaint gives: a buffer index this
+                // code kept itself would invert its phase on any iteration where the commit did
+                // not go out, and every repaint after that would write into what is on screen.
+                if picture.len() == len
+                    && let Some(mut w) = session.window(window)
+                    && let Ok(b) = w.acquire()
+                    && !top_addrs[b as usize].is_null()
+                {
+                    // SAFETY: the destination maps `len` writable bytes and `picture` holds
+                    // exactly `len`; the two are distinct allocations.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(picture.as_ptr(), top_addrs[b as usize], len)
+                    };
+                    if w.commit(b, (0, 0, SCREEN_W, BAR_H)).is_err() {
+                        kprint(b"desktop-shell: top bar Commit failed\n");
+                    }
+                }
+            }
+        }
+
         // **Redraw the bar when the list changed, and only then.** Every manager event would
         // otherwise repaint a bar that says the same thing, and a panel commit is a full-width
         // blit the compositor has to composite.
@@ -2417,7 +2769,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 recapture(m, &entries, current_desktop, &mut shots);
                 present_overview(
                     &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
-                    &over_addrs,
+                    &entries, &over_addrs,
                 );
                 Line::new()
                     .s(b"desktop-shell: overview now showing ")
@@ -2432,13 +2784,22 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // cannot see is not a filter.
         if modal_dirty {
             if let Some(id) = modal {
-                let filtered = filter(&programs, query.text());
-                let rows: alloc::vec::Vec<ListRow<'_>> = filtered
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| ListRow { key: i as u64, label: name })
-                    .collect();
-                present_modal(&mut session, id, &theme, &font, &query, &rows, &modal_addrs);
+                let rows = modal_rows(&programs, query.text());
+                // Read before the borrow: `present_modal` takes the tree mutably to record what
+                // it painted, and the hover it should paint *with* comes from the tree as it is.
+                let hovered = modal_router.hovered_key(&modal_tree);
+                present_modal(
+                    &mut session,
+                    id,
+                    &theme,
+                    &font,
+                    &query,
+                    &rows,
+                    &modal_addrs,
+                    &mut modal_tree,
+                    hovered,
+                    &mut modal_list,
+                );
             }
         }
     }
@@ -2775,6 +3136,7 @@ fn render_overview(
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
     current: u32,
+    entries: &[WinEntry],
 ) -> MemFramebuffer {
     let geometry =
         Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::XRGB8888)
@@ -2796,7 +3158,10 @@ fn render_overview(
         label.push_str(&desktop_label(desktops, d.id));
         rows.push(sized(
             libdraw::geom::Size::new(SIDE_W, SIDE_ROW_H),
-            padding(Insets { top: 8, right: 8, bottom: 8, left: 8 }, text(label)),
+            row(alloc::vec![
+                padding(Insets::all(MINI_PAD), desktop_preview(entries, d.id, theme)),
+                padding(Insets { top: 8, right: 8, bottom: 8, left: 0 }, text(label)),
+            ]),
         ));
     }
     let side = column(rows);
@@ -2808,9 +3173,14 @@ fn render_overview(
     );
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&side, bounds, &metrics);
-    // The session's theme, read once in `_start` — the shell's own chrome follows the file
-    // it hands to every application, or it themes the windows and not the bars around them.
-    paint(&mut fb, font, theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
+    // **A dark panel over the ground, not a white sheet on it** (M11 Part E batch 10). `paint`
+    // clears to `background`, which since the theme turned light is the white an application
+    // draws on — so the sidebar was a white column down the side of a blue desktop, which is
+    // what the request called out. Translucency is what it asked for and that waits on an alpha
+    // channel; a dark panel with light ink is what reads as deliberate without one.
+    let side_theme = sidebar(theme);
+    paint(&mut fb, font, &side_theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    });
 
     // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
     // toolkit to lay out and a element per pixel would be absurd.
@@ -2873,6 +3243,7 @@ fn open_overview(
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
     current: u32,
+    entries: &[WinEntry],
     addrs: &mut [*mut u8; BUFFERS],
 ) -> Option<u32> {
     let len = OVER_PITCH * SCREEN_H as usize;
@@ -2914,7 +3285,7 @@ fn open_overview(
         kprint(b"desktop-shell: overview buffers FAILED\n");
         return None;
     }
-    present_overview(session, id, theme, font, shots, desktops, current, addrs);
+    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs);
     Some(id)
 }
 
@@ -2927,10 +3298,11 @@ fn present_overview(
     shots: &[(u32, u32, u32, alloc::vec::Vec<u8>)],
     desktops: &[Desktop],
     current: u32,
+    entries: &[WinEntry],
     addrs: &[*mut u8; BUFFERS],
 ) {
     let len = OVER_PITCH * SCREEN_H as usize;
-    let bytes = render_overview(theme, font, shots, desktops, current).into_bytes();
+    let bytes = render_overview(theme, font, shots, desktops, current, entries).into_bytes();
     if bytes.len() != len {
         return;
     }
@@ -2969,10 +3341,65 @@ fn close_overview(
     }
 }
 
+/// A miniature of one desktop: its ground, with a box where each of its windows is.
+///
+/// **Rectangles rather than scaled window contents** (M11 Part E batch 10). The maintainer named
+/// both and said "whatever is easy"; the difference is not effort but *availability*. A thumbnail
+/// is a capture, and the compositor can only capture what it composites — the windows on the
+/// desktop being shown. A sidebar is a row per desktop that is *not* being shown, so there is
+/// nothing to capture, and asking the compositor to composite an off-screen desktop to photograph
+/// it is a different feature from drawing where its windows are.
+///
+/// What the shell does have is every window's origin, size and desktop, which it keeps for the
+/// taskbar. So this is arithmetic, not pixels: it needs no capture, no scaling, and no image
+/// decoding — which is what the same request looked like it needed.
+///
+/// **Bordered boxes rather than filled ones**, so two overlapping windows read as two.
+fn desktop_preview(entries: &[WinEntry], desktop: u32, theme: &Theme) -> Element<()> {
+    // The screen's proportions, so the miniature is the shape of the thing it stands for.
+    let (iw, ih) = (MINI_W - 2, MINI_H - 2);
+    let mut layers = alloc::vec::Vec::with_capacity(4);
+    layers.push(fill(theme.border));
+    layers.push(padding(Insets::all(1), fill(theme.desktop)));
+    for e in entries.iter().filter(|e| e.desktop == desktop && !e.minimized) {
+        // Scaled by the same ratio in both axes as the screen, and clamped into the interior: a
+        // window dragged partly off-screen must not draw outside the miniature that stands for
+        // the screen.
+        let sx = (e.origin.0.max(0) as u32 * iw / SCREEN_W).min(iw.saturating_sub(1));
+        let sy = (e.origin.1.max(0) as u32 * ih / SCREEN_H as u32).min(ih.saturating_sub(1));
+        // At least two pixels, or the border and the face have nowhere to go and a window
+        // vanishes rather than being small.
+        let sw = (e.size.0 * iw / SCREEN_W).max(2).min(iw - sx);
+        let sh = (e.size.1 * ih / SCREEN_H as u32).max(2).min(ih - sy);
+        let face = if e.focused { theme.face_hover } else { theme.face };
+        layers.push(offset(
+            1 + sx as i32,
+            1 + sy as i32,
+            sized(
+                libdraw::geom::Size::new(sw, sh),
+                stack(alloc::vec![fill(theme.border), padding(Insets::all(1), fill(face))]),
+            ),
+        ));
+    }
+    sized(libdraw::geom::Size::new(MINI_W, MINI_H), stack(layers))
+}
+
+/// A sidebar miniature's size — the screen's 16:10, small enough for a row.
+const MINI_W: u32 = 96;
+/// See [`MINI_W`].
+const MINI_H: u32 = 60;
+/// Space around a miniature inside its row.
+const MINI_PAD: u32 = 6;
+
 /// The overview's sidebar width, at the right-hand edge.
 const SIDE_W: u32 = 200;
 /// One desktop row in the sidebar.
-const SIDE_ROW_H: u32 = 40;
+///
+/// **Tall enough for a miniature** since M11 Part E batch 10: `MINI_H` plus `MINI_PAD` on each
+/// side. `check-login` clicks a row by index and computes the same arithmetic, so this number is
+/// in two places and the gate names which (that is the cost of a click point a gate can aim at,
+/// and M11's decision 2 chose it deliberately).
+const SIDE_ROW_H: u32 = MINI_H + MINI_PAD * 2;
 /// A thumbnail's size in the overview's grid.
 const THUMB_W: u32 = 240;
 /// See [`THUMB_W`].
@@ -3659,11 +4086,17 @@ fn place_new_windows(
             desktop: current,
         });
         dirty = true;
-        let (x, y) = (0, *next_origin);
+        // **Inset from the left edge, not flush against it** (M11 Part E batch 4). The cascade
+        // stepped down from the bar and started at x=0, so a first window sat with its frame on
+        // the screen's border — which reads as a window that has been shoved rather than placed.
+        // One step in, so the offset matches the one the cascade already uses downward.
+        let (x, y) = (CASCADE_STEP, *next_origin);
         // Wrapped, or the 34th window is placed below an 800px screen and never seen.
         *next_origin += CASCADE_STEP;
         if *next_origin > SCREEN_H - CASCADE_STEP {
-            *next_origin = BAR_H as i32;
+            // Back to where the cascade starts, which is one step below the bar rather than
+            // against it — the same inset the first window gets.
+            *next_origin = BAR_H as i32 + CASCADE_STEP;
         }
         let place = MgrPlace { window: created.window, x, y };
         let mut body = [0u8; 12];
@@ -3678,10 +4111,17 @@ fn place_new_windows(
                 .end();
             continue;
         }
+        // **`x`, not a literal zero.** This said `at 0,` because the cascade always started at
+        // the left edge — a value hardcoded into the line that reports it, which is the shape
+        // that stays right until the thing it describes changes. Insetting the cascade made the
+        // shell log one origin and place another, and `check-login` parses this line to find the
+        // window it is about to click (M11 Part E batch 4).
         Line::new()
             .s(b"desktop-shell: placed window ")
             .u(created.window as u64)
-            .s(b" at 0,")
+            .s(b" at ")
+            .i(x as i64)
+            .s(b",")
             .i(y as i64)
             .end();
     }
@@ -3697,14 +4137,12 @@ fn present_modal(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
     addrs: &[*mut u8; BUFFERS],
+    tree: &mut Tree,
+    hovered: Option<u64>,
+    list: &mut ListState,
 ) {
     let len = MODAL_PITCH * MODAL_H as usize;
-    // **A local, because the launcher keeps no selection.** Enter launches the filtered list's
-    // first entry (see the `KEY_ENTER` arm), so there is nothing to persist between frames —
-    // and since M10 Part C that is said by the state being a throwaway here rather than by a
-    // `_` in a pattern, which is what it looked like when the widget returned it.
-    let mut list = ListState::default();
-    let fb = render_modal(theme, font, query, rows, &mut list);
+    let fb = render_modal(theme, font, query, rows, list, tree, hovered);
     let bytes = fb.into_bytes();
     if bytes.len() != len {
         return;
@@ -3775,18 +4213,12 @@ fn open_modal(
     programs: &[alloc::string::String],
     addrs: &mut [*mut u8; BUFFERS],
     query: &TextFieldState,
+    tree: &mut Tree,
+    list: &mut ListState,
 ) -> Option<u32> {
-    let rows: alloc::vec::Vec<ListRow<'_>> = programs
-        .iter()
-        .enumerate()
-        // Keyed by index into the **unfiltered** list, which is what `ListRow::key`'s doc asks
-        // for: a filter reorders and shortens the rows, and an index into the filtered view
-        // would pair row 2's widget with row 3's element the moment a character is typed.
-        .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
-        .collect();
-    // A throwaway for the reason `present_modal`'s is one: no selection is kept.
-    let mut list = ListState::default();
-    let picture = render_modal(theme, font, query, &rows, &mut list);
+    let rows = modal_rows(programs, query.text());
+    // Nothing is hovered before the window exists.
+    let picture = render_modal(theme, font, query, &rows, list, tree, None);
     let bytes = picture.into_bytes();
     let len = MODAL_PITCH * MODAL_H as usize;
     if bytes.len() != len {
@@ -3794,7 +4226,15 @@ fn open_modal(
         return None;
     }
     let role = Role::Popup { parent };
-    let id = match session.create(&CreateWindowRequest::new(MODAL_W, MODAL_H, role), BUFFERS) {
+    // **Hanging from the applications button, not sitting on top of it** (M11 Part E batch 4).
+    // A popup created with `new` takes its parent's origin, and the parent here is the top bar —
+    // so the modal covered the bar it dropped from, including the button that opened it.
+    // `nxterm`'s menu has always used `at`; this is the same call, with the button's left edge
+    // and the bar's height. A popup is clipped by the *screen* rather than by its parent, which
+    // is what lets it hang below a 24-pixel bar.
+    let id = match session
+        .create(&CreateWindowRequest::at(MODAL_W, MODAL_H, role, 0, BAR_H as i32), BUFFERS)
+    {
         Ok(id) => id,
         Err(_) => {
             kprint(b"desktop-shell: modal CreateWindow FAILED\n");

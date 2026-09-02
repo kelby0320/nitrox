@@ -205,6 +205,12 @@ fn main() -> ExitCode {
         Some("preview") => cmd_preview(
             qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
         ),
+        // Same positional-argument rule as `preview`, and for the same reason: `--kvm` in the
+        // name slot would be reported as "no shot called `--kvm`".
+        Some("shot") => cmd_shot(
+            qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
+            accel,
+        ),
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
@@ -250,6 +256,8 @@ fn print_help() {
            \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
+           shot              boot the release image and photograph the desktop;\n  \
+           \x20                `shot all|greeter|desktop|apps|windows|overview`\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
@@ -1607,14 +1615,19 @@ fn parse_work_area(rest: &str) -> Option<(i32, i32, u32, u32, u32, u32)> {
 }
 
 /// Read `<id> at 0,<y>` — the tail of the shell's placement line. Returns `(id, y)`.
-fn parse_placement(rest: &str) -> Option<(u32, i32)> {
+fn parse_placement(rest: &str) -> Option<(u32, i32, i32)> {
     let mut it = rest.split_whitespace();
     let id = it.next()?.parse().ok()?;
     if it.next()? != "at" {
         return None;
     }
-    let (_, y) = it.next()?.split_once(',')?;
-    Some((id, y.parse().ok()?))
+    // **`x` as well as `y`, since M11 Part E batch 4.** It was discarded because the cascade
+    // always started at the left edge, so every button this gate aims at could be measured from
+    // the window's width alone. Insetting the cascade moved every one of them, and the gate went
+    // on clicking as though the window began at zero — landing on minimise where it meant
+    // maximise. A gate that assumes an origin is a gate that stops working when something moves.
+    let (x, y) = it.next()?.split_once(',')?;
+    Some((id, x.parse().ok()?, y.parse().ok()?))
 }
 
 /// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxterm`'s menu-popup line.
@@ -1717,35 +1730,13 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
 fn cmd_check_login(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
-    let ovmf = locate_ovmf()?;
 
-    let work = repo_root().join("tools/build-cache");
+    let work = build_cache();
     fs::create_dir_all(&work).ok();
     let qmp_sock = work.join("qmp-login.sock");
-    let _ = fs::remove_file(&qmp_sock);
-
-    let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
-    cmd.arg("-drive")
-        .arg(format!("format=raw,file={}", image_path().display()))
-        .arg("-display")
-        .arg("none")
-        .arg("-qmp")
-        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
-        .arg("-chardev")
-        .arg("stdio,id=hostserial,signal=off")
-        .arg("-serial")
-        .arg("chardev:hostserial")
-        .arg("-smp")
-        .arg("4")
-        .arg("-no-reboot")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
 
     println!("xtask: graphical login gate — booting the release image…\n");
-    let mut session = Session::spawn(cmd, "check-login")?;
-    let mut qmp = Qmp::connect(&qmp_sock)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock)?;
 
     // 1. The greeter is up before anyone has authenticated. That is the claim Part D's second
     //    box makes, and in a release image nothing else has drawn anything.
@@ -1806,6 +1797,16 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // asking the kernel for its own endpoint would block it waiting for its own answer. The
     // bind's success is what it can report; the `desktop` command below is what proves the
     // binding is reachable (M8 Part F).
+    // **The clock read the wall clock** (M11 Part E batch 9), which is the one thing about it a
+    // gate can see: its value changes every minute, and this boot has no reference render of a
+    // bar to compare pixels against. What the line distinguishes is a clock absent because the
+    // RTC was unreadable from a bar that failed to draw one — the *formatting* is a host test in
+    // `libtime`, where it belongs.
+    //
+    // Immediately after the theme, because that is where it is: the shell reads both before it
+    // draws anything, and an expectation placed beside its topic rather than its position in the
+    // stream scans past output that was there.
+    session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: serving /dev/desktop")?;
     session.expect("desktop-shell: application /dev/desktop bound")?;
     session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
@@ -1907,7 +1908,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `<id> at 0,<y>`; nothing moves this window between here and there — a desktop change and a
     // minimise leave the origin alone — so this is its origin at that point.
     let placed = session.rest_of_line()?;
-    let (term_id, term_y) = parse_placement(&placed)
+    let (term_id, term_x, term_y) = parse_placement(&placed)
         .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // Its width, which the title bar's buttons are measured from — **before the window-list
     // line**, which follows it: an `expect` scans forward, so asserting the list first would
@@ -1932,8 +1933,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // slot left; the first run after that clicked *close* where it meant maximise, which is what
     // a coordinate constant hides and a changing layout exposes.
     let button_y = term_y + 13;
-    let maximise_at = (term_w as i32 - 39, button_y);
-    let minimise_at = (term_w as i32 - 65, button_y);
+    // Measured from the window's **right edge**, which is its origin plus its width — not from
+    // its width, which is the same number only while windows are placed at x=0.
+    let right = term_x + term_w as i32;
+    let maximise_at = (right - 39, button_y);
+    let minimise_at = (right - 65, button_y);
 
     // **Maximise here is asserted as far as the shell's answer** — that the ask reached it and
     // that it answered with the *work area* rather than the screen. What the client does with
@@ -2025,20 +2029,31 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("  ok: the taskbar asked, and the client closed itself");
     let first_term_id = term_id;
 
-    // Launch another, because everything below needs a terminal — the same sequence as the
-    // first launch, and the modal it opens is closed by the launch.
+    // Launch another, because everything below needs a terminal — and **by clicking the row this
+    // time**, which is the second launch path and did not exist until M11 Part E batch 4. The
+    // shell read pointer events for the overview, the applications button and the taskbar, and
+    // never for the modal's own window: its rows could not be clicked at all, and nothing under
+    // the cursor reacted. Everything after this step depends on the terminal, so a click that
+    // silently does nothing fails the rest of the gate rather than passing quietly.
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
+    // Filtered to one row first, so the row being clicked is known without the gate having to
+    // work out where `nxterm` sorts in the contents of `/bin`.
     for c in "nxterm".chars() {
         let mut qcode = String::new();
         qcode.push(c);
         press(&mut qmp, &qcode)?;
     }
-    press(&mut qmp, "ret")?;
+    // **The modal hangs from the button now**, at (0, `BAR_H`), rather than covering the bar it
+    // drops from — so the first row sits a field's height below the bar. `click_at` asserts the
+    // press position before anything downstream is checked, which is what separates "the pointer
+    // was not over the row" from "it was, and the click did nothing".
+    const ROW1: (i32, i32) = (60, 64);
+    click_at(&mut qmp, &mut session, ROW1.0, ROW1.1)?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: placed window ")?;
     let replaced = session.rest_of_line()?;
-    let (term_id, term_y) = parse_placement(&replaced).ok_or_else(|| {
+    let (term_id, term_x, term_y) = parse_placement(&replaced).ok_or_else(|| {
         format!("could not read the replacement terminal's placement from {replaced:?}")
     })?;
     session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
@@ -2074,9 +2089,32 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     the left — so (90, 788) is inside the first one.
 
     // Close the modal first: it is a popup on top, and a press meant for the bar would land in
-    // it. Escape is what the modal itself declines to type.
-    press(&mut qmp, "esc")?;
+    // it. **By clicking outside it rather than by pressing Escape** (M11 Part E batch 4) —
+    // Escape is covered by the launch step above, and dismissal-on-outside-click is what did not
+    // exist: this process never sees a press aimed at another window, so the modal stayed open
+    // over whatever was clicked. The compositor's focus event is the one signal that says the
+    // person went elsewhere, and it is what closes it now.
+    //
+    // **Onto bare desktop, which is the case that was broken.** Clicking another *window* raises
+    // it, and a raise is a focus change the popup hears about — so the first version of this step
+    // clicked into the terminal and passed while the reported bug survived: a press on the
+    // desktop or on a panel raises nothing, changes no focus, and left the modal open over it.
+    // The compositor sends `Surface::Dismissed` for that press now, which is the half a client
+    // cannot see for itself.
+    //
+    // **The bottom bar's dead space**, between the last window-list entry and the desktop
+    // indicator. A panel never takes focus, so a press there raises nothing and produces no focus
+    // change *whatever else is on screen* — which is what makes it the honest test. Aiming at
+    // bare desktop instead would depend on the terminal not being maximised at this point in the
+    // gate, and it is.
+    click_at(&mut qmp, &mut session, 600, 788)?;
     session.expect("desktop-shell: applications modal closed")?;
+    // **That the compositor *said* so is checked against the whole transcript below**, not here.
+    // The dismissal is logged while the press is being routed and the `press at` line is logged
+    // when the routed record is delivered — so the dismissal comes *first*, and `click_at`'s own
+    // position assertion has already scanned past it. Same rule this gate applies to every line
+    // whose order is an implementation detail rather than a claim.
+
 
     click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
     session.expect("desktop-shell: minimized window ")?;
@@ -2209,7 +2247,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // The first thumbnail sits at (16, 40) and is 240x150 — see `thumb_rect`. Press inside it,
     // release over the second sidebar row, which is desktop 2.
     const THUMB: (i32, i32) = (100, 100);
-    let side_row = |i: i32| (1180, 24 + i * 40 + 20);
+    // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
+    // padding — and this is the second place that number lives. Half a row down, so the aim is
+    // clear of both edges.
+    let side_row = |i: i32| (1180, 24 + i * 72 + 36);
     // **The drag starts from a position already verified — by the click that opened this.** A
     // drag cannot check its own start: there is no press receipt until the button goes down, and
     // by then it has begun. `click_at(1200, 788)` above asserted where it landed and left the
@@ -2322,7 +2363,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     // Then the sidebar click, with no drag in flight. Row 1 is the second desktop — `cli`,
     // which is where the terminal is — so the refresh must find it again.
-    let side_row = |i: i32| (1180, 24 + i * 40 + 20);
+    // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
+    // padding — and this is the second place that number lives. Half a row down, so the aim is
+    // clear of both edges.
+    let side_row = |i: i32| (1180, 24 + i * 72 + 36);
     let (sx, sy) = side_row(1);
     click_at(&mut qmp, &mut session, sx, sy)?;
     session.expect("desktop-shell: switched to cli")?;
@@ -2399,9 +2443,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.pointer = Some((press_at.0 + DRAG_STEPS * DRAG_DX, press_at.1 + DRAG_STEPS * DRAG_DY));
     // The window ended up offset by exactly what was injected. One line for the gesture:
     // the compositor reports no geometry change per motion, deliberately.
+    // **From where it started, not from zero.** A drag moves a window by what was injected, and
+    // the destination is its origin plus that — which was the same number only while the cascade
+    // placed every window at x=0 (M11 Part E batch 4).
     session.expect(&format!(
         "desktop-shell: window {term_id} geometry {},{} ",
-        DRAG_STEPS * DRAG_DX,
+        term_x + DRAG_STEPS * DRAG_DX,
         term_y + DRAG_STEPS * DRAG_DY
     ))?;
     println!("  ok: the terminal moved with its own title bar, offset by where it was grabbed");
@@ -2418,9 +2465,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // reallocates and *commits* at the new size, and the geometry the shell reads back is the
     // committed one. A client that still declined would produce every line but the last.
     //
-    // The button is at the window's top-right, and the window has moved: its origin is
-    // `DRAG_STEPS * DRAG_DX` across and `term_y + DRAG_STEPS * DRAG_DY` down.
-    let moved_x = DRAG_STEPS * DRAG_DX;
+    // The button is at the window's top-right, and the window has moved: its origin is where it
+    // was placed plus what the drag injected.
+    let moved_x = term_x + DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
     click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 39, moved_y + 13)?;
     session.expect("nxterm: asked the shell for window state 2")?;
@@ -2862,15 +2909,27 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_button("left", true)?;
     // **Past the slop, then across.** The browser turns a press into a drag once it has
     // travelled, which is what keeps a click a click.
+    //
+    // **The slop counts toward where the pointer is**, and it did not until M11 Part E batch 2b
+    // found out. Injection is relative: these six motions move the guest's pointer 600 across
+    // and 240 down, and the walk below started its arithmetic from `row1` as though they had
+    // not happened — so every step was 600 too far right, and the pointer ended clamped against
+    // the screen's right edge instead of at `onto`.
+    //
+    // It passed for a month because the editor's text area reached the window's last pixel
+    // column, so a drop at the extreme edge landed on it anyway. Giving the window a frame moved
+    // the content in by four pixels and the drop started landing on the frame — a real gate bug,
+    // surfaced by a change that had nothing to do with it.
+    let mut at = row1;
     for _ in 0..6 {
         qmp.send_motion(100, 40)?;
+        at = (at.0 + 100, at.1 + 40);
     }
     session.expect("nxfiles: dragging other.txt")?;
     session.expect("compositor: drag from window ")?;
     // Into the editor's document area — below its title bar and status strip, and well inside
     // the half of the screen it now occupies.
     let onto = (work.0 + work.2 as i32 * 3 / 4, work.1 + work.3 as i32 / 2);
-    let mut at = row1;
     while at != onto {
         let step = (
             (onto.0 - at.0).clamp(-100, 100),
@@ -2888,6 +2947,59 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxedit: drop of other.txt on the document")?;
     session.expect("nxedit: opened /home/papers/other.txt - 0 bytes")?;
     println!("  ok: a file dragged from the browser opened in the editor");
+
+    // 10. **An editor launched from the menu, which is a launch with no file** (M11 Part E
+    //     batch 7). `nxedit` required `argv[1]` and the applications modal passes none, so it
+    //     printed "no file to edit" and exited — reported as "nxedit doesn't launch from the
+    //     menu", and true in the most literal way. It opens untitled now and asks for a name when
+    //     there is something to save.
+    press(&mut qmp, "esc")?;
+    session.skip_to_end()?;
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+    for c in "nxedit".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    // **Enter, not a click on the row.** Clicking a row is proved above, where the terminal every
+    // later step depends on is launched that way; what this step is about is what happens *after*
+    // a launch that carries no file, so it takes the shortest route to one.
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxedit into its own namespace")?;
+    // **The placement is the proof**, not the launch: the shell said the same thing before this
+    // change, and the editor then exited before it ever created a window. A window that gets
+    // placed is a window that exists.
+    session.expect("desktop-shell: placed window ")?;
+    let untitled = session.rest_of_line()?;
+    let (untitled_id, _, _) = parse_placement(&untitled)
+        .ok_or_else(|| format!("could not read the untitled editor's placement from {untitled:?}"))?;
+    println!("  ok: the editor launched from the menu and stayed up (window {untitled_id})");
+
+    // **Wait for it to reach the screen before typing at it.** "Placed" says the shell put the
+    // window somewhere, not that the compositor has moved the keyboard to it — the same race that
+    // sent a launch's keystrokes into the wrong program in batch 4. Settling the screen is the
+    // property that actually has to hold.
+    let _ = settle_and_capture(&mut qmp, &build_cache().join("check-login.ppm"))?;
+
+    // Ctrl+S with nothing named asks for a name rather than writing one nobody chose.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    // Then the name, one key at a time — the same discipline every typed sequence here uses.
+    for c in "scratch".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    // **`/home`, which *is* the user's subtree from inside the session.** A session namespace
+    // binds the user's directory at `/home` — that is what scopes it — so an untitled buffer
+    // named here lands in the place the session owns, and a path mentioning `alice` would be
+    // this gate asserting the host's view of a name the guest cannot see. An empty buffer is
+    // zero bytes: the newline the editor adds is per line, and there are none.
+    session.expect("nxedit: saved /home/scratch - 0 bytes")?;
+    println!("  ok: an untitled buffer was named and written into the session's home");
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
@@ -2975,6 +3087,22 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // the machinery was there (`libstream` documents `PeerClosed` as "stop producing, exit")
     // and the gate now says so out loud. Order-independent: the child notices its master go at
     // whatever moment the tty-server gets there.
+    // **The modal was dismissed by the compositor, not by a focus change** (M11 Part E batch 5).
+    // The distinction is the whole of the fix: clicking another *window* raises it, and a raise
+    // is a focus change the popup hears about — which is why the first version of this step
+    // passed while the reported bug survived. A press on a panel raises nothing.
+    if !transcript.contains("compositor: dismissed win=") {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err(format!(
+            "the applications modal closed, but the compositor never sent a dismissal — so it \
+             closed on a focus change, which is the half of this that already worked. A press on \
+             a panel raises no window and changes no focus, so nothing but `Surface::Dismissed` \
+             can have closed it.\n\nthe transcript is at {}",
+            path.display()
+        )
+        .into());
+    }
     if !transcript.contains("nxsh: terminal closed") {
         let path = build_cache().join("guest-transcript-check-login.log");
         let _ = fs::write(&path, &transcript);
@@ -3600,6 +3728,32 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // few motions rather than re-pinning — and a retry here is cheap for the same reason.
     // Nothing dismisses this popup but choosing from it, so an attempt that lands elsewhere
     // leaves it open for the next one.
+    // **Hover before the click, and it has to be in that order** (M11 Part E batch 3). Hover is
+    // the first thing in this system that reacts to the pointer without a button held, and it is
+    // invisible to a gate: the highlight is pixels, and this boot has no reference render of a
+    // menu to compare against. So the client says which item it is over — `MENU_CLEAR_KEY`, the
+    // one the click then activates.
+    //
+    // Moving and clicking as one step does not show it: choosing `Clear` closes the menu, and
+    // the popup is destroyed at the top of the next iteration *before* it would have painted
+    // itself hovered. So the pointer arrives first and the receipt is waited for.
+    //
+    // **It is a claim about the path, not the widget.** `menu_item` painting a highlight when
+    // told to is a host test; that `Router::inside` is fed by real PS/2 motion, through the
+    // compositor, into a popup's own router, and reaches the view, is only observable here — and
+    // it had never happened before this batch, because nothing asked the router.
+    move_pointer_to(&mut qmp, cx, cy)?;
+    session.expect("nxterm: menu hover 2")?;
+    // **The receipt is also the position proof**, which is why the tracked position is set here
+    // rather than assumed. `move_pointer_to` deliberately does not record where it went — only a
+    // *confirmed* press does, because injection is relative and an unacknowledged move leaves
+    // the host believing something it cannot check. Here the guest has just said it is over the
+    // item, so the position is known by evidence rather than by assertion.
+    //
+    // Skipping this cost an afternoon: the click below then walked its delta from the position
+    // the *previous* click had confirmed, doubling the movement, landing at the corner, and
+    // dismissing the menu — after which the retry pressed on the terminal underneath.
+    qmp.pointer = Some((cx, cy));
     click_at(&mut qmp, &mut session, cx, cy)?;
     session.expect("nxterm: menu chose Clear")?;
 
@@ -3753,12 +3907,206 @@ fn cmd_preview(what: &str) -> R<()> {
     Ok(())
 }
 
+/// `cargo xtask shot [all|greeter|desktop|apps|windows|overview]` — photograph the running
+/// desktop.
+///
+/// **The other half of `preview`, and the half it said it could not be.** Part A's command
+/// renders the toolkit's own surfaces on the host in about a second, and its doc names what that
+/// structurally cannot show: anything the *compositor* draws — the cursor, the drag outline, the
+/// ground between windows — and the arrangement of real windows on a real screen. Those are
+/// composed in the guest by clients that have to run, so the only honest way to look at them is
+/// to boot and take the picture.
+///
+/// **A photograph, not a render**, which is what keeps this out of the "two sources for one
+/// answer" trap that `preview_frames` exists to avoid: nothing here draws anything. It boots the
+/// **release** image — the one a person would use, with no `--selftest` clients on the screen —
+/// drives it to each moment worth looking at, and writes what QEMU says is on the display.
+///
+/// **Several moments per boot**, because the boot is the cost. One run gives the greeter, the
+/// bare desktop, the applications modal, a screen with real windows on it, and the overview — a
+/// polish list is written against all five. The overview is there because it is the one surface
+/// with no other way to be looked at: it covers the screen and closes when anything else is
+/// clicked.
+///
+/// It is a tool and not a gate: it asserts only enough to know the picture is of a working
+/// desktop rather than of a blank screen, which is the one failure that would otherwise be
+/// mistaken for a design opinion.
+fn cmd_shot(what: &str, accel: Accel) -> R<()> {
+    const MOMENTS: [&str; 5] = ["greeter", "desktop", "apps", "windows", "overview"];
+    if what != "all" && !MOMENTS.contains(&what) {
+        return Err(format!(
+            "no shot called {what:?} — try `all` or one of: {}",
+            MOMENTS.join(", ")
+        )
+        .into());
+    }
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::Normal)?;
+
+    let work = build_cache();
+    fs::create_dir_all(&work).ok();
+    let dump = work.join("shot.ppm");
+    let qmp_sock = work.join("qmp-shot.sock");
+    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock)?;
+
+    // A closure would borrow both halves for the rest of the function, so the capture is a
+    // statement each time — four lines, and no plumbing to read past.
+    macro_rules! capture {
+        ($name:expr) => {
+            if what == "all" || what == $name {
+                let ppm = settle_and_capture(&mut qmp, &dump)?;
+                let (w, h, rgb) = parse_ppm(&ppm)?;
+                let path = work.join(concat!("shot-", $name, ".png"));
+                write_png(&path, w, h, &rgb)?;
+                println!("  shot: {} ({w}x{h})", path.display());
+            }
+        };
+    }
+
+    println!("xtask: booting the release image to photograph it…\n");
+
+    // 1. **The greeter**, which in a release image is the only window there is.
+    session.expect("desktop-session-mgr: greeter presented")?;
+    // The pointer somewhere a person would leave it, so the cursor is in the picture. Without
+    // this it sits whereever QEMU starts it, which is the top-left corner and under the window.
+    move_pointer_to(&mut qmp, 640, 400)?;
+    capture!("greeter");
+
+    // 2. **A session.** No wrong password here — that is `check-login`'s claim to make, and a
+    //    tool that took twice as long to produce the same pictures would be a tool used less.
+    type_at_greeter(&mut qmp, &mut session, DEMO_USER)?;
+    press(&mut qmp, "tab")?;
+    type_at_greeter(&mut qmp, &mut session, DEMO_PASSWORD)?;
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: up (graphical session leader)")?;
+    // Both bars, because a desktop missing one is exactly the picture that would be mistaken
+    // for a design decision rather than a broken boot. In the order the shell prints them —
+    // `expect` scans forward, so a pair asserted by topic rather than by position in the stream
+    // times out on output that was there.
+    // **The clock read the wall clock**, which is the one thing about it a gate can see: its
+    // value changes every minute and the bar is pixels this boot has no reference render of. The
+    // line distinguishes a clock that is absent because the RTC was unreadable from a bar that
+    // failed to draw one — and the *formatting* is a host test in `libtime`, where it belongs.
+    session.expect("desktop-shell: clock ")?;
+    session.expect("desktop-shell: top bar presented, window ")?;
+    session.expect("desktop-shell: bottom bar placed at 0,776")?;
+    capture!("desktop");
+
+    // 3. **The applications modal**, the one piece of chrome with no window of its own: a popup
+    //    over the desktop, which is where the toolkit's list rows are seen at their real size.
+    click_at(&mut qmp, &mut session, 60, 12)?;
+    session.expect("desktop-shell: applications modal open")?;
+    capture!("apps");
+
+    // 4. **Real windows.** Two applications rather than one, because half of what a desktop
+    //    looks like is how two windows sit next to each other — and one of each kind: a
+    //    proportional-font application and the terminal, which is the only grid on the screen.
+    launch_from_modal(&mut qmp, &mut session, "nxfiles")?;
+    // **Escape before aiming at the button again**, the precondition `check-login` states for
+    // the same click: `click_at` retries a press that did not land, and an abandoned attempt
+    // still pressed *somewhere* — if that somewhere was the applications button the modal is
+    // already open, the aimed click opens no second one, and the wait below never ends.
+    press(&mut qmp, "esc")?;
+    session.skip_to_end()?;
+    click_at(&mut qmp, &mut session, 60, 12)?;
+    session.expect("desktop-shell: applications modal open")?;
+    // And drawn, before a keystroke is aimed at it.
+    let _ = settle_and_capture(&mut qmp, &dump)?;
+    launch_from_modal(&mut qmp, &mut session, "nxterm")?;
+    // The shell cascades what it places, so the two land offset rather than stacked.
+    //
+    // **No wait here**: `launch_from_modal` already waited for the shell to place the window,
+    // which is the stronger receipt — and the terminal's own startup lines come *before* that, so
+    // an `expect` for one of them scans past output that was already there.
+    move_pointer_to(&mut qmp, 900, 500)?;
+    capture!("windows");
+
+    // 5. **The overview**, which is the one surface with no other way to be looked at: it is
+    //    opened from the desktop indicator, it covers the screen, and it is where the sidebar's
+    //    desktop miniatures live (M11 Part E batch 10).
+    //    **Pressed by hand rather than through `click_at`**, because the shell logs the open
+    //    while it routes the press and the compositor logs the press when it *delivers* the
+    //    routed record — so the open comes first, and `click_at`'s own position assertion scans
+    //    past it. Nothing is lost: a press that misses simply does not open the overview, and the
+    //    wait below fails.
+    const OVERVIEW_AT: (i32, i32) = (1200, 788);
+    move_pointer_to(&mut qmp, OVERVIEW_AT.0, OVERVIEW_AT.1)?;
+    qmp.send_button("left", true)?;
+    qmp.send_button("left", false)?;
+    session.expect("desktop-shell: overview open, window ")?;
+    qmp.pointer = Some(OVERVIEW_AT);
+    capture!("overview");
+
+    let _ = fs::remove_file(&qmp_sock);
+    println!("\nxtask: shots written to {}", work.display());
+    Ok(())
+}
+
+/// Type a program's name into the open applications modal and launch it.
+///
+/// The modal is a `popup`, so it holds the keyboard — the same property `check-login` relies on.
+fn launch_from_modal(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<()> {
+    for c in program.chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(qmp, &qcode)?;
+    }
+    press(qmp, "ret")?;
+    session.expect(&format!("desktop-shell: launched {program} into its own namespace"))?;
+    session.expect("desktop-shell: applications modal closed")?;
+    // **And wait until its window is on screen**, which is not the same claim and is the one the
+    // next step needs. A launch returns when the *shell* has spawned the program; the program
+    // then starts, creates a window, and the compositor focuses it — after the modal for the
+    // *next* launch has already opened. Typing into that modal put the second program's name
+    // into the first program, and in a file browser Enter means "open the selected row", so the
+    // shot ended up with an editor on `theme.toml` instead of a terminal.
+    session.expect("desktop-shell: placed window ")?;
+    Ok(())
+}
+
+/// Boot the **release** image headless with a QMP socket and the serial on stdio.
+///
+/// Shared by `check-login` and `shot`, which are the two things that boot the image a person
+/// would actually use — every other gate boots `--selftest`. The three that do build this
+/// command themselves and differ from each other in the image mode and the flags; these two are
+/// identical, and two identical copies of a boot are how the second one quietly stops matching.
+fn spawn_release_guest(accel: Accel, gate: &'static str, qmp_sock: &Path) -> R<(Session, Qmp)> {
+    let ovmf = locate_ovmf()?;
+    // Removed rather than reused: a socket left by a killed run is a file `Qmp::connect` will
+    // open and never get an answer from. The *caller* owns the path, because it is also what
+    // gets cleaned up at the end of a gate.
+    let _ = fs::remove_file(qmp_sock);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let session = Session::spawn(cmd, gate)?;
+    let qmp = Qmp::connect(qmp_sock)?;
+    Ok((session, qmp))
+}
+
 /// The repository file the image build stages at `guest_path`.
 ///
 /// **The one place a guest font path becomes a host file**, used by the staging *and* by every
 /// host-side render. That is what makes the gate's central claim true rather than asserted: the
 /// picture drawn here is drawn with the same bytes the guest read off ext4, because both come
-/// from this function and both paths come from `Theme::dark()`. Point the built-in theme at a
+/// from this function and both paths come from `Theme::light()`. Point the built-in theme at a
 /// different face and the image, the previews and the gate all follow it — or, if nothing stages
 /// that face, all three fail together and say so.
 fn font_asset(guest_path: &str) -> R<PathBuf> {
@@ -3766,7 +4114,7 @@ fn font_asset(guest_path: &str) -> R<PathBuf> {
         // **Without saying where the path came from**, because two callers supply it: the
         // built-in theme, for the staging and the reference renders, and `check-terminal`, whose
         // path arrives off the guest's serial line and can therefore be a user's `theme.toml`.
-        // Naming the wrong one would send a reader to `Theme::dark()` for a value that is in a
+        // Naming the wrong one would send a reader to `Theme::light()` for a value that is in a
         // file on the disk (PR #264 review, finding 1).
         format!(
             "{guest_path:?} is not a file directly under {FONT_DIR} — the image build stages \
@@ -3793,10 +4141,10 @@ fn host_font(guest_path: &str) -> R<libdraw::text::Font> {
 /// **The built-in theme rather than the staged file**, and the difference matters: the file
 /// carries a deliberately non-default `font_px` for `check-login` to read back, while the guest
 /// client whose pictures this gate compares — `ui-testclient` — gets no setup record at all and
-/// draws with `Theme::dark()`. Rendering the host's reference from the file would compare two
+/// draws with `Theme::light()`. Rendering the host's reference from the file would compare two
 /// different themes and call the difference a display bug.
 fn host_faces() -> R<(libdraw::text::Font, libdraw::text::Font)> {
-    let t = libdraw::theme::Theme::dark();
+    let t = libdraw::theme::Theme::light();
     Ok((host_font(t.font_ui.as_str())?, host_font(t.font_mono.as_str())?))
 }
 
@@ -3929,13 +4277,13 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // one constant, two call sites — and it is what the system did before this part.
     //
     // These lines pin the guest's half. The host's is pinned by `host_faces`, which takes both
-    // paths from `Theme::dark()`, and by `libdraw`'s own test that the two are different files.
+    // paths from `Theme::light()`, and by `libdraw`'s own test that the two are different files.
     //
     // **First, because `expect` consumes forward.** Both are printed before `ui-testclient`
     // opens a window at all, so asserting them after any line further down the boot scans past
     // them and times out on output that was there — the failure mode PR #258's review named.
     {
-        let t = libdraw::theme::Theme::dark();
+        let t = libdraw::theme::Theme::light();
         session.expect(&format!("ui-testclient: font loaded {}", t.font_ui.as_str()))?;
         session.expect(&format!("ui-testclient: font loaded {}", t.font_mono.as_str()))?;
         println!("  ok: the guest loaded the desktop's face and the terminal's, in that order");
@@ -5654,6 +6002,22 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libcrypto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libtime`'s calendar arithmetic and duration parsing — the same six tests, moved here with
+    // the module when it grew a second consumer (M11 Part E batch 9).
+    //
+    // **Adding a crate to the workspace does not add it to this list**, and that is the whole
+    // lesson: these tests ran as part of `-p coreutils --lib` while `time` was a module of it,
+    // and moving the module out silently stopped running them. Nothing failed — a moved test that
+    // nobody runs passes by not existing (PR #265 review, blocking 1). The century rules in
+    // `civil_from_days` are what was left unguarded, and they now feed a clock on the top bar as
+    // well as `date`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libtime")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
@@ -7964,13 +8328,13 @@ fn assemble_image(
     // not at all — a missing file is the built-in theme, which is what the host tests pin — and
     // a file naming every value is what makes the thing *discoverable*: a person who wants to
     // change a colour opens it and sees which colours there are. It is written from
-    // `Theme::dark()` rather than typed out, so the file and the constants cannot drift.
+    // `Theme::light()` rather than typed out, so the file and the constants cannot drift.
     {
         let mut text = String::from("# The session's theme. Delete this file for the built-in one.\n");
         text.push_str("# Colours are \"#RRGGBB\"; font_px is a size in pixels per em.\n\n");
-        // Written from `Theme::dark()` so the file and the constants cannot drift — except for
+        // Written from `Theme::light()` so the file and the constants cannot drift — except for
         // the one field the gate reads back, which is deliberately not the default.
-        let mut shipped = libdraw::theme::Theme::dark();
+        let mut shipped = libdraw::theme::Theme::light();
         shipped.font_px = f32::from(THEME_FONT_PX);
         text.push_str(&shipped.to_config());
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
@@ -8039,7 +8403,7 @@ fn assemble_image(
     // is larger than every program in the boot image put together. A client resolves the path
     // its theme names and demand-pages the file in.
     //
-    // **Which files, from the theme rather than from a list here** (M11 Part D). `Theme::dark()`
+    // **Which files, from the theme rather than from a list here** (M11 Part D). `Theme::light()`
     // names a proportional face for the desktop and a fixed-advance one for the grid; staging
     // exactly those is what makes "the guest reads the font the host rendered with" a property
     // of the build instead of two lists somebody keeps equal. `font_asset` is the same mapping
@@ -8052,7 +8416,7 @@ fn assemble_image(
     {
         let fonts = staging.join("system").join("fonts");
         fs::create_dir_all(&fonts)?;
-        let theme = libdraw::theme::Theme::dark();
+        let theme = libdraw::theme::Theme::light();
         let mut faces: Vec<PathBuf> =
             vec![font_asset(theme.font_ui.as_str())?, font_asset(theme.font_mono.as_str())?];
         faces.dedup();
@@ -8779,35 +9143,39 @@ mod diag_tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// The terminal's ground is the desktop's ground, and no cell colour is invisible on it.
+    /// The terminal's ground is its own, and no cell colour is invisible on it.
     ///
-    /// **What this used to claim, and why that was unsound.** M11 Part B first asserted that no
-    /// ANSI colour equals a *chrome* colour — an attempt to encode "a theme must not retint what
-    /// programs print" as an inequality. It is the wrong encoding, and the palette this ships
-    /// contains the counterexample: `ansi[0]` and `title_inactive` are both `#1C222A`, because
-    /// both were chosen independently as the darkest tone in one scheme. The test passed only
-    /// because `title_inactive` was the one theme colour missing from its list — scoped around
-    /// its own counterexample (PR #262 review, blocking 1).
+    /// **What this used to claim, and why each version was replaced.** M11 Part B first asserted
+    /// that no ANSI colour equals a *chrome* colour — an attempt to encode "a theme must not
+    /// retint what programs print" as an inequality. It is the wrong encoding, and the palette
+    /// contained the counterexample: `ansi[0]` and `title_inactive` were both `#1C222A`, chosen
+    /// independently as the darkest tone in one scheme. It passed only because `title_inactive`
+    /// was the one theme colour missing from its list (PR #262 review, blocking 1). **Provenance
+    /// is not equality**, and a test comparing values cannot see provenance.
     ///
-    /// **Provenance is not equality.** What matters is that the sixteen are *not derived from*
-    /// the theme, and two independent choices coinciding says nothing about that. That property
-    /// is read in the code — `Palette::default`'s `ansi` is sixteen literals — and a test
-    /// comparing values cannot see it.
+    /// Its replacement asserted that the grid's two defaults *followed* the theme, which was
+    /// structural from Part B until Part E cut the tie. What is asserted now is the decision that
+    /// replaced it, and the evidence for it:
     ///
-    /// So what is asserted here is what a value comparison can actually establish:
-    ///
-    /// - **The two defaults follow the theme**, which is structural since Part B and fails if
-    ///   either is written out as a literal again.
-    /// - **No cell colour is the ground it is drawn on.** A cell painted in a colour equal to
-    ///   the background is text that cannot be read at all — the one legibility property with a
-    ///   sharp edge. (Nearly-equal is a judgement; ANSI black on a dark ground is dim
-    ///   everywhere, which is the convention rather than a bug.)
+    /// - **The grid's ground is not the desktop's**, which fails if somebody re-ties them.
+    /// - **No cell colour is the ground it is drawn on.** A cell painted in the background colour
+    ///   is text that cannot be read at all — the one legibility property with a sharp edge.
+    ///   (Nearly-equal is a judgement; ANSI black on a dark ground is dim everywhere, which is
+    ///   the convention rather than a bug.)
+    /// - **And the reason the tie was cut, as a live check**: the brightest of the sixteen is
+    ///   within a hair of the desktop's white. Following the theme would put invisible text on
+    ///   screen, and avoiding that would mean retuning the sixteen — the one thing the rule above
+    ///   forbids. If somebody ever does retune them for a light ground, this fails and says so,
+    ///   which is the moment to revisit the decision rather than to delete the assertion.
     #[test]
-    fn the_terminals_ground_follows_the_theme_and_no_cell_is_invisible_on_it() {
+    fn the_terminals_ground_is_its_own_and_no_cell_is_invisible_on_it() {
         let theme = libui::paint::Theme::default();
         let palette = libterm::cell::Palette::default();
-        assert_eq!(palette.background, theme.background, "one ground, from one place");
-        assert_eq!(palette.foreground, theme.foreground);
+
+        assert_ne!(
+            palette.background, theme.background,
+            "the grid's ground was re-tied to the desktop's (M11 Part E); see the assertion below"
+        );
 
         for (i, c) in palette.ansi.iter().enumerate() {
             assert_ne!(
@@ -8815,5 +9183,22 @@ mod diag_tests {
                 "ANSI colour {i} is the terminal's own background — text in it is invisible"
             );
         }
+
+        let gap = |a: libdraw::format::Rgb, b: libdraw::format::Rgb| {
+            (a.r.abs_diff(b.r)).max(a.g.abs_diff(b.g)).max(a.b.abs_diff(b.b))
+        };
+        let brightest = palette
+            .ansi
+            .iter()
+            .copied()
+            .max_by_key(|c| u32::from(c.r) + u32::from(c.g) + u32::from(c.b))
+            .expect("sixteen colours");
+        assert!(
+            gap(brightest, theme.background) <= 32,
+            "the brightest ANSI colour is {brightest:?}, no longer close to the desktop's ground \
+             {:?} — the sixteen may have been retuned for a light ground, which is the trigger \
+             for revisiting whether the grid should follow the theme after all",
+            theme.background
+        );
     }
 }

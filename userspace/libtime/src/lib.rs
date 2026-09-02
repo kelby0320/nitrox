@@ -1,3 +1,5 @@
+#![no_std]
+
 //! Calendar arithmetic and duration parsing — the pure half of `date` and `sleep`.
 //!
 //! Both utilities are mostly *not* about syscalls: `date` reads one clock and then does
@@ -10,6 +12,8 @@
 //! the leap rules rather than a chain of special cases — the century rules that make 1900
 //! and 2100 common years while 2000 is a leap year fall out of the era arithmetic instead
 //! of being written down and then got wrong.
+
+extern crate alloc;
 
 use alloc::string::String;
 

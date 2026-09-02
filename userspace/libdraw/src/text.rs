@@ -302,7 +302,7 @@ pub unsafe fn load_ui(
     who: &[u8],
 ) -> Result<(Font, FontPath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { load_themed(root_ns, theme.font_ui, crate::theme::Theme::dark().font_ui, who) }
+    unsafe { load_themed(root_ns, theme.font_ui, crate::theme::Theme::light().font_ui, who) }
 }
 
 /// Load the fixed-advance face a theme names, falling back to the built-in one.
@@ -319,7 +319,7 @@ pub unsafe fn load_mono(
     who: &[u8],
 ) -> Result<(Font, FontPath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::dark().font_mono, who) }
+    unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::light().font_mono, who) }
 }
 
 /// `wanted`, or `builtin` if `wanted` will not load — the rule written once for both roles, with

@@ -25,7 +25,12 @@ use libdraw::geom::Size;
 // they all share; `libui::paint::Theme` names the same type for the painting half.
 pub use libdraw::theme::Theme;
 
-use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, text};
+use librsproto::surface::PointerEvent;
+
+use crate::element::{
+    Edge, Element, IconKind, Insets, bevel, column, dock, docked, fill, icon, padding, row, sized,
+    stack, text,
+};
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
 // thing that can disagree about a key. The same argument the `libinput` dependency is
@@ -87,6 +92,113 @@ pub fn button<Msg>(
     layers.push(padding(BUTTON_PAD, text(label)));
     stack(layers).on_press(msg).focusable()
 }
+
+/// A popup's backing: a one-pixel border, and the face inside it.
+///
+/// **Because a popup is the one surface with nothing behind it to define its edge.** A window has
+/// a frame and a bar has the screen's edge; a menu is a rectangle floating over whatever it
+/// covers, and without a line around it the light face bleeds into a light window underneath. The
+/// reference desktop draws exactly this, and it is the only reason `border` is a theme colour.
+///
+/// One helper, so the applications modal and a menu cannot disagree about what a popup looks
+/// like — they are the same kind of thing seen twice.
+pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    stack(alloc::vec![
+        fill(theme.border),
+        padding(Insets::all(POPUP_BORDER), fill(theme.face)),
+        padding(Insets::all(POPUP_BORDER), content),
+    ])
+}
+
+/// How thick a popup's border is.
+const POPUP_BORDER: u32 = 1;
+
+/// A window's own frame: an edge, and a margin between its content and that edge.
+///
+/// **The title bar is flush and the content is not**, which is what the reference desktop does
+/// and is not arbitrary: a title bar is the window's edge — it is what you grab to move it — and
+/// insetting it would put a strip of frame above a bar that already reads as one. The content
+/// below is what wants breathing room.
+///
+/// Takes the title and the rest separately rather than wrapping a finished tree, because those
+/// two are exactly the parts that are treated differently. An application that wants no frame
+/// simply does not call this; the greeter does not, having no title bar to be flush with.
+pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    // **Both children wrapped, and the zero-inset one is not decoration.** The diff requires a
+    // container's children to be all keyed or all unkeyed, and every caller keys its title bar —
+    // so docking the title directly beside an unkeyed content pane is a `MixedKeying` error at
+    // the first frame. Wrapping both puts the keys one level down, inside their own parents,
+    // where they still do their job; the alternative was for this helper to invent a key in the
+    // application's own namespace.
+    let inner = dock(
+        alloc::vec![docked(Edge::Top, padding(Insets::all(0), title))],
+        padding(
+            Insets { top: 0, right: WINDOW_FRAME, bottom: WINDOW_FRAME, left: WINDOW_FRAME },
+            content,
+        ),
+    );
+    stack(alloc::vec![
+        fill(theme.border),
+        padding(Insets::all(WINDOW_BORDER), fill(theme.face)),
+        padding(Insets::all(WINDOW_BORDER), inner),
+    ])
+}
+
+/// How thick the line around a window is.
+pub const WINDOW_BORDER: u32 = 1;
+
+/// How much frame shows between a window's content and its edge.
+pub const WINDOW_FRAME: u32 = 3;
+
+/// What [`window_frame`] takes off a window's width before its content sees it.
+///
+/// **Published because applications compute their own content size**, and they have to compute
+/// the same one this draws — a widget built for one height and laid out at another is the bug
+/// each of their `*_h()` methods already carries a comment about. Three constants rather than
+/// three open-coded sums.
+pub const WINDOW_FRAME_W: u32 = 2 * (WINDOW_BORDER + WINDOW_FRAME);
+
+/// What it takes off the height, *in addition* to the title bar: the top border, and the frame
+/// and border below the content.
+pub const WINDOW_FRAME_H: u32 = WINDOW_BORDER * 2 + WINDOW_FRAME;
+
+/// Where a framed window's content starts, horizontally.
+pub const WINDOW_CONTENT_X: u32 = WINDOW_BORDER + WINDOW_FRAME;
+
+/// Where it starts vertically — this, plus [`TITLE_BAR_H`].
+pub const WINDOW_CONTENT_Y: u32 = WINDOW_BORDER;
+
+/// One row of a dropdown menu: a label that highlights under the pointer.
+///
+/// **The same treatment a selected list row gets** — the selection colour bevelled inside a
+/// one-pixel border in the focus blue — because they are the same thing seen twice: the item
+/// that would happen if you acted now. The reference desktop draws them identically.
+///
+/// **Hover is state the caller passes in**, as it is for every widget here. What is new is that
+/// somebody finally passes it: `Router::inside` has reported the widget under the cursor since
+/// M4 and `WidgetState::hovered` has existed just as long, and until M11 Part E batch 3 no
+/// application ever connected the two — so nothing in this system had ever reacted to the
+/// pointer moving over it.
+pub fn menu_item<Msg: Clone>(
+    label: &str,
+    msg: Msg,
+    hovered: bool,
+    theme: &Theme,
+) -> Element<Msg> {
+    let mut layers = alloc::vec::Vec::with_capacity(3);
+    if hovered {
+        layers.push(fill(theme.focus_ring));
+        layers.push(padding(Insets::all(1), bevel(theme.selection)));
+    }
+    layers.push(padding(MENU_ITEM_PAD, text(label)));
+    stack(layers).on_press(msg)
+}
+
+/// The space around a menu item's label.
+///
+/// Wider than a button's, because a menu is a column of text rather than a control: the reading
+/// is horizontal and the eye needs the gutter.
+const MENU_ITEM_PAD: Insets = Insets { top: 3, right: 10, bottom: 3, left: 10 };
 
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;
@@ -195,7 +307,7 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
             fill(theme.track),
             column(alloc::vec![
                 sized(Size::new(0, pos), fill(theme.track)),
-                sized(Size::new(0, len), fill(theme.thumb)),
+                sized(Size::new(0, len), bevel(theme.thumb)),
                 // The remainder, so the thumb does not stretch to the bottom.
                 fill(theme.track).flex(1),
             ]),
@@ -256,10 +368,13 @@ pub fn title_bar<Msg: Clone>(
     theme: &Theme,
 ) -> Element<Msg> {
     let face = if focused { theme.title_active } else { theme.title_inactive };
-    let btn = |label: &str, msg: Msg| {
+    // **A glyph, not a letter** (M11 Part E, batch 2). These were `_`, `[]` and `X` — three
+    // characters standing in for three controls, which read as text on a bar full of text. They
+    // are drawn now, and the button keeps its size, so nothing a gate clicks has moved.
+    let btn = |glyph: IconKind, msg: Msg| {
         sized(
             Size::new(TITLE_BUTTON_W, TITLE_BAR_H),
-            stack(alloc::vec![padding(BUTTON_PAD, text(label))]).on_press(msg),
+            stack(alloc::vec![icon(glyph)]).on_press(msg),
         )
     };
     // **A button a caller has no message for is not drawn.** The alternative is a button that
@@ -269,13 +384,13 @@ pub fn title_bar<Msg: Clone>(
     let mut controls = alloc::vec::Vec::with_capacity(4);
     controls.push(padding(TITLE_PAD, text(title)).flex(1));
     if let Some(m) = buttons.minimise {
-        controls.push(btn("_", m));
+        controls.push(btn(IconKind::Minimise, m));
     }
     if let Some(m) = buttons.maximise {
-        controls.push(btn("[]", m));
+        controls.push(btn(IconKind::Maximise, m));
     }
     if let Some(m) = buttons.close {
-        controls.push(btn("X", m));
+        controls.push(btn(IconKind::Close, m));
     }
     // **The drag is on the bar itself, not on the face underneath the label.** Dispatch walks
     // *up* from whatever was hit to the nearest handler, and the label spans the bar — so a
@@ -1246,6 +1361,24 @@ impl ListState {
 /// How much space a row's label gets around it.
 const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 
+impl ListState {
+    /// Move the offset to where a drag on the scrollbar's track points.
+    ///
+    /// **The conversion belongs here, not in each caller**, because the widget already knows the
+    /// arithmetic and the caller only knows the numbers it passed in. `nxterm` does the same
+    /// conversion with the same [`ScrollState::offset_at`], from a grid's coordinates — this is
+    /// that for a list, so the two cannot drift apart on rounding.
+    ///
+    /// Takes the same `height`, `row_height` and row count [`list_view`] was given: a drag
+    /// converted against a different geometry from the one drawn puts the thumb where the pointer
+    /// is not (M11 Part E batch 6).
+    pub fn drag_to(&mut self, height: u32, row_height: u32, total: usize, y: i32) {
+        let visible = if row_height == 0 { 0 } else { height / row_height };
+        let bar = ScrollState { offset: self.offset as u32, visible, total: total as u32 };
+        self.offset = bar.offset_at(height, y) as usize;
+    }
+}
+
 /// A scrolling list of rows, with one selected.
 ///
 /// **The one model-backed widget** `desktop-shell.md` §5 settles on — "an explicit toolkit
@@ -1291,6 +1424,8 @@ pub fn list_view<Msg>(
     row_height: u32,
     activate: fn(u64) -> Msg,
     grab: Option<fn(u64) -> Msg>,
+    scroll: Option<fn(PointerEvent) -> Msg>,
+    hovered: Option<u64>,
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -1317,8 +1452,28 @@ pub fn list_view<Msg>(
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
         let selected = state.selected == Some(i);
-        let face = if selected { theme.face_hover } else { theme.track };
-        let row_el = stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))]);
+        // **A selection is blue with a darker edge**, not a lighter grey (M11 Part E, batch 2).
+        // The reference draws a one-pixel border in the same blue the focus ring uses and fills
+        // the inside with a gradient, and that border is what separates a selected row from the
+        // row above it — without it two adjacent selections would merge into one block.
+        //
+        // **Hover is quieter than selection and loses to it** (batch 3) — *unless nothing is
+        // selected*, in which case it is the answer and gets the blue (batch 5). The rule is
+        // still "one primary highlight": two of equal weight is two answers to "what happens if
+        // I act now", and where there is no keyboard selection to compete with, the pointer's is
+        // not competing. The applications modal is exactly that list — it keeps no selection at
+        // all, so every hover landed on the quiet branch and the menu highlighted in grey.
+        let primary = selected || (hovered == Some(r.key) && state.selected.is_none());
+        let row_el = if primary {
+            stack(alloc::vec![
+                fill(theme.focus_ring),
+                padding(Insets::all(1), bevel(theme.selection)),
+                padding(ROW_PAD, text(r.label)),
+            ])
+        } else {
+            let ground = if hovered == Some(r.key) { theme.face_hover } else { theme.track };
+            stack(alloc::vec![fill(ground), padding(ROW_PAD, text(r.label))])
+        };
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
         // **A press *down* on a row, for the caller that needs the gesture rather than the
@@ -1343,10 +1498,16 @@ pub fn list_view<Msg>(
             visible: visible as u32,
             total: rows.len() as u32,
         };
-        row(alloc::vec![
-            list.flex(1),
-            scrollbar(bar, SCROLLBAR_W, height, theme),
-        ])
+        // **The bar takes the pointer when the caller has somewhere to send it** (M11 Part E
+        // batch 6). It was built without a handler, so a list's scrollbar showed a position and
+        // could not be dragged — a control that looks live and is not, which is the defect this
+        // toolkit's own notes keep naming. `nxterm` builds its scrollbar directly and has always
+        // wired this; a list's was simply never offered.
+        let mut bar_el = scrollbar(bar, SCROLLBAR_W, height, theme);
+        if let Some(f) = scroll {
+            bar_el = bar_el.on_pointer(f);
+        }
+        row(alloc::vec![list.flex(1), bar_el])
     } else {
         list
     };
@@ -1372,7 +1533,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -1382,7 +1543,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -1392,9 +1553,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -1406,11 +1567,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState { selected: Some(19), offset: 0 };
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -1421,7 +1582,7 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_faces(&e).iter().any(|f| *f == Theme::default().face_hover),
+            row_bevels(&e).iter().any(|f| *f == Some(Theme::default().selection)),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -1434,7 +1595,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState { selected: Some(3), offset: 2 };
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, &Theme::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -1488,17 +1649,169 @@ mod list_view_tests {
         assert_eq!(s.selected, Some(2));
     }
 
+    #[test]
+    fn a_menu_item_highlights_under_the_pointer_and_is_flat_otherwise() {
+        let p = Theme::default();
+        let hot: Element<u8> = menu_item("Clear", 1, true, &p);
+        let cold: Element<u8> = menu_item("Clear", 1, false, &p);
+
+        let fills = |e: &Element<u8>| {
+            let mut out = alloc::vec::Vec::new();
+            walk(e, &mut |n| {
+                if let Node::Fill(c) = &n.node {
+                    out.push(*c);
+                }
+            });
+            out
+        };
+        let bevels = |e: &Element<u8>| {
+            let mut out = alloc::vec::Vec::new();
+            walk(e, &mut |n| {
+                if let Node::Bevel(c) = &n.node {
+                    out.push(*c);
+                }
+            });
+            out
+        };
+
+        // The same two layers a selected list row gets: a border in the focus blue, and the
+        // selection colour bevelled inside it.
+        assert_eq!(fills(&hot), alloc::vec![p.focus_ring], "no border on the hovered item");
+        assert_eq!(bevels(&hot), alloc::vec![p.selection], "no selection fill on the hovered item");
+
+        // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
+        // an item that paints a face when it is not hovered is a menu with every row lit.
+        assert!(fills(&cold).is_empty() && bevels(&cold).is_empty(), "an idle item drew a face");
+    }
+
+    #[test]
+    fn the_scrollbar_takes_the_pointer_only_when_the_caller_offered_somewhere_to_send_it() {
+        // **The missing half was the handler, not the arithmetic.** `ScrollState::offset_at` has
+        // been right since M5 and `nxterm` has always dragged with it; a *list's* bar was built
+        // without an `on_pointer` at all, so the events never left the router. This asserts the
+        // wiring, and the `None` case is the control — without it the test would pass for a
+        // widget that attached a handler unconditionally, which is a different bug.
+        let p = Theme::default();
+        let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
+        let handlers = |e: &Element<u64>| {
+            let mut n = 0;
+            walk(e, &mut |c| {
+                if c.on_pointer.is_some() {
+                    n += 1;
+                }
+            });
+            n
+        };
+        let with: Element<u64> = list_view(
+            &rows(&many),
+            &mut ListState::default(),
+            100,
+            20,
+            |k| k,
+            None,
+            Some(|_| 0),
+            None,
+            &p,
+        );
+        assert_eq!(handlers(&with), 1, "the scrollbar took no pointer handler");
+        let without: Element<u64> =
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+        assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
+    }
+
+    #[test]
+    fn a_drag_on_the_track_moves_the_offset_and_a_release_does_not() {
+        // **The scrollbar was decoration.** `list_view` built one and gave it no pointer handler,
+        // so a list showed its position and could not be dragged — a control that looks live and
+        // is not, which is the defect this crate's own notes keep naming. `nxterm` builds its
+        // scrollbar directly and has always wired this (M11 Part E batch 6).
+        let mut st = ListState::default();
+        // Twenty rows of 20px in a 100px viewport: five visible, fifteen of travel.
+        st.drag_to(100, 20, 20, 100);
+        assert!(st.offset > 0, "a drag to the bottom of the track moved nothing");
+        let bottom = st.offset;
+        st.drag_to(100, 20, 20, 0);
+        assert_eq!(st.offset, 0, "a drag to the top did not come back");
+        assert!(bottom <= 15, "the offset ran past the last full screen of rows");
+
+        // A list that fits has nowhere to go, and must not be moved by a drag on a track that is
+        // not drawn — the case `offset_at` returns zero for.
+        let mut st = ListState::default();
+        st.drag_to(100, 20, 3, 100);
+        assert_eq!(st.offset, 0, "a list shorter than its viewport scrolled");
+    }
+
+    #[test]
+    fn with_nothing_selected_the_hovered_row_is_the_highlight() {
+        // **The applications modal is this list**, and it keeps no selection at all — Enter takes
+        // the first filtered entry — so before batch 5 every hover landed on the quiet branch and
+        // a menu that is nothing *but* hover highlighted in grey. One primary highlight is the
+        // rule; where there is no selection to compete with, the pointer's is not competing.
+        let p = Theme::default();
+        let data = [(1u64, "a"), (2, "b")];
+        let e: Element<u64> =
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), &p);
+        assert_eq!(row_faces(&e)[1], p.focus_ring, "the hovered row has no border");
+        assert_eq!(row_bevels(&e)[1], Some(p.selection), "the hovered row is not the blue");
+        assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
+    }
+
+    #[test]
+    fn a_hovered_row_is_quieter_than_a_selected_one_and_loses_to_it() {
+        let p = Theme::default();
+        let data = [(1u64, "a"), (2, "b")];
+        // Row 1 selected, row 0 hovered: two different highlights, and they must not be the
+        // same weight — two answers to "what happens if I act now" is one too many.
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &mut ListState { selected: Some(1), offset: 0 },
+            100,
+            20,
+            |k| k,
+            None,
+            None,
+            Some(1),
+            &p,
+        );
+        let faces = row_faces(&e);
+        assert_eq!(faces[0], p.face_hover, "the hovered row did not react");
+        assert_eq!(faces[1], p.focus_ring, "the selected row lost its border");
+        assert_eq!(row_bevels(&e)[1], Some(p.selection), "the selected row lost its fill");
+
+        // And hovering the *selected* row leaves it selected rather than downgrading it.
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &mut ListState { selected: Some(1), offset: 0 },
+            100,
+            20,
+            |k| k,
+            None,
+            None,
+            Some(2),
+            &p,
+        );
+        assert_eq!(row_faces(&e)[1], p.focus_ring, "selection lost to hover");
+    }
+
     /// The selected row paints differently, or selection is invisible.
     #[test]
     fn the_selected_row_is_painted_differently() {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, &p);
+            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
-        assert_eq!(faces[1], p.face_hover, "the selected row is not the selected colour");
+        // **Two layers, and both are the claim** (M11 Part E, batch 2): a one-pixel border in
+        // the focus blue, and the selection colour bevelled inside it. Asserting only the fill
+        // would pass for a selection with no edge, which is the thing that makes two adjacent
+        // selected rows read as one block.
+        assert_eq!(faces[1], p.focus_ring, "the selected row has no border");
+        assert_eq!(faces[0], p.track, "an unselected row is the list's own ground");
+        let bevels = row_bevels(&e);
+        assert_eq!(bevels[1], Some(p.selection), "the selected row is not the selection colour");
+        assert_eq!(bevels[0], None, "an unselected row is a flat fill, not a gradient");
     }
 
     /// A scrollbar that is always there wastes width; one that never appears strands rows.
@@ -1507,11 +1820,11 @@ mod list_view_tests {
         let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, &p);
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -1520,7 +1833,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -1529,7 +1842,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 
@@ -1556,6 +1869,27 @@ mod list_view_tests {
             if let Some(m) = n.on_press {
                 out.push(m);
             }
+        });
+        out
+    }
+
+    /// The bevelled fill each row carries, if any — the visible face of a selected row since
+    /// M11 Part E, where `row_faces` now reports the one-pixel border drawn behind it.
+    fn row_bevels<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<Rgb>> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if n.key.is_none() {
+                return;
+            }
+            let mut found = None;
+            walk(n, &mut |c| {
+                if found.is_none()
+                    && let Node::Bevel(rgb) = &c.node
+                {
+                    found = Some(*rgb);
+                }
+            });
+            out.push(found);
         });
         out
     }

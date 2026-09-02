@@ -165,6 +165,11 @@ impl Role {
         !matches!(self, Role::Panel { .. })
     }
 
+    /// Whether this is a popup — a window a press elsewhere dismisses.
+    pub const fn is_popup(&self) -> bool {
+        matches!(self, Role::Popup { .. })
+    }
+
     /// The edge and size this role reserves, if any.
     pub const fn strut(&self) -> Option<(Edge, u32)> {
         match self {
@@ -369,10 +374,18 @@ impl CreateWindowRequest {
         Self { width, height, role, offset_x: 0, offset_y: 0 }
     }
 
-    /// A popup at `(x, y)` from its parent's origin.
+    /// A window at `(x, y)` — from its parent's origin for a popup, from the screen's otherwise.
     ///
-    /// The offset is ignored — written and read as zero — for every other role, `dialog`
-    /// included, so this says what it means rather than being the general constructor.
+    /// **What it means depends on the role, and that is the point.** A popup's offset is where it
+    /// hangs from the item that opened it, and only its creator knows that. A `normal` or
+    /// `dialog` window's is a **preference**: the compositor holds such a window's first
+    /// configure until a manager places it, so with a manager attached this is never seen, and
+    /// without one it is the only answer there is (M11 Part E batch 8). A `panel` ignores it —
+    /// its role already says which edge it docks to.
+    ///
+    /// Before that batch every role but `popup` landed at the origin, which meant a client that
+    /// runs *before* the window manager — the login greeter, which exists so that the manager can
+    /// be started — could only ever appear in the corner.
     pub const fn at(width: u32, height: u32, role: Role, x: i32, y: i32) -> Self {
         Self { width, height, role, offset_x: x, offset_y: y }
     }
@@ -395,12 +408,16 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     };
     put_u16(out, 10, aux16);
     put_u32(out, 12, aux32);
-    // Zero for every role but `popup` — `dialog` included, which has a parent but is placed by
-    // a manager — for the same reason the aux words are zeroed: two identical requests must
-    // produce identical bytes.
+    // **Zero for a `panel` only**, since M11 Part E batch 8. A panel's role already says which
+    // edge it docks to, so an offset would be a second answer to that question — and the aux
+    // words are zeroed for the same reason: two identical requests must produce identical bytes.
+    //
+    // The others carry it. For a popup it is where the menu hangs from the item that opened it;
+    // for a `normal` or `dialog` it is a *preference*, which a manager overrides and which is the
+    // only answer there is when nothing is managing — the case the login greeter lives in.
     let (ox, oy) = match req.role {
-        Role::Popup { .. } => (req.offset_x, req.offset_y),
-        Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => (0, 0),
+        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (req.offset_x, req.offset_y),
+        Role::Panel { .. } => (0, 0),
     };
     put_u32(out, 16, ox as u32);
     put_u32(out, 20, oy as u32);
@@ -429,12 +446,14 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
         ROLE_DIALOG => Role::Dialog { parent: aux32 },
         _ => return None,
     };
-    // **Only a `popup`.** Having a parent is not the test: a `dialog` has one and is still placed
-    // by a manager, so reading these words for it would invent an offset the client is not
-    // entitled to send — and the spec says they are read as zero, not merely written as zero.
+    // **Read for every role but `panel`**, matching what the writer sends. Reading a word the
+    // writer zeroes is harmless; *not* reading one it sends is a request silently discarded,
+    // which is what a centred greeter ran into.
     let (offset_x, offset_y) = match role {
-        Role::Popup { .. } => (get_u32(body, 16) as i32, get_u32(body, 20) as i32),
-        Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => (0, 0),
+        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => {
+            (get_u32(body, 16) as i32, get_u32(body, 20) as i32)
+        }
+        Role::Panel { .. } => (0, 0),
     };
     Some(CreateWindowRequest { width, height, role, offset_x, offset_y })
 }
@@ -1184,6 +1203,39 @@ pub const OP_START_DRAG: u16 = 0x090F;
 /// range that means something else.
 pub const OP_DROPPED: u16 = 0x0930;
 
+/// `Surface::Dismissed` — **server → client. Unsolicited, `request_id` 0, no reply.**
+///
+/// Body, 4 bytes: `window` (u32). A press landed somewhere that is not this popup, so whatever it
+/// was offering is no longer what the person is doing. **A request, like
+/// [`CloseRequested`](OP_CLOSE_REQUESTED), and refusable the same way**: the client destroys the
+/// window, and one that ignores this simply stays open.
+///
+/// **Its own op rather than a second meaning for an existing one.** `CloseRequested` says
+/// somebody asked this window to close; this says the pointer went elsewhere. Two things a client
+/// reads as "close" in one match arm is the mistake `Dropped`/`InputLost` had to be renamed out
+/// of — and the difference is real, because a client may well answer them differently: an editor
+/// asks "save first?" when *closed* and a menu just goes away when dismissed.
+///
+/// **Why the compositor has to say it at all.** A popup's owner never sees a press aimed at
+/// another window, so "click outside to dismiss" is not something a client can implement. Focus
+/// almost covers it and does not: focus here is a consequence of stacking, so clicking a *window*
+/// raises it and the popup hears about it — but clicking the desktop or a panel raises nothing,
+/// changes no focus, and left every popup in the system open (M11 Part E batch 5).
+///
+/// **Sent for a press anywhere that is not the popup itself — its parent included.** A first
+/// version exempted the parent, meaning to protect the button that opened a menu from racing a
+/// dismissal, and that was wrong twice: a popup's parent is the whole *bar* rather than the
+/// button, so clicking the bar left the menu up — and dismissing is precisely what makes clicking
+/// that button a second time close the thing it opened. The press that *opens* a popup cannot
+/// dismiss it: the popup does not exist when that press is routed.
+///
+/// **Only the topmost popup is told.** With two up at once — a menu, and a rename prompt opened
+/// by a manager hotkey that reaches the shell whatever holds focus — a press outside both
+/// dismisses the upper one, and the next press dismisses the other. Self-healing rather than
+/// stuck, and the alternative is a client hearing about a press that landed on a popup covering
+/// it, which is not "outside" from where that client sits.
+pub const OP_DISMISSED: u16 = 0x0931;
+
 /// A drop payload that is one file.
 pub const DROP_KIND_FILE: u32 = 1 << 0;
 /// A drop payload that is one directory.
@@ -1446,7 +1498,7 @@ impl MgrDesktop {
     }
 }
 
-/// One window, by id — [`CloseRequested`](OP_CLOSE_REQUESTED).
+/// One window, by id — [`CloseRequested`](OP_CLOSE_REQUESTED) and [`Dismissed`](OP_DISMISSED).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct WindowRef {
@@ -2212,35 +2264,42 @@ mod tests {
 
     /// **Only a `popup` carries an offset.** Every other role, `dialog` included, sends zero.
     ///
-    /// A `dialog` names a parent, but the parent carries its desktop membership and its
-    /// lifetime — not its position. It is an ordinary listed window and a manager places it, so
-    /// a client-supplied offset would be redundant with what `MgrWindowCreated` already tells
-    /// the manager, and would compete with the placement the manager chose. Nothing asserted
-    /// this either way before, so the encoder could have started carrying it and no test would
-    /// have noticed.
+    /// **Only a `panel` discards it, since M11 Part E batch 8.** A panel's role already says which
+    /// edge it docks to, so an offset would be a second answer to that question. A `normal` or
+    /// `dialog` window's offset is a *preference* the compositor honours until a manager
+    /// overrides it — which was previously discarded on the wire, so a client that runs before
+    /// any manager exists could only ever appear at the origin.
     #[test]
-    fn only_a_popup_carries_an_offset_on_the_wire() {
-        for role in [
-            Role::Normal,
-            Role::Panel { dock: Edge::Top, reserve: 4 },
-            Role::Dialog { parent: 9 },
-        ] {
-            let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
-            build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, 88))
-                .expect("encodes");
-            assert_eq!(&buf[16..24], &[0u8; 8], "{role:?} must not put an offset on the wire");
+    fn a_panel_discards_an_offset_and_the_other_roles_carry_it() {
+        let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
+        let panel = Role::Panel { dock: Edge::Top, reserve: 4 };
+        build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, panel, 77, 88))
+            .expect("encodes");
+        assert_eq!(&buf[16..24], &[0u8; 8], "a panel put an offset on the wire");
 
-            // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
-            // zeroed asserts nothing: it holds for a parser that reads those words too, because
-            // there is nothing in them to read. The reader is a separate arm and needs a body
-            // that would betray it (PR #220 review, finding 1).
-            put_u32(&mut buf, 16, 77);
-            put_u32(&mut buf, 20, 88);
+        // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
+        // zeroed asserts nothing: it holds for a parser that reads those words too, because
+        // there is nothing in them to read. The reader is a separate arm and needs a body
+        // that would betray it (PR #220 review, finding 1).
+        put_u32(&mut buf, 16, 77);
+        put_u32(&mut buf, 20, 88);
+        let back = parse_create_window_request(&buf).expect("parses");
+        assert_eq!(
+            (back.offset_x, back.offset_y),
+            (0, 0),
+            "a panel took an offset that was on the wire"
+        );
+
+        // And the roles that carry one, round-tripped.
+        for role in [Role::Normal, Role::Dialog { parent: 9 }] {
+            let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
+            build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, -88))
+                .expect("encodes");
             let back = parse_create_window_request(&buf).expect("parses");
             assert_eq!(
                 (back.offset_x, back.offset_y),
-                (0, 0),
-                "{role:?} must discard an offset even when one is on the wire"
+                (77, -88),
+                "{role:?} lost the origin it asked for"
             );
         }
 

@@ -46,7 +46,7 @@
 //!
 //! **Two faces since M11 Part D**, and which window gets which is part of what the gate checks:
 //! this window is the desktop's proportional font, the terminal's below is the fixed-advance
-//! one, and both paths come from `Theme::dark()` — the same place the host takes them from.
+//! one, and both paths come from `Theme::light()` — the same place the host takes them from.
 //!
 //! **A connection per window, though neither thing that forced it is true any more.** Input
 //! records carry a window id (C3 part 1) and `Session` holds several windows on one connection
@@ -399,7 +399,7 @@ fn churn(root_ns: u64) -> bool {
 /// resolve" means the staging broke. Carrying on would leave a green boot with no text on screen.
 ///
 /// The theme is the built-in one. Nothing hands this client a setup record — `service-mgr`
-/// starts it — so the paths it loads are `Theme::dark()`'s, which is what makes them the same
+/// starts it — so the paths it loads are `Theme::light()`'s, which is what makes them the same
 /// two files `xtask` renders the host's reference with.
 fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
     use libdraw::theme::Theme;

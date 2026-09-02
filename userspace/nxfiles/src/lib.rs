@@ -27,15 +27,15 @@ use alloc::vec::Vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{
     Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
 };
 use libui::widget::{
-    GRIP_W, ListRow, ListState, Theme as UiTheme, TITLE_BAR_H, TitleButtons, WidgetState,
-    button, list_view, resize_grip, title_bar,
+    GRIP_W, ListRow, ListState, Theme as UiTheme, TITLE_BAR_H, TitleButtons, WINDOW_FRAME_H,
+    WidgetState, button, list_view, resize_grip, title_bar, window_frame,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -200,6 +200,8 @@ pub enum Msg {
     Grab(u64),
     /// The "up" control was pressed.
     Up,
+    /// The scrollbar is being dragged — see [`ListState::drag_to`].
+    Scroll(PointerEvent),
     /// A key reached the window.
     Key(KeyEvent),
     /// The title bar was dragged.
@@ -321,6 +323,15 @@ impl App {
                 // Resolved here, while the listing this index came from is still the listing.
                 self.pressed =
                     self.entries.get(i as usize).map(|e| (e.name.clone(), 0, 0));
+            }
+            // **The drag converts through the widget's own arithmetic** — `ListState::drag_to`,
+            // the same `ScrollState::offset_at` `nxterm` uses for its grid — so a list and a
+            // terminal cannot disagree about where a thumb points (M11 Part E batch 6).
+            Msg::Scroll(p) => {
+                if p.buttons != 0 {
+                    let (h, total) = (self.list_h(), self.entries.len());
+                    self.list.drag_to(h, ROW_H, total, p.y);
+                }
             }
             Msg::Up => {
                 let up = parent(&self.path);
@@ -475,7 +486,11 @@ impl App {
     /// is the topmost layer and takes any press under it, so a row there would be a row that
     /// cannot be clicked.
     pub fn list_h(&self) -> u32 {
-        self.window.h.saturating_sub(TITLE_BAR_H + PATH_H + GRIP_W)
+        // **`WINDOW_FRAME_H` too, since M11 Part E batch 2b.** `window_frame` insets the content
+        // below the title bar, so a list built for the old height would be laid out three pixels
+        // shorter — one row of arithmetic off, which this method's own reason for existing is to
+        // prevent.
+        self.window.h.saturating_sub(TITLE_BAR_H + PATH_H + GRIP_W + WINDOW_FRAME_H)
     }
 
     /// The element tree for the current state.
@@ -492,7 +507,7 @@ impl App {
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
-    pub fn view(&mut self, ui: &UiTheme) -> Element<Msg> {
+    pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let title = title_bar(
             TITLE,
@@ -519,7 +534,13 @@ impl App {
 
         // The path strip: where you are, and the one control that leaves it.
         let strip = row(alloc::vec![
-            button("^", Msg::Up, WidgetState::default(), &ui).key(UP_KEY),
+            button(
+                "^",
+                Msg::Up,
+                WidgetState { hovered: hovered == Some(UP_KEY), ..Default::default() },
+                &ui,
+            )
+            .key(UP_KEY),
             padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.path.clone()))
                 .key(PATH_KEY),
             padding(
@@ -539,20 +560,30 @@ impl App {
         // lands on a row; by the time it comes up the gesture is over. The two do not fight —
         // a press that never moves produces a click and opens what was pressed, and one that
         // moves has already told the compositor it is carrying something.
-        let list =
-            list_view(&rows, &mut self.list, h, ROW_H, Msg::Activate, Some(Msg::Grab), &ui);
+        let list = list_view(
+            &rows,
+            &mut self.list,
+            h,
+            ROW_H,
+            Msg::Activate,
+            Some(Msg::Grab),
+            Some(Msg::Scroll),
+            hovered,
+            &ui,
+        );
 
-        let body = dock(
-            alloc::vec![
-                docked(Edge::Top, title),
-                docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
-            ],
+        let body = window_frame(
+            title,
+            dock(
+                alloc::vec![docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY))],
             // **Sized to the height it was built for.** `list_view` does not size itself, and
             // the dock's flex child otherwise gets everything left over — so the widget would
             // build rows for one height and be drawn at another, leaving `visible` off by one
             // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
             // wrapper as the reliable way to keep the two in step.
-            sized(Size::new(0, h), list).key(LIST_KEY),
+                sized(Size::new(0, h), list).key(LIST_KEY),
+            ),
+            &ui,
         );
 
         // The grip over the bottom-right corner, as `nxterm` places its own.
@@ -657,7 +688,7 @@ mod tests {
         let cell = FixedCell { w: 8, h: 16 };
         let mut tree = Tree::new();
         for frame in 0..3 {
-            let e = a.view(&UiTheme::default());
+            let e = a.view(&UiTheme::default(), None);
             let l = layout(&e, bounds(a.window_size()), &cell);
             tree.update(&e, &l).unwrap_or_else(|err| panic!("frame {frame}: {err:?}"));
         }
@@ -694,13 +725,13 @@ mod tests {
         for _ in 0..19 {
             down(&mut a);
         }
-        let _ = a.view(&UiTheme::default());
+        let _ = a.view(&UiTheme::default(), None);
         let scrolled = a.list.offset;
         assert!(scrolled > 0, "precondition: 19 rows down has scrolled the list");
         assert_eq!(a.list.selected, Some(19));
 
         up(&mut a);
-        let _ = a.view(&UiTheme::default());
+        let _ = a.view(&UiTheme::default(), None);
         assert_eq!(
             a.list.offset, scrolled,
             "the selection moved up inside the visible rows, so the list must not have moved"
@@ -750,16 +781,16 @@ mod tests {
         a.update(Msg::Activate(2));
         let path = a.take_open().unwrap();
         a.opened(&path, true);
-        let ui: Element<Msg> = a.view(&UiTheme::default());
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
         assert!(labelled(&ui, NOTICE_KEY).contains("opening a.txt"), "the strip says so");
 
         a.opened(&path, false);
-        let ui: Element<Msg> = a.view(&UiTheme::default());
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
         assert!(labelled(&ui, NOTICE_KEY).contains("could not open a.txt"));
 
         // And a new listing supersedes it: the notice is about a press, not about the directory.
         a.show("/home", alloc::vec![Entry::file("a.txt")]);
-        let ui: Element<Msg> = a.view(&UiTheme::default());
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
         assert_eq!(labelled(&ui, NOTICE_KEY), "", "a listing clears it");
     }
 

@@ -71,6 +71,13 @@ pub struct Routed {
     /// it — changing a window's geometry is the manager's, so this becomes a `DragEnded` event
     /// and the manager answers with the `Configure` it would have sent anyway (M9 Parts E, F).
     pub resized: Option<(u32, Rect)>,
+    /// A popup a press landed outside of, which its owner should be told about.
+    ///
+    /// **The compositor reports rather than acts**, as it does for a close request and a resize:
+    /// the window belongs to the client, and whether a dismissal ends what the popup was offering
+    /// is the client's to decide. What only the compositor can know is that the press happened
+    /// somewhere else at all (M11 Part E batch 5).
+    pub dismissed: Option<u32>,
 }
 
 /// Where the resize outline was and where it is now, both to repaint.
@@ -492,6 +499,7 @@ impl InputRouter {
 
             Logical::Button { button, pressed, buttons, .. } => {
                 let mut restacked = None;
+                let mut dismissed = None;
                 if pressed && self.grab.is_none() {
                     // **Before the grab**, or the first click after boot is delivered to a
                     // window that was never entered: nothing has moved the cursor, `inside`
@@ -512,6 +520,27 @@ impl InputRouter {
                     // Remembered for the release the compositor owes this window if the grab
                     // ends any way other than this button coming up.
                     self.grab_button = button;
+                    // **A press that is not on the popup dismisses it** (M11 Part E batch 5).
+                    // Focus almost covers this and does not: focus here is a consequence of
+                    // stacking, so pressing on a *window* raises it and the popup hears about it
+                    // — while pressing the desktop or a panel raises nothing, changes no focus,
+                    // and left every popup in the system open. The press is still delivered
+                    // wherever it landed; this only tells the popup's owner.
+                    //
+                    // **Anywhere that is not the popup, its parent included.** A first version
+                    // exempted the parent, meaning to protect the button that opened a menu from
+                    // racing a dismissal — and it was wrong twice over: a popup's parent is the
+                    // whole *bar*, not the button, so clicking the bar left the menu up; and the
+                    // handler it was protecting is inert while a modal is open anyway, so
+                    // dismissing is precisely what makes clicking the button a second time close
+                    // the thing it opened. The opening press cannot dismiss: the popup does not
+                    // exist yet when it is routed.
+                    if let Some(top) = stack.focus_candidate()
+                        && stack.window(top).is_some_and(|w| w.role.is_popup())
+                        && self.grab != Some(top)
+                    {
+                        dismissed = Some(top);
+                    }
                     if let Some(window) = self.grab
                         && stack.window(window).is_some_and(|w| w.role.takes_focus())
                     {
@@ -563,7 +592,13 @@ impl InputRouter {
                     self.grab_broken = false;
                     self.update_crossing(stack, out);
                 }
-                Routed { restacked, resized: ended, outline: outline_gone, ..Routed::default() }
+                Routed {
+                    restacked,
+                    resized: ended,
+                    outline: outline_gone,
+                    dismissed,
+                    ..Routed::default()
+                }
             }
 
             Logical::Dropped => {
@@ -2110,6 +2145,42 @@ mod tests {
             out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == bar)),
             "a sticky window takes the click on desktop 7"
         );
+    }
+
+    #[test]
+    fn a_press_outside_a_popup_dismisses_it_and_one_inside_does_not() {
+        // **The case focus cannot cover.** Pressing a *window* raises it, and the raise is the
+        // focus change the popup hears about — so an early version of this behaviour looked
+        // complete while the reported bug survived: a press on the desktop or on a panel raises
+        // nothing, changes no focus, and left every popup in the system open.
+        let mut s = WindowStack::new();
+        let bar = win(&mut s, Role::Panel { dock: Edge::Top, reserve: 24 }, 0, 0, 640, 24);
+        let menu = win(&mut s, Role::Popup { parent: bar }, 0, 24, 120, 200);
+        let mut r = InputRouter::new(SCREEN);
+        assert_eq!(s.focus_candidate(), Some(menu), "the popup is topmost and takes focus");
+
+        // On the panel, well clear of the popup: nothing is raised, because a panel does not take
+        // focus — so no focus change occurs and nothing else would have told the popup anything.
+        warp(&mut r, &mut s, 400, 10);
+        let mut out = Vec::new();
+        let routed = r.route(&button(true), &mut s, &mut out);
+        assert_eq!(routed.dismissed, Some(menu), "a press on a panel did not dismiss the popup");
+        assert_eq!(routed.restacked, None, "a panel raise would be the other mechanism");
+
+        // **Inside it is not outside it.** Choosing from a menu is a press on the menu, and a
+        // dismissal there would race the client's own handling of the choice.
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 40, 100);
+        let routed = r.route(&button(true), &mut s, &mut out);
+        assert_eq!(routed.dismissed, None, "pressing the popup dismissed it");
+
+        // **Its parent counts as outside**, which is what makes clicking the applications button
+        // a second time close the menu it opened: the parent is the whole bar, and the handler
+        // that would otherwise reopen the modal is inert while one is up.
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 300, 10);
+        let routed = r.route(&button(true), &mut s, &mut out);
+        assert_eq!(routed.dismissed, Some(menu), "pressing the popup's parent did not dismiss it");
     }
 
     #[test]

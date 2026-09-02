@@ -111,6 +111,16 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
     }
 }
 
+/// What the taskbar should call this window.
+///
+/// **"untitled" rather than nothing** (M11 Part E batch 7). An empty title leaves the window list
+/// showing `window 20`, which is the compositor's fallback and reads as a program that failed to
+/// say what it is. The *title bar* has its own version of this, with the modified mark; this one
+/// is what another process shows, and it is set once rather than per keystroke.
+fn window_title(path: &str) -> &str {
+    if path.is_empty() { "untitled" } else { libfs::basename_str(path) }
+}
+
 /// Write `bytes` to `path` the safe way: a temporary beside it, renamed over it.
 ///
 /// The error is the message the status strip shows, so it is written for the person looking at
@@ -186,13 +196,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         Some(Ok(s)) => (s.argv, s.env),
         _ => (Vec::new(), libstream::wire::Record::default()),
     };
-    // **`argv[1]` or nothing.** An editor with no file has nothing to save to, and an untitled
-    // buffer would be a promise this application cannot keep: there is no save-as, because there
-    // is no file dialog and no way to ask for a name.
-    let Some(path) = argv.get(1).cloned() else {
-        kprint(b"nxedit: no file to edit (argv[1] is the path)\n");
-        exit(2);
-    };
+    // **`argv[1]`, or an untitled buffer** (M11 Part E batch 7). This used to print "no file to
+    // edit" and exit, which is what "nxedit doesn't launch from the menu" turned out to be: the
+    // applications modal passes no arguments, so the editor started and stopped. The refusal had
+    // a reason — an untitled buffer is a promise an application cannot keep if it has no way to
+    // ask for a name — and the answer is to ask, in a field in its own status strip.
+    let path = argv.get(1).cloned().unwrap_or_default();
+    // Where an untitled buffer is saved. The session hands every application its `HOME`; an
+    // editor started outside one keeps `/home`, which is what a namespace without a user's
+    // subtree still has.
+    let home = alloc::string::String::from(
+        env.field_str("HOME").filter(|h| !h.is_empty()).unwrap_or("/home"),
+    );
 
     // **From the environment, not from a default** (M11 Part C), and read *before* the font,
     // because since M11 Part D the theme is what names the file to load. It used to sit further
@@ -207,12 +222,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    let mut app = App::new(&path);
-    open_into(&mut app, root_ns, &path);
-    // **The file being edited can change**, since a drop replaces it — so this is the binary's
-    // copy of `app.path()` rather than the argument it started from.
-    let mut editing = path.clone();
-
+    let mut app = App::new(&path, &home);
+    // **Nothing to open when there is nothing named.** `open_into` would report a missing file,
+    // which is true and is not what an empty buffer means.
+    if !path.is_empty() {
+        open_into(&mut app, root_ns, &path);
+    }
     let mut size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
@@ -229,7 +244,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // title bar; retitling on every keystroke would be a message per keystroke to say something
     // the window already shows.
     if let Some(mut w) = win.window(window_id)
-        && w.set_title(libfs::basename_str(&path)).is_err()
+        && w.set_title(window_title(&path)).is_err()
     {
         kprint(b"nxedit: SetTitle refused\n");
     }
@@ -275,7 +290,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
         }
         // ---- render ----
-        let ui = app.view(&theme);
+        // The widget under the pointer, from the router that has always known and that nothing
+        // had ever asked (M11 Part E batch 3).
+        let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
@@ -321,6 +338,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // a file is a syscall, so the application says it wants to save and the `main` that owns
         // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
         if let Some(text) = app.take_save() {
+            // **Read from the application, not tracked beside it.** The path changes twice — a
+            // drop replaces the file, and naming an untitled buffer gives it one — so a copy
+            // `main` kept would be a second answer needing an update at both. There was one: a
+            // `let` bound once at startup that the drop path had to remember to refresh
+            // (M11 Part E batch 9).
+            let editing = alloc::string::String::from(app.path());
             let bytes = to_bytes(&text);
             let result = save(root_ns, &editing, &bytes);
             match result {
@@ -406,6 +429,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             .end();
                     }
                 }
+                // A dismissal is a popup's event; this window is not one.
+                WindowEvent::Dismissed => {}
                 // **Answered by exiting, and the unsaved buffer goes with it.** An editor with
                 // somewhere to put a question would ask it — that is what a `CloseRequested`
                 // rather than a destruction is *for* — and this one has no dialog to ask in.
@@ -430,9 +455,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // The path is the window's identity now: the title, and what a save
                         // writes to. Both are read from `app`, so the one copy `main` keeps has
                         // to follow — this was a `let` bound once at startup.
-                        editing = String::from(app.path());
+                        let editing = String::from(app.path());
                         if let Some(mut w) = win.window(window_id)
-                            && w.set_title(libfs::basename_str(&editing)).is_err()
+                            && w.set_title(window_title(&editing)).is_err()
                         {
                             kprint(b"nxedit: SetTitle refused\n");
                         }

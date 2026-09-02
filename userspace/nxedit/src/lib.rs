@@ -37,8 +37,9 @@ use libui::element::{
     Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
 };
 use libui::widget::{
-    GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TitleButtons, WidgetState, button,
-    resize_grip, text_area, title_bar,
+    GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState, TitleButtons,
+    WINDOW_FRAME_H,
+    WidgetState, button, resize_grip, text_area, text_field, title_bar, window_frame,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
@@ -83,6 +84,25 @@ pub const ACCEPTOR: &str = "document";
 /// speaks (`libinput::keymap`, which maps it to `s`/`S`), and the test below pins it to that
 /// table rather than to this comment.
 pub const SAVE_KEYCODE: u16 = 31;
+
+/// Confirms the name being typed for an untitled buffer.
+const NAME_CONFIRM: u16 = libkern::abi::KEY_ENTER;
+/// Abandons it, leaving the buffer untitled and unsaved.
+const NAME_CANCEL: u16 = libkern::abi::KEY_ESC;
+
+/// Join a directory and a file name — `libfs::join`'s rule, on `str`.
+///
+/// The same helper `nxfiles` keeps for the same reason: this half of the application never sees
+/// a path as bytes, and converting to call `libfs` would be a round trip through a lossy
+/// conversion for a rule that is one line.
+fn join(dir: &str, name: &str) -> String {
+    let mut s = String::from(dir);
+    if !s.ends_with('/') {
+        s.push('/');
+    }
+    s.push_str(name);
+    s
+}
 
 /// Everything the editor is.
 pub struct App {
@@ -130,6 +150,22 @@ pub struct App {
     resize_requested: Option<u32>,
     /// The editor has been asked to close, and the binary owes an exit.
     closing: bool,
+    /// A name being typed for a buffer that has never had one.
+    ///
+    /// **`Some` is a mode**, and it is the first one this editor has: while a name is being typed
+    /// the keys belong to it rather than to the buffer, and the status strip shows the field
+    /// instead of what last happened. It exists because an editor launched from the applications
+    /// menu has no `argv[1]` — it used to print "no file to edit" and exit, which is what "nxedit
+    /// doesn't launch from the menu" turned out to be (M11 Part E batch 7).
+    ///
+    /// **In the editor rather than through the shell.** A `Desktop` op that asked the shell to
+    /// collect a name would make the shell a dialog provider for arbitrary clients — an authority
+    /// question — and would need a blocking exchange over an async protocol. A field in this
+    /// window is no protocol at all, and this crate's own key path already noted that "the first
+    /// widget that wants a key needs exactly this shape".
+    naming: Option<TextFieldState>,
+    /// Where an untitled buffer is saved, from the session's `HOME`.
+    home: String,
 }
 
 /// What can happen to the editor.
@@ -153,15 +189,21 @@ pub enum Msg {
 
 impl App {
     /// An editor for `path`, with an empty buffer until something is loaded into it.
-    pub fn new(path: &str) -> App {
+    pub fn new(path: &str, home: &str) -> App {
         App {
             path: String::from(path),
             name: libfs::basename_str(path).to_string(),
+            naming: None,
+            home: String::from(home),
             text: TextAreaState::new(),
             saved_at: 0,
             blocked: None,
             differs: false,
-            status: String::from("opening…"),
+            status: if path.is_empty() {
+                String::from("untitled — save to name it")
+            } else {
+                String::from("opening…")
+            },
             window: START_SIZE,
             focused: true,
             maximized: false,
@@ -320,7 +362,19 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Key(k) => self.key(k),
-            Msg::Save => self.save_requested = true,
+            // **Saving an untitled buffer asks for a name first.** The write itself is the
+            // binary's, as always; what changes here is that there may be nowhere to write to
+            // yet, and inventing a path would be a file somebody did not choose.
+            Msg::Save => {
+                if self.path.is_empty() {
+                    if self.naming.is_none() {
+                        self.naming = Some(TextFieldState::new());
+                        self.status = String::from("name it, then Enter");
+                    }
+                } else {
+                    self.save_requested = true;
+                }
+            }
             // Nothing here: the payload is in the event the binary is holding, and *which*
             // widget took the drop is all the toolkit can say. The binary pairs them.
             Msg::Dropped => {}
@@ -347,9 +401,41 @@ impl App {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return;
         }
+        // **While a name is being typed the keys are the field's**, buffer and chords included.
+        // A `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
+        // already being answered.
+        if let Some(field) = self.naming.as_mut() {
+            match k.keycode {
+                NAME_CANCEL => {
+                    self.naming = None;
+                    self.status = String::from("not saved");
+                }
+                NAME_CONFIRM => {
+                    let name = field.text().trim().to_string();
+                    if name.is_empty() {
+                        // Nothing typed is not a name, and an empty one would save to the
+                        // directory itself. Left open rather than cancelled: the person is
+                        // mid-answer.
+                        self.status = String::from("a name, then Enter");
+                        return;
+                    }
+                    self.path = join(&self.home, &name);
+                    self.name = name;
+                    self.naming = None;
+                    self.save_requested = true;
+                }
+                code => {
+                    field.apply(code, k.modifiers);
+                }
+            }
+            return;
+        }
         if k.modifiers & MOD_CTRL != 0 {
             if k.keycode == SAVE_KEYCODE {
-                self.save_requested = true;
+                // **Through `update`, not straight to the flag**, so the untitled case asks for a
+                // name here too — a chord and a button that did different things would be the
+                // same control answering twice.
+                self.update(Msg::Save);
             }
             // **Every other chord is swallowed, not passed on.** `Ctrl+X` folding to a printable
             // character would otherwise type it, which is how an editor inserts junk when a
@@ -395,7 +481,8 @@ impl App {
 
     /// The height the text area is laid out at — the window less its chrome and the grip.
     pub fn area_h(&self) -> u32 {
-        self.window.h.saturating_sub(TITLE_BAR_H + STATUS_H + GRIP_W)
+        // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`.
+        self.window.h.saturating_sub(TITLE_BAR_H + STATUS_H + GRIP_W + WINDOW_FRAME_H)
     }
 
     /// What the title bar shows: the file's name, marked when the buffer differs from the disk.
@@ -405,6 +492,15 @@ impl App {
     /// *title* (what the taskbar shows) is set once and stays the name alone: retitling on every
     /// keystroke is a message per keystroke to say something the window itself already shows.
     pub fn title(&self) -> String {
+        if self.name.is_empty() {
+            // **Named for what it is, not left blank.** A window whose title bar says nothing
+            // reads as a window that failed to load something.
+            return if self.modified() {
+                String::from("* untitled")
+            } else {
+                String::from("untitled")
+            };
+        }
         if self.modified() {
             alloc::format!("* {}", self.name)
         } else {
@@ -422,7 +518,7 @@ impl App {
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
-    pub fn view(&mut self, ui: &UiTheme) -> Element<Msg> {
+    pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let title = title_bar(
             &self.title(),
@@ -443,9 +539,29 @@ impl App {
 
         // The status strip: the one control, and what the last thing that happened was.
         let strip = row(alloc::vec![
-            button("save", Msg::Save, WidgetState::default(), &ui).key(SAVE_KEY),
-            padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.status.clone()))
+            button(
+                "save",
+                Msg::Save,
+                WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
+                &ui,
+            )
+            .key(SAVE_KEY),
+            // **The field replaces the status, it does not sit beside it.** The strip is one row
+            // of chrome and a name being typed *is* what last happened — showing both would make
+            // a person read two things to find out which one is asking for an answer.
+            match self.naming.as_ref() {
+                Some(f) => padding(
+                    Insets { top: 2, right: 6, bottom: 2, left: 6 },
+                    text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                )
+                .key(STATUS_KEY)
+                .flex(1),
+                None => padding(
+                    Insets { top: 4, right: 4, bottom: 4, left: 6 },
+                    text(self.status.clone()),
+                )
                 .key(STATUS_KEY),
+            },
         ]);
 
         let h = self.area_h();
@@ -456,15 +572,16 @@ impl App {
         // the honest answer: the title bar is not where a document goes.
         let area = text_area(&mut self.text, h, ROW_H, self.focused, &ui).on_drop(Msg::Dropped);
 
-        let body = dock(
-            alloc::vec![
-                docked(Edge::Top, title),
-                docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
-            ],
+        let body = window_frame(
+            title,
+            dock(
+                alloc::vec![docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY))],
             // Sized to the height it was built for, like every scrolling widget in this tree:
             // the dock's flex child otherwise gets whatever is left, and the widget would build
             // rows for one height and be drawn at another.
-            sized(Size::new(0, h), area).key(AREA_KEY),
+                sized(Size::new(0, h), area).key(AREA_KEY),
+            ),
+            &ui,
         );
 
         let grip = offset(
@@ -512,7 +629,7 @@ mod tests {
 
     /// An editor with `hello` open, as if the file had been read.
     fn app() -> App {
-        let mut a = App::new("/home/notes.txt");
+        let mut a = App::new("/home/notes.txt", "/home");
         // `hello\n` on disk, which is what `hello` writes back — so this buffer starts matching
         // its file, which every test below depends on.
         a.loaded("hello", b"hello\n");
@@ -556,7 +673,7 @@ mod tests {
     fn a_buffer_that_could_not_be_read_refuses_to_be_written() {
         // The danger is the empty window: a failed read shows nothing, and saving nothing over a
         // file is that file destroyed by an editor that never displayed it.
-        let mut a = App::new("/home/notes.txt");
+        let mut a = App::new("/home/notes.txt", "/home");
         a.blocked("could not be read");
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
@@ -571,7 +688,7 @@ mod tests {
         // normalises line endings, so a CRLF file is already something else on screen — and an
         // editor that called that unmodified would rewrite it, two bytes shorter per line, on a
         // `Ctrl+S` pressed out of habit (PR #259 review, finding 3).
-        let mut a = App::new("/home/dos.txt");
+        let mut a = App::new("/home/dos.txt", "/home");
         a.loaded("alpha\nbeta\n", b"alpha\r\nbeta\r\n");
         assert!(a.modified(), "the buffer is not what the file holds");
         assert_eq!(a.title(), "* dos.txt", "and the title says so before anything is typed");
@@ -587,7 +704,7 @@ mod tests {
 
         // And a file that *does* survive is not marked: this must distinguish, or it is a
         // permanent asterisk rather than an answer.
-        let mut b = App::new("/home/unix.txt");
+        let mut b = App::new("/home/unix.txt", "/home");
         b.loaded("alpha\nbeta\n", b"alpha\nbeta\n");
         assert!(!b.modified());
     }
@@ -625,11 +742,67 @@ mod tests {
     }
 
     #[test]
+    fn an_untitled_buffer_is_named_on_save_and_saved_where_it_was_named() {
+        // **This is what "nxedit doesn't launch from the menu" was**: the applications modal
+        // passes no arguments, the editor required `argv[1]`, so it started and exited (M11
+        // Part E batch 7).
+        let mut a = App::new("", "/home/alice");
+        assert_eq!(a.title(), "untitled", "an unnamed buffer has no title to show");
+        assert!(a.take_save().is_none(), "an untitled buffer had somewhere to be written");
+
+        // Save asks rather than writes. **The control is `take_save`**: a version that set the
+        // flag anyway would pass an assertion about the status text alone.
+        a.update(Msg::Save);
+        assert!(a.take_save().is_none(), "an untitled save wrote to a path nobody chose");
+        assert!(a.status().contains("name it"), "status was {:?}", a.status());
+
+        // The keys are the field's now, buffer included.
+        // "notes", by keycode — the codes the keymap maps to those letters, which is what an
+        // injected keystroke carries.
+        for c in [49u16, 24, 20, 18, 31] {
+            key(&mut a, c, 0);
+        }
+        assert_eq!(a.text.text(), "", "typing a name went into the buffer");
+
+        key(&mut a, libkern::abi::KEY_ENTER, 0);
+        assert_eq!(a.path(), "/home/alice/notes", "named into the wrong directory");
+        // Unmarked: naming a buffer is not editing it, and this one has had nothing typed into
+        // it — the keys went to the field. The mark means "not what is on disk".
+        assert_eq!(a.title(), "notes", "the title bar still says untitled");
+        assert!(a.take_save().is_some(), "confirming a name did not ask for the save");
+    }
+
+    #[test]
+    fn abandoning_the_name_leaves_the_buffer_untitled_and_unwritten() {
+        let mut a = App::new("", "/home/alice");
+        a.update(Msg::Save);
+        key(&mut a, 49, 0);
+        key(&mut a, libkern::abi::KEY_ESC, 0);
+        assert_eq!(a.path(), "", "escaping the prompt named the buffer anyway");
+        assert!(a.take_save().is_none(), "escaping the prompt saved it anyway");
+
+        // And an empty name is not a name: it would write to the directory itself.
+        a.update(Msg::Save);
+        key(&mut a, libkern::abi::KEY_ENTER, 0);
+        assert_eq!(a.path(), "", "an empty name became a path");
+        assert!(a.take_save().is_none());
+        assert!(a.status().contains("a name"), "status was {:?}", a.status());
+    }
+
+    #[test]
+    fn a_named_buffer_saves_without_asking() {
+        // The control for the two above: the path that *has* a name must not grow a prompt.
+        let mut a = app();
+        a.update(Msg::Save);
+        assert!(a.take_save().is_some(), "a named buffer asked for a name");
+    }
+
+    #[test]
     fn a_missing_file_is_not_a_failure() {
         // Opening a path that is not there is how a file gets made, so the buffer is writable —
         // and the strip says which of the two happened, because a person who meant to open an
         // existing file wants to know they did not.
-        let mut a = App::new("/home/new.txt");
+        let mut a = App::new("/home/new.txt", "/home");
         a.absent();
         assert_eq!(a.refusal(), None);
         assert_eq!(a.status(), "new file");
@@ -707,7 +880,7 @@ mod tests {
     fn the_name_is_the_last_component() {
         // The title's name comes from `libfs`, so this pins what this application depends on
         // rather than re-testing that crate: a trailing separator must not give an empty title.
-        let named = |p: &str| App::new(p).title();
+        let named = |p: &str| App::new(p, "/home").title();
         assert_eq!(named("/home/alice/notes.txt"), "notes.txt");
         assert_eq!(named("notes.txt"), "notes.txt");
         assert_eq!(named("/home/papers/"), "papers", "a trailing separator is not the name");

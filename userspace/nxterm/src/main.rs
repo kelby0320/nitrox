@@ -90,6 +90,14 @@ struct Popup {
     tree: Tree,
     /// Routing state, likewise: focus within the menu is not focus within the terminal.
     router: Router,
+    /// Which item the pointer was over at the last paint.
+    ///
+    /// **Kept so a change can be *reported*, not so the view can be built** — the view reads
+    /// `router.inside()` directly, which is the one source. This is a receipt: a gate driving a
+    /// release image sees nothing of a highlight, and hover is the first thing in this system
+    /// that reacts to the pointer moving without a button held, so "the path works" needed
+    /// something to assert (M11 Part E batch 3).
+    hovered: Option<u64>,
     size: Size,
 }
 
@@ -107,7 +115,9 @@ impl Popup {
         ui_font: &Font,
         theme: &Theme,
     ) -> Option<Self> {
-        let menu = app.menu_view(theme);
+        // No hover yet: the pointer is over the *bar* item that opened this, not over the popup,
+        // and this call only measures the menu — which hover does not change the size of.
+        let menu = app.menu_view(theme, None);
         let m = FontMetrics::new(ui_font, theme.font_px);
         let size = measure(&menu, Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &m);
         if size.w == 0 || size.h == 0 {
@@ -145,7 +155,15 @@ impl Popup {
             }
             return None;
         };
-        Some(Self { id, pool, scratch, tree: Tree::new(), router: Router::new(), size })
+        Some(Self {
+            id,
+            pool,
+            scratch,
+            tree: Tree::new(),
+            router: Router::new(),
+            hovered: None,
+            size,
+        })
     }
 
     /// Paint the menu and put it on screen **when something changed**, and say whether all is
@@ -166,7 +184,27 @@ impl Popup {
         ui_font: &Font,
         theme: &Theme,
     ) -> bool {
-        let menu = app.menu_view(theme);
+        let now = self.router.hovered_key(&self.tree);
+        if now != self.hovered {
+            self.hovered = now;
+            // The item's key, which is a number this program chose — not a label, and not a
+            // position. There is nothing here a person typed.
+            #[cfg(feature = "test-harness")]
+            {
+                let mut l = libkern::debug::Line::new();
+                l.s(b"nxterm: menu hover ");
+                match now {
+                    Some(k) => {
+                        l.u(k);
+                    }
+                    None => {
+                        l.s(b"none");
+                    }
+                }
+                l.end();
+            }
+        }
+        let menu = app.menu_view(theme, now);
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
         let l = layout(&menu, bounds, &FontMetrics::new(ui_font, theme.font_px));
         match self.tree.update(&menu, &l) {
@@ -479,7 +517,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     loop {
         // ---- render ----
-        let ui = app.view(&theme);
+        // **The widget under the pointer, from the router that already knew.** `Router::inside`
+        // has reported it since M4; nothing had ever asked, so nothing in this system reacted to
+        // the pointer moving over it (M11 Part E batch 3).
+        let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&ui_font, theme.font_px));
         // The anchor for the next frame's popup. Read every frame rather than only when the
         // menu opens: the item's position is a fact about the layout, not about the menu.
@@ -724,7 +765,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
         // dropped rather than routed into the terminal.
         if popup.as_ref().is_some_and(|p| p.id == from) {
-            let menu = app.menu_view(&theme);
+            // **A press landed outside the menu, so it goes away** (M11 Part E batch 5). This is
+            // the one thing a popup's owner cannot work out for itself: it never sees a press
+            // aimed at another window, and until the compositor said so a menu stayed open over
+            // whatever was clicked next.
+            if matches!(event, WindowEvent::Dismissed) {
+                app.menu_open = false;
+                continue;
+            }
+            let menu =
+                app.menu_view(&theme, popup.as_ref().and_then(|p| p.router.hovered_key(&p.tree)));
             let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
             let ml = layout(&menu, bounds, &FontMetrics::new(&ui_font, theme.font_px));
             let msgs: alloc::vec::Vec<Msg> = match event {
@@ -811,6 +861,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // as routing state.
                 app.focused = f;
             }
+            // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
+            WindowEvent::Dismissed => {}
             // **The shell asking, answered the same way the close button is.** There is nothing
             // to refuse with and nothing to save: what a client with unsaved work would do here
             // is open a dialog, which is why this arrives as a request rather than a destruction.

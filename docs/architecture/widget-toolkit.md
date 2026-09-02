@@ -424,6 +424,22 @@ space for it:
 |---|---|
 | `text_area` | The editor's buffer. Multi-line, with a cursor, a **selection**, a goal column for vertical movement, and scrolling that follows the cursor. `TextAreaState` carries all of it; the widget draws the visible lines, the selection behind them and the caret |
 
+**And M11 Part E added four more, from the same rule seen from the other side** — these came
+from *driving* the desktop rather than from building an application, which is what a polish pass
+is:
+
+| Widget | Why it exists |
+|---|---|
+| `window_frame` | A window's own edge: a one-pixel border, three pixels of frame on the left, right and bottom, and the title bar flush at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
+| `popup_frame` | A menu or modal's edge. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
+| `menu_item` | A dropdown row that highlights under the pointer, the way a selected list row does — they are the same thing seen twice |
+| `ListState::drag_to` | Converts a pointer's y on a scrollbar into an offset. On the state rather than in each caller, so a list's thumb and `nxterm`'s grid answer the same question the same way |
+
+Two painting primitives arrived with them: `Node::Bevel`, a fill with the theme's gradient — a
+*second* fill rather than a flag on the first, because a flat fill is correct from the clip alone
+and a gradient is only correct from the node's own rect — and `Node::Icon`, the three window
+controls drawn as shapes rather than typed as `_`, `[]` and `X`.
+
 **The waiting was the point, and it is worth saying what it bought.** This section's standing
 reason was that "building an editor's widget remains a guess at requirements no editor has yet
 posed" — and the requirements an editor actually posed were not the ones a guess would have
@@ -660,6 +676,14 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   [`libterm`](../../userspace/libterm) measures a cell from. Until that part there was one
   `SYSTEM_FONT_PATH` and every client loaded it, so every label in every window was monospaced.
   `nxterm` is the one program that loads both: its menus are widgets and its grid is not.
+
+  **And widgets react to the pointer**, since M11 Part E batch 3 — which is later than it
+  sounds: `Router::inside` has reported the widget under the cursor since M4 and
+  `WidgetState::hovered` has existed just as long, and no application ever connected the two, so
+  nothing in this system had ever responded to a pointer that was merely *over* it.
+  `Router::hovered_key` is what an application asks, and the distinction is load-bearing:
+  `inside` is a **diff-tree id** and `.key(…)` is the application's own numbering, so comparing
+  one to the other compiles and gives a stable wrong answer.
 
   A path a theme names is resolved in the *application's* namespace, so whether it loads is not
   something the shell could have checked when it parsed the file — an unloadable path falls back

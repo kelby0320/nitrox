@@ -3212,20 +3212,271 @@ it is noticed on. Its own list, and its own milestone.
 
 ### Part E — the polish passes
 
-- [ ] **Batches, from the maintainer's list, each ending in a preview and — where the item is
-      behaviour rather than appearance — a boot.** Every batch updates `check-display`'s
-      reference in the same commit, so the gate fails the moment pixels move without intent.
-      That is the whole regression story for a hundred small changes, and it is enough.
+- [x] **A way to look at the whole desktop** ✅ — `cargo xtask shot`, which is the half Part A's
+      command said it could not be. `preview` renders the toolkit's own surfaces on the host in a
+      second; its doc names what that structurally cannot show — the cursor, the drag outline, the
+      ground between windows, and how real windows sit next to each other. So this **photographs**
+      rather than renders: it boots the release image, drives it to four moments (the greeter, the
+      bare desktop, the applications modal, two real windows) and writes what QEMU says is on the
+      display. A photograph adds no second renderer to keep in step with the first, which is the
+      trap `preview_frames` exists to avoid.
 
-- [ ] **No checkbox list here on purpose.** The items do not exist yet; they are written while
-      driving the system. What this part commits to is the *shape* — batch, preview, review,
-      apply — and the stopping condition in decision 5.
+      Several moments per boot, because the boot is the cost. It is a tool and not a gate: it
+      asserts only enough to know the picture is of a working desktop rather than a blank screen,
+      that being the one failure that would otherwise be read as a design opinion.
 
-### Part F — the control panel, allowed to slip
+- [ ] **The list itself** — [`m11-polish-list.md`](m11-polish-list.md), the maintainer's, written
+      while driving. Decision 5 says this plan does not contain it; what this box does is give it
+      a file, and a place for the two kinds of thing that are *not* polish to go instead (feel,
+      and M12 capability).
 
-- [ ] **Desktop settings a person can drive**: the theme file above, and the desktops
+- [ ] **Batch 1 — the palette turns light** ✅ (2026-09-01). One theme, and `Theme::light()`
+      *replaces* `Theme::dark()` rather than joining it: decision 4 applied, because two themes
+      double the reference pictures and double the judgement each polish item takes. Values are
+      measured from the maintainer's reference desktop rather than invented.
+
+      **Three things the light theme forced**, each recorded where it happened. `background` split
+      into two fields — it was also the ground *between* windows, on the argument that a seam
+      shows when a client's buffer is smaller than its frame, and a light theme ends that because
+      the two stopped being the same kind of thing. `outline` had to become saturated, being the
+      one colour composited over *both* grounds. And the terminal's grid keeps its own dark
+      ground: Part B tied it to the theme when there was one theme and it was dark, and turning
+      the desktop light is exactly the event that shows the tie was to the sixteen ANSI colours,
+      which are tuned for a dark ground and would put invisible text on a white one.
+
+- [ ] **Batch 2a — the chrome grows a third dimension** ✅ (2026-09-01). Gradients, drawn window
+      controls, and a line around anything with an edge.
+
+      **One bevel number for every gradient**, not a pair of colours per surface: the reference's
+      own gradients span ±10 and ±14 around their midpoints, so one amount reproduces both, and a
+      palette keeps one value coherent rather than eight. `Node::Bevel` is a second fill rather
+      than a flag on the first, because the two differ in what they need to know — a flat fill is
+      correct from the clip alone and a gradient is only correct from the node's rect, so a
+      one-row repaint of a gradient must draw the same picture as a full one. That is a host test.
+
+      **The window controls are drawn, not typed.** `_`, `[]` and `X` were three characters
+      standing in for three controls on a bar already full of text. Shapes cost a paint arm;
+      images would cost a decoder, an asset path and a size convention — filed, per the settled
+      decision, and the trade is worth revisiting when something needs an icon that is not three
+      strokes.
+
+      **And a selection is blue with a darker edge**, which is the second half of the request and
+      the half that matters: without the border, two adjacent selected rows read as one block.
+
+- [x] **Batch 2b — the window frame** ✅ (2026-09-01). A one-pixel edge, three pixels of frame on
+      the left, right and bottom, and the title bar flush at the top — which is what the reference
+      does and is not arbitrary: a title bar *is* the window's edge, the thing you grab to move
+      it, and insetting it would put a strip of frame above a bar that already reads as one.
+
+      **Held back from 2a because it moves geometry.** `window_frame` publishes what it costs, and
+      three applications subtract it; `nxterm` needed one pair of constants where it had three
+      open-coded sums of `BAR_H + TITLE_BAR_H` that agreed only because nothing had ever been
+      added between a window's edge and its content.
+
+      **The frame's dock wraps both children**, because the diff requires a container's children
+      to be all keyed or all unkeyed and every caller keys its title bar. The alternative was for
+      the toolkit to invent a key in the application's namespace.
+
+      **And it surfaced a gate bug that had nothing to do with it.** `check-login`'s drag ignored
+      the six slop motions when computing its walk, so the pointer ended clamped against the
+      screen's right edge rather than at the target — which landed on the editor's text area
+      anyway, because the area reached the window's last pixel column. Four pixels of frame moved
+      the content in and the drop started landing on the frame.
+
+- [x] **Batch 3 — the pointer starts meaning something** ✅ (2026-09-01). The second half of the
+      menu request, and it turned out to be the whole system: **nothing had ever reacted to the
+      pointer being over it.** `Router::inside` has reported the widget under the cursor since M4
+      and `WidgetState::hovered` has existed just as long; no application had ever connected them,
+      so every button, row and menu item painted its resting face whatever the pointer did.
+
+      A menu row now highlights the way a selected list row does — they are the same thing seen
+      twice, the item that would happen if you acted now — and a hovered list row gets the face
+      rather than the blue, because two highlights of equal weight is two answers to one question.
+
+      **`Router::hovered_key` exists because two id spaces meet here.** `inside` is a diff-tree id
+      and `.key(…)` is the application's own numbering; comparing one to the other compiles and
+      returns a stable wrong answer. That is what shipped first, and `check-terminal` caught it —
+      a menu item keyed 2 reporting as 4.
+
+      **The shell's modal is the one surface still without hover**, and it is a shape rather than
+      an omission: `desktop-shell` has no `Router` at all, hit-testing the modal's coordinates by
+      hand. Giving it feedback means giving it a router first, which is a change to how it handles
+      input rather than to how it looks.
+
+- [x] **Batch 4 — the applications menu, and two small things** ✅ (2026-09-01). Four reports with
+      one cause: the shell read pointer events for the overview's thumbnails, the applications
+      button and the taskbar, and **never for the modal's own window**. So its rows could not be
+      clicked, nothing under the cursor reacted, and a click aimed elsewhere was never seen at
+      all. It has a `Router` now — the modal's contents are a widget tree that filters and
+      scrolls, and hit-testing that by hand would be the toolkit's layout written twice.
+
+      Placement was separate and simpler: a popup created with `new` takes its parent's origin,
+      so the modal covered the bar it dropped from. `nxterm`'s menu has always used `at`.
+      Dismissal needed a signal — `InputLost` is queue overflow, not focus, and reading it as one
+      would close the modal on a burst of motion; `WindowEvent::Focus(false)` is the right one and
+      already reached clients.
+
+      **Three latent bugs surfaced on the way**, none of them in what was reported: two row
+      builders keyed the same row differently the moment a query was non-empty; the shell's
+      placement line hardcoded `at 0,` — a value written into the line that reports it, right
+      until the cascade moved; and `check-login` measured every title-bar button from a window's
+      *width*, which is its right edge only while windows start at x=0.
+
+      **No hover receipt for this one, deliberately.** `nxterm` reports its menu hover because a
+      gate has no other way to see it. This shell has zero build-mode `cfg` sites — the state the
+      test-path retrofit exists to preserve — and `check-login` boots the release image, so such a
+      line would be both a reintroduction and invisible to the gate wanting it. The click proves
+      the router; hover rides the same router.
+
+- [x] **Batch 5 — the highlight is blue, and a press outside really does dismiss** ✅
+      (2026-09-01). Both were reported as still broken after batch 4, and both were right.
+
+      **The highlight** was batch 3's rule applied to a list that has no selection: hover was
+      "quieter than the selection and loses to it", and the applications modal keeps no selection
+      at all, so every hover took the quiet branch. The rule is still one primary highlight —
+      where there is no selection to compete with, the pointer's is not competing.
+
+      **The dismissal** needed a protocol op. Batch 4 used `Focus(false)`, which arrives when
+      something *raises* — so clicking another window worked and clicking the desktop or a panel
+      did not, because focus here is a consequence of stacking and neither raises anything. The
+      gate proved only the case that worked, having noted the other in a comment. `Dismissed`
+      (`0x0931`) is the compositor saying a press landed elsewhere, which is the half a client
+      cannot see: a popup's owner never receives a press aimed at another window.
+
+      **Its own op, not a second meaning for `CloseRequested`** — that one may deserve a "save
+      first?" and this deserves nothing but going away, and two things read as "close" in one arm
+      is what `Dropped`/`InputLost` had to be renamed out of. **And no parent exemption**: a first
+      version spared the popup's parent to protect the button that opened it, which was wrong
+      twice — the parent is the whole bar, and dismissing is what makes clicking that button again
+      close what it opened.
+
+- [x] **Batch 6 — a scrollbar you can drag** ✅ (2026-09-01). The arithmetic was never the
+      problem: `ScrollState::offset_at` has been right since M5 and `nxterm` has dragged its grid
+      with it ever since. `list_view` built a scrollbar and gave it **no pointer handler at all**,
+      so a list showed its position and could not be moved — a control that looks live and is not,
+      which is the defect this toolkit's own notes keep naming.
+
+      The conversion lives on `ListState` rather than in each caller, so a list's thumb and a
+      terminal's cannot drift apart on rounding. Two consumers wired it, and the launcher needed a
+      second fix to go with it: its list state was rebuilt every frame — true to "the launcher
+      keeps no selection", and it also meant the scroll offset reset every frame, so `/bin`'s 26
+      entries were ten reachable rows and a filter.
+
+      **The control is the `None` case.** Asserting that the bar carries a handler would pass for
+      a widget that attached one unconditionally, which is a different bug.
+
+- [x] **Batch 7 — the editor opens untitled** ✅ (2026-09-01). "nxedit doesn't launch from the
+      menu" was true in the most literal way: it required `argv[1]`, the applications modal passes
+      none, so it printed "no file to edit" and exited. The refusal had a reason — M10 Part D
+      declined an untitled buffer because there was no way to ask for a name — and the answer is
+      to ask.
+
+      **In the editor, not through the shell.** The details pass offered a `Desktop` op that would
+      have the shell collect a name; that would make the shell a dialog provider for arbitrary
+      clients, which is an authority question, and would need a blocking exchange over an async
+      protocol. A field in the editor's own status strip is no protocol at all — and this crate's
+      key path already carried a note that "the first widget that wants a key needs exactly this
+      shape". This is that widget.
+
+      **Naming is a mode**, the editor's first: while a name is being typed the keys are the
+      field's, buffer and chords included, and the strip shows the field instead of the status. An
+      empty name is refused rather than treated as one, because it would write to the directory.
+
+      Gated end to end: launched from the menu, and the *placement* is the proof rather than the
+      launch — the shell said the same thing before, and the editor exited before creating a
+      window. Then Ctrl+S, a name, and the file written into the session's `/home`.
+
+- [x] **Batch 8 — taskbar buttons, and a greeter that could not be centred** ✅ (2026-09-01). Two
+      small requests, one of which was not small underneath.
+
+      **The taskbar entries are bordered boxes.** They were labels on a flat bar, so two windows
+      read as one line with a gap in it; the focused one is filled as well as marked, from the
+      same flag the glyph comes from.
+
+      **The login prompt could not be centred, and finding out why is the batch.** A `normal`
+      window's requested origin was discarded — zeroed by the encoder, ignored by the parser, and
+      overwritten by the compositor — on the rule that a manager places it. True, and it leaves no
+      answer for a window that exists *before* any manager: the greeter is what somebody uses to
+      start the process that would place it.
+
+      So the offset is now a **preference** for `normal` and `dialog`: the first configure is
+      still held for a manager, so with one attached nothing changes, and it is the window's
+      origin only when nobody is managing. A `panel` still discards it — its role already names
+      the edge it docks to.
+
+      **Three layers had to agree**, which is why the first two attempts changed nothing: the
+      compositor placed it at the origin, then the encoder zeroed it, then the parser would have.
+      Each had its own comment explaining that the offset was a popup's.
+
+- [x] **Batch 9 — a clock on the top bar** ✅ (2026-09-01), the first of the three stretches.
+
+      **No timer object.** `sys_wait` already takes an absolute monotonic deadline and the shell
+      already computes one for the close it may have to insist on; the clock's next change is one
+      more candidate for the same minimum. A bar that ticks costs one wake a minute and no new
+      kernel object. The alignment is read from the *wall* clock and the deadline is *monotonic*,
+      which is not a mix-up — one says how far into the minute we are, the other is what the wait
+      counts.
+
+      **`YYYY-MM-DD HH:MM`, UTC, and no month names.** There is no timezone database and no
+      locale, so a localised form would be a fiction — the reason `date` emits fields and prints
+      UTC — and it means the bar and the command agree about what time it is. **Empty when the
+      clock is unset**, rather than 1970: the kernel reports the RTC as unreadable rather than
+      inventing an epoch, and a bar showing a fabricated date would undo that one layer up.
+
+      **The calendar arithmetic moved below both consumers**, from `coreutils::time` to a new
+      `libtime`. That is `userspace/CLAUDE.md`'s rule applied on the day it triggered: a helper
+      with one consumer belongs to that consumer, a helper with two belongs below both — and the
+      shell reaching into `coreutils` for it is the shape that rule exists to catch.
+
+- [x] **Batch 10 — desktop previews, and an image subsystem that turned out not to be needed** ✅
+      (2026-09-01). The request read as "this needs image support"; it does not.
+
+      **A sidebar row is a desktop that is not being composited**, so there is nothing to
+      photograph — the overview's existing thumbnails are captures of the *current* desktop's
+      windows, and the compositor can only capture what it composites. What the shell does have is
+      every window's origin, size and desktop, kept for the taskbar. So a miniature is arithmetic:
+      the desktop's ground, with a bordered box where each of its windows is, scaled by the
+      screen's own ratio. No capture, no scaling of pixels, no decoder.
+
+      **The sidebar stopped being a white sheet.** `paint` clears to `background`, which since the
+      theme turned light is the white an application draws on — so the sidebar was a white column
+      down the side of a blue desktop, which is what the request called out first. It is the
+      desktop's own ground darkened, with the window ground as ink: derived from two colours the
+      theme already has, so a new palette needs no extra decision. **Translucency is what was
+      asked for and it still waits on an alpha channel** — that decision is unchanged.
+
+      `cargo xtask shot` gained a fifth moment, because the overview is the one surface with no
+      other way to be looked at.
+
+- [x] **Batches, from the maintainer's list, each ending in a preview and — where the item is
+      behaviour rather than appearance — a boot.** ✅ Ten of them, in three passes of feedback,
+      recorded above and in [`m11-polish-list.md`](m11-polish-list.md).
+
+- [x] **No checkbox list here on purpose.** ✅ The shape held: batch, look, review, apply. What it
+      produced that the plan did not anticipate is that **most of the second and third passes were
+      defects rather than taste** — a menu whose rows could not be clicked, a scrollbar with no
+      pointer handler, an editor that exited when launched, a window that could not ask to be
+      centred. Polish is where a system is used for the first time in the way a person would use
+      it, and that is what finds those.
+
+- [x] **The stopping condition, and what "empty" turned out to mean** ✅ (2026-09-01). Decision 5
+      says M11 ends when the list is empty. It is not literally empty; what is true is that
+      **nothing left on it is polish**: real icons and a background image wait on the images item
+      filed for M12, and transparency waits on an alpha channel `libdraw` rules out today. Drop
+      shadows are the third, and they are held for a reason worth keeping — a shadow makes every
+      window's damage region larger than the window, and the compositor clears before it draws
+      straight into the scanned-out framebuffer, so shadows would make the flicker they sit on top
+      of worse. They belong after the feel work, not before it.
+
+### Part F — the control panel, slipped to M12 (2026-09-01)
+
+- [~] **Desktop settings a person can drive**: the theme file above, and the desktops
       `/dev/desktop` already serves. Its scope is stated here so that slipping it is a decision
-      rather than a disappearance.
+      rather than a disappearance — **and it slipped**. The details pass allowed exactly this, and
+      the reason it is the right call rather than the convenient one is decision 5's other half:
+      polish is what this milestone is for, and a settings application arriving *instead of* a
+      finished polish list was named as the wrong trade before either existed. The list is
+      finished; this is not started. It moves whole, with its gate.
 
 - [ ] **Gate**: `check-login` drives it — change a setting, and read the *file* back the way Part
       D of M10 reads a saved buffer back, from outside the application that wrote it.
@@ -3244,6 +3495,25 @@ Both applications ship thin in M10 and both want to be real: **tabs** in each, *
 the confirmation dialogs they imply), and **drag-and-drop within** a window. None of it is
 designed here; what this entry does is exist, so the line M10 draws is a line rather than an
 omission.
+
+**And images** — filed here on 2026-09-01, out of M11's polish list, because it is a subsystem
+rather than a batch. Two of that list's items want it: a background image, and window controls
+drawn from an icon set rather than as three strokes. What it is *not* wanted for is the desktop
+previews, which turned out to need only geometry the shell already holds (M11 Part E batch 10).
+
+Four options were costed, and the choice is deliberately not made here:
+
+| | Guest cost | Build cost | Disk, 1280×800 |
+|---|---|---|---|
+| Raw pixels staged at build time (P6) | ~40-line reader; the *writer* in `libdraw::ppm` is 10 | `xtask` converts with the `png` crate it already has | 3.0 MB, uncompressed |
+| QOI | ~250–300 lines, no dependency | ~200-line encoder, or the `qoi` crate host-side | ~400 KB–1 MB |
+| PNG in the guest | inflate (~400+ lines), unfiltering, refuse interlaced — or vet a `no_std` crate's whole tree | none | ~300–800 KB |
+
+The cost that makes it a milestone item is not any one of those: it is a **format decision, an
+asset pipeline in the image build, a size budget, and a place in the layering** — plus, for the
+wallpaper specifically, the **shell-owned background window** M11's settled decisions sketched
+(the shell holds `/home` and a theme; the compositor holds neither and should not gain a
+filesystem to draw wallpaper).
 
 **Its trigger is M10 landing**, and its ordering against M11 (themes and visual polish) is open —
 polish wants something finished to polish, and these are the two applications that will most show

@@ -280,7 +280,7 @@ Request, 24 bytes:
 | 8 | 2 | `role` tag |
 | 10 | 2 | role aux16 — a panel's `dock` edge; otherwise **zero** |
 | 12 | 4 | role aux32 — a panel's `reserve`, or a popup/dialog's `parent`; otherwise **zero** |
-| 16 | 4 | `offset_x`, signed — a **popup's** offset from its parent's origin; otherwise **zero** |
+| 16 | 4 | `offset_x`, signed — a **popup's** offset from its parent's origin, a `normal` or `dialog`'s requested origin on the screen; **zero** for a `panel` |
 | 20 | 4 | `offset_y`, signed — likewise |
 
 **A popup is placed by its creator, and the offset is how.** Only the client knows where the
@@ -288,8 +288,19 @@ menu item its popup drops from was drawn, so a manager does not place popups —
 exempt from the initial-configure hold below, because there is nobody to wait for.
 
 **A `dialog` is not.** It names a parent, but the parent carries its desktop membership and its
-lifetime — not its position. In placement terms a dialog is an ordinary listed window: it lands
-at the compositor's default origin, a manager places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
+lifetime — not its position. In placement terms a dialog is an ordinary listed window: a manager
+places it, and it is held like a `normal`.
+
+**A `normal` or `dialog` window's offset is a preference, not a placement** (M11 Part E batch 8).
+The compositor holds such a window's first configure until a manager answers, so with a manager
+attached the requested origin is never seen — placement remains entirely the manager's. It is the
+window's origin only when *nobody is managing*, which the deadline below releases into. Before
+that batch these words were written and read as zero, which meant a client that runs before any
+manager exists — the login greeter, whose whole purpose is to let somebody start the thing that
+manages windows — could only ever appear at the origin.
+
+**A `panel` still discards it.** Its role names the edge it docks to and how much it reserves; an
+offset would be a second answer to that question.
 
 A manager needs nothing **from the client** to place one: `WindowCreated` carries the parent id
 and the requested size, and the manager already tracks where the parent is from the geometry
@@ -1266,7 +1277,7 @@ nothing is how somebody changes their mind.
 
 **`0x0930` rather than `0x0910`**: the client block `0x0900`–`0x090F` is full and `0x0910`–`0x092F`
 is the manager's, so this begins a second client block rather than borrowing a number from a
-range that means something else.
+range that means something else. `Dismissed` (`0x0931`) continues it.
 
 **Delivered only for a gesture the user finished** — the button coming up. A grab taken away, or
 a `SYN_DROPPED` from the input stream, cancels: the pointer's position is then a guess, and a
@@ -1283,6 +1294,38 @@ a gesture the user completed was silently forgotten. **A cap on a record is a pr
 receiver**: a sender that can emit more than a receiver can take is a record that disappears on
 delivery. The compositor's send buffer and `libsurface`'s receive buffers are both this constant,
 spelled the same way, so the two cannot drift (PR #260 review).
+
+
+### `Dismissed` (`0x0931`, server → client)
+
+| Field | Bytes | Notes |
+|---|---|---|
+| `window` | 4 | the popup a press landed outside of |
+
+**A request, like `CloseRequested`, and refusable the same way**: the client destroys the window,
+and one that ignores it stays open. **Its own op rather than a second meaning for
+`CloseRequested`** — that one is somebody asking a window to close and may deserve a "save
+first?"; this is the pointer having gone elsewhere and deserves nothing but going away. Two things
+a client reads as "close" in one match arm is the mistake `Dropped` and `InputLost` had to be
+renamed out of.
+
+**Why the compositor has to say it.** A popup's owner never sees a press aimed at another window,
+so "click outside to dismiss" is not something a client can implement. Focus almost covers it and
+does not: focus is a consequence of stacking, so clicking a *window* raises it and the popup hears
+about the focus change — while clicking the desktop or a panel raises nothing, changes no focus,
+and left every popup in the system open (M11 Part E batch 5).
+
+**Sent for a press anywhere that is not the popup itself — its parent included.** A first version
+exempted the parent, meaning to protect the button that opened a menu; that was wrong twice, since
+a popup's parent is the whole *bar* rather than the button, and dismissing is exactly what makes
+clicking that button a second time close what it opened. The opening press cannot dismiss: the
+popup does not exist when it is routed.
+
+**Only the topmost popup is told.** Two can be up at once — `nxterm`'s menu, and the shell's
+rename prompt, which a manager hotkey opens whatever holds focus — and a press outside both
+dismisses the upper one; the next press dismisses the other. Self-healing rather than stuck, and
+deliberate: telling the lower one would be telling a client about a press that landed on a popup
+covering it, which is not "outside" from where that client sits.
 
 ## See also
 

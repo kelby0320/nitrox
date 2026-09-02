@@ -35,8 +35,13 @@ use librsproto::surface::{
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, sized, stack};
-use libui::widget::{GRIP_W, TITLE_BAR_H, TitleButtons, resize_grip, title_bar};
-use libui::widget::{Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, scrollbar};
+use libui::widget::{
+    GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip,
+    title_bar, window_frame,
+};
+use libui::widget::{
+    Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, menu_item, scrollbar,
+};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -44,6 +49,14 @@ pub const GRID_KIND: u32 = 0x4772_6964;
 /// The key on the menu bar's one item, so [`libui::layout::locate`] can find where it landed
 /// and the popup can be placed under it.
 pub const MENU_ITEM_KEY: u64 = 1;
+
+/// The popup's rows, keyed so the router can say which one the cursor is inside.
+///
+/// **Keys are what make hover possible**: `Router::inside` reports the id of the keyed widget
+/// under the pointer, so an unkeyed item is one the router cannot name (M11 Part E batch 3).
+pub const MENU_CLEAR_KEY: u64 = 2;
+/// See [`MENU_CLEAR_KEY`].
+pub const MENU_RESET_KEY: u64 = 3;
 
 /// The key on the grid, so the window can give it the keyboard on its first frame.
 ///
@@ -81,6 +94,18 @@ pub const TITLE: &str = "nxterm";
 
 /// Width of the scrollbar, in pixels.
 pub const SCROLL_W: u32 = 12;
+
+/// What the chrome costs the grid horizontally: the scrollbar, and the window's frame.
+///
+/// **One pair of constants, because three places compute this** — `resize` fits the cells,
+/// `grid_origin` places them, and `track_h` sizes the scrollbar against the same content box.
+/// They were three open-coded sums of `BAR_H + TITLE_BAR_H`, which agreed only because nothing
+/// had ever been added between the window's edge and its content. M11 Part E batch 2b added
+/// something (PR #265).
+const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W;
+
+/// And vertically: the title bar, the menu bar, and the frame.
+const CHROME_H: u32 = BAR_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
 
 /// What the chrome can ask the terminal to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -235,7 +260,9 @@ impl App {
     pub fn new(cols: usize, rows: usize, metrics: Metrics) -> App {
         let g = metrics.pixel_size(cols, rows);
         App {
-            window: Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H),
+            // The same two sums `resize` subtracts, so the window this opens at is a window
+            // whose grid is exactly `cols` x `rows` — and stays so after the first `Configure`.
+            window: Size::new(g.w + CHROME_W, g.h + CHROME_H),
             maximized: false,
             grid: Grid::new(cols, rows),
             parser: Parser::new(),
@@ -288,9 +315,8 @@ impl App {
             return None;
         }
         self.window = size;
-        let cols = (size.w.saturating_sub(SCROLL_W) / self.metrics.cell_w).max(1) as usize;
-        let rows = (size.h.saturating_sub(BAR_H + TITLE_BAR_H) / self.metrics.cell_h).max(1)
-            as usize;
+        let cols = (size.w.saturating_sub(CHROME_W) / self.metrics.cell_w).max(1) as usize;
+        let rows = (size.h.saturating_sub(CHROME_H) / self.metrics.cell_h).max(1) as usize;
         let reflow = self.grid.resize(cols, rows);
         // **Through the map, not around it.** `view_top` is an absolute line number and the
         // rewrap changed how many lines exist above it.
@@ -301,7 +327,10 @@ impl App {
 
     /// Where the grid's top-left sits inside the window.
     pub fn grid_origin(&self) -> libdraw::geom::Point {
-        libdraw::geom::Point::new(0, (BAR_H + TITLE_BAR_H) as i32)
+        libdraw::geom::Point::new(
+            WINDOW_CONTENT_X as i32,
+            (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H) as i32,
+        )
     }
 
     /// Feed bytes from the program on the other end.
@@ -512,7 +541,7 @@ impl App {
         // cannot be pressed. That is not hypothetical: `MIN_THUMB` is 16 and a following view
         // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
         // its thumb *entirely* under the grip.
-        self.window.h.saturating_sub(BAR_H + TITLE_BAR_H + GRIP_W)
+        self.window.h.saturating_sub(CHROME_H + GRIP_W)
     }
 
     /// The element tree for the current state.
@@ -522,13 +551,18 @@ impl App {
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
-    pub fn view(&self, ui: &UiTheme) -> Element<Msg> {
+    pub fn view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let grid_px = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
 
         let bar = menu_bar(
             vec![
-                button("Terminal", Msg::ToggleMenu, WidgetState::default(), &ui)
+                button(
+                    "Terminal",
+                    Msg::ToggleMenu,
+                    WidgetState { hovered: hovered == Some(MENU_ITEM_KEY), ..Default::default() },
+                    &ui,
+                )
                     .key(MENU_ITEM_KEY),
             ],
             BAR_H,
@@ -557,9 +591,10 @@ impl App {
             &ui,
         )
         .key(TITLE_KEY);
-        let body = dock(
-            vec![
-                docked(Edge::Top, title),
+        let body = window_frame(
+            title,
+            dock(
+                vec![
                 docked(Edge::Top, bar.key(BAR_KEY)),
                 docked(
                     Edge::Right,
@@ -576,8 +611,10 @@ impl App {
                     )
                     .key(SCROLLBAR_KEY),
                 ),
-            ],
-            custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
+                ],
+                custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
+            ),
+            &ui,
         );
 
         // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
@@ -612,19 +649,27 @@ impl App {
     /// **The theme is the caller's**, like [`view`](Self::view)'s: the popup is painted by the
     /// binary, and a menu built from one theme beside a window painted with another is the same
     /// two-themes mistake one surface further out.
-    pub fn menu_view(&self, ui: &UiTheme) -> Element<Msg> {
-        self.menu(ui)
+    pub fn menu_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        self.menu(ui, hovered)
     }
 
     /// The popup's contents.
-    fn menu(&self, ui: &UiTheme) -> Element<Msg> {
-        use libui::element::{column, fill};
+    fn menu(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        use libui::element::column;
+        // **`menu_item`, not `button`** (M11 Part E batch 3): a menu row highlights the way a
+        // selected list row does, because they are the same thing seen twice — the item that
+        // would happen if you acted now. `hovered` comes from the popup's own router.
         let items = column(vec![
-            button("Clear", Msg::Clear, WidgetState::default(), ui),
-            button("Reset", Msg::Reset, WidgetState::default(), ui),
+            menu_item("Clear", Msg::Clear, hovered == Some(MENU_CLEAR_KEY), ui)
+                .key(MENU_CLEAR_KEY),
+            menu_item("Reset", Msg::Reset, hovered == Some(MENU_RESET_KEY), ui)
+                .key(MENU_RESET_KEY),
         ]);
-        // A backing fill under the items, so the menu is opaque over whatever it covers.
-        stack(vec![fill(ui.face), padding(Insets::all(2), items)])
+        // A backing fill under the items, so the menu is opaque over whatever it covers — and a
+        // border around it, because on a light theme the face and the window underneath are
+        // within a few units of each other (M11 Part E, batch 2). `popup_frame` supplies both,
+        // and is what the applications modal uses too.
+        libui::widget::popup_frame(padding(Insets::all(2), items), ui)
     }
 }
 
@@ -674,7 +719,7 @@ mod tests {
         }
         assert!(a.scroll().scrollable(), "precondition: there is a thumb to press");
 
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar is keyed");
@@ -707,7 +752,7 @@ mod tests {
         // must reach the grip rather than the title bar's drag or the grid's keys.
         let mut a = app();
         let (t, l, mut r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let g = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
         let p = PointerEvent {
             window: 1,
@@ -971,13 +1016,14 @@ mod tests {
             // menu is a *window*, so opening it adds nothing here. Since M9 Part E the root is
             // a stack of two — the body and the resize grip over its corner — rather than the
             // dock alone, and that is still fixed.
-            let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default()).node else {
+            let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default(), None).node else {
                 panic!("open={open}: the window's tree is the body under its grip");
             };
             assert_eq!(layers.len(), 2, "open={open}: the body and the grip, and nothing else");
             assert!(
-                matches!(layers[0].node, libui::element::Node::Dock { .. }),
-                "open={open}: the body is the dock"
+                matches!(layers[0].node, libui::element::Node::Stack { .. }),
+                "open={open}: the body is the framed window — a border, a face and the dock \
+                 inside them, since M11 Part E batch 2b"
             );
         }
     }
@@ -993,20 +1039,27 @@ mod tests {
         let cell = FixedCell { w: 8, h: 16 };
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
 
-        let view = a.view(&UiTheme::default());
+        let view = a.view(&UiTheme::default(), None);
         let l = layout(&view, bounds, &cell);
         let item = locate(&view, &l, MENU_ITEM_KEY).expect("the menu item is keyed");
         a.menu_anchor = Some(item);
         a.menu_open = true;
 
         // The popup hangs from the item's left edge, immediately below it. The menu bar sits
-        // *under* the title bar since M9 Part A, so "inside the bar" is measured from there.
-        assert!(item.origin.y >= TITLE_BAR_H as i32, "the item is below the title bar");
-        assert!(item.bottom() <= (TITLE_BAR_H + BAR_H) as i64, "the item is inside the menu bar");
+        // *under* the title bar since M9 Part A, so "inside the bar" is measured from there —
+        // and inside the window's frame since M11 Part E batch 2b, which moves both bars down by
+        // the top border. Written as the sum rather than a number, so the next thing added to
+        // the chrome moves this with it.
+        let bar_top = (WINDOW_CONTENT_Y + TITLE_BAR_H) as i32;
+        assert!(item.origin.y >= bar_top, "the item is below the title bar");
+        assert!(
+            item.bottom() <= (bar_top as u32 + BAR_H) as i64,
+            "the item is inside the menu bar"
+        );
 
         // And the menu it will hold has a real size to be created at — measured, not guessed,
         // because a popup window needs its extent before it exists.
-        let menu = a.menu_view(&UiTheme::default());
+        let menu = a.menu_view(&UiTheme::default(), None);
         let size = libui::layout::measure(
             &menu,
             libui::layout::Constraints::loose(bounds.size),
@@ -1027,8 +1080,26 @@ mod tests {
         // that costs the user a row of text.
         let a = app();
         let g = a.metrics.pixel_size(20, 6);
-        assert_eq!(a.window_size(), Size::new(g.w + SCROLL_W, g.h + BAR_H + TITLE_BAR_H));
-        assert_eq!(a.grid_origin().y, (BAR_H + TITLE_BAR_H) as i32, "the grid starts below both");
+        assert_eq!(a.window_size(), Size::new(g.w + CHROME_W, g.h + CHROME_H));
+        // **And the grid starts inside the frame**, not at the window's edge: the origin is what
+        // maps a pointer to a cell, so a frame the origin did not know about would offset every
+        // click by four pixels — invisible until a click near a cell boundary lands one column
+        // over (M11 Part E batch 2b).
+        assert_eq!(
+            a.grid_origin(),
+            libdraw::geom::Point::new(
+                WINDOW_CONTENT_X as i32,
+                (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H) as i32
+            ),
+            "the grid starts below the bars and inside the frame"
+        );
+        // The window is the grid plus chrome, and the chrome is *all* of it — a test that added
+        // up only the parts it remembered would pass for a frame that took space from the grid.
+        assert_eq!(
+            a.window_size().h - a.grid_origin().y as u32 - g.h,
+            libui::widget::WINDOW_BORDER + libui::widget::WINDOW_FRAME,
+            "what is left below the grid is the frame and the border, and nothing else"
+        );
     }
 
     #[test]
@@ -1219,7 +1290,7 @@ mod tests {
     /// The tree, layout and router of a live window, with the grid focused as `main` does it.
     fn window(a: &App) -> (libui::diff::Tree, libui::layout::Layout, libui::route::Router) {
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let mut t = libui::diff::Tree::new();
         t.update(&e, &l).expect("a clean frame");
@@ -1238,7 +1309,7 @@ mod tests {
     fn click_maximise(a: &mut App) {
         use libui::widget::TITLE_BUTTON_W;
         let (t, l, mut r) = window(a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         let x = a.window_size().w as i32 - (TITLE_BUTTON_W as i32 + TITLE_BUTTON_W as i32 / 2);
         let y = TITLE_BAR_H as i32 / 2;
         let mut msgs = alloc::vec::Vec::new();
@@ -1268,7 +1339,7 @@ mod tests {
         // line, so this is the difference between a demo and a terminal.
         let mut a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
 
         for msg in [
             r.key(&t, &e, key_ev(35, KEY_DOWN)),   // h, pressed
@@ -1288,7 +1359,7 @@ mod tests {
         // down, so acting on the release too doubles every character typed.
         let mut a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         a.update(r.key(&t, &e, key_ev(35, KEY_DOWN)).unwrap());
         a.update(r.key(&t, &e, key_ev(35, KEY_UP)).unwrap());
         assert_eq!(a.take_outbox(), b"h", "the release typed as well");
@@ -1302,7 +1373,7 @@ mod tests {
         // with the pointer, and `route`'s bubbling is there for a keyboard menu that M6 owns.
         let a = app();
         let (t, _l, r) = window(&a);
-        let e = a.view(&UiTheme::default());
+        let e = a.view(&UiTheme::default(), None);
         assert!(matches!(r.key(&t, &e, key_ev(35, KEY_DOWN)), Some(Msg::Key(_))));
     }
 

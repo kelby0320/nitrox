@@ -124,14 +124,23 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     **There is no Part F**: the details pass counted six, and the sixth — graduating
     `display-substrate.md` — was retired as "not a part" and paid off under M9's account on
     2026-08-30, where the debt belonged.
-    **M11 — in progress (A–D of F landed 2026-09-01)**: `xtask preview`, which renders the
+    **M11 — ✅ complete (2026-09-01), in five parts**: `xtask preview`, which renders the
     toolkit's reference on the host so a judgement about how something looks costs a second
     rather than a boot (A); one `Theme` in `libdraw`, where the compositor and the toolkit can
     both reach it (B); that theme read from `/home/theme.toml` and handed to each application on
-    the setup record it already gets (C); and **the UI font stopping being a terminal font** (D)
-    — two font roles, a proportional face for every label in the system and the fixed-advance one
-    kept for the grid. What remains is the polish passes (E), driven by a list the maintainer
-    writes while test-driving, and a control panel (F) that is allowed to slip to M12. (Desktops and the applications milestone — M8, and what is now M10 — were
+    the setup record it already gets (C); **the UI font stopping being a terminal font** (D) — two
+    font roles, a proportional face for every label and the fixed-advance one kept for the grid;
+    and **the polish passes** (E) — ten batches over three rounds of maintainer feedback, from a
+    light palette measured off a reference desktop to desktop previews in the overview. **Part F,
+    the control panel, slipped to M12** as the details pass allowed: the list finished and it had
+    not started, and a settings application arriving instead of a finished polish list was named
+    as the wrong trade before either existed.
+
+    **What the polish passes actually found**: most of rounds two and three were *defects*, not
+    taste — an applications menu whose rows could not be clicked, a scrollbar built with no
+    pointer handler, an editor that exited when launched from the menu, a window that had no way
+    to ask where it should appear. Polish is the first time a system is used the way a person
+    would use it, and that is what surfaces those. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
     Design in
