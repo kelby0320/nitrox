@@ -3468,7 +3468,7 @@ it is noticed on. Its own list, and its own milestone.
       straight into the scanned-out framebuffer, so shadows would make the flicker they sit on top
       of worse. They belong after the feel work, not before it.
 
-### Part F — the control panel, slipped to M12 (2026-09-01)
+### Part F — the control panel, not built and no longer scheduled (2026-09-01)
 
 - [~] **Desktop settings a person can drive**: the theme file above, and the desktops
       `/dev/desktop` already serves. Its scope is stated here so that slipping it is a decision
@@ -3476,13 +3476,18 @@ it is noticed on. Its own list, and its own milestone.
       the reason it is the right call rather than the convenient one is decision 5's other half:
       polish is what this milestone is for, and a settings application arriving *instead of* a
       finished polish list was named as the wrong trade before either existed. The list is
-      finished; this is not started. It moves whole, with its gate.
+      finished; this is not started.
 
-- [ ] **Gate**: `check-login` drives it — change a setting, and read the *file* back the way Part
-      D of M10 reads a saved buffer back, from outside the application that wrote it.
+- [~] **It did not move to M12 either — it became a trigger**: *when the settings outgrow a
+      hand-edited file*, on the maintainer's judgement after living with the theme file for a
+      milestone. A part deferred twice is a part nobody has needed, and a schedule slot would be
+      the third deferral rather than the first delivery. Recorded in
+      [`deferred-decisions.md`](../rationale/deferred-decisions.md) with the rest, since it now
+      belongs to no milestone.
 
-- [ ] **May move to M12.** Polish is what this milestone is for, and a settings application that
-      arrives instead of a finished polish list is the wrong trade.
+- [ ] **Gate, kept with it**: `check-login` drives it — change a setting, and read the *file* back
+      the way Part D of M10 reads a saved buffer back, from outside the application that wrote
+      it.
 
 
 ## Milestone 12 — applications, deepened
@@ -3497,8 +3502,10 @@ designed here; what this entry does is exist, so the line M10 draws is a line ra
 omission.
 
 **And images** — filed here on 2026-09-01, out of M11's polish list, because it is a subsystem
-rather than a batch. Two of that list's items want it: a background image, and window controls
-drawn from an icon set rather than as three strokes. What it is *not* wanted for is the desktop
+rather than a batch. Two of that list's items wanted it: a background image, which M12 Part F
+builds, and window controls drawn from an icon set, which it does **not** — an icon set is a
+naming convention, a size convention and a lookup path, and stays filed behind the decoder that
+would make it possible. What it is *not* wanted for is the desktop
 previews, which turned out to need only geometry the shell already holds (M11 Part E batch 10).
 
 Four options were costed, and the choice is deliberately not made here:
@@ -3518,6 +3525,304 @@ filesystem to draw wallpaper).
 **Its trigger is M10 landing**, and its ordering against M11 (themes and visual polish) is open —
 polish wants something finished to polish, and these are the two applications that will most show
 it.
+
+### Scope, settled 2026-09-01
+
+M11's close is what forced this: the polish list emptied into things that were not polish, and
+they needed somewhere to go that was not "M12, eventually".
+
+**Three strands, and the parts that carry them are in the details pass below** — this list is
+what the milestone is *for*, not how it is cut up. (It assigned its own A/B/C before the details
+pass existed, which left two incompatible letterings dated the same day; PR #266 review, finding
+2.)
+
+- **Application depth.** Tabs in each, undo/redo and find in the editor, file operations in the
+  browser (rename, delete, copy, new folder), and drag-and-drop *within* a window. Its
+  confirmation dialogs make this the first *application* to create a `Role::Dialog`.
+- **Copy and paste.** The largest strand, and the one that needed a decision before it could be
+  scoped.
+- **Images.** The decoder, the asset path, and the wallpaper as a shell-owned background window.
+
+**What moved out.** The compositor work is [Milestone 13](#milestone-13--the-compositors-feel):
+different work, driven by measurement rather than by use, and a milestone holding both cannot say
+when it is done. **The control panel is trigger-gated rather than scheduled** — see below.
+
+### The control panel is a trigger now, not a part
+
+It was M11 Part F, "allowed to slip", and it slipped. Rather than move it a second time, its
+condition is written down: **when the settings outgrow a hand-edited file.**
+
+That is the maintainer's own judgement, on 2026-09-01, after living with the theme file for a
+milestone: *"the file is fine. A control panel will be needed when we have a lot more settings and
+the file becomes cumbersome."* A part that is deferred twice is a part nobody has needed yet, and
+a trigger says that honestly where a schedule pretends otherwise. Its scope is unchanged and its
+gate is unchanged; what it loses is a slot it was not going to fill.
+
+`form` (see [What this unblocks](#what-this-unblocks)) is now *eligible* by its own stated
+condition — "after the toolkit and the first applications" — and is deliberately left filed
+rather than scheduled, for the same reason.
+
+### Decision 1 — the clipboard is a resource server, and a binding is the authority
+
+Settled with the maintainer 2026-09-01, so Part E can be built rather than re-argued.
+
+**Its own process, with its endpoint bound per session.** A clipboard is shared mutable state
+between mutually untrusting programs, and "anything running may read what you last copied" is
+ambient authority — the mechanism by which a password manager's clipboard gets scraped on real
+systems. This system already has the answer: **you can read the clipboard if it is in your
+namespace**, and rights are attenuable, so a profile can be given a write-only clipboard or none
+at all. No new machinery, and a capability story Wayland does not have.
+
+**It stores, which is the point of choosing it over offers.** The alternative considered was
+Wayland's model — the copier keeps the data and the compositor brokers a transfer on paste, so
+nothing is stored and no third party ever holds your text. It was rejected for one reason: the
+clipboard dies with the application you copied from, which is the behaviour Linux users install
+clipboard managers to escape. Copy from the editor, close it, paste.
+
+**The binding is the authority, and focus-gating is deferred.** A read succeeds for anyone holding
+the endpoint, whenever they like — consistent with every other resource here. Focus-gated reads
+are what modern desktops do and would close background scraping *within* a session, at the cost of
+a dependency between the clipboard server and the compositor and a read that fails for reasons its
+caller cannot see. **Trigger: an application inside a session that the person does not trust** —
+which is the day profiles stop being a build-time idea.
+
+**Text first.** `text/plain` is the honest start; the type tag exists so a later image or a typed
+stream is a second kind rather than a second clipboard.
+
+**And the terminal needs selection before it can copy at all** — `libterm`'s grid has none, which
+M5 deferred alongside the clipboard itself. That is part of this work, not a prerequisite for it.
+
+### Decision 2 — PNG, decoded in the guest, because a wallpaper is the user's
+
+Settled with the maintainer 2026-09-01, **against the recommendation**, and the reasoning is worth
+keeping because it is a judgement about what the system is for rather than about cost.
+
+The question upstream of the format was: **is a wallpaper a shipped asset or a file a person drops
+in their home directory?** Shipped assets would have allowed the decode to happen on the host at
+build time, and the guest to read something trivial — QOI at ~300 lines, or raw P6 at ~40 and 3 MB
+of disk. Both were costed and both were cheaper.
+
+The answer is that a wallpaper a person cannot supply is not really a wallpaper. So the guest
+decodes what a person actually has, which is PNG: **inflate** (RFC 1951 — fixed and dynamic
+Huffman, a 32 KiB window), **unfiltering**, and a refusal for interlaced. Roughly 400–600 lines,
+and the largest single piece of code M12 contains.
+
+**Hand-rolled or a crate is not settled here.** The bar for a userspace dependency is in
+`userspace/CLAUDE.md` and the whole transitive tree must clear it; the precedent cuts both ways —
+`ab_glyph` was taken deliberately, and `libcrypto` was hand-rolled on the same page. Inflate is
+well specified and testable against published vectors, and it is **reusable**: a package format,
+compressed logs and anything else later want exactly this. That argues for owning it, but not
+loudly enough to settle it before somebody has tried building the alternatives for
+`x86_64-unknown-nitrox`.
+
+**Consequences that follow from "the user's file", not from PNG.** The wallpaper is read by
+`desktop-shell` — it holds `/home` and a theme, where the compositor holds neither and should not
+gain a filesystem to draw with — and shown as a full-screen background window it owns. The theme
+file gains a key naming the path, bounded like `font_ui` is and for the same reason. An image that
+does not load falls back to the ground colour and says so, which is the stance every other
+unreadable value in that file already gets.
+
+**Icons stay filed.** PNG makes an icon set *possible*; an icon set is a naming convention, a size
+convention and a lookup path, which is a second decision and not this one.
+
+### Details pass, 2026-09-01
+
+Six parts, and the governing decisions below them, so each can be built rather than re-argued.
+The two taken before this pass — the clipboard's owner and the image format — are above.
+
+### Part A — dialogs, and the second window
+
+- [ ] **`Role::Dialog` gets its first *application*, and the toolkit grows a dimension.** The
+      role has existed since M2 Part A and is created today by exactly one thing: `ui-testclient`,
+      which makes one deliberately so that the held-configure and ignored-offset halves of its
+      contract are asserted — added because a reviewer asked for it (PR #220, finding 2), and
+      watched by `check-display`. Its placement change in M11 Part E batch 8 is covered by a host
+      test named for that batch.
+
+      So the gap is not coverage, it is *use*: no program a person runs has ever created one, and
+      `widget-toolkit.md` §11 named exactly that as the trigger — "Multi-window applications. One
+      `App` drives one window. Trigger: dialogs that are real windows rather than `stack`
+      overlays". This is that day.
+
+      (The first version of this said the role had "no consumer at all" and was "exercised by
+      nothing", which was false twice over and would have sent the building session looking for
+      coverage that exists — PR #266 review, blocking 1.)
+
+- [ ] **Gate**: `check-login` drives a confirmation to both answers. A dialog that only ever gets
+      "yes" is half a control.
+
+### Part B — the browser: file operations, and drag-and-drop within a window
+
+- [ ] **Rename, delete, copy, new folder**, each with the confirmation Part A makes possible.
+      `nxfiles` holds `/home` and performs them itself: it has the authority for its own subtree,
+      and routing them through the shell would be asking a supervisor to do what the application
+      is already entitled to.
+
+- [ ] **Copy goes through `libfs::copy_file`**, which maps source and destination and copies
+      between the mappings with no heap at all, bounded by `MAX_COPY` (8 MiB) — a bound whose own
+      doc settles the question, since "the pages themselves are demand-paged, so this bounds VA,
+      not RAM", and which names a windowed copy as the refinement if a real workload exceeds it.
+      It is what `copy_tree` and the `copy` coreutil already use.
+
+      (An earlier draft re-opened streaming-versus-bound as though it were open, and pointed at
+      `read_file` — the one function here that *does* allocate the whole file, and the wrong one
+      for a copy to call. PR #266 review, finding 4.)
+
+- [ ] **Drag-and-drop within a window** — the half M10 Part E did not build, where the compositor
+      is not involved because the payload never leaves the client.
+
+- [ ] **Gate**: `check-login` renames a file and reads the new name back with `nxsh`, the way the
+      editor's save is already checked from outside the application that did it.
+
+### Part C — the editor: undo, redo and find
+
+- [ ] **Undo grouping is the decision**, not the stack. Per keystroke is unusable and per save is
+      useless; what a person expects is a word or a line. It belongs in `TextAreaState`, which
+      already owns the buffer, the cursor and the selection.
+
+- [ ] **Find reuses the shape the save-as field established** (M11 Part E batch 7): a mode in
+      which the keys are the field's rather than the buffer's. That was called "the first widget
+      that wants a key"; this is the second.
+
+- [ ] **Gate**: type, undo, redo, and read the file back from outside.
+
+### Part D — tabs, in both applications
+
+- [ ] **A tab strip is a widget**, and the toolkit has none. §8's rule is that an application
+      needed it, so it exists — `scrollbar` and `text_area` each arrived for one. Two wanting it
+      clears that bar with room to spare rather than being it.
+
+- [ ] **Gate**: two buffers in one window, switched, and the right one saved.
+
+### Part E — copy and paste
+
+- [ ] **A clipboard server**, endpoint bound per session, storing rather than brokering. Decision 1
+      above.
+
+- [ ] **A kill ring, not a slot** — see decision 3.
+
+- [ ] **Reachable as a path**, `/dev/clipboard`, and usable from a pipeline — decision 4.
+
+- [ ] **Selection in the terminal grid**, which `libterm` has never had: M5 deferred it in the same
+      breath as the clipboard. What a selection *is* across a reflow is the question inside it.
+
+- [ ] **Gate**: copy in the editor, paste in the terminal, and the shell prints what was copied —
+      one gesture crossing two applications and a server, which is the whole point.
+
+### Part F — images and the wallpaper
+
+- [ ] **PNG decoded in the guest** — inflate, unfiltering, no interlacing. Decision 2 above.
+      Whether that is hand-rolled or a crate is settled by building both for
+      `x86_64-unknown-nitrox`, which `userspace/CLAUDE.md` requires before taking a dependency
+      anyway.
+
+- [ ] **The wallpaper is a window `desktop-shell` owns**, full-screen and bottom-most. The shell
+      holds `/home` and a theme; the compositor holds neither and should not gain a filesystem in
+      order to draw.
+
+- [ ] **Fit if larger, centre if smaller** — decision 6.
+
+- [ ] **Gate**: `check-login` names a staged image in the theme, and the shell reports the size it
+      decoded. A picture is pixels a release-image boot has no reference for; the dimensions are
+      what can be asserted.
+
+### Governing decisions
+
+Settled with the maintainer 2026-09-01. Decisions 1 and 2 (the clipboard's owner, and PNG) are
+recorded above with M12's scope; these are the rest.
+
+**3. The clipboard is a kill ring, and the ring is the server's while the cursor is the
+client's.** A single slot loses the thing you copied two copies ago, which is what every editor
+with a kill ring exists to avoid. So the server keeps the last N entries, most recent first, and
+`Copy` pushes.
+
+The division is the interesting half: **the ring is shared and the position in it is not.** A
+"paste the one before that" gesture is a property of the editing somebody is doing right now, not
+of the machine — two applications cycling at once would fight over one cursor, and a cursor that
+one client advanced would move under another. So the server answers by index and holds no
+per-client state.
+
+**A paste always takes the newest entry, and never consults a cursor.** That is the ordinary case
+and the one that matters: copy in one application, paste in another. The client asks for index 0
+and gets what was last copied, whoever copied it.
+
+**Cycling is a continuation of a paste, not state a client keeps.** It is valid only immediately
+after one — it *replaces* what was just inserted — and any other action ends the sequence:
+typing, a copy, focus moving away. That is Emacs's rule for `M-y`, and it is the rule rather than
+an implementation detail, because it is what makes a stale cursor unreachable: the position exists
+only inside one uninterrupted gesture, and anything that could invalidate it has already ended it.
+
+**Where it can still go stale, the server says so.** Decision 4 makes the clipboard reachable from
+a pipeline, so something *not* being driven by the person can push while they are mid-cycle. Each
+entry therefore comes back with the ring's serial, and a cycle request carries the serial it last
+saw; if the ring has moved under it the server says so and the client starts again from the
+newest. One `u64`, and it turns a silent wrong paste into a visible restart.
+
+(The under-specified version of this said only that "a client remembers which entry it last pasted
+and asks for the next", which reads as persistent state — the maintainer asked what that does to a
+copy between two applications, and the answer is nothing, but the question is what produced the
+three rules above.)
+
+**4. It is reachable as a path, and usable from a pipeline.** `/dev/clipboard`, bound into the
+session namespace the way `/dev/tty` and `/dev/draw` are. There is no generic read/write verb in
+this system — a resource server speaks its own ops, as the tty does — so shell access is a small
+utility either side of the pipe rather than a new file interface.
+
+That is the maintainer's addition to this pass, and it is the more interesting half of the
+decision: a clipboard that only graphical applications can reach would be the first resource in
+this system that a pipeline cannot. Making it a path also makes the ring *inspectable* — listing
+what is in it is a command rather than a feature somebody has to build a window for.
+
+**5. A capped payload first, and chunking is expected rather than hypothetical.** The IPC payload
+is 4008 bytes, so one exchange carries about two screens of terminal text; the cap is a named
+promise like `MAX_EVENT_BODY` is. The maintainer's judgement is that this will not be enough for
+long — "we can start with 1, but we may need to end up at 2" — so the trigger is written as an
+expectation: **the first thing somebody cannot copy.** A shared memory object was the third option
+and is not taken: M10 rejected handle transfer for drops because a refused handle has no clean
+owner, and the clipboard would inherit that question.
+
+**6. `Ctrl+C`/`Ctrl+V`, and `Ctrl+Shift` in the terminal.** What fingers already know, and the
+terminal has to differ because `Ctrl+C` means interrupt there and always will. The kill ring needs
+a third binding to cycle; it is a part-level detail, and `Ctrl+Shift+V` cycling on repeat is the
+obvious candidate.
+
+**7. The wallpaper fits or centres, and scaling to fill is deferred as a *mode*.** `box_downscale`
+already scales down with a box average and explicitly refuses to scale up, so fitting a too-large
+picture and centring a smaller one needs no new code. Filling needs an upscaler and a decision
+about interpolation. The maintainer wants both eventually — "it'd be nice to have 1 and 2 as
+options" — so the theme key is designed with room for a mode beside the path, and only one mode
+ships.
+
+## Milestone 13 — the compositor's feel
+
+Named 2026-09-01, when M11's polish pass produced two reports that were not about appearance and
+one diagnosis that explained both.
+
+**The work is ordered, and the order is the point.**
+
+- **Part A — the shadow buffer.** Compose into RAM and copy the finished damage rectangle to the
+  aperture in one pass. Today `libdraw::compose::compose` fills each damage rectangle with the
+  background and *then* blits the surfaces back, directly into the framebuffer being scanned out —
+  so every motion of a drag paints the union of the old and new rectangles background-first and
+  the scanout catches it. That is the flicker reported on 2026-09-01, and probably also
+  "moving a window is slow" from 2026-08-28. **A measurement comes first**: the claim that this is
+  also *faster* — the per-pixel work moving off MMIO into cached RAM — is plausible and unproven,
+  and a milestone that opens by proving it is worth more than one that assumes it.
+- **Part B — alpha.** `libdraw` says in as many words that there is no alpha channel and this is
+  not the beginning of one; changing that is a substrate decision, not a batch. **It comes after
+  Part A because Part A makes it cheap**: once compositing goes through RAM, blending is a small
+  change to a loop that already exists, where doing it first means writing the blend against the
+  scanned-out aperture and then rewriting it.
+- **Part C — what alpha unlocks**, both of which M11 deferred *onto* it: drop shadows around
+  windows and menus, and the translucent overview sidebar. Shadows in particular must not come
+  first — a shadow makes every window's damage region larger than the window, which without Part A
+  enlarges exactly the flash it sits on top of.
+
+**Its gate is not `check-display`.** That gate compares a settled screen against a render, and
+none of this changes a settled screen — it changes what happens *between* settled screens. What
+Part A needs is a measurement and, for the flicker specifically, a person looking at it; what
+Parts B and C need is `check-display`'s reference moving deliberately, which is the shape M11
+already used.
 
 ## What this unblocks
 

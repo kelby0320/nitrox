@@ -21475,3 +21475,220 @@ degrades from a background flash to tearing. Cost is ~4 MB for 1280×800 and one
 damaged pixels per frame; it may also be *faster*, since the per-pixel work moves off MMIO into
 cached RAM, but that is a measurement to take rather than a claim to make. Recorded here so the
 feel milestone starts from evidence rather than from a symptom.
+
+## 2026-09-01 — M12 and M13 scoped, and two decisions taken before either starts
+
+M11 closed by emptying its polish list into things that were not polish, so the next two
+milestones were scoped the same day, with a details pass on the two questions that would otherwise
+be answered while coding.
+
+### The shape
+
+**M12 — applications, deepened**: application depth (tabs, undo/redo, find, file operations, and
+the confirmation dialogs that make it the first real consumer of `Role::Dialog`), **copy and
+paste**, and **images**. **M13 — the compositor's feel**: the shadow buffer, then alpha, then the
+shadows and translucency that wait on it.
+
+**They are two milestones rather than one because they are different kinds of work.** Application
+depth is driven by using applications; compositor work is driven by measurement. A milestone
+holding both cannot say when it is done — and the feel work would queue behind editor tabs, when
+it is the thing noticed every time the machine is touched.
+
+**And the order inside M13 is load-bearing.** The shadow buffer makes alpha *cheap*: once
+compositing goes through RAM, blending is a small change to a loop that already exists, where
+doing alpha first means writing the blend against the scanned-out aperture and then rewriting it.
+Shadows come last because a shadow enlarges every window's damage region — without the shadow
+buffer it would enlarge exactly the flash it sits on top of.
+
+### The control panel becomes a trigger
+
+It was M11 Part F, "allowed to slip", and slipped. Rather than move it into M12 and possibly move
+it again, its condition is written down: **when the settings outgrow a hand-edited file.** The
+maintainer's judgement after a milestone of living with the theme file: *"the file is fine. A
+control panel will be needed when we have a lot more settings and the file becomes cumbersome."*
+
+A part deferred twice is a part nobody has needed, and a trigger says so where a schedule pretends
+otherwise. `form` is treated the same way — it is now *eligible* by its own stated condition and
+is left filed rather than scheduled.
+
+### Decision 1 — the clipboard is a resource server, and a binding is the authority
+
+M5 deferred the clipboard with a specific argument: there was none anywhere, and inventing one for
+a terminal would decide its design by accident. That condition expired — there are now three
+consumers that shape it honestly: the editor (whose `text_area` has selection), the browser
+(paths), and the terminal (which has *no* selection yet, so grid selection is part of the work).
+
+**Its own process, endpoint bound per session.** A clipboard is shared mutable state between
+mutually untrusting programs, and "anything running may read what you last copied" is ambient
+authority — how a password manager's clipboard gets scraped on real systems. This system already
+answers that with a binding, and rights are attenuable, so a profile can hold a write-only
+clipboard or none. That is a capability story Wayland does not have.
+
+**It stores, and that is why it was chosen over offers.** The alternative was Wayland's model —
+the copier keeps the data, the compositor brokers a transfer on paste, nothing is stored and no
+third party holds your text. Rejected for one reason: the clipboard dies with the application you
+copied from, which is what Linux users install clipboard managers to escape.
+
+**The binding is the authority.** A read succeeds for anyone holding the endpoint, whenever they
+like — consistent with every other resource here. **Trigger for focus-gated reads: an application
+inside a session that the person does not trust**, which is the day profiles stop being a
+build-time idea.
+
+### Decision 2 — PNG in the guest, taken against the recommendation
+
+The question upstream of the format was whether a wallpaper is a **shipped asset** or **a file a
+person drops in their home directory**. Shipped assets would have let the decode happen on the
+host at build time: QOI at ~300 lines and ~400 KB–1 MB, or raw P6 at ~40 lines and 3 MB. Both were
+costed, both are cheaper, and both were recommended.
+
+**The maintainer chose user files**, and the reasoning is a judgement about what the system is for
+rather than about cost: a wallpaper a person cannot supply is not really a wallpaper. So the guest
+decodes what people actually have — inflate (RFC 1951), unfiltering, and a refusal for interlaced.
+Roughly 400–600 lines, and the largest single piece of code M12 contains.
+
+**Whether to hand-roll inflate or take a crate is deliberately not settled here.** The precedent
+cuts both ways on the same page of `userspace/CLAUDE.md` — `ab_glyph` was taken deliberately and
+`libcrypto` was hand-rolled — and inflate is reusable beyond images (a package format, compressed
+logs). That argues for owning it, but not loudly enough to settle before somebody has tried
+building the alternatives for `x86_64-unknown-nitrox`, which is what that page requires anyway.
+
+**What follows from "the user's file" rather than from PNG**: the wallpaper is read by
+`desktop-shell`, which holds `/home` and a theme where the compositor holds neither, and shown as a
+full-screen background window it owns; the theme file gains a bounded path key, like `font_ui`; and
+an image that does not load falls back to the ground colour and says so, which is the stance every
+other unreadable value in that file already gets. **Icons stay filed** — PNG makes an icon set
+possible, and an icon set is a naming convention, a size convention and a lookup path, which is a
+second decision.
+
+## 2026-09-01 — M12's details pass: a kill ring, a path, and a trigger the toolkit wrote for itself
+
+Six parts and five more governing decisions, so M12 can be built rather than re-argued. The two
+taken earlier the same day — the clipboard's owner and the image format — are in the entry above.
+
+### The milestone fires a trigger the toolkit named years of milestones ago
+
+`widget-toolkit.md` §11 has said since M4: *"Multi-window applications. One `App` drives one
+window. Trigger: dialogs that are real windows rather than `stack` overlays."* M12's file
+operations need confirmations, so the trigger fires — and the alternative was live: a modal confirm
+as a `stack` layer is cheaper, cannot be dragged away from what it is confirming, and would have
+been defensible.
+
+It was rejected because **no *application* has ever created one**. The role has existed since M2
+Part A, and the only thing that makes one is `ui-testclient` — deliberately, so that the
+held-configure and ignored-offset halves of its contract are asserted, added because a reviewer
+asked for it (PR #220, finding 2) and watched by `check-display`; its M11 placement change has a
+host test named for that batch. So the role is *covered* and unused, and §11's trigger is about
+use: a dialog a person can see, created by a program they run.
+
+(This paragraph first claimed the role had "no consumer at all" and was exercised by nothing,
+which was false twice over — corrected before merge, while the entry was still in an open PR.
+Had it merged it would have been permanent and would have sent the session building M12 looking
+for coverage that already exists.) So dialogs become real windows and the toolkit
+grows the dimension it wrote the trigger for.
+
+### Decision 3 — the clipboard is a kill ring, and the ring is shared while the cursor is not
+
+The maintainer asked for a kill ring rather than a single slot, which changes the protocol's shape
+rather than only its size. A slot loses what you copied two copies ago, which is the whole reason
+kill rings exist.
+
+**The division is the part worth recording.** The ring is the server's — shared, N entries, most
+recent first, `Copy` pushes. The *position* in it is the client's: "paste the one before that" is a
+property of the editing somebody is doing right now, not of the machine. Two applications cycling
+at once would fight over one cursor, and a cursor one client advanced would move under another. So
+a client remembers what it last pasted and asks for the next by index, and the server holds no
+per-client state.
+
+### Decision 4 — it is reachable as a path, and usable from a pipeline
+
+Also the maintainer's, and the more interesting half: `/dev/clipboard`, bound into the session
+namespace the way `/dev/tty` and `/dev/draw` are, with a small utility either side of a pipe.
+
+**A clipboard only graphical applications could reach would be the first resource in this system a
+pipeline cannot use** — in a system whose stated inheritance from Unix is "composable pipelines and
+everything as a resource". It also makes the ring inspectable: listing what is in it becomes a
+command rather than a window somebody has to build.
+
+There is no generic read/write verb here — a resource server speaks its own ops, as the tty server
+does with `OP_TTY_READ`/`OP_TTY_WRITE` — so this is a binding plus a utility, not a new file
+interface.
+
+### Decisions 5 to 7, briefly
+
+**A capped payload first**, at the 4008-byte IPC payload — about two screens of terminal text —
+with chunking recorded as *expected* rather than hypothetical, on the maintainer's judgement that
+it will not be enough for long. The trigger is written as the first thing somebody cannot copy. A
+shared memory object was the third option and is not taken: M10 rejected handle transfer for drops
+because a refused handle has no clean owner, and the clipboard would inherit that question.
+
+**`Ctrl+C`/`Ctrl+V`, and `Ctrl+Shift` in the terminal**, because `Ctrl+C` means interrupt there and
+always will — the split every real terminal makes, so it is a difference people arrive already
+knowing.
+
+**The wallpaper fits or centres**, using the box downscale that exists and explicitly refuses to
+scale up; scaling to fill is deferred as a *mode* rather than dropped, so the theme key is designed
+with room for one beside the path and only one mode ships.
+
+## 2026-09-01 — the kill ring's cursor, pinned down by a question about two applications
+
+M12's details pass said the clipboard's ring is the server's and the cursor into it is the
+client's, and left it at "a client remembers which entry it last pasted and asks for the next".
+The maintainer asked what that does to the ordinary case — copy in one application, paste in
+another.
+
+**It does nothing to it**, because an ordinary paste never consults a cursor: it takes the newest
+entry, whoever copied it. But the question is a good one, because the sentence it was aimed at
+describes *persistent* client state, and persistent state goes stale — paste, cycle back two,
+have another application copy, and the next paste comes from a position that now points at
+something else.
+
+So the rule is written down properly, and it is Emacs's:
+
+- **A paste takes the newest entry.** Index 0, always.
+- **Cycling is a continuation of a paste, not state.** Valid only immediately after one, replacing
+  what was just inserted, and ended by any other action — typing, a copy, focus moving. That is
+  what makes a stale cursor *unreachable* rather than merely unlikely: the position exists inside
+  one uninterrupted gesture, and everything that could invalidate it has already ended it.
+- **And where it can still go stale, the server says so.** Decision 4 put the clipboard on a path,
+  so something not being driven by the person can push while they are mid-cycle. Entries carry the
+  ring's serial and a cycle request carries the one it saw; a ring that moved underneath produces a
+  restart from the newest rather than a silently wrong paste. One `u64`.
+
+Worth noting how this arrived: the design was sound and its *description* was not, and the gap was
+found by asking what it did to the most ordinary thing somebody would do with it. A decision
+record that cannot answer that question has not been written down yet.
+
+## 2026-09-01 — what #266's review caught: a false premise, and six deferrals that were only prose
+
+A planning PR with no code in it, reviewed by asking one question — *do the claims these documents
+make about the current code hold?* Eighteen of twenty did. The two that did not are worth keeping.
+
+**The reason given for making dialogs real windows was false on both halves.** The entry said
+`Role::Dialog` had existed "since M6 with no consumer at all" and that its M11 placement change was
+"exercised by nothing". In fact it landed in M2 Part A; `ui-testclient` creates one deliberately and
+`check-display` watches the line; and the batch-8 change has a host test named for that batch. The
+test exists *because a previous reviewer asked for it* — its comment says "without this the two
+roles could be merged back into one arm and every gate would stay green (PR #220 review, finding
+2)", which is precisely the gap this entry claimed was open.
+
+The decision survives a correct premise, and is stronger for it: **no *application* has ever created
+one.** The role is covered and unused, and §11's trigger was always about use — a dialog a person can
+see, created by a program they run. Corrected in place because the entry was still in an open PR;
+had it merged, the append-only rule would have made a wrong reason for a right decision permanent,
+and sent the session building M12 hunting for coverage that already exists.
+
+**And six deferrals-with-triggers existed only as prose in a planning document** — the control
+panel's trigger, `form`'s eligibility, the icon set, focus-gated clipboard reads, clipboard
+chunking, and scale-to-fill. `deferred-decisions.md` states the rule flatly: *"A deferral only
+exists if it is in this document"*, and names the three gaps that cost most to rediscover as ones
+recorded in an architecture doc, a `TODO` and a crate's `CLAUDE.md` instead — "so none was ever
+reviewed". Writing that rule down did not stop the next six from being written somewhere else.
+
+They are catalogued now, and the control panel is **the first real use of the
+`no-code-site` escape hatch**. That hatch's own doc said it was "covered by a unit test rather than
+by a live example, deliberately: an escape hatch nobody has opened is exactly the thing that does
+not work the first time it is needed." It worked.
+
+**The lesson that generalises**: a document that only *describes* code can be wrong in ways code
+review normally catches for free, because nothing fails to compile. The check that found both of
+these was reading every claim as a claim and going to look.
