@@ -34,6 +34,8 @@ foreground = "#2F2F2F"
 font_px = 16
 bevel = 12
 font_ui = "/system/fonts/DejaVuSans.ttf"
+wallpaper = ""
+wallpaper_mode = "fit"
 ```
 
 **Those are the built-in values**, and the first line is what the image build writes at the top of
@@ -65,13 +67,34 @@ the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file
 | `bevel` | number, `0`–`64` | How far a gradient's top lightens and its bottom darkens |
 | `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional |
 | `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
+| `wallpaper` | `"/path"` or `""` | A PNG to draw behind everything. Empty means none |
+| `wallpaper_mode` | `"fit"` | How it is placed when it is not the screen's size |
 
 **Two fonts because a grid is not a label** (M11 Part D). Everything the toolkit draws takes
 `font_ui`; `nxterm`'s grid takes `font_mono`, and `nxterm` is the one program that loads both —
 its menus are widgets and its cells are not. Before Part D there was a single path constant and
 every client loaded it, so every label in the system was monospaced.
 
-A path is **absolute, at most 64 bytes, and free of control characters, `"` and `\`**; a longer
+**The wallpaper is a file a person supplies**, which is why the built-in theme names none and
+why the guest decodes PNG at all rather than reading something the build converted (M12
+decision 2). `desktop-shell` reads it — the shell holds `/home` and a theme, where the compositor
+holds neither and should not gain a filesystem in order to draw — and puts it in a full-screen
+bottom-most window it owns. A file that is absent, unreadable, or not a PNG this decoder handles
+leaves the desktop its `desktop` colour and says on the console which of those it was.
+
+**`wallpaper_mode` has exactly one legal value today**, and that is the point of it existing:
+`fit` scales a too-large picture down to fit inside the screen with its aspect ratio kept, and
+centres a smaller one. Filling the screen needs an upscaler and a decision about interpolation —
+`TODO(wallpaper-fill)` — so the *dimension* is in the schema now and a second mode will be a
+value rather than a new key. A file naming `fill` is refused by name rather than quietly fitted,
+which is what makes that deferral observable from the outside.
+
+**What the decoder accepts**: bit depth 8, every colour type (greyscale, RGB, palette,
+greyscale+alpha, RGBA), not interlaced, and at most 64 megapixels. An alpha channel is read past
+and dropped: nothing in this system composites with alpha yet, and a wallpaper is drawn on
+nothing.
+
+A path is **absolute, at most 128 bytes, and free of control characters, `"` and `\`**; a longer
 or relative one leaves that role at its default. The last two are refused for the reason the
 whole file is a TOML file: a path holding a quote would round-trip through *this* reader and read
 as something else in any other one. The bound is not arbitrary: the theme travels to each

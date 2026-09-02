@@ -1417,8 +1417,9 @@ written for.
 drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming
 convention, a size convention and a lookup path, which is a second decision after the one that
 makes images possible at all. **Trigger: something needs an icon that is not three strokes** — a
-toolbar, a file-type glyph in the browser. M12 Part F builds the PNG decoder and deliberately does
-not build this on top of it.
+toolbar, a file-type glyph in the browser. M12 Part F **built** the PNG decoder (2026-09-02) and
+deliberately did not build this on top of it, so what is left here is the second decision rather
+than the first.
 
 **Focus-gated clipboard reads — `TODO(clipboard-focus)` <!-- check-deferrals: no-code-site -->.**
 M12's clipboard is a resource server whose *binding* is the authority: anything holding the

@@ -4126,22 +4126,56 @@ The two taken before this pass — the clipboard's owner and the image format �
       plan's gate list had already claimed — including `select_range`'s clamp, which was
       documented as a guard against a stale range and covered by nothing.
 
-### Part F — images and the wallpaper
+### Part F — images and the wallpaper ✅ complete (2026-09-02)
 
-- [ ] **PNG decoded in the guest** — inflate, unfiltering, no interlacing. Decision 2 above.
-      Whether that is hand-rolled or a crate is settled by building both for
-      `x86_64-unknown-nitrox`, which `userspace/CLAUDE.md` requires before taking a dependency
-      anyway.
+- [x] **PNG decoded in the guest** ✅ — every colour type at bit depth 8, refusing interlacing,
+      other depths, and a header claiming more than `MAX_PIXELS` before a byte is allocated.
+      `libdraw::png`, about 250 lines.
 
-- [ ] **The wallpaper is a window `desktop-shell` owns**, full-screen and bottom-most. The shell
-      holds `/home` and a theme; the compositor holds neither and should not gain a filesystem in
-      order to draw.
+      **Inflate is `miniz_oxide`**, and the plan's own procedure is what settled it: built for
+      `x86_64-unknown-nitrox` under `-Z build-std` before being taken, as `userspace/CLAUDE.md`
+      requires. Whole transitive tree one crate (`adler2`), both licences permissive, and
+      `decompress_to_vec_zlib` hands back exactly the shape the unfilter step wants — which is
+      the clause that decided it, the same one that carried `ab_glyph` over `fontdue`. ~500 lines
+      of owned RFC 1951 remains the thing to reach for if the dependency stops fitting.
 
-- [ ] **Fit if larger, centre if smaller** — decision 6.
+      **The tests are where a PNG decoder is usually wrong**, and three of them caught a real
+      mistake in this one on the way: the average filter computed in `u8` (a two-pixel row is
+      needed to reach it — the left neighbour is zero at a row start, so the first version of
+      that test passed against the bug), the Paeth predictor in `u8` rather than `i16`, and the
+      Paeth tie-break order, whose first test asserted `paeth(5,5,5) == 5` and pinned nothing.
 
-- [ ] **Gate**: `check-login` names a staged image in the theme, and the shell reports the size it
-      decoded. A picture is pixels a release-image boot has no reference for; the dimensions are
-      what can be asserted.
+- [x] **The wallpaper is a window `desktop-shell` owns** ✅, full-screen and bottom-most. It is a
+      `Role::Panel` with `reserve: 0`, which says all three things with no protocol change: a
+      panel cannot take focus, so a press on the picture raises nothing exactly as a press on
+      bare desktop did; a zero reservation leaves the work area alone; and creating it first
+      makes it bottom-most, because the compositor's stack is creation-ordered. A new
+      `Role::Background` would have been a wire change, a stacking rule and a `check-display`
+      reference to express what three existing properties already do.
+
+      **The theme names it**, and the built-in theme names none: a wallpaper is a file a person
+      supplies, so a default would make the desktop's ground depend on what the build happened to
+      stage. `FontPath` became `ThemePath` when the wallpaper became its second consumer.
+
+- [x] **Fit if larger, centre if smaller** ✅ — decision **7** (this list said 6, which is the
+      binding decision). `libdraw::scale::fit` plans and `place` draws; both are host-tested,
+      because a pitch and an origin are exactly the arithmetic that is invisible when wrong and
+      expensive to discover by booting.
+
+- [x] **Gate** ✅: `check-login` asserts `wallpaper 1920x1080 drawn 1280x720 at 0,40 window N`.
+      The staged picture is **deliberately not the screen's size** — the same argument
+      `THEME_FONT_PX` rests on: 1920x1080 can only have come from an `IHDR` that was read, and
+      `1280x720 at 0,40` only from the fit having run on it. A stretch-to-fill would say
+      `1280x800 at 0,0`.
+
+- [x] **Two things the part got wrong and the gate did not catch** ✅. The line was printed as
+      soon as the picture was *placed*, so it claimed a fitted wallpaper while `CreateWindow`
+      went on to fail — the gate passed against a desktop showing its bare ground colour, and
+      `cargo xtask shot` is what found it. It is printed after the commit now and carries the
+      window id. And `check-login` wrote its transcript **only on failure**, so a passing run
+      left a stale one that reads as evidence: twenty minutes went into diagnosing a missing
+      line in a file three hours old. It is written on the way past now, whichever way the run
+      ends.
 
 ### Governing decisions
 

@@ -28,6 +28,19 @@ ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
 # the difference between a box the text fits in and one that clips its last column. Already
 # in the tree beneath `ab_glyph`; named directly rather than leaned on transitively.
 libm = { version = "0.2", default-features = false }
+# Inflate, for the PNG decoder (M12 Part F). **Verified against the bar in
+# `userspace/CLAUDE.md` rather than read off a badge**: it builds for
+# `x86_64-unknown-nitrox` under `-Z build-std`, its whole transitive tree is one crate
+# (`adler2`), both licences are permissive (MIT/Zlib/Apache and 0BSD/MIT/Apache), and it
+# dead-strips to nothing while unused. `decompress_to_vec_zlib` returns exactly the shape PNG's
+# unfilter step wants, so there is nothing to work around — which is the clause that decided it,
+# the same one that carried `ab_glyph` over `fontdue`. See the decision log, 2026-09-02.
+#
+# **0.9 rather than 0.8, which costs the host build nothing.** `tools/` links this crate for
+# `preview` and `check-display`, and its `png` dependency already brings both — `png` wants 0.8
+# and its own `flate2` wants 0.9 — so joining the version that is there anyway leaves the tools
+# lock with the same two it had before this crate had an inflate at all. The guest resolves one.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 # Acquiring the framebuffer is the one part of this crate that touches syscalls, so it
 # sits behind the optional `io` feature — the same split `libstream` uses to keep its
 # wire core dependency-free. Off by default, so `cargo test -p libdraw` on the host

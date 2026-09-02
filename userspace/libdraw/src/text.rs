@@ -29,7 +29,7 @@
 use alloc::vec::Vec;
 
 #[cfg(feature = "io")]
-use crate::theme::FontPath;
+use crate::theme::ThemePath;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
 
@@ -300,7 +300,7 @@ pub unsafe fn load_ui(
     root_ns: u64,
     theme: &crate::theme::Theme,
     who: &[u8],
-) -> Result<(Font, FontPath), LoadError> {
+) -> Result<(Font, ThemePath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
     unsafe { load_themed(root_ns, theme.font_ui, crate::theme::Theme::light().font_ui, who) }
 }
@@ -317,7 +317,7 @@ pub unsafe fn load_mono(
     root_ns: u64,
     theme: &crate::theme::Theme,
     who: &[u8],
-) -> Result<(Font, FontPath), LoadError> {
+) -> Result<(Font, ThemePath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
     unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::light().font_mono, who) }
 }
@@ -337,10 +337,10 @@ pub unsafe fn load_mono(
 #[cfg(feature = "io")]
 unsafe fn load_themed(
     root_ns: u64,
-    wanted: FontPath,
-    builtin: FontPath,
+    wanted: ThemePath,
+    builtin: ThemePath,
     who: &[u8],
-) -> Result<(Font, FontPath), LoadError> {
+) -> Result<(Font, ThemePath), LoadError> {
     // SAFETY: forwarded from the caller's contract.
     match unsafe { load(root_ns, wanted.as_str()) } {
         Ok(f) => Ok((f, wanted)),
@@ -349,7 +349,7 @@ unsafe fn load_themed(
         // (PR #264 review, optional 1).
         Err(e) if wanted == builtin => Err(e),
         Err(e) => {
-            // `s` rather than `untrusted`: a `FontPath` cannot hold a control byte, which is
+            // `s` rather than `untrusted`: a `ThemePath` cannot hold a control byte, which is
             // most of why it validates at all.
             libkern::debug::Line::new()
                 .s(who)

@@ -70,11 +70,16 @@ a request is being met in a particular way.
 
 - [ ] Real icons for minimize, maximize, and close buttons. (Icon support needed?)
       *(drawn as shapes in batch 2a. Real image icons wait on an icon set — a naming convention, a
-      size convention and a lookup path — which stays filed behind M12's PNG decoder rather than
-      arriving with it.)*
-- [ ] **Desktop Background** - We can choose a default color that fits the theme.  Probably some shade of blue.  It would be nice to be able to have background image support.  Image support can be a stretch goal, but all real OS desktops have background image support.
-      *(the colour landed in batch 1. The image half is filed for M12, with three options costed
-      in the plan — it is a format, an asset pipeline and a size budget, not a batch.)*
+      size convention and a lookup path. M12 Part F built the PNG decoder they need and
+      deliberately did not build them on top of it: `TODO(icon-set)`, whose trigger is something
+      needing an icon that is not three strokes.)*
+- [x] **Desktop Background** - We can choose a default color that fits the theme.  Probably some shade of blue.  It would be nice to be able to have background image support.  Image support can be a stretch goal, but all real OS desktops have background image support.
+      *(the colour landed in batch 1; the image half landed in **M12 Part F**, 2026-09-02 — a PNG
+      decoded in the guest, because a wallpaper a person cannot supply is not really a wallpaper,
+      named by a `wallpaper` key in the theme file and drawn in a full-screen bottom-most window
+      `desktop-shell` owns. Fits if larger, centres if smaller; filling is `TODO(wallpaper-fill)`.
+      It was "a format, an asset pipeline and a size budget, not a batch", which is why it was
+      filed rather than done here.)*
 - [] **Stretch 1** - Drop shadow support around windows and menus.  Could be a good addition, but I don't know how difficult this will be.  Not critical.
 
 - [x] The open applications menu is positioned wrong.  It should be a drop down from the applications button.  It also doesn't close when you click outside of it.  Also, you can't click any of the menu items. Menu item hovering doesn't work either.
@@ -172,4 +177,5 @@ Performance and responsiveness. Decision 6: its own list, its own milestone.
 Capability rather than appearance. See
 [`display-arm-plan.md`](display-arm-plan.md) → Milestone 12.
 
-*(nothing new yet)*
+*(nothing new yet — and M12 has since closed the one item on the Open list above that was filed
+here rather than deferred: the desktop background's image half, in Part F.)*

@@ -22290,3 +22290,88 @@ over a grid — `check-display` never types, `check-terminal` types but never dr
 gate asserts the paste through the filesystem. Two lines of rendering, stated as behaviour in an
 architecture document, deletable in silence. `libterm::render` now pins the highlight and the
 cursor-wins precedence, using the `is_inverted` helper the cursor's own test has had since M5.
+
+## 2026-09-02 — M12 Part F: inflate is a dependency, and a wallpaper is a panel
+
+**The plan left one thing open and named the procedure that settles it**: whether inflate is
+hand-rolled or a crate, decided "by building both for `x86_64-unknown-nitrox`, which
+`userspace/CLAUDE.md` requires before taking a dependency anyway". So that is what happened.
+`miniz_oxide` builds under `-Z build-std`, its whole transitive tree is one crate (`adler2`), the
+licences are MIT/Zlib/Apache and 0BSD/MIT/Apache, and it dead-strips to nothing while unused.
+
+What decided it was not any of those, which every candidate has to clear anyway. It was the clause
+`userspace/CLAUDE.md` states after them: **a dependency you have to work around is worse than code
+you own**, which is the argument that carried `ab_glyph` over `fontdue`. `decompress_to_vec_zlib`
+returns a `Vec<u8>` of the whole inflated stream, which is exactly what PNG's unfilter step reads —
+there is nothing to work around. The ~500 lines of owned RFC 1951 remain the thing to reach for the
+day this stops fitting, and the reusability argument for owning it (a package format, compressed
+logs) is an argument for *an* inflate, which this is.
+
+**The PNG layer is ours** — chunk walking, unfiltering, colour types, the refusals — about 250
+lines, and the decision inside it is what to refuse *by name*: interlacing, a bit depth that is not
+8, a colour type outside the five, a broken palette, and a header claiming more than 64 megapixels.
+The caller is `desktop-shell` and what it does with a refusal is put a sentence on the console
+beside a desktop that fell back to its ground colour; "the image did not load" would be the same
+answer for a missing file, an interlaced picture and a truncated download.
+
+**A wallpaper is a `Role::Panel` with `reserve: 0`**, and that says all three things the plan asks
+for with no protocol change. A panel cannot take focus, so a press on the picture raises nothing —
+which is exactly what a press on bare desktop did before there was a picture there, and a press
+still *dismisses* an open popup because the compositor's rule is "anywhere that is not the popup".
+A zero reservation leaves the work area alone, so a maximised window is unchanged. And creating it
+first makes it bottom-most, because the stack is creation-ordered. A new `Role::Background` would
+have been a wire change, a stacking rule and a `check-display` reference to express what three
+existing properties already do.
+
+**`FontPath` became `ThemePath`** when the wallpaper became its second consumer. The rule
+`userspace/CLAUDE.md` states for helpers — one with two consumers belongs to neither — applies to
+types: one named for its first caller is a type the second caller has to explain.
+
+## 2026-09-02 — three PNG tests that passed against the bug, and the shape they share
+
+A PNG decoder is a place where being subtly wrong is the norm, so every guard got a control. Three
+of them failed to fail, and all three failed the same way: **the test never reached the state where
+the bug is.**
+
+- **The average filter.** `(a + b) / 2` in `u8` wraps for any pair summing past 255. The test used
+  a one-pixel row — where the left neighbour is *zero* at the row start, so `(0 + 200) / 2` never
+  overflows. Two pixels are needed: the second has a large neighbour on both sides.
+- **The Paeth tie-break.** `paeth(5, 5, 5) == 5` pins nothing, because every branch returns 5. The
+  discriminating triples had to be searched for — `paeth(0, 3, 1)` is 3 under the spec's
+  `a`-then-`b`-then-`c` order and 1 under any other.
+- **A `checked_add` that cannot fire.** The chunk length is a `u32` and `usize` is 64 bits here, so
+  `start + len` cannot wrap and the guard was protecting an invariant it did not — the note PR
+  #269's review left on the same shape. It is plain arithmetic now, with a `const` assertion on
+  `usize::BITS` so a 32-bit target breaks the build rather than the decoder.
+
+**The shape, and it is the fourth and fifth and sixth time this milestone.** #270's was a rule
+re-stated in a closure; #271's was a second guard answering for the one under test, and a bound
+tested with a value the *other* bound refuses first. These are the same thing again: an arrangement
+that cannot distinguish the versions. The check that finds all of them is identical and costs one
+command — break the line, run the suite, see whether anything goes red — and it is now clearly
+worth running on every guard rather than on the ones that look risky.
+
+## 2026-09-02 — a line printed before the thing it claims, and a transcript only written on failure
+
+Two harness faults, found within minutes of each other, both of the form *the instrument was not
+measuring what it appeared to*.
+
+**The wallpaper line was printed as soon as the picture had been decoded and placed** — before the
+window was created. `CreateWindow` then failed (`libsurface` refuses fewer than two buffers, and
+the wallpaper asked for one on the reasoning that it draws exactly one frame). So the gate asserted
+`wallpaper 1920x1080 drawn 1280x720 at 0,40`, passed, and the desktop showed its bare ground
+colour. `cargo xtask shot` is what found it: a picture of the screen, which is what that tool
+exists for. **A line has to be printed where the thing it claims has happened**, and the line now
+carries the window id so the assertion is about a window rather than about arithmetic.
+
+**`check-login` wrote its transcript only on failure.** A passing run therefore left whatever an
+earlier failing one had put there — and twenty minutes went into diagnosing a missing wallpaper
+line in a file three hours old, including reading the ext4 image with `debugfs` to prove a file was
+correct that had never been in doubt. The tail of that same function already carries a paragraph
+saying a stale transcript "reads as evidence"; it was written about the checks *after* `finish()`
+and not about the case nobody thought needed it. It is written on the way past now, whichever way
+the run ends.
+
+One lesson, arriving from two directions at once: **before believing an instrument, check that it
+measured this run.** The cheap version of that here was one `ls -l` on the file being read, and one
+glance at where in the code the line it wanted is printed.

@@ -2,9 +2,13 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-01** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-02** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
-click;
+click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
+Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
+reservation, holding a PNG the theme names and this shell decodes, because the shell holds
+`/home` and a theme where the compositor holds neither (see [`clipboard.md`](clipboard.md) and
+`display-arm-plan.md` M12 decision 2);
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
 
