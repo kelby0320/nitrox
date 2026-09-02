@@ -63,6 +63,23 @@ const DEMO_HOME: &str = "/home/alice";
 /// the file, through the shell, onto the setup record and into a window (PR #263 review,
 /// blocking 2). It is inside what the fixed chrome holds, which is what `MAX_FONT_PX` bounds.
 const THEME_FONT_PX: u8 = 14;
+
+/// Where the staged wallpaper goes, **as the session sees it**.
+///
+/// `libsession` binds the user's home at `/home`, so a file staged at `/home/alice/wallpaper.png`
+/// is this path inside the session — the same relationship `THEME_PATH` has to `theme.toml`.
+const WALLPAPER_PATH: &str = "/home/wallpaper.png";
+
+/// The size of the generated wallpaper, and **deliberately not the screen's** — 1920x1080 into
+/// a 1280x800 screen is 16:9 into 16:10, so the fit is a real downscale *and* a real letterbox.
+///
+/// The same argument [`THEME_FONT_PX`] rests on: a picture the size of the screen would let a
+/// shell that never decoded anything report the right numbers. These two can only have come from
+/// an `IHDR` that was actually read, and the drawn size (1280x720, inset 40 rows) can only have
+/// come from the fit arithmetic having run on them.
+const WALLPAPER_W: u32 = 1920;
+/// See [`WALLPAPER_W`].
+const WALLPAPER_H: u32 = 1080;
 const DEMO_SALT: [u8; 8] = [0x9e, 0x3f, 0xa2, 0x5c, 0x71, 0x0b, 0xd4, 0x86];
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -1892,6 +1909,42 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         .and_then(|(_, n)| n.trim().parse::<u32>().ok())
         .ok_or_else(|| format!("no font_px in the shell's theme line: {theme_line:?}"))?;
     println!("  ok: the shell resolved a theme ({})", theme_line.trim());
+
+    // **The wallpaper, decoded in the guest** (M12 Part F). Immediately after the theme, because
+    // that is where it is in the stream: the shell reads the theme, opens the picture it names,
+    // and only then creates its first bar. An expectation placed beside the *topic* rather than
+    // beside its position scans past output that was there — the same rule the theme's own line
+    // above states, and the one M11 Part C learned the expensive way.
+    //
+    // **Both numbers, because they answer different questions.** `1920x1080` can only have come
+    // from an `IHDR` the guest actually read — the staged picture is deliberately not the
+    // screen's size, so a shell that decoded nothing cannot report it, exactly as `THEME_FONT_PX`
+    // is deliberately not the built-in 16. `1280x720 at 0,40` can only have come from the fit
+    // arithmetic having run on those numbers: 16:9 into a 16:10 screen is a real downscale and a
+    // real letterbox, and a stretch-to-fill would say `1280x800 at 0,0`.
+    //
+    // A picture is pixels a release-image boot has no reference for, which is what the plan says
+    // about this gate; the dimensions are what can be asserted, and they pin the whole chain —
+    // the theme naming a file, `libfs` reading it, `libdraw::png` decoding it, and
+    // `libdraw::scale::fit` placing it.
+    // **And the line is printed after the window is committed**, which the first version of
+    // this step was not: it asserted a line emitted as soon as the picture had been placed, so
+    // it passed while `CreateWindow` failed and the desktop showed its bare ground colour. The
+    // `window N` on the end is what makes this an assertion about a picture on screen rather
+    // than about arithmetic.
+    session.expect(&format!(
+        "desktop-shell: wallpaper {WALLPAPER_W}x{WALLPAPER_H} drawn 1280x720 at 0,40 window "
+    ))?;
+    // **Kept, because stickiness is asserted against this id** further down: a press on an empty
+    // desktop has to name *this* window, and `win=none` is what a wallpaper stamped with
+    // desktop 1 gives.
+    let wallpaper_line = session.rest_of_line()?;
+    let wallpaper_id: u32 = wallpaper_line
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("no window id in the wallpaper line: {wallpaper_line:?}"))?;
+    println!("  ok: the guest decoded a {WALLPAPER_W}x{WALLPAPER_H} PNG and put it on screen");
     // **The narrow bind, which is what closed the `manage-ungated` deferral.** The shell builds
     // an application namespace and checks it *before* launching into it: `/dev/draw/new`
     // resolves, `/dev/draw/manage` does not. Asserting the shell's own verdict rather than
@@ -2444,6 +2497,40 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: overview open, window ")?;
     press(&mut qmp, "esc")?;
     session.expect("desktop-shell: overview closed")?;
+
+    // **And so is the wallpaper, which it was not** (M12 Part F; PR #272 review, blocking 1).
+    // It is created at startup like the bars, so the compositor stamped it with desktop 1 and
+    // every other desktop showed the bare ground colour — visible as flicker rather than as a
+    // missing feature, because switching back restored it.
+    //
+    // **Asserted on an empty desktop**, which is what makes the press unambiguous: `Super+3`
+    // has nothing on it, so every point that is not one of the two bars is the wallpaper or is
+    // nothing at all. A press in the middle names the wallpaper's window when it is sticky and
+    // gives `win=none` when it is not — the same discriminator the bars use above, and the same
+    // reason: the shell's own "is sticky" line says it *asked*, and the compositor's says it
+    // took.
+    chord(&mut qmp, false, "3")?;
+    session.expect("desktop-shell: switched to ")?;
+    // **Empty is asserted, not assumed** — the discriminator only works where nothing else is
+    // under the cursor, and which desktop holds what has moved several times by this point.
+    session.expect("(empty)")?;
+    // **`click_at` already consumed the press line**, up to the coordinates — so what is left
+    // to read is the `win=` it ends with, and an `expect` for the whole line would scan past
+    // its own evidence. (It did, on this step's first run.)
+    click_at(&mut qmp, &mut session, 640, 400)?;
+    let hit = session.rest_of_line()?;
+    if !hit.contains(&format!("win={wallpaper_id}")) {
+        return Err(format!(
+            "a press on an empty desktop reported '{}' — the wallpaper (window {wallpaper_id}) \
+             is not sticky, so every desktop but the first shows the bare ground colour",
+            hit.trim()
+        )
+        .into());
+    }
+    println!("  ok: the wallpaper is sticky — still there on an empty desktop");
+    // Back to the one the rest of this gate is written against.
+    chord(&mut qmp, false, "2")?;
+    session.expect("desktop-shell: switched to ")?;
 
     // 6f. **The overview's clicks, which were dead until 2026-08-26.** `desktop-shell.md` §6
     //     says "you can switch desktops from inside it"; a press on a sidebar row set no drag
@@ -3275,8 +3362,34 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // **The serial column is what says it happened.** Asking the terminal would be asking the
     // accused: its grid is where the pasted text was drawn, and the thing in doubt is whether
     // the bytes were real.
-    session.send("list .")?;
-    session.expect(&format!("{TYPED}.clip"))?;
+    //
+    // **Retried, because the two sides are genuinely concurrent.** Nothing orders the terminal's
+    // `touch` against the serial `list` — two shells in two sessions, and the only thing between
+    // them is the filesystem. The first version sent one `list` and passed by luck; M12 Part F's
+    // wallpaper added a PNG decode to the shell's startup, the timing moved, and it started
+    // failing. This is `expect_within`'s stated case — absence that is retryable rather than a
+    // verdict — and it is still a verdict at the end of the loop: a `touch` that never ran fails
+    // the gate after thirty seconds rather than passing.
+    let mut made = false;
+    for _ in 0..10 {
+        session.send("list .")?;
+        if session
+            .expect_within(&format!("{TYPED}.clip"), std::time::Duration::from_secs(3))?
+        {
+            made = true;
+            break;
+        }
+        // Discard the failed listing, or the next attempt matches this one's output.
+        session.skip_to_end()?;
+    }
+    if !made {
+        return Err(format!(
+            "the terminal pasted {} bytes but no {TYPED}.clip appeared in /home: the shell in \
+             the terminal did not run the command the paste completed",
+            TYPED.len()
+        )
+        .into());
+    }
     session.expect("/home>")?;
     println!("  ok: the paste reached the shell in the terminal, and it made {TYPED}.clip");
 
@@ -3604,10 +3717,14 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
-    // **Every check below writes the transcript on failure.** `expect` saves it on its own
-    // failures, but these run after `finish()` — so one used to report a verdict with no guest
-    // output to diagnose it from, and the file left on disk was a *stale* one from an earlier
-    // run. That is worse than none: it reads as evidence.
+    // **Written on the way past, whichever way this ends.** The checks below each wrote it on
+    // *their* failure, so a passing run left whatever an earlier failing one had put there —
+    // and a stale transcript is worse than none, because it reads as evidence. It cost an
+    // afternoon in M12 Part F: a wallpaper line missing from a file three hours old was
+    // diagnosed as a broken decoder for twenty minutes before anybody checked the timestamp.
+    // The same argument the checks below already make about their own failures, applied to the
+    // case nobody thought needed it.
+    let _ = fs::write(build_cache().join("guest-transcript-check-login.log"), &transcript);
 
     // **The grid grew, in cells.** Read off the client's own line rather than computed here:
     // the cell size is the font's, and re-deriving it in the gate would be a second
@@ -4837,6 +4954,31 @@ fn encode_png(w: u32, h: u32, rgb: &[u8]) -> R<Vec<u8>> {
         writer.write_image_data(rgb).map_err(|e| format!("png data: {e}"))?;
     }
     Ok(out)
+}
+
+/// The staged wallpaper's bytes: a gradient at [`WALLPAPER_W`] × [`WALLPAPER_H`].
+///
+/// **A gradient rather than a flat fill**, and that is the one property the picture needs beyond
+/// its size: a solid colour would decode identically under a broken unfilter, because every
+/// predictor of a constant row is the constant. A gradient varies along both axes, so `Sub`,
+/// `Up`, `Average` and `Paeth` all produce different bytes and a decoder that got one wrong
+/// produces visible bands. The encoder chooses the filters, so this does not name them.
+///
+/// **Generated rather than checked in.** A binary asset in a repository is one nobody reviews,
+/// and every property a gate wants from this is a property of these fifteen lines.
+fn wallpaper_png() -> R<Vec<u8>> {
+    let (w, h) = (WALLPAPER_W, WALLPAPER_H);
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // A blue-green wash with a red ramp across it — three channels that do not track
+            // each other, so a swapped channel is visible rather than symmetric.
+            rgb.push((x * 255 / w) as u8);
+            rgb.push((y * 255 / h) as u8);
+            rgb.push(((x + y) * 255 / (w + h)) as u8);
+        }
+    }
+    encode_png(w, h, &rgb)
 }
 
 /// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
@@ -8963,9 +9105,31 @@ fn assemble_image(
         // the one field the gate reads back, which is deliberately not the default.
         let mut shipped = libdraw::theme::Theme::light();
         shipped.font_px = f32::from(THEME_FONT_PX);
+        // **The theme names the wallpaper** (M12 Part F). It is the *file* that decides the
+        // desktop has a picture behind it — the built-in theme names none, deliberately, because
+        // a wallpaper is a file a person supplies and a default would make the desktop's ground
+        // depend on whatever the build happened to stage.
+        shipped.wallpaper = Some(
+            libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
+                .ok_or("the staged wallpaper path does not fit a ThemePath")?,
+        );
         text.push_str(&shipped.to_config());
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
+    }
+    // The wallpaper itself, **generated rather than checked in**: a binary asset in the repo is
+    // one nobody can review, and the properties a gate needs from it — its size, and that its
+    // pixels vary — are properties of the generator. It is a real PNG all the same, written by
+    // the `png` crate `preview` already uses, so the guest's decoder is reading an encoder it
+    // shares nothing with.
+    {
+        let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("wallpaper.png");
+        let bytes = wallpaper_png()?;
+        let n = bytes.len();
+        fs::write(&path, &bytes).map_err(|e| format!("stage {}: {e}", path.display()))?;
+        println!(
+            "xtask: seeded {WALLPAPER_PATH} ({WALLPAPER_W}x{WALLPAPER_H}, {n} bytes)"
+        );
     }
     println!("xtask: seeded /system/users + {DEMO_HOME} (with a theme)");
     // The content-addressed store, pre-built read-only into the ext4 root. Each package

@@ -52,6 +52,7 @@ pub mod format;
 pub mod framebuffer;
 pub mod geom;
 pub mod hash;
+pub mod png;
 pub mod ppm;
 pub mod scale;
 pub mod scene;

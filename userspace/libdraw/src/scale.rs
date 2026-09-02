@@ -20,6 +20,7 @@
 
 use crate::format::{PixelFormat, Rgb};
 use crate::framebuffer::Geometry;
+use crate::geom::{Point, Size};
 
 /// Average the `src` rectangle covering one destination pixel.
 ///
@@ -84,10 +85,323 @@ pub fn box_downscale(src: &[u8], src_geom: Geometry, dst: &mut [u8], dst_geom: G
     true
 }
 
+/// Where a picture goes on a screen, and at what size.
+///
+/// **Fit if larger, centre if smaller** — M12 decision 7, and the whole of it. A picture bigger
+/// than the screen is scaled down to fit inside it with its aspect ratio kept; one that already
+/// fits is drawn at its own size, centred. Scaling *up* to fill is deferred as a **mode** rather
+/// than left out — `TODO(wallpaper-fill)` — because it needs an upscaler and a decision about
+/// interpolation, and the maintainer wants both eventually.
+///
+/// **A plan rather than a picture**, so the arithmetic is testable without a framebuffer. The
+/// caller downscales if [`scaled`](Self::scaled) and blits at [`origin`](Self::origin).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Fit {
+    /// The size to draw the picture at.
+    pub size: Size,
+    /// Where its top-left corner goes.
+    ///
+    /// Never negative: a picture is only ever drawn at a size that fits, so it is inset rather
+    /// than cropped. A caller does not have to clip.
+    pub origin: Point,
+    /// Whether reaching [`size`](Self::size) needs a downscale.
+    ///
+    /// **A flag rather than "`size != image`"**, because the caller's two paths differ by more
+    /// than a comparison: one allocates a second buffer and runs [`box_downscale`], the other
+    /// blits the decoded pixels straight through.
+    pub scaled: bool,
+}
+
+/// Plan where `image` goes on a `screen`.
+///
+/// A zero dimension in either produces a zero-sized fit at the origin — total rather than
+/// panicking, because the image's size comes from a file's header and the screen's from a
+/// device.
+pub fn fit(image: Size, screen: Size) -> Fit {
+    if image.w == 0 || image.h == 0 || screen.w == 0 || screen.h == 0 {
+        return Fit { size: Size::new(0, 0), origin: Point::new(0, 0), scaled: false };
+    }
+    let size = if image.w <= screen.w && image.h <= screen.h {
+        image
+    } else {
+        // **The tighter of the two ratios, in integer arithmetic.** `w * sh` against `h * sw`
+        // compares `w/h` with `sw/sh` without dividing, so there is no rounding before the
+        // decision — and both products fit a `u64` for any image `MAX_PIXELS` admits.
+        let by_width = image.w as u64 * screen.h as u64 >= image.h as u64 * screen.w as u64;
+        if by_width {
+            // Width is the binding axis. The height is rounded to at least 1: a picture 4000
+            // wide and 3 tall scaled to a 1280 screen is 0.96 rows, and a zero-height buffer is
+            // one `box_downscale` refuses.
+            let h = (image.h as u64 * screen.w as u64 / image.w as u64).max(1) as u32;
+            Size::new(screen.w, h.min(screen.h))
+        } else {
+            let w = (image.w as u64 * screen.h as u64 / image.h as u64).max(1) as u32;
+            Size::new(w.min(screen.w), screen.h)
+        }
+    };
+    Fit {
+        size,
+        // Integer division truncates, so an odd leftover puts the extra pixel on the right and
+        // bottom. Consistent, and half a pixel is not a placement anybody can see.
+        origin: Point::new(
+            ((screen.w - size.w) / 2) as i32,
+            ((screen.h - size.h) / 2) as i32,
+        ),
+        scaled: size != image,
+    }
+}
+
+/// Draw `image` onto `dst` where [`fit`] says, filling the rest with `ground`.
+///
+/// **The whole of "put a wallpaper on a screen", so the arithmetic is here rather than in the
+/// shell.** Two things in it are easy to get wrong and invisible when they are — the destination
+/// pitch, which is the device's and not `width * 4`, and the origin, which is where a letterbox
+/// comes from. Both are testable without a framebuffer, and neither is worth discovering by
+/// booting.
+///
+/// **Both geometries must name the same pixel format.** The ground is *encoded* into `dst`'s
+/// format and the picture is copied word for word, so a mismatch would put the two halves of one
+/// buffer in different formats — invisible in the arithmetic and unmistakable on a screen. The
+/// scaled path was safe by accident, because [`box_downscale`] refuses anything but XRGB8888 on
+/// both sides; the unscaled path had no check at all (PR #272 review, optional 5). Refused here
+/// rather than documented, because "every caller today is XRGB8888" is a property of today.
+///
+/// Downscales internally when the plan says so, allocating the intermediate. Returns `false` if
+/// a geometry is unusable, the formats differ, or `dst` is shorter than its own geometry claims
+/// — the same refusal [`box_downscale`] makes, and for the same reason.
+pub fn place(
+    image: &[u8],
+    image_geom: Geometry,
+    plan: Fit,
+    ground: Rgb,
+    dst: &mut [u8],
+    dst_geom: Geometry,
+) -> bool {
+    if dst_geom.width == 0 || dst_geom.height == 0 || image_geom.format != dst_geom.format {
+        return false;
+    }
+    if dst.len() < dst_geom.pitch * dst_geom.height as usize {
+        return false;
+    }
+    // The ground first, everywhere. A letterboxed picture leaves bars, and a buffer the
+    // compositor hands back holds whatever was in it last.
+    let word = dst_geom.format.encode(ground).to_le_bytes();
+    for y in 0..dst_geom.height as usize {
+        let row = &mut dst[y * dst_geom.pitch..y * dst_geom.pitch + dst_geom.width as usize * 4];
+        for px in row.chunks_exact_mut(4) {
+            px.copy_from_slice(&word);
+        }
+    }
+    if plan.size.w == 0 || plan.size.h == 0 {
+        // Nothing to draw, and the ground is drawn — which is the right answer for a picture
+        // that planned to nothing rather than a reason to report failure.
+        return true;
+    }
+
+    // **The scaled copy is materialised only when it is needed.** A picture already the right
+    // size is blitted from the caller's buffer, so the ordinary "wallpaper matches the screen"
+    // case allocates nothing.
+    let scaled;
+    let (src, src_geom) = if plan.scaled {
+        let Some(g) = Geometry::with_pitch(
+            plan.size.w,
+            plan.size.h,
+            plan.size.w as usize * 4,
+            image_geom.format,
+        ) else {
+            return false;
+        };
+        let mut buf = alloc::vec![0u8; g.pitch * g.height as usize];
+        if !box_downscale(image, image_geom, &mut buf, g) {
+            return false;
+        }
+        scaled = buf;
+        (&scaled[..], g)
+    } else {
+        (image, image_geom)
+    };
+
+    for y in 0..plan.size.h as usize {
+        let dy = plan.origin.y + y as i32;
+        if dy < 0 || dy >= dst_geom.height as i32 {
+            continue;
+        }
+        for x in 0..plan.size.w as usize {
+            let dx = plan.origin.x + x as i32;
+            if dx < 0 || dx >= dst_geom.width as i32 {
+                continue;
+            }
+            let so = y * src_geom.pitch + x * 4;
+            let dof = dy as usize * dst_geom.pitch + dx as usize * 4;
+            if so + 4 > src.len() || dof + 4 > dst.len() {
+                continue;
+            }
+            dst[dof..dof + 4].copy_from_slice(&src[so..so + 4]);
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framebuffer::MemFramebuffer;
+
+    // ---- fit or centre (M12 Part F) ----
+
+    /// A `w`×`h` image whose every pixel is `c`.
+    fn flat(w: u32, h: u32, c: Rgb) -> (alloc::vec::Vec<u8>, Geometry) {
+        let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888).unwrap();
+        let word = g.format.encode(c).to_le_bytes();
+        let mut v = alloc::vec![0u8; g.pitch * h as usize];
+        for px in v.chunks_exact_mut(4) {
+            px.copy_from_slice(&word);
+        }
+        (v, g)
+    }
+
+    #[test]
+    fn place_centres_a_small_picture_and_grounds_the_rest() {
+        let (img, ig) = flat(2, 2, Rgb::new(255, 0, 0));
+        let dg = Geometry::with_pitch(6, 6, 6 * 4, PixelFormat::XRGB8888).unwrap();
+        let mut dst = alloc::vec![0u8; dg.pitch * 6];
+        let plan = fit(Size::new(2, 2), Size::new(6, 6));
+        assert!(place(&img, ig, plan, Rgb::new(0, 0, 128), &mut dst, dg));
+        // The picture lands at (2, 2).
+        assert_eq!(at(&dst, dg, 2, 2), Rgb::new(255, 0, 0));
+        assert_eq!(at(&dst, dg, 3, 3), Rgb::new(255, 0, 0));
+        // …and everything outside it is the ground.
+        assert_eq!(at(&dst, dg, 0, 0), Rgb::new(0, 0, 128));
+        assert_eq!(at(&dst, dg, 1, 2), Rgb::new(0, 0, 128));
+        assert_eq!(at(&dst, dg, 4, 4), Rgb::new(0, 0, 128));
+    }
+
+    #[test]
+    fn place_honours_a_destination_pitch_that_is_not_the_width() {
+        // **The device's pitch, not `width * 4`.** A framebuffer's rows are padded, and a blit
+        // that assumed otherwise shears the picture diagonally — the classic display bug, and
+        // the one `check-display` exists to catch a boot later than this does.
+        let (img, ig) = flat(2, 2, Rgb::new(0, 255, 0));
+        let dg = Geometry::with_pitch(2, 2, 64, PixelFormat::XRGB8888).unwrap();
+        let mut dst = alloc::vec![0u8; dg.pitch * 2];
+        let plan = fit(Size::new(2, 2), Size::new(2, 2));
+        assert!(place(&img, ig, plan, Rgb::new(0, 0, 0), &mut dst, dg));
+        assert_eq!(at(&dst, dg, 0, 1), Rgb::new(0, 255, 0), "row 1 is one pitch down");
+        // The padding between rows is untouched, which is what a pitch is for.
+        assert_eq!(&dst[8..64], &alloc::vec![0u8; 56][..]);
+    }
+
+    #[test]
+    fn place_downscales_a_larger_picture_and_letterboxes_it() {
+        let (img, ig) = flat(8, 4, Rgb::new(200, 100, 50));
+        let dg = Geometry::with_pitch(4, 4, 16, PixelFormat::XRGB8888).unwrap();
+        let mut dst = alloc::vec![0u8; dg.pitch * 4];
+        let plan = fit(Size::new(8, 4), Size::new(4, 4));
+        assert_eq!(plan.size, Size::new(4, 2));
+        assert_eq!(plan.origin, Point::new(0, 1));
+        assert!(place(&img, ig, plan, Rgb::new(0, 0, 0), &mut dst, dg));
+        assert_eq!(at(&dst, dg, 0, 0), Rgb::new(0, 0, 0), "the letterbox above");
+        assert_eq!(at(&dst, dg, 0, 1), Rgb::new(200, 100, 50), "the picture");
+        assert_eq!(at(&dst, dg, 3, 2), Rgb::new(200, 100, 50));
+        assert_eq!(at(&dst, dg, 0, 3), Rgb::new(0, 0, 0), "and below");
+    }
+
+    #[test]
+    fn place_refuses_two_geometries_in_different_formats() {
+        // The ground is encoded into `dst`'s format and the picture is copied word for word, so
+        // a mismatch puts the two halves of one buffer in different formats. The scaled path was
+        // safe only because `box_downscale` refuses anything but XRGB8888; the unscaled path —
+        // a picture already the right size, which is the ordinary case — had no check.
+        let (img, ig) = flat(2, 2, Rgb::new(1, 2, 3));
+        let dg = Geometry::with_pitch(2, 2, 8, PixelFormat::XBGR8888).unwrap();
+        let mut dst = alloc::vec![0u8; dg.pitch * 2];
+        let plan = fit(Size::new(2, 2), Size::new(2, 2));
+        assert!(!plan.scaled, "the unscaled path is the one with no other check");
+        assert!(!place(&img, ig, plan, Rgb::new(0, 0, 0), &mut dst, dg));
+    }
+
+    #[test]
+    fn place_refuses_a_destination_shorter_than_its_geometry() {
+        let (img, ig) = flat(2, 2, Rgb::new(1, 2, 3));
+        let dg = Geometry::with_pitch(4, 4, 16, PixelFormat::XRGB8888).unwrap();
+        let mut dst = alloc::vec![0u8; 8];
+        assert!(!place(&img, ig, fit(Size::new(2, 2), Size::new(4, 4)), Rgb::new(0, 0, 0), &mut dst, dg));
+    }
+
+
+    #[test]
+    fn a_picture_smaller_than_the_screen_is_centred_at_its_own_size() {
+        let f = fit(Size::new(400, 300), Size::new(1280, 800));
+        assert_eq!(f.size, Size::new(400, 300));
+        assert_eq!(f.origin, Point::new(440, 250));
+        assert!(!f.scaled, "nothing to scale");
+    }
+
+    #[test]
+    fn a_picture_the_size_of_the_screen_is_neither_scaled_nor_moved() {
+        let f = fit(Size::new(1280, 800), Size::new(1280, 800));
+        assert_eq!(f, Fit { size: Size::new(1280, 800), origin: Point::new(0, 0), scaled: false });
+    }
+
+    #[test]
+    fn a_wider_picture_is_bound_by_width_and_letterboxed() {
+        // 2:1 into 16:10 — width is the tighter axis, so the height comes out short and the
+        // leftover is split top and bottom.
+        let f = fit(Size::new(2560, 1280), Size::new(1280, 800));
+        assert_eq!(f.size, Size::new(1280, 640));
+        assert_eq!(f.origin, Point::new(0, 80));
+        assert!(f.scaled);
+    }
+
+    #[test]
+    fn a_taller_picture_is_bound_by_height_and_pillarboxed() {
+        // 1:2 into 16:10 — height binds, and the leftover is split left and right.
+        let f = fit(Size::new(1000, 2000), Size::new(1280, 800));
+        assert_eq!(f.size, Size::new(400, 800));
+        assert_eq!(f.origin, Point::new(440, 0));
+        assert!(f.scaled);
+    }
+
+    #[test]
+    fn the_aspect_ratio_is_kept_rather_than_stretched() {
+        // **The point of fitting rather than filling.** Stretching to the screen is one line
+        // shorter and makes every face on a wallpaper the wrong shape.
+        let f = fit(Size::new(4000, 1000), Size::new(1280, 800));
+        assert_eq!(f.size.w, 1280);
+        assert_eq!(f.size.h, 320, "4:1 stays 4:1");
+        assert_ne!(f.size, Size::new(1280, 800), "not stretched to fill");
+    }
+
+    #[test]
+    fn a_picture_larger_in_one_axis_only_is_still_scaled_to_fit() {
+        // Taller than the screen but narrower. A rule that only fired when *both* axes were
+        // over would draw this one off the bottom.
+        let f = fit(Size::new(200, 1600), Size::new(1280, 800));
+        assert_eq!(f.size, Size::new(100, 800));
+        assert!(f.scaled);
+        assert!(f.size.h <= 800 && f.size.w <= 1280, "inside the screen in both axes");
+    }
+
+    #[test]
+    fn an_extreme_ratio_still_produces_a_buffer_box_downscale_will_take() {
+        // 4000 x 3 into 1280 wide is 0.96 rows. A zero-height destination is one
+        // `box_downscale` refuses, so the fit would be a wallpaper that silently did not
+        // appear.
+        let f = fit(Size::new(4000, 3), Size::new(1280, 800));
+        assert!(f.size.w > 0 && f.size.h > 0, "got {:?}", f.size);
+        let mut dst = alloc::vec![0u8; (f.size.w * f.size.h * 4) as usize];
+        let src = alloc::vec![0u8; 4000 * 3 * 4];
+        let sg = Geometry::with_pitch(4000, 3, 4000 * 4, PixelFormat::XRGB8888).unwrap();
+        let dg = Geometry::with_pitch(f.size.w, f.size.h, (f.size.w * 4) as usize, PixelFormat::XRGB8888)
+            .unwrap();
+        assert!(box_downscale(&src, sg, &mut dst, dg), "the planned size is one it accepts");
+    }
+
+    #[test]
+    fn a_zero_dimension_is_answered_rather_than_panicking() {
+        // The image's size comes from a file's header and the screen's from a device.
+        assert_eq!(fit(Size::new(0, 100), Size::new(1280, 800)).size, Size::new(0, 0));
+        assert_eq!(fit(Size::new(100, 100), Size::new(0, 800)).size, Size::new(0, 0));
+    }
 
     fn geom(w: u32, h: u32) -> Geometry {
         Geometry::packed(w, h, PixelFormat::XRGB8888)

@@ -131,7 +131,7 @@ pub struct Theme {
     /// decision 3. A desktop whose menus are monospaced is a desktop that looks like a terminal,
     /// and until Part D every window in this system was: `SYSTEM_FONT_PATH` was one constant and
     /// every client loaded it.
-    pub font_ui: FontPath,
+    pub font_ui: ThemePath,
     /// The font a character grid is drawn with.
     ///
     /// **Separate because a grid needs a fixed advance**, which is a property of the file rather
@@ -139,7 +139,55 @@ pub struct Theme {
     /// font here does not make a terminal with narrow columns, it makes a terminal whose columns
     /// are wrong. A theme may name a different mono face; naming a proportional one is a theme
     /// breaking its own terminal, which is why the two are separate keys and not one.
-    pub font_mono: FontPath,
+    pub font_mono: ThemePath,
+    /// A picture to draw behind everything, or `None` for the bare [`desktop`](Self::desktop)
+    /// colour.
+    ///
+    /// **`Option`, because most themes have none** — and because "no wallpaper" has to be
+    /// expressible in the file rather than only by omission: a theme *received on the wire* is
+    /// always complete (see [`to_config`](Self::to_config)), so a shell reading one needs a
+    /// value that means "nothing" rather than a missing line.
+    ///
+    /// The file names it and `desktop-shell` reads it: the shell holds `/home` and a theme,
+    /// where the compositor holds neither and should not gain a filesystem in order to draw
+    /// (M12 decision 2).
+    pub wallpaper: Option<ThemePath>,
+    /// How a wallpaper is placed when it is not the screen's size.
+    ///
+    /// **A key of its own, and today it has exactly one legal value** — M12 decision 7: the
+    /// maintainer wants filling as well eventually, so the *dimension* exists in the schema now
+    /// and a second mode is a value rather than a new key. `fill` needs an upscaler and a
+    /// decision about interpolation and is deferred as `TODO(wallpaper-fill)`; a file naming it
+    /// is refused by name rather than silently fitted, which is what makes that trigger
+    /// observable.
+    pub wallpaper_mode: WallpaperMode,
+}
+
+/// How a wallpaper is placed. See [`Theme::wallpaper_mode`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum WallpaperMode {
+    /// Scale down to fit inside the screen if larger, centre if smaller. The only mode that
+    /// ships — [`scale::fit`](crate::scale::fit) is the arithmetic.
+    #[default]
+    Fit,
+}
+
+impl WallpaperMode {
+    /// The name this writes and reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WallpaperMode::Fit => "fit",
+        }
+    }
+
+    /// Parse a mode name — `None` for one that does not exist *yet*, which is the answer `fill`
+    /// gets until `TODO(wallpaper-fill)` is built.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "fit" => Some(WallpaperMode::Fit),
+            _ => None,
+        }
+    }
 }
 
 impl Theme {
@@ -190,8 +238,13 @@ impl Theme {
 
             font_px: 16.0,
             bevel: 12,
-            font_ui: FontPath::new(crate::text::UI_FONT_PATH),
-            font_mono: FontPath::new(crate::text::MONO_FONT_PATH),
+            font_ui: ThemePath::new(crate::text::UI_FONT_PATH),
+            font_mono: ThemePath::new(crate::text::MONO_FONT_PATH),
+            // **The shipped theme names no picture**, which is the honest default: a wallpaper
+            // is a file a person supplies, and inventing one here would make the desktop's
+            // ground depend on an asset the build happened to stage.
+            wallpaper: None,
+            wallpaper_mode: WallpaperMode::Fit,
         }
     }
 }
@@ -324,9 +377,37 @@ impl Theme {
                 // TOML string, so a bare one is a file this reader and a real TOML reader
                 // disagree about — and `unquote` accepts a bare value, which is what makes the
                 // check explicit here rather than implied.
-                "font_ui" | "font_mono" if !raw.starts_with('"') => false,
+                "font_ui" | "font_mono" | "wallpaper" | "wallpaper_mode"
+                    if !raw.starts_with('"') =>
+                {
+                    false
+                }
                 "font_ui" => set_path(&mut t.font_ui, value),
                 "font_mono" => set_path(&mut t.font_mono, value),
+                // **An empty string is "no wallpaper", not a bad path.** `to_config` writes one
+                // for `None`, so a reader of a theme it was handed must accept it; and a person
+                // clearing the line in their own file means the same thing.
+                "wallpaper" => {
+                    if value.is_empty() {
+                        t.wallpaper = None;
+                        true
+                    } else {
+                        match ThemePath::parse(value) {
+                            Some(p) => {
+                                t.wallpaper = Some(p);
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                }
+                "wallpaper_mode" => match WallpaperMode::parse(value) {
+                    Some(m) => {
+                        t.wallpaper_mode = m;
+                        true
+                    }
+                    None => false,
+                },
                 _ => {
                     issues.push(Issue { line: n + 1, kind: IssueKind::UnknownKey });
                     continue;
@@ -373,6 +454,8 @@ impl Theme {
             bevel,
             font_ui,
             font_mono,
+            wallpaper,
+            wallpaper_mode,
         } = *self;
         let mut s = alloc::string::String::new();
         for (k, c) in [
@@ -401,11 +484,20 @@ impl Theme {
         // reader refuses is a round trip that only works by accident.
         let _ = writeln!(s, "font_ui = \"{}\"", font_ui.as_str());
         let _ = writeln!(s, "font_mono = \"{}\"", font_mono.as_str());
+        // **Written even when there is none**, as an empty string. Every field, always — a
+        // reader of this never falls back to a default, which is the property that makes it
+        // safe to hand to another process.
+        let _ = writeln!(s, "wallpaper = \"{}\"", wallpaper.as_ref().map_or("", |p| p.as_str()));
+        let _ = writeln!(s, "wallpaper_mode = \"{}\"", wallpaper_mode.as_str());
         s
     }
 }
 
-/// The path to a font file, bounded so a [`Theme`] stays `Copy` and `const`-constructible.
+/// A path a theme names, bounded so a [`Theme`] stays `Copy` and `const`-constructible.
+///
+/// **Called `FontPath` until M12 Part F**, when the wallpaper became its second consumer. The
+/// rule `userspace/CLAUDE.md` states for helpers applies to types too: one named for its first
+/// caller is a type the second caller has to explain.
 ///
 /// **A fixed-capacity path rather than a `String`**, and the reason is the same one that made
 /// `Theme::light()` a `const fn`: the compositor keeps theme colours as `const` items, and a heap
@@ -414,7 +506,7 @@ impl Theme {
 /// argv and the environment, so a path a person could make arbitrarily long is a theme file that
 /// could stop applications from launching.
 ///
-/// A path is absolute, non-empty, at most [`MAX_FONT_PATH`] bytes, and free of control
+/// A path is absolute, non-empty, at most [`MAX_THEME_PATH`] bytes, and free of control
 /// characters, `"` and `\` — the control bytes because it is logged when it fails to load and a
 /// font path is one of the few pieces of a theme file that reaches a console, the other two
 /// because the value is written back out as a TOML basic string. A path holding a quote would
@@ -422,14 +514,14 @@ impl Theme {
 /// argument the unquoted-`font_px` rule rests on, applied to the other end of the string
 /// (PR #264 review, optional 4).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct FontPath {
+pub struct ThemePath {
     /// Zero-filled past `len`, so the derived equality compares paths rather than the debris of
     /// whatever longer path a slot held before.
-    bytes: [u8; MAX_FONT_PATH],
+    bytes: [u8; MAX_THEME_PATH],
     len: u8,
 }
 
-impl FontPath {
+impl ThemePath {
     /// A path known at compile time.
     ///
     /// **Panics on a path this type cannot hold**, which is what makes it usable in a `const`:
@@ -438,8 +530,8 @@ impl FontPath {
     /// file calls [`parse`](Self::parse), which answers instead of panicking.
     pub const fn new(s: &str) -> Self {
         let b = s.as_bytes();
-        assert!(usable(b), "a font path must be absolute, printable, and fit MAX_FONT_PATH");
-        let mut bytes = [0u8; MAX_FONT_PATH];
+        assert!(usable(b), "a theme path must be absolute, printable, and fit MAX_THEME_PATH");
+        let mut bytes = [0u8; MAX_THEME_PATH];
         let mut i = 0;
         while i < b.len() {
             bytes[i] = b[i];
@@ -461,16 +553,16 @@ impl FontPath {
     }
 }
 
-impl core::fmt::Debug for FontPath {
+impl core::fmt::Debug for ThemePath {
     /// The path, not 64 bytes of mostly zeroes — a `Theme` is printed by a failing test.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
-/// Whether `b` is a path [`FontPath`] can hold.
+/// Whether `b` is a path [`ThemePath`] can hold.
 const fn usable(b: &[u8]) -> bool {
-    if b.is_empty() || b.len() > MAX_FONT_PATH || b[0] != b'/' {
+    if b.is_empty() || b.len() > MAX_THEME_PATH || b[0] != b'/' {
         return false;
     }
     let mut i = 0;
@@ -489,13 +581,14 @@ const fn usable(b: &[u8]) -> bool {
 // `len` is a `u8`, and it is only wide enough to hold what `usable` admits while the bound below
 // fits in one. Raising it past 255 would truncate silently and `as_str` would hand back a short
 // path with nothing anywhere reporting it (PR #264 review, optional 3).
-const _: () = assert!(MAX_FONT_PATH <= u8::MAX as usize);
+const _: () = assert!(MAX_THEME_PATH <= u8::MAX as usize);
 
-/// The longest font path a theme can name.
+/// The longest path a theme can name.
 ///
-/// Enough for `/system/fonts/` plus a long family name, and small enough that two of them on the
-/// setup record are noise beside the 4 KiB it holds.
-pub const MAX_FONT_PATH: usize = 64;
+/// Enough for `/system/fonts/` plus a long family name — and, since M12 Part F, for a wallpaper
+/// somewhere under a home directory, which is what raised it from 64. Small enough that three of
+/// them on the setup record are noise beside the 4 KiB it holds.
+pub const MAX_THEME_PATH: usize = 128;
 
 /// A size rounded to the precision [`px_parts`] can print without loss.
 fn round_px(v: f32) -> f32 {
@@ -587,8 +680,8 @@ fn set(slot: &mut Rgb, value: &str) -> bool {
 }
 
 /// Parse a font path into `slot`, answering whether it was one.
-fn set_path(slot: &mut FontPath, value: &str) -> bool {
-    match FontPath::parse(value) {
+fn set_path(slot: &mut ThemePath, value: &str) -> bool {
+    match ThemePath::parse(value) {
         Some(p) => {
             *slot = p;
             true
@@ -712,10 +805,15 @@ mod tests {
         t.background = Rgb::new(0x01, 0x02, 0x03);
         t.selection = Rgb::new(0xFE, 0xDC, 0xBA);
         t.font_px = 13.0;
-        t.font_ui = FontPath::new("/home/Fancy.ttf");
+        t.font_ui = ThemePath::new("/home/Fancy.ttf");
+        t.wallpaper = Some(ThemePath::new("/home/alice/hills.png"));
 
         let text = t.to_config();
-        assert_eq!(text.lines().count(), 20, "sixteen colours, a size, a bevel and two fonts");
+        assert_eq!(
+            text.lines().count(),
+            22,
+            "sixteen colours, a size, a bevel, two fonts, a wallpaper and its mode"
+        );
         let (back, issues) = Theme::from_config(&text);
         assert_eq!(back, t);
         assert!(issues.is_empty(), "{issues:?}");
@@ -724,6 +822,47 @@ mod tests {
         // different starting point still lands on `t`, because every field is named.
         let (over, _) = Theme::from_config(&text);
         assert_eq!(over, t, "every field is present, so nothing is inherited");
+
+        // **And a theme with no wallpaper round-trips too**, which is the case the empty string
+        // exists for: `None` has to survive the wire, or a shell handed a theme would fall back
+        // to whatever its own default was rather than to "no picture".
+        let bare = Theme::light();
+        assert_eq!(bare.wallpaper, None, "the shipped theme names none");
+        let (read_back, issues) = Theme::from_config(&bare.to_config());
+        assert_eq!(read_back, bare);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn a_wallpaper_mode_that_does_not_exist_yet_is_refused_by_name() {
+        // **`fill` is `TODO(wallpaper-fill)`, and the refusal is what makes that observable.**
+        // Silently fitting a file that asked to fill would be a deferral nobody could find from
+        // the outside — a person would conclude filling was broken rather than absent.
+        let (t, issues) = Theme::from_config("wallpaper_mode = \"fill\"\n");
+        assert_eq!(t.wallpaper_mode, WallpaperMode::Fit, "the default is unchanged");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, IssueKind::BadValue);
+        // …and the one mode that does exist is taken.
+        let (t, issues) = Theme::from_config("wallpaper_mode = \"fit\"\n");
+        assert_eq!(t.wallpaper_mode, WallpaperMode::Fit);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn a_wallpaper_path_is_bounded_and_quoted_like_a_font_path_is() {
+        // The same rules, because it is the same type — which is why it stopped being called
+        // `FontPath`. A bare value is a file this reader and a real TOML reader disagree about.
+        let (_, issues) = Theme::from_config("wallpaper = /home/x.png\n");
+        assert_eq!(issues.len(), 1, "a bare path is refused");
+        let (_, issues) = Theme::from_config("wallpaper = \"relative.png\"\n");
+        assert_eq!(issues.len(), 1, "so is a relative one");
+        let long = "/".repeat(MAX_THEME_PATH + 1);
+        let (_, issues) = Theme::from_config(&alloc::format!("wallpaper = \"{long}\"\n"));
+        assert_eq!(issues.len(), 1, "and one past the bound");
+        // An empty string is not a bad path — it is how "no wallpaper" is spelled.
+        let (t, issues) = Theme::from_config("wallpaper = \"\"\n");
+        assert_eq!(t.wallpaper, None);
+        assert!(issues.is_empty(), "{issues:?}");
     }
 
     #[test]
@@ -741,38 +880,38 @@ mod tests {
 
     #[test]
     fn a_font_path_is_absolute_bounded_and_free_of_control_bytes() {
-        assert_eq!(FontPath::parse("/system/fonts/DejaVuSans.ttf").map(|p| p.as_str().len()), Some(28));
+        assert_eq!(ThemePath::parse("/system/fonts/DejaVuSans.ttf").map(|p| p.as_str().len()), Some(28));
         // A name that is not ASCII is a name all the same — the input is a `&str`.
-        assert!(FontPath::parse("/home/\u{c9}criture.ttf").is_some());
+        assert!(ThemePath::parse("/home/\u{c9}criture.ttf").is_some());
 
-        assert_eq!(FontPath::parse(""), None, "empty");
-        assert_eq!(FontPath::parse("DejaVuSans.ttf"), None, "relative");
-        assert_eq!(FontPath::parse("/home/a\nb.ttf"), None, "a path with a newline is not a path");
+        assert_eq!(ThemePath::parse(""), None, "empty");
+        assert_eq!(ThemePath::parse("DejaVuSans.ttf"), None, "relative");
+        assert_eq!(ThemePath::parse("/home/a\nb.ttf"), None, "a path with a newline is not a path");
         // **A quote and a backslash, because the value is written back as a TOML basic string.**
         // `/home/a"b.ttf` would round-trip through this reader and read as something else in any
         // other TOML parser, which is the claim the schema makes about every file it accepts.
-        assert_eq!(FontPath::parse("/home/a\"b.ttf"), None, "a quote would escape the string");
-        assert_eq!(FontPath::parse("/home/a\\b.ttf"), None, "a backslash would be an escape");
-        let long = alloc::format!("/home/{}.ttf", "x".repeat(MAX_FONT_PATH));
-        assert_eq!(FontPath::parse(&long), None, "longer than the record can carry");
+        assert_eq!(ThemePath::parse("/home/a\"b.ttf"), None, "a quote would escape the string");
+        assert_eq!(ThemePath::parse("/home/a\\b.ttf"), None, "a backslash would be an escape");
+        let long = alloc::format!("/home/{}.ttf", "x".repeat(MAX_THEME_PATH));
+        assert_eq!(ThemePath::parse(&long), None, "longer than the record can carry");
         // The bound is inclusive, and the test says which side of it: exactly MAX is fine.
-        let exact = alloc::format!("/{}", "x".repeat(MAX_FONT_PATH - 1));
-        assert_eq!(FontPath::parse(&exact).map(|p| p.as_str().len()), Some(MAX_FONT_PATH));
+        let exact = alloc::format!("/{}", "x".repeat(MAX_THEME_PATH - 1));
+        assert_eq!(ThemePath::parse(&exact).map(|p| p.as_str().len()), Some(MAX_THEME_PATH));
     }
 
     #[test]
     fn a_font_path_compares_as_a_path_and_not_as_its_buffer() {
-        // **What this actually pins is `len`**, and the comment used to claim more. `FontPath`
+        // **What this actually pins is `len`**, and the comment used to claim more. `ThemePath`
         // derives `PartialEq` over a 64-byte array, so the zero fill is what makes that equality
         // mean "the same path" — but no constructor here can leave a previous path's tail
         // behind, because both start from a fresh array, so nothing in this crate can produce
         // the case the fill defends against. Filling with `0xFF` instead leaves every test in
         // this file green (PR #264 review, optional 2). The half that does bite is below: stop
         // slicing at `len` in `as_str` and five tests fail, this one included.
-        let a = FontPath::new("/system/fonts/DejaVuSans.ttf");
-        let b = FontPath::parse("/system/fonts/DejaVuSans.ttf").expect("a usable path");
+        let a = ThemePath::new("/system/fonts/DejaVuSans.ttf");
+        let b = ThemePath::parse("/system/fonts/DejaVuSans.ttf").expect("a usable path");
         assert_eq!(a, b);
-        assert_ne!(a, FontPath::new("/system/fonts/DejaVuSansMono.ttf"));
+        assert_ne!(a, ThemePath::new("/system/fonts/DejaVuSansMono.ttf"));
         assert_eq!(alloc::format!("{a:?}"), "\"/system/fonts/DejaVuSans.ttf\"");
     }
 

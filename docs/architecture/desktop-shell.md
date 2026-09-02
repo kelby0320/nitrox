@@ -2,9 +2,13 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-01** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-02** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
-click;
+click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
+Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
+reservation, holding a PNG the theme names and this shell decodes, because the shell holds
+`/home` and a theme where the compositor holds neither (see [`clipboard.md`](clipboard.md) and
+`display-arm-plan.md` M12 decision 2);
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
 
@@ -130,12 +134,22 @@ GNOME 2 window list; GNOME 3's automatic workspace lifecycle is shelved rather t
 
 | Surface | Persistent? | Contents | Churn |
 |---|---|---|---|
+| **Wallpaper** | yes | the picture the theme names, fitted and centred | **none** — drawn once at startup |
 | **Top bar** | yes | workspaces button (left), applications button, clock (centre), tray (right, v2) | low |
 | **Bottom bar** | yes | window list, desktop indicator | **high** — every open, close, retitle, focus change |
 | **Applications modal** | no | search field, filtered entries | **highest** — the whole list is rebuilt per keystroke |
 | **Overview** | no | thumbnails of the current desktop, sidebar of the others | bursty |
 
-The churn column is not decoration: it is what settled the toolkit question in §5.
+The churn column is not decoration: it is what settled the toolkit question in §5 — and the
+wallpaper's zero is why it is the one surface here that builds no element tree at all: it is a
+picture blitted into a buffer, not a widget.
+
+**The wallpaper is a `Role::Panel` with `reserve: 0`** (M12 Part F), which is what makes it
+bottom-most, unfocusable and free of any claim on the work area without a new role: a panel
+cannot take focus, a zero reservation subtracts nothing, and the compositor's stack is
+creation-ordered so creating it first puts it under everything. Like the bars it is made
+**sticky**, because a picture behind everything belongs to the screen rather than to one desktop.
+It is absent when the theme names no file, which is the shipped default.
 
 ## 3. One process, several windows
 
