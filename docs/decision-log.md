@@ -21559,3 +21559,64 @@ an image that does not load falls back to the ground colour and says so, which i
 other unreadable value in that file already gets. **Icons stay filed** — PNG makes an icon set
 possible, and an icon set is a naming convention, a size convention and a lookup path, which is a
 second decision.
+
+## 2026-09-01 — M12's details pass: a kill ring, a path, and a trigger the toolkit wrote for itself
+
+Six parts and five more governing decisions, so M12 can be built rather than re-argued. The two
+taken earlier the same day — the clipboard's owner and the image format — are in the entry above.
+
+### The milestone fires a trigger the toolkit named years of milestones ago
+
+`widget-toolkit.md` §11 has said since M4: *"Multi-window applications. One `App` drives one
+window. Trigger: dialogs that are real windows rather than `stack` overlays."* M12's file
+operations need confirmations, so the trigger fires — and the alternative was live: a modal confirm
+as a `stack` layer is cheaper, cannot be dragged away from what it is confirming, and would have
+been defensible.
+
+It was rejected because `Role::Dialog` has existed since M6 with **no consumer at all**, and its
+placement semantics were *changed* in M11 Part E batch 8 with nothing exercising them. A role
+nothing creates is a role nobody knows is broken. So dialogs become real windows and the toolkit
+grows the dimension it wrote the trigger for.
+
+### Decision 3 — the clipboard is a kill ring, and the ring is shared while the cursor is not
+
+The maintainer asked for a kill ring rather than a single slot, which changes the protocol's shape
+rather than only its size. A slot loses what you copied two copies ago, which is the whole reason
+kill rings exist.
+
+**The division is the part worth recording.** The ring is the server's — shared, N entries, most
+recent first, `Copy` pushes. The *position* in it is the client's: "paste the one before that" is a
+property of the editing somebody is doing right now, not of the machine. Two applications cycling
+at once would fight over one cursor, and a cursor one client advanced would move under another. So
+a client remembers what it last pasted and asks for the next by index, and the server holds no
+per-client state.
+
+### Decision 4 — it is reachable as a path, and usable from a pipeline
+
+Also the maintainer's, and the more interesting half: `/dev/clipboard`, bound into the session
+namespace the way `/dev/tty` and `/dev/draw` are, with a small utility either side of a pipe.
+
+**A clipboard only graphical applications could reach would be the first resource in this system a
+pipeline cannot use** — in a system whose stated inheritance from Unix is "composable pipelines and
+everything as a resource". It also makes the ring inspectable: listing what is in it becomes a
+command rather than a window somebody has to build.
+
+There is no generic read/write verb here — a resource server speaks its own ops, as the tty server
+does with `OP_TTY_READ`/`OP_TTY_WRITE` — so this is a binding plus a utility, not a new file
+interface.
+
+### Decisions 5 to 7, briefly
+
+**A capped payload first**, at the 4008-byte IPC payload — about two screens of terminal text —
+with chunking recorded as *expected* rather than hypothetical, on the maintainer's judgement that
+it will not be enough for long. The trigger is written as the first thing somebody cannot copy. A
+shared memory object was the third option and is not taken: M10 rejected handle transfer for drops
+because a refused handle has no clean owner, and the clipboard would inherit that question.
+
+**`Ctrl+C`/`Ctrl+V`, and `Ctrl+Shift` in the terminal**, because `Ctrl+C` means interrupt there and
+always will — the split every real terminal makes, so it is a difference people arrive already
+knowing.
+
+**The wallpaper fits or centres**, using the box downscale that exists and explicitly refuses to
+scale up; scaling to fill is deferred as a *mode* rather than dropped, so the theme key is designed
+with room for one beside the path and only one mode ships.

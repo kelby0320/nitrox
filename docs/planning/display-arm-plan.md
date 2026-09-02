@@ -3616,6 +3616,136 @@ unreadable value in that file already gets.
 **Icons stay filed.** PNG makes an icon set *possible*; an icon set is a naming convention, a size
 convention and a lookup path, which is a second decision and not this one.
 
+### Details pass, 2026-09-01
+
+Six parts, and the governing decisions below them, so each can be built rather than re-argued.
+The two taken before this pass — the clipboard's owner and the image format — are above.
+
+### Part A — dialogs, and the second window
+
+- [ ] **`Role::Dialog` gets its first consumer, and the toolkit grows a dimension.** The role has
+      existed since M6 and nothing has ever created one; its placement semantics changed in M11
+      Part E batch 8 and are exercised by nothing at all. `widget-toolkit.md` §11 named the
+      trigger — "Multi-window applications. One `App` drives one window. Trigger: dialogs that are
+      real windows rather than `stack` overlays" — and this is that day.
+
+- [ ] **Gate**: `check-login` drives a confirmation to both answers. A dialog that only ever gets
+      "yes" is half a control.
+
+### Part B — the browser: file operations, and drag-and-drop within a window
+
+- [ ] **Rename, delete, copy, new folder**, each with the confirmation Part A makes possible.
+      `nxfiles` holds `/home` and performs them itself: it has the authority for its own subtree,
+      and routing them through the shell would be asking a supervisor to do what the application
+      is already entitled to.
+
+- [ ] **Copy is the one with a size**, and `libfs::read_file` maps whole files — so a copy of
+      something large is a heap problem before it is a feature. Either it streams or it names a
+      bound; deciding that is the part's, not this pass's.
+
+- [ ] **Drag-and-drop within a window** — the half M10 Part E did not build, where the compositor
+      is not involved because the payload never leaves the client.
+
+- [ ] **Gate**: `check-login` renames a file and reads the new name back with `nxsh`, the way the
+      editor's save is already checked from outside the application that did it.
+
+### Part C — the editor: undo, redo and find
+
+- [ ] **Undo grouping is the decision**, not the stack. Per keystroke is unusable and per save is
+      useless; what a person expects is a word or a line. It belongs in `TextAreaState`, which
+      already owns the buffer, the cursor and the selection.
+
+- [ ] **Find reuses the shape the save-as field established** (M11 Part E batch 7): a mode in
+      which the keys are the field's rather than the buffer's. That was called "the first widget
+      that wants a key"; this is the second.
+
+- [ ] **Gate**: type, undo, redo, and read the file back from outside.
+
+### Part D — tabs, in both applications
+
+- [ ] **A tab strip is a widget**, and the toolkit has none. It arrives here because two
+      applications want it, which is the rule §8 has applied to every widget it holds.
+
+- [ ] **Gate**: two buffers in one window, switched, and the right one saved.
+
+### Part E — copy and paste
+
+- [ ] **A clipboard server**, endpoint bound per session, storing rather than brokering. Decision 1
+      above.
+
+- [ ] **A kill ring, not a slot** — see decision 3.
+
+- [ ] **Reachable as a path**, `/dev/clipboard`, and usable from a pipeline — decision 4.
+
+- [ ] **Selection in the terminal grid**, which `libterm` has never had: M5 deferred it in the same
+      breath as the clipboard. What a selection *is* across a reflow is the question inside it.
+
+- [ ] **Gate**: copy in the editor, paste in the terminal, and the shell prints what was copied —
+      one gesture crossing two applications and a server, which is the whole point.
+
+### Part F — images and the wallpaper
+
+- [ ] **PNG decoded in the guest** — inflate, unfiltering, no interlacing. Decision 2 above.
+      Whether that is hand-rolled or a crate is settled by building both for
+      `x86_64-unknown-nitrox`, which `userspace/CLAUDE.md` requires before taking a dependency
+      anyway.
+
+- [ ] **The wallpaper is a window `desktop-shell` owns**, full-screen and bottom-most. The shell
+      holds `/home` and a theme; the compositor holds neither and should not gain a filesystem in
+      order to draw.
+
+- [ ] **Fit if larger, centre if smaller** — decision 6.
+
+- [ ] **Gate**: `check-login` names a staged image in the theme, and the shell reports the size it
+      decoded. A picture is pixels a release-image boot has no reference for; the dimensions are
+      what can be asserted.
+
+### Governing decisions
+
+Settled with the maintainer 2026-09-01. Decisions 1 and 2 (the clipboard's owner, and PNG) are
+recorded above with M12's scope; these are the rest.
+
+**3. The clipboard is a kill ring, and the ring is the server's while the cursor is the
+client's.** A single slot loses the thing you copied two copies ago, which is what every editor
+with a kill ring exists to avoid. So the server keeps the last N entries, most recent first, and
+`Copy` pushes.
+
+The division is the interesting half: **the ring is shared and the position in it is not.** A
+"paste the one before that" gesture is a property of the editing somebody is doing right now, not
+of the machine — two applications cycling at once would fight over one cursor, and a cursor that
+one client advanced would move under another. So a client remembers which entry it last pasted and
+asks for the next; the server answers by index and holds no per-client state.
+
+**4. It is reachable as a path, and usable from a pipeline.** `/dev/clipboard`, bound into the
+session namespace the way `/dev/tty` and `/dev/draw` are. There is no generic read/write verb in
+this system — a resource server speaks its own ops, as the tty does — so shell access is a small
+utility either side of the pipe rather than a new file interface.
+
+That is the maintainer's addition to this pass, and it is the more interesting half of the
+decision: a clipboard that only graphical applications can reach would be the first resource in
+this system that a pipeline cannot. Making it a path also makes the ring *inspectable* — listing
+what is in it is a command rather than a feature somebody has to build a window for.
+
+**5. A capped payload first, and chunking is expected rather than hypothetical.** The IPC payload
+is 4008 bytes, so one exchange carries about two screens of terminal text; the cap is a named
+promise like `MAX_EVENT_BODY` is. The maintainer's judgement is that this will not be enough for
+long — "we can start with 1, but we may need to end up at 2" — so the trigger is written as an
+expectation: **the first thing somebody cannot copy.** A shared memory object was the third option
+and is not taken: M10 rejected handle transfer for drops because a refused handle has no clean
+owner, and the clipboard would inherit that question.
+
+**6. `Ctrl+C`/`Ctrl+V`, and `Ctrl+Shift` in the terminal.** What fingers already know, and the
+terminal has to differ because `Ctrl+C` means interrupt there and always will. The kill ring needs
+a third binding to cycle; it is a part-level detail, and `Ctrl+Shift+V` cycling on repeat is the
+obvious candidate.
+
+**7. The wallpaper fits or centres, and scaling to fill is deferred as a *mode*.** `box_downscale`
+already scales down with a box average and explicitly refuses to scale up, so fitting a too-large
+picture and centring a smaller one needs no new code. Filling needs an upscaler and a decision
+about interpolation. The maintainer wants both eventually — "it'd be nice to have 1 and 2 as
+options" — so the theme key is designed with room for a mode beside the path, and only one mode
+ships.
+
 ## Milestone 13 — the compositor's feel
 
 Named 2026-09-01, when M11's polish pass produced two reports that were not about appearance and
