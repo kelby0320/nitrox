@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{
@@ -35,9 +35,9 @@ use libui::element::{
     with_spacing,
 };
 use libui::widget::{
-    DIALOG_GAP, GRIP_W, ListRow, ListState, Theme as UiTheme, TITLE_BAR_H, TextFieldState,
-    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view, menu_bar,
-    menu_item, popup_frame, resize_grip, text_field, title_bar, window_frame,
+    DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
+    TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
+    menu_bar, menu_item, popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -113,6 +113,19 @@ pub const PROMPT_KEY: u64 = 17;
 pub const BAR_KEY: u64 = 18;
 /// The element key on the path strip's inner row — the half that is either the path or a prompt.
 pub const STRIP_INNER_KEY: u64 = 19;
+/// The element key on the tab strip.
+pub const TAB_STRIP_KEY: u64 = 24;
+/// Where pane keys start — see `nxedit::TAB_KEY_BASE`, whose reasoning is the same.
+///
+/// **The top bit matters more here than there.** This browser keys its list rows by *index*, and
+/// a directory can hold any number of entries — so a base of a few thousand would put row `n` and
+/// a tab on the same number for a large enough folder, and hovering one would highlight the other
+/// (PR #270 review, optional 6). A row index cannot reach the high bit.
+pub const TAB_KEY_BASE: u64 = 1 << 63;
+/// The key that opens a tab: `t`. Pinned against the keymap by a test, as `nxedit`'s are.
+pub const NEW_TAB_KEYCODE: u16 = 20;
+/// The key that closes one: `w`.
+pub const CLOSE_TAB_KEYCODE: u16 = 17;
 /// The element key on the confirmation dialog's title bar.
 pub const CONFIRM_TITLE_KEY: u64 = 20;
 /// The element key on its question.
@@ -319,13 +332,36 @@ impl Entry {
 }
 
 /// Everything the browser is.
-pub struct App {
+/// One tab: a directory, what is in it, and where the person is in that list.
+///
+/// **Split out in M12 Part D**, the same line `nxedit` draws between a buffer and its window.
+/// What stays on [`App`] is what a *window* has; what moves here is what a person expects to
+/// survive switching tabs — including the scroll offset, because a tab that jumped back to the
+/// top when you came back to it would lose your place every time you looked at another folder.
+pub struct Pane {
+    /// Identity across frames and across the strip. Not the index: closing a tab renumbers the
+    /// rest.
+    key: u64,
     /// Where the listing came from, absolute and with no trailing separator except at the root.
     path: String,
     /// What is in it, sorted.
     entries: Vec<Entry>,
     /// Which row is selected and how far the list is scrolled.
     list: ListState,
+}
+
+/// Everything the browser is.
+pub struct App {
+    /// The open panes, in the order their tabs are drawn. **Never empty**, for the reason
+    /// `nxedit`'s buffers are not: closing the last tab closes the window.
+    panes: Vec<Pane>,
+    /// Which pane's tab is current, by [`Pane::key`].
+    current: u64,
+    /// The next key to hand out — monotonic, so a stale message can never name a pane that has
+    /// taken its place. Numbered from [`TAB_KEY_BASE`] so a tab's key cannot collide with the
+    /// chrome's element keys *or with a list row's index*, which `Router::hovered_key` reports in
+    /// one namespace.
+    next_key: u64,
     /// The window's size in pixels — what the client commits.
     window: Size,
     /// Whether this window holds the keyboard, which the title bar shows.
@@ -470,15 +506,26 @@ pub enum Msg {
     KeepIt,
     /// The delete dialog's title bar was dragged.
     DragConfirm,
+    /// A tab was pressed — make it current.
+    SelectTab(u64),
+    /// A tab's close box was pressed, or `Ctrl+W`.
+    CloseTab(u64),
+    /// `Ctrl+T`: a second view of where you are.
+    NewTab,
 }
 
 impl App {
     /// A browser showing nothing, at `path`.
     pub fn new(path: &str) -> App {
         App {
-            path: String::from(path),
-            entries: Vec::new(),
-            list: ListState::default(),
+            panes: alloc::vec![Pane {
+                key: TAB_KEY_BASE,
+                path: String::from(path),
+                entries: Vec::new(),
+                list: ListState::default(),
+            }],
+            current: TAB_KEY_BASE,
+            next_key: TAB_KEY_BASE + 1,
             window: START_SIZE,
             focused: true,
             maximized: false,
@@ -503,14 +550,61 @@ impl App {
         }
     }
 
+    /// The pane whose tab is current. Never `None` — the last tab closing closes the window.
+    fn pane(&self) -> &Pane {
+        self.panes.iter().find(|p| p.key == self.current).unwrap_or(&self.panes[0])
+    }
+
+    /// The current pane, mutably. See [`pane`](Self::pane).
+    fn pane_mut(&mut self) -> &mut Pane {
+        let key = self.current;
+        let i = self.panes.iter().position(|p| p.key == key).unwrap_or(0);
+        &mut self.panes[i]
+    }
+
+    /// The tabs, for the strip that draws them: key and label.
+    pub fn tabs(&self) -> Vec<(u64, String)> {
+        self.panes
+            .iter()
+            .map(|p| {
+                let name = libfs::basename_str(&p.path);
+                let label = if name.is_empty() { "/" } else { name };
+                (p.key, String::from(label))
+            })
+            .collect()
+    }
+
+    /// Which tab is current.
+    pub fn current_tab(&self) -> u64 {
+        self.current
+    }
+
+    /// How many panes are open.
+    pub fn tab_count(&self) -> usize {
+        self.panes.len()
+    }
+
+    /// Remove the tab keyed `k`, closing the window if it was the last.
+    fn drop_tab(&mut self, k: u64) {
+        if self.panes.len() <= 1 {
+            self.closing = true;
+            return;
+        }
+        let Some(i) = self.panes.iter().position(|p| p.key == k) else { return };
+        self.panes.remove(i);
+        if self.current == k {
+            self.current = self.panes[i.saturating_sub(1).min(self.panes.len() - 1)].key;
+        }
+    }
+
     /// Where the browser is.
     pub fn path(&self) -> &str {
-        &self.path
+        &self.pane().path
     }
 
     /// What it is showing.
     pub fn entries(&self) -> &[Entry] {
-        &self.entries
+        &self.pane().entries
     }
 
     /// Replace the listing: `path` is now where we are, and `entries` is what is in it.
@@ -525,9 +619,10 @@ impl App {
     /// select whatever happens to be at that position.
     pub fn show(&mut self, path: &str, mut entries: Vec<Entry>) {
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-        self.path = String::from(path);
-        self.entries = entries;
-        self.list = ListState { selected: (!self.entries.is_empty()).then_some(0), offset: 0 };
+        let p = self.pane_mut();
+        p.path = String::from(path);
+        p.entries = entries;
+        p.list = ListState { selected: (!p.entries.is_empty()).then_some(0), offset: 0 };
         // A listing supersedes whatever the last row press had to say about itself.
         self.notice = None;
         // **And a question about a directory you have left is not a question worth keeping**
@@ -562,13 +657,13 @@ impl App {
 
     /// The path a row press leads to, or `None` for a row that is not a directory.
     fn child(&self, i: usize) -> Option<String> {
-        let e = self.entries.get(i)?;
-        e.is_dir.then(|| join(&self.path, &e.name))
+        let e = self.pane().entries.get(i)?;
+        e.is_dir.then(|| join(&self.pane().path, &e.name))
     }
 
     /// The path a row *names*, whether or not it is a directory.
     fn full(&self, i: usize) -> Option<String> {
-        self.entries.get(i).map(|e| join(&self.path, &e.name))
+        self.pane().entries.get(i).map(|e| join(&self.pane().path, &e.name))
     }
 
     /// Apply a message.
@@ -576,7 +671,7 @@ impl App {
         match msg {
             Msg::Activate(i) => {
                 let i = i as usize;
-                self.list.selected = Some(i);
+                self.pane_mut().list.selected = Some(i);
                 // **A directory navigates; anything else is opened**, which since M10 Part D
                 // means asking the shell — `Desktop::Open` — rather than launching anything
                 // here. A browser holds no authority to spawn a program and should not: it has
@@ -596,23 +691,23 @@ impl App {
             Msg::Grab(i) => {
                 // Resolved here, while the listing this index came from is still the listing.
                 self.pressed =
-                    self.entries.get(i as usize).map(|e| (e.name.clone(), 0, 0));
+                    self.pane().entries.get(i as usize).map(|e| (e.name.clone(), 0, 0));
             }
             // **The drag converts through the widget's own arithmetic** — `ListState::drag_to`,
             // the same `ScrollState::offset_at` `nxterm` uses for its grid — so a list and a
             // terminal cannot disagree about where a thumb points (M11 Part E batch 6).
             Msg::Scroll(p) => {
                 if p.buttons != 0 {
-                    let (h, total) = (self.list_h(), self.entries.len());
-                    self.list.drag_to(h, ROW_H, total, p.y);
+                    let (h, total) = (self.list_h(), self.pane().entries.len());
+                    self.pane_mut().list.drag_to(h, ROW_H, total, p.y);
                 }
             }
             Msg::Up => {
-                let up = parent(&self.path);
+                let up = parent(&self.pane().path);
                 // The root is its own parent, so this is a no-op there rather than an error —
                 // the same rule `libfs::parent` states, and the reason the control is never
                 // disabled: a control that greys out at the root is one more state to draw.
-                if up != self.path {
+                if up != self.pane().path {
                     self.goto = Some(up);
                 }
             }
@@ -628,6 +723,31 @@ impl App {
                 self.menu = if self.menu == Some(m) { None } else { Some(m) };
             }
             Msg::Choose(a) => self.choose(a),
+            Msg::SelectTab(k) => {
+                if self.panes.iter().any(|p| p.key == k) {
+                    self.current = k;
+                }
+            }
+            // **A new tab opens where you are**, not at `HOME`. Opening a second view of the
+            // same folder is what a person reaches for when they are about to move something
+            // out of it, and getting back to where they were is the work the tab exists to save.
+            Msg::NewTab => {
+                let key = self.next_key;
+                self.next_key += 1;
+                let here = self.pane().path.clone();
+                self.panes.push(Pane {
+                    key,
+                    path: here.clone(),
+                    entries: Vec::new(),
+                    list: ListState::default(),
+                });
+                self.current = key;
+                // The listing is a syscall, so the new pane starts empty and asks for one.
+                self.goto = Some(here);
+            }
+            // **A browser's tab has nothing to lose**, so there is no question to ask: a listing
+            // is a view of the filesystem rather than unsaved work.
+            Msg::CloseTab(k) => self.drop_tab(k),
             // **The path was resolved when the question was asked**, not composed from
             // `self.path` now: the parent window is free to navigate while a dialog is up, and
             // this is the one operation a person cannot undo (PR #268 review, blocking 2).
@@ -662,7 +782,8 @@ impl App {
     /// instead.
     fn choose(&mut self, a: Action) {
         self.menu = None;
-        let selected = self.list.selected.and_then(|i| self.entries.get(i)).cloned();
+        let selected =
+            self.pane().list.selected.and_then(|i| self.pane().entries.get(i)).cloned();
         if a.needs_selection() && selected.is_none() {
             self.notice = Some(String::from("nothing is selected"));
             return;
@@ -671,8 +792,8 @@ impl App {
         // selection both move while a prompt or a question is up, and an operation that read them
         // late acted on something nobody chose.
         let target = Target {
-            dir: self.path.clone(),
-            from: selected.as_ref().map(|e| join(&self.path, &e.name)),
+            dir: self.pane().path.clone(),
+            from: selected.as_ref().map(|e| join(&self.pane().path, &e.name)),
             name: selected.as_ref().map(|e| e.name.clone()).unwrap_or_default(),
             is_dir: selected.as_ref().is_some_and(|e| e.is_dir),
         };
@@ -727,12 +848,14 @@ impl App {
         // records a directory as the target, and this is its one caller. Kept as belt and
         // braces, and named as such rather than left looking load-bearing: breaking it alone
         // fails no test (PR #268 review, optional 1).
-        let Some(target) = self.entries.get(i).filter(|e| e.is_dir).cloned() else { return };
+        let Some(target) = self.pane().entries.get(i).filter(|e| e.is_dir).cloned() else {
+            return;
+        };
         if target.name == carried {
             return;
         }
-        let from = join(&self.path, carried);
-        let dir = join(&self.path, &target.name);
+        let from = join(&self.pane().path, carried);
+        let dir = join(&self.pane().path, &target.name);
         self.op = Some(FileOp::MoveInto { from, to: join(&dir, carried) });
     }
 
@@ -742,7 +865,7 @@ impl App {
     /// above the list and an internal drag has to turn a `y` back into a row; deriving that
     /// arithmetic twice is how a drop lands one row off the thing it was released over.
     pub fn list_top(&self) -> u32 {
-        libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H + MENU_BAR_H + PATH_H
+        libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H
     }
 
     /// How many rows the list actually draws — what `list_view` builds from the height it is
@@ -763,8 +886,8 @@ impl App {
         if y < top || y >= top + (self.visible_rows() as u32 * ROW_H) as i32 {
             return None;
         }
-        let i = self.list.offset + ((y - top) as u32 / ROW_H) as usize;
-        (i < self.entries.len()).then_some(i)
+        let i = self.pane().list.offset + ((y - top) as u32 / ROW_H) as usize;
+        (i < self.pane().entries.len()).then_some(i)
     }
 
     /// Whether a window-local point is inside this window at all.
@@ -779,6 +902,26 @@ impl App {
     /// two browsers.
     fn key(&mut self, k: KeyEvent) {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
+            return;
+        }
+        // The tab chords, which are the keyboard's half of the strip. **Before the prompt
+        // check**, deliberately: without it the chord would not open a tab at all while a name
+        // is being typed, because the field's branch returns first.
+        //
+        // It would *not* type a `t` into the name, which is what this comment used to claim —
+        // `libinput`'s keymap folds Ctrl+letter into the C0 range and `TextFieldState::apply`
+        // drops anything below `0x20`, with the comment "Control characters are not text". The
+        // ordering is right for the other half (PR #270 review, worth fixing 5).
+        if k.modifiers & MOD_CTRL != 0 {
+            match k.keycode {
+                NEW_TAB_KEYCODE => self.update(Msg::NewTab),
+                CLOSE_TAB_KEYCODE => {
+                    let key = self.current;
+                    self.update(Msg::CloseTab(key));
+                }
+                // Every other chord is swallowed rather than folded into a printable character.
+                _ => {}
+            }
             return;
         }
         // **While a name is being typed the keys are the field's**, arrows and Backspace
@@ -800,16 +943,16 @@ impl App {
             }
             return;
         }
-        let len = self.entries.len();
+        let len = self.pane().entries.len();
         match k.keycode {
             libkern::abi::KEY_DOWN => {
-                self.list.down(len);
+                self.pane_mut().list.down(len);
             }
             libkern::abi::KEY_UP => {
-                self.list.up();
+                self.pane_mut().list.up();
             }
             libkern::abi::KEY_ENTER => {
-                if let Some(i) = self.list.selected {
+                if let Some(i) = self.pane().list.selected {
                     self.update(Msg::Activate(i as u64));
                 }
             }
@@ -860,7 +1003,8 @@ impl App {
                 let name = self.pressed.take().map(|(n, _, _)| n);
                 self.dragging = false;
                 self.over = None;
-                self.drag = name.and_then(|n| self.entries.iter().find(|e| e.name == n).cloned());
+                self.drag =
+                    name.and_then(|n| self.pane().entries.iter().find(|e| e.name == n).cloned());
                 return if self.drag.is_some() { Gesture::HandOff } else { Gesture::None };
             }
             let was = self.over;
@@ -868,7 +1012,7 @@ impl App {
             // that would do nothing — the same rule the compositor follows for windows that do
             // not take the payload.
             self.over =
-                self.row_at(y).filter(|&i| self.entries.get(i).is_some_and(|e| e.is_dir));
+                self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
             return if was == self.over { Gesture::None } else { Gesture::Moved };
         }
         let Some((name, ox, oy)) = self.pressed.clone() else { return Gesture::None };
@@ -882,19 +1026,20 @@ impl App {
         // The gesture is a drag now — an *internal* one, which it stays until it leaves.
         // **Checked against the current listing here rather than at the drop**, so a row that
         // has gone carries nothing rather than carrying whatever now sits at that position.
-        if !self.entries.iter().any(|e| e.name == name) {
+        if !self.pane().entries.iter().any(|e| e.name == name) {
             self.pressed = None;
             return Gesture::None;
         }
         self.dragging = true;
-        self.over = self.row_at(y).filter(|&i| self.entries.get(i).is_some_and(|e| e.is_dir));
+        self.over =
+            self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
         Gesture::Moved
     }
 
     /// The entry the binary owes a `StartDrag` for. Clears the record.
     pub fn take_drag(&mut self) -> Option<(Entry, String)> {
         let e = self.drag.take()?;
-        let path = join(&self.path, &e.name);
+        let path = join(&self.pane().path, &e.name);
         Some((e, path))
     }
 
@@ -992,7 +1137,12 @@ impl App {
 
     /// Which row is selected, for a caller that needs to know nothing moved it.
     pub fn list_selected(&self) -> Option<usize> {
-        self.list.selected
+        self.pane().list.selected
+    }
+
+    /// How far the current pane's list is scrolled, in rows.
+    pub fn list_offset(&self) -> usize {
+        self.pane().list.offset
     }
 
     /// The filesystem operation the binary owes, if any. Clears the record.
@@ -1043,7 +1193,9 @@ impl App {
         // below the title bar, so a list built for the old height would be laid out three pixels
         // shorter — one row of arithmetic off, which this method's own reason for existing is to
         // prevent.
-        self.window.h.saturating_sub(TITLE_BAR_H + MENU_BAR_H + PATH_H + GRIP_W + WINDOW_FRAME_H)
+        self.window.h.saturating_sub(
+            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + GRIP_W + WINDOW_FRAME_H,
+        )
     }
 
     /// The element tree for the current state.
@@ -1134,7 +1286,7 @@ impl App {
                 .key(NOTICE_KEY),
             ]),
             None => row(alloc::vec![
-                padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.path.clone()))
+                padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.pane().path.clone()))
                     .key(PATH_KEY),
                 padding(
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
@@ -1154,7 +1306,17 @@ impl App {
             middle.key(STRIP_INNER_KEY).flex(1),
         ]);
 
-        let labels: Vec<String> = self.entries.iter().map(|e| e.label()).collect();
+        // **The tab strip, between the menus and the path.** Above the path because a tab *is*
+        // a path — the strip says which of several you are looking at, and the strip below says
+        // where that one is.
+        let tab_list = self.tabs();
+        let items: Vec<libui::widget::Tab<'_>> = tab_list
+            .iter()
+            .map(|(k, label)| libui::widget::Tab { key: *k, label: label.as_str(), marked: false })
+            .collect();
+        let tabs = tab_strip(&items, self.current, hovered, Msg::SelectTab, Msg::CloseTab, &ui);
+
+        let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
         for (i, l) in labels.iter().enumerate() {
             rows.push(ListRow { key: i as u64, label: l });
@@ -1176,7 +1338,7 @@ impl App {
         };
         let list = list_view(
             &rows,
-            &mut self.list,
+            &mut self.pane_mut().list,
             h,
             ROW_H,
             Msg::Activate,
@@ -1191,6 +1353,10 @@ impl App {
             dock(
                 alloc::vec![
                     docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),
+                    docked(
+                        Edge::Top,
+                        sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
+                    ),
                     docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
                 ],
             // **Sized to the height it was built for.** `list_view` does not size itself, and
@@ -1421,17 +1587,17 @@ mod tests {
             down(&mut a);
         }
         let _ = a.view(&UiTheme::default(), None);
-        let scrolled = a.list.offset;
+        let scrolled = a.list_offset();
         assert!(scrolled > 0, "precondition: 19 rows down has scrolled the list");
-        assert_eq!(a.list.selected, Some(19));
+        assert_eq!(a.list_selected(), Some(19));
 
         up(&mut a);
         let _ = a.view(&UiTheme::default(), None);
         assert_eq!(
-            a.list.offset, scrolled,
+            a.list_offset(), scrolled,
             "the selection moved up inside the visible rows, so the list must not have moved"
         );
-        assert_eq!(a.list.selected, Some(18));
+        assert_eq!(a.list_selected(), Some(18));
     }
 
     #[test]
@@ -2002,6 +2168,103 @@ mod tests {
     }
 
     #[test]
+    fn tabs_hold_their_own_directory_selection_and_scroll() {
+        // **What a person expects to survive switching**, and the reason `Pane` exists: a tab
+        // that came back at the top of a different folder would lose their place every time they
+        // glanced at another one.
+        let mut a = app();
+        select(&mut a, 2); // a.txt
+        assert_eq!(a.list_selected(), Some(2));
+
+        a.update(Msg::NewTab);
+        assert_eq!(a.tab_count(), 2);
+        // A new tab opens where you are, and asks for its own listing.
+        assert_eq!(a.take_goto().as_deref(), Some("/home"));
+        a.show("/home/work", alloc::vec![Entry::file("payroll.txt")]);
+        assert_eq!(a.path(), "/home/work");
+        assert_eq!(a.list_selected(), Some(0));
+
+        // And the first tab is exactly as it was left.
+        let first = a.tabs()[0].0;
+        a.update(Msg::SelectTab(first));
+        assert_eq!(a.path(), "/home");
+        assert_eq!(a.list_selected(), Some(2), "its own selection");
+        assert_eq!(a.entries().len(), 4, "and its own listing");
+    }
+
+    #[test]
+    fn a_tabs_key_can_never_be_a_row_index() {
+        // **One namespace, two things numbering into it.** `Router::hovered_key` reports the
+        // nearest keyed ancestor across the whole window, and this browser keys its list rows by
+        // index — so a base merely *far* from the chrome's keys still collides in a big enough
+        // directory, and hovering row `n` would draw a tab hovered (PR #270 review, optional 6).
+        let mut a = app();
+        for _ in 0..4 {
+            a.update(Msg::NewTab);
+            let _ = a.take_goto();
+        }
+        for (key, _) in a.tabs() {
+            assert!(key >= TAB_KEY_BASE, "every tab is above the base");
+        }
+        // A row index is a `usize` that counts entries; it cannot reach the high bit, so the two
+        // ranges are disjoint by construction rather than by being far apart.
+        assert_eq!(TAB_KEY_BASE, 1 << 63);
+    }
+
+    #[test]
+    fn a_browser_tab_closes_without_asking_and_the_last_one_closes_the_window() {
+        // **Nothing to lose**: a listing is a view of the filesystem rather than unsaved work,
+        // so there is no question to ask — which is the difference between this and the
+        // editor's tabs, and worth a test because the two look alike.
+        let mut a = app();
+        a.update(Msg::NewTab);
+        let _ = a.take_goto();
+        assert_eq!(a.tab_count(), 2);
+        let second = a.tabs()[1].0;
+
+        a.update(Msg::CloseTab(second));
+        assert_eq!(a.tab_count(), 1);
+        assert!(a.confirming().is_none(), "a pane asks nothing");
+        assert!(!a.closing());
+
+        a.update(Msg::CloseTab(a.tabs()[0].0));
+        assert!(a.closing(), "the last tab takes the window with it");
+    }
+
+    #[test]
+    fn a_tab_is_labelled_by_the_folder_it_shows() {
+        let mut a = app();
+        assert_eq!(a.tabs()[0].1, "home");
+        a.show("/", alloc::vec![Entry::dir("home")]);
+        assert_eq!(a.tabs()[0].1, "/", "the root has no last component");
+    }
+
+    #[test]
+    fn the_tab_chords_are_the_ones_the_keymap_names() {
+        assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
+        assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
+    }
+
+    #[test]
+    fn a_tab_chord_while_naming_still_opens_a_tab() {
+        // **The chords are checked before the prompt**, or the field's branch returns first and
+        // the chord does nothing at all while a name is being typed.
+        //
+        // The name is asserted unchanged as well, and that half is the *field's* doing rather
+        // than the ordering's: `apply` drops control characters. Kept because it says what the
+        // whole gesture leaves behind, and labelled so nobody reads it as what the ordering
+        // buys (PR #270 review, worth fixing 5).
+        let mut a = app();
+        a.update(Msg::Choose(Action::NewFolder));
+        press_key(&mut a, KEY_X);
+        assert_eq!(a.prompt_len(), Some(1));
+
+        a.update(Msg::Key(KeyEvent::new(1, NEW_TAB_KEYCODE, KEY_DOWN, MOD_CTRL)));
+        assert_eq!(a.tab_count(), 2, "the chord opened a tab");
+        assert_eq!(a.prompt_len(), Some(1), "and typed nothing into the name");
+    }
+
+    #[test]
     fn up_leaves_a_directory_and_stops_at_the_root() {
         let mut a = App::new("/home/work");
         a.update(Msg::Up);
@@ -2057,9 +2320,9 @@ mod tests {
         for _ in 0..2 {
             a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_DOWN, KEY_DOWN, 0)));
         }
-        assert_eq!(a.list.selected, Some(2), "precondition: the selection has moved");
+        assert_eq!(a.list_selected(), Some(2), "precondition: the selection has moved");
         a.show("/home/work", alloc::vec![Entry::file("only.txt")]);
-        assert_eq!(a.list.selected, Some(0));
+        assert_eq!(a.list_selected(), Some(0));
     }
 
     #[test]
@@ -2068,9 +2331,9 @@ mod tests {
         // anything at all — the same trap the test above fell into.
         let mut a = app();
         a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_DOWN, KEY_DOWN, 0)));
-        assert!(a.list.selected.is_some(), "precondition: something is selected");
+        assert!(a.list_selected().is_some(), "precondition: something is selected");
         a.show("/home/empty", Vec::new());
-        assert_eq!(a.list.selected, None, "nothing to select, and no phantom row 0");
+        assert_eq!(a.list_selected(), None, "nothing to select, and no phantom row 0");
         assert!(a.entries().is_empty());
     }
 

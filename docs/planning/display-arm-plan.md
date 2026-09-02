@@ -3952,13 +3952,83 @@ The two taken before this pass — the clipboard's owner and the image format �
       somebody is looking for in their own file is theirs, the same rule that keeps the buffer's
       receipt a count.
 
-### Part D — tabs, in both applications
+### Part D — tabs, in both applications ✅ complete (2026-09-02)
 
-- [ ] **A tab strip is a widget**, and the toolkit has none. §8's rule is that an application
-      needed it, so it exists — `scrollbar` and `text_area` each arrived for one. Two wanting it
-      clears that bar with room to spare rather than being it.
+- [x] **A tab strip is a widget** ✅, and the toolkit had none. §8's rule is that an application
+      needed it, so it exists; two wanting it cleared that bar with room to spare.
 
-- [ ] **Gate**: two buffers in one window, switched, and the right one saved.
+      **Fixed width, not shared out**, which is the decision inside the widget. Tabs that divided
+      the strip between them move *every* tab whenever another opens — so the one a person is
+      reaching for slides away as they reach, and a gate's aim point depends on how many happen
+      to be open. The cost is that enough of them run off the end: `TODO(tab-overflow)`.
+
+      A press on a tab's close box does not also select it, which is the toolkit's shadowing rule
+      rather than this widget's — the same one that lets a title bar carry buttons.
+
+- [x] **And the split each application had to make** ✅. `nxedit` grew a `Buffer` and `nxfiles` a
+      `Pane`: what stays on the `App` is what a *window* has — its size, its focus, the outboxes,
+      the strip's field, the question it may be asking — and what moves is what a person expects
+      to survive switching. Getting that line wrong is how a second tab inherits the first's undo
+      history, and the split makes it impossible rather than careful. The browser's scroll offset
+      moved too: a tab that came back at the top would lose your place every time you glanced at
+      another folder.
+
+      **The two differ where the data does.** Closing an editor tab over unsaved work asks —
+      Part A's dialog, with the tab's key captured when the question is asked, which is Part B's
+      lesson one part on. Closing a browser tab asks nothing: a listing is a view of the
+      filesystem rather than work. And the last tab closing closes the window in both, which is
+      what keeps the "never empty" invariant every accessor rests on.
+
+      **A drop now opens a tab**, which removed a refusal rather than adding one: it used to
+      replace the buffer, so it had to be declined while there was unsaved work — a drop that
+      visibly did nothing. Dropping a file that is already open switches to its tab, because two
+      tabs on one file are two buffers that can disagree about it.
+
+      **Tab keys carry the top bit**, because `Router::hovered_key` reports the nearest keyed
+      ancestor across the *whole* window: a tab keyed `2` and a button keyed `2` are one number,
+      and hovering the tab would have drawn the button hovered. The base was `1000` — far from
+      the chrome's keys and *not disjoint* from the browser's, which keys its list rows by index
+      and can hold any number of them. `1 << 63` is what the claim needed to be true (review,
+      optional 6).
+
+- [x] **Gate** ✅: `check-login` step 9c — the drop from step 9 now makes a second tab, the first
+      is clicked, and the save is asserted **from outside** to have reached that tab's file. That
+      is the whole risk of tabs in an editor: a save that went to the buffer opened last rather
+      than the one on screen.
+
+      **And the gate found a real interaction on its first run.** Step 8b's search leaves its
+      match *selected* — which is what a find is for — and typing replaces a selection, so a
+      keystroke two steps later edited the middle of the file instead of appending: seven bytes
+      reached disk where ten were expected. Both halves are right and together they are
+      hand-made find-and-replace; what was wrong was the gate's assumption. It presses `End`
+      first now, and `typing_after_a_find_replaces_what_was_found` pins the behaviour.
+
+- [x] **And the lost click, finished** ✅. Part B's fix was half of one: it froze the hover from
+      the press onwards, and the motion that brings a pointer onto a row is usually in the *same*
+      batch as the press — so the live hover had already moved while the tree still held the old
+      one, and the next frame stranded the capture. It failed about one run in seven. A four-line
+      probe in the guest answered it immediately, where two rounds of reasoning about timing had
+      not. `Child` answers a gesture with the hover its **tree** was built with; the shell's modal
+      holds its resample until after the drain **and refuses to apply it while a grab is held** —
+      the review proved that deferring alone only moves the bug one drain later, because the
+      motion that opened the gesture has already sampled the new hover. The mechanism has a host
+      test whose control loses the click; the gate's improvement is eight consecutive runs, which
+      is evidence and not proof, and the log says so.
+
+      **Eleven host tests** across the three crates, including the widget's two published
+      metrics asserted against a real tree, tabs holding their own cursor and history, a question
+      about one tab surviving a switch to another, and a tab chord not typing into an open name
+      prompt.
+
+- [x] **Review fixes** ✅ (PR #270). Two blocking: the shell applying the deferred hover while
+      still grabbed, above; and a `Child` test that re-stated the rule in a local closure, so
+      reverting the implementation left all 200 green — fixed by extracting `reported_hover` and
+      calling it from both, after which the control fails. Then a save that named its buffer with
+      a `bool` and wrote one tab's bytes to another tab's path — **late target resolution, third
+      occurrence this milestone**; the key spaces made disjoint rather than distant; and the two
+      applications made to agree that a tab chord is the *window's* and is checked before an open
+      field, while the buffer chords stay the field's. A comment justifying that ordering with a
+      reason the reviewer disproved was replaced rather than kept.
 
 ### Part E — copy and paste
 

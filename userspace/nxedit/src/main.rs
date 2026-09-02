@@ -288,6 +288,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut reported = app.revision();
     // The same shape as `reported`, for the field that names an untitled buffer.
     let mut reported_name = app.naming_len();
+    // **The title follows the current tab** (M12 Part D). It used to be set once, because there
+    // was one file for the life of the process; a window whose taskbar entry still names the tab
+    // you switched away from is the window list lying about what is on screen.
+    let mut reported_title = String::from(window_title(&path));
+    // Which tab was last reported, so a switch is one line and a redraw is none.
+    let mut reported_tab = app.current_tab();
 
     loop {
         // **One line per edit, and it carries a count rather than the text.** A gate driving a
@@ -303,6 +309,30 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **And the same for the name field**, which `revision` cannot see: naming a buffer is
         // not editing it. Without this the seven keystrokes that name an untitled buffer are
         // unacknowledged, and a dropped one arrives as a file with the wrong name.
+        // Retitled only when it changes, which is what keeps this one message per *switch*
+        // rather than one per frame.
+        let want_title = String::from(window_title(app.path()));
+        if want_title != reported_title
+            && let Some(mut w) = win.window(window_id)
+        {
+            if w.set_title(&want_title).is_err() {
+                kprint(b"nxedit: SetTitle refused\n");
+            }
+            reported_title = want_title;
+        }
+        // **One line per tab the person lands on.** A gate driving a release image cannot see a
+        // strip; what it can see is which file the editor says it is showing, which is the only
+        // thing a tab switch changes that anybody outside can check.
+        let showing = app.current_tab();
+        if showing != reported_tab {
+            reported_tab = showing;
+            libkern::debug::Line::new()
+                .s(b"nxedit: tab ")
+                .u(showing)
+                .s(b" showing ")
+                .untrusted(app.path().as_bytes())
+                .end();
+        }
         let named = app.naming_len();
         if named != reported_name {
             reported_name = named;
@@ -460,13 +490,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The write happens here, not in `update`.** `update` is a function of values; writing
         // a file is a syscall, so the application says it wants to save and the `main` that owns
         // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
-        if let Some(text) = app.take_save() {
-            // **Read from the application, not tracked beside it.** The path changes twice — a
-            // drop replaces the file, and naming an untitled buffer gives it one — so a copy
-            // `main` kept would be a second answer needing an update at both. There was one: a
-            // `let` bound once at startup that the drop path had to remember to refresh
-            // (M11 Part E batch 9).
-            let editing = alloc::string::String::from(app.path());
+        if let Some((key, editing, text)) = app.take_save() {
+            // **The path comes back with the bytes**, from the buffer that asked to be saved.
+            // Reading `app.path()` here answers for whatever tab is current *now* — the top of
+            // the iteration after the whole batch was applied — so a `Ctrl+S` and a tab click in
+            // one drain wrote the other tab's bytes to the other tab's path (PR #270 review).
             let bytes = to_bytes(&text);
             let result = save(root_ns, &editing, &bytes);
             match result {
@@ -484,7 +512,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     .s(why.as_bytes())
                     .end(),
             }
-            app.saved(result);
+            app.saved(key, result);
             // Round again rather than waiting: the status strip has changed and nothing else is
             // going to arrive to prompt a redraw.
             continue;
@@ -615,17 +643,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         .untrusted(name.as_bytes())
                         .s(if taken { b" on the document" as &[u8] } else { b" outside it" })
                         .end();
+                    // **A drop opens a tab**, so nothing here has to decide whether the buffer
+                    // on screen can be given up — `accept_drop` either switches to the tab that
+                    // already has the file or makes a new one. The title follows the current tab
+                    // at the top of the loop, so this no longer sets it by hand.
                     if taken && app.accept_drop(path) {
                         open_into(&mut app, root_ns, path);
-                        // The path is the window's identity now: the title, and what a save
-                        // writes to. Both are read from `app`, so the one copy `main` keeps has
-                        // to follow — this was a `let` bound once at startup.
-                        let editing = String::from(app.path());
-                        if let Some(mut w) = win.window(window_id)
-                            && w.set_title(window_title(&editing)).is_err()
-                        {
-                            kprint(b"nxedit: SetTitle refused\n");
-                        }
                     }
                 }
                 WindowEvent::InputLost => kprint(b"nxedit: input dropped\n"),

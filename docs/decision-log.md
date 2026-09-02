@@ -22007,3 +22007,139 @@ catch. Escaping a search no longer blanks the strip, which was a control answeri
 Two gate comments overclaimed: the byte count that discriminates per-keystroke grouping is eight
 rather than nine, and the `Esc` after a search is not asserted by anything downstream, because
 nothing types into that editor again.
+
+## 2026-09-02 — M12 Part D: tabs, and the line between a window and what is in it
+
+The widget was the small half. The decision inside it is **fixed width rather than sharing the
+strip out**: tabs that divided the space between them would move *every* tab whenever another
+opened, so the one a person is reaching for slides away as they reach, and a gate's aim point
+would depend on how many happen to be open. The cost is that enough of them run off the end —
+`TODO(tab-overflow)`, whose fix is a strip that scrolls and therefore the same clipping question
+§8 defers for containers generally.
+
+**The larger half was a line each application had to draw**: what belongs to a *window* and what
+belongs to what is in it. `nxedit` grew a `Buffer` and `nxfiles` a `Pane`. The window keeps its
+size, its focus, the outboxes, the strip's field and the question it may be asking; the buffer or
+pane keeps everything a person expects to survive switching — including the editor's undo history,
+which is part of the text, and the browser's scroll offset, because a tab that came back at the top
+would lose your place every time you glanced at another folder. Drawing that line wrong is how a
+second tab inherits the first's history, and it reads as correct until somebody presses `Ctrl+Z` in
+the wrong tab.
+
+**The two applications differ exactly where their data does.** Closing an editor tab over unsaved
+work asks — Part A's dialog, with the tab's key captured when the question is asked, which is Part
+B's lesson applied a part later. Closing a browser tab asks nothing: a listing is a view of the
+filesystem rather than work. Both close the window on the last tab, which is what keeps the
+never-empty invariant every accessor rests on.
+
+**A drop now opens a tab, and that removed a rule rather than adding one.** It used to replace the
+buffer, so it had to be refused while there was unsaved work — a drop that visibly did nothing for
+a reason the person had to read the strip to find. With tabs there is nothing to lose by taking it,
+and the protection is stronger: the modified buffer is not touched at all.
+
+**And one thing that would have been a real bug**: a tab's key is an *element* key too.
+`Router::hovered_key` walks up to the nearest keyed ancestor and reports that number across the
+whole window's tree, so a tab keyed `2` and a save button keyed `2` are one number — hovering the
+tab would have drawn the button hovered. Numbering tabs from a base well above the chrome's keys
+makes the two namespaces disjoint by construction rather than by remembering, and it went in before
+the second application could repeat it.
+
+**What the gate found on its first run.** Step 8b's search leaves its match *selected* — which is
+what a find is for — and typing replaces a selection. So a keystroke two steps later edited the
+middle of the file rather than appending to it, and seven bytes reached disk where ten were
+expected. Both halves are right, and together they are hand-made find-and-replace. What was wrong
+was the gate's assumption that a buffer it had searched was in a neutral state; it presses `End`
+first now, and the behaviour has a test of its own. Worth recording because the failure looked
+exactly like a tab saving the wrong buffer, which is the thing that step exists to catch — an
+assertion can fail for a reason that is not the one it was written for, and the byte count is what
+made the difference legible.
+
+## 2026-09-02 — finishing the lost click: a gesture must see the tree's hover, not the pointer's
+
+M12 Part B diagnosed this and fixed half of it. The other half showed up as a `check-login` failure
+about one run in seven — the browser's menu row pressed, and no message produced — and this time a
+probe in the guest answered it in four lines rather than any amount of reading:
+
+```
+ev=ENTER    hov=none  live=14
+ev=MOTION   hov=none  live=14
+ev=PRESS    hov=none  live=14
+ev=RELEASE  hov=14    live=14   msgs=0
+```
+
+`hov` is what the tree was built with and `live` is what the pointer is over. **They had already
+diverged before the press.** Part B froze the hover *from the press onwards*, and that is too late:
+the motion that brings the pointer onto a row arrives in the **same batch** as the press, with no
+frame between them, so the live hover advances while the retained tree still holds the old one. The
+press is routed against the old tree — correctly — and then the next frame rebuilds with the new
+hover, gives the captured node a different id, and `path_to_id` finds nothing on release.
+
+The rule is one line and it is the one that was missing: **while a gesture is in progress, what a
+caller is told about the hover is what the retained tree was built with.** `Child` keeps both — the
+live hover and the shown one — and answers with the shown one under a grab. `desktop-shell`'s modal
+needs **both halves**: it holds its resample until after the drain, *and* refuses to apply it while
+a grab is still held. Holding alone only moves the bug one drain later — the motion that opened the
+gesture has already sampled the new hover, so the post-drain apply repaints with it and strands the
+capture exactly as before. (The first version of this entry said the modal "gets the same by
+holding its resample", which was not true; PR #270 review, blocking 1, demonstrated it at the
+loop-shape level. Corrected in place because the entry was still in an open PR.)
+
+**What is proven and what is not.** The mechanism is proven: a host test drives a motion and a press
+in one batch with a frame after them, and the control — answering with the live hover — loses the
+click, `left: Some(2)` against `right: None`. The *gate's* improvement is evidence rather than
+proof: eight consecutive runs where the previous rate was about one failure in six, which is
+suggestive at roughly p=0.3 of happening anyway. Saying so beats the alternative, which this
+session has already done twice.
+
+**And the method is the finding.** Both times this bug was chased by reasoning about timing it
+produced a confident wrong answer; both times a probe that printed the input and the output of the
+step in doubt answered it immediately. The probe is four lines and costs one run.
+
+## 2026-09-02 — what #270's review caught: a rule with no test, and a target that moved again
+
+Blocking 1 is the entry above: the shell applied the deferred hover *while grabbed*, so deferring
+alone moved the bug one drain later rather than fixing it. The rest are smaller, and two of them
+are the same shapes this milestone has now hit three times each.
+
+**A rule implemented in two places is a rule with no test.** The `Child` hover test built its
+expectation with a local closure that re-stated the rule — so reverting the implementation left all
+200 tests green. The fix is not a better assertion, it is **one function**: `reported_hover(grabbed,
+live, shown)`, called by `Child::hovered_key` and by the test. With the implementation reverted the
+control now fails, 199 passed and 1 failed. This is the fifth time this milestone that a control
+passed against a deliberately broken build; every one was a test that could reach the *answer*
+without going through the code that computes it.
+
+**Late target resolution, third occurrence.** `nxedit` said `save_requested: bool` and `main`
+answered "which buffer?" by reading `app.path()` at the top of the next iteration — after the whole
+batch had been applied. A `Ctrl+S` and a tab click arriving in one drain therefore wrote one tab's
+bytes to the other tab's path. `take_save` returns `(key, path, bytes)` now and `saved(key, …)`
+credits the buffer that asked. The control shows `left: "/home/other.txt"` against
+`right: "/home/notes.txt"`. #268's review named the class — "an operation's target is recomputed
+from state that can move between the gesture that chose it and the gesture that confirms it" — and
+it has since been true of a delete, a rename, a copy and now a save. **The shape to look for is a
+`bool` that means "something wants this"**: the boolean records that a thing was asked for and
+throws away *what it was asked about*.
+
+**Two agreements settled while they were cheap.**
+
+- **The key spaces are disjoint by construction now, not merely far apart.** Both applications said
+  `TAB_KEY_BASE = 1000` and both docs claimed that made a tab's key unable to collide with the
+  chrome's. It did — but `nxfiles` keys its *list rows by index*, and a directory can hold more than
+  a thousand entries, so row 1000 and the first tab would have been one number and hovering one
+  would have highlighted the other. `1 << 63` is a base a row index cannot reach. The reviewer's
+  phrasing is the lesson: the base was chosen for exactly this class, and it still failed to be what
+  it said it was.
+- **The two applications agree about a tab chord over an open field.** They grew the same widget in
+  the same part and disagreed: `nxfiles` checked `Ctrl+T`/`Ctrl+W` before its prompt, `nxedit` let
+  the field's branch return first, so a `Ctrl+T` during a find did nothing. The line is **what the
+  chord acts on** — a tab is the *window's* and is checked first; `Ctrl+S`, `Ctrl+Z`, `Ctrl+Y` and
+  `Ctrl+F` act on the buffer, and while a field is open the buffer is not what is being addressed.
+  Both directions are pinned by tests in `nxedit`.
+
+The review also killed a wrong comment. `nxfiles`' chord ordering was justified by "otherwise the
+field would swallow it as text", which the reviewer disproved: `Ctrl+T` folds to `0x14` and
+`TextFieldState::apply` drops anything below `0x20`, so the field would never have inserted it. The
+ordering is right for the *other* half — without it the chord would not open a tab at all while a
+prompt is up — and the test now says so in its name. **A comment that gives a true rule a false
+reason is worse than no comment**: it is what the next reader trusts when deciding whether the rule
+still applies.
