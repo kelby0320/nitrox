@@ -3838,6 +3838,16 @@ The two taken before this pass — the clipboard's owner and the image format �
       the notice slot *the prompt had replaced*. The answer existed and was never drawn. The test
       asserted the message rather than the absence of an operation, which is what caught it.
 
+- [x] **And one the gate found, in `libui` rather than here** ✅. The menu's rows could be
+      clicked and did nothing, about one run in two: a capture is a *tree id* of the deepest node
+      under the cursor, a hovered `menu_item` draws three layers where a quiet one draws one, and
+      a frame presented between the press and the release therefore gives that node a new id —
+      `path_to_id` finds nothing and the click is gone. `Child` samples its hover only between
+      gestures now, and `Router::grabbed` is published so a main window's loop can follow the same
+      rule; `desktop-shell`'s modal does. **This is very probably the launcher-row flake** that
+      cost three CI failures and two wrong attributions — see the decision log, which records it
+      as likely rather than proven.
+
 ### Part C — the editor: undo, redo and find
 
 - [ ] **Undo grouping is the decision**, not the stack. Per keystroke is unusable and per save is

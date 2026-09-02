@@ -89,6 +89,14 @@ pub struct Child {
     scratch: MemFramebuffer,
     /// The shared buffers, and the mappings that are unmapped when this value drops.
     pool: BufferPool,
+    /// The hover the retained tree was last built with.
+    ///
+    /// **Frozen while a button is held**, which is not a nicety: a capture names a *tree id*, the
+    /// widgets here change shape under the pointer, and rebuilding the tree with a new hover
+    /// between a press and its release gives the captured node a different id. `path_to_id` then
+    /// finds nothing and the click is lost — intermittently, because it depends on whether a
+    /// frame happened to be presented in between (M12 Part B).
+    hover: Option<u64>,
 }
 
 impl Child {
@@ -156,7 +164,7 @@ impl Child {
             }
             return None;
         };
-        Some(Self { id, size, tree: Tree::new(), router: Router::new(), scratch, pool })
+        Some(Self { id, size, tree: Tree::new(), router: Router::new(), scratch, pool, hover: None })
     }
 
     /// The compositor's id for this window — what an event names.
@@ -174,8 +182,13 @@ impl Child {
     /// **A key, not a tree id.** `Router::inside` reports a diff-tree id and `.key(…)` is the
     /// application's own numbering; comparing one to the other compiles and gives a stable wrong
     /// answer (M11 Part E batch 3).
+    ///
+    /// **It does not move while a button is held** — see [`hover`](Self::hover). A caller builds
+    /// its view from this and hands the result to both [`present`](Self::present) and
+    /// [`route`](Self::route), so freezing it here is what keeps the tree those two share the
+    /// same shape for the whole of a gesture.
     pub fn hovered_key(&self) -> Option<u64> {
-        self.router.hovered_key(&self.tree)
+        self.hover
     }
 
     /// Paint `content` and put it on screen **if anything changed**. `false` if this frame could
@@ -258,7 +271,14 @@ impl Child {
             WindowEvent::Pointer(p) => {
                 let bounds = Rect::new(0, 0, self.size.w, self.size.h);
                 let l = layout(content, bounds, &FontMetrics::new(font, theme.font_px));
-                self.router.pointer(&self.tree, content, &l, *p).0
+                let out = self.router.pointer(&self.tree, content, &l, *p).0;
+                // **Sampled here, and only between gestures.** The press that opens a capture
+                // must not be followed by a frame drawn with a different hover, or the id that
+                // capture recorded stops naming anything.
+                if !self.router.grabbed() {
+                    self.hover = self.router.hovered_key(&self.tree);
+                }
+                out
             }
             WindowEvent::Focus(f) => {
                 self.router.set_window_focused(*f);
@@ -278,6 +298,113 @@ impl Child {
         if let Some(w) = session.window(self.id) {
             let _ = w.destroy();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::element::{Element, Insets, padding, text};
+    use crate::layout::FixedCell;
+    use crate::route::Router;
+    use crate::widget::{Theme, menu_item};
+    use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
+
+    /// A menu row is a widget whose *shape* changes under the pointer: quiet it draws one layer,
+    /// hovered it draws three. That is what makes the id a capture records go stale.
+    fn menu(hovered: Option<u64>) -> Element<u32> {
+        let theme = Theme::default();
+        crate::element::column(alloc::vec![
+            menu_item("one", 1u32, hovered == Some(1), &theme).key(1),
+            menu_item("two", 2u32, hovered == Some(2), &theme).key(2),
+        ])
+    }
+
+    #[test]
+    fn a_click_survives_a_repaint_between_the_press_and_the_release() {
+        // **The bug this exists to prevent, reproduced at the level it lives at.** A capture is a
+        // tree id of the *deepest* node under the cursor. Rebuild the tree with a different hover
+        // between the press and the release and that node is a different node with a different
+        // id, `path_to_id` finds nothing, and the release produces no message at all — which
+        // presents as a menu row that can be clicked and does nothing, once in every few runs.
+        //
+        // `Child` cannot be built here (every one of its methods is a syscall or a `Session`), so
+        // this drives the two pieces it wires together: a retained `Tree` and a `Router`, with
+        // the hover resampled the way `Child::route` resamples it.
+        let cell = FixedCell { w: 8, h: 16 };
+        let bounds = Rect::new(0, 0, 120, 60);
+        let mut tree = Tree::new();
+        let mut router = Router::new();
+        // What `Child` stores: the hover the retained tree was last built with.
+        let mut hover: Option<u64> = None;
+
+        let at = |kind: u16, flags: u16, buttons: u16, y: i32| PointerEvent {
+            kind,
+            button: 0x110,
+            buttons,
+            flags,
+            x: 20,
+            y,
+            ..Default::default()
+        };
+        // Row 1 is the second `menu_item`, which is 20 tall in this metric.
+        let row1_y = 30;
+
+        let mut step = |ev: PointerEvent, hover: &mut Option<u64>, tree: &mut Tree, router: &mut Router| {
+            let ui = menu(*hover);
+            let l = crate::layout::layout(&ui, bounds, &cell);
+            tree.update(&ui, &l).expect("diffable");
+            let out = router.pointer(tree, &ui, &l, ev).0;
+            if !router.grabbed() {
+                *hover = router.hovered_key(tree);
+            }
+            out
+        };
+
+        // Move onto the row, press, and *repaint* — which is where the tree changes shape.
+        step(at(POINTER_MOTION, 0, 0, row1_y), &mut hover, &mut tree, &mut router);
+        assert_eq!(hover, Some(2), "the pointer is over the second row");
+        let down = step(at(POINTER_BUTTON, POINTER_PRESSED, 1, row1_y), &mut hover, &mut tree, &mut router);
+        assert!(down.is_empty(), "a press is not a click");
+        let up = step(at(POINTER_BUTTON, 0, 0, row1_y), &mut hover, &mut tree, &mut router);
+        assert_eq!(up, alloc::vec![2u32], "the release on the pressed row is the click");
+    }
+
+    #[test]
+    fn the_hover_does_not_move_while_a_button_is_held() {
+        // The rule the test above depends on, stated on its own: a widget may change under the
+        // pointer, but not while a button is down on it.
+        let cell = FixedCell { w: 8, h: 16 };
+        let bounds = Rect::new(0, 0, 120, 60);
+        let mut tree = Tree::new();
+        let mut router = Router::new();
+        let ui = menu(None);
+        let l = crate::layout::layout(&ui, bounds, &cell);
+        tree.update(&ui, &l).expect("diffable");
+        let at = |kind: u16, flags: u16, buttons: u16, y: i32| PointerEvent {
+            kind,
+            button: 0x110,
+            buttons,
+            flags,
+            x: 20,
+            y,
+            ..Default::default()
+        };
+        router.pointer(&tree, &ui, &l, at(POINTER_MOTION, 0, 0, 10));
+        assert!(!router.grabbed());
+        router.pointer(&tree, &ui, &l, at(POINTER_BUTTON, POINTER_PRESSED, 1, 10));
+        assert!(router.grabbed(), "a press opens a capture");
+        // Dragging onto the other row while held must not be reported as a new hover.
+        router.pointer(&tree, &ui, &l, at(POINTER_MOTION, 0, 1, 30));
+        assert!(router.grabbed());
+        router.pointer(&tree, &ui, &l, at(POINTER_BUTTON, 0, 0, 30));
+        assert!(!router.grabbed(), "the release closes it");
+    }
+
+    /// Space for a `padding` import that keeps the element helpers honest in this module.
+    #[allow(dead_code)]
+    fn _unused() -> Element<u32> {
+        padding(Insets::all(0), text("x"))
     }
 }
 

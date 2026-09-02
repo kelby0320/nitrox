@@ -733,6 +733,14 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   keystroke, and that presenting must be gated on the diff or a third commit blocks in `acquire`
   inside the render half of a loop that then stops pumping anything else.
 
+  **A `Child`'s hover does not move while a button is held**, and that is a correctness rule
+  rather than a nicety (M12 Part B). `Router` records a capture as a **tree id**, and `hit_test`
+  names the *deepest* node under the cursor; a hovered `menu_item` draws three layers where a
+  quiet one draws one, so a frame presented between a press and its release gives that node a new
+  id, `path_to_id` finds nothing, and the click is silently lost. A caller that retains a tree
+  must therefore not rebuild it with a different hover mid-gesture — `Child` does that for the
+  windows it owns, and `Router::grabbed` is published so a main window's loop can do the same.
+
   **A `Child` is one of the two parented roles**, `popup` and `dialog` — the pair the compositor's
   own `parent_of` matches and the spec calls "transient, parented". Its size is fixed at creation
   and measured from its tree, so a tree containing a `dock` is refused: `Dock` measures as

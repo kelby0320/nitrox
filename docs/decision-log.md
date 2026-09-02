@@ -21854,3 +21854,40 @@ it can be corrected, and the explanation was being written into the notice slot 
 replaced*: the answer existed and was never drawn. The test asserted the message rather than the
 absence of an operation, which is the difference between checking that nothing happened and
 checking that the person was told why.
+
+## 2026-09-02 — the lost click: a capture is a tree id, and hovered widgets change shape
+
+`check-login` failed in CI on the browser's new menu: the press reached the popup and produced no
+message. It reproduced locally about one run in two, which made it cheap to instrument, and the
+probe answered it in one line — the press routed with hover `none` and the release with hover
+`14`, and the release produced nothing.
+
+**The mechanism.** `Router` records a capture on press as a *tree id*, and `hit_test` returns the
+**deepest** node under the cursor — inside a `menu_item`, that is the padding around its label.
+A hovered `menu_item` draws three layers where a quiet one draws one, so rebuilding the tree with
+a different hover puts two new layers ahead of that node and gives it a different id. On release
+`path_to_id` finds the recorded id gone, the whole dispatch block is skipped, and the click
+vanishes. It is intermittent because it depends on whether a frame happened to be presented
+between the press and the release.
+
+**The fix is a rule, not a special case**: a widget may change under the pointer, but not while a
+button is held on it. `Child` now samples its hover only between gestures and hands the same value
+to both `present` and `route`, so the tree those two share keeps its shape for the whole gesture.
+`Router::grabbed` is published for main-window loops, which own their own trees and have to do the
+same — `desktop-shell`'s applications modal does now.
+
+**And this is very probably the launcher-row flake**, which cost three CI failures across two
+parts and which I attributed twice to something else: first to the close timer (a bisect over an
+intermittent step, which measures nothing), then to an unacknowledged burst of injected keystrokes
+(a real hazard, named in the shell's own source, and worth fixing on its own). The modal's rows
+are `list_view` rows and change shape with hover exactly as a menu row does; the receipts I added
+made the gate wait between keystrokes, which changes when frames are presented, which is why it
+went quiet. **I am recording this as the likely cause rather than the proven one** — what is
+proven is the mechanism, reproduced in a host test whose control loses the click — because the
+last two attributions were confident and wrong, and the third does not get a free pass for being
+better evidenced.
+
+The lesson worth keeping is narrower than "test more". Both wrong attributions came from reasoning
+about *timing* around an intermittent failure; the one that held came from asking the guest what
+it actually routed. An instrument that names the input and the output of the step in doubt is
+worth more than any amount of inference about what else changed.
