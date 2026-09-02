@@ -58,47 +58,78 @@ const BUFFERS: usize = 2;
 /// The returned string is what the strip shows, so it is written for the person looking at the
 /// window rather than for a log.
 fn perform(ns: u64, op: &FileOp) -> &'static str {
+    // **The destination is tested first, and that is what makes "nothing overwrites" true.**
+    // Three of the four refusals this used to claim were unreachable, and one of them was worse
+    // than unreachable (PR #268 review, worth fixing 1):
+    //
+    // - `libfs::create_file` is documented *idempotent* — `fs-server-ext4` resolves with
+    //   `RESOLVE_CREATE`, discards "already exists" and grows the file to zero, which is a
+    //   no-op. So *new file* onto an existing name **succeeded**, destroyed nothing, and told
+    //   the person a new empty file was there while the old one and its contents still were.
+    // - `libfs::rename`'s `map_rename_error` deliberately does not distinguish an occupied
+    //   destination — its own doc says a caller that cares should test with `file_size` first,
+    //   which is what the `copy` coreutil does. So a refused rename or move was correct and
+    //   reported "could not rename it", which reads like a fault rather than an answer.
+    //
+    // Testing here gives all of them the sentence written for them, and puts the promise in this
+    // program rather than in what a server happens to return.
+    let taken = |path: &String| {
+        libfs::file_size(ns, path.as_bytes()).is_some() || libfs::is_dir(ns, path.as_bytes())
+    };
     match op {
-        FileOp::Create { path, dir: false } => match libfs::create_file(ns, path.as_bytes()) {
-            Ok(()) => "created",
-            Err(libfs::FileError::Exists) => "that name is taken",
-            Err(_) => "could not create it",
-        },
-        FileOp::Create { path, dir: true } => match libfs::mkdir(ns, path.as_bytes()) {
-            Ok(()) => "created",
-            Err(libfs::TreeError::MakeDir(k))
-                if k == libkern::error::KError::AlreadyExists.as_i32() =>
-            {
-                "that name is taken"
+        FileOp::Create { path, dir } => {
+            if taken(path) {
+                return "that name is taken";
             }
-            Err(_) => "could not create it",
-        },
+            let made = if *dir {
+                libfs::mkdir(ns, path.as_bytes()).is_ok()
+            } else {
+                libfs::create_file(ns, path.as_bytes()).is_ok()
+            };
+            if made { "created" } else { "could not create it" }
+        }
         // **Never `replace`**, for rename, copy and move alike: overwriting is a second
         // question, and a browser that answered it silently would be one whose most ordinary
         // mistake — typing a name that is already there — destroys a file.
         FileOp::Rename { from, to } => {
+            if taken(to) {
+                return "that name is taken";
+            }
             match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
                 Ok(()) => "renamed",
-                Err(libfs::FileError::Exists) => "that name is taken",
                 Err(_) => "could not rename it",
             }
         }
         FileOp::MoveInto { from, to } => {
+            if taken(to) {
+                return "there is one there already";
+            }
             match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
                 Ok(()) => "moved",
-                Err(libfs::FileError::Exists) => "there is one there already",
                 Err(_) => "could not move it",
             }
         }
         // **`copy_file`, which maps both sides and copies between the mappings** with no heap at
         // all, bounded by `libfs::MAX_COPY`. `read_file` is the one function here that allocates
-        // a whole file, and the wrong one for a copy to call.
-        FileOp::Copy { from, to } => match libfs::copy_file(ns, from.as_bytes(), to.as_bytes(), false) {
-            Ok(_) => "copied",
-            Err(libfs::FileError::Exists) => "that name is taken",
-            Err(libfs::FileError::TooLarge) => "too large to copy",
-            Err(_) => "could not copy it",
-        },
+        // a whole file, and the wrong one for a copy to call. A *folder* takes `copy_tree`, which
+        // was always there — `copy_file` on one merely fails.
+        FileOp::Copy { from, to, dir } => {
+            if taken(to) {
+                return "that name is taken";
+            }
+            if *dir {
+                return match libfs::copy_tree(ns, from.as_bytes(), to.as_bytes(), false, &mut |_, _, _| {})
+                {
+                    Ok(()) => "copied",
+                    Err(_) => "could not copy it",
+                };
+            }
+            match libfs::copy_file(ns, from.as_bytes(), to.as_bytes(), false) {
+                Ok(_) => "copied",
+                Err(libfs::FileError::TooLarge) => "too large to copy",
+                Err(_) => "could not copy it",
+            }
+        }
         FileOp::Delete { path, dir } => {
             let r = if *dir {
                 libfs::remove_tree(ns, path.as_bytes(), &mut |_, _| {}).is_ok()
@@ -425,7 +456,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let anchor = app.menu_anchor[usize::from(which != Menu::File)];
                 match anchor {
                     Some(a) => {
-                        let view = app.menu_view(&theme, None);
+                        let view = app.menu_view(which, &theme, None);
                         menu = Child::open(
                             &mut win,
                             Role::Popup { parent: window_id },
@@ -475,8 +506,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if let Some(m) = menu.as_mut() {
             let now = m.hovered_key();
             menu_hovered = now;
-            let view = app.menu_view(&theme, now);
-            if !m.present(&mut win, &view, &font, &theme) {
+            let view = menu_shown.map(|w| app.menu_view(w, &theme, now));
+            if let Some(view) = view
+                && !m.present(&mut win, &view, &font, &theme)
+            {
                 kprint(b"nxfiles: the menu could not be drawn\n");
             }
         }
@@ -595,11 +628,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     app.dismiss_menu();
                     continue;
                 }
-                let view = app.menu_view(&theme, menu_hovered);
-                let msgs = menu
-                    .as_mut()
-                    .map(|m| m.route(&view, &font, &theme, &event))
-                    .unwrap_or_default();
+                let msgs = match (menu_shown, menu.as_mut()) {
+                    (Some(which), Some(m)) => {
+                        let view = app.menu_view(which, &theme, menu_hovered);
+                        m.route(&view, &font, &theme, &event)
+                    }
+                    _ => Vec::new(),
+                };
                 for msg in msgs {
                     app.update(msg);
                 }

@@ -191,6 +191,36 @@ impl Action {
     }
 }
 
+/// What an operation was chosen **for**, resolved at the moment it was chosen.
+///
+/// **The fix for a whole class of bug** (PR #268 review, blocking 2 and 3). Every operation here
+/// is two gestures — choose it from a menu, then answer a prompt or a question — and the first
+/// version composed the paths at the *second*, out of `self.path` and `self.list.selected`. Both
+/// move while a prompt or a dialog is up: the compositor has no input-exclusive window
+/// (`TODO(dialog-modality)`), the prompt is a *keyboard* mode only, and a click on a row still
+/// navigates or re-selects. So a delete answered after walking into another directory removed a
+/// file there with the same name — one the person was never asked about, while the dialog's own
+/// text still named the one they chose.
+///
+/// Resolving here makes the operation mean what it meant when it was asked for, whatever the
+/// window does afterwards.
+///
+/// **It overlaps with `show` dropping the prompt and the question**, and only partly. A listing
+/// is the only thing that changes `self.path`, so for *delete* either fix alone would do; the
+/// *selection* moves without one — a click on a file row re-selects and navigates nothing — and
+/// there this is the only thing standing between a rename and the wrong file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Target {
+    /// The directory the operation happens in, as it was when the row was pressed.
+    dir: String,
+    /// The full path of the entry it acts on — `None` for the two that act on the directory.
+    from: Option<String>,
+    /// That entry's name, which is what the question shows.
+    name: String,
+    /// Whether it is a directory, which decides whether a removal descends.
+    is_dir: bool,
+}
+
 /// A filesystem operation the binary owes, and the browser cannot perform.
 ///
 /// **The outbox shape everything else here uses**: `update` is a function of values and a
@@ -220,6 +250,12 @@ pub enum FileOp {
         from: String,
         /// The path to write.
         to: String,
+        /// Whether it is a directory, which decides whether the copy descends.
+        ///
+        /// **`copy_file` on a folder just fails**, and reported "could not copy it" for a
+        /// perfectly ordinary request (PR #268 review, optional 3). `libfs::copy_tree` was
+        /// already there.
+        dir: bool,
     },
     /// Remove `path`, and everything under it if it is a directory.
     Delete {
@@ -359,13 +395,13 @@ pub struct App {
     /// belong to the field rather than to the list, and the strip shows it in place of the path.
     /// Three of the five operations need a name and this is all three of them — one prompt, not
     /// three dialogs.
-    prompt: Option<(Action, TextFieldState)>,
-    /// The entry a delete is asking about, and nothing while nothing is being asked.
+    prompt: Option<(Action, Target, TextFieldState)>,
+    /// What a delete is asking about, and nothing while nothing is being asked.
     ///
     /// **A question rather than a prompt**, because removal is the one operation a person cannot
     /// undo and a typed name is not a confirmation of anything. The binary turns this into a
     /// `Role::Dialog` window, which is what M12 Part A built.
-    confirm: Option<Entry>,
+    confirm: Option<Target>,
     /// Whether the *dialog* holds the keyboard, which its own title bar shows.
     pub confirm_focused: bool,
     /// The dialog's title bar was dragged, and the binary owes a `StartMove` **on its window**.
@@ -494,6 +530,16 @@ impl App {
         self.list = ListState { selected: (!self.entries.is_empty()).then_some(0), offset: 0 };
         // A listing supersedes whatever the last row press had to say about itself.
         self.notice = None;
+        // **And a question about a directory you have left is not a question worth keeping**
+        // (PR #268 review, blocking 2 and 3). Resolving the target at `choose` time is what
+        // makes the *operation* correct; this is what stops the browser sitting in a mode whose
+        // subject is no longer on screen — a prompt replaces the path in the strip, so after a
+        // navigation there would be nothing at all saying where the name is about to land.
+        //
+        // Both, deliberately: neither closes the other's case. A click on a *file* row re-selects
+        // without re-listing, which this never sees.
+        self.prompt = None;
+        self.confirm = None;
     }
 
     /// Turn a wire entry into a row.
@@ -582,10 +628,14 @@ impl App {
                 self.menu = if self.menu == Some(m) { None } else { Some(m) };
             }
             Msg::Choose(a) => self.choose(a),
+            // **The path was resolved when the question was asked**, not composed from
+            // `self.path` now: the parent window is free to navigate while a dialog is up, and
+            // this is the one operation a person cannot undo (PR #268 review, blocking 2).
             Msg::ConfirmDelete => {
-                if let Some(e) = self.confirm.take() {
-                    self.op =
-                        Some(FileOp::Delete { path: join(&self.path, &e.name), dir: e.is_dir });
+                if let Some(t) = self.confirm.take()
+                    && let Some(path) = t.from
+                {
+                    self.op = Some(FileOp::Delete { path, dir: t.is_dir });
                 }
             }
             // **Says so**, because a dialog that vanishes with nothing changed is
@@ -617,12 +667,21 @@ impl App {
             self.notice = Some(String::from("nothing is selected"));
             return;
         }
+        // **Resolved now, not when the answer arrives.** See [`Target`]: `self.path` and the
+        // selection both move while a prompt or a question is up, and an operation that read them
+        // late acted on something nobody chose.
+        let target = Target {
+            dir: self.path.clone(),
+            from: selected.as_ref().map(|e| join(&self.path, &e.name)),
+            name: selected.as_ref().map(|e| e.name.clone()).unwrap_or_default(),
+            is_dir: selected.as_ref().is_some_and(|e| e.is_dir),
+        };
         match a {
-            Action::Delete => self.confirm = selected,
+            Action::Delete => self.confirm = Some(target),
             // The field starts empty rather than pre-filled with the current name. Pre-filling
             // would need a selection and a caret to be useful — a person would have to clear it
             // before typing — and the field has neither yet.
-            _ => self.prompt = Some((a, TextFieldState::new())),
+            _ => self.prompt = Some((a, target, TextFieldState::new())),
         }
     }
 
@@ -632,7 +691,7 @@ impl App {
     /// a separator in the field would be a way to write outside it by typing — and this browser
     /// is showing one directory, not offering a command line.
     fn confirm_prompt(&mut self) {
-        let Some((a, field)) = self.prompt.as_ref() else { return };
+        let Some((a, target, field)) = self.prompt.as_ref() else { return };
         let (a, name) = (*a, field.text().trim().to_string());
         if name.is_empty() {
             self.notice = Some(String::from("a name, then Enter"));
@@ -642,13 +701,16 @@ impl App {
             self.notice = Some(String::from("a name, not a path"));
             return;
         }
-        let to = join(&self.path, &name);
-        let from = self.list.selected.and_then(|i| self.full(i));
+        // **`target.dir`, not `self.path`**, and `target.from`, not the selection: both were
+        // resolved when the menu row was pressed. Reading them here renamed whatever happened to
+        // sit at row 0 after a navigation the prompt gave no sign of (PR #268 review, blocking 3).
+        let to = join(&target.dir, &name);
+        let from = target.from.clone();
         self.op = match a {
             Action::NewFile => Some(FileOp::Create { path: to, dir: false }),
             Action::NewFolder => Some(FileOp::Create { path: to, dir: true }),
             Action::Rename => from.map(|from| FileOp::Rename { from, to }),
-            Action::Copy => from.map(|from| FileOp::Copy { from, to }),
+            Action::Copy => from.map(|from| FileOp::Copy { from, to, dir: target.is_dir }),
             // `choose` sends a delete to the dialog and never to a prompt.
             Action::Delete => None,
         };
@@ -661,6 +723,10 @@ impl App {
     /// directory dropped into itself is a rename to a path beneath the thing being moved — which
     /// the filesystem would refuse and which nothing sensible could mean.
     fn drop_on(&mut self, i: usize, carried: &str) {
+        // **`is_dir` is checked again here and nothing reaches it** — `pointer_moved` only ever
+        // records a directory as the target, and this is its one caller. Kept as belt and
+        // braces, and named as such rather than left looking load-bearing: breaking it alone
+        // fails no test (PR #268 review, optional 1).
         let Some(target) = self.entries.get(i).filter(|e| e.is_dir).cloned() else { return };
         if target.name == carried {
             return;
@@ -679,10 +745,22 @@ impl App {
         libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H + MENU_BAR_H + PATH_H
     }
 
-    /// The row a window-local `y` is over, if it is over the list at all.
+    /// How many rows the list actually draws — what `list_view` builds from the height it is
+    /// given.
+    ///
+    /// **Not `entries.len()`**, which is the whole of PR #268's blocking 1: a window is taller
+    /// than the rows it has room for by up to a row, plus the grip and the frame, and a `y` in
+    /// that band is still inside the window and still under the pointer grab. Bounding a drop
+    /// against the *entries* rather than the *rows* mapped it to a directory that was never
+    /// drawn and never highlighted — so a file moved into a folder the person could not see.
+    pub fn visible_rows(&self) -> usize {
+        (self.list_h() / ROW_H) as usize
+    }
+
+    /// The row a window-local `y` is over, if it is over a **drawn** row at all.
     fn row_at(&self, y: i32) -> Option<usize> {
         let top = self.list_top() as i32;
-        if y < top {
+        if y < top || y >= top + (self.visible_rows() as u32 * ROW_H) as i32 {
             return None;
         }
         let i = self.list.offset + ((y - top) as u32 / ROW_H) as usize;
@@ -715,7 +793,7 @@ impl App {
                 }
                 libkern::abi::KEY_ENTER => self.confirm_prompt(),
                 code => {
-                    if let Some((_, f)) = self.prompt.as_mut() {
+                    if let Some((_, _, f)) = self.prompt.as_mut() {
                         f.apply(code, k.modifiers);
                     }
                 }
@@ -865,9 +943,9 @@ impl App {
         self.menu = None;
     }
 
-    /// The entry a delete is asking about, for the binary that owns the dialog's window.
-    pub fn confirming(&self) -> Option<&Entry> {
-        self.confirm.as_ref()
+    /// The name a delete is asking about, for the binary that owns the dialog's window.
+    pub fn confirming(&self) -> Option<&str> {
+        self.confirm.as_ref().map(|t| t.name.as_str())
     }
 
     /// The dialog could not be opened, so the question cannot be asked.
@@ -904,7 +982,7 @@ impl App {
     /// steps later, looking like a logic bug. The same shape `nxedit::App::naming_len` has, and
     /// added for the same reason it was: a count, not the text.
     pub fn prompt_len(&self) -> Option<usize> {
-        self.prompt.as_ref().map(|(_, f)| f.text().chars().count())
+        self.prompt.as_ref().map(|(_, _, f)| f.text().chars().count())
     }
 
     /// The row an internal drag is over, which the view draws a highlight on.
@@ -1037,7 +1115,7 @@ impl App {
             // the answer was written and never drawn: the field kept the caret and nothing said
             // why Enter had done nothing. Found by the test below, which asserted the message
             // rather than the absence of an operation.
-            Some((a, f)) => row(alloc::vec![
+            Some((a, _, f)) => row(alloc::vec![
                 padding(
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
                     text(String::from(a.prompt().unwrap_or(""))),
@@ -1141,19 +1219,18 @@ impl App {
     /// **`menu_item`, not `button`**: a menu row highlights the way a selected list row does,
     /// because they are the same thing seen twice — the item that would happen if you acted now.
     /// `hovered` comes from the popup's own router, which is a different tree from this window's.
-    pub fn menu_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+    /// **Which menu is a parameter, not read from state** (PR #268 review, optional 2). It used
+    /// to fall through to *File* whenever `self.menu` was `None` — and `Msg::Choose` clears that
+    /// before the binary closes the window, so any further event from an *Edit* popup in the same
+    /// batch would have routed against the File tree. Nothing could be made of it, and a shape
+    /// that depends on nobody making anything of it is one to remove rather than to argue about.
+    pub fn menu_view(&self, which: Menu, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let item = |label: &str, a: Action, key: u64| {
             menu_item(label, Msg::Choose(a), hovered == Some(key), ui).key(key)
         };
-        let items = match self.menu {
-            Some(Menu::Edit) => column(alloc::vec![item(
-                "copy",
-                Action::Copy,
-                MENU_COPY_KEY
-            )]),
-            // `File` is also what a closed menu measures as, which nothing draws: the binary
-            // opens a window only while `menu` is `Some`.
-            _ => column(alloc::vec![
+        let items = match which {
+            Menu::Edit => column(alloc::vec![item("copy", Action::Copy, MENU_COPY_KEY)]),
+            Menu::File => column(alloc::vec![
                 item("new file", Action::NewFile, MENU_NEW_FILE_KEY),
                 item("new folder", Action::NewFolder, MENU_NEW_FOLDER_KEY),
                 item("rename", Action::Rename, MENU_RENAME_KEY),
@@ -1173,8 +1250,8 @@ impl App {
     /// **The destructive answer is on the left**, matching the editor's *discard*, because a
     /// person who has learned where the safe half is should not have to relearn it per window.
     pub fn confirm_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let name = self.confirm.as_ref().map(|e| e.name.as_str()).unwrap_or_default();
-        let what = if self.confirm.as_ref().is_some_and(|e| e.is_dir) {
+        let name = self.confirm.as_ref().map(|t| t.name.as_str()).unwrap_or_default();
+        let what = if self.confirm.as_ref().is_some_and(|t| t.is_dir) {
             "Delete this folder and everything in it?"
         } else {
             "Delete this file?"
@@ -1583,7 +1660,11 @@ mod tests {
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(
             a.take_op(),
-            Some(FileOp::Copy { from: "/home/a.txt".into(), to: "/home/x".into() })
+            Some(FileOp::Copy {
+                from: "/home/a.txt".into(),
+                to: "/home/x".into(),
+                dir: false
+            })
         );
     }
 
@@ -1636,7 +1717,7 @@ mod tests {
         let mut a = app();
         select(&mut a, 2); // a.txt
         a.update(Msg::Choose(Action::Delete));
-        assert_eq!(a.confirming().map(|e| e.name.as_str()), Some("a.txt"), "it asks");
+        assert_eq!(a.confirming(), Some("a.txt"), "it asks");
         assert!(a.take_op().is_none(), "and does nothing while it is asking");
 
         // Keeping it removes the question and nothing else.
@@ -1745,7 +1826,7 @@ mod tests {
         // real one. An `Edit` menu that grew them here would be a second.
         let mut a = app();
         a.update(Msg::ToggleMenu(Menu::File));
-        let file: Element<Msg> = a.menu_view(&UiTheme::default(), None);
+        let file: Element<Msg> = a.menu_view(Menu::File, &UiTheme::default(), None);
         for (key, item) in [
             (MENU_NEW_FILE_KEY, "new file"),
             (MENU_NEW_FOLDER_KEY, "new folder"),
@@ -1758,7 +1839,7 @@ mod tests {
         assert_eq!(labelled(&file, MENU_COPY_KEY), "");
 
         a.update(Msg::ToggleMenu(Menu::Edit));
-        let edit: Element<Msg> = a.menu_view(&UiTheme::default(), None);
+        let edit: Element<Msg> = a.menu_view(Menu::Edit, &UiTheme::default(), None);
         assert_eq!(labelled(&edit, MENU_COPY_KEY), "copy");
         // **And nothing else is here**: cut and paste are a pair that holds something between
         // two gestures, which is a clipboard however it is spelled, and M12 Part E builds the
@@ -1785,6 +1866,139 @@ mod tests {
         // Choosing anything puts the menu away, or it would sit over the answer.
         a.update(Msg::Choose(Action::NewFile));
         assert_eq!(a.menu(), None);
+    }
+
+    #[test]
+    fn a_drop_below_the_last_drawn_row_lands_nowhere() {
+        // **A window is taller than the rows it has room for** — up to a row's worth, plus the
+        // grip and the frame — and a `y` in that band is still inside the window and still under
+        // the pointer grab. Bounding a drop against `entries.len()` rather than against the rows
+        // `list_view` actually drew mapped it to a directory that was never on screen and never
+        // highlighted, so a file moved into a folder the person could not see (PR #268 review,
+        // blocking 1).
+        let mut a = App::new("/big");
+        let mut rows: alloc::vec::Vec<Entry> = (1..=20)
+            .map(|i| Entry::dir(&alloc::format!("d{i:02}")))
+            .collect();
+        rows.extend((1..=21).map(|i| Entry::file(&alloc::format!("f{i:02}"))));
+        a.show("/big", rows);
+        assert!(a.entries().len() > a.visible_rows(), "more entries than the window draws");
+
+        let last_drawn_bottom = (a.list_top() + a.visible_rows() as u32 * ROW_H) as i32;
+        assert!(
+            last_drawn_bottom < a.window_size().h as i32,
+            "there is a band below the rows and inside the window, which is the whole hazard"
+        );
+
+        a.update(Msg::Grab(1)); // d02
+        a.pointer_moved(100, row_y(&a, 1), 1);
+        a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 1), 1);
+        assert_eq!(a.drop_target(), Some(1), "over a real row to start with");
+        // Two pixels below the last drawn row, and well inside the window. The gesture reports
+        // `Moved` because the *highlight* changed — it had to be cleared — and what matters is
+        // what it changed to.
+        let below = last_drawn_bottom + 2;
+        assert_eq!(a.pointer_moved(100 + DRAG_SLOP, below, 1), Gesture::Moved);
+        assert_eq!(a.drop_target(), None, "nothing is drawn there");
+        assert_eq!(a.pointer_moved(100 + DRAG_SLOP, below, 0), Gesture::None);
+        assert!(a.take_op().is_none(), "and letting go there moves nothing");
+    }
+
+    #[test]
+    fn a_question_answered_after_navigating_still_names_what_it_asked_about() {
+        // **The class this and the two below share**: an operation is two gestures, and the first
+        // version composed its paths at the *second* — out of `self.path` and the selection, both
+        // of which move while a prompt or a dialog is up. There is no input-exclusive window
+        // (`TODO(dialog-modality)`) and the prompt is a keyboard mode only, so the parent goes on
+        // taking clicks (PR #268 review, blocking 2).
+        let mut a = app();
+        select(&mut a, 2); // a.txt
+        a.update(Msg::Choose(Action::Delete));
+        assert_eq!(a.confirming(), Some("a.txt"));
+
+        // The person clicks `work/` in the parent, which navigates. The binary re-lists.
+        a.update(Msg::Activate(1));
+        let to = a.take_goto().expect("a directory row navigates");
+        assert_eq!(to, "/home/work");
+        a.show(&to, alloc::vec![Entry::file("a.txt"), Entry::file("payroll.txt")]);
+
+        // **A listing supersedes the question**, so there is nothing left to answer wrongly.
+        assert_eq!(a.confirming(), None, "a question about a directory you have left is gone");
+        a.update(Msg::ConfirmDelete);
+        assert!(a.take_op().is_none());
+    }
+
+    #[test]
+    fn a_delete_answered_after_the_selection_moves_removes_what_was_asked_about() {
+        // The half a re-listing does *not* cover: clicking a **file** row re-selects without
+        // navigating, so nothing clears the question.
+        //
+        // **This does not pin the captured path, and saying so is the point.** `self.path` only
+        // changes in `show`, and `show` now drops the question — so for *delete* the two fixes
+        // overlap and composing the path late would give the same answer here. Run alone against
+        // that version this test passes, which makes it a guard for the question surviving a
+        // selection change and nothing more. What pins the capture is the rename below, where the
+        // *source* moves without a listing.
+        let mut a = app();
+        select(&mut a, 2); // a.txt
+        a.update(Msg::Choose(Action::Delete));
+        a.update(Msg::Activate(3)); // notes.txt — selects it, and asks the shell to open it
+        let _ = a.take_open();
+        assert_eq!(a.confirming(), Some("a.txt"), "the question still names what it asked about");
+        a.update(Msg::ConfirmDelete);
+        assert_eq!(
+            a.take_op(),
+            Some(FileOp::Delete { path: "/home/a.txt".into(), dir: false }),
+            "and it removes that, not whatever is selected now"
+        );
+    }
+
+    #[test]
+    fn a_rename_answered_after_the_selection_moves_renames_what_was_chosen() {
+        // Same shape in the prompt, where it is worse: the prompt *replaces* the path in the
+        // strip, so after a navigation nothing on screen says where the name is about to land
+        // (PR #268 review, blocking 3).
+        let mut a = app();
+        select(&mut a, 2); // a.txt
+        a.update(Msg::Choose(Action::Rename));
+        a.update(Msg::Activate(3)); // notes.txt
+        let _ = a.take_open();
+        press_key(&mut a, KEY_X);
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(
+            a.take_op(),
+            Some(FileOp::Rename { from: "/home/a.txt".into(), to: "/home/x".into() }),
+            "the entry the menu row was pressed on, not the one selected now"
+        );
+
+        // And a navigation drops the prompt outright, so the mode cannot outlive its directory.
+        let mut a = app();
+        select(&mut a, 2);
+        a.update(Msg::Choose(Action::Rename));
+        a.show("/home/work", alloc::vec![Entry::file("payroll.txt")]);
+        let ui: Element<Msg> = a.view(&UiTheme::default(), None);
+        assert_eq!(labelled(&ui, PATH_KEY), "/home/work", "the path is back");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert!(a.take_op().is_none(), "and Enter renames nothing");
+    }
+
+    #[test]
+    fn copying_a_folder_is_a_tree_copy() {
+        // `copy_file` on a directory merely fails, and `Action::Copy` does not exclude one —
+        // so the operation has to carry which it is (PR #268 review, optional 3).
+        let mut a = app();
+        select(&mut a, 0); // archive/
+        a.update(Msg::Choose(Action::Copy));
+        press_key(&mut a, KEY_X);
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(
+            a.take_op(),
+            Some(FileOp::Copy {
+                from: "/home/archive".into(),
+                to: "/home/x".into(),
+                dir: true
+            })
+        );
     }
 
     #[test]

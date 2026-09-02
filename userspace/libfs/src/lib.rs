@@ -877,7 +877,7 @@ fn remove_tree_at(
 /// place. The `--parents` walk stays in `mkdir`, because creating intermediates is that
 /// program's flag rather than a fact about making a directory.
 ///
-/// `TreeError::Mkdir` carries the server's `KError`, so a caller can tell an occupied name from
+/// [`TreeError::MakeDir`] carries the server's `KError`, so a caller can tell an occupied name from
 /// anything else without a confirming round trip — the same reason [`rmdir_at`] carries one.
 pub fn mkdir(ns: u64, path: &[u8]) -> Result<(), TreeError> {
     let name = basename(path);

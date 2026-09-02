@@ -3126,10 +3126,16 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //
     //     **The dialog's geometry is hardcoded here**, the way this gate already hardcodes a
     //     title bar's height and a list's row height, because it cannot link the crate that
-    //     defines them. `nxedit::CONFIRM_DISCARD_CX` and its three siblings are the source, and
-    //     `the_published_button_centres_are_where_the_buttons_are` is the host test that pins
-    //     these four numbers to the tree that is actually built — so a change to the dialog's
-    //     padding fails there, beside the change, rather than here after a three-minute boot.
+    //     defines them. `libui::widget::DIALOG_LEFT_CX` and its siblings are the source — they
+    //     were `nxedit`'s until M12 Part B moved them down beside `dialog_frame`, when a second
+    //     confirmation would otherwise have given this gate two tables to keep in step — and
+    //     `libui::widget::tests::dialog_buttons_land_where_the_constants_say` is the host test
+    //     that pins these numbers to a tree that is actually built, so a change to `DIALOG_PAD`
+    //     fails there, beside the change, rather than here after a three-minute boot.
+    //
+    //     (This paragraph named two symbols that same part deleted — PR #268 review, worth
+    //     fixing 2 — which is the drift the move was made to prevent, in the one place a
+    //     compiler cannot see.)
     const CONFIRM_W: i32 = 340;
     const CONFIRM_H: i32 = 132;
     const CONFIRM_DISCARD_CX: i32 = 91;

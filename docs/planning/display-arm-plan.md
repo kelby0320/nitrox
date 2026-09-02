@@ -3838,6 +3838,29 @@ The two taken before this pass — the clipboard's owner and the image format �
       the notice slot *the prompt had replaced*. The answer existed and was never drawn. The test
       asserted the message rather than the absence of an operation, which is what caught it.
 
+- [x] **Three the review found, and they were one bug wearing three hats** ✅ (PR #268). *An
+      operation's target was recomputed from state that can move between the gesture that chose
+      it and the gesture that confirmed it.* A delete answered after walking into another
+      directory removed a file **there** with the same name — one nobody was asked about, while
+      the dialog's own text still named the one they chose; a rename after clicking another row
+      renamed that row instead; and a drop below the last drawn row moved a file into a folder
+      that was never on screen, because `row_at` bounded against `entries.len()` rather than
+      against the rows `list_view` actually draws.
+
+      Each is now resolved **when the operation is chosen** rather than when it is answered, and
+      a new listing drops the prompt and the question outright. The two fixes overlap only
+      partly, which the code says: a listing is the only thing that changes the directory, so for
+      delete either would do — but the *selection* moves without one, and there the captured
+      target is the only thing between a rename and the wrong file. The test for the delete case
+      is honest about not pinning the capture; the rename's does.
+
+      **And `perform`'s refusals were three-quarters decoration.** `libfs::create_file` is
+      documented idempotent, so *new file* onto an existing name succeeded and said "created"
+      while the old file and its contents were still there; `libfs::rename` deliberately does not
+      distinguish an occupied destination, so a correctly-refused rename reported a fault. The
+      destination is tested first now, which puts "nothing overwrites" in this program rather
+      than in what a server happens to return.
+
 - [x] **And one the gate found, in `libui` rather than here** ✅. The menu's rows could be
       clicked and did nothing, about one run in two: a capture is a *tree id* of the deepest node
       under the cursor, a hovered `menu_item` draws three layers where a quiet one draws one, and

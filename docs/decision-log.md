@@ -21891,3 +21891,45 @@ The lesson worth keeping is narrower than "test more". Both wrong attributions c
 about *timing* around an intermittent failure; the one that held came from asking the guest what
 it actually routed. An instrument that names the input and the output of the step in doubt is
 worth more than any amount of inference about what else changed.
+
+## 2026-09-02 — what #268's review caught: an operation whose target moved under it
+
+Three blocking findings, and the reviewer's own summary is the useful part: *an operation's target
+is recomputed from state that can move between the gesture that chose it and the gesture that
+confirms it.* One bug wearing three hats, and worth recording as a shape rather than three fixes.
+
+Every operation in the browser is **two gestures** — choose it from a menu, then answer a prompt or
+a question — and the first version composed its paths at the *second*, out of `self.path` and
+`self.list.selected`. Both move while a prompt or a dialog is up, and there is nothing to stop
+them: the compositor has no input-exclusive window (`TODO(dialog-modality)`, filed in Part A), and
+the prompt is a *keyboard* mode only, so a click on a row still navigates or re-selects. So a
+delete answered after walking into another directory removed a file **there** with the same name —
+one the person was never asked about, while the dialog's own text still named the one they chose.
+Silent and harmless when the two directories do not share a name, destructive exactly when they do,
+which is the case least likely to be noticed.
+
+The third was the same shape one layer down: `row_at` bounded a drop against `entries.len()`
+rather than against the rows `list_view` actually draws, so the band below the last row — still
+inside the window, still under the pointer grab — mapped to an entry that was never on screen and
+never highlighted.
+
+**The fix is to resolve the target when it is chosen**, plus dropping the prompt and the question
+whenever a new listing arrives. The two overlap only partly and the code says so: a listing is the
+only thing that changes the directory, so for delete either alone would do — but the selection
+moves without one, and there the captured target is the only thing between a rename and the wrong
+file. The test for the delete case is written to say it does *not* pin the capture, because it
+passes against the version that composes the path late; the rename's is the one that discriminates.
+
+**And a separate finding worth its own note: three of four "that name is taken" arms were
+unreachable, and the fourth was worse than that.** `libfs::create_file` is documented *idempotent*
+— `fs-server-ext4` resolves with `RESOLVE_CREATE`, discards "already exists" and grows the file to
+zero — so *new file* onto an existing name **succeeded**, destroyed nothing, and told the person a
+new empty file existed while the old one and its contents still did. And `libfs::rename`'s error
+mapping deliberately does not distinguish an occupied destination, its own doc saying a caller that
+cares should test with `file_size` first. So the refusals were correct and the sentences were not.
+The destination is tested before every mutation now, which puts "nothing overwrites" in this
+program rather than in what a server happens to return.
+
+The generalisation: **a promise about what an operation will not do belongs where the operation is,
+not in an error arm that assumes the layer below reports what you hoped.** Reading the callee's
+documentation is what settles which of those you have written.
