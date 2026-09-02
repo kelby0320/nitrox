@@ -22007,3 +22007,86 @@ catch. Escaping a search no longer blanks the strip, which was a control answeri
 Two gate comments overclaimed: the byte count that discriminates per-keystroke grouping is eight
 rather than nine, and the `Esc` after a search is not asserted by anything downstream, because
 nothing types into that editor again.
+
+## 2026-09-02 — M12 Part D: tabs, and the line between a window and what is in it
+
+The widget was the small half. The decision inside it is **fixed width rather than sharing the
+strip out**: tabs that divided the space between them would move *every* tab whenever another
+opened, so the one a person is reaching for slides away as they reach, and a gate's aim point
+would depend on how many happen to be open. The cost is that enough of them run off the end —
+`TODO(tab-overflow)`, whose fix is a strip that scrolls and therefore the same clipping question
+§8 defers for containers generally.
+
+**The larger half was a line each application had to draw**: what belongs to a *window* and what
+belongs to what is in it. `nxedit` grew a `Buffer` and `nxfiles` a `Pane`. The window keeps its
+size, its focus, the outboxes, the strip's field and the question it may be asking; the buffer or
+pane keeps everything a person expects to survive switching — including the editor's undo history,
+which is part of the text, and the browser's scroll offset, because a tab that came back at the top
+would lose your place every time you glanced at another folder. Drawing that line wrong is how a
+second tab inherits the first's history, and it reads as correct until somebody presses `Ctrl+Z` in
+the wrong tab.
+
+**The two applications differ exactly where their data does.** Closing an editor tab over unsaved
+work asks — Part A's dialog, with the tab's key captured when the question is asked, which is Part
+B's lesson applied a part later. Closing a browser tab asks nothing: a listing is a view of the
+filesystem rather than work. Both close the window on the last tab, which is what keeps the
+never-empty invariant every accessor rests on.
+
+**A drop now opens a tab, and that removed a rule rather than adding one.** It used to replace the
+buffer, so it had to be refused while there was unsaved work — a drop that visibly did nothing for
+a reason the person had to read the strip to find. With tabs there is nothing to lose by taking it,
+and the protection is stronger: the modified buffer is not touched at all.
+
+**And one thing that would have been a real bug**: a tab's key is an *element* key too.
+`Router::hovered_key` walks up to the nearest keyed ancestor and reports that number across the
+whole window's tree, so a tab keyed `2` and a save button keyed `2` are one number — hovering the
+tab would have drawn the button hovered. Numbering tabs from a base well above the chrome's keys
+makes the two namespaces disjoint by construction rather than by remembering, and it went in before
+the second application could repeat it.
+
+**What the gate found on its first run.** Step 8b's search leaves its match *selected* — which is
+what a find is for — and typing replaces a selection. So a keystroke two steps later edited the
+middle of the file rather than appending to it, and seven bytes reached disk where ten were
+expected. Both halves are right, and together they are hand-made find-and-replace. What was wrong
+was the gate's assumption that a buffer it had searched was in a neutral state; it presses `End`
+first now, and the behaviour has a test of its own. Worth recording because the failure looked
+exactly like a tab saving the wrong buffer, which is the thing that step exists to catch — an
+assertion can fail for a reason that is not the one it was written for, and the byte count is what
+made the difference legible.
+
+## 2026-09-02 — finishing the lost click: a gesture must see the tree's hover, not the pointer's
+
+M12 Part B diagnosed this and fixed half of it. The other half showed up as a `check-login` failure
+about one run in seven — the browser's menu row pressed, and no message produced — and this time a
+probe in the guest answered it in four lines rather than any amount of reading:
+
+```
+ev=ENTER    hov=none  live=14
+ev=MOTION   hov=none  live=14
+ev=PRESS    hov=none  live=14
+ev=RELEASE  hov=14    live=14   msgs=0
+```
+
+`hov` is what the tree was built with and `live` is what the pointer is over. **They had already
+diverged before the press.** Part B froze the hover *from the press onwards*, and that is too late:
+the motion that brings the pointer onto a row arrives in the **same batch** as the press, with no
+frame between them, so the live hover advances while the retained tree still holds the old one. The
+press is routed against the old tree — correctly — and then the next frame rebuilds with the new
+hover, gives the captured node a different id, and `path_to_id` finds nothing on release.
+
+The rule is one line and it is the one that was missing: **while a gesture is in progress, what a
+caller is told about the hover is what the retained tree was built with.** `Child` keeps both — the
+live hover and the shown one — and answers with the shown one under a grab. `desktop-shell`'s modal
+gets the same by holding its resample until after the drain, so every event in one batch routes
+against the tree that is on screen.
+
+**What is proven and what is not.** The mechanism is proven: a host test drives a motion and a press
+in one batch with a frame after them, and the control — answering with the live hover — loses the
+click, `left: Some(2)` against `right: None`. The *gate's* improvement is evidence rather than
+proof: eight consecutive runs where the previous rate was about one failure in six, which is
+suggestive at roughly p=0.3 of happening anyway. Saying so beats the alternative, which this
+session has already done twice.
+
+**And the method is the finding.** Both times this bug was chased by reasoning about timing it
+produced a confident wrong answer; both times a probe that printed the input and the output of the
+step in doubt answered it immediately. The probe is four lines and costs one run.

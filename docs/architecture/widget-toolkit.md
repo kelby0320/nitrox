@@ -24,6 +24,7 @@ assembles it by hand and is the first application to do so). **Theming** (§11) 
 M11 Part B, in the half that matters to this crate: there is one `Theme`, it is `libdraw`'s
 because the compositor needs it too, and `Palette` folded into it. Where its values come from is
 Part C's. The **text
+**tab strip** left it in **M12 Part D**, wanted by both applications in the same part. The **text
 area** left this list in **M10 Part C**: §8 said it would arrive when an application posed real
 requirements rather than hypothetical ones, and M10's editor posed them. It gained **undo, redo
 and find** in M12 Part C — where the decision was the *grouping*, not the stack: a word, a line, a
@@ -718,6 +719,16 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   nothing needed a container that scrolls. The trigger stands, narrowed to what would actually
   produce one: **chrome that must stay put while content moves under it** — a path strip beside a
   scrolling pane, or the editor's gutter.
+- **A tab strip** — *here since M12 Part D*. §8's rule is that a widget exists because an
+  application needed it; two wanted this one at once, which clears that bar rather than being it.
+  `tab_strip` gives every tab a **fixed** width, because tabs that shared the strip out would move
+  each other whenever one opened — the tab a person is reaching for sliding away as they reach.
+  Enough of them run off the end: `TODO(tab-overflow)`, whose fix is the scrolling container
+  deferred above.
+
+  **A tab's key is an element key**, and that matters: `Router::hovered_key` reports the nearest
+  keyed ancestor across the whole window, so applications number their tabs from a base above
+  their chrome's keys rather than colliding with them.
 - **Multi-window applications** — *here since M12 Part A*, for the windows an application opens
   **beside** its main one. The trigger fired exactly as written: `nxedit` asks before discarding
   an unsaved buffer, and it asks in a real `Role::Dialog` window rather than in a `stack` overlay.
@@ -735,13 +746,18 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   keystroke, and that presenting must be gated on the diff or a third commit blocks in `acquire`
   inside the render half of a loop that then stops pumping anything else.
 
-  **A `Child`'s hover does not move while a button is held**, and that is a correctness rule
-  rather than a nicety (M12 Part B). `Router` records a capture as a **tree id**, and `hit_test`
-  names the *deepest* node under the cursor; a hovered `menu_item` draws three layers where a
-  quiet one draws one, so a frame presented between a press and its release gives that node a new
-  id, `path_to_id` finds nothing, and the click is silently lost. A caller that retains a tree
-  must therefore not rebuild it with a different hover mid-gesture — `Child` does that for the
-  windows it owns, and `Router::grabbed` is published so a main window's loop can do the same.
+  **While a gesture is in progress, a `Child` reports the hover its *tree* was built with**, not
+  the one the pointer is over — a correctness rule rather than a nicety (M12 Parts B and D).
+  `Router` records a capture as a **tree id**, and `hit_test` names the *deepest* node under the
+  cursor; a hovered `menu_item` draws three layers where a quiet one draws one, so a frame
+  presented between a press and its release gives that node a new id, `path_to_id` finds nothing,
+  and the click is silently lost.
+
+  Part B froze the hover from the press onwards and that was too late: the motion that brings the
+  pointer onto a widget usually arrives in the **same batch** as the press, so the live hover has
+  already moved while the tree still holds the old one. `Child` keeps both values and answers with
+  the shown one under a grab; `Router::grabbed` is published so a main window's loop can follow the
+  same rule, and it must also hold its own resample until after a batch is drained.
 
   **A `Child` is one of the two parented roles**, `popup` and `dialog` — the pair the compositor's
   own `parent_of` matches and the spec calls "transient, parented". Its size is fixed at creation

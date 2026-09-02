@@ -38,10 +38,9 @@ use libui::element::{
     with_spacing,
 };
 use libui::widget::{
-    GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState, TitleButtons,
-    WINDOW_FRAME_H,
-    WidgetState, button, dialog_frame, resize_grip, text_area, text_field, title_bar,
-    window_frame,
+    GRIP_W, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
+    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, tab_strip,
+    text_area, text_field, title_bar, window_frame,
 };
 
 /// The status strip's height in pixels — one row of chrome under the title bar.
@@ -67,6 +66,17 @@ pub const GRIP_KEY: u64 = 4;
 pub const STRIP_KEY: u64 = 5;
 /// The element key on the status text.
 pub const STATUS_KEY: u64 = 6;
+/// The element key on the tab strip.
+pub const TAB_STRIP_KEY: u64 = 7;
+
+/// Where buffer keys start, and therefore where the tabs' element keys do.
+///
+/// **Because a tab's key is an element key too.** `Router::hovered_key` walks up to the nearest
+/// keyed ancestor and reports *that* number, across the whole window's tree — so a tab keyed `2`
+/// and the save button keyed `2` are one number, and hovering the tab would draw the button
+/// hovered. Numbering buffers from a base well above the chrome's keys makes the two namespaces
+/// disjoint by construction rather than by remembering.
+pub const TAB_KEY_BASE: u64 = 1000;
 
 /// The element key on the confirmation dialog's title bar.
 ///
@@ -129,6 +139,11 @@ pub const UNDO_KEYCODE: u16 = 44;
 pub const REDO_KEYCODE: u16 = 21;
 /// The key that opens the find field: `f`.
 pub const FIND_KEYCODE: u16 = 33;
+/// The key that opens a tab: `t`.
+pub const NEW_TAB_KEYCODE: u16 = 20;
+/// The key that closes one: `w`. Closing the last tab closes the window, which is what the
+/// chord means everywhere else it exists.
+pub const CLOSE_TAB_KEYCODE: u16 = 17;
 
 /// Confirms the name being typed for an untitled buffer.
 const NAME_CONFIRM: u16 = libkern::abi::KEY_ENTER;
@@ -149,13 +164,25 @@ fn join(dir: &str, name: &str) -> String {
     s
 }
 
-/// Everything the editor is.
-pub struct App {
-    /// The absolute path being edited. Never changes: this editor opens one file.
+/// One open file: everything that belongs to a buffer rather than to the editor.
+///
+/// **Split out in M12 Part D**, when the window grew tabs. What stays on [`App`] is what a
+/// *window* has — its size, its focus, the outboxes, the strip's field, the question it may be
+/// asking — and what moves here is what a person would expect to survive switching tabs. Getting
+/// that line wrong is how a second tab inherits the first's undo history, which is the shape this
+/// split exists to make impossible rather than careful.
+pub struct Buffer {
+    /// Identity across frames and across the tab strip.
+    ///
+    /// **Not the index**: closing a tab renumbers every one after it, and a message naming an
+    /// index outlives the frame that produced it.
+    key: u64,
+    /// The absolute path being edited, or empty for a buffer that has never been named.
     path: String,
-    /// The last component of [`path`](Self::path), for the title bar.
+    /// The last component of [`path`](Self::path), for the tab and the title bar.
     name: String,
-    /// The buffer, and the whole of the editing model — `libui` owns those rules.
+    /// The text, and the whole of the editing model — `libui` owns those rules, including the
+    /// undo history, which is per buffer because it is part of the text.
     text: TextAreaState,
     /// The buffer's revision when it was last read or written.
     ///
@@ -174,9 +201,21 @@ pub struct App {
     /// The consequence was an editor that could open a file, be told nothing had changed, and
     /// rewrite it two bytes shorter per line on the first `Ctrl+S` (PR #259 review, finding 3).
     ///
-    /// So it is folded into [`modified`](Self::modified): what the title bar marks is "this is
-    /// not what is on disk", which is true from the first frame here.
+    /// So it is folded into [`App::modified`]: what the title bar marks is "this is not what is
+    /// on disk", which is true from the first frame here.
     differs: bool,
+}
+
+/// Everything the editor is.
+pub struct App {
+    /// The open buffers, in the order their tabs are drawn. **Never empty**: the last one closing
+    /// closes the window, so every method below can assume there is a current buffer.
+    buffers: Vec<Buffer>,
+    /// Which buffer's tab is current, by [`Buffer::key`].
+    current: u64,
+    /// The next key to hand out. Monotonic, so a key is never reused and a stale message can
+    /// never name a buffer that has taken its place.
+    next_key: u64,
     /// What the status strip says.
     status: String,
     /// The window's size in pixels — what the client commits.
@@ -195,8 +234,7 @@ pub struct App {
     resize_requested: Option<u32>,
     /// The editor has been asked to close, and the binary owes an exit.
     closing: bool,
-    /// Somebody asked this window to close over an unsaved buffer, and the person has not
-    /// answered yet.
+    /// What is being closed over an unsaved buffer, and the person has not answered yet.
     ///
     /// **`true` is a second window**, not an overlay. `Surface::CloseRequested` says outright
     /// that "a client that wants to ask 'save first?' opens a dialog and closes when that
@@ -204,7 +242,7 @@ pub struct App {
     /// every close by exiting and the buffer went with it. The binary reads this each frame and
     /// opens or destroys a `Role::Dialog` window to match — the same shape `nxterm` uses for its
     /// menu, and the reason [`libui::window::Child`] exists.
-    confirming: bool,
+    confirming: Option<Closing>,
     /// Whether the *dialog* holds the keyboard, which its own title bar shows.
     ///
     /// **Not [`focused`](Self::focused)**, which is the main window's: a dialog taking focus
@@ -243,6 +281,19 @@ pub struct App {
     /// is theirs, the same rule that keeps the buffer's receipt a count and the compositor's
     /// chord log to the modifier alone.
     find_report: Option<Option<usize>>,
+}
+
+/// What a confirmation is about.
+///
+/// **Resolved when the question is asked**, which is M12 Part B's lesson applied one part later:
+/// a tab's key is captured here rather than re-read when the answer arrives, so a question about
+/// one tab cannot end up closing another that has since become current.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Closing {
+    /// The whole window, and every buffer in it.
+    Window,
+    /// One tab, by its key.
+    Tab(u64),
 }
 
 /// What the status strip's field is collecting.
@@ -298,21 +349,44 @@ pub enum Msg {
     KeepEditing,
     /// The dialog's title bar was dragged.
     DragConfirm,
+    /// A tab was pressed — make it current.
+    SelectTab(u64),
+    /// A tab's close box was pressed, or `Ctrl+W`.
+    CloseTab(u64),
+    /// `Ctrl+T`: an untitled buffer in a tab of its own.
+    NewTab,
+}
+
+impl Buffer {
+    /// A buffer for `path`, empty until something is loaded into it.
+    fn new(key: u64, path: &str) -> Buffer {
+        Buffer {
+            key,
+            path: String::from(path),
+            name: libfs::basename_str(path).to_string(),
+            text: TextAreaState::new(),
+            saved_at: 0,
+            blocked: None,
+            differs: false,
+        }
+    }
+
+    /// Whether what is on screen differs from what is on disk.
+    fn modified(&self) -> bool {
+        self.differs || self.text.revision() != self.saved_at
+    }
 }
 
 impl App {
     /// An editor for `path`, with an empty buffer until something is loaded into it.
     pub fn new(path: &str, home: &str) -> App {
         App {
-            path: String::from(path),
-            name: libfs::basename_str(path).to_string(),
+            buffers: alloc::vec![Buffer::new(TAB_KEY_BASE, path)],
+            current: TAB_KEY_BASE,
+            next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
             find_report: None,
-            text: TextAreaState::new(),
-            saved_at: 0,
-            blocked: None,
-            differs: false,
             status: if path.is_empty() {
                 String::from("untitled — save to name it")
             } else {
@@ -326,10 +400,85 @@ impl App {
             move_requested: false,
             resize_requested: None,
             closing: false,
-            confirming: false,
+            confirming: None,
             confirm_focused: true,
             confirm_move_requested: false,
         }
+    }
+
+    /// Remove the tab keyed `k`, and close the window if it was the last one.
+    ///
+    /// **The last tab closing closes the window**, which is what keeps `buffers` non-empty — the
+    /// invariant every accessor here relies on. The alternative, an editor showing no buffer at
+    /// all, is a window with nothing in it and no way to get one back.
+    fn drop_tab(&mut self, k: u64) {
+        if self.buffers.len() <= 1 {
+            self.closing = true;
+            return;
+        }
+        let Some(i) = self.buffers.iter().position(|b| b.key == k) else { return };
+        self.buffers.remove(i);
+        if self.current == k {
+            // The tab to its left, or the first — whichever survives. A person closing a tab is
+            // looking at where it was, so the neighbour is the least surprising place to land.
+            self.current = self.buffers[i.saturating_sub(1).min(self.buffers.len() - 1)].key;
+        }
+    }
+
+    /// The buffer whose tab is current.
+    ///
+    /// **Never `None`**, and that is an invariant rather than a hope: `buffers` starts with one
+    /// and the close path turns "the last tab" into "the window", so there is always a current
+    /// buffer. Panicking here would be a `no_std` client dying in front of somebody, so it falls
+    /// back to the first — a wrong buffer is recoverable and a dead editor is not.
+    fn buf(&self) -> &Buffer {
+        self.buffers
+            .iter()
+            .find(|b| b.key == self.current)
+            .unwrap_or(&self.buffers[0])
+    }
+
+    /// The current buffer, mutably. See [`buf`](Self::buf) for why this cannot be `None`.
+    fn buf_mut(&mut self) -> &mut Buffer {
+        let key = self.current;
+        let i = self.buffers.iter().position(|b| b.key == key).unwrap_or(0);
+        &mut self.buffers[i]
+    }
+
+    /// Open `path` in a **new tab** and make it current, returning its key.
+    ///
+    /// The caller reads the file into it afterwards, the way `main` already does for the first.
+    pub fn open_tab(&mut self, path: &str) -> u64 {
+        let key = self.next_key;
+        self.next_key += 1;
+        self.buffers.push(Buffer::new(key, path));
+        self.current = key;
+        key
+    }
+
+    /// The tabs, for the strip that draws them.
+    pub fn tabs(&self) -> Vec<(u64, String, bool)> {
+        self.buffers
+            .iter()
+            .map(|b| {
+                let name = if b.name.is_empty() {
+                    String::from("untitled")
+                } else {
+                    b.name.clone()
+                };
+                (b.key, name, b.modified())
+            })
+            .collect()
+    }
+
+    /// Which tab is current.
+    pub fn current_tab(&self) -> u64 {
+        self.current
+    }
+
+    /// How many buffers are open — what tells the last close from the others.
+    pub fn tab_count(&self) -> usize {
+        self.buffers.len()
     }
 
     /// The file held `raw`, which decoded to `text`.
@@ -340,12 +489,14 @@ impl App {
     /// of habit. Comparing what *would be written* against what was read is the only honest
     /// answer, and it is one comparison at open rather than a rule about encodings.
     pub fn loaded(&mut self, text: &str, raw: &[u8]) {
-        self.text = TextAreaState::with_text(text);
-        self.saved_at = self.text.revision();
-        self.blocked = None;
-        self.differs = to_bytes(&self.text.text()) != raw;
+        let b = self.buf_mut();
+        b.text = TextAreaState::with_text(text);
+        b.saved_at = b.text.revision();
+        b.blocked = None;
+        b.differs = to_bytes(&b.text.text()) != raw;
+        let differs = b.differs;
         self.status = describe(raw.len(), "opened");
-        if self.differs {
+        if differs {
             self.status.push_str(" · line endings normalised, so saving rewrites it");
         }
     }
@@ -356,10 +507,11 @@ impl App {
     /// stays empty and writable and the strip says which of the two happened — a person who
     /// meant to open an existing file wants to know they did not.
     pub fn absent(&mut self) {
-        self.text = TextAreaState::new();
-        self.saved_at = self.text.revision();
-        self.blocked = None;
-        self.differs = false;
+        let b = self.buf_mut();
+        b.text = TextAreaState::new();
+        b.saved_at = b.text.revision();
+        b.blocked = None;
+        b.differs = false;
         self.status = String::from("new file");
     }
 
@@ -370,21 +522,22 @@ impl App {
     /// blocked buffer stays blocked for the run: what would clear it is a successful read, and
     /// this editor reads once.
     pub fn blocked(&mut self, why: &str) {
-        self.text = TextAreaState::new();
-        self.saved_at = self.text.revision();
-        self.blocked = Some(String::from(why));
-        self.differs = false;
+        let b = self.buf_mut();
+        b.text = TextAreaState::new();
+        b.saved_at = b.text.revision();
+        b.blocked = Some(String::from(why));
+        b.differs = false;
         self.status = String::from(why);
     }
 
     /// The path being edited.
     pub fn path(&self) -> &str {
-        &self.path
+        &self.buf().path
     }
 
     /// The buffer, for a binary that is about to write it.
     pub fn text(&self) -> String {
-        self.text.text()
+        self.buf().text.text()
     }
 
     /// How many times the buffer has been edited — the receipt a keystroke reached it.
@@ -395,7 +548,7 @@ impl App {
     /// an editor is theirs, and the same rule that keeps the compositor's chord log to the
     /// modifier alone applies here.
     pub fn revision(&self) -> u64 {
-        self.text.revision()
+        self.buf().text.revision()
     }
 
     /// Whether what is on screen differs from what is on disk.
@@ -403,7 +556,7 @@ impl App {
     /// Two ways for that to be true: something was typed, or the file did not survive being read
     /// unchanged — see [`differs`](Self::differs).
     pub fn modified(&self) -> bool {
-        self.differs || self.text.revision() != self.saved_at
+        self.buf().modified()
     }
 
     /// What the status strip is saying.
@@ -413,7 +566,7 @@ impl App {
 
     /// Whether this buffer refuses to be written, and why.
     pub fn refusal(&self) -> Option<&str> {
-        self.blocked.as_deref()
+        self.buf().blocked.as_deref()
     }
 
     /// The save the binary owes, as the bytes to write. Clears the record.
@@ -425,11 +578,11 @@ impl App {
         if !core::mem::take(&mut self.save_requested) {
             return None;
         }
-        if let Some(why) = &self.blocked {
+        if let Some(why) = self.buf().blocked.clone() {
             self.status = alloc::format!("not saved — {why}");
             return None;
         }
-        Some(self.text.text())
+        Some(self.buf().text.text())
     }
 
     /// Take `path` as the file to edit, if this buffer can be given up.
@@ -440,21 +593,19 @@ impl App {
     /// application exists to not have. The status strip says so, because a drop that visibly
     /// does nothing is indistinguishable from one that was not delivered.
     ///
-    /// **And dropping the file already open is a no-op**, not a reload: it is the likeliest
-    /// accident with a browser beside an editor, and re-reading would be a way to lose an
-    /// unsaved buffer that this rule has just protected.
+    /// **And dropping the file already open switches to it** rather than opening it twice: two
+    /// tabs on one file are two buffers that can disagree about what is in it, and the last one
+    /// saved wins silently.
     pub fn accept_drop(&mut self, path: &str) -> bool {
-        if path == self.path {
+        if let Some(b) = self.buffers.iter().find(|b| b.path == path) {
+            self.current = b.key;
             self.status = alloc::format!("{} is already open", libfs::basename_str(path));
             return false;
         }
-        if self.modified() {
-            self.status =
-                alloc::format!("not opening {} — save first", libfs::basename_str(path));
-            return false;
-        }
-        self.path = String::from(path);
-        self.name = libfs::basename_str(path).to_string();
+        // **A new tab, since M12 Part D.** It used to replace the buffer, and had to refuse when
+        // that buffer was modified — a drop that visibly did nothing, for a reason the person had
+        // to read the strip to discover. With tabs there is nothing to lose by taking it.
+        self.open_tab(path);
         true
     }
 
@@ -466,13 +617,14 @@ impl App {
     pub fn saved(&mut self, result: Result<usize, &str>) {
         match result {
             Ok(n) => {
-                self.saved_at = self.text.revision();
+                let b = self.buf_mut();
+                b.saved_at = b.text.revision();
                 // The file is now what the buffer holds, whatever it held before.
-                self.differs = false;
+                b.differs = false;
                 // **A save closes the undo group.** What a person wants back after saving is
                 // what they have typed since it — not everything since the file was opened,
                 // which is what one long group would give them.
-                self.text.end_group();
+                b.text.end_group();
                 self.status = describe(n, "saved");
             }
             Err(why) => self.status = alloc::format!("NOT saved — {why}"),
@@ -487,7 +639,7 @@ impl App {
             // binary's, as always; what changes here is that there may be nowhere to write to
             // yet, and inventing a path would be a file somebody did not choose.
             Msg::Save => {
-                if self.path.is_empty() {
+                if self.buf().path.is_empty() {
                     // **Any field but a naming one is replaced**, not treated as "already
                     // asking" (PR #269 review, worth fixing 2). `field.is_none()` was right
                     // when naming was the only mode; once find joined it, clicking *save* with
@@ -512,21 +664,43 @@ impl App {
             // close" — turns a *second* `CloseRequested` into an exit, and a shell that asks
             // twice is exactly what a person clicking a taskbar entry twice produces. So the
             // only route out of a modified buffer is the answer the person gave.
+            // **Any modified buffer stops it**, not just the current one: closing the window
+            // takes every tab with it, so a question about only what is on screen would let the
+            // others go silently.
             Msg::Close => {
-                if self.modified() {
-                    self.confirming = true;
+                if self.buffers.iter().any(Buffer::modified) {
+                    self.confirming = Some(Closing::Window);
                 } else {
                     self.closing = true;
                 }
             }
-            Msg::Discard => {
-                self.confirming = false;
-                self.closing = true;
+            Msg::SelectTab(k) => {
+                if self.buffers.iter().any(|b| b.key == k) {
+                    self.current = k;
+                }
             }
+            // **A new tab is an untitled buffer**, the same thing the applications menu launches
+            // the editor into — so `Ctrl+T` and a launch with no argument reach one state.
+            Msg::NewTab => {
+                self.open_tab("");
+                self.status = String::from("untitled — save to name it");
+            }
+            Msg::CloseTab(k) => {
+                let modified = self.buffers.iter().any(|b| b.key == k && b.modified());
+                if modified {
+                    self.confirming = Some(Closing::Tab(k));
+                } else {
+                    self.drop_tab(k);
+                }
+            }
+            Msg::Discard => match self.confirming.take() {
+                Some(Closing::Window) | None => self.closing = true,
+                Some(Closing::Tab(k)) => self.drop_tab(k),
+            },
             // **The status strip says so**, because a dialog that vanishes with nothing changed
             // is indistinguishable from one that took the other answer.
             Msg::KeepEditing => {
-                self.confirming = false;
+                self.confirming = None;
                 self.status = String::from("still editing — nothing was discarded");
             }
             Msg::RequestState(s) => {
@@ -552,7 +726,15 @@ impl App {
         // **While a name is being typed the keys are the field's**, buffer and chords included.
         // A `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
         // already being answered.
-        if let Some((which, field)) = self.field.as_mut() {
+        // **While a field is open the keys are the field's**, buffer and chords included. A
+        // `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
+        // already being answered.
+        //
+        // **What was typed is read out before anything else is touched.** The field lives in
+        // `self`, and both answers below reach for another part of `self` — the buffer, to name
+        // it or to search it. Holding the field's borrow across that is the shape the split into
+        // `Buffer` turned from "works" into "will not compile", which is the better failure.
+        if let Some((which, _)) = self.field.as_ref() {
             let which = *which;
             match k.keycode {
                 NAME_CANCEL => {
@@ -565,37 +747,48 @@ impl App {
                         self.status = String::from("not saved");
                     }
                 }
-                NAME_CONFIRM => match which {
-                    Field::Naming => {
-                        let name = field.text().trim().to_string();
-                        if name.is_empty() {
-                            // Nothing typed is not a name, and an empty one would save to the
-                            // directory itself. Left open rather than cancelled: the person is
-                            // mid-answer.
-                            self.status = String::from("a name, then Enter");
-                            return;
+                NAME_CONFIRM => {
+                    // **Owned**, so the field's borrow ends here rather than spanning the
+                    // buffer work below. `TextFieldState::text` hands back a `&str` into the
+                    // field, which is exactly the borrow that must not be alive.
+                    let typed: String =
+                        self.field.as_ref().map(|(_, f)| String::from(f.text())).unwrap_or_default();
+                    match which {
+                        Field::Naming => {
+                            let name = typed.trim().to_string();
+                            if name.is_empty() {
+                                // Nothing typed is not a name, and an empty one would save to
+                                // the directory itself. Left open rather than cancelled: the
+                                // person is mid-answer.
+                                self.status = String::from("a name, then Enter");
+                                return;
+                            }
+                            let path = join(&self.home, &name);
+                            let b = self.buf_mut();
+                            b.path = path;
+                            b.name = name;
+                            self.field = None;
+                            self.save_requested = true;
                         }
-                        self.path = join(&self.home, &name);
-                        self.name = name;
-                        self.field = None;
-                        self.save_requested = true;
+                        // **The field stays open**, which is the whole of what makes Enter walk
+                        // through the matches: a find that closed on its first hit would need
+                        // re-typing to see the second. `Esc` is what ends it.
+                        Field::Finding => {
+                            let hit = self.buf_mut().text.find(&typed);
+                            let line = self.buf().text.cursor().0;
+                            self.status = if hit {
+                                alloc::format!("found {typed}")
+                            } else {
+                                alloc::format!("no {typed}")
+                            };
+                            self.find_report = Some(hit.then_some(line));
+                        }
                     }
-                    // **The field stays open**, which is the whole of what makes Enter walk
-                    // through the matches: a find that closed on its first hit would need
-                    // re-typing to see the second. `Esc` is what ends it.
-                    Field::Finding => {
-                        let needle = field.text();
-                        let hit = self.text.find(&needle);
-                        self.status = if hit {
-                            alloc::format!("found {needle}")
-                        } else {
-                            alloc::format!("no {needle}")
-                        };
-                        self.find_report = Some(hit.then(|| self.text.cursor().0));
-                    }
-                },
+                }
                 code => {
-                    field.apply(code, k.modifiers);
+                    if let Some((_, f)) = self.field.as_mut() {
+                        f.apply(code, k.modifiers);
+                    }
                 }
             }
             return;
@@ -607,14 +800,16 @@ impl App {
                 // same control answering twice.
                 SAVE_KEYCODE => self.update(Msg::Save),
                 UNDO_KEYCODE => {
-                    self.status = String::from(if self.text.undo() {
+                    let ok = self.buf_mut().text.undo();
+                    self.status = String::from(if ok {
                         "undone"
                     } else {
                         "nothing to undo"
                     });
                 }
                 REDO_KEYCODE => {
-                    self.status = String::from(if self.text.redo() {
+                    let ok = self.buf_mut().text.redo();
+                    self.status = String::from(if ok {
                         "redone"
                     } else {
                         "nothing to redo"
@@ -629,6 +824,11 @@ impl App {
                 // shape (PR #269 review, worth fixing 1). The field therefore always starts
                 // empty; carrying the last needle across an `Esc` would be a feature, and is
                 // not one anybody has asked for.
+                NEW_TAB_KEYCODE => self.update(Msg::NewTab),
+                CLOSE_TAB_KEYCODE => {
+                    let k = self.current;
+                    self.update(Msg::CloseTab(k));
+                }
                 FIND_KEYCODE => {
                     self.field = Some((Field::Finding, TextFieldState::new()));
                     self.status = String::from("find, then Enter");
@@ -640,7 +840,7 @@ impl App {
             }
             return;
         }
-        self.text.apply(k.keycode, k.modifiers);
+        self.buf_mut().text.apply(k.keycode, k.modifiers);
     }
 
     /// The state a `RequestState` is owed for. Clears the record.
@@ -665,7 +865,7 @@ impl App {
 
     /// Whether a confirmation is being asked — the binary opens a dialog window to match.
     pub fn confirming(&self) -> bool {
-        self.confirming
+        self.confirming.is_some()
     }
 
     /// How many characters have been typed into the strip's field, or `None` when none is open.
@@ -708,7 +908,7 @@ impl App {
     /// abandoned and the strip says why — a person can save and close, which is the thing they
     /// were being asked about.
     pub fn confirm_failed(&mut self) {
-        self.confirming = false;
+        self.confirming = None;
         self.status = String::from("could not ask about the unsaved buffer — save, then close");
     }
 
@@ -744,7 +944,9 @@ impl App {
     /// The height the text area is laid out at — the window less its chrome and the grip.
     pub fn area_h(&self) -> u32 {
         // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`.
-        self.window.h.saturating_sub(TITLE_BAR_H + STATUS_H + GRIP_W + WINDOW_FRAME_H)
+        self.window
+            .h
+            .saturating_sub(TITLE_BAR_H + TAB_STRIP_H + STATUS_H + GRIP_W + WINDOW_FRAME_H)
     }
 
     /// What the title bar shows: the file's name, marked when the buffer differs from the disk.
@@ -754,7 +956,7 @@ impl App {
     /// *title* (what the taskbar shows) is set once and stays the name alone: retitling on every
     /// keystroke is a message per keystroke to say something the window itself already shows.
     pub fn title(&self) -> String {
-        if self.name.is_empty() {
+        if self.buf().name.is_empty() {
             // **Named for what it is, not left blank.** A window whose title bar says nothing
             // reads as a window that failed to load something.
             return if self.modified() {
@@ -764,9 +966,9 @@ impl App {
             };
         }
         if self.modified() {
-            alloc::format!("* {}", self.name)
+            alloc::format!("* {}", self.buf().name)
         } else {
-            self.name.clone()
+            self.buf().name.clone()
         }
     }
 
@@ -826,18 +1028,47 @@ impl App {
             },
         ]);
 
+        // **The tab strip, drawn whatever the count.** A strip that appeared with the second
+        // tab would move everything below it the moment a file was dropped in — the window's
+        // content jumping under the pointer that dropped it. One tab is a strip with one tab.
+        let tabs: Vec<(u64, String, bool)> = self.tabs();
+        let items: Vec<libui::widget::Tab<'_>> = tabs
+            .iter()
+            .map(|(k, name, marked)| libui::widget::Tab {
+                key: *k,
+                label: name.as_str(),
+                marked: *marked,
+            })
+            .collect();
+        let strip_tabs = tab_strip(
+            &items,
+            self.current,
+            hovered,
+            Msg::SelectTab,
+            Msg::CloseTab,
+            &ui,
+        );
+
         let h = self.area_h();
         // **The text area takes drops; the chrome does not.** That distinction is the whole of
         // what decision 3 buys — the compositor knows only that this window declared an
         // acceptor, and *where* on the window a drop means something is decided here, by which
         // element is under the point. Dropping a file on the title bar does nothing, which is
         // the honest answer: the title bar is not where a document goes.
-        let area = text_area(&mut self.text, h, ROW_H, self.focused, &ui).on_drop(Msg::Dropped);
+        let focused = self.focused;
+        let area =
+            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ui).on_drop(Msg::Dropped);
 
         let body = window_frame(
             title,
             dock(
-                alloc::vec![docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY))],
+                alloc::vec![
+                    docked(
+                        Edge::Top,
+                        sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),
+                    ),
+                    docked(Edge::Top, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
+                ],
             // Sized to the height it was built for, like every scrolling widget in this tree:
             // the dock's flex child otherwise gets whatever is left, and the widget would build
             // rows for one height and be drawn at another.
@@ -885,7 +1116,16 @@ impl App {
         )
         .key(CONFIRM_TITLE_KEY);
 
-        let name = if self.name.is_empty() { "untitled" } else { self.name.as_str() };
+        // **The buffer the question is about, which is not always the current one**: closing a
+        // *tab* asks about that tab even if the person switched away while the dialog was up.
+        // The key was captured when the question was asked — M12 Part B's lesson, one part on.
+        let subject = match self.confirming {
+            Some(Closing::Tab(k)) => self.buffers.iter().find(|b| b.key == k),
+            _ => Some(self.buf()),
+        };
+        let name = subject
+            .map(|b| if b.name.is_empty() { "untitled" } else { b.name.as_str() })
+            .unwrap_or("untitled");
         let question = padding(
             Insets::all(libui::widget::DIALOG_PAD),
             column(alloc::vec![
@@ -1041,25 +1281,41 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_is_refused_while_there_is_work_to_lose() {
-        // **The same rule the save path follows, from the other side.** Opening a dropped file
-        // replaces what is on screen, and an editor that discarded unsaved work because
-        // something was dragged onto it is the failure this application exists not to have.
+    fn a_drop_opens_a_tab_and_never_costs_the_one_that_is_open() {
+        // **The rule this replaces, and why it went** (M12 Part D). A drop used to *replace* the
+        // buffer, so it had to be refused while there was unsaved work — a drop that visibly did
+        // nothing, for a reason the person had to read the strip to find. With tabs there is
+        // nothing to lose by taking it, so the refusal is gone and the protection is stronger:
+        // the modified buffer is not touched at all.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         assert!(a.modified(), "precondition: there is something to lose");
+        let before = a.text();
 
-        assert!(!a.accept_drop("/home/other.txt"));
-        assert_eq!(a.path(), "/home/notes.txt", "still editing what it was");
-        assert!(a.status().contains("save first"), "status was {:?}", a.status());
+        assert!(a.accept_drop("/home/other.txt"), "taken, not refused");
+        assert_eq!(a.path(), "/home/other.txt", "and it is what is on screen now");
+        assert_eq!(a.tab_count(), 2);
 
-        // Saved, and the same drop is taken.
-        a.update(Msg::Save);
-        let owed = a.take_save().unwrap();
-        a.saved(Ok(owed.len()));
-        assert!(a.accept_drop("/home/other.txt"));
-        assert_eq!(a.path(), "/home/other.txt");
-        assert_eq!(a.title(), "other.txt", "and the title follows the file");
+        // The first buffer is still there, still modified, still exactly as it was.
+        a.update(Msg::SelectTab(TAB_KEY_BASE));
+        assert_eq!(a.path(), "/home/notes.txt");
+        assert_eq!(a.text(), before);
+        assert!(a.modified());
+    }
+
+    #[test]
+    fn dropping_a_file_that_is_already_open_switches_to_its_tab() {
+        // Two tabs on one file are two buffers that can disagree about what is in it, and the
+        // last one saved wins silently.
+        let mut a = app();
+        a.accept_drop("/home/other.txt");
+        assert_eq!(a.tab_count(), 2);
+        a.update(Msg::SelectTab(TAB_KEY_BASE));
+
+        assert!(!a.accept_drop("/home/other.txt"), "not a second tab");
+        assert_eq!(a.tab_count(), 2);
+        assert_eq!(a.path(), "/home/other.txt", "but it is what is on screen");
+        assert!(a.status().contains("already open"), "status was {:?}", a.status());
     }
 
     #[test]
@@ -1093,7 +1349,7 @@ mod tests {
         for c in [49u16, 24, 20, 18, 31] {
             key(&mut a, c, 0);
         }
-        assert_eq!(a.text.text(), "", "typing a name went into the buffer");
+        assert_eq!(a.text(), "", "typing a name went into the buffer");
 
         key(&mut a, libkern::abi::KEY_ENTER, 0);
         assert_eq!(a.path(), "/home/alice/notes", "named into the wrong directory");
@@ -1314,6 +1570,111 @@ mod tests {
     }
 
     #[test]
+    fn tabs_hold_their_own_buffer_cursor_and_history() {
+        // **The whole point of the split into `Buffer`.** What a person expects to survive
+        // switching tabs is everything about the file — its text, whether it is modified, and
+        // what undo would take back. Getting the line wrong is how a second tab inherits the
+        // first's history, and it is a mistake that reads as correct until somebody presses
+        // `Ctrl+Z` in the wrong tab.
+        let mut a = app(); // /home/notes.txt holding "hello"
+        key(&mut a, KEY_X, 0);
+        key(&mut a, KEY_X, 0);
+        let first = a.text();
+
+        a.update(Msg::NewTab);
+        assert_eq!(a.tab_count(), 2);
+        assert_eq!(a.text(), "", "a new tab is an untitled empty buffer");
+        assert_eq!(a.path(), "");
+
+        // Undo in the new tab has nothing to take: the history did not come with it.
+        key(&mut a, UNDO_KEYCODE, MOD_CTRL);
+        assert!(a.status().contains("nothing to undo"), "status was {:?}", a.status());
+
+        // And the first tab still has both its text and its history.
+        a.update(Msg::SelectTab(TAB_KEY_BASE));
+        assert_eq!(a.text(), first);
+        key(&mut a, UNDO_KEYCODE, MOD_CTRL);
+        assert_eq!(a.text(), "hello", "its own group, in its own tab");
+    }
+
+    #[test]
+    fn the_strip_marks_the_tabs_that_are_unsaved() {
+        let mut a = app();
+        a.update(Msg::NewTab);
+        a.update(Msg::SelectTab(TAB_KEY_BASE));
+        key(&mut a, KEY_X, 0);
+        let tabs = a.tabs();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!((tabs[0].1.as_str(), tabs[0].2), ("notes.txt", true));
+        assert_eq!((tabs[1].1.as_str(), tabs[1].2), ("untitled", false));
+    }
+
+    #[test]
+    fn closing_a_modified_tab_asks_and_only_the_answer_removes_it() {
+        let mut a = app();
+        a.update(Msg::NewTab);
+        a.update(Msg::SelectTab(TAB_KEY_BASE));
+        key(&mut a, KEY_X, 0);
+
+        a.update(Msg::CloseTab(TAB_KEY_BASE));
+        assert!(a.confirming(), "a modified tab asks");
+        assert_eq!(a.tab_count(), 2, "and nothing has gone");
+        assert!(!a.closing(), "and the window is not closing");
+
+        a.update(Msg::KeepEditing);
+        assert_eq!(a.tab_count(), 2);
+
+        a.update(Msg::CloseTab(TAB_KEY_BASE));
+        a.update(Msg::Discard);
+        assert_eq!(a.tab_count(), 1, "the tab, not the window");
+        assert!(!a.closing());
+        assert_eq!(a.path(), "", "and the untitled one is what is left");
+    }
+
+    #[test]
+    fn a_question_about_one_tab_survives_switching_to_another() {
+        // **M12 Part B's lesson, one part on.** The key is captured when the question is asked,
+        // so switching tabs while the dialog is up cannot make the answer close a different one
+        // — and the dialog goes on naming the tab it asked about.
+        let mut a = app();
+        key(&mut a, KEY_X, 0); // notes.txt is modified
+        a.update(Msg::NewTab);
+        a.update(Msg::SelectTab(TAB_KEY_BASE));
+        a.update(Msg::CloseTab(TAB_KEY_BASE));
+        assert!(a.confirming());
+
+        a.update(Msg::SelectTab(TAB_KEY_BASE + 1)); // the person switches while it is asking
+        assert_eq!(a.path(), "");
+        a.update(Msg::Discard);
+        assert_eq!(a.tab_count(), 1);
+        assert_eq!(a.path(), "", "the untitled tab is what survived — tab 0 was the subject");
+    }
+
+    #[test]
+    fn closing_the_last_tab_closes_the_window() {
+        // Which is what keeps `buffers` non-empty — the invariant every accessor relies on. An
+        // editor showing no buffer at all is a window with nothing in it and no way back.
+        let mut a = app();
+        assert_eq!(a.tab_count(), 1);
+        a.update(Msg::CloseTab(TAB_KEY_BASE));
+        assert!(a.closing(), "the last tab takes the window with it");
+    }
+
+    #[test]
+    fn closing_the_window_asks_about_any_modified_tab_not_just_the_current_one() {
+        // Closing takes every tab, so a question about only what is on screen would let the
+        // others go silently.
+        let mut a = app();
+        key(&mut a, KEY_X, 0); // tab 0 modified
+        a.update(Msg::NewTab); // tab 1 clean, and current
+        assert!(!a.modified(), "the current buffer has nothing to lose");
+
+        a.update(Msg::Close);
+        assert!(a.confirming(), "but another tab does");
+        assert!(!a.closing());
+    }
+
+    #[test]
     fn save_while_finding_asks_for_a_name_rather_than_doing_nothing() {
         // **The save button stays in the strip and stays clickable while a search is open**, and
         // "already asking" was written when naming was the only field there could be. With find
@@ -1351,6 +1712,41 @@ mod tests {
         assert!(after_find.contains("found"));
         key(&mut a, libkern::abi::KEY_ESC, 0);
         assert_eq!(a.status(), after_find, "escaping a search erases nothing");
+    }
+
+    #[test]
+    fn typing_after_a_find_replaces_what_was_found() {
+        // **Find leaves its match selected, and typing replaces a selection.** Both halves are
+        // right on their own, and together they are hand-made find-and-replace — which is worth
+        // a test because it is also a surprise: `check-login` typed a character two steps after a
+        // search and edited the middle of the file rather than appending to it, and the seven
+        // bytes that reached disk were the first anybody knew (M12 Part D).
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("nitroxab", b"nitroxab\n");
+        key(&mut a, FIND_KEYCODE, MOD_CTRL);
+        // `t`, `r`, `o`
+        for code in [20u16, 19, 24] {
+            key(&mut a, code, 0);
+        }
+        key(&mut a, libkern::abi::KEY_ENTER, 0);
+        key(&mut a, libkern::abi::KEY_ESC, 0);
+
+        key(&mut a, KEY_X, 0);
+        assert_eq!(a.text(), "nixxab", "the match was replaced, not appended to");
+
+        // And a movement first is what appends — which is the shape a person uses to get out of
+        // a search, and what the gate does now.
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("nitroxab", b"nitroxab\n");
+        key(&mut a, FIND_KEYCODE, MOD_CTRL);
+        for code in [20u16, 19, 24] {
+            key(&mut a, code, 0);
+        }
+        key(&mut a, libkern::abi::KEY_ENTER, 0);
+        key(&mut a, libkern::abi::KEY_ESC, 0);
+        key(&mut a, libkern::abi::KEY_END, 0);
+        key(&mut a, KEY_X, 0);
+        assert_eq!(a.text(), "nitroxabx");
     }
 
     #[test]

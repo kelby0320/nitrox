@@ -1455,6 +1455,14 @@ Nothing is missing meanwhile — moving a file into a folder is a drag, which is
 reach for first — and the maintainer asked the question that produced this entry rather than
 assuming an answer (2026-09-02).
 
+**Tabs run off the end of a window — `TODO(tab-overflow)`.** `libui`'s `tab_strip` gives every
+tab a fixed `TAB_W`, so enough of them are simply not drawn. Sharing the strip out between them
+was the alternative and is worse: every tab moves whenever another opens, so the one a person is
+reaching for slides away as they reach, and a gate's aim point depends on how many happen to be
+open. What overflow needs is a strip that scrolls, which is the same clipping-and-virtualisation
+question §8 defers for containers generally. **Trigger: somebody opens more than a window's width
+of tabs** — five at the default size.
+
 **Undo keeps whole copies rather than deltas — `TODO(undo-deltas)`.** `TextAreaState`'s history
 is `MAX_UNDO` snapshots of the whole buffer, which is the depth bound and the memory bound at
 once. A delta stack costs the size of the *change* instead, and costs a separate inverse for every

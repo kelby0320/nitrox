@@ -2244,6 +2244,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
 
         let mut modal_dirty = false;
+        // The hover the *next* frame will be drawn with. Applied after the drain, so that every
+        // event in one batch is routed against the tree currently on screen.
+        let mut next_hover = modal_hover;
         while let Some((w, event)) = session.next_event() {
             // A press on the applications button opens the modal. **A press, not a key**: a
             // `panel` takes no keyboard focus, so a key never reaches this process — see
@@ -2275,19 +2278,21 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     // invisible to the gate that would want it. What proves this wiring is the
                     // click below it: hover and clicking ride the same router, so a router that
                     // hit-tests wrongly fails the launch.
-                    // **Resampled only between gestures** (M12 Part B). A capture is a *tree
-                    // id* of the deepest node under the cursor, and a hovered row draws more
-                    // layers than a quiet one — so repainting with a *different* hover between a
-                    // press and its release gives that node a new id, `path_to_id` finds nothing
-                    // and the click is silently lost. It presents as a launcher row that can be
-                    // clicked and does nothing, once in every few runs, which is what this gate
-                    // failed on three times before the cause was found in `libui`.
+                    // **What a gesture sees is what the tree was built with** (M12 Part D). A
+                    // capture is a *tree id* of the deepest node under the cursor, and a hovered
+                    // row draws more layers than a quiet one — so repainting with a *different*
+                    // hover between a press and its release gives that node a new id,
+                    // `path_to_id` finds nothing, and the click is silently lost. It presents as
+                    // a launcher row that can be clicked and does nothing.
+                    //
+                    // **Not resampled while a button is held, and not mid-batch either.** M12
+                    // Part B froze it from the press onwards, which is too late: the motion that
+                    // brings the pointer onto a row is usually in the *same* drain as the press,
+                    // so the hover advanced before any frame was drawn and the next one stranded
+                    // the capture. Held until after the drain, every event in a batch routes
+                    // against the tree that is actually on screen.
                     if !modal_router.grabbed() {
-                        let now = modal_router.hovered_key(&modal_tree);
-                        if now != modal_hover {
-                            modal_hover = now;
-                            modal_dirty = true;
-                        }
+                        next_hover = modal_router.hovered_key(&modal_tree);
                     }
                     for msg in msgs {
                         // The drag converts through the widget's own arithmetic, which is what
@@ -2832,6 +2837,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
 
+        // The hover the drain settled on, applied now that no more events will be routed
+        // against the tree it would change.
+        if next_hover != modal_hover {
+            modal_hover = next_hover;
+            modal_dirty = true;
+        }
         // Redraw the modal when the query changed, so the filter is visible. A filter you
         // cannot see is not a filter.
         if modal_dirty {

@@ -3020,7 +3020,16 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // click would work and the window would not move, but the gate would be asserting against a
     // gesture it did not mean to make. The path text carries no handler and still raises the
     // window, because click-to-focus is the compositor's and not the toolkit's.
-    click_at(&mut qmp, &mut session, fx + 120, fy + 26 + 12)?;
+    // **On the path strip**, which is now three strips down: a title bar, the menus, and the
+    // tabs. `fy + 38` used to be the path and is the *menu bar* since M12 Parts B and D — it
+    // still raised the window, because click-to-focus is the compositor's and the bar's own
+    // background carries no handler, so this went on passing while meaning something else.
+    click_at(
+        &mut qmp,
+        &mut session,
+        fx + 120,
+        fy + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H / 2,
+    )?;
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
     press(&mut qmp, "ret")?;
@@ -3036,7 +3045,8 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
     // missed the change would press one row high and drag the wrong file.
     const MENU_BAR_H: i32 = 24;
-    let row1 = (fx + 120, fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + ROW_H + ROW_H / 2);
+    let row1 =
+        (fx + 120, fy + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
@@ -3080,6 +3090,64 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxedit: drop of other.txt on the document")?;
     session.expect("nxedit: opened /home/papers/other.txt - 0 bytes")?;
     println!("  ok: a file dragged from the browser opened in the editor");
+
+    // 9c. **Two buffers in one window, switched, and the right one saved** (M12 Part D). The drop
+    //     above opened a *tab* rather than replacing the buffer — which is what removed the old
+    //     refusal, since there is nothing to lose by taking a file when it arrives beside the one
+    //     already open. So the editor is now showing `other.txt` with `notes.txt` a tab away.
+    session.expect("nxedit: tab ")?;
+    let showing = session.rest_of_line()?;
+    if !showing.contains("other.txt") {
+        return Err(format!("the drop should have made other.txt current; the editor says {showing:?}").into());
+    }
+
+    // **The tabs are where the fixed width says they are**, which is what a fixed width buys: a
+    // tab does not move when another opens. `libui::widget::TAB_W` and `TAB_STRIP_H` are the
+    // source, pinned to a real tree by `a_tab_selects_where_it_is_and_its_close_box_does_not_
+    // select_it` — this gate cannot link the crate, so it hardcodes them as it does every other
+    // chrome metric.
+    const TAB_W: i32 = 120;
+    // **A tab strip in both applications** (M12 Part D): above the editor's text and below the
+    // browser's menus, which moved every one of the browser's rows down again.
+    // `nxfiles::list_top` is that application's own version of the same sum.
+    const TAB_STRIP_H: i32 = 24;
+    // The editor is the work area's right half after the snap above.
+    let ed = (work.0 + (work.2 / 2) as i32, work.1);
+    // Tab `i`'s label area: 4 is `WINDOW_CONTENT_X`, `TAB_W` per tab, and 40 into the label —
+    // clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
+    let tab = |i: i32| (ed.0 + 4 + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + TAB_STRIP_H / 2);
+    let tab0 = tab(0);
+    click_at(&mut qmp, &mut session, tab0.0, tab0.1)?;
+    session.expect("nxedit: tab ")?;
+    let switched = session.rest_of_line()?;
+    if !switched.contains("notes.txt") {
+        return Err(format!("clicking the first tab should show notes.txt; got {switched:?}").into());
+    }
+    println!("  ok: the editor holds two buffers, and a tab click switched between them");
+
+    // **`End` first, and that is not tidying.** Step 8b's search left its match *selected* —
+    // which is what a find is supposed to do — and typing replaces a selection, so a bare
+    // keystroke here would have edited the middle of the file rather than appending to it. It
+    // did, on the first run: `tro` became `c` and the save wrote seven bytes. The behaviour is
+    // right and the gate's assumption was not.
+    press(&mut qmp, "end")?;
+    // **And the save goes to the tab that is current, not the one opened last.** That is the
+    // whole risk of tabs in an editor, and the assertion is made from outside: the serial shell
+    // reads the file back.
+    press(&mut qmp, "c")?;
+    session.expect("nxedit: buffer rev ")?;
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: saved /home/papers/notes.txt - 10 bytes")?;
+    session.send("open ./papers/notes.txt")?;
+    session.expect(&format!("{TYPED}abc"))?;
+    session.expect("/home>")?;
+    // The other tab's file is untouched: a save that went to the wrong buffer would have
+    // written nine bytes here instead of leaving it empty.
+    session.send("list ./papers")?;
+    session.expect("/home>")?;
+    println!("  ok: and the save reached the current tab's file, read back by the shell");
 
     // 9b. **The browser renames a file, and the shell reads the new name back** (M12 Part B).
     //     The same two-session fact steps 7 and 8 use, a third time: the graphical side does

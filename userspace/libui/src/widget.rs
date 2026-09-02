@@ -243,6 +243,101 @@ pub fn dialog_frame<Msg>(
     )
 }
 
+/// How tall a tab strip is.
+///
+/// **A fixed metric, like every other piece of chrome here** (M11's decision 2): the gates aim at
+/// tabs, and one whose height followed the theme's text size would move under a gate that had to
+/// read a theme file to know where to click.
+pub const TAB_STRIP_H: u32 = 24;
+
+/// How wide one tab is.
+///
+/// **Fixed rather than shared out**, which is the decision worth stating. Tabs that divided the
+/// strip between them would move every one of them whenever another opened — so the tab a person
+/// is reaching for slides away as they reach, and a gate's aim point depends on how many tabs
+/// happen to be open. Fixed width means a tab is where it was, and the cost is that enough of
+/// them run off the end: `TODO(tab-overflow)` names the scrolling that would fix it, and the
+/// trigger is somebody opening more than a window's width of them.
+pub const TAB_W: u32 = 120;
+
+/// How wide the close box at a tab's right end is.
+pub const TAB_CLOSE_W: u32 = 20;
+
+/// The centre of a tab's close box, measured from that tab's left edge.
+///
+/// Published for the same reason [`DIALOG_LEFT_CX`] is: `check-login` presses it and cannot link
+/// this crate.
+pub const TAB_CLOSE_CX: i32 = (TAB_W - TAB_CLOSE_W / 2) as i32;
+
+/// One tab: what it is called, whether it is marked, and what identifies it across frames.
+pub struct Tab<'a> {
+    /// Identity across frames — see [`ListRow::key`], whose reasoning is the same one.
+    ///
+    /// **Not the index**, because closing a tab renumbers every one after it and the diff would
+    /// pair each surviving tab's widget with its neighbour's element.
+    pub key: u64,
+    /// What it is called.
+    pub label: &'a str,
+    /// Shown with a leading mark — an editor's unsaved buffer.
+    pub marked: bool,
+}
+
+/// A row of tabs, one of them current.
+///
+/// **`select` and `close` both take the key**, not the index, for the reason the key exists: the
+/// message outlives the frame that produced it, and by the time an application acts on it the
+/// tab it names may have moved.
+///
+/// A press on the close box does *not* select the tab, because a nearer `on_press` shadows the
+/// one on the tab — the same rule that lets a title bar carry buttons without dragging the
+/// window. That rule is the toolkit's rather than this widget's.
+pub fn tab_strip<Msg: Clone>(
+    tabs: &[Tab<'_>],
+    current: u64,
+    hovered: Option<u64>,
+    select: impl Fn(u64) -> Msg,
+    close: impl Fn(u64) -> Msg,
+    theme: &Theme,
+) -> Element<Msg> {
+    let mut row_items = alloc::vec::Vec::with_capacity(tabs.len());
+    for t in tabs {
+        let face = if t.key == current {
+            theme.background
+        } else if hovered == Some(t.key) {
+            theme.face_hover
+        } else {
+            theme.face
+        };
+        let mut label = String::new();
+        if t.marked {
+            label.push_str("* ");
+        }
+        label.push_str(t.label);
+        // **The current tab is the window's own ground**, so it reads as continuous with what is
+        // below it and the others as a strip above. That is what makes a row of boxes look like
+        // tabs rather than like buttons.
+        let inner = row(alloc::vec![
+            padding(Insets { top: 4, right: 2, bottom: 4, left: 8 }, text(label)).flex(1),
+            sized(
+                Size::new(TAB_CLOSE_W, TAB_STRIP_H),
+                stack(alloc::vec![icon(IconKind::Close)]).on_press(close(t.key)),
+            ),
+        ]);
+        row_items.push(
+            sized(
+                Size::new(TAB_W, TAB_STRIP_H),
+                stack(alloc::vec![fill(face), inner]).on_press(select(t.key)),
+            )
+            .key(t.key),
+        );
+    }
+    // A border under the strip, so an unselected tab has an edge where the current one does not.
+    sized(
+        Size::new(0, TAB_STRIP_H),
+        stack(alloc::vec![fill(theme.border), row(row_items)]),
+    )
+}
+
 /// One row of a dropdown menu: a label that highlights under the pointer.
 ///
 /// **The same treatment a selected list row gets** — the selection colour bevelled inside a
@@ -3549,6 +3644,90 @@ two");
 
     fn font() -> libdraw::text::Font {
         libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
+    }
+
+    /// Every `Text` node in a tree, joined — enough to say what a widget shows without pinning
+    /// where in its tree it sits.
+    fn all_text<M>(e: &Element<M>) -> String {
+        fn walk<M>(e: &Element<M>, out: &mut String) {
+            if let crate::element::Node::Text(t) = &e.node {
+                out.push_str(t);
+            }
+            for c in e.children() {
+                walk(c, out);
+            }
+        }
+        let mut out = String::new();
+        walk(e, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_tab_selects_where_it_is_and_its_close_box_does_not_select_it() {
+        // **The two published metrics, and the shadowing rule between them.** `check-login`
+        // presses a tab at `TAB_W * i + something` and its close box at `TAB_CLOSE_CX`, and it
+        // cannot link this crate — so the numbers are asserted here against a tree that is
+        // actually built, the way the dialog's aim points are.
+        assert_eq!((TAB_W, TAB_STRIP_H, TAB_CLOSE_W), (120, 24, 20));
+        assert_eq!(TAB_CLOSE_CX, 110);
+
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let theme = Theme::default();
+        let tabs = [
+            Tab { key: 7, label: "one", marked: false },
+            Tab { key: 9, label: "two", marked: true },
+        ];
+        let ui: Element<M> = tab_strip(&tabs, 7, None, M::Select, M::Close, &theme);
+
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let l = crate::layout::layout(&ui, Rect::new(0, 0, 400, TAB_STRIP_H), &cell);
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&ui, &l).expect("a tab strip is diffable");
+        let mut router = crate::route::Router::new();
+        let click = |r: &mut crate::route::Router, x: i32| {
+            let at = |flags: u16, buttons: u16| PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons,
+                flags,
+                x,
+                y: (TAB_STRIP_H / 2) as i32,
+                ..Default::default()
+            };
+            r.pointer(&tree, &ui, &l, at(librsproto::surface::POINTER_PRESSED, 1));
+            r.pointer(&tree, &ui, &l, at(0, 0)).0
+        };
+
+        // The second tab's label area selects it, by **key** and not by position.
+        assert_eq!(click(&mut router, TAB_W as i32 + 20), alloc::vec![M::Select(9)]);
+        // Its close box closes it and does *not* also select it: a nearer `on_press` shadows the
+        // one on the tab, which is the same rule that lets a title bar carry buttons.
+        assert_eq!(click(&mut router, TAB_W as i32 + TAB_CLOSE_CX), alloc::vec![M::Close(9)]);
+        // And the first tab is still where it was, which is what a fixed width buys.
+        assert_eq!(click(&mut router, 20), alloc::vec![M::Select(7)]);
+    }
+
+    #[test]
+    fn a_marked_tab_says_so_in_its_label() {
+        // The editor's unsaved mark, which is the only thing distinguishing two tabs on the same
+        // file name — and the reason `Tab` carries a flag rather than the caller pre-marking the
+        // string: two applications would otherwise spell the mark two ways.
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Select(u64),
+            Close(u64),
+        }
+        let theme = Theme::default();
+        let quiet = [Tab { key: 1, label: "notes", marked: false }];
+        let dirty = [Tab { key: 1, label: "notes", marked: true }];
+        let a: Element<M> = tab_strip(&quiet, 1, None, M::Select, M::Close, &theme);
+        let b: Element<M> = tab_strip(&dirty, 1, None, M::Select, M::Close, &theme);
+        assert_eq!(all_text(&a), "notes");
+        assert_eq!(all_text(&b), "* notes");
     }
 
     #[test]

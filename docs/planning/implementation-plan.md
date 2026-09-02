@@ -156,7 +156,9 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     because a pair that holds something between two gestures is a clipboard; **Part C landed
     2026-09-02**: undo and redo grouped by word, line, deletion run, movement and save — the
     grouping being the decision rather than the stack — plus find, sharing the very field the
-    save-as prompt uses),
+    save-as prompt uses; **Part D landed 2026-09-02**: a `tab_strip` widget both applications
+    wanted at once, and the line each had to draw between what a window holds and what a buffer
+    or a pane does),
     **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
     because "anything running may read what you last copied" is ambient authority — and
     **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather

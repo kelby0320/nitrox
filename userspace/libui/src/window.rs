@@ -89,14 +89,22 @@ pub struct Child {
     scratch: MemFramebuffer,
     /// The shared buffers, and the mappings that are unmapped when this value drops.
     pool: BufferPool,
-    /// The hover the retained tree was last built with.
-    ///
-    /// **Frozen while a button is held**, which is not a nicety: a capture names a *tree id*, the
-    /// widgets here change shape under the pointer, and rebuilding the tree with a new hover
-    /// between a press and its release gives the captured node a different id. `path_to_id` then
-    /// finds nothing and the click is lost — intermittently, because it depends on whether a
-    /// frame happened to be presented in between (M12 Part B).
+    /// The live hover: what the pointer is actually over.
     hover: Option<u64>,
+    /// The hover the retained tree was **last built with**.
+    ///
+    /// **This is the one a gesture must see**, and the distinction is the whole of a bug that
+    /// took two goes to fix. A capture names a *tree id*; the widgets here change shape under the
+    /// pointer; so rebuilding the tree with a different hover between a press and its release
+    /// gives the captured node a new id, `path_to_id` finds nothing, and the click is lost.
+    ///
+    /// M12 Part B froze the hover *from the press onwards*, which is too late: the motion that
+    /// brought the pointer onto the widget is usually in the **same batch** as the press, so the
+    /// live hover has already advanced while the tree still reflects the old one. The press is
+    /// routed against the old tree — correctly — and then the next frame rebuilds with the new
+    /// hover and strands the capture. It failed about one run in seven, and a probe in the guest
+    /// is what finally said so rather than any amount of reading (M12 Part D).
+    shown: Option<u64>,
 }
 
 impl Child {
@@ -164,7 +172,16 @@ impl Child {
             }
             return None;
         };
-        Some(Self { id, size, tree: Tree::new(), router: Router::new(), scratch, pool, hover: None })
+        Some(Self {
+            id,
+            size,
+            tree: Tree::new(),
+            router: Router::new(),
+            scratch,
+            pool,
+            hover: None,
+            shown: None,
+        })
     }
 
     /// The compositor's id for this window — what an event names.
@@ -183,12 +200,13 @@ impl Child {
     /// application's own numbering; comparing one to the other compiles and gives a stable wrong
     /// answer (M11 Part E batch 3).
     ///
-    /// **It does not move while a button is held** — see [`hover`](Self::hover). A caller builds
-    /// its view from this and hands the result to both [`present`](Self::present) and
-    /// [`route`](Self::route), so freezing it here is what keeps the tree those two share the
-    /// same shape for the whole of a gesture.
+    /// **While a gesture is in progress this is what the retained tree was built with**, not
+    /// what the pointer is over — see [`shown`](Self::shown). A caller builds its view from this
+    /// and hands the result to both [`present`](Self::present) and [`route`](Self::route), so
+    /// answering with the tree's own hover is what keeps all three the same shape for the whole
+    /// of a gesture.
     pub fn hovered_key(&self) -> Option<u64> {
-        self.hover
+        if self.router.grabbed() { self.shown } else { self.hover }
     }
 
     /// Paint `content` and put it on screen **if anything changed**. `false` if this frame could
@@ -218,6 +236,10 @@ impl Child {
         font: &Font,
         theme: &Theme,
     ) -> bool {
+        // **What this frame is being drawn with**, recorded before it is drawn: the caller built
+        // `content` from `hovered_key` a moment ago, so this is the hover the retained tree is
+        // about to hold. Under a grab it is already `shown` and this is a no-op.
+        self.shown = self.hovered_key();
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
         let l = layout(content, bounds, &FontMetrics::new(font, theme.font_px));
         let damage = match self.tree.update(content, &l) {
@@ -272,12 +294,9 @@ impl Child {
                 let bounds = Rect::new(0, 0, self.size.w, self.size.h);
                 let l = layout(content, bounds, &FontMetrics::new(font, theme.font_px));
                 let out = self.router.pointer(&self.tree, content, &l, *p).0;
-                // **Sampled here, and only between gestures.** The press that opens a capture
-                // must not be followed by a frame drawn with a different hover, or the id that
-                // capture recorded stops naming anything.
-                if !self.router.grabbed() {
-                    self.hover = self.router.hovered_key(&self.tree);
-                }
+                // Tracked always; what a *gesture* sees is gated in `hovered_key`, because by
+                // the time a press arrives this has usually already moved.
+                self.hover = self.router.hovered_key(&self.tree);
                 out
             }
             WindowEvent::Focus(f) => {
@@ -368,6 +387,73 @@ mod tests {
         assert!(down.is_empty(), "a press is not a click");
         let up = step(at(POINTER_BUTTON, 0, 0, row1_y), &mut hover, &mut tree, &mut router);
         assert_eq!(up, alloc::vec![2u32], "the release on the pressed row is the click");
+    }
+
+    #[test]
+    fn a_click_survives_a_motion_and_a_press_arriving_together() {
+        // **The case the first fix missed, and the one that actually happens.** A pointer walked
+        // onto a row and pressed produces the motion and the press in one batch, with no frame
+        // between them — so the live hover advances while the retained tree still holds the old
+        // one. Freezing from the press onwards is too late: the *next* frame rebuilds with the
+        // new hover and strands the capture taken against the old tree.
+        //
+        // This is `Child`'s rule reproduced at the level it lives at: what a gesture sees is what
+        // the tree was built with. Drive it with the *presented* hover throughout and the click
+        // survives; drive it with the live one and it does not — which is the control below.
+        let cell = FixedCell { w: 8, h: 16 };
+        let bounds = Rect::new(0, 0, 120, 60);
+        let mut tree = Tree::new();
+        let mut router = Router::new();
+        let mut live: Option<u64> = None;
+        let mut shown: Option<u64> = None;
+
+        let at = |kind: u16, flags: u16, buttons: u16, y: i32| PointerEvent {
+            kind,
+            button: 0x110,
+            buttons,
+            flags,
+            x: 20,
+            y,
+            ..Default::default()
+        };
+        // What `Child::hovered_key` answers: the tree's hover while a gesture is running.
+        let seen = |router: &Router, live: Option<u64>, shown: Option<u64>| {
+            if router.grabbed() { shown } else { live }
+        };
+
+        // Frame one, drawn with nothing hovered.
+        let ui = menu(seen(&router, live, shown));
+        let l = crate::layout::layout(&ui, bounds, &cell);
+        tree.update(&ui, &l).expect("diffable");
+        shown = seen(&router, live, shown);
+
+        // **One batch: the crossing, the motion and the press, with no frame between them.**
+        let row1_y = 30;
+        for ev in [
+            at(librsproto::surface::POINTER_ENTER, 0, 0, row1_y),
+            at(POINTER_MOTION, 0, 0, row1_y),
+            at(POINTER_BUTTON, POINTER_PRESSED, 1, row1_y),
+        ] {
+            let ui = menu(seen(&router, live, shown));
+            let l = crate::layout::layout(&ui, bounds, &cell);
+            router.pointer(&tree, &ui, &l, ev);
+            live = router.hovered_key(&tree);
+        }
+        assert_eq!(live, Some(2), "the pointer is over the second row");
+        assert!(router.grabbed(), "and holding it");
+        assert_eq!(seen(&router, live, shown), None, "but the gesture sees what the tree holds");
+
+        // A frame happens now — the one that used to strand the capture.
+        let ui = menu(seen(&router, live, shown));
+        let l = crate::layout::layout(&ui, bounds, &cell);
+        tree.update(&ui, &l).expect("diffable");
+        shown = seen(&router, live, shown);
+
+        // And the release still finds the widget it captured.
+        let ui = menu(seen(&router, live, shown));
+        let l = crate::layout::layout(&ui, bounds, &cell);
+        let out = router.pointer(&tree, &ui, &l, at(POINTER_BUTTON, 0, 0, row1_y)).0;
+        assert_eq!(out, alloc::vec![2u32], "the click survived the frame in the middle");
     }
 
     #[test]
