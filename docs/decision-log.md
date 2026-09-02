@@ -21475,3 +21475,87 @@ degrades from a background flash to tearing. Cost is ~4 MB for 1280×800 and one
 damaged pixels per frame; it may also be *faster*, since the per-pixel work moves off MMIO into
 cached RAM, but that is a measurement to take rather than a claim to make. Recorded here so the
 feel milestone starts from evidence rather than from a symptom.
+
+## 2026-09-01 — M12 and M13 scoped, and two decisions taken before either starts
+
+M11 closed by emptying its polish list into things that were not polish, so the next two
+milestones were scoped the same day, with a details pass on the two questions that would otherwise
+be answered while coding.
+
+### The shape
+
+**M12 — applications, deepened**: application depth (tabs, undo/redo, find, file operations, and
+the confirmation dialogs that make it the first real consumer of `Role::Dialog`), **copy and
+paste**, and **images**. **M13 — the compositor's feel**: the shadow buffer, then alpha, then the
+shadows and translucency that wait on it.
+
+**They are two milestones rather than one because they are different kinds of work.** Application
+depth is driven by using applications; compositor work is driven by measurement. A milestone
+holding both cannot say when it is done — and the feel work would queue behind editor tabs, when
+it is the thing noticed every time the machine is touched.
+
+**And the order inside M13 is load-bearing.** The shadow buffer makes alpha *cheap*: once
+compositing goes through RAM, blending is a small change to a loop that already exists, where
+doing alpha first means writing the blend against the scanned-out aperture and then rewriting it.
+Shadows come last because a shadow enlarges every window's damage region — without the shadow
+buffer it would enlarge exactly the flash it sits on top of.
+
+### The control panel becomes a trigger
+
+It was M11 Part F, "allowed to slip", and slipped. Rather than move it into M12 and possibly move
+it again, its condition is written down: **when the settings outgrow a hand-edited file.** The
+maintainer's judgement after a milestone of living with the theme file: *"the file is fine. A
+control panel will be needed when we have a lot more settings and the file becomes cumbersome."*
+
+A part deferred twice is a part nobody has needed, and a trigger says so where a schedule pretends
+otherwise. `form` is treated the same way — it is now *eligible* by its own stated condition and
+is left filed rather than scheduled.
+
+### Decision 1 — the clipboard is a resource server, and a binding is the authority
+
+M5 deferred the clipboard with a specific argument: there was none anywhere, and inventing one for
+a terminal would decide its design by accident. That condition expired — there are now three
+consumers that shape it honestly: the editor (whose `text_area` has selection), the browser
+(paths), and the terminal (which has *no* selection yet, so grid selection is part of the work).
+
+**Its own process, endpoint bound per session.** A clipboard is shared mutable state between
+mutually untrusting programs, and "anything running may read what you last copied" is ambient
+authority — how a password manager's clipboard gets scraped on real systems. This system already
+answers that with a binding, and rights are attenuable, so a profile can hold a write-only
+clipboard or none. That is a capability story Wayland does not have.
+
+**It stores, and that is why it was chosen over offers.** The alternative was Wayland's model —
+the copier keeps the data, the compositor brokers a transfer on paste, nothing is stored and no
+third party holds your text. Rejected for one reason: the clipboard dies with the application you
+copied from, which is what Linux users install clipboard managers to escape.
+
+**The binding is the authority.** A read succeeds for anyone holding the endpoint, whenever they
+like — consistent with every other resource here. **Trigger for focus-gated reads: an application
+inside a session that the person does not trust**, which is the day profiles stop being a
+build-time idea.
+
+### Decision 2 — PNG in the guest, taken against the recommendation
+
+The question upstream of the format was whether a wallpaper is a **shipped asset** or **a file a
+person drops in their home directory**. Shipped assets would have let the decode happen on the
+host at build time: QOI at ~300 lines and ~400 KB–1 MB, or raw P6 at ~40 lines and 3 MB. Both were
+costed, both are cheaper, and both were recommended.
+
+**The maintainer chose user files**, and the reasoning is a judgement about what the system is for
+rather than about cost: a wallpaper a person cannot supply is not really a wallpaper. So the guest
+decodes what people actually have — inflate (RFC 1951), unfiltering, and a refusal for interlaced.
+Roughly 400–600 lines, and the largest single piece of code M12 contains.
+
+**Whether to hand-roll inflate or take a crate is deliberately not settled here.** The precedent
+cuts both ways on the same page of `userspace/CLAUDE.md` — `ab_glyph` was taken deliberately and
+`libcrypto` was hand-rolled — and inflate is reusable beyond images (a package format, compressed
+logs). That argues for owning it, but not loudly enough to settle before somebody has tried
+building the alternatives for `x86_64-unknown-nitrox`, which is what that page requires anyway.
+
+**What follows from "the user's file" rather than from PNG**: the wallpaper is read by
+`desktop-shell`, which holds `/home` and a theme where the compositor holds neither, and shown as a
+full-screen background window it owns; the theme file gains a bounded path key, like `font_ui`; and
+an image that does not load falls back to the ground colour and says so, which is the stance every
+other unreadable value in that file already gets. **Icons stay filed** — PNG makes an icon set
+possible, and an icon set is a naming convention, a size convention and a lookup path, which is a
+second decision.

@@ -3519,6 +3519,134 @@ filesystem to draw wallpaper).
 polish wants something finished to polish, and these are the two applications that will most show
 it.
 
+### Scope, settled 2026-09-01
+
+M11's close is what forced this: the polish list emptied into things that were not polish, and
+they needed somewhere to go that was not "M12, eventually".
+
+- **Part A — application depth.** Tabs in each, undo/redo and find in the editor, file operations
+  in the browser (rename, delete, copy, new folder). Its confirmation dialogs make this the first
+  real consumer of `Role::Dialog` — worth naming, because that role's placement semantics changed
+  in M11 Part E batch 8 and nothing exercises them.
+- **Part B — copy and paste.** The largest part, and the one that needed a decision before it
+  could be scoped. See below.
+- **Part C — images.** The decoder, the asset path, and the wallpaper as a shell-owned background
+  window. See below.
+- **Drag-and-drop *within* a window** — filed with the application depth it belongs to.
+
+**What moved out.** The compositor work is [Milestone 13](#milestone-13--the-compositors-feel):
+different work, driven by measurement rather than by use, and a milestone holding both cannot say
+when it is done. **The control panel is trigger-gated rather than scheduled** — see below.
+
+### The control panel is a trigger now, not a part
+
+It was M11 Part F, "allowed to slip", and it slipped. Rather than move it a second time, its
+condition is written down: **when the settings outgrow a hand-edited file.**
+
+That is the maintainer's own judgement, on 2026-09-01, after living with the theme file for a
+milestone: *"the file is fine. A control panel will be needed when we have a lot more settings and
+the file becomes cumbersome."* A part that is deferred twice is a part nobody has needed yet, and
+a trigger says that honestly where a schedule pretends otherwise. Its scope is unchanged and its
+gate is unchanged; what it loses is a slot it was not going to fill.
+
+`form` (see [What this unblocks](#what-this-unblocks)) is now *eligible* by its own stated
+condition — "after the toolkit and the first applications" — and is deliberately left filed
+rather than scheduled, for the same reason.
+
+### Decision 1 — the clipboard is a resource server, and a binding is the authority
+
+Settled with the maintainer 2026-09-01, so Part B can be built rather than re-argued.
+
+**Its own process, with its endpoint bound per session.** A clipboard is shared mutable state
+between mutually untrusting programs, and "anything running may read what you last copied" is
+ambient authority — the mechanism by which a password manager's clipboard gets scraped on real
+systems. This system already has the answer: **you can read the clipboard if it is in your
+namespace**, and rights are attenuable, so a profile can be given a write-only clipboard or none
+at all. No new machinery, and a capability story Wayland does not have.
+
+**It stores, which is the point of choosing it over offers.** The alternative considered was
+Wayland's model — the copier keeps the data and the compositor brokers a transfer on paste, so
+nothing is stored and no third party ever holds your text. It was rejected for one reason: the
+clipboard dies with the application you copied from, which is the behaviour Linux users install
+clipboard managers to escape. Copy from the editor, close it, paste.
+
+**The binding is the authority, and focus-gating is deferred.** A read succeeds for anyone holding
+the endpoint, whenever they like — consistent with every other resource here. Focus-gated reads
+are what modern desktops do and would close background scraping *within* a session, at the cost of
+a dependency between the clipboard server and the compositor and a read that fails for reasons its
+caller cannot see. **Trigger: an application inside a session that the person does not trust** —
+which is the day profiles stop being a build-time idea.
+
+**Text first.** `text/plain` is the honest start; the type tag exists so a later image or a typed
+stream is a second kind rather than a second clipboard.
+
+**And the terminal needs selection before it can copy at all** — `libterm`'s grid has none, which
+M5 deferred alongside the clipboard itself. That is part of this work, not a prerequisite for it.
+
+### Decision 2 — PNG, decoded in the guest, because a wallpaper is the user's
+
+Settled with the maintainer 2026-09-01, **against the recommendation**, and the reasoning is worth
+keeping because it is a judgement about what the system is for rather than about cost.
+
+The question upstream of the format was: **is a wallpaper a shipped asset or a file a person drops
+in their home directory?** Shipped assets would have allowed the decode to happen on the host at
+build time, and the guest to read something trivial — QOI at ~300 lines, or raw P6 at ~40 and 3 MB
+of disk. Both were costed and both were cheaper.
+
+The answer is that a wallpaper a person cannot supply is not really a wallpaper. So the guest
+decodes what a person actually has, which is PNG: **inflate** (RFC 1951 — fixed and dynamic
+Huffman, a 32 KiB window), **unfiltering**, and a refusal for interlaced. Roughly 400–600 lines,
+and the largest single piece of code M12 contains.
+
+**Hand-rolled or a crate is not settled here.** The bar for a userspace dependency is in
+`userspace/CLAUDE.md` and the whole transitive tree must clear it; the precedent cuts both ways —
+`ab_glyph` was taken deliberately, and `libcrypto` was hand-rolled on the same page. Inflate is
+well specified and testable against published vectors, and it is **reusable**: a package format,
+compressed logs and anything else later want exactly this. That argues for owning it, but not
+loudly enough to settle it before somebody has tried building the alternatives for
+`x86_64-unknown-nitrox`.
+
+**Consequences that follow from "the user's file", not from PNG.** The wallpaper is read by
+`desktop-shell` — it holds `/home` and a theme, where the compositor holds neither and should not
+gain a filesystem to draw with — and shown as a full-screen background window it owns. The theme
+file gains a key naming the path, bounded like `font_ui` is and for the same reason. An image that
+does not load falls back to the ground colour and says so, which is the stance every other
+unreadable value in that file already gets.
+
+**Icons stay filed.** PNG makes an icon set *possible*; an icon set is a naming convention, a size
+convention and a lookup path, which is a second decision and not this one.
+
+## Milestone 13 — the compositor's feel
+
+Named 2026-09-01, when M11's polish pass produced two reports that were not about appearance and
+one diagnosis that explained both.
+
+**The work is ordered, and the order is the point.**
+
+- **Part A — the shadow buffer.** Compose into RAM and copy the finished damage rectangle to the
+  aperture in one pass. Today `libdraw::compose::compose` fills each damage rectangle with the
+  background and *then* blits the surfaces back, directly into the framebuffer being scanned out —
+  so every motion of a drag paints the union of the old and new rectangles background-first and
+  the scanout catches it. That is the flicker reported on 2026-09-01, and probably also
+  "moving a window is slow" from 2026-08-28. **A measurement comes first**: the claim that this is
+  also *faster* — the per-pixel work moving off MMIO into cached RAM — is plausible and unproven,
+  and a milestone that opens by proving it is worth more than one that assumes it.
+- **Part B — alpha.** `libdraw` says in as many words that there is no alpha channel and this is
+  not the beginning of one; changing that is a substrate decision, not a batch. **It comes after
+  Part A because Part A makes it cheap**: once compositing goes through RAM, blending is a small
+  change to a loop that already exists, where doing it first means writing the blend against the
+  scanned-out aperture and then rewriting it.
+- **Part C — what alpha unlocks**, both of which M11 deferred *onto* it: drop shadows around
+  windows and menus, and the translucent overview sidebar. Shadows in particular must not come
+  first — a shadow makes every window's damage region larger than the window, which without Part A
+  enlarges exactly the flash it sits on top of.
+
+**Its gate is not `check-display`.** That gate compares a settled screen against a render, and
+none of this changes a settled screen — it changes what happens *between* settled screens. What
+Part A needs is a measurement and, for the flicker specifically, a person looking at it; what
+Parts B and C need is `check-display`'s reference moving deliberately, which is the shape M11
+already used.
+
 ## What this unblocks
 
 Filed shell items waiting on this arm:

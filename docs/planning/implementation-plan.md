@@ -140,7 +140,19 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     taste — an applications menu whose rows could not be clicked, a scrollbar built with no
     pointer handler, an editor that exited when launched from the menu, a window that had no way
     to ask where it should appear. Polish is the first time a system is used the way a person
-    would use it, and that is what surfaces those. (Desktops and the applications milestone — M8, and what is now M10 — were
+    would use it, and that is what surfaces those.
+
+    **M12 and M13 were scoped 2026-09-01**, when M11's list emptied into things that were not
+    polish. **M12 — applications, deepened**: application depth (tabs, undo/redo, find, file
+    operations and the confirmation dialogs that make it the first consumer of `Role::Dialog`),
+    **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
+    because "anything running may read what you last copied" is ambient authority — and
+    **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather
+    than one the build ships. **M13 — the compositor's feel**: the shadow buffer first (with a
+    measurement in front of it), then alpha, then the drop shadows and translucency that both
+    wait on it. The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
+    without it would enlarge the flicker they sit on. **The control panel is trigger-gated**
+    rather than scheduled: when settings outgrow a hand-edited file. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
     Design in
