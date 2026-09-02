@@ -159,9 +159,16 @@ pub fn fit(image: Size, screen: Size) -> Fit {
 /// comes from. Both are testable without a framebuffer, and neither is worth discovering by
 /// booting.
 ///
+/// **Both geometries must name the same pixel format.** The ground is *encoded* into `dst`'s
+/// format and the picture is copied word for word, so a mismatch would put the two halves of one
+/// buffer in different formats — invisible in the arithmetic and unmistakable on a screen. The
+/// scaled path was safe by accident, because [`box_downscale`] refuses anything but XRGB8888 on
+/// both sides; the unscaled path had no check at all (PR #272 review, optional 5). Refused here
+/// rather than documented, because "every caller today is XRGB8888" is a property of today.
+///
 /// Downscales internally when the plan says so, allocating the intermediate. Returns `false` if
-/// a geometry is unusable or `dst` is shorter than its own geometry claims — the same refusal
-/// [`box_downscale`] makes, and for the same reason.
+/// a geometry is unusable, the formats differ, or `dst` is shorter than its own geometry claims
+/// — the same refusal [`box_downscale`] makes, and for the same reason.
 pub fn place(
     image: &[u8],
     image_geom: Geometry,
@@ -170,7 +177,7 @@ pub fn place(
     dst: &mut [u8],
     dst_geom: Geometry,
 ) -> bool {
-    if dst_geom.width == 0 || dst_geom.height == 0 {
+    if dst_geom.width == 0 || dst_geom.height == 0 || image_geom.format != dst_geom.format {
         return false;
     }
     if dst.len() < dst_geom.pitch * dst_geom.height as usize {
@@ -296,6 +303,20 @@ mod tests {
         assert_eq!(at(&dst, dg, 0, 1), Rgb::new(200, 100, 50), "the picture");
         assert_eq!(at(&dst, dg, 3, 2), Rgb::new(200, 100, 50));
         assert_eq!(at(&dst, dg, 0, 3), Rgb::new(0, 0, 0), "and below");
+    }
+
+    #[test]
+    fn place_refuses_two_geometries_in_different_formats() {
+        // The ground is encoded into `dst`'s format and the picture is copied word for word, so
+        // a mismatch puts the two halves of one buffer in different formats. The scaled path was
+        // safe only because `box_downscale` refuses anything but XRGB8888; the unscaled path —
+        // a picture already the right size, which is the ordinary case — had no check.
+        let (img, ig) = flat(2, 2, Rgb::new(1, 2, 3));
+        let dg = Geometry::with_pitch(2, 2, 8, PixelFormat::XBGR8888).unwrap();
+        let mut dst = alloc::vec![0u8; dg.pitch * 2];
+        let plan = fit(Size::new(2, 2), Size::new(2, 2));
+        assert!(!plan.scaled, "the unscaled path is the one with no other check");
+        assert!(!place(&img, ig, plan, Rgb::new(0, 0, 0), &mut dst, dg));
     }
 
     #[test]

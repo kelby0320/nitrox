@@ -1935,6 +1935,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect(&format!(
         "desktop-shell: wallpaper {WALLPAPER_W}x{WALLPAPER_H} drawn 1280x720 at 0,40 window "
     ))?;
+    // **Kept, because stickiness is asserted against this id** further down: a press on an empty
+    // desktop has to name *this* window, and `win=none` is what a wallpaper stamped with
+    // desktop 1 gives.
+    let wallpaper_line = session.rest_of_line()?;
+    let wallpaper_id: u32 = wallpaper_line
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("no window id in the wallpaper line: {wallpaper_line:?}"))?;
     println!("  ok: the guest decoded a {WALLPAPER_W}x{WALLPAPER_H} PNG and put it on screen");
     // **The narrow bind, which is what closed the `manage-ungated` deferral.** The shell builds
     // an application namespace and checks it *before* launching into it: `/dev/draw/new`
@@ -2488,6 +2497,40 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: overview open, window ")?;
     press(&mut qmp, "esc")?;
     session.expect("desktop-shell: overview closed")?;
+
+    // **And so is the wallpaper, which it was not** (M12 Part F; PR #272 review, blocking 1).
+    // It is created at startup like the bars, so the compositor stamped it with desktop 1 and
+    // every other desktop showed the bare ground colour — visible as flicker rather than as a
+    // missing feature, because switching back restored it.
+    //
+    // **Asserted on an empty desktop**, which is what makes the press unambiguous: `Super+3`
+    // has nothing on it, so every point that is not one of the two bars is the wallpaper or is
+    // nothing at all. A press in the middle names the wallpaper's window when it is sticky and
+    // gives `win=none` when it is not — the same discriminator the bars use above, and the same
+    // reason: the shell's own "is sticky" line says it *asked*, and the compositor's says it
+    // took.
+    chord(&mut qmp, false, "3")?;
+    session.expect("desktop-shell: switched to ")?;
+    // **Empty is asserted, not assumed** — the discriminator only works where nothing else is
+    // under the cursor, and which desktop holds what has moved several times by this point.
+    session.expect("(empty)")?;
+    // **`click_at` already consumed the press line**, up to the coordinates — so what is left
+    // to read is the `win=` it ends with, and an `expect` for the whole line would scan past
+    // its own evidence. (It did, on this step's first run.)
+    click_at(&mut qmp, &mut session, 640, 400)?;
+    let hit = session.rest_of_line()?;
+    if !hit.contains(&format!("win={wallpaper_id}")) {
+        return Err(format!(
+            "a press on an empty desktop reported '{}' — the wallpaper (window {wallpaper_id}) \
+             is not sticky, so every desktop but the first shows the bare ground colour",
+            hit.trim()
+        )
+        .into());
+    }
+    println!("  ok: the wallpaper is sticky — still there on an empty desktop");
+    // Back to the one the rest of this gate is written against.
+    chord(&mut qmp, false, "2")?;
+    session.expect("desktop-shell: switched to ")?;
 
     // 6f. **The overview's clicks, which were dead until 2026-08-26.** `desktop-shell.md` §6
     //     says "you can switch desktops from inside it"; a press on a sidebar row set no drag

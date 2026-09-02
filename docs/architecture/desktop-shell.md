@@ -134,12 +134,22 @@ GNOME 2 window list; GNOME 3's automatic workspace lifecycle is shelved rather t
 
 | Surface | Persistent? | Contents | Churn |
 |---|---|---|---|
+| **Wallpaper** | yes | the picture the theme names, fitted and centred | **none** — drawn once at startup |
 | **Top bar** | yes | workspaces button (left), applications button, clock (centre), tray (right, v2) | low |
 | **Bottom bar** | yes | window list, desktop indicator | **high** — every open, close, retitle, focus change |
 | **Applications modal** | no | search field, filtered entries | **highest** — the whole list is rebuilt per keystroke |
 | **Overview** | no | thumbnails of the current desktop, sidebar of the others | bursty |
 
-The churn column is not decoration: it is what settled the toolkit question in §5.
+The churn column is not decoration: it is what settled the toolkit question in §5 — and the
+wallpaper's zero is why it is the one surface here that builds no element tree at all: it is a
+picture blitted into a buffer, not a widget.
+
+**The wallpaper is a `Role::Panel` with `reserve: 0`** (M12 Part F), which is what makes it
+bottom-most, unfocusable and free of any claim on the work area without a new role: a panel
+cannot take focus, a zero reservation subtracts nothing, and the compositor's stack is
+creation-ordered so creating it first puts it under everything. Like the bars it is made
+**sticky**, because a picture behind everything belongs to the screen rather than to one desktop.
+It is absent when the theme names no file, which is the shipped default.
 
 ## 3. One process, several windows
 

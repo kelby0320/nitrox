@@ -34,7 +34,6 @@
 //! The alternative was ~500 lines of RFC 1951 we would own and could reuse for a package format
 //! later. It remains the thing to reach for if this dependency ever stops fitting.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::format::PixelFormat;
@@ -49,14 +48,35 @@ const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 // arithmetic in `decode` wrap on a file claiming a 4 GiB chunk.
 const _: () = assert!(usize::BITS >= 64, "PNG chunk arithmetic assumes a 64-bit usize");
 
+/// What a decode may allocate at its peak, in bytes.
+///
+/// **Chosen against the machine, which is the thing the cap has to be about.** The guest boots
+/// with 256 MiB; 32 is a comfortable twelfth of it, admits every wallpaper up to 2560x1600, and
+/// refuses 4K — which will be somebody's picture one day, and will then be a *refusal* rather
+/// than a dead session (see [`PngError::OutOfMemory`]).
+pub const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes held per pixel at the peak of a decode, which is what [`MAX_PIXELS`] divides.
+///
+/// Two buffers are alive at once, twice: `unfilter` holds the inflated stream and its own output
+/// together, then `to_xrgb` holds that output and the XRGB8888 result. RGBA is the worst case at
+/// four bytes a sample, so both moments are `4 + 4`. `decode` drops the inflated stream between
+/// them so the two peaks do not add.
+const PEAK_BYTES_PER_PIXEL: usize = 8;
+
 /// The largest image this will decode, in pixels.
 ///
 /// **A bound on `width * height`, not on either alone**, because what has to be allocated is
-/// their product: the unfiltered bytes, and then the XRGB8888 buffer. 64 megapixels is far past
-/// any screen this runs on and short of the arithmetic overflowing anything; a header claiming
-/// more is refused before a single allocation, which is the point — a four-byte field a person
-/// downloaded is not a size to trust.
-pub const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+/// their product — and **derived from [`MAX_DECODE_BYTES`] rather than picked**, which is what
+/// makes the refusal below mean what it says.
+///
+/// It was 64 megapixels, and that number refused nothing that mattered: an all-zero 8192x8192
+/// RGB PNG compresses to about 190 KiB, passes `libfs`'s 8 MiB read cap with three orders of
+/// magnitude to spare, passes a 64-megapixel test *exactly*, and then asks for well over half a
+/// gigabyte — on a 256 MiB machine, where `libheap` returns null, `handle_alloc_error` fires and
+/// `desktop-shell`'s panic handler exits the graphical session. A cap ten times the machine's
+/// memory is a cap that only refuses arithmetic overflow (PR #272 review, worth fixing 2).
+pub const MAX_PIXELS: u64 = (MAX_DECODE_BYTES / PEAK_BYTES_PER_PIXEL) as u64;
 
 /// Why a PNG did not decode.
 ///
@@ -79,6 +99,15 @@ pub enum PngError {
     Palette,
     /// `width * height` is zero or over [`MAX_PIXELS`].
     Size,
+    /// An allocation the decode needed could not be made.
+    ///
+    /// **A refusal rather than a panic**, which is the whole reason the buffers below are
+    /// reserved fallibly: `libheap` returns null on exhaustion, `handle_alloc_error` fires, and
+    /// the caller's panic handler ends the process — so an infallible `vec![0; n]` here makes a
+    /// too-large picture kill the graphical session instead of leaving it a ground colour and a
+    /// sentence. [`MAX_PIXELS`] catches the ordinary case; this catches the one where the
+    /// machine is already short.
+    OutOfMemory,
     /// The zlib stream did not inflate.
     Inflate,
     /// The inflated data is not the size the header implies — too short, or a filter byte names
@@ -98,6 +127,7 @@ impl PngError {
             PngError::Interlaced => "is interlaced, which this does not decode",
             PngError::Palette => "has a broken palette",
             PngError::Size => "is empty, or larger than this will decode",
+            PngError::OutOfMemory => "did not fit in memory",
             PngError::Inflate => "did not inflate",
             PngError::Filter => "has a filter this does not decode",
         }
@@ -196,10 +226,31 @@ pub fn decode(bytes: &[u8]) -> Result<Image, PngError> {
     }
 
     let h = header.ok_or(PngError::NotPng)?;
-    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat)
+    // **Bounded by what the header implies**, which is the honest limit and closes a hole a cap
+    // on the *image* cannot: a few hundred bytes of `IDAT` can inflate to gigabytes, and an
+    // unbounded `decompress_to_vec` would allocate all of it before anything here saw a byte.
+    // One filter byte plus a row of samples, per row, is exactly what `unfilter` reads.
+    let expect = h.height as usize * (1 + h.width as usize * h.bpp);
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&idat, expect)
         .map_err(|_| PngError::Inflate)?;
     let unfiltered = unfilter(&raw, &h)?;
+    // **Dropped before the XRGB buffer is asked for**, so the two moments where two buffers are
+    // alive do not add. That is what makes `PEAK_BYTES_PER_PIXEL` eight rather than twelve, and
+    // it is the difference between admitting a 2560x1600 picture and refusing it.
+    drop(raw);
     to_xrgb(&unfiltered, &h, &palette)
+}
+
+/// `n` zeroed bytes, or [`PngError::OutOfMemory`] — never a panic.
+///
+/// `vec![0; n]` aborts through `handle_alloc_error` when the allocator returns null, which in
+/// this system means the calling *process* exits. A wallpaper that does not fit has to be a
+/// sentence on the console, so every buffer sized from a file's header is reserved this way.
+fn zeroed(n: usize) -> Result<Vec<u8>, PngError> {
+    let mut v: Vec<u8> = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| PngError::OutOfMemory)?;
+    v.resize(n, 0);
+    Ok(v)
 }
 
 /// Parse `IHDR`, refusing what this decoder does not implement.
@@ -249,7 +300,7 @@ fn unfilter(raw: &[u8], h: &Header) -> Result<Vec<u8>, PngError> {
     if raw.len() < expect {
         return Err(PngError::Filter);
     }
-    let mut out = vec![0u8; stride * h.height as usize];
+    let mut out = zeroed(stride * h.height as usize)?;
     for y in 0..h.height as usize {
         let filter = raw[y * (stride + 1)];
         let src = &raw[y * (stride + 1) + 1..y * (stride + 1) + 1 + stride];
@@ -300,7 +351,7 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 /// Turn unfiltered samples into XRGB8888.
 fn to_xrgb(data: &[u8], h: &Header, palette: &[[u8; 3]]) -> Result<Image, PngError> {
     let (w, ht) = (h.width as usize, h.height as usize);
-    let mut pixels = vec![0u8; w * ht * 4];
+    let mut pixels = zeroed(w * ht * 4)?;
     let format = PixelFormat::XRGB8888;
     for i in 0..w * ht {
         let s = i * h.bpp;
@@ -573,13 +624,53 @@ mod tests {
     #[test]
     fn a_header_claiming_more_pixels_than_the_cap_is_refused_before_anything_is_allocated() {
         // **Four bytes from a file, multiplied by four and handed to the allocator.** 65535 by
-        // 65535 is 4.2 gigapixels; without the cap this asks for 17 GB and the process dies
-        // somewhere with no message.
+        // 65535 is 4.2 gigapixels; without the cap this asks for tens of gigabytes and the
+        // process dies somewhere with no message.
         let mut huge = Vec::new();
         huge.extend_from_slice(&SIGNATURE);
         huge.extend_from_slice(&ihdr(65535, 65535, 8, 2, 0));
         huge.extend_from_slice(&chunk(b"IEND", &[]));
         assert_eq!(decode(&huge), Err(PngError::Size));
+    }
+
+    #[test]
+    fn the_cap_refuses_a_picture_the_machine_could_not_hold() {
+        // **The case the old 64-megapixel cap did not refuse** (PR #272 review, worth fixing 2):
+        // an 8192x8192 image compresses to a couple of hundred kilobytes when it is flat, sails
+        // through `libfs`'s 8 MiB read cap, passed a 64-megapixel test *exactly*, and then asked
+        // for well over half a gigabyte on a 256 MiB machine. The number is derived now, so this
+        // asserts the derivation rather than a literal.
+        let mut big = Vec::new();
+        big.extend_from_slice(&SIGNATURE);
+        big.extend_from_slice(&ihdr(8192, 8192, 8, 2, 0));
+        big.extend_from_slice(&chunk(b"IEND", &[]));
+        assert_eq!(decode(&big), Err(PngError::Size));
+        // …and the sizes a wallpaper actually is are still admitted. These are *header* checks:
+        // what they pin is which images `parse_ihdr` lets through, not a whole decode.
+        assert!(1920 * 1080 < MAX_PIXELS, "a 1080p picture fits");
+        assert!(2560 * 1600 < MAX_PIXELS, "so does a 2560x1600 one");
+        assert!(3840 * 2160 > MAX_PIXELS, "and 4K is refused rather than fatal");
+        // The budget is what the bound is made of, so a change to one moves the other.
+        assert_eq!(MAX_PIXELS, (MAX_DECODE_BYTES / PEAK_BYTES_PER_PIXEL) as u64);
+    }
+
+    #[test]
+    fn a_stream_that_inflates_past_what_the_header_implies_is_refused() {
+        // **A few hundred bytes of `IDAT` can inflate to gigabytes**, and a cap on the *image*
+        // cannot catch it: the header is small and honest, and the allocation happens inside the
+        // inflate before anything here sees a byte. The limit is what the rows actually need —
+        // one filter byte plus a row of samples, per row.
+        let honest = [0u8, 1, 2, 3]; // 1x1 RGB needs exactly four bytes
+        let mut bomb = alloc::vec![0u8; 64 * 1024];
+        bomb[..4].copy_from_slice(&honest);
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&bomb, 9);
+        assert!(z.len() < 1024, "the fixture is small and expands hugely: {} bytes", z.len());
+        let mut v = Vec::new();
+        v.extend_from_slice(&SIGNATURE);
+        v.extend_from_slice(&ihdr(1, 1, 8, 2, 0));
+        v.extend_from_slice(&chunk(b"IDAT", &z));
+        v.extend_from_slice(&chunk(b"IEND", &[]));
+        assert_eq!(decode(&v), Err(PngError::Inflate));
     }
 
     #[test]

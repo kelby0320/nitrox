@@ -1416,23 +1416,54 @@ fn open_wallpaper(
             return None;
         }
     };
+    // **Everything past `create` unwinds through one exit, because the window now exists.**
+    // Returning `None` from the middle would leave the compositor holding a full-screen,
+    // configured, hit-testable `panel` with nothing committed to it, for the life of the
+    // process — no manager is attached this early, so its initial `Configure` goes out at once.
+    // `open_overview` and `open_modal` in this file both say this, each after a review found it
+    // (PR #244 blocking 3, PR #237 finding 7); this is the third (PR #272 review, worth
+    // fixing 3).
+    let mut ok = true;
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
             kprint(b"desktop-shell: wallpaper buffer alloc FAILED\n");
-            return None;
+            ok = false;
+            break;
         };
         // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
         // are distinct allocations, so they cannot overlap.
         unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-        let mut w = session.window(id)?;
+        let Some(mut w) = session.window(id) else {
+            kprint(b"desktop-shell: wallpaper window vanished\n");
+            ok = false;
+            break;
+        };
         if w.attach(i as u32, SCREEN_W, SCREEN_H as u32, pitch as u32, handle).is_err() {
             kprint(b"desktop-shell: wallpaper AttachBuffer FAILED\n");
-            return None;
+            ok = false;
+            break;
         }
     }
-    let mut w = session.window(id)?;
-    if w.commit(0, (0, 0, SCREEN_W, SCREEN_H as u32)).is_err() {
-        kprint(b"desktop-shell: wallpaper Commit FAILED\n");
+    if ok {
+        // A pattern guard cannot borrow mutably, so the commit is a statement rather than a
+        // `match` arm's condition.
+        match session.window(id) {
+            Some(mut w) => {
+                if w.commit(0, (0, 0, SCREEN_W, SCREEN_H as u32)).is_err() {
+                    kprint(b"desktop-shell: wallpaper Commit FAILED\n");
+                    ok = false;
+                }
+            }
+            None => {
+                kprint(b"desktop-shell: wallpaper window vanished\n");
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        if let Some(w) = session.window(id) {
+            let _ = w.destroy();
+        }
         return None;
     }
     // **After the commit, not before it.** The first version of this line was printed as soon as
@@ -1949,13 +1980,23 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         //
         // `STICKY_DESKTOP` is the reserved value for exactly this, specified in Part A and
         // unused until now: chrome belongs to the screen rather than to one desktop.
-        for bar in [Some(window), bottom].into_iter().flatten() {
-            if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, bar, STICKY_DESKTOP) {
-                Line::new().s(b"desktop-shell: bar ").u(bar as u64).s(b" is sticky").end();
+        //
+        // **The wallpaper is in this list too, and was not** (PR #272 review, blocking 1). It
+        // is created at startup like the bars, so it is stamped with desktop 1, and every other
+        // desktop showed the bare ground colour until you switched back — which reads as
+        // flicker rather than as a missing feature. A picture behind everything belongs to the
+        // screen for exactly the reason the chrome does.
+        //
+        // **The gate could not have caught it**: `check-login` asserts the wallpaper line once,
+        // at startup, and its `Super+2` comes hundreds of lines later. What catches it is the
+        // step added below.
+        for surface in [Some(window), bottom, wallpaper].into_iter().flatten() {
+            if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, surface, STICKY_DESKTOP) {
+                Line::new().s(b"desktop-shell: surface ").u(surface as u64).s(b" is sticky").end();
             } else {
                 Line::new()
-                    .s(b"desktop-shell: bar ")
-                    .u(bar as u64)
+                    .s(b"desktop-shell: surface ")
+                    .u(surface as u64)
                     .s(b" could not be made sticky; it will vanish on a desktop switch")
                     .end();
             }

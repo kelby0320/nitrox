@@ -4168,6 +4168,27 @@ The two taken before this pass — the clipboard's owner and the image format �
       `1280x720 at 0,40` only from the fit having run on it. A stretch-to-fill would say
       `1280x800 at 0,0`.
 
+- [x] **Review fixes** ✅ (PR #272). One blocking: **the wallpaper was never made sticky**, so
+      it lived on desktop 1 and every other desktop showed the bare ground colour — reading as
+      flicker rather than as a missing feature, because switching back restored it. The sticky
+      pass beside it already carried the same lesson for the bars (PR #243 review, blocking 1)
+      and the wallpaper simply was not in the array. The gate could not have caught it: it
+      asserted the wallpaper line once, at startup, hundreds of lines before its first
+      `Super+2`. It asserts stickiness now, on an *empty* desktop where a press names the
+      wallpaper's window or `win=none`, and the control reports the latter.
+
+      Then: **the pixel cap was ten times what the machine can hold**. 64 megapixels refused a
+      4-gigapixel claim and nothing that mattered — an 8192x8192 flat PNG is ~190 KiB, passes
+      `libfs`'s read cap, passed the cap *exactly*, and then asked for over half a gigabyte on a
+      256 MiB machine, where the outcome is `handle_alloc_error` and an exited graphical
+      session. It is derived from a 32 MiB budget now; the inflate is bounded by what the header
+      implies (which also closes a decompression bomb a pixel cap cannot see); the raw stream is
+      dropped before the XRGB buffer is asked for, halving the peak; and every buffer is
+      reserved with `try_reserve`, so an allocation that fails anyway is a refusal rather than a
+      dead session. Plus a window leaked on four failure paths past `create` — the third time
+      this file has needed that fix — a `place` that encoded the ground and copied the picture
+      without checking the two formats matched, and a §2 surfaces table that still listed four.
+
 - [x] **Two things the part got wrong and the gate did not catch** ✅. The line was printed as
       soon as the picture was *placed*, so it claimed a fitted wallpaper while `CreateWindow`
       went on to fail — the gate passed against a desktop showing its bare ground colour, and

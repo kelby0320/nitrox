@@ -22375,3 +22375,47 @@ the run ends.
 One lesson, arriving from two directions at once: **before believing an instrument, check that it
 measured this run.** The cheap version of that here was one `ls -l` on the file being read, and one
 glance at where in the code the line it wanted is printed.
+
+## 2026-09-02 — what #272's review caught: a surface that was not chrome, and a cap that refused nothing
+
+**One blocking, and it is a lesson about copying a pattern without its list.** The wallpaper was
+never made sticky, so the compositor's `create` stamped it with desktop 1 and every other desktop
+showed the bare ground colour. The sticky pass is three lines above where the wallpaper is created
+and carries a paragraph explaining exactly this failure for the bars — *"without this they vanish
+on the first switch"*, from PR #243's review. Adding a fifth surface to the shell meant adding it
+to an array of two, and the array is a list of names.
+
+**The gate could not have caught it**, which is the part worth keeping: `check-login` asserts the
+wallpaper line once, at startup, and its first `Super+2` is hundreds of lines later. A property
+that only breaks *after* an event needs an assertion after that event. It has one now, on an
+**empty** desktop — where a press names the wallpaper's window if it is sticky and `win=none` if
+it is not, which is the same discriminator the bars use and for the same reason: the shell's own
+"is sticky" line says only that it asked.
+
+**A cap has to be about the machine, not about the arithmetic.** `MAX_PIXELS` was 64 megapixels,
+which refuses a 4-gigapixel header and nothing else. The review measured the case that matters: an
+all-zero 8192×8192 RGB PNG is about 190 KiB, sails through `libfs`'s 8 MiB read cap, passes a
+64-megapixel test *exactly*, and then asks for well over half a gigabyte on a 256 MiB machine —
+where `libheap` returns null, `handle_alloc_error` fires, and the graphical session exits. The
+module's own promise is that a refusal is "a sentence on the console beside a desktop that fell
+back to its ground colour", and for the only inputs that could reach it, it was not.
+
+Four changes, and only the first is the number:
+
+- **The cap is derived from a byte budget** — 32 MiB, a twelfth of the machine — divided by the
+  bytes held per pixel at the peak. Admits every wallpaper to 2560×1600; refuses 4K.
+- **The inflate is bounded by what the header implies.** A few hundred bytes of `IDAT` can inflate
+  to gigabytes, and a cap on the *image* cannot see it: the header is small and honest and the
+  allocation happens inside the decompressor. `decompress_to_vec_zlib_with_limit` takes the exact
+  figure the rows need.
+- **The raw stream is dropped before the XRGB buffer is asked for**, so the two moments where two
+  buffers are alive do not add. That is what makes the peak eight bytes a pixel rather than twelve.
+- **Every buffer is reserved with `try_reserve`.** `vec![0; n]` aborts the process on exhaustion;
+  a wallpaper that does not fit has to be a message. The cap catches the ordinary case, this
+  catches the one where the machine is already short.
+
+**And a leak this file has now fixed three times.** Four paths returned `None` after `CreateWindow`
+succeeded, leaving the compositor a full-screen configured hit-testable panel with nothing
+committed. `open_overview` and `open_modal` both carry the same fix with a review citation
+attached. Three occurrences of one shape in one file is a sign the shape wants a helper — a
+`with_window(id, |w| …)` that destroys on the error path — rather than a fourth comment.
