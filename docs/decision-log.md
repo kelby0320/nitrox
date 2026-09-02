@@ -22419,3 +22419,69 @@ succeeded, leaving the compositor a full-screen configured hit-testable panel wi
 committed. `open_overview` and `open_modal` both carry the same fix with a review citation
 attached. Three occurrences of one shape in one file is a sign the shape wants a helper — a
 `with_window(id, |w| …)` that destroys on the error path — rather than a fourth comment.
+
+## 2026-09-02 — the overview covered the thing it is an overview of
+
+Reported from a real session the day the wallpaper shipped: *"when you open the desktop selection
+bar it shows the old blue background. The desktop selection is supposed to look a bit like an
+overlay so it should retain the desktop background."*
+
+Exactly right, and the cause is one sentence: **the overview is a full-screen opaque window**.
+There is no alpha channel anywhere in this system — `libdraw`'s own `blend` doc says so and says
+it is not the beginning of one — so an overview does not sit *over* the desktop, it replaces it.
+Painting a flat ground was correct while the desktop *was* a flat colour, and became a lie the
+moment a picture went behind everything.
+
+**Dimmed rather than shown at full brightness**, which is what makes it read as behind something.
+`Rgb::blend` composites black over each pixel at a coverage — the same primitive glyph
+rasterisation uses, with no stored channel anywhere. GNOME blurs as well; a blur is a separable
+convolution over a million pixels per open, and dimming alone is what the request asked for.
+
+**And the sidebar miniatures draw it too, undimmed.** The report is ambiguous about whether "the
+desktop selection bar" is the overview or the sidebar inside it, and the honest answer is that
+both showed the same wrong thing: a preview of a desktop that has a picture, drawn as flat blue,
+is a preview of a desktop nobody has. The ground is dimmed so what is drawn over it reads; a
+miniature *is* what is being read, so it is not. That asymmetry is the whole rule.
+
+**The shell keeps the composed picture — four megabytes for the machine's life.** The alternatives
+are re-reading and re-decoding the file on every open, which is tens of milliseconds on a gesture
+that should feel instant, or keeping the *decoded* image instead, which is twice the size. Stated
+where the field is, because a reader's first question about a retained framebuffer is why.
+
+**What this says about the gates.** Nothing failed. `check-login` opened the overview, asserted it
+opened, and passed — because a gate that asserts a window exists cannot see what colour it is, and
+a release-image boot has no reference render to compare a photograph against. What found it was a
+person looking at the screen, and what would have found it sooner is `cargo xtask shot`, which had
+been run four times that afternoon on the *desktop* and never on the overview. The gate now asserts
+the shell's own report of which ground it chose, which pins the plumbing; the picture still needs
+an eye.
+
+## 2026-09-02 — the wallpaper becomes a photograph, and the repository keeps the original
+
+The maintainer supplied one: `scuba-divers.png`, 1920×1440, and asked for it as the default. Two
+decisions came with it.
+
+**The repository holds the picture as taken, and the build crops it.** It is 4:3 and the screen is
+16:10, so fitting it whole leaves 107 pixels of desktop colour down each side — which the
+maintainer saw and did not want. The alternative to cropping in the build was committing a
+pre-cropped file, which loses 240 rows permanently and puts the decision inside a binary nobody
+can review. `xtask` takes the full width and drops equal rows from the top and bottom, which for
+this picture is empty water; a horizontal crop would have to choose which diver to lose.
+
+**It replaced a generated gradient, and the argument for generating was weaker than it sounded.**
+That fixture existed so no unreviewable binary was load-bearing for a gate. That is a good rule for
+a *fixture*; this is content a person chose, and the property the gate needs from it — its size —
+is asserted against the same constants the crop uses.
+
+**What that cost the gate, said out loud.** The drawn size no longer distinguishes fit from fill:
+16:10 into a 16:10 screen is `1280x800 at 0,0` under either rule. The gradient was 16:9 and did
+discriminate — at the price of bars down the side of every real picture. So the discrimination
+moved to where it costs a second instead of a boot: `libdraw::scale`'s stretch control, which
+takes six tests down with it. The gate keeps the half that still carries weight — a decoded size
+the shell cannot invent.
+
+**The general shape.** A gate's fixture and a system's content pull in opposite directions: a
+fixture wants to be *awkward*, because awkward inputs discriminate, and content wants to be
+right. When one thing has to be both, the discriminating property belongs in a host test and the
+gate keeps what is left. Noticing which half of an assertion stopped meaning anything is the part
+that is easy to skip.
