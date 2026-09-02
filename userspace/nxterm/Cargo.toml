@@ -14,7 +14,7 @@ libterm = { path = "../libterm" }
 libui = { path = "../libui" }
 libdraw = { path = "../libdraw", features = ["io"] }
 libsurface = { path = "../libsurface" }
-librsproto = { path = "../librsproto" }
+librsproto = { path = "../librsproto", features = ["io"] }
 libkern = { path = "../libkern" }
 libstream = { path = "../libstream", features = ["io"] }
 libheap = { path = "../libheap" }
@@ -34,3 +34,11 @@ path = "src/main.rs"
 # would pin it. Off in a real build: a terminal that narrated itself to the kernel log would
 # undo the point of the tty server owning output.
 test-harness = []
+
+# The keymap, for the chord constants' tests only: `COPY_KEYCODE` claims to be `c`, and the
+# table is what says so — a comment cannot. **A dev-dependency**, as `nxedit` has it: nothing in
+# the terminal decodes keys itself — `libterm::encode` turns a keycode into bytes for the pty —
+# so a `[dependencies]` entry compiled and linked it into the nitrox-target build for nothing
+# (PR #271 review, optional 4).
+[dev-dependencies]
+libinput = { path = "../libinput" }

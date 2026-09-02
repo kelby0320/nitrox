@@ -1449,7 +1449,12 @@ clipboard shipped before the real one. M12 decision 1 makes the clipboard a *res
 precisely so that what you last copied is not readable by everything running, and Part E's own
 scope leaves the door open for this: "the type tag exists so a later image or a typed stream is a
 second kind rather than a second clipboard". A file path is that second kind. **Trigger: Part E's
-ring exists.**
+ring exists — and since 2026-09-02 it does.**
+
+What the browser needs on top of it is `CLIP_KIND_PATH` beside `CLIP_KIND_TEXT`, an *Edit* menu
+that pushes one and a *paste* that reads one, and a decision about what pasting a path into a
+**text** field should do — the name, or nothing. None of that is Part E's scope, which is why the
+trigger firing moves this from "waiting" to "buildable" rather than closing it.
 
 Nothing is missing meanwhile — moving a file into a folder is a drag, which is the gesture people
 reach for first — and the maintainer asked the question that produced this entry rather than

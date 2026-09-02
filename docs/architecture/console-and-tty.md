@@ -1,13 +1,15 @@
 # Console and TTY
 
-**Status: stages 1–4 built (2026-08-13).** The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-09-02.** The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
 Part C**: a terminal emulator hands the server a channel with `Tty::AttachBackend` and the
 discipline writes to it instead of the serial console, so `nxterm` hosts a real `nxsh`. Routing
 is **per backend**: input and `Ctrl-C` reach the terminals on the backend they came from and no
-others. Job control and terminal emulation remain unbuilt.
+others. **The grid grew a selection in M12 Part E** — the one M5 deferred alongside the clipboard —
+which is `libterm`'s rather than the server's: see [`clipboard.md`](clipboard.md). Job control and
+terminal emulation remain unbuilt.
 
 This Status line has been wrong twice, in both directions, which is worth one sentence: it said
 "its clients have not moved yet" until 2026-08-12 while the staging list below had marked all

@@ -2110,11 +2110,25 @@ fn unavailable(c: &Call) -> EvalError {
 
 
 /// Encode a value as a TSM1 stream for a stage's `stdin`.
+///
+/// **Text is wrapped rather than refused**, which is what `StreamFlags::TEXT_FALLBACK` is for:
+/// a `String` becomes a one-column stream with a row per line, and so does a `List` of them.
+/// The spec calls that the "Unix floor" — plain text carried through the typed pipeline so
+/// every generic operator still works on it — and until M12 Part E nothing in the tree either
+/// wrote one or read one. `"hello" | clip --copy` is what made the gap visible: a clipboard you
+/// cannot pipe a string into is not usable from a pipeline, which is the checkbox.
+///
+/// **Only those two shapes.** A `List` of Ints is not text, and inventing a rendering for it
+/// here would put a display decision in the transport — the error below names what does work
+/// instead.
 fn encode_stream(v: &Val) -> Result<Vec<u8>> {
+    if let Some(bytes) = encode_text_stream(v) {
+        return bytes.map_err(|_| EvalError::new("could not encode the piped text"));
+    }
     let Val::Data(Value::Table(t)) = v else {
         return Err(EvalError::new(alloc::format!(
-            "only a Table can be piped into a program, got {} — a program reads a stream, \
-             and a stream is a table",
+            "only a Table or text can be piped into a program, got {} — a program reads a \
+             stream, and a stream is a table",
             v.type_name()
         )));
     };
@@ -2122,6 +2136,32 @@ fn encode_stream(v: &Val) -> Result<Vec<u8>> {
     t.encode(&mut buf)
         .map_err(|_| EvalError::new("could not encode the piped table"))?;
     Ok(buf)
+}
+
+/// `Some` if `v` is text — a `String`, or a `List` of them — encoded as a text-fallback stream.
+///
+/// `None` means "not text", which is different from "text that would not encode": the caller
+/// falls through to the table path for the first and reports for the second.
+fn encode_text_stream(v: &Val) -> Option<core::result::Result<Vec<u8>, libstream::wire::WireError>> {
+    let lines: Vec<&str> = match v {
+        Val::Data(Value::Str(s)) => s.split('\n').collect(),
+        Val::Data(Value::List(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for i in items.iter() {
+                match i {
+                    Value::Str(s) => out.push(s.as_str()),
+                    // One non-string element and this is not a list of text. Falling through
+                    // rather than dropping it: a partial encode would silently lose data.
+                    _ => return None,
+                }
+            }
+            out
+        }
+        _ => return None,
+    };
+    // `Vec<u8>` is itself a `ByteSink` — no wrapper needed, and no bound to get wrong.
+    let mut buf: Vec<u8> = Vec::new();
+    Some(libstream::table::write_text_fallback(&mut buf, &lines, 0).map(|()| buf))
 }
 
 /// Decode a stage run's captured output into a value.
@@ -3308,7 +3348,44 @@ mod tests {
         // and that error is the proof. Had it been spawned as the command `t` (which the
         // mock knows), the run would have succeeded and proved nothing.
         let e = r.expect_err("an Int cannot be piped into a program");
-        assert!(e.message.contains("only a Table can be piped"), "{}", e.message);
+        assert!(e.message.contains("only a Table or text can be piped"), "{}", e.message);
+    }
+
+    /// Text *can* be piped into a program, wrapped as the stream the spec calls the "Unix
+    /// floor" — M12 Part E, where `"hello" | clip --copy` found that nothing in the tree had
+    /// ever written a `TEXT_FALLBACK` stream.
+    #[test]
+    fn a_string_and_a_list_of_strings_reach_a_program_as_a_text_stream() {
+        // `\\n` in the *shell* source: the literal has to carry a newline for the split to be
+        // visible, and a raw one would end the line.
+        for source in ["\"one\\ntwo\" | sink", "[\"one\", \"two\"] | sink"] {
+            let host = MockHost::new().with_program("sink", None);
+            let (r, log) = run_with(host, source);
+            r.unwrap_or_else(|e| panic!("{source}: {}", e.message));
+            let inputs = log.borrow().inputs.clone();
+            let bytes = inputs
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| panic!("{source}: the stage got no stream"));
+            let t = libstream::wire::Table::decode(&bytes).expect("a TSM1 stream");
+            assert!(
+                t.flags.contains(libstream::StreamFlags::TEXT_FALLBACK),
+                "{source}: the flag is what makes it text rather than a one-column table"
+            );
+            assert_eq!(t.rows.len(), 2, "{source}: one row per line");
+            assert_eq!(t.rows[0][0], Value::Str(alloc::string::String::from("one")));
+            assert_eq!(t.rows[1][0], Value::Str(alloc::string::String::from("two")));
+        }
+    }
+
+    /// …and a list that is *not* text is still refused, rather than half-encoded.
+    #[test]
+    fn a_list_with_one_non_string_is_not_text() {
+        let host = MockHost::new().with_program("sink", None);
+        let (r, _log) = run_with(host, "[\"one\", 2] | sink");
+        let e = r.expect_err("a mixed list is not text");
+        assert!(e.message.contains("only a Table or text can be piped"), "{}", e.message);
     }
 
 

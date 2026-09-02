@@ -22143,3 +22143,150 @@ ordering is right for the *other* half — without it the chord would not open a
 prompt is up — and the test now says so in its name. **A comment that gives a true rule a false
 reason is worse than no comment**: it is what the next reader trusts when deciding whether the rule
 still applies.
+
+## 2026-09-02 — M12 Part E: the clipboard is a namespace entry, and a selection is an offset
+
+The clipboard's governing decisions were taken on 2026-09-01 so this part could be built rather
+than re-argued, and they held. What the building added is below.
+
+**The binding is the authority, and that turned out to need no new mechanism at all.** A clipboard
+is shared mutable state between mutually untrusting programs, and "anything running may read what
+you last copied" is how a password manager's clipboard gets scraped on a real desktop. The answer
+is the one this system already gives to everything: you can read it if it is in your namespace. A
+profile that binds no `/dev/clipboard` has none; an endpoint attenuated to `RIGHT_SEND` before it
+reaches an application is one that can copy and not read. No protocol change, and a capability
+story Wayland does not have — at the cost, stated in the deferral, that anything *inside* a session
+can read the ring.
+
+**Both columns get it, which is new.** `/dev/draw` goes only to the graphical session because a
+serial one has no compositor. The clipboard goes to both, because decision 4 makes it reachable as
+a path so a *pipeline* can use it, and pipelines are typed at the serial prompt. It is the first
+endpoint in this system that is neither display-specific nor console-specific.
+
+**A selection is an offset into a logical line, and that is the whole of the reflow question.** M5
+deferred terminal selection "in the same breath as the clipboard", and the plan named the rewrap as
+the open question inside it. The answer was already in the tree: a logical line's *text* is
+invariant across a rewrap — exactly the property `Line::wrapped` was added for in M9 Part D — so a
+position expressed as an offset into one survives, and re-dividing that offset by the new width is
+the entire mapping. `Reflow::map_position` does it, `map_line` became a call to it, and **the
+cursor's remap moved into it as well**, so the two cannot disagree about where a character went. A
+control that carries the column through unchanged fails both the selection test and the cursor
+test, which is what says they are one implementation.
+
+Clearing the selection on resize was the alternative, and is what several real terminals do. It was
+not taken because the mechanism already existed: the scrolled-back viewport's anchor had to survive
+a rewrap for the same reason, one milestone earlier.
+
+**A terminal cannot cycle, and saying so is part of the design.** Decision 3 makes cycling a
+continuation that *replaces what was just inserted*. In an editor the buffer is the client's own.
+In a terminal a paste is bytes already sent down the pty to a program that has read them; taking
+them back would mean sending backspaces to something that may not be a line editor. So the third
+binding lives in the editor and `Ctrl+Shift+V` in `nxterm` always pastes the newest.
+
+**The staleness check comes before the bound**, in the ring, and the test that pins it constructs a
+state where both conditions hold. A cycle whose index has *also* gone out of range would otherwise
+be told "you have reached the end", when what happened is that the ring moved and the index means
+something else — and the client's two answers to those are opposite: stop cycling, versus start
+again from the newest.
+
+**A `server_code`, not a new `KError`.** `docs/reference/error-codes.md` states the rule — a
+`KError` is for a condition more than one component can produce and any client can act on — and one
+server produces "the ring moved under your cycle". So it is `InvalidArgument` plus `CLIP_ERR_STALE`,
+and `ClipError::Refused` carries **both** halves, because the other refusal sharing that `kerror` is
+a malformed body and the two mean opposite things to a client.
+
+## 2026-09-02 — the flag that had been written for four milestones and read by nothing
+
+`clip` was supposed to be a small utility either side of a pipe. `"hello" | clip --copy` was
+refused: *only a Table can be piped into a program*. And `clip`'s own output printed a column
+header called `line` above whatever had been pasted.
+
+Both are the same fact. `StreamFlags::TEXT_FALLBACK` is the "Unix floor" this system defines —
+plain text wrapped as `Table<{line: String}>` so it flows through the typed pipeline and every
+generic operator still works on it. `libstream::write_text_fallback` has written one since the
+format existed. **Nothing in the tree had ever produced one, and nothing had ever read one.** The
+first program that genuinely wanted the shape found both ends missing.
+
+So the shell now wraps a `String` — or a list of them — as a text-fallback stream on the way into a
+program, and renders one as text on the way out. Only those two shapes: a list of Ints is not text,
+and inventing a rendering for it in the *transport* would put a display decision in the wrong
+layer.
+
+**The lesson is about unused mechanism rather than about streams.** A flag with a writer and no
+reader looks exactly like a flag that works, and it stays that way until something needs it to mean
+something. The tell was available the whole time and nobody was looking for it: a `grep` for the
+constant found one definition, one writer, and no consumer.
+
+## 2026-09-02 — a queue one short does not block; it drops the last handle silently
+
+The graphical session came up with no `/dev/clipboard` and every send reported success. The cause
+was a control channel created at depth 4 now carrying five `SENDMODE_NOBLOCK` handoffs to a child
+that has not run yet.
+
+**This is the second time**, and the first one left a comment: `libsession::spawn_leader` says
+"a queue one short does not block, it *drops the last handle silently* — that is what happened the
+first time this carried four endpoints instead of one", from M7 Part F, where the symptom was a
+terminal that opened with nothing in it. Reading that comment is what named this one on sight,
+which is the best case for a comment of that kind and the reason to write them.
+
+Both depths now say the number bounds the send count rather than being a round one that happened to
+fit. What would be better is a send that reports rather than a depth that has to be remembered;
+that is a channel-API change and not this part's.
+
+And beside it, found by adding a fifth endpoint to a list of four: `init`'s
+`close_retained_endpoints` had been closing three. `DRAW_ENDPOINT` was added to the retained set and
+not to the cleanup, so a failed `service-mgr` spawn leaked the compositor's forwarding endpoint —
+keeping the compositor alive with nothing able to reach it, which is the exact failure the
+neighbouring `send_handle` doc says that function exists to prevent. **A list of names is a list
+each new member has to be remembered into**, and the sixth reader is the one who notices.
+
+## 2026-09-02 — the two damage spaces, a second time
+
+`Grid::select_from` damages every **screen** row. `nxterm`'s viewport may be showing *history*, in
+which case `damage_rows` maps the grid's dirty rows past the bottom of the view and filters them
+away — so a drag in the scrollback highlighted nothing.
+
+That is the identical mistake `App::view_moved` exists for: M9's note beside it says "the grid's
+dirty flags name *screen* rows, and a view scrolled far enough back holds none of them", written
+when scrolling to the top of the history painted nothing. A selection is the second cause, and the
+field now says so.
+
+**Found by reading, not by a gate** — the gate selects in a terminal that is following its output,
+where the two spaces coincide and the bug is invisible. What made it findable was that the earlier
+one had been written down *next to the field*, so adding a caller who damages the grid meant
+reading a paragraph about exactly this. A comment naming a class rather than an instance is the
+thing that pays here.
+
+## 2026-09-02 — what #271's review caught: two tests that answered for both versions
+
+No blocking finding in the code. Both were **tests that passed against a deliberately broken
+implementation**, which the reviewer established by breaking thirteen production lines and running
+the targeted suite each time rather than by reading them.
+
+**A guard tested in a state where a different guard answers.**
+`motion_with_no_button_held_does_not_select` sent motion with no button held and asserted nothing
+was selected. It never *pressed* — so there was no anchor, and `Grid::extend`'s own no-anchor guard
+returned early for the correct version and for one with `nxterm`'s `buttons` check deleted. What it
+pinned was `libterm`'s guard, which `libterm` already tests. The discriminating state is *after a
+release*: a release does not clear the anchor, so a pointer crossing the grid afterwards drags the
+head along with it. `left: Some("hello wor")` against `right: Some("hello")`.
+
+**A bound tested with a value the other bound refuses first.** `ClipEntry::read` refuses on two
+conditions — over `MAX_CLIP_BYTES`, and past what actually arrived. The test named for the second
+stamped a length of 4000, which is over the cap, so the first refused it and the second could be
+deleted with the suite green. They are two tests now, and each needed its own arrangement: the
+arrival one stamps a length *inside* the cap, and the cap one needs a buffer **long enough to hold
+what it claims**, or the arrival bound refuses it first. The first version of that second test made
+exactly the mistake it was written to fix, and its control caught it one command later.
+
+**The general shape, four for four this milestone.** A test reaches the answer without going
+through the code that computes it. #270's version was a rule re-stated in a local closure; this
+one is a *second guard* standing in for the one under test. The check that finds both is the same:
+break the line, run the suite, see whether anything goes red.
+
+**And one thing with no test at all**, which the same method surfaced: the selection **highlight**.
+`cursor || selected` reduced to `cursor` left all 164 host tests green, and no gate drags a pointer
+over a grid — `check-display` never types, `check-terminal` types but never drags, and Part E's own
+gate asserts the paste through the filesystem. Two lines of rendering, stated as behaviour in an
+architecture document, deletable in silence. `libterm::render` now pins the highlight and the
+cursor-wins precedence, using the `is_inverted` helper the cursor's own test has had since M5.

@@ -298,6 +298,7 @@ fn run_session(
     profile: u64,
     tty: u64,
     draw: u64,
+    clipboard: u64,
     user: &[u8],
     password: &[u8],
 ) -> bool {
@@ -317,6 +318,7 @@ fn run_session(
         fs_endpoint: fs,
         profile_endpoint: profile,
         tty_endpoint: tty,
+        clipboard_endpoint: clipboard,
         home: &home[..hl],
         user,
         // Its clients render text, and a constructed namespace has no font without this.
@@ -355,6 +357,12 @@ fn run_session(
     } else {
         kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
     }
+    // Reported the same way and for the same reason — see `session_has_clipboard`.
+    if libsession::session_has_clipboard() {
+        kprint(b"desktop-session-mgr: session has /dev/clipboard\n");
+    } else {
+        kprint(b"desktop-session-mgr: session has NO /dev/clipboard\n");
+    }
 
     // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
     // a real shell; what it has to be now is a process that proves the session runs.
@@ -362,12 +370,13 @@ fn run_session(
     // namespace per application it launches; `nxsh` is handed one and constructs nothing.
     // The compositor endpoint travels with it: the shell binds `/dev/draw/new` into every
     // application namespace it builds, and a binding cannot be re-bound.
-    // **Four endpoints, in the order the shell reads them.** It binds all four into the
+    // **Five endpoints, in the order the shell reads them.** It binds all four into the
     // namespaces it constructs per application — the compositor's so a window can be made, the
     // fs-server's so text can be rendered, the tty server's so a terminal emulator can obtain a
-    // terminal, and the profile server's so an application can spawn programs. Each is an
-    // *endpoint* rather than the session's binding of it, because a binding resolves to a
-    // kernel registration and never back to one.
+    // terminal, the profile server's so an application can spawn programs, and the clipboard
+    // server's so copy and paste reach something. Each is an *endpoint* rather than the
+    // session's binding of it, because a binding resolves to a kernel registration and never
+    // back to one.
     // **The real home, as an argument.** The shell binds `/home` into every application
     // namespace it constructs, and that bind needs the subtree base — which its own namespace
     // cannot tell it, because there `/home` *is* the home and a binding does not resolve back
@@ -381,7 +390,10 @@ fn run_session(
         "desktop-shell",
         &[home_str],
         SYSCAP_BIND_NAMESPACE,
-        &[draw, fs, tty, profile],
+        // **Five now.** The fifth is the clipboard (M12 Part E); the shell binds it into every
+        // application namespace it constructs, for the same reason as the other four — a
+        // binding resolves to a kernel registration and never back to an endpoint.
+        &[draw, fs, tty, profile, clipboard],
     );
     // The leader has been reaped, so this drops the last reference to the namespace and with
     // it every binding in it.
@@ -407,6 +419,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // connection handed to it: it resolves `manage` as well as `new`, and Part E gates
     // applications by binding those two paths differently.
     let draw_endpoint = recv_handoff(control);
+    // The clipboard server's forwarding endpoint (M12 Part E) — the fifth, and the second
+    // that both columns take.
+    let clipboard_endpoint = recv_handoff(control);
     // The oracle, resolved rather than couriered — Part C. Once at startup: its lifetime is
     // the machine's, and re-resolving per attempt would mint a session per keystroke.
     let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
@@ -535,7 +550,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             let ok = run_session(
                 root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
-                draw_endpoint, &user[..ul], &pass[..pl],
+                draw_endpoint, clipboard_endpoint, &user[..ul], &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.

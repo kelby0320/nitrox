@@ -160,7 +160,13 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     wanted at once, and the line each had to draw between what a window holds and what a buffer
     or a pane does),
     **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
-    because "anything running may read what you last copied" is ambient authority — and
+    because "anything running may read what you last copied" is ambient authority; **Part E
+    landed 2026-09-02**: `clipboard-server` holds a kill ring, `/dev/clipboard` is bound into
+    both session columns and into every application namespace the shell builds, `libterm` grew
+    the selection M5 deferred — a pair of absolute positions that follows a rewrap through the
+    same map the cursor does — and `clip` puts the ring either side of a pipe, which is what
+    caught `StreamFlags::TEXT_FALLBACK` having been written for four milestones and read by
+    nothing — and
     **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather
     than one the build ships. **M13 — the compositor's feel**: the shadow buffer first (with a
     measurement in front of it), then alpha, then the drop shadows and translucency that both

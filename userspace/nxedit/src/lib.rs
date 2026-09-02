@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 
 use libdraw::geom::{Rect, Size};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, RESIZE_BOTTOM, RESIZE_RIGHT,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{
@@ -150,6 +150,27 @@ pub const NEW_TAB_KEYCODE: u16 = 20;
 /// chord means everywhere else it exists.
 pub const CLOSE_TAB_KEYCODE: u16 = 17;
 
+/// The key that copies the selection: `c`.
+///
+/// **`Ctrl+C` here, not `Ctrl+Shift+C`.** M12 decision 6: what fingers already know, and this
+/// is not a terminal — nothing in an editor claims `Ctrl+C` for an interrupt, so there is
+/// nothing to work around. `nxterm` is the one that has to differ, and its own constants say
+/// why.
+pub const COPY_KEYCODE: u16 = 46;
+/// The key that cuts: `x`.
+pub const CUT_KEYCODE: u16 = 45;
+/// The key that pastes: `v`. With **Shift** as well it cycles — see [`App::cycling`].
+pub const PASTE_KEYCODE: u16 = 47;
+
+/// Whether `k` is `Ctrl+Shift+V` — the one key that *continues* a paste rather than ending it.
+///
+/// A function rather than a condition spelled twice: [`App::key`] asks it to decide whether to
+/// end a cycling sequence and the chord's own arm asks it to act, and two spellings of one rule
+/// is how the sequence ends on the key that was meant to continue it.
+fn is_cycle_chord(k: KeyEvent) -> bool {
+    k.keycode == PASTE_KEYCODE && k.modifiers & MOD_CTRL != 0 && k.modifiers & MOD_SHIFT != 0
+}
+
 /// Confirms the name being typed for an untitled buffer.
 const NAME_CONFIRM: u16 = libkern::abi::KEY_ENTER;
 /// Abandons it, leaving the buffer untitled and unsaved.
@@ -240,6 +261,10 @@ pub struct App {
     /// whenever the client is behind, which `pool.acquire` blocking on the third commit makes
     /// ordinary. Same resolution rule as `confirming`: capture the subject when it is asked for.
     save_requested: Option<u64>,
+    /// What the editor owes the clipboard — see [`ClipRequest`].
+    clip_request: Option<ClipRequest>,
+    /// The paste a cycle would continue, or `None`. See [`Cycling`].
+    cycling: Option<Cycling>,
     /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
     state_requested: Option<u32>,
     /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
@@ -323,6 +348,46 @@ pub enum Field {
     Naming,
     /// Text to look for in the buffer.
     Finding,
+}
+
+/// What the editor owes the clipboard, which only `main` can do.
+///
+/// An outbox, like [`App::take_save`]: `update` is a function of values and `/dev/clipboard` is
+/// IPC, so the application records what it wants and the binary that owns the namespace
+/// performs it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ClipRequest {
+    /// Push this text onto the ring.
+    Copy(String),
+    /// Fetch the newest entry and insert it.
+    Paste,
+    /// Fetch the entry **after** the one just pasted, replacing what that paste inserted.
+    ///
+    /// M12 decision 3's rule, and the reason this is a separate request rather than a paste
+    /// with an index: cycling is only valid *immediately after a paste*, and what makes a stale
+    /// position unreachable is that any other action ends the sequence. [`App::cycling`] is that
+    /// state, and everything else clears it.
+    Cycle,
+}
+
+/// Where a paste put its text, and which entry it was.
+///
+/// **The whole of the cycling rule, in one `Option`.** It exists only between a paste and the
+/// next thing the person does; every other action clears it, so a position from five minutes ago
+/// cannot be reached. The serial is what the *server* checks — a pipeline can push while
+/// somebody is mid-cycle, and then the index means a different entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cycling {
+    /// The buffer the paste went into. A cycle after switching tabs is not a cycle.
+    pub buffer: u64,
+    /// The range the paste occupies now, which a cycle replaces.
+    pub from: (usize, usize),
+    /// See [`from`](Self::from).
+    pub to: (usize, usize),
+    /// Which ring entry was pasted. The next cycle asks for the one after it.
+    pub index: u32,
+    /// The ring's serial when that entry was read. The server refuses if it has moved.
+    pub serial: u64,
 }
 
 impl Field {
@@ -410,6 +475,8 @@ impl App {
             focused: true,
             maximized: false,
             save_requested: None,
+            clip_request: None,
+            cycling: None,
             state_requested: None,
             move_requested: false,
             resize_requested: None,
@@ -583,6 +650,72 @@ impl App {
         self.buf().blocked.as_deref()
     }
 
+    /// Copy the selection onto the ring, deleting it as well when `cut`.
+    ///
+    /// **Nothing selected is not a request.** A copy that pushed an empty entry would move the
+    /// ring's serial under every client that was mid-cycle, for a gesture that had nothing to
+    /// copy — and it would push whatever was last copied one place further back.
+    fn copy(&mut self, cut: bool) {
+        let Some(text) = self.buf().text.selected_text() else {
+            self.status = String::from(if cut { "nothing to cut" } else { "nothing to copy" });
+            return;
+        };
+        if cut {
+            self.buf_mut().text.delete_selection();
+            // A cut is a complete edit, so the next keystroke is a separate undo step.
+            self.buf_mut().text.end_group();
+        }
+        self.status = String::from(if cut { "cut" } else { "copied" });
+        self.clip_request = Some(ClipRequest::Copy(text));
+    }
+
+    /// What the editor owes the clipboard, taken exactly once.
+    pub fn take_clip_request(&mut self) -> Option<ClipRequest> {
+        self.clip_request.take()
+    }
+
+    /// Where a cycle would continue from, or `None` — see [`Cycling`].
+    ///
+    /// The binary reads this to build a cycle's request: which index to ask for next, and which
+    /// serial to carry.
+    pub fn cycling(&self) -> Option<Cycling> {
+        self.cycling
+    }
+
+    /// Insert `text` as a paste, and remember where it went so a cycle can replace it.
+    ///
+    /// `index` and `serial` are what the server answered with. A caller that pasted the newest
+    /// entry passes `0` and the serial it came back with.
+    pub fn pasted(&mut self, text: &str, index: u32, serial: u64) {
+        let buffer = self.current;
+        let (from, to) = self.buf_mut().text.insert_text(text);
+        self.cycling = Some(Cycling { buffer, from, to, index, serial });
+        self.status = String::from("pasted");
+    }
+
+    /// Replace what the last paste inserted with `text` — a cycle's answer.
+    ///
+    /// **Does nothing without a live [`cycling`](Self::cycling)**, and nothing if the current
+    /// buffer is not the one that was pasted into: the range names positions in *that* buffer's
+    /// text, and applying it to another would replace whatever happens to be at those
+    /// coordinates.
+    pub fn cycled(&mut self, text: &str, index: u32, serial: u64) {
+        let Some(c) = self.cycling else { return };
+        if c.buffer != self.current {
+            return;
+        }
+        self.buf_mut().text.select_range(c.from, c.to);
+        let (from, to) = self.buf_mut().text.insert_text(text);
+        self.cycling = Some(Cycling { buffer: c.buffer, from, to, index, serial });
+        self.status = String::from("pasted the one before");
+    }
+
+    /// End a cycling sequence — the ring moved, or there is nothing further back.
+    pub fn cycle_ended(&mut self, why: &str) {
+        self.cycling = None;
+        self.status = String::from(why);
+    }
+
     /// The save the binary owes, as the bytes to write. Clears the record.
     ///
     /// `None` when nothing asked for one — **or when this buffer is blocked**, which is where
@@ -649,6 +782,12 @@ impl App {
 
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
+        // **Every message that is not a key is an action, and an action ends a cycle** — see
+        // `key`, which handles its own case because one key is the exception. Switching tabs,
+        // saving, and closing a dialog are all "something else happened".
+        if !matches!(msg, Msg::Key(_)) {
+            self.cycling = None;
+        }
         match msg {
             Msg::Key(k) => self.key(k),
             // **Saving an untitled buffer asks for a name first.** The write itself is the
@@ -738,6 +877,13 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return;
+        }
+        // **Every key but the cycle itself ends a cycling sequence** — M12 decision 3, and the
+        // whole reason a stale ring position is unreachable rather than merely unlikely. The
+        // position exists only inside one uninterrupted gesture, so this is where "uninterrupted"
+        // is enforced: one place, before any arm can forget.
+        if !is_cycle_chord(k) {
+            self.cycling = None;
         }
         // **While a name is being typed the keys are the field's**, buffer and chords included.
         // A `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
@@ -865,6 +1011,18 @@ impl App {
                 FIND_KEYCODE => {
                     self.field = Some((Field::Finding, TextFieldState::new()));
                     self.status = String::from("find, then Enter");
+                }
+                COPY_KEYCODE => self.copy(false),
+                CUT_KEYCODE => self.copy(true),
+                // **Shift is the cycle**, and the two arrive as one keycode with one bit
+                // between them — M12 decision 6's "third binding", settled here because the
+                // decision says it is a part-level detail.
+                PASTE_KEYCODE => {
+                    self.clip_request = Some(if is_cycle_chord(k) {
+                        ClipRequest::Cycle
+                    } else {
+                        ClipRequest::Paste
+                    });
                 }
                 // **Every other chord is swallowed, not passed on.** `Ctrl+X` folding to a
                 // printable character would otherwise type it, which is how an editor inserts
@@ -1608,6 +1766,125 @@ mod tests {
 
         key(&mut a, libkern::abi::KEY_ESC, 0);
         assert_eq!(a.field_kind(), None, "and Escape ends it");
+    }
+
+    // --- the clipboard (M12 Part E) -----------------------------------------
+
+    /// Select `needle` in the current buffer, the way `Ctrl+F` does.
+    fn select(a: &mut App, needle: &str) {
+        assert!(a.buf_mut().text.find(needle), "the fixture contains {needle}");
+    }
+
+    #[test]
+    fn copying_nothing_is_not_a_request() {
+        // **A copy that pushed an empty entry would move the ring's serial** under every client
+        // that was mid-cycle, and push whatever was last copied one place further back — for a
+        // gesture that had nothing to copy.
+        let mut a = app();
+        key(&mut a, COPY_KEYCODE, MOD_CTRL);
+        assert_eq!(a.take_clip_request(), None);
+        assert_eq!(a.status(), "nothing to copy");
+    }
+
+    #[test]
+    fn copy_takes_the_selection_and_cut_also_removes_it() {
+        let mut a = app();
+        select(&mut a, "ell");
+        key(&mut a, COPY_KEYCODE, MOD_CTRL);
+        assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(String::from("ell"))));
+        assert_eq!(a.text(), "hello", "a copy does not change the buffer");
+
+        select(&mut a, "ell");
+        key(&mut a, CUT_KEYCODE, MOD_CTRL);
+        assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(String::from("ell"))));
+        assert_eq!(a.text(), "ho", "a cut does");
+    }
+
+    #[test]
+    fn the_shift_is_what_makes_a_paste_a_cycle() {
+        let mut a = app();
+        key(&mut a, PASTE_KEYCODE, MOD_CTRL);
+        assert_eq!(a.take_clip_request(), Some(ClipRequest::Paste));
+        key(&mut a, PASTE_KEYCODE, MOD_CTRL | MOD_SHIFT);
+        assert_eq!(a.take_clip_request(), Some(ClipRequest::Cycle));
+    }
+
+    #[test]
+    fn a_paste_arms_a_cycle_and_the_cycle_replaces_what_it_inserted() {
+        let mut a = app();
+        a.pasted("WORLD", 0, 7);
+        assert_eq!(a.text(), "WORLDhello");
+        let c = a.cycling().expect("a paste arms a cycle");
+        assert_eq!((c.index, c.serial), (0, 7));
+
+        a.cycled("MARS", 1, 7);
+        assert_eq!(a.text(), "MARShello", "the cycle replaced the paste, not the buffer");
+        assert_eq!(a.cycling().map(|c| c.index), Some(1), "and armed the next one");
+    }
+
+    #[test]
+    fn anything_but_the_cycle_chord_ends_the_sequence() {
+        // **M12 decision 3's rule, and the whole reason a stale ring position is unreachable
+        // rather than merely unlikely.** The position exists only inside one uninterrupted
+        // gesture, so a typed character, a save, a tab switch — anything — has to end it.
+        for (name, act) in [
+            ("a typed character", (|a: &mut App| key(a, KEY_X, 0)) as fn(&mut App)),
+            ("a copy chord", |a| key(a, COPY_KEYCODE, MOD_CTRL)),
+            ("a plain paste", |a| key(a, PASTE_KEYCODE, MOD_CTRL)),
+            ("a save", |a| a.update(Msg::Save)),
+            ("a new tab", |a| a.update(Msg::NewTab)),
+        ] {
+            let mut a = app();
+            a.pasted("WORLD", 0, 7);
+            assert!(a.cycling().is_some(), "{name}: precondition");
+            act(&mut a);
+            assert_eq!(a.cycling(), None, "{name} should have ended the sequence");
+        }
+        // …and the cycle chord itself does not.
+        let mut a = app();
+        a.pasted("WORLD", 0, 7);
+        key(&mut a, PASTE_KEYCODE, MOD_CTRL | MOD_SHIFT);
+        assert!(a.cycling().is_some(), "the one key that continues it");
+    }
+
+    #[test]
+    fn a_cycle_into_a_different_tab_does_nothing() {
+        // The range names positions in the buffer that was pasted into. Applying it to another
+        // would replace whatever happens to be at those coordinates — a silent edit to a file
+        // the person was not looking at.
+        let mut a = app();
+        a.pasted("WORLD", 0, 7);
+        let c = a.cycling().expect("armed");
+        a.update(Msg::NewTab);
+        // **Re-armed by hand, with the *first* tab's key.** `NewTab` cleared the state, which is
+        // the rule the test above covers; what is under test here is the other guard — a
+        // `Cycling` naming a buffer that is no longer current.
+        a.cycling = Some(c);
+        let before = a.text();
+        a.cycled("MARS", 1, 7);
+        assert_eq!(a.text(), before, "a stale buffer key is not a cycle");
+        assert_eq!(a.text(), "", "…and the new tab is still the empty one");
+    }
+
+    #[test]
+    fn a_paste_is_one_undo_step() {
+        // Grouped with typing, one undo would take back the paste *and* the word before it. A
+        // person who pastes and then undoes means "not that".
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        a.pasted("WORLD", 0, 7);
+        assert_eq!(a.text(), "xWORLDhello");
+        key(&mut a, UNDO_KEYCODE, MOD_CTRL);
+        assert_eq!(a.text(), "xhello", "the paste came back out and the typing stayed");
+    }
+
+    #[test]
+    fn a_multi_line_paste_keeps_what_followed_the_cursor() {
+        // The tail of the line moves to the end of what was inserted. Without that, pasting
+        // into the middle of a line silently eats the rest of it.
+        let mut a = app();
+        a.pasted("one\ntwo", 0, 1);
+        assert_eq!(a.text(), "one\ntwohello");
     }
 
     #[test]

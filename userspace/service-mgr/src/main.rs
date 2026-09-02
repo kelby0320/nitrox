@@ -250,9 +250,17 @@ fn sleep_ns(timer_h: u64, duration_ns: u64) {
 /// Create a connected control-channel pair (depth 4). Returns `(smgr_end, svc_end)`:
 /// service-mgr keeps `smgr_end`, the service receives `svc_end`. `None` on failure.
 fn create_control_channel() -> Option<(u64, u64)> {
+    // **Depth 8, and the number bounds the send count rather than being a round one.** The
+    // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring
+    // shorter than the number of them does not block — it **drops the last handle silently**.
+    // This was 4 while the graphical column sent four; M12 Part E's clipboard made it five, and
+    // the symptom was a session whose namespace had no `/dev/clipboard` and a copy that failed
+    // two processes away, with the send reporting success. `libsession::spawn_leader` carries
+    // the same warning from the same failure in M7 Part F — which is what named this one on
+    // sight.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0)
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 8, 0)
     };
     if cr != 0 {
         return None;
@@ -628,6 +636,7 @@ fn bring_up_login_chain(
     profile_endpoint: u64,
     tty_endpoint: u64,
     draw_endpoint: u64,
+    clip_endpoint: u64,
 ) {
     if fs_endpoint == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
@@ -654,11 +663,16 @@ fn bring_up_login_chain(
     // Duplicated **before** the serial column takes its set, since `send_handle` moves.
     // `TRANSFER | DUPLICATE` is what the hand-down needs and all it needs.
     // SAFETY: duplicating our own endpoint handles with attenuated rights.
-    let (fs_dup, profile_dup, tty_dup) = unsafe {
+    // **The clipboard is duplicated here too, and it is the first endpoint *both* columns
+    // want for the same reason.** `/dev/draw` goes only to the graphical twin because a serial
+    // session has no compositor; the clipboard is reachable as a path precisely so a pipeline
+    // can use it (M12 decision 4), and pipelines run in both.
+    let (fs_dup, profile_dup, tty_dup, clip_dup) = unsafe {
         (
             dup_endpoint(fs_endpoint),
             dup_endpoint(profile_endpoint),
             dup_endpoint(tty_endpoint),
+            dup_endpoint(clip_endpoint),
         )
     };
     let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
@@ -672,6 +686,8 @@ fn bring_up_login_chain(
             close_endpoints(fs_dup, profile_dup);
             close_one(tty_endpoint);
             close_one(tty_dup);
+            close_one(clip_endpoint);
+            close_one(clip_dup);
         }
         return;
     }
@@ -683,6 +699,8 @@ fn bring_up_login_chain(
     send_handle(sess_ctrl, fs_endpoint);
     send_handle(sess_ctrl, profile_endpoint);
     send_handle(sess_ctrl, tty_endpoint);
+    // (4) the clipboard server's forwarding endpoint (M12 Part E).
+    send_handle(sess_ctrl, clip_endpoint);
     // The auth channel is no longer couriered: session-mgr resolves `/svc/auth` for a
     // session of its own, and so will `desktop-session-mgr`.
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
@@ -696,7 +714,7 @@ fn bring_up_login_chain(
     // them — so they are duplicated before the serial column is given its set. Duplicating
     // first rather than after means a failure here costs the graphical login, not both:
     // init makes the same argument where it retains the profile endpoint before binding it.
-    if !bring_up_desktop_session(root_ns, fs_dup, profile_dup, tty_dup, draw_endpoint) {
+    if !bring_up_desktop_session(root_ns, fs_dup, profile_dup, tty_dup, draw_endpoint, clip_dup) {
         // Non-fatal by design. A machine with a serial login and no graphical one is
         // degraded; a machine with neither is unreachable, and the serial column is already
         // up by this point.
@@ -710,7 +728,14 @@ fn bring_up_login_chain(
 /// `false` if it could not be started. Its greeter is a compositor client, so unlike
 /// `session-mgr` it also needs `/dev/draw` — which it resolves itself from the inherited root
 /// namespace, exactly as every other graphical client does.
-fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64, draw: u64) -> bool {
+fn bring_up_desktop_session(
+    root_ns: u64,
+    fs: u64,
+    profile: u64,
+    tty: u64,
+    draw: u64,
+    clip: u64,
+) -> bool {
     if fs == 0 {
         // The duplicates are this function's to release once it declines to use them.
         // SAFETY: closing our own handles.
@@ -718,6 +743,7 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64, draw:
             close_one(profile);
             close_one(tty);
             close_one(draw);
+            close_one(clip);
         }
         return false;
     }
@@ -730,6 +756,7 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64, draw:
             close_endpoints(fs, profile);
             close_one(tty);
             close_one(draw);
+            close_one(clip);
         }
         return false;
     }
@@ -739,6 +766,8 @@ fn bring_up_desktop_session(root_ns: u64, fs: u64, profile: u64, tty: u64, draw:
     send_handle(ctrl, tty);
     // The fourth, and the one the serial column does not get.
     send_handle(ctrl, draw);
+    // The fifth: the clipboard, which both columns get (M12 Part E).
+    send_handle(ctrl, clip);
     // SAFETY: closing our own handles; the twin runs independently from here.
     unsafe {
         syscall1(SYS_HANDLE_CLOSE, ctrl);
@@ -786,22 +815,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
     kprint(b"service-mgr: up\n");
     // The handoffs, in init's send order: the fs-server endpoint, then the profile
     // server's. Positional — see `bring_up_login_chain`.
-    let (fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint) = if handoff == 0 {
-        (0, 0, 0, 0)
-    } else {
-        let fs = recv_handoff(handoff);
-        let profile = recv_handoff(handoff);
-        let tty = recv_handoff(handoff);
-        // The compositor's forwarding endpoint. Only the graphical column takes it: a serial
-        // session has no use for `/dev/draw`, and handing it one would be authority for
-        // nothing.
-        let draw = recv_handoff(handoff);
-        // SAFETY: closing our own handoff-channel end; every handoff is in hand.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
-        (fs, profile, tty, draw)
-    };
+    let (fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint, clip_endpoint) =
+        if handoff == 0 {
+            (0, 0, 0, 0, 0)
+        } else {
+            let fs = recv_handoff(handoff);
+            let profile = recv_handoff(handoff);
+            let tty = recv_handoff(handoff);
+            // The compositor's forwarding endpoint. Only the graphical column takes it: a
+            // serial session has no use for `/dev/draw`, and handing it one would be authority
+            // for nothing.
+            let draw = recv_handoff(handoff);
+            // The clipboard's, which **both** columns take — M12 decision 4 makes it reachable
+            // as a path so a pipeline can use it, and a pipeline runs in either.
+            let clip = recv_handoff(handoff);
+            // SAFETY: closing our own handoff-channel end; every handoff is in hand.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
+            (fs, profile, tty, draw, clip)
+        };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
-    bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint, tty_endpoint, draw_endpoint);
+    bring_up_login_chain(
+        root_ns,
+        fs_endpoint,
+        profile_endpoint,
+        tty_endpoint,
+        draw_endpoint,
+        clip_endpoint,
+    );
     supervise(notif, root_ns, load_declarations(root_ns));
 }
 

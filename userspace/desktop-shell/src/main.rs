@@ -780,6 +780,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// subtree bind, and `manage` comes back with it. Today nothing in `libsurface`, `libui`,
 /// `libdraw` or `nxterm` resolves anything but `new`. The second endpoint is the fallback and
 /// that is its trigger.
+#[allow(clippy::too_many_arguments)]
 fn build_app_namespace(
     draw: u64,
     fs: u64,
@@ -787,6 +788,7 @@ fn build_app_namespace(
     profile: u64,
     home: &str,
     desktop: u64,
+    clipboard: u64,
 ) -> u64 {
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -905,6 +907,30 @@ fn build_app_namespace(
             kprint(b"desktop-shell: application /dev/desktop bind FAIL\n");
         } else {
             kprint(b"desktop-shell: application /dev/desktop bound\n");
+        }
+    }
+
+    // **`/dev/clipboard`, so applications can copy and paste** (M12 Part E). It is bound here
+    // for `/dev/desktop`'s reason: the session namespace is the shell's own and nothing else
+    // runs in it, so a binding there alone would have no consumer — while the editor, the
+    // browser, the terminal and any `clip` a pipeline runs all live in namespaces this
+    // function builds.
+    //
+    // **And granting it is a capability decision, exactly as `/dev/desktop` is.** Everything
+    // in this session can then read what anything else copied. That is M12 decision 1's
+    // accepted position — the binding is the authority, and the trigger for narrowing it is an
+    // application inside a session that the person does not trust, which is the day profiles
+    // stop being a build-time idea. The mechanism for narrowing needs no protocol change: an
+    // endpoint attenuated to `RIGHT_SEND` before it reaches here is an application that can
+    // copy and not read.
+    if clipboard != 0 {
+        let cpath = b"/dev/clipboard";
+        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        let cr = unsafe {
+            syscall4(SYS_NS_BIND, ns, cpath.as_ptr() as u64, cpath.len() as u64, clipboard)
+        };
+        if cr != 0 {
+            kprint(b"desktop-shell: application /dev/clipboard bind FAIL\n");
         }
     }
 
@@ -1180,6 +1206,8 @@ struct Launcher<'a> {
     profile: u64,
     /// This shell's own `/dev/desktop`, bound into what it builds.
     desktop: u64,
+    /// The clipboard server, bound into what it builds — see [`build_app_namespace`].
+    clipboard: u64,
     /// The user's home, bound as `/home` in an application's namespace.
     home: &'a str,
     /// The environment record an application reads its `HOME` from.
@@ -1207,13 +1235,13 @@ impl Launcher<'_> {
 /// The body of [`Launcher::launch`], kept a free function so the long sequence of handle
 /// bookkeeping reads as it did before the context was gathered.
 fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
-    let (session_ns, draw, fs, tty, profile, desktop, home, env) =
-        (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.home, l.env);
+    let (session_ns, draw, fs, tty, profile, desktop, clipboard, home, env) =
+        (l.session_ns, l.draw, l.fs, l.tty, l.profile, l.desktop, l.clipboard, l.home, l.env);
     if draw == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch\n");
         return false;
     }
-    let app_ns = build_app_namespace(draw, fs, tty, profile, home, desktop);
+    let app_ns = build_app_namespace(draw, fs, tty, profile, home, desktop, clipboard);
     if app_ns == 0 {
         return false;
     }
@@ -1449,6 +1477,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let fs_endpoint = recv_handle(setup);
     let tty_endpoint = recv_handle(setup);
     let profile_endpoint = recv_handle(setup);
+    // The clipboard server's forwarding endpoint (M12 Part E), for the same reason as the
+    // other four: a `/dev/clipboard` *binding* resolves to a kernel registration and never
+    // back to an endpoint, so the shell cannot re-bind what its own namespace holds.
+    let clipboard_endpoint = recv_handle(setup);
     if draw_endpoint == 0 {
         kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
     }
@@ -1568,7 +1600,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     if draw_endpoint != 0 {
         let app_ns =
             build_app_namespace(
-                draw_endpoint, fs_endpoint, tty_endpoint, profile_endpoint, home, desktop_endpoint,
+                draw_endpoint,
+                fs_endpoint,
+                tty_endpoint,
+                profile_endpoint,
+                home,
+                desktop_endpoint,
+                clipboard_endpoint,
             );
         if app_ns != 0 {
             may_launch = verify_app_namespace(app_ns, !home.is_empty(), desktop_endpoint != 0);
@@ -1586,6 +1624,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         tty: tty_endpoint,
         profile: profile_endpoint,
         desktop: desktop_endpoint,
+        clipboard: clipboard_endpoint,
         home,
         env: &env,
         enabled: may_launch,

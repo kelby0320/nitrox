@@ -778,12 +778,17 @@ pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
 /// This is where a `Table` finally gets a real rendering — `Val::render` deliberately
 /// gives only a summary, because laying out columns is a *display* decision and belongs
 /// with the operator that ends a chain rather than with the value.
+///
+/// **A text-fallback stream prints as text**, with no header — see [`text_fallback_lines`].
 pub fn display(v: &Val) -> String {
     let Val::Data(Value::Table(t)) = v else {
         let mut s = v.render();
         s.push('\n');
         return s;
     };
+    if let Some(text) = text_fallback_lines(t) {
+        return text;
+    }
     let headers: Vec<String> = t.schema.fields.iter().map(|f| f.name.clone()).collect();
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     let cells: Vec<Vec<String>> = t
@@ -816,6 +821,35 @@ pub fn display(v: &Val) -> String {
         out.push('\n');
     }
     out
+}
+
+/// A text-fallback stream rendered as the text it is: one row per line, no column header.
+///
+/// **`StreamFlags::TEXT_FALLBACK` is what the "Unix floor" means**, and until M12 Part E
+/// nothing in the tree produced one — so the flag had been defined, documented and written by
+/// `libstream::write_text_fallback` for four milestones with **no reader anywhere**. `clip` is
+/// the first producer, and printing `line` above somebody's pasted text is what made that
+/// visible: the whole point of wrapping plain text as `Table<{line: String}>` is that it flows
+/// through a typed pipeline *and still looks like text at the end of one*.
+///
+/// `None` for anything else, including a stream that claims the flag but does not have the
+/// shape — one `String` column. A producer that sets the bit on a three-column table is wrong,
+/// and rendering its first column as "the text" would hide two of them.
+fn text_fallback_lines(t: &Table) -> Option<String> {
+    if !t.flags.contains(libstream::StreamFlags::TEXT_FALLBACK) {
+        return None;
+    }
+    if t.schema.fields.len() != 1 || t.schema.fields[0].ty != libstream::TypeTag::String {
+        return None;
+    }
+    let mut out = String::new();
+    for row in &t.rows {
+        if let Some(Value::Str(line)) = row.first() {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Some(out)
 }
 
 fn pad_into(out: &mut String, text: &str, width: usize, last: bool) {
@@ -904,6 +938,55 @@ pub fn concat(a: Val, b: Val) -> OpResult<Val> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use libstream::wire::Table;
+    use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
+
+    fn text_stream(flags: StreamFlags, lines: &[&str]) -> Val {
+        let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE);
+        Val::Data(Value::Table(alloc::sync::Arc::new(Table {
+            flags,
+            schema,
+            rows: lines.iter().map(|l| vec![Value::Str(String::from(*l))]).collect(),
+        })))
+    }
+
+    #[test]
+    fn a_text_fallback_stream_displays_as_text_and_a_plain_table_keeps_its_header() {
+        // **The flag had no reader for four milestones** — `clip` is the first producer in the
+        // tree (M12 Part E), and what it produced printed `line` above somebody's pasted text.
+        assert_eq!(
+            display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"])),
+            "one\ntwo\n"
+        );
+        // The control: the identical rows *without* the flag are a table, and a table has
+        // columns. Without this the test above would pass for a `display` that dropped every
+        // header.
+        assert_eq!(display(&text_stream(StreamFlags::NONE, &["one", "two"])), "line\none\ntwo\n");
+    }
+
+    #[test]
+    fn a_flag_on_the_wrong_shape_is_not_believed() {
+        // A producer that sets the bit on a table that is not one `String` column is wrong, and
+        // rendering its first column as "the text" would hide the rest. Two columns here: the
+        // header comes back.
+        let schema = Schema::new()
+            .field("line", TypeTag::String, TypeModifiers::NONE)
+            .field("n", TypeTag::Int, TypeModifiers::NONE);
+        let v = Val::Data(Value::Table(alloc::sync::Arc::new(Table {
+            flags: StreamFlags::TEXT_FALLBACK,
+            schema,
+            rows: vec![vec![Value::Str(String::from("one")), Value::Int(1)]],
+        })));
+        assert!(display(&v).starts_with("line"));
+    }
+
+    #[test]
+    fn an_empty_text_fallback_stream_displays_as_nothing() {
+        // `clip` on an empty ring emits exactly this, and a shell that printed a bare `line`
+        // for it would be reporting a column name as the clipboard's contents.
+        assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &[])), "");
+    }
     use alloc::vec;
 
     fn table(names: &[&str], sizes: &[i64]) -> Val {

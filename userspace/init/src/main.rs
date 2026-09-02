@@ -90,6 +90,15 @@ static mut TTY_ENDPOINT: u64 = 0;
 /// because the shell resolves `manage` as well as `new`, and Part E gates *applications* by
 /// binding the two paths differently.
 static mut DRAW_ENDPOINT: u64 = 0;
+
+/// The clipboard server's **forwarding** endpoint, retained after the `/dev/clipboard` bind so
+/// init can hand it down for *both* session columns to bind (M12 Part E).
+///
+/// The fifth to make this trip, and the first that both columns want for the same reason: M12
+/// decision 4 makes the clipboard reachable as a path so a *pipeline* can use it, and the
+/// pipeline lives in the serial session as much as the graphical one. `/dev/draw` is the
+/// counter-example — one column has no use for a compositor.
+static mut CLIPBOARD_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -132,6 +141,20 @@ static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
 /// namespace and holds it exclusively thereafter.
 static mut SPAWN_TTY: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/tty-server
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
+
+/// Spawn args for the `clipboard-server`: one moved handle — the control channel — in
+/// `handles[0]`. It resolves nothing at all: the ring is `.bss`, so its inherited LOOKUP-only
+/// namespace goes unused.
+static mut SPAWN_CLIPBOARD: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/clipboard-server
     handle_count: 1,
     move_mask: 1,
     arg0: 0,
@@ -941,6 +964,81 @@ fn bind_tty_server(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the clipboard server and bind its forwarding endpoint at `/dev/clipboard`.
+///
+/// The Resource Server Startup Protocol, as everywhere: spawn with a control channel, wait for
+/// `Meta::Ready`, bind the forwarding endpoint it carries. The server binds nothing itself and
+/// holds no `BIND_NAMESPACE`.
+///
+/// **Deliberately not critical-path.** A boot without a clipboard is a boot where copy and paste
+/// do nothing; every other thing the system does still works. Like `bind_tty_server`, a failure
+/// here says so and the boot continues.
+///
+/// **The root binding is not what applications use.** It exists so the endpoint has a home and
+/// so a program running outside any session can reach it; what an application resolves is the
+/// `/dev/clipboard` its *session* namespace carries, which is bound from the duplicate retained
+/// here. That is the same two-level arrangement `/dev/tty` has, and it is what makes the
+/// clipboard attenuable per session rather than ambient.
+fn bind_clipboard_server(root_ns: u64) -> bool {
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // SAFETY: SPAWN_CLIPBOARD is a valid writable arg block.
+    let h = unsafe {
+        SPAWN_CLIPBOARD.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/clipboard-server", &raw mut SPAWN_CLIPBOARD)
+    };
+    if h < 0 {
+        kprint(b"init: clipboard-server spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: clipboard-server Ready timeout/invalid\n");
+            // SAFETY: done with the control channel either way.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing init's own control endpoint — the `PeerClosed` the server expects.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // Duplicate *before* binding, for `bind_tty_server`'s reason: a failure here should be a
+    // failure to bind at all, rather than a bound `/dev/clipboard` no session can be given.
+    // SAFETY: duplicating our own endpoint handle with attenuated rights.
+    let retained =
+        unsafe { syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, root_ns, b"/dev/clipboard".as_ptr() as u64, 14, endpoint)
+    };
+    if br == 0 && retained >= 0 {
+        // SAFETY: single-threaded init.
+        unsafe { CLIPBOARD_ENDPOINT = retained as u64 };
+    } else if retained >= 0 {
+        // SAFETY: the bind failed; nothing will use the duplicate.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
+    }
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: clipboard-server bind FAIL at /dev/clipboard\n");
+        return false;
+    }
+    kprint(b"init: clipboard server bound at /dev/clipboard\n");
+    true
+}
+
 /// Spawn the input server and bind its endpoint at `/dev/input/new`.
 ///
 /// The Resource Server Startup Protocol, as everywhere: spawn with a control channel, wait
@@ -1174,7 +1272,13 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // Handing it a live but permanently empty channel would leave it blocked on a handoff
     // that is never coming, turning a degraded restart into a hung one.
     // SAFETY: single-threaded init.
-    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 && TTY_ENDPOINT == 0 && DRAW_ENDPOINT == 0 } {
+    if unsafe {
+        FS_ENDPOINT == 0
+            && PROFILE_ENDPOINT == 0
+            && TTY_ENDPOINT == 0
+            && DRAW_ENDPOINT == 0
+            && CLIPBOARD_ENDPOINT == 0
+    } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
         return unsafe {
@@ -1185,11 +1289,13 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         };
     }
 
-    // The handoff channel: depth 4, so both sends land in the ring without init ever
-    // blocking on a child that has not run yet.
+    // The handoff channel. **Depth 8, and the number is the send count's bound rather than a
+    // round one**: the sends below are `SENDMODE_NOBLOCK` against a child that has not run yet,
+    // so a ring shorter than the number of handoffs drops the last one silently. It was 4 for
+    // four handoffs — exactly full — and M12 Part E's clipboard is the fifth.
     // SAFETY: CTRL0/CTRL1 are valid writable out-params (mounts are long done).
     let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 8, 0)
     };
     if cr != 0 {
         kprint(b"init: service-mgr handoff channel FAIL\n");
@@ -1229,6 +1335,8 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         TTY_ENDPOINT = 0;
         send_handle(init_end, DRAW_ENDPOINT);
         DRAW_ENDPOINT = 0;
+        send_handle(init_end, CLIPBOARD_ENDPOINT);
+        CLIPBOARD_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
@@ -1286,6 +1394,20 @@ unsafe fn close_retained_endpoints() {
         if TTY_ENDPOINT != 0 {
             syscall1(SYS_HANDLE_CLOSE, TTY_ENDPOINT);
             TTY_ENDPOINT = 0;
+        }
+        // **These two were missing.** The list is a list of names, so each endpoint added since
+        // it was written had to be remembered here separately, and `DRAW_ENDPOINT` was not —
+        // a failed `service-mgr` spawn leaked the compositor's forwarding endpoint, keeping the
+        // compositor alive with nothing able to reach it, which is the exact failure
+        // `send_handle`'s doc says this function exists to prevent. Found while adding the
+        // clipboard beside it (M12 Part E).
+        if DRAW_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, DRAW_ENDPOINT);
+            DRAW_ENDPOINT = 0;
+        }
+        if CLIPBOARD_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, CLIPBOARD_ENDPOINT);
+            CLIPBOARD_ENDPOINT = 0;
         }
     }
 }
@@ -1484,6 +1606,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // for exactly the case where this server is absent.
     if !bind_tty_server(root_ns) {
         kprint(b"init: no terminal server; sessions will have no /dev/tty\n");
+    }
+
+    // The clipboard, beside the terminal server and for the same reasons: spawned from `/bin`,
+    // and not critical-path. Both columns want it — M12 decision 4 makes it reachable from a
+    // pipeline, and a pipeline runs in a serial session too.
+    if !bind_clipboard_server(root_ns) {
+        kprint(b"init: no clipboard server; copy and paste will do nothing\n");
     }
 
     // ---- the display arm ----

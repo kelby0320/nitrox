@@ -935,6 +935,13 @@ enum EditKind {
     Typing,
     /// Characters coming out.
     Deleting,
+    /// A whole insertion arriving at once — a paste.
+    ///
+    /// **Its own kind so it is its own undo step.** Grouped with `Typing` a paste would merge
+    /// into whatever word was being typed before it, and one undo would take back both. A
+    /// person who pastes and then undoes means "not that", and the text they had typed is not
+    /// part of "that".
+    Pasting,
 }
 
 /// A buffer and a cursor, as they were before a group of edits.
@@ -1144,6 +1151,68 @@ impl TextAreaState {
         if !c.is_alphanumeric() {
             self.group = None;
         }
+    }
+
+    /// Insert `text` at the cursor, replacing any selection, as **one** undo step.
+    ///
+    /// The paste primitive (M12 Part E). `insert` per character would be usable and wrong in two
+    /// ways: a newline is not a character it accepts, and the undo grouping would break the
+    /// pasted text into words.
+    ///
+    /// Returns the range it occupies afterwards, `(line, col)` to `(line, col)` — which is what
+    /// makes **cycling** possible at all: M12 decision 3 says a cycle *replaces what was just
+    /// inserted*, so the caller has to be told where that is. Deriving it from the cursor and
+    /// the text's shape at the call site is the same arithmetic done in a place with less to
+    /// check it against.
+    pub fn insert_text(&mut self, text: &str) -> ((usize, usize), (usize, usize)) {
+        self.begin(EditKind::Pasting);
+        self.delete_selection();
+        let from = (self.line, self.col);
+        // The tail of the current line moves to the end of what is being inserted, exactly as
+        // `newline` moves it — a paste ending mid-line must not swallow what was after it.
+        let tail = self.lines[self.line].split_off(self.col);
+        let mut parts = text.split('\n');
+        // `split` always yields at least one piece, so this cannot be `None`.
+        let first = parts.next().unwrap_or("");
+        self.lines[self.line].push_str(first);
+        self.col += first.len();
+        for part in parts {
+            self.line += 1;
+            self.lines.insert(self.line, String::from(part));
+            self.col = part.len();
+        }
+        let to = (self.line, self.col);
+        self.lines[self.line].push_str(&tail);
+        self.goal = None;
+        self.revision += 1;
+        // **A paste is a complete step**, so the next keystroke starts a new group rather than
+        // being undone together with it.
+        self.group = None;
+        (from, to)
+    }
+
+    /// Select from `from` to `to`, putting the cursor at `to`.
+    ///
+    /// **Total, and clamped**, because the caller's coordinates may be stale: the range a paste
+    /// returned is only valid until the next edit, and a cycle that arrived after one would
+    /// otherwise index out of the buffer. Clamping means a stale range selects something
+    /// harmless rather than panicking in an editor holding somebody's unsaved work.
+    pub fn select_range(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let clamp = |(line, col): (usize, usize), lines: &Vec<String>| {
+            let line = line.min(lines.len() - 1);
+            let mut col = col.min(lines[line].len());
+            while col > 0 && !lines[line].is_char_boundary(col) {
+                col -= 1;
+            }
+            (line, col)
+        };
+        let from = clamp(from, &self.lines);
+        let to = clamp(to, &self.lines);
+        self.anchor = Some(from);
+        self.line = to.0;
+        self.col = to.1;
+        self.goal = None;
+        self.group = None;
     }
 
     /// Split the line at the cursor, replacing any selection.
@@ -2837,6 +2906,67 @@ mod tests {
                 a.insert(c);
             }
         }
+    }
+
+    // ---- paste and its range (M12 Part E) ----
+
+    #[test]
+    fn insert_text_returns_the_range_it_occupies() {
+        // **The return value is what makes cycling possible at all.** M12 decision 3 says a
+        // cycle *replaces what was just inserted*, so the caller has to be told where that is —
+        // and deriving it at the call site from the cursor and the text's shape would be the
+        // same arithmetic done somewhere with less to check it against.
+        let mut a = area();
+        a.apply(KEY_RIGHT, 0); // between `a` and `bc`
+        let (from, to) = a.insert_text("XY");
+        assert_eq!(a.text(), "aXYbc\nde\nfghi");
+        assert_eq!(from, (0, 1));
+        assert_eq!(to, (0, 3), "one line, so the range is columns 1..3");
+
+        // …and a multi-line paste ends on the line it made, not the one it started on.
+        let mut a = area();
+        let (from, to) = a.insert_text("one\ntwo");
+        assert_eq!(from, (0, 0));
+        assert_eq!(to, (1, 3));
+        assert_eq!(a.text(), "one\ntwoabc\nde\nfghi", "and the tail followed it down");
+    }
+
+    #[test]
+    fn select_range_then_insert_text_is_the_cycle() {
+        // The two halves together are what `nxedit::App::cycled` does. Doing it here as well
+        // pins the *primitives*: `nxedit`'s own test would pass against a `select_range` that
+        // selected nothing, because `insert_text` inserts at the cursor either way.
+        let mut a = area();
+        let (from, to) = a.insert_text("FIRST");
+        assert_eq!(a.text(), "FIRSTabc\nde\nfghi");
+        a.select_range(from, to);
+        assert_eq!(a.selected_text().as_deref(), Some("FIRST"), "the range names what went in");
+        a.insert_text("SECOND");
+        assert_eq!(a.text(), "SECONDabc\nde\nfghi", "which the next paste replaced");
+    }
+
+    #[test]
+    fn select_range_clamps_a_stale_range_rather_than_panicking() {
+        // **The guard is documented and was not covered** (PR #271 review, optional 7). A range
+        // is only valid until the next edit, and a cycle that arrived after one would otherwise
+        // index out of the buffer — in an editor holding somebody's unsaved work. Clamping
+        // makes a stale range select something harmless instead.
+        let mut a = area();
+        a.select_range((99, 99), (99, 99));
+        assert_eq!(a.selected_text(), None, "collapsed onto the end of the last line");
+        assert_eq!(a.cursor(), (2, 4), "and the cursor is inside the buffer");
+        assert_eq!(a.text(), "abc\nde\nfghi", "nothing was changed by asking");
+    }
+
+    #[test]
+    fn select_range_lands_on_a_character_boundary() {
+        // Columns are byte offsets, and a stale one can point into the middle of a multi-byte
+        // character — where every `String` operation below panics. Clamping walks back to the
+        // boundary rather than trusting the number.
+        let mut a = TextAreaState::with_text("aéb");
+        // `é` is two bytes, so 2 is inside it.
+        a.select_range((0, 0), (0, 2));
+        assert_eq!(a.selected_text().as_deref(), Some("a"));
     }
 
     // ---- undo and redo (M12 Part C) ----

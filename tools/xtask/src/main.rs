@@ -327,6 +327,9 @@ const COREUTILS: &[&str] = &[
     "list", "copy", "mkdir", "remove", "rename", "move", "touch", "date", "sleep", "whoami",
     // The graphical session's desktops, and `/dev/desktop`'s first consumer — see M8 Part F.
     "desktop",
+    // The clipboard, either side of a pipe — M12 decision 4, which is what makes the kill ring
+    // reachable by something other than a window.
+    "clip",
 ];
 
 /// The system services, packaged into the store like any other program.
@@ -354,6 +357,9 @@ const SYSTEM_SERVICES: &[&str] = &[
     // after the profile server rather than before it.
     "compositor",
     "input-server",
+    // The kill ring (M12 Part E). A store package like the rest: nothing about a clipboard is
+    // needed to reach a mounted root, and its only client runs long after one.
+    "clipboard-server",
 ];
 
 /// The test programs, packaged into a store package of their own in selftest/test-harness
@@ -402,6 +408,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("input-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
+    // The clipboard (M12 Part E). A lib + bin split like `auth-service`: the ring is
+    // host-tested, this builds the bare-target server.
+    build_userspace_bin("clipboard-server", None)?;
     // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
     // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
     // the crate with no reader for either feature. Passing one anyway would make the next
@@ -1141,6 +1150,36 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //     in guest because "the shell is still there" is the whole claim.
     s.send("list [x]")?;
     s.expect("cannot begin a bareword")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 19c. **The clipboard, from a pipeline** — M12 Part E and decision 4, whose whole point is
+    //      that this resource is not graphical-only. Four claims in order: a session's namespace
+    //      carries `/dev/clipboard`; a pipeline can push into the ring; a paste comes back out
+    //      as text; and the ring is a *ring*, so what was copied first is still reachable at
+    //      index 1 after a second copy.
+    //
+    //      **Asserted from the serial column deliberately.** The graphical gate proves copy in
+    //      one application and paste in another; this proves the same server answers a process
+    //      with no window at all, which is the half a windowed test cannot see.
+    s.send("\"clip-one\" | clip --copy")?;
+    s.expect("/home>")?;
+    s.send("clip")?;
+    s.expect("clip-one")?;
+    s.expect("/home>")?;
+    s.send("\"clip-two\" | clip --copy")?;
+    s.expect("/home>")?;
+    s.send("clip")?;
+    s.expect("clip-two")?;
+    s.expect("/home>")?;
+    // Index 1 is the one before it — the property that makes this a kill ring rather than a
+    // slot, and the one a single-slot implementation would fail while passing everything above.
+    s.send("clip 1")?;
+    s.expect("clip-one")?;
+    s.expect("/home>")?;
+    // …and the listing says how much is there without saying what it is.
+    s.send("clip --list | count")?;
+    s.expect("2")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -3148,6 +3187,105 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.send("list ./papers")?;
     session.expect("/home>")?;
     println!("  ok: and the save reached the current tab's file, read back by the shell");
+
+    // 9d. **Copy in the editor, paste in the terminal, and the shell reads what was copied**
+    //     (M12 Part E) — one gesture crossing two applications and a server, which is the whole
+    //     point of making the clipboard a resource rather than a slot in a widget.
+    //
+    //     **Asserted through the filesystem, not through a log line.** `nxterm` in a *release*
+    //     image does not report its grid — deliberately, since a terminal narrating itself to
+    //     the kernel log undoes the point of the tty server owning output — so "the shell
+    //     printed it" cannot be read off the transcript. What can be is the file the pasted text
+    //     names: the serial column lists a directory and the name is there or it is not. That is
+    //     the same two-session trick steps 7, 8 and 9b use, and it is stronger than a log line,
+    //     because a paste that delivered the wrong bytes produces a differently-named file
+    //     rather than a matching count.
+    //
+    //     The copy is a **find**, which selects its match — so this needs no keystroke that
+    //     changes the buffer, and steps 11 and 12 find the editor exactly as step 9c left it.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "f")?;
+    qmp.send_key("ctrl", false)?;
+    for (i, c) in TYPED.chars().enumerate() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxedit: find so far {} chars", i + 1))?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("nxedit: find hit at line 0")?;
+    // **Escape first, and that is the rule Part D's review settled rather than tidying.** A
+    // chord that acts on the *buffer* stays the field's while a field is open, and a copy is
+    // one — so `Ctrl+C` here would have gone to the find field and done nothing. (It did, on
+    // this step's first run.) Escape closes the field and leaves the match selected: the
+    // selection is the buffer's, not the field's.
+    press(&mut qmp, "esc")?;
+    // Ctrl+C. **A count, never the text** — an editor's buffer is a person's document, and the
+    // serial console is a log file. The count is exactly `TYPED`'s length, which is what says
+    // the *selection* was copied rather than the line or the buffer.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "c")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect(&format!("nxedit: copied {} bytes", TYPED.len()))?;
+    println!("  ok: the editor copied its selection onto the ring");
+
+    // A terminal to paste into. **Launched here rather than reusing step 6's**, which was
+    // closed long before the editor existed — and closed again at the end of this step, so the
+    // windows steps 11 and 12 drive are the ones they expect to find.
+    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+    type_into_modal(&mut qmp, &mut session, "nxterm")?;
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxterm into its own namespace")?;
+    session.expect("desktop-shell: applications modal closed")?;
+
+    // Click into the new terminal's grid to give it the keyboard. **Its origin comes off the
+    // shell's own placement line** — the cascade moves, and a gate that assumed an origin is
+    // the bug M11 Part E batch 4 fixed. Its *size* cannot: the shell logs at most
+    // `MAX_LOGGED_GEOMETRY` geometry lines per session and this run passed that long ago, which
+    // is why step 11 hardcodes the editor's size too. A point a little inside the top-left is
+    // in the grid whatever the size, and needs no second number.
+    session.expect("desktop-shell: placed window ")?;
+    let placed = session.rest_of_line()?;
+    let (_, tx, ty) = parse_placement(&placed)
+        .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
+    // Below the title bar and the terminal's own menu bar, and well inside the frame.
+    click_at(&mut qmp, &mut session, tx + 100, ty + TITLE_BAR_H + MENU_BAR_H + 40)?;
+
+    // `touch ./` — typed — then the paste, then a suffix. **The suffix is what makes the
+    // assertion discriminating**: `nitrox.clip` can only exist if the paste delivered exactly
+    // `nitrox` *and* landed at the cursor with typing continuing after it. A paste that
+    // delivered nothing leaves `.clip`; one that delivered the whole line leaves something
+    // else again.
+    // QMP's own key names, not the characters: `.` is `dot` and `/` is `slash`.
+    for qcode in ["t", "o", "u", "c", "h", "spc", "dot", "slash"] {
+        press(&mut qmp, qcode)?;
+    }
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(&mut qmp, "v")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    session.expect(&format!("nxterm: pasted {} bytes", TYPED.len()))?;
+    for qcode in ["dot", "c", "l", "i", "p"] {
+        press(&mut qmp, qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+
+    // **The serial column is what says it happened.** Asking the terminal would be asking the
+    // accused: its grid is where the pasted text was drawn, and the thing in doubt is whether
+    // the bytes were real.
+    session.send("list .")?;
+    session.expect(&format!("{TYPED}.clip"))?;
+    session.expect("/home>")?;
+    println!("  ok: the paste reached the shell in the terminal, and it made {TYPED}.clip");
+
+    // Close the terminal from inside, so steps 11 and 12 drive the windows step 9 left.
+    for qcode in ["e", "x", "i", "t"] {
+        press(&mut qmp, qcode)?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("nxterm: the terminal ended")?;
 
     // 9b. **The browser renames a file, and the shell reads the new name back** (M12 Part B).
     //     The same two-session fact steps 7 and 8 use, a third time: the graphical side does
@@ -6526,6 +6664,16 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("auth-service")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // clipboard-server's library tests (the kill ring: which entry index 0 names, what a
+    // wrap does, when a cycle is refused). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("clipboard-server")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

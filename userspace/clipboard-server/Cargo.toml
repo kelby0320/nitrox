@@ -1,0 +1,20 @@
+[package]
+name = "clipboard-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+librsproto = { path = "../librsproto" }
+
+# The library/binary split every resource server here uses: the library is the ring — the
+# half that can be wrong about which entry index 0 names — and is host-tested; the binary is
+# the bare-target syscall plumbing, which cannot build on host (`#![no_main]`).
+# Alloc-free: the ring is a bounded `.bss` object, so there is nothing to allocate.
+[lib]
+name = "clipboard_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clipboard-server"
+path = "src/main.rs"

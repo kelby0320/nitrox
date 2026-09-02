@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod auth;
+pub mod clipboard;
 pub mod desktop;
 pub mod error;
 pub mod file;
@@ -39,6 +40,19 @@ pub const RS_MAGIC: u32 = 0x5253_4D47;
 pub const RS_HEADER_LEN: usize = 28;
 /// Protocol version this codec speaks.
 pub const RS_VERSION: u16 = 1;
+
+/// The largest rsproto message this codec will build, in bytes — envelope and body together.
+///
+/// **A mirror of [`IPC_PAYLOAD_SIZE`], pinned rather than trusted.** The codec core is
+/// `core`-only by design (see this module's header), so it cannot *read* `libkern`'s constant;
+/// but two constants that agree by coincidence are exactly the seam this crate exists to close
+/// (PR #259 review, optional 5). The assertion below runs whenever `io` is on — which is every
+/// build that actually sends one of these — so a change to the IPC payload breaks the build
+/// here rather than truncating somebody's message in the guest.
+pub const RS_MAX_PAYLOAD: usize = 4008;
+
+#[cfg(feature = "io")]
+const _: () = assert!(RS_MAX_PAYLOAD == libkern::abi::IPC_PAYLOAD_SIZE);
 
 /// `RsFlags` — message-envelope flags.
 pub const RS_FLAG_REPLY: u32 = 1 << 0;
