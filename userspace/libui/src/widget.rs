@@ -818,7 +818,56 @@ pub struct TextAreaState {
     /// Movement never bumps it, and neither does an edit that did nothing — `Backspace` at the
     /// start of the buffer, `Delete` at its end.
     revision: u64,
+    /// States to go back to, oldest first.
+    undo: Vec<Snapshot>,
+    /// States to come forward to, cleared by any new edit.
+    redo: Vec<Snapshot>,
+    /// What the edits since the last snapshot were, or `None` when the next one starts a group.
+    group: Option<EditKind>,
 }
+
+/// What kind of edit is in progress, so that adjacent ones of a kind coalesce.
+///
+/// **The grouping is the decision, not the stack** (M12 Part C). Per keystroke is unusable —
+/// undoing a sentence becomes forty presses — and per save is useless, because the thing a person
+/// wants back is usually the last word they typed. What they expect is a word or a line, so a run
+/// of printable characters is one group, a separator ends it, `Enter` ends it, a run of deletions
+/// is a group of its own, and **any movement ends whatever was open**: the cursor moving means
+/// what comes next is a different edit, wherever it lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    /// Characters going in.
+    Typing,
+    /// Characters coming out.
+    Deleting,
+}
+
+/// A buffer and a cursor, as they were before a group of edits.
+///
+/// **A whole copy, not a delta**, and the trade is worth stating. A delta stack is what a large
+/// editor keeps: it costs the size of the change rather than the size of the file, and it costs a
+/// separate inverse for every kind of edit — an insert, a join, a split, and a replace that is
+/// two of those at once. Each is a way to be subtly wrong, and none of them is checkable by
+/// reading. A copy cannot be wrong about what it restores; what it costs is memory, bounded here
+/// by [`MAX_UNDO`] groups. **Trigger for deltas: a file where that bound bites** —
+/// `TODO(undo-deltas)`.
+///
+/// The selection is deliberately not kept. A selection is a gesture in progress rather than part
+/// of the text, and restoring one would make undo re-select something the person has since moved
+/// away from.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Snapshot {
+    lines: Vec<String>,
+    line: usize,
+    col: usize,
+}
+
+/// How many groups of edits a buffer can go back through.
+///
+/// Each is a copy of the whole buffer (see [`Snapshot`]), so this is the memory bound as well as
+/// the depth one. Sixty-four is far more than a person reaches for between saves and small enough
+/// that even a large file's history stays a fraction of what the editor already holds to draw it.
+pub const MAX_UNDO: usize = 64;
 
 impl Default for TextAreaState {
     fn default() -> Self {
@@ -830,6 +879,9 @@ impl Default for TextAreaState {
             goal: None,
             offset: 0,
             revision: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            group: None,
         }
     }
 }
@@ -930,6 +982,8 @@ impl TextAreaState {
     pub fn place(&mut self, line: usize, col: usize) {
         self.anchor = None;
         self.goal = None;
+        // A click is a movement, and ends a group for the same reason an arrow key does.
+        self.group = None;
         self.line = line.min(self.lines.len() - 1);
         let l = &self.lines[self.line];
         let mut c = col.min(l.len());
@@ -983,15 +1037,23 @@ impl TextAreaState {
 
     /// Insert `c` at the cursor, replacing any selection.
     pub fn insert(&mut self, c: char) {
+        self.begin(EditKind::Typing);
         self.delete_selection();
         self.lines[self.line].insert(self.col, c);
         self.col += c.len_utf8();
         self.goal = None;
         self.revision += 1;
+        // **A separator ends the group it is part of**, so a word and the space after it undo
+        // together and the next word is a step of its own. Ending the group *before* the space
+        // would make every space a group of one, and undo would hand the space back alone.
+        if !c.is_alphanumeric() {
+            self.group = None;
+        }
     }
 
     /// Split the line at the cursor, replacing any selection.
     pub fn newline(&mut self) {
+        self.begin(EditKind::Typing);
         self.delete_selection();
         let tail = self.lines[self.line].split_off(self.col);
         self.lines.insert(self.line + 1, tail);
@@ -999,12 +1061,147 @@ impl TextAreaState {
         self.col = 0;
         self.goal = None;
         self.revision += 1;
+        // A line is a group, which is the coarser half of "a word or a line".
+        self.group = None;
+    }
+
+    /// Start a group of `kind` if one is not already open, and forget the way forward.
+    ///
+    /// **Called before the edit, because the snapshot is of what came before it.** An edit that
+    /// will not happen must not call this: a snapshot pushed for a `Backspace` at the start of
+    /// the buffer is an undo step that visibly does nothing, which is worse than no step at all.
+    fn begin(&mut self, kind: EditKind) {
+        if self.group != Some(kind) {
+            let here =
+                Snapshot { lines: self.lines.clone(), line: self.line, col: self.col };
+            if self.undo.len() == MAX_UNDO {
+                self.undo.remove(0);
+            }
+            self.undo.push(here);
+            self.group = Some(kind);
+        }
+        // **Any edit abandons the way forward**, which is what makes redo a branch rather than a
+        // second history: typing after an undo means the undone text is not coming back, and a
+        // stack that kept it would offer to restore something since replaced.
+        self.redo.clear();
+    }
+
+    /// Close whatever group is open, so the next edit starts a new one.
+    ///
+    /// **For the boundaries this type cannot see.** Movement, a separator and `Enter` are edits,
+    /// and it closes groups on all three by itself — but *saving* is an application's event, and
+    /// it is exactly the boundary a person means: what they want back after a save is what they
+    /// have typed since it, not everything since the file was opened. Without this, typing a
+    /// word, saving, and typing another word left one group, and one undo emptied the buffer
+    /// back to the file's original contents. `check-login` found it, by byte count, from outside.
+    pub fn end_group(&mut self) {
+        self.group = None;
+    }
+
+    /// Go back one group of edits. `false` when there is nothing to go back to.
+    ///
+    /// **The revision moves**, so a buffer undone back to what is on disk still reads as
+    /// modified. That is deliberate and it is the safe direction: the alternative is comparing
+    /// the whole text against the file on every keystroke, and over-reporting only means a person
+    /// is asked before closing something that turned out to match — `TODO(undo-clean-revision)`.
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo.pop() else { return false };
+        self.redo.push(Snapshot { lines: self.lines.clone(), line: self.line, col: self.col });
+        self.restore(prev);
+        true
+    }
+
+    /// Come forward one group. `false` when there is nothing ahead.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else { return false };
+        self.undo.push(Snapshot { lines: self.lines.clone(), line: self.line, col: self.col });
+        self.restore(next);
+        true
+    }
+
+    /// Put a snapshot back, and end whatever group was open.
+    ///
+    /// The cursor is clamped rather than trusted: it came from this buffer, but restoring the
+    /// *other* stack's entry after a sequence of undos and redos is one arithmetic slip away
+    /// from an index that panics inside `text_area` on the next frame.
+    fn restore(&mut self, s: Snapshot) {
+        self.lines = s.lines;
+        self.line = s.line.min(self.lines.len().saturating_sub(1));
+        self.col = s.col.min(self.lines[self.line].len());
+        self.anchor = None;
+        self.goal = None;
+        self.group = None;
+        self.revision += 1;
+    }
+
+    /// Find `needle` after the cursor, wrapping once, and select it. `false` if it is nowhere.
+    ///
+    /// **After the cursor and wrapping**, which is what makes pressing the same key again walk
+    /// through every occurrence and come back to the first. An empty needle matches nothing
+    /// rather than everything: it is what the field holds before anything is typed, and a search
+    /// that jumped on each keystroke of an empty one would move the buffer under the person.
+    ///
+    /// The match is **selected**, not merely scrolled to. A cursor sitting silently at a hit
+    /// leaves the person to find it; a highlight says which of several this one is. The scrolling
+    /// is the widget's, which follows the cursor on the next frame.
+    pub fn find(&mut self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        // **From the next character after the cursor**, or a second press finds the match it is
+        // already sitting on.
+        //
+        // **Character, not byte.** `col + 1` lands *inside* a multi-byte character whenever the
+        // cursor is on one, and `str::get` of a range that starts there yields `None` — so the
+        // search silently skipped the rest of that line and wrapped to a match behind the
+        // cursor. It looked like "find went backwards", and the test below is what found it.
+        let text = &self.lines[self.line];
+        let mut from = (self.col + 1).min(text.len());
+        while from < text.len() && !text.is_char_boundary(from) {
+            from += 1;
+        }
+        let start = (self.line, from);
+        let hit = self.search_from(needle, start).or_else(|| self.search_from(needle, (0, 0)));
+        let Some((line, col)) = hit else { return false };
+        self.line = line;
+        self.col = col;
+        self.anchor = Some((line, col + needle.len()));
+        self.goal = None;
+        self.group = None;
+        true
+    }
+
+    /// The first occurrence of `needle` at or after `(line, col)`, searching to the end only.
+    ///
+    /// **Never spans a line break**, which is a limit rather than an oversight: lines are
+    /// separate `String`s here, and a needle containing one would have to be split and matched
+    /// piecewise. Nothing can type a newline into the find field, so it is unreachable from the
+    /// editor — stated so that the next caller does not assume otherwise.
+    fn search_from(&self, needle: &str, (line, col): (usize, usize)) -> Option<(usize, usize)> {
+        for (i, text) in self.lines.iter().enumerate().skip(line) {
+            let from = if i == line { col.min(text.len()) } else { 0 };
+            // `get` rather than a slice: `from` can land inside a multi-byte character, and this
+            // is reached with `col + 1` on every search.
+            if let Some(at) = text.get(from..).and_then(|tail| tail.find(needle)) {
+                return Some((i, from + at));
+            }
+        }
+        None
     }
 
     /// Delete backwards: the selection if there is one, else the character before the cursor,
     /// else join with the previous line.
     pub fn backspace(&mut self) -> bool {
+        // **The guard comes before the group**, so a `Backspace` that cannot do anything does not
+        // leave an undo step that visibly does nothing.
+        if self.selection().is_none() && self.col == 0 && self.line == 0 {
+            return false;
+        }
+        self.begin(EditKind::Deleting);
         if self.delete_selection() {
+            // Replacing a selection is its own thing, not a run of deletions: whatever comes
+            // next — usually the character being typed over it — starts a group of its own.
+            self.group = None;
             return true;
         }
         self.goal = None;
@@ -1032,7 +1229,16 @@ impl TextAreaState {
     /// Delete forwards: the selection, else the character after the cursor, else join with the
     /// next line.
     pub fn delete(&mut self) -> bool {
+        // As in `backspace`: nothing to remove is not an undo step.
+        if self.selection().is_none()
+            && self.col >= self.lines[self.line].len()
+            && self.line + 1 >= self.lines.len()
+        {
+            return false;
+        }
+        self.begin(EditKind::Deleting);
         if self.delete_selection() {
+            self.group = None;
             return true;
         }
         self.goal = None;
@@ -1129,7 +1335,11 @@ impl TextAreaState {
     /// **Shift starts a selection from where the cursor is**, and an unshifted movement drops
     /// one. That is the whole of the selection model: there is no separate "selecting" mode to
     /// get out of sync with what is on screen.
+    /// **A movement ends whatever group was open**, wherever it lands: the cursor moving means
+    /// what is typed next is a different edit, and a group that spanned one would undo two
+    /// separate pieces of text at once.
     fn before_move(&mut self, extend: bool) {
+        self.group = None;
         if extend {
             if self.anchor.is_none() {
                 self.anchor = Some((self.line, self.col));
@@ -2513,6 +2723,213 @@ mod tests {
     /// `abc` / `de` / `fghi`, cursor at the start.
     fn area() -> TextAreaState {
         TextAreaState::with_text("abc\nde\nfghi")
+    }
+
+    /// Type `text` into `a`, one character at a time, the way a person does.
+    fn type_text(a: &mut TextAreaState, text: &str) {
+        for c in text.chars() {
+            if c == '\n' {
+                a.newline();
+            } else {
+                a.insert(c);
+            }
+        }
+    }
+
+    // ---- undo and redo (M12 Part C) ----
+
+    #[test]
+    fn a_word_is_one_undo_step_and_so_is_a_line() {
+        // **The grouping is the decision, not the stack.** Per keystroke is unusable — undoing a
+        // sentence becomes forty presses — and per save is useless. A run of printable characters
+        // is one group, a separator ends it, and `Enter` ends it.
+        let mut a = TextAreaState::new();
+        type_text(&mut a, "hello world");
+        assert!(a.undo(), "there is something to undo");
+        assert_eq!(a.text(), "hello ", "the last word, and not the last letter");
+        assert!(a.undo());
+        assert_eq!(a.text(), "", "and the word before it, with its separator");
+        assert!(!a.undo(), "and then there is nothing");
+    }
+
+    #[test]
+    fn a_line_ends_a_group() {
+        // **`Enter` joins the group it lands in and closes it**, so the line you just typed —
+        // its text *and* its break — comes back in one step, and what you type on the next line
+        // is a step of its own. Splitting the break out would make undoing a line take two
+        // presses that look identical.
+        let mut a = TextAreaState::new();
+        type_text(&mut a, "one\ntwo");
+        assert!(a.undo());
+        assert_eq!(a.text(), "one\n", "the second line's word");
+        assert!(a.undo());
+        assert_eq!(a.text(), "", "then the first line and its break, together");
+        assert!(!a.undo());
+
+        // And a break typed after a movement is its own group, because the movement closed the
+        // one before it.
+        let mut a = TextAreaState::with_text("ab");
+        a.end(false);
+        a.newline();
+        a.insert('c');
+        assert!(a.undo());
+        assert_eq!(a.text(), "ab\n");
+        assert!(a.undo());
+        assert_eq!(a.text(), "ab");
+    }
+
+    #[test]
+    fn moving_ends_a_group_so_two_edits_undo_separately() {
+        // **Wherever it lands.** Without this, typing at one end of a line, moving to the other
+        // and typing again undoes both at once — two pieces of text a person put in two places.
+        let mut a = TextAreaState::with_text("ab");
+        a.end(false);
+        a.insert('X');
+        a.home(false);
+        a.insert('Y');
+        assert_eq!(a.text(), "YabX");
+        assert!(a.undo());
+        assert_eq!(a.text(), "abX", "only the edit after the move");
+        assert!(a.undo());
+        assert_eq!(a.text(), "ab");
+    }
+
+    #[test]
+    fn deleting_is_its_own_kind_of_group() {
+        // A run of deletions coalesces, and typing after them starts a new group rather than
+        // extending the one that was removing.
+        let mut a = TextAreaState::with_text("abcdef");
+        a.end(false);
+        a.backspace();
+        a.backspace();
+        assert_eq!(a.text(), "abcd");
+        a.insert('Z');
+        assert_eq!(a.text(), "abcdZ");
+        assert!(a.undo());
+        assert_eq!(a.text(), "abcd", "the typing, on its own");
+        assert!(a.undo());
+        assert_eq!(a.text(), "abcdef", "then both deletions together");
+    }
+
+    #[test]
+    fn an_edit_that_does_nothing_is_not_a_step() {
+        // A `Backspace` at the start of the buffer and a `Delete` at its end change nothing, and
+        // a snapshot for either is an undo press that visibly does nothing — which reads as a
+        // broken undo rather than an empty history.
+        let mut a = TextAreaState::with_text("ab");
+        assert!(!a.backspace(), "nothing before the cursor");
+        assert!(!a.undo(), "and nothing to undo");
+        a.end(false);
+        a.down(false);
+        a.end(false);
+        assert!(!a.delete(), "nothing after it");
+        assert!(!a.undo());
+    }
+
+    #[test]
+    fn a_boundary_the_buffer_cannot_see_can_still_be_drawn() {
+        // A save is the boundary this exists for: what a person wants back afterwards is what
+        // they have typed *since*, and without an explicit end the whole session is one group.
+        let mut a = TextAreaState::new();
+        type_text(&mut a, "first");
+        a.end_group();
+        type_text(&mut a, "second");
+        assert!(a.undo());
+        assert_eq!(a.text(), "first", "only what came after the boundary");
+        assert!(a.undo());
+        assert_eq!(a.text(), "");
+    }
+
+    #[test]
+    fn redo_comes_forward_and_a_new_edit_abandons_it() {
+        let mut a = TextAreaState::new();
+        type_text(&mut a, "one two");
+        a.undo();
+        assert_eq!(a.text(), "one ");
+        assert!(a.redo(), "and forward again");
+        assert_eq!(a.text(), "one two");
+
+        // **Typing after an undo is a branch**, so what was undone is not coming back.
+        a.undo();
+        assert_eq!(a.text(), "one ");
+        a.insert('X');
+        assert!(!a.redo(), "the way forward is gone");
+        assert_eq!(a.text(), "one X");
+    }
+
+    #[test]
+    fn the_history_is_bounded_and_drops_the_oldest() {
+        // Each step is a copy of the whole buffer, so the depth bound is the memory bound.
+        let mut a = TextAreaState::new();
+        for i in 0..MAX_UNDO + 10 {
+            a.insert(char::from(b'a' + (i % 26) as u8));
+            // A separator between each, so every character is its own group.
+            a.insert(' ');
+        }
+        let mut steps = 0;
+        while a.undo() {
+            steps += 1;
+        }
+        assert_eq!(steps, MAX_UNDO, "the oldest go, and the bound holds");
+        assert_ne!(a.text(), "", "so the very beginning is not reachable, which the cap means");
+    }
+
+    #[test]
+    fn undoing_marks_the_buffer_changed() {
+        // `revision` is what an editor derives "modified" from, and undo has to move it or a
+        // buffer taken back to something else would read as matching the file.
+        let mut a = TextAreaState::new();
+        a.insert('x');
+        let after_typing = a.revision();
+        a.undo();
+        assert_ne!(a.revision(), after_typing);
+    }
+
+    // ---- find (M12 Part C) ----
+
+    #[test]
+    fn find_walks_forward_through_every_match_and_wraps() {
+        let mut a = TextAreaState::with_text("one two
+three two
+two");
+        assert!(a.find("two"));
+        assert_eq!(a.cursor(), (0, 4), "the first, after the cursor");
+        assert!(a.find("two"));
+        assert_eq!(a.cursor(), (1, 6), "the next");
+        assert!(a.find("two"));
+        assert_eq!(a.cursor(), (2, 0));
+        assert!(a.find("two"), "and round again");
+        assert_eq!(a.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn find_selects_what_it_found() {
+        // A cursor sitting silently at a hit leaves the person to spot it; a highlight says which
+        // of several this one is.
+        let mut a = TextAreaState::with_text("alpha beta");
+        assert!(a.find("beta"));
+        assert_eq!(a.selected_text().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn find_answers_no_for_what_is_not_there_and_for_nothing() {
+        let mut a = TextAreaState::with_text("alpha");
+        assert!(!a.find("omega"), "absent");
+        assert_eq!(a.cursor(), (0, 0), "and the cursor did not move");
+        // An empty needle is what the field holds before anything is typed; matching everything
+        // would move the buffer under the person on the way to their first character.
+        assert!(!a.find(""));
+        assert_eq!(a.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn find_does_not_split_a_multi_byte_character() {
+        // The search starts one byte past the cursor, and that byte can be inside a character.
+        let mut a = TextAreaState::with_text("é and é");
+        assert!(a.find("é"), "the second one");
+        assert_eq!(a.cursor(), (0, 7));
+        assert!(a.find("é"), "and back to the first");
+        assert_eq!(a.cursor(), (0, 0));
     }
 
     /// How many `Fill`s of `colour` the tree holds — the caret is one, and a selection's

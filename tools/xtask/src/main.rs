@@ -2904,6 +2904,69 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("/home>")?;
     println!("  ok: the shell read back what the editor saved, from outside it");
 
+    // 8b. **Undo, redo, and find** (M12 Part C). The grouping is the decision this part makes,
+    //     and the gate asserts it the only way that cannot be argued with: **by byte count, from
+    //     outside**. Two characters typed together are one group, so one undo takes both — seven
+    //     bytes on disk rather than eight — and a redo brings both back. An implementation that
+    //     grouped per *keystroke* would leave nine, and one that grouped per *save* would leave
+    //     seven after the redo as well.
+    for c in "ab".chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        session.expect("nxedit: buffer rev ")?;
+    }
+
+    // Ctrl+Z. The revision moves on an undo, which is what makes an undone buffer read as
+    // modified — the editor has to ask before closing something that is no longer the file.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "z")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: buffer rev ")?;
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    // Seven: `nitrox` and the newline the editor adds. Nine would mean the undo took one
+    // character; the group is a word.
+    session.expect("nxedit: saved /home/papers/notes.txt - 7 bytes")?;
+    session.send("open ./papers/notes.txt")?;
+    session.expect(TYPED)?;
+    session.expect("/home>")?;
+    println!("  ok: one undo took the whole group, and the shell read back the shorter file");
+
+    // Ctrl+Y brings it back, and the file grows by exactly what the undo removed.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "y")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: buffer rev ")?;
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: saved /home/papers/notes.txt - 9 bytes")?;
+    session.send("open ./papers/notes.txt")?;
+    session.expect(&format!("{TYPED}ab"))?;
+    session.expect("/home>")?;
+    println!("  ok: and redo put it back, byte for byte");
+
+    // **Find is the second thing that wants the keys** — the shape the save-as field
+    // established, which is why it is the same field. What is typed goes to it and not to the
+    // buffer, and the receipt is where the match landed rather than what was looked for.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "f")?;
+    qmp.send_key("ctrl", false)?;
+    for (i, c) in "tro".chars().enumerate() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxedit: find so far {} chars", i + 1))?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("nxedit: find hit at line 0")?;
+    // Escape ends the mode and gives the keys back to the buffer — asserted by the next thing
+    // typed reaching it, which is step 9's drag and everything after.
+    press(&mut qmp, "esc")?;
+    println!("  ok: find took the keys, matched, and gave them back");
+
     // 9. **A file dragged from the browser onto the editor** (M10 Part E) — the part every
     //    application above exists to make honest: two real windows, one payload, and no test
     //    client on either end.

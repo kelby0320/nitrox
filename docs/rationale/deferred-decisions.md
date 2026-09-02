@@ -1455,6 +1455,20 @@ Nothing is missing meanwhile — moving a file into a folder is a drag, which is
 reach for first — and the maintainer asked the question that produced this entry rather than
 assuming an answer (2026-09-02).
 
+**Undo keeps whole copies rather than deltas — `TODO(undo-deltas)`.** `TextAreaState`'s history
+is [`MAX_UNDO`] snapshots of the whole buffer, which is the depth bound and the memory bound at
+once. A delta stack costs the size of the *change* instead, and costs a separate inverse for every
+kind of edit — an insert, a join, a split, and a replace that is two of those at once. Each is a
+way to be subtly wrong and none of them is checkable by reading; a copy cannot be wrong about what
+it restores. **Trigger: a file where sixty-four copies of it is a number anybody notices.**
+
+**An undone buffer still reads as modified — `TODO(undo-clean-revision)`.** "Modified" is derived
+from `TextAreaState::revision`, and undo moves it — so undoing back to exactly what is on disk
+leaves the editor saying the buffer has changed, and closing it asks a question with no answer
+worth giving. It is the safe direction: the alternative is comparing the whole text against the
+file on every keystroke, and over-reporting costs a person one extra dialog where under-reporting
+costs them their work. **Trigger: somebody finds the extra question annoying enough to say so.**
+
 **A dialog is not kept above the window it belongs to — `TODO(dialog-stacking)`.** A `dialog` is created on top of the stack and takes
 focus, so it starts above its parent; click the parent and the compositor raises it *over* its own
 question, which every desktop this borrows from prevents. Nothing is lost — the dialog is still

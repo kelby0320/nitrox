@@ -21933,3 +21933,45 @@ program rather than in what a server happens to return.
 The generalisation: **a promise about what an operation will not do belongs where the operation is,
 not in an error arm that assumes the layer below reports what you hoped.** Reading the callee's
 documentation is what settles which of those you have written.
+
+## 2026-09-02 — M12 Part C: undo is a grouping decision, and a save is a boundary
+
+The plan said the decision was the grouping and not the stack, and that turned out to be exactly
+right: the stack is thirty lines and the grouping is five rules, each of which somebody would
+notice if it were missing.
+
+**A run of printable characters is one group. A separator ends it** — so a word and the space after
+it come back together and the next word is its own step; ending the group *before* the space would
+make every space a group of one and hand it back alone. **`Enter` ends it**, so a line and its
+break are one, and splitting them would make undoing a line take two presses that look identical.
+**Deletions are a different kind**, so typing after deleting does not extend the deletion. **Any
+movement ends whatever was open**, wherever it lands, because the cursor moving means what comes
+next is a different edit. And **an edit that would do nothing opens no group at all**: a snapshot
+pushed for a `Backspace` at the start of the buffer is an undo press that visibly does nothing,
+which reads as a broken undo rather than an empty history.
+
+**The sixth rule is one the buffer cannot see, and the gate is what found it.** `TextAreaState`
+knows about keystrokes; it does not know about saves. So `end_group` is published and `nxedit`
+calls it after a successful write — because what a person wants back after saving is what they
+have typed *since*, not everything since the file was opened. Without it, `check-login`'s first run
+typed six characters into an empty file, saved, typed two more, and one undo emptied the buffer.
+The assertion that caught it was a **byte count read back by the serial shell**, which is the same
+"ask somebody other than the accused" shape the editor's save has used since M10 Part D.
+
+**Snapshots rather than deltas**, stated as a trade rather than assumed. A delta stack costs the
+size of the change instead of the size of the file, and costs a separate inverse for every kind of
+edit — an insert, a join, a split, and a replace that is two of those at once. Each is a way to be
+subtly wrong and none of them is checkable by reading; a copy cannot be wrong about what it
+restores. Bounded at `MAX_UNDO`, with `TODO(undo-deltas)` and a trigger.
+
+**Find is the same field the save-as prompt is**, which the plan asked for and which is worth
+saying plainly: a second copy of "a mode in which the keys are the field's" would be two places
+that could disagree about what `Esc` does. `Field::{Naming, Finding}` is one mode with two
+purposes, and its receipt names which — a gate waiting on "name so far" while somebody types a
+search would wait for ever.
+
+**And a bug the tests found that reading would not have.** The search started one *byte* past the
+cursor. That lands inside a multi-byte character whenever the cursor is on one, `str::get` of a
+range starting there yields `None`, the rest of the line was silently skipped, and find appeared to
+go *backwards* — wrapping to a match behind the cursor. The test that caught it was the one written
+for a property rather than for a path: "find does not split a multi-byte character".
