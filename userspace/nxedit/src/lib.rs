@@ -34,7 +34,8 @@ use librsproto::surface::{
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{
-    Edge, Element, Insets, dock, docked, offset, padding, row, sized, stack, text,
+    Edge, Element, Insets, column, dock, docked, offset, padding, row, sized, stack, text,
+    with_spacing,
 };
 use libui::widget::{
     GRIP_W, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState, TitleButtons,
@@ -65,6 +66,70 @@ pub const GRIP_KEY: u64 = 4;
 pub const STRIP_KEY: u64 = 5;
 /// The element key on the status text.
 pub const STATUS_KEY: u64 = 6;
+
+/// The element key on the confirmation dialog's title bar.
+///
+/// **A separate window's keys, in the same space.** Keys are per *tree*, and the dialog is a
+/// tree of its own — nothing would break if these repeated the numbers above. They do not,
+/// because a key that appears in two trees is a thing two `hovered ==` comparisons can both
+/// match, and the hover the router reports is already one of the two id spaces that look alike
+/// (M11 Part E batch 3).
+pub const CONFIRM_TITLE_KEY: u64 = 10;
+/// The element key on the dialog's question.
+pub const CONFIRM_TEXT_KEY: u64 = 11;
+/// The element key on the dialog's button strip.
+pub const CONFIRM_STRIP_KEY: u64 = 12;
+/// The element key on the dialog's *discard* button.
+pub const CONFIRM_DISCARD_KEY: u64 = 13;
+/// The element key on the dialog's *keep editing* button.
+pub const CONFIRM_KEEP_KEY: u64 = 14;
+
+/// The confirmation dialog's width in pixels.
+///
+/// **A size, not a measurement**, which is the opposite of what a menu does — and the reason is
+/// the gate. `check-login` has to press two buttons in this window, and it aims with arithmetic
+/// off the origin the shell logs; buttons that resized with the name of the file being edited
+/// would move under it. `widget-toolkit.md` §11's "chrome metrics are not themeable" is the same
+/// argument one level up (M11 decision 2), and the two buttons below share the width equally so
+/// that "a quarter across and three quarters across" is all the gate has to know.
+pub const CONFIRM_W: u32 = 340;
+/// Its height in pixels.
+pub const CONFIRM_H: u32 = 132;
+/// The margin between the dialog's frame and the button strip inside it.
+pub const CONFIRM_PAD: u32 = 12;
+/// The gap between the dialog's two buttons.
+pub const CONFIRM_GAP: u32 = 8;
+/// How tall each of the dialog's buttons is.
+pub const CONFIRM_BUTTON_H: u32 = 26;
+
+/// How wide each of them is — half of what is left after the frame, the margins and the gap.
+///
+/// **Published, with the three below, because `check-login` presses these buttons and cannot
+/// link this crate.** It is a host tool in another workspace, so it hardcodes coordinates the
+/// way it already hardcodes `TITLE_BAR_H` and a list's row height — and the test beside these
+/// constants is what pins the numbers it hardcodes to the tree that is actually built. Deriving
+/// them here rather than writing four literals means a change to the padding moves the gate's
+/// target and the test that guards it together.
+pub const CONFIRM_BUTTON_W: u32 =
+    (CONFIRM_W - libui::widget::WINDOW_FRAME_W - 2 * CONFIRM_PAD - CONFIRM_GAP) / 2;
+
+/// The centre of the *discard* button, in the dialog window's own coordinates.
+pub const CONFIRM_DISCARD_CX: i32 =
+    (libui::widget::WINDOW_CONTENT_X + CONFIRM_PAD + CONFIRM_BUTTON_W / 2) as i32;
+
+/// The centre of the *keep editing* button, likewise.
+pub const CONFIRM_KEEP_CX: i32 = (libui::widget::WINDOW_CONTENT_X
+    + CONFIRM_PAD
+    + CONFIRM_BUTTON_W
+    + CONFIRM_GAP
+    + CONFIRM_BUTTON_W / 2) as i32;
+
+/// The vertical centre of both, measured up from the dialog's bottom edge.
+pub const CONFIRM_BUTTON_CY: i32 = (CONFIRM_H
+    - libui::widget::WINDOW_BORDER
+    - libui::widget::WINDOW_FRAME
+    - CONFIRM_PAD
+    - CONFIRM_BUTTON_H / 2) as i32;
 
 /// The window's size in pixels at startup, before any manager places it.
 pub const START_SIZE: Size = Size::new(560, 420);
@@ -150,6 +215,29 @@ pub struct App {
     resize_requested: Option<u32>,
     /// The editor has been asked to close, and the binary owes an exit.
     closing: bool,
+    /// Somebody asked this window to close over an unsaved buffer, and the person has not
+    /// answered yet.
+    ///
+    /// **`true` is a second window**, not an overlay. `Surface::CloseRequested` says outright
+    /// that "a client that wants to ask 'save first?' opens a dialog and closes when that
+    /// resolves"; until M12 Part A no application had ever created one, so this editor answered
+    /// every close by exiting and the buffer went with it. The binary reads this each frame and
+    /// opens or destroys a `Role::Dialog` window to match — the same shape `nxterm` uses for its
+    /// menu, and the reason [`libui::window::Child`] exists.
+    confirming: bool,
+    /// Whether the *dialog* holds the keyboard, which its own title bar shows.
+    ///
+    /// **Not [`focused`](Self::focused)**, which is the main window's: a dialog taking focus
+    /// from its parent sends both halves down one channel, and a title bar drawn from the wrong
+    /// one would show two active windows or none.
+    pub confirm_focused: bool,
+    /// The dialog's title bar was dragged, and the binary owes the compositor a `StartMove` **on
+    /// the dialog's window**.
+    ///
+    /// A second flag rather than a second use of [`move_requested`](Self::move_requested),
+    /// because the two name different windows: an interactive move is a request on one window
+    /// id, and one flag would have moved whichever window the binary happened to pass.
+    confirm_move_requested: bool,
     /// A name being typed for a buffer that has never had one.
     ///
     /// **`Some` is a mode**, and it is the first one this editor has: while a name is being typed
@@ -184,7 +272,18 @@ pub enum Msg {
     /// A title-bar button asking the manager for a window state.
     RequestState(u32),
     /// Somebody wants this window gone — its own close button, or the shell asking.
+    ///
+    /// **Over an unsaved buffer this asks rather than closes**, which is the whole of M12 Part
+    /// A: it raises [`App::confirming`] and the binary turns that into a real dialog window.
+    /// Only [`Msg::Discard`] ends the run.
     Close,
+    /// The dialog's *discard* answer: close, and the buffer goes with it.
+    Discard,
+    /// The dialog's *keep editing* answer, its close button, and `Esc`: the question goes away
+    /// and nothing else happens.
+    KeepEditing,
+    /// The dialog's title bar was dragged.
+    DragConfirm,
 }
 
 impl App {
@@ -212,6 +311,9 @@ impl App {
             move_requested: false,
             resize_requested: None,
             closing: false,
+            confirming: false,
+            confirm_focused: true,
+            confirm_move_requested: false,
         }
     }
 
@@ -379,8 +481,30 @@ impl App {
             // widget took the drop is all the toolkit can say. The binary pairs them.
             Msg::Dropped => {}
             Msg::DragWindow => self.move_requested = true,
+            Msg::DragConfirm => self.confirm_move_requested = true,
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
-            Msg::Close => self.closing = true,
+            // **A modified buffer never closes on this message, however many times it
+            // arrives.** The obvious spelling — "ask if we are not already asking, otherwise
+            // close" — turns a *second* `CloseRequested` into an exit, and a shell that asks
+            // twice is exactly what a person clicking a taskbar entry twice produces. So the
+            // only route out of a modified buffer is the answer the person gave.
+            Msg::Close => {
+                if self.modified() {
+                    self.confirming = true;
+                } else {
+                    self.closing = true;
+                }
+            }
+            Msg::Discard => {
+                self.confirming = false;
+                self.closing = true;
+            }
+            // **The status strip says so**, because a dialog that vanishes with nothing changed
+            // is indistinguishable from one that took the other answer.
+            Msg::KeepEditing => {
+                self.confirming = false;
+                self.status = String::from("still editing — nothing was discarded");
+            }
             Msg::RequestState(s) => {
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
                     self.maximized = s == WINDOW_STATE_MAXIMIZED;
@@ -463,6 +587,44 @@ impl App {
     /// Whether the editor has been asked to close.
     pub fn closing(&self) -> bool {
         self.closing
+    }
+
+    /// Whether a confirmation is being asked — the binary opens a dialog window to match.
+    pub fn confirming(&self) -> bool {
+        self.confirming
+    }
+
+    /// Whether a `StartMove` is owed **on the dialog's window**. Clears the record.
+    pub fn take_confirm_move(&mut self) -> bool {
+        core::mem::take(&mut self.confirm_move_requested)
+    }
+
+    /// The dialog could not be opened, so the question cannot be asked.
+    ///
+    /// **The window stays, and the buffer stays.** The two alternatives are both worse: exiting
+    /// would discard unsaved work on the strength of a failed window creation, and leaving
+    /// [`confirming`](Self::confirming) set would make an editor that can never be closed at
+    /// all, because every later `Close` would try to open the same dialog again. So the close is
+    /// abandoned and the strip says why — a person can save and close, which is the thing they
+    /// were being asked about.
+    pub fn confirm_failed(&mut self) {
+        self.confirming = false;
+        self.status = String::from("could not ask about the unsaved buffer — save, then close");
+    }
+
+    /// What the dialog does with a key.
+    ///
+    /// **`Esc` only, and it is the cautious answer.** A modal a person cannot dismiss from the
+    /// keyboard is a modal that has taken the keyboard hostage, and `Esc` is what the naming
+    /// field already uses for "never mind" — one rule for the two places in this editor where
+    /// the keys stop being the buffer's. There is deliberately no key for *discard*: `Enter` is
+    /// the obvious candidate and the obvious accident, since the question arrives while somebody
+    /// is typing.
+    pub fn confirm_key(&self, k: KeyEvent) -> Option<Msg> {
+        if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
+            return None;
+        }
+        (k.keycode == NAME_CANCEL).then_some(Msg::KeepEditing)
     }
 
     /// The size of this window in pixels.
@@ -590,6 +752,85 @@ impl App {
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
         );
         stack(alloc::vec![body, grip])
+    }
+
+    /// The element tree for the confirmation dialog — a **second window's** whole face.
+    ///
+    /// **Sized rather than measured**, which is why the frame below is `window_frame` like every
+    /// other window's rather than something that could report a natural size: `libui`'s `Dock`
+    /// measures as everything it is offered, deliberately, so a tree containing one has no
+    /// natural size at all and [`libui::window::Child::open`] refuses it. Wrapping the whole
+    /// thing in a fixed `sized` is what makes the measurement exact — see [`CONFIRM_W`] for why
+    /// a dialog wants a fixed size in the first place.
+    ///
+    /// **The name is on its own line.** Folded into the question it would push a long file name
+    /// off the right edge and take the `?` with it, so what clips is the name and never the
+    /// sentence.
+    pub fn confirm_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        let title = title_bar(
+            "Unsaved changes",
+            self.confirm_focused,
+            Msg::DragConfirm,
+            // **One button, and it is the cautious answer.** Minimise and maximise are absent
+            // rather than present-and-inert: a control that looks live and is not is the defect
+            // M8's overview shipped three of, and `title_bar` draws only the buttons it is given
+            // a message for. Closing the question is *keep editing* — the dialog's own frame
+            // must not be a third way to discard a buffer.
+            TitleButtons {
+                minimise: None,
+                maximise: None,
+                close: Some(Msg::KeepEditing),
+            },
+            ui,
+        )
+        .key(CONFIRM_TITLE_KEY);
+
+        let name = if self.name.is_empty() { "untitled" } else { self.name.as_str() };
+        let question = padding(
+            Insets::all(CONFIRM_PAD),
+            column(alloc::vec![
+                text("Discard unsaved changes?"),
+                text(String::from(name)),
+            ]),
+        )
+        .key(CONFIRM_TEXT_KEY);
+
+        // **Two buttons sharing the width equally**, so that where they are is arithmetic
+        // anybody can do: a quarter across and three quarters across, at a fixed height off the
+        // bottom. `check-login` presses both, and it aims from the origin the shell logs.
+        //
+        // **Two answers and not three** — `TODO(dialog-save-answer)`. *Save and close* is the
+        // obvious third, and it is not a button: an untitled buffer has nowhere to save to, so
+        // it is the naming field's flow and then a close. See `deferred-decisions.md`.
+        let answer = |label: &str, msg: Msg, key: u64| {
+            button(
+                label,
+                msg,
+                WidgetState { hovered: hovered == Some(key), ..Default::default() },
+                ui,
+            )
+            .key(key)
+            .flex(1)
+        };
+        let strip = sized(
+            Size::new(0, CONFIRM_BUTTON_H + CONFIRM_PAD),
+            padding(
+                Insets { top: 0, right: CONFIRM_PAD, bottom: CONFIRM_PAD, left: CONFIRM_PAD },
+                with_spacing(
+                    row(alloc::vec![
+                        answer("discard", Msg::Discard, CONFIRM_DISCARD_KEY),
+                        answer("keep editing", Msg::KeepEditing, CONFIRM_KEEP_KEY),
+                    ]),
+                    CONFIRM_GAP,
+                ),
+            ),
+        )
+        .key(CONFIRM_STRIP_KEY);
+
+        sized(
+            Size::new(CONFIRM_W, CONFIRM_H),
+            window_frame(title, dock(alloc::vec![docked(Edge::Bottom, strip)], question), ui),
+        )
     }
 }
 
@@ -891,5 +1132,207 @@ mod tests {
         // The constant is a literal, so it is pinned against the table it has to agree with
         // rather than against the comment beside it.
         assert_eq!(libinput::keymap::to_char(SAVE_KEYCODE, 0), Some(b's'));
+    }
+
+    // ---- M12 Part A: the confirmation ----
+
+    #[test]
+    fn closing_a_modified_buffer_asks_rather_than_exiting() {
+        // **The rule the whole part exists for.** Until M12 Part A this editor answered
+        // `CloseRequested` by exiting, and its own comment said so: "an editor with somewhere to
+        // put a question would ask it — and this one has no dialog to ask in".
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Close);
+        assert!(a.confirming(), "a modified buffer asks");
+        assert!(!a.closing(), "and does not exit while it is asking");
+    }
+
+    #[test]
+    fn closing_a_clean_buffer_asks_nothing() {
+        // The other half, and the one that keeps the ordinary close a single click: a buffer
+        // that matches its file has nothing to lose, so there is nothing to ask about.
+        let mut a = app();
+        a.update(Msg::Close);
+        assert!(!a.confirming(), "nothing to ask about");
+        assert!(a.closing());
+    }
+
+    #[test]
+    fn a_second_close_request_does_not_discard_the_buffer() {
+        // **The control for the obvious wrong spelling.** "Ask if we are not already asking,
+        // otherwise close" reads fine and turns the *second* `CloseRequested` into an exit —
+        // and a second one is exactly what a person clicking a taskbar entry twice produces,
+        // which since this part is also how they force a wedged window shut. With that spelling
+        // this test fails on the `closing` assertion.
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Close);
+        a.update(Msg::Close);
+        assert!(a.confirming(), "still asking");
+        assert!(!a.closing(), "a repeated ask is not an answer");
+    }
+
+    #[test]
+    fn only_discard_ends_the_run() {
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Close);
+
+        // Keeping ends the question and nothing else — the buffer is byte-for-byte what it was.
+        let text = a.text();
+        a.update(Msg::KeepEditing);
+        assert!(!a.confirming(), "the question is answered");
+        assert!(!a.closing(), "and the answer was no");
+        assert_eq!(a.text(), text);
+        assert!(a.modified(), "keeping does not mark it saved");
+        assert!(a.status().contains("still editing"), "status was {:?}", a.status());
+
+        // Asking again, and discarding this time.
+        a.update(Msg::Close);
+        assert!(a.confirming());
+        a.update(Msg::Discard);
+        assert!(!a.confirming(), "the dialog goes when it is answered");
+        assert!(a.closing());
+    }
+
+    #[test]
+    fn saving_removes_the_reason_to_ask() {
+        // Derived rather than remembered: `confirming` is decided by `modified()` at the moment
+        // of the close, so a save between the two makes the question go away by itself.
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Save);
+        let owed = a.take_save().expect("a save was asked for");
+        a.saved(Ok(owed.len()));
+        assert!(!a.modified());
+
+        a.update(Msg::Close);
+        assert!(!a.confirming(), "nothing unsaved to ask about");
+        assert!(a.closing());
+    }
+
+    #[test]
+    fn the_dialog_answers_escape_and_nothing_else() {
+        // **`Esc` because a modal a keyboard cannot dismiss has taken the keyboard hostage**,
+        // and nothing else because `Enter` is the obvious accident: the question arrives while
+        // somebody is typing.
+        let a = app();
+        let ev = |code: u16, pressed: u16| KeyEvent::new(1, code, pressed, 0);
+        assert_eq!(a.confirm_key(ev(NAME_CANCEL, KEY_DOWN)), Some(Msg::KeepEditing));
+        assert_eq!(a.confirm_key(ev(NAME_CONFIRM, KEY_DOWN)), None, "Enter must not discard");
+        assert_eq!(a.confirm_key(ev(KEY_X, KEY_DOWN)), None);
+        // A release is not a press. Without this guard `Esc` would answer twice, and the second
+        // answer would arrive after the window it belongs to had been destroyed.
+        assert_eq!(a.confirm_key(ev(NAME_CANCEL, 0)), None, "a release is not an answer");
+    }
+
+    #[test]
+    fn a_dialog_that_will_not_open_leaves_the_window_alone() {
+        // **Neither of the two tempting failures.** Exiting would discard unsaved work because a
+        // window could not be created; staying `confirming` would make an editor that can never
+        // be closed, since every later `Close` would try the same failing creation again.
+        let mut a = app();
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Close);
+        a.confirm_failed();
+        assert!(!a.confirming());
+        assert!(!a.closing(), "a failed dialog must not discard the buffer");
+        assert!(a.status().contains("save, then close"), "status was {:?}", a.status());
+        // And the editor is still usable: a later save works.
+        a.update(Msg::Save);
+        assert!(a.take_save().is_some());
+    }
+
+    /// A fake face: every character an 8x16 box, which is all these tests need.
+    const CELL: libui::layout::FixedCell = libui::layout::FixedCell { w: 8, h: 16 };
+
+    #[test]
+    fn the_dialog_measures_to_exactly_the_size_it_declares() {
+        // **What lets it be a window at all.** `libui::window::Child::open` sizes a child window
+        // from what its tree measures, and `Node::Dock` measures as *everything it is offered* —
+        // deliberately, since a dock's job is to divide a given area. `window_frame` contains
+        // one, so without the fixed `sized` wrapper this tree measures to the constraint's
+        // maximum and `Child::open` refuses it. Delete the wrapper and this fails naming a
+        // number in the hundreds of millions.
+        let a = app();
+        let ui = a.confirm_view(&UiTheme::default(), None);
+        let got = libui::layout::measure(
+            &ui,
+            libui::layout::Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)),
+            &CELL,
+        );
+        assert_eq!(got, Size::new(CONFIRM_W, CONFIRM_H));
+    }
+
+    #[test]
+    fn the_published_button_centres_are_where_the_buttons_are() {
+        // **This is what `check-login` aims at.** The gate cannot link this crate, so it
+        // hardcodes these four numbers the way it already hardcodes a title bar's height — and
+        // this test is what stops them being four numbers nothing checks. A press *and* a
+        // release, because a click is the release: pressing alone proves only that something is
+        // under the point.
+        let a = app();
+        let ui = a.confirm_view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&ui, Rect::new(0, 0, CONFIRM_W, CONFIRM_H), &CELL);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&ui, &l).expect("the dialog is diffable");
+        let mut router = libui::route::Router::new();
+
+        let click = |r: &mut libui::route::Router, x: i32, y: i32| {
+            let at = |flags: u16, buttons: u16| librsproto::surface::PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons,
+                flags,
+                x,
+                y,
+                ..Default::default()
+            };
+            r.pointer(&tree, &ui, &l, at(librsproto::surface::POINTER_PRESSED, 1));
+            r.pointer(&tree, &ui, &l, at(0, 0)).0
+        };
+
+        assert_eq!(
+            click(&mut router, CONFIRM_DISCARD_CX, CONFIRM_BUTTON_CY),
+            alloc::vec![Msg::Discard],
+        );
+        assert_eq!(
+            click(&mut router, CONFIRM_KEEP_CX, CONFIRM_BUTTON_CY),
+            alloc::vec![Msg::KeepEditing],
+        );
+        // And the two are not the same button: a layout that collapsed one of them would make
+        // both presses land on whichever survived, and both assertions above would still pass.
+        assert!(CONFIRM_KEEP_CX - CONFIRM_DISCARD_CX >= CONFIRM_BUTTON_W as i32);
+    }
+
+    #[test]
+    fn the_dialogs_close_button_keeps_the_buffer() {
+        // **A dialog's own frame must not be a third way to discard.** `title_bar` draws only
+        // the buttons it is given a message for, so the question here is which message the one
+        // button carries — and the cautious answer is the only defensible default for a control
+        // whose meaning is "make this go away".
+        let a = app();
+        let ui = a.confirm_view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&ui, Rect::new(0, 0, CONFIRM_W, CONFIRM_H), &CELL);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&ui, &l).expect("the dialog is diffable");
+        let mut router = libui::route::Router::new();
+        // The rightmost title-bar button, measured the way every gate in this tree measures one.
+        let x = CONFIRM_W as i32 - libui::widget::WINDOW_CONTENT_X as i32
+            - (libui::widget::TITLE_BUTTON_W / 2) as i32;
+        let y = (libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H / 2) as i32;
+        let at = |flags: u16, buttons: u16| librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons,
+            flags,
+            x,
+            y,
+            ..Default::default()
+        };
+        router.pointer(&tree, &ui, &l, at(librsproto::surface::POINTER_PRESSED, 1));
+        let (msgs, _) = router.pointer(&tree, &ui, &l, at(0, 0));
+        assert_eq!(msgs, alloc::vec![Msg::KeepEditing]);
     }
 }

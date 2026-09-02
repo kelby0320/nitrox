@@ -1044,6 +1044,11 @@ impl WindowStack {
     /// A window that is already topmost is left alone and reports **empty** damage: the stack
     /// did not change, so nothing needs repainting. Click-to-focus raises on every press,
     /// including the tenth press on the same window.
+    ///
+    /// **A window's transients do not ride up with it, and nothing keeps them above it** —
+    /// `TODO(dialog-stacking)`. Raising a parent puts it over its own `dialog`, which every
+    /// desktop this borrows from prevents; see `deferred-decisions.md` for why M12 Part A did
+    /// not need it and what would make it necessary.
     pub fn raise(&mut self, id: u32) -> Result<Damage, StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         if i + 1 == self.windows.len() {
@@ -1177,6 +1182,12 @@ impl WindowStack {
     /// The topmost window that may take keyboard focus, if any.
     ///
     /// Panels are skipped: clicking the clock must not steal input from the terminal.
+    ///
+    /// **There is no input-exclusive window** — `TODO(dialog-modality)`. A `dialog` is the
+    /// topmost focusable one while it is up and stops being so the moment anything else is
+    /// raised, so a confirmation does not prevent its parent from being typed into. Modality
+    /// would be a rule here and in routing rather than anything a client could draw; see
+    /// `deferred-decisions.md` for the trigger.
     pub fn focus_candidate(&self) -> Option<u32> {
         // **Unconfigured windows are not candidates**, for the same reason they are not
         // composited: the compositor has decided they are not on screen yet, and giving the

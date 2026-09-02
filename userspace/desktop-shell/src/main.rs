@@ -1719,14 +1719,28 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // of truth about a rectangle, and the rectangle a window returns to is a decision — this is
     // the process that made it.
     let mut restore: alloc::vec::Vec<(u32, (i32, i32, u32, u32))> = alloc::vec::Vec::new();
-    // Windows asked to close, and when to stop waiting for them.
+    // Windows already asked to close, whose next middle-click destroys them.
     //
     // **Asked first, insisted on afterwards.** A window holds a process's work, and a taskbar
     // that destroyed it would take the decision away from the only participant that knows
     // whether that matters. A client that ignores the request gets `Manage::Close` instead,
     // which is the only answer available to a desktop whose applications draw their own chrome
     // (M9 Part C).
-    let mut closing: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
+    //
+    // **What insisting waits for is the person, not a clock** (M12 Part A). This was a
+    // two-second grace period, and it was safe for exactly as long as no client could decline:
+    // every application in the tree answered `CloseRequested` by exiting, so the timer never
+    // fired outside a wedge. The editor's confirmation is the first client that deliberately
+    // does not answer — it is asking the person the shell's own question — and against it a
+    // timer *loses the buffer*, two seconds after a click, with no way to intervene. A shell
+    // cannot tell "wedged" from "asking"; the person looking at the dialog can, so the second
+    // click is what says "I meant it", which is what a Force Quit is everywhere else.
+    //
+    // Considered and rejected: cancelling the grace when a `dialog` parented to that window
+    // appears. It reads well and only works for clients that ask in the way this one happens
+    // to — a client asking in an overlay, or one genuinely busy, is punished for it — and it
+    // makes a visible policy depend on a coincidence of roles.
+    let mut asked_to_close: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     let mut next_origin = BAR_H as i32 + CASCADE_STEP;
 
     // Registered on the first pass of the loop, once the manager channel is known to exist.
@@ -1827,14 +1841,29 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // nothing left in the kernel queue to wake this. Polling once after any request is the
         // belt: the drain below sees the parked events and the next iteration blocks normally
         // (PR #242 review, optional 10 — unverified there, and cheap enough to close).
-        // **Bounded while a close is outstanding**, so the insist below happens without the
-        // user having to touch anything else. With nothing owed this is still an indefinite
-        // sleep rather than a poll.
-        let deadline = if sent_request {
-            0
-        } else {
-            closing.iter().map(|&(_, at)| at).min().unwrap_or(u64::MAX).min(next_tick)
-        };
+        // **The clock's minute is the only deadline left.** A close used to put one here too;
+        // it is a click rather than a timer now, so an outstanding close costs no wakeups at
+        // all and the shell sleeps until something happens or the minute turns.
+        //
+        // **Which is what turned the belt above into a load-bearing one** (M12 Part A). The
+        // `sent_request` flag covers *manager* requests, and the session's own — a `create`
+        // waiting for its first `Configure`, an `acquire` waiting for a buffer release — park
+        // arriving input inside the transport in exactly the same way, with nothing left in a
+        // kernel queue to wake this. Those parked events were rescued by whatever wake happened
+        // next, and until this part there was almost always one within two seconds: the close
+        // grace period. Take the timer away and a press that landed while the modal was
+        // committing a frame sat in the transport until the *minute* turned — which presented
+        // as a launcher row that could be clicked and did nothing, once per run, entirely
+        // reproducibly.
+        //
+        // So the queue is asked rather than assumed. `pump` is a non-blocking poll that moves
+        // whatever the transport is holding into the per-window queues the drain below reads,
+        // and a session with anything in them does not block. It cannot spin: the drain empties
+        // what this counts.
+        if session.pump().is_err() {
+            fail(b"desktop-shell: compositor connection lost\n");
+        }
+        let deadline = if sent_request || session.events_pending() > 0 { 0 } else { next_tick };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
@@ -2626,7 +2655,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     // shell insists only when nothing happens (M9 Part C).
                     if p.button == libkern::abi::BTN_MIDDLE {
                         sent_request = true;
-                        ask_to_close(m, wid, &mut closing);
+                        ask_to_close(m, wid, &mut asked_to_close);
                         continue;
                     }
                     if e.focused && !e.minimized {
@@ -2654,39 +2683,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
             }
         }
-        // **Insist on any close that has run out of patience.** The wait above is bounded while
-        // this list is non-empty, so this happens without the user touching anything else — and
-        // a window that went away on its own has already left `entries`, so the ordinary case
-        // never reaches `Manage::Close` at all.
-        //
-        // **The list is emptied even when it cannot be acted on**, because the wait above is
-        // derived from it: an entry that no iteration can ever time or send would make
-        // `sys_wait` return at once on an already-past deadline, for ever — the spin this file
-        // calls machine-wide harmful at the top of the loop. Neither failure is reachable today
-        // (`manager` is assigned once and never cleared; `sys_clock_read(Monotonic)` fails only
-        // on a bad selector or a bad out-pointer, both constants here), which is exactly why it
-        // is worth making structural rather than leaving it true by luck (PR #251 review).
-        if !closing.is_empty() {
-            match (now_ns(), manager.as_mut()) {
-                (Some(now), Some(m)) => {
-                    let mut still = alloc::vec::Vec::new();
-                    for &(id, at) in &closing {
-                        if !entries.iter().any(|e| e.id == id) {
-                            // Gone, by the client's own hand. Nothing to insist on.
-                            continue;
-                        }
-                        if now < at {
-                            still.push((id, at));
-                            continue;
-                        }
-                        sent_request = true;
-                        insist_on_close(m, id);
-                    }
-                    closing = still;
-                }
-                _ => closing.clear(),
-            }
-        }
+        // **A window that went on its own is no longer owed an insist.** Ids are never reused,
+        // so a stale entry could not name the wrong window — but it would make the *next*
+        // window to be asked look like it had already been asked once, and the click that
+        // should have asked would destroy it instead. `entries` is the shell's own record of
+        // what is still there, so this is the same prune the destroy path does.
+        asked_to_close.retain(|id| entries.iter().any(|e| e.id == *id));
 
         // **The clock, when the minute it shows has changed.** Compared as text rather than by
         // the deadline having passed: an unset clock formats to nothing every time, so this
@@ -2805,24 +2807,19 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     }
 }
 
-/// How long a client has to answer a close request before the shell insists.
-///
-/// **Long enough for a client that is merely busy, short enough that a person does not think
-/// the click was lost.** A responsive client exits in milliseconds; this is for one that is
-/// wedged, and the alternative to waiting at all is destroying windows out from under processes
-/// that were fine.
-const CLOSE_GRACE_NS: u64 = 2_000_000_000;
-
 /// Scratch for [`now_ns`].
 static mut CLOCK_BUF: u64 = 0;
 
 /// The monotonic clock, in nanoseconds, or `None` if it will not answer.
 ///
-/// Only the close grace period needs it, and both call sites treat `None` as *no insisting*
-/// rather than as an unbounded one: the ask is still sent and nothing is recorded to follow it
-/// up. A client that ignores the request keeps its window, which is the failure that leaves the
-/// machine working — the alternative shapes all end in a wait bounded by a deadline nothing can
-/// ever evaluate, which is a spin.
+/// **The clock on the top bar is what needs it**, since M11 Part E batch 9 — it ticks off this
+/// rather than off a timer object. The close grace period used to be the only caller and is
+/// gone: insisting on a close is a second click now rather than an elapsed two seconds, so
+/// nothing about closing a window depends on the clock answering at all.
+///
+/// `None` is a clock that has stopped, and every caller treats it as *nothing to do this round*
+/// rather than as zero: a deadline nothing can evaluate is a wait that returns immediately for
+/// ever, which is the spin this file calls machine-wide harmful.
 fn now_ns() -> Option<u64> {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     let r = unsafe {
@@ -2839,13 +2836,24 @@ fn now_ns() -> Option<u64> {
     Some(unsafe { (&raw const CLOCK_BUF).read() })
 }
 
-/// Ask a window's client to close, and remember to insist if it does not.
-fn ask_to_close(
-    mgr: &mut ChannelTransport,
-    window: u32,
-    closing: &mut alloc::vec::Vec<(u32, u64)>,
-) {
+/// Ask a window's client to close — or, if it has already been asked, insist.
+///
+/// **The second click is the insist**, which is the whole of M12 Part A's close-policy change:
+/// the first middle-click asks, and if the window is still there when the person clicks again
+/// they have said they meant it. Before this the answer was a two-second timer, which was safe
+/// only while no client could decline — see `asked_to_close`'s declaration for why the editor's
+/// confirmation dialog is exactly the client that makes a timer lose work.
+///
+/// A window that goes away on its own leaves `asked_to_close` with the entry that named it, so
+/// the ordinary case never reaches `Manage::Close` at all.
+fn ask_to_close(mgr: &mut ChannelTransport, window: u32, asked: &mut alloc::vec::Vec<u32>) {
     use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
+    if asked.contains(&window) {
+        if insist_on_close(mgr, window) {
+            asked.retain(|id| *id != window);
+        }
+        return;
+    }
     let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
     if (MgrWindowRef { window, other: 0 }).write(&mut body).is_none() {
         return;
@@ -2856,15 +2864,12 @@ fn ask_to_close(
         return;
     }
     Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
-    // A second ask before the first has run out replaces its deadline rather than adding an
-    // entry: one window is being closed once, however many times it is clicked.
-    closing.retain(|&(id, _)| id != window);
-    if let Some(now) = now_ns() {
-        closing.push((window, now.saturating_add(CLOSE_GRACE_NS)));
-    }
+    asked.push(window);
 }
 
 /// Destroy a window whose client did not answer — `Manage::Close`.
+///
+/// Reached only from [`ask_to_close`]'s second click. `true` if the compositor took it.
 fn insist_on_close(mgr: &mut ChannelTransport, window: u32) -> bool {
     use librsproto::surface::{MgrWindowRef, OP_MGR_CLOSE};
     let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
@@ -3878,6 +3883,27 @@ fn log_window_list(shown: &[&WinEntry], label: &str, desktops: usize) {
     l.end();
 }
 
+/// Where a dialog of `size` goes over `base`, kept inside the work area.
+///
+/// **Centred on its parent, then clamped**, in that order: a dialog wider than the window it
+/// belongs to would otherwise hang off the screen's edge with half its buttons unreachable, and
+/// a dialog is exactly the window a person must be able to answer. One that will not fit at all
+/// is put at the work area's origin rather than negative, so what is lost is its bottom-right
+/// rather than its title bar.
+///
+/// `base` is `(x, y, w, h)` — the parent's rectangle, or the work area when there is no parent
+/// this shell knows about.
+fn centre_dialog(base: (i32, i32, u32, u32), size: (u32, u32), work: &MgrLayout) -> (i32, i32) {
+    let x = base.0.saturating_add((base.2 as i32 - size.0 as i32) / 2);
+    let y = base.1.saturating_add((base.3 as i32 - size.1 as i32) / 2);
+    // `.max(0)` keeps the clamp's bounds ordered when the dialog is larger than the work area;
+    // `clamp` panics on an inverted range, and this file's whole stance is that a shell must
+    // not be the thing that dies.
+    let max_x = work.work_x.saturating_add((work.work_w as i32 - size.0 as i32).max(0));
+    let max_y = work.work_y.saturating_add((work.work_h as i32 - size.1 as i32).max(0));
+    (x.clamp(work.work_x, max_x), y.clamp(work.work_y, max_y))
+}
+
 /// Drain the manager channel and place every window it announces.
 ///
 /// **Placing is what releases a held window.** With a manager attached the compositor holds a
@@ -3900,7 +3926,7 @@ fn place_new_windows(
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
         OP_MGR_LAYOUT_CHANGED, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
         OP_MGR_DRAG_ENDED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
-        OP_MGR_WINDOW_STATE_REQUEST, OP_MGR_WINDOW_TITLE, ROLE_NORMAL,
+        OP_MGR_WINDOW_STATE_REQUEST, OP_MGR_WINDOW_TITLE, ROLE_DIALOG, ROLE_NORMAL,
     };
     let mut dirty = false;
     // **Four bytes more than `MAX_TITLE`, which is what a title record actually is.** A
@@ -4060,6 +4086,62 @@ fn place_new_windows(
         let Some(created) = MgrWindowCreated::read(&buf[..n]) else {
             continue;
         };
+        // **A dialog is placed and not listed** (M12 Part A). It is *held* for a manager
+        // exactly as a `normal` is — `rsproto-surface-ops.md` says so outright — so a shell
+        // that ignored one would leave every dialog waiting out the compositor's 200 ms
+        // deadline and then appearing wherever the client happened to ask, which for a client
+        // that cannot know where it is means the top-left corner of the screen.
+        //
+        // **Centred on its parent**, which is the placement the spec says a manager can work
+        // out for itself: `WindowCreated` carries the parent id and the requested size, and the
+        // geometry stream has been telling this shell where every window is all along. A parent
+        // it does not know — a dialog on one of the shell's own windows, or on a `popup` —
+        // centres on the work area instead, which is the honest answer to "over what?".
+        //
+        // **And it does not join `entries`.** A taskbar slot for a dialog would offer to close
+        // or minimise it on its own, and a question minimised behind its window is a window
+        // that cannot be closed and will not say why. Its parent's slot is the one that stands
+        // for both.
+        if created.role == ROLE_DIALOG && !ours.contains(&created.window) {
+            let base = entries
+                .iter()
+                .find(|e| e.id == created.aux32)
+                .map(|e| (e.origin.0, e.origin.1, e.size.0, e.size.1))
+                .unwrap_or((layout.work_x, layout.work_y, layout.work_w, layout.work_h));
+            let (x, y) = centre_dialog(base, (created.width, created.height), layout);
+            let place = MgrPlace { window: created.window, x, y };
+            let mut body = [0u8; 12];
+            if place.write(&mut body).is_none() {
+                continue;
+            }
+            let mut reply = [0u8; 64];
+            if mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_err() {
+                Line::new()
+                    .s(b"desktop-shell: Place refused for dialog ")
+                    .u(created.window as u64)
+                    .end();
+                continue;
+            }
+            // **Where it went, because a gate has no other way to find it.** `check-login`
+            // presses both of a confirmation's buttons, and it aims from this origin — the
+            // alternative is re-deriving this centring in the harness, which would be a second
+            // copy of a policy that is the shell's to change (M10 Part E's own rule).
+            Line::new()
+                .s(b"desktop-shell: placed dialog ")
+                .u(created.window as u64)
+                .s(b" of window ")
+                .u(created.aux32 as u64)
+                .s(b" at ")
+                .i(x as i64)
+                .s(b",")
+                .i(y as i64)
+                .s(b" ")
+                .u(created.width as u64)
+                .s(b"x")
+                .u(created.height as u64)
+                .end();
+            continue;
+        }
         // **Only `normal` windows, and none of the shell's own.** A bar is a `panel` and the
         // modal is a `popup`, so the role filter covers those — but an application's own popup
         // is a `popup` too, and listing one would put a menu in the taskbar. The id check is

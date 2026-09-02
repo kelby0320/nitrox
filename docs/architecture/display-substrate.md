@@ -142,6 +142,13 @@ each changes what the compositor does:
   any other listed window. (An earlier revision also distinguished it as "not offered as a
   wirable node on the composition canvas"; the canvas was cut in `ui-composition-model.md`
   revision 3, and the rest of the definition stands without it.)
+
+  **"Listed" here means the manager places it, not that it appears in a taskbar.** The two
+  parted company the first time anything created one: `desktop-shell` centres a dialog on its
+  parent and gives it no window-list entry, because an entry offering to close or minimise a
+  question independently of the window it belongs to is a question that can be minimised behind
+  its own parent (M12 Part A). What the role fixes is that the *compositor* holds its first
+  `Configure` for a manager; what a manager then does with it is policy.
 - **`normal`** — everything else.
 
 **A panel reserves space.** A maximised window must not cover the bars, which X calls struts.

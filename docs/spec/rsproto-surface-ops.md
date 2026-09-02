@@ -782,9 +782,12 @@ it and none is needed**: a client that wants to ask "save first?" opens a dialog
 that resolves, and a client that ignores this stays open. What the request buys is that the
 decision reaches the process holding the work rather than being taken from it.
 
-A shell that means it will follow this with [`Manage::Close`](#requestclose-0x0924-and-close-0x0925) after a grace period.
-That is a policy, not part of this contract — a client cannot tell how long it has, and should
-not try to.
+A shell that means it may follow this with [`Manage::Close`](#requestclose-0x0924-and-close-0x0925).
+**When it does is a policy, not part of this contract** — a client cannot tell how long it has,
+and should not try to. `desktop-shell`'s policy was a two-second grace period and is a *second
+middle-click* since M12 Part A: a shell cannot tell a client that is wedged from one that is
+asking its user a question, and a timer against the latter destroys the work the question was
+about. A client must be correct under either, which is what "cannot tell how long it has" means.
 
 ### `DestroyWindow` (`0x0904`)
 

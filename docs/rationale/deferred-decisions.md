@@ -1441,6 +1441,31 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
+**A dialog is not kept above the window it belongs to — `TODO(dialog-stacking)`.** A `dialog` is created on top of the stack and takes
+focus, so it starts above its parent; click the parent and the compositor raises it *over* its own
+question, which every desktop this borrows from prevents. Nothing is lost — the dialog is still
+there and still the only way out of a modified buffer — but it can be hidden behind the thing it is
+asking about. The fix is a stacking rule in the compositor (a window's transients ride above it),
+which is a change to `raise` and to what `raise_above` may be asked for, and M12 Part A did not
+need it: nothing in the gate or in ordinary use clicks *through* a question it has just been asked.
+**Trigger: a dialog somebody loses**, or the first application with two of them.
+
+**Modality is not enforced — `TODO(dialog-modality)`.** A
+confirmation does not stop its parent accepting input: `nxedit` keeps typing into the buffer while
+the question is up, because focus follows the topmost window and nothing prevents a click going
+back to the editor. The system has no concept of an input-exclusive window, and adding one is a
+compositor rule about routing rather than about drawing. It is survivable by construction here —
+the question is re-derived from `modified()` each time it is asked, so an edit made while it is up
+is simply part of what is being discarded, and a *save* made while it is up removes the reason to
+ask at all. **Trigger: a dialog whose question can be invalidated by what its parent does** — one
+that names a file being renamed, say, rather than one that asks about a buffer.
+
+**A confirmation has two answers and not three — `TODO(dialog-save-answer)`.** Discard and keep editing; there is no *save and close*.
+The reason is that an untitled buffer has nowhere to save to, so the third answer is not a button
+but a second flow — the name field, then the write, then the close — and half of it already exists
+as a mode in the status strip. **Trigger: the editor gains a save that cannot fail to have a
+destination**, which is what a save-as dialog would be.
+
 **`form` is now eligible and still filed.** Designed since v1 and never built; its own stated
 condition was "after the toolkit and the first applications", which M10 and M11 satisfied. It is
 left filed rather than scheduled for the same reason the control panel is: nothing has asked for

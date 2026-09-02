@@ -22,6 +22,12 @@ libinput = { path = "../libinput" }
 # For the `EV_KEY` codes the text field and list act on — the same set `libterm` imports.
 libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }
+# For `window::Child`, the one module here that is not a function of values: a second window is
+# a `Session`, a `BufferPool` and a scratch framebuffer as much as it is a tree and a router,
+# and the two consumers that wanted it — `nxterm`'s menu and `nxedit`'s confirmation — would
+# otherwise hold two copies of the same six fields. The layering this crate documents has
+# always been `libui` above `libsurface`; M12 Part A is where it stopped being "yet".
+libsurface = { path = "../libsurface" }
 #  for the baseline:  has no float transcendentals, and the ascent is a float.
 libm = { version = "0.2", default-features = false }
 

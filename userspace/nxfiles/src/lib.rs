@@ -522,10 +522,12 @@ impl App {
                 })),
                 // **A close button, because without one every close takes the wedged path.**
                 // The taskbar's middle-click sends `CloseRequested`; a client that ignores it
-                // survives the two-second grace period and is then destroyed by
+                // keeps its window until a *second* middle-click destroys it with
                 // `Manage::Close` — the route the shell documents as being for a client that
                 // has *stopped answering*. An application with no way to close itself would
-                // take it every single time (PR #257 review, finding 3).
+                // take it every single time (PR #257 review, finding 3). (That second click was
+                // a two-second timer until M12 Part A; what changed is who decides, not that
+                // this is the path an unanswered request ends on.)
                 close: Some(Msg::Close),
             },
             &ui,
