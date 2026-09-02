@@ -3207,10 +3207,36 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect(&format!("compositor: asked window {edit_id} to close"))?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
+    let asked_dialog = session.rest_of_line()?;
+    let (_, _, ax, ay, _, _) = parse_dialog_placement(&asked_dialog)
+        .ok_or_else(|| format!("could not read the ask's dialog placement from {asked_dialog:?}"))?;
     println!("  ok: the taskbar's ask reached a client that declined to answer it");
 
-    // **And the second click insists.** The window goes, the dialog goes with it — a dialog is
-    // destroyed with its parent — and the shell says which of the two paths it took.
+    // **The person answers it, and the arming must not outlive the answer** (PR #267 review,
+    // blocking 1). The first version of this policy armed on the ask and disarmed only when the
+    // window went away, so *keep editing* left the entry armed for the life of the window and
+    // the next middle-click — at any distance in time — destroyed it with no question at all.
+    // That is the unbounded version of the very outcome this change replaced a two-second timer
+    // to avoid.
+    click_at(&mut qmp, &mut session, ax + CONFIRM_KEEP_CX, ay + CONFIRM_BUTTON_CY)?;
+    session.expect("nxedit: close cancelled, still editing")?;
+
+    // **A real wait, in a gate that is otherwise expect-driven.** There is no output that says
+    // an arming expired — expiry is the *absence* of a state — so the only way to observe it is
+    // to let the clock pass it. `INSIST_WINDOW_NS` is five seconds; six is past it with room,
+    // and it is the one sleep in this file that is waiting for a rule rather than for a message.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    middle_click_at(&mut qmp, &mut session, entry.0, entry.1)?;
+    // **Asked, not destroyed** — and this assertion *is* the control. Under the version the
+    // review caught, this click produced "did not answer; closed it" and the buffer went with
+    // the window; here the question is put again, which is what a click made long after the
+    // last one means.
+    session.expect(&format!("compositor: asked window {edit_id} to close"))?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    println!("  ok: the arming expired, so a later click asked again rather than destroying");
+
+    // **And a click while the ask is still in hand insists.** The window goes, the dialog goes
+    // with it — a dialog is destroyed with its parent — and the shell says which path it took.
     middle_click_at(&mut qmp, &mut session, entry.0, entry.1)?;
     session.expect(&format!("desktop-shell: window {edit_id} did not answer; closed it"))?;
     println!("  ok: a second middle-click destroyed the window the first one only asked about");

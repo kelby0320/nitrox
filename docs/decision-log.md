@@ -21745,11 +21745,28 @@ intervene.
 
 A shell cannot tell "wedged" from "asking". The person looking at the dialog can. So the first
 middle-click asks and the second insists, which is what a Force Quit is on every desktop this
-borrows from, and the shell loses a clock. Considered and rejected: cancelling the grace when a
-`dialog` parented to that window appears — it reads well, works only for clients that ask in the way
-this one happens to, and makes a visible policy depend on a coincidence of roles.
+borrows from. Considered and rejected: cancelling the grace when a `dialog` parented to that window
+appears — it reads well, works only for clients that ask in the way this one happens to, and makes a
+visible policy depend on a coincidence of roles.
 
-`check-login` now drives both halves, so `Manage::Close` is exercised end to end for the first time.
+**And the arming expires after five seconds, which the first version of this got wrong** (PR #267
+review, blocking 1). It armed on the ask and disarmed only when the window went away — so a person
+who middle-clicked, read the question and chose *keep editing* left the entry armed for the life of
+the window, and a middle-click ten minutes later went straight to `Manage::Close` with no question
+and nothing on screen that had ever said the entry was armed. The lost buffer this decision exists
+to prevent, with the two-second bound replaced by an unbounded one.
+
+The shell cannot observe an answer: `CloseRequested` has no refusal by design, and inferring one
+from a dialog appearing or going away is the coupling rejected in the paragraph above. So the second
+click counts only while it is still *part of the first gesture* — which is the rule M12's kill ring
+already settles for cycling, and for the same reason: a continuation is valid immediately after the
+thing it continues, and a stale one has to be unreachable rather than merely unlikely. It is a clock
+the shell reads when a click arrives rather than one it wakes for, and unlike the grace period it
+*acts on nothing* when it expires — it forgets, and the next click asks again, which is the
+recoverable direction.
+
+`check-login` now drives all three — the ask, the expiry, and the insist — so `Manage::Close` is
+exercised end to end for the first time.
 
 ## 2026-09-01 — the close timer was holding up something else: parked events cannot wake a wait
 

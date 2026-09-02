@@ -1272,6 +1272,21 @@ mod tests {
         // this test is what stops them being four numbers nothing checks. A press *and* a
         // release, because a click is the release: pressing alone proves only that something is
         // under the point.
+        // **The literals `check-login` actually types, asserted here.** Deriving the constants
+        // from `CONFIRM_PAD` and then comparing them against a tree built from the same
+        // `CONFIRM_PAD` pins nothing: both sides move together, and the gate's own table —
+        // which cannot import this crate — is linked to them by nothing at all. With
+        // `CONFIRM_PAD` at 40 every test in this file passed while the gate went on clicking
+        // `y = 103` at buttons spanning 62..88, failing after a three-minute boot, which is
+        // exactly the outcome the doc comment on `CONFIRM_BUTTON_W` says is prevented (PR #267
+        // review, finding 2). These four numbers are that table.
+        assert_eq!(
+            (CONFIRM_DISCARD_CX, CONFIRM_KEEP_CX, CONFIRM_BUTTON_CY),
+            (91, 249, 103),
+            "check-login hardcodes these three; change the dialog's metrics and change them there"
+        );
+        assert_eq!((CONFIRM_W, CONFIRM_H), (340, 132), "and these two, as the size it checks");
+
         let a = app();
         let ui = a.confirm_view(&UiTheme::default(), None);
         let l = libui::layout::layout(&ui, Rect::new(0, 0, CONFIRM_W, CONFIRM_H), &CELL);
@@ -1304,6 +1319,25 @@ mod tests {
         // And the two are not the same button: a layout that collapsed one of them would make
         // both presses land on whichever survived, and both assertions above would still pass.
         assert!(CONFIRM_KEEP_CX - CONFIRM_DISCARD_CX >= CONFIRM_BUTTON_W as i32);
+
+        // **The aim point is the button's *centre*, not merely a point inside it** (PR #267
+        // review, optional 6). Padding the strip on all four sides instead of three halves the
+        // buttons — 26 pixels to 14 — and every assertion above still passes, because a centre
+        // stays inside a box that shrank around it. So the row's own height is bracketed: one
+        // pixel inside each edge hits, and a point a full button above it does not.
+        let half = CONFIRM_BUTTON_H as i32 / 2;
+        for edge in [CONFIRM_BUTTON_CY - half + 1, CONFIRM_BUTTON_CY + half - 1] {
+            assert_eq!(
+                click(&mut router, CONFIRM_DISCARD_CX, edge),
+                alloc::vec![Msg::Discard],
+                "the button does not reach {edge}, so {CONFIRM_BUTTON_CY} is not its centre"
+            );
+        }
+        assert!(
+            click(&mut router, CONFIRM_DISCARD_CX, CONFIRM_BUTTON_CY - CONFIRM_BUTTON_H as i32)
+                .is_empty(),
+            "a whole button above the aim point is not the button"
+        );
     }
 
     #[test]

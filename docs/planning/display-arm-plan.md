@@ -3694,6 +3694,13 @@ The two taken before this pass — the clipboard's owner and the image format �
       "wedged" from "asking"; the person looking at the dialog can. **M9 Part C named this
       trigger** — "the first application that can be wedged on purpose" — and it fired here.
 
+      **The arming expires**, five seconds after the ask, which the first version did not do:
+      it disarmed only when the window went away, so answering *keep editing* left the entry
+      armed for the window's life and a later click destroyed it with no question — the same
+      lost buffer, unbounded (PR #267 review, blocking 1). A second click counts only while it
+      is still part of the first gesture, which is the rule M12's kill ring already settles for
+      cycling.
+
 - [x] **Gate** ✅: `check-login` steps 11 and 12. Step 11 drives the confirmation to **both**
       answers from the editor's own close button — a dialog that only ever gets "yes" is half a
       control — and asserts the dialog's origin is its parent's centre, clamped, rather than
@@ -3701,6 +3708,13 @@ The two taken before this pass — the clipboard's owner and the image format �
       reaches a client that declines it, the second destroys the window. **That is the first time
       `Manage::Close` has been driven end to end**, which M9 Part C left open for want of a client
       that could be wedged.
+
+      Step 12 also drives the **expiry**: the ask is answered with *keep editing*, the arming
+      is allowed to run out, and the next click is asserted to **ask again** rather than
+      destroy. That assertion is the control for the bug above — under the version review
+      caught, it printed "did not answer; closed it" instead. It is the one deliberate sleep in
+      a gate that is otherwise expect-driven, because an expiry is the absence of a state and
+      has no line to wait for.
 
       **Ten host tests in `nxedit`, each run alone against a broken implementation**: closing a
       modified buffer asking rather than exiting, a clean one closing at once, a *second* close
@@ -3713,9 +3727,12 @@ The two taken before this pass — the clipboard's owner and the image format �
 
       **The four button coordinates are published from `nxedit` and hardcoded in the gate**,
       because a host tool in another workspace cannot link the crate — the same arrangement that
-      already hardcodes a title bar's height. The host test is what pins them to the tree that is
-      actually built, so a padding change fails beside the change rather than after a
-      three-minute boot.
+      already hardcodes a title bar's height. The host test asserts **the literals themselves**,
+      not merely that the derived constants agree with the tree: both sides derive from
+      `CONFIRM_PAD`, so comparing them pinned nothing, and with `CONFIRM_PAD` at 40 every host
+      test passed while the gate went on clicking a `y` the buttons no longer covered (PR #267
+      review, finding 2). The claim that a padding change fails beside the change rather than
+      after a three-minute boot is true now, and was not.
 
 - [x] **One bug found on the way, and it was not in any of this** ✅. Removing the close timer
       made `check-login`'s launcher-row click fail reproducibly, and the timer turned out to have

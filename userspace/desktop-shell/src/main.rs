@@ -1740,7 +1740,22 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // appears. It reads well and only works for clients that ask in the way this one happens
     // to — a client asking in an overlay, or one genuinely busy, is punished for it — and it
     // makes a visible policy depend on a coincidence of roles.
-    let mut asked_to_close: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    //
+    // **And the arming expires, because the shell cannot see an answer** (PR #267 review,
+    // blocking 1). The first version armed on the ask and disarmed only on the destroy, so a
+    // person who middle-clicked, read the question and chose *keep editing* left the entry
+    // armed for the life of the window — and a middle-click ten minutes later went straight to
+    // `Manage::Close` with no question and nothing on screen that had ever said so. That is the
+    // outcome this whole change exists to prevent, with the two-second bound replaced by an
+    // unbounded one.
+    //
+    // There is no signal that says a client declined: `CloseRequested` has no refusal by
+    // design, and inferring one from a dialog appearing or going away is the coincidence-of-
+    // roles coupling rejected above. So the second click insists only while it is still *part of
+    // the first gesture* — the rule M12's kill ring settles for cycling, for the same reason:
+    // a continuation is valid immediately after the thing it continues, and a stale one must be
+    // unreachable rather than merely unlikely.
+    let mut asked_to_close: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
     let mut next_origin = BAR_H as i32 + CASCADE_STEP;
 
     // Registered on the first pass of the loop, once the manager channel is known to exist.
@@ -2684,11 +2699,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
         // **A window that went on its own is no longer owed an insist.** Ids are never reused,
-        // so a stale entry could not name the wrong window — but it would make the *next*
-        // window to be asked look like it had already been asked once, and the click that
-        // should have asked would destroy it instead. `entries` is the shell's own record of
-        // what is still there, so this is the same prune the destroy path does.
-        asked_to_close.retain(|id| entries.iter().any(|e| e.id == *id));
+        // so a stale entry can never name a later window and nothing here is about correctness:
+        // it is that this vector would otherwise hold an entry per window ever asked about, for
+        // the life of the session (PR #267 review, optional 5 — the first version of this
+        // comment claimed the stale entry could arm the *next* window, which its own first
+        // clause rules out).
+        asked_to_close.retain(|(id, _)| entries.iter().any(|e| e.id == *id));
 
         // **The clock, when the minute it shows has changed.** Compared as text rather than by
         // the deadline having passed: an unset clock formats to nothing every time, so this
@@ -2836,21 +2852,49 @@ fn now_ns() -> Option<u64> {
     Some(unsafe { (&raw const CLOCK_BUF).read() })
 }
 
-/// Ask a window's client to close — or, if it has already been asked, insist.
+/// How long a close request stays armed for the click that insists on it.
+///
+/// **Not the grace period coming back.** That timer *acted* when it expired — it destroyed a
+/// window whose client had not answered. This one only forgets: when it runs out the next
+/// middle-click asks again, which is the safe direction and the one a person can recover from
+/// by clicking once more.
+///
+/// It is how long a second click is still part of the first, and the person is the clock it is
+/// measured against: they click, watch for a moment, and click again when nothing happened.
+/// Long enough for that; short enough that a click made after reading a question and answering
+/// it is a fresh intention rather than a continuation. `check-login`'s two clicks are 63 ms
+/// apart on the accelerator CI uses, so the gate has two orders of magnitude of room.
+const INSIST_WINDOW_NS: u64 = 5_000_000_000;
+
+/// Ask a window's client to close — or, if the ask is still in hand, insist.
 ///
 /// **The second click is the insist**, which is the whole of M12 Part A's close-policy change:
 /// the first middle-click asks, and if the window is still there when the person clicks again
 /// they have said they meant it. Before this the answer was a two-second timer, which was safe
 /// only while no client could decline — see `asked_to_close`'s declaration for why the editor's
-/// confirmation dialog is exactly the client that makes a timer lose work.
+/// confirmation dialog is exactly the client that makes a timer lose work, and for why the arm
+/// expires rather than lasting the window's life.
 ///
-/// A window that goes away on its own leaves `asked_to_close` with the entry that named it, so
-/// the ordinary case never reaches `Manage::Close` at all.
-fn ask_to_close(mgr: &mut ChannelTransport, window: u32, asked: &mut alloc::vec::Vec<u32>) {
+/// **A clock that will not answer means nothing is ever armed**, so the taskbar can ask and
+/// never insist. That is this file's stance on `now_ns` everywhere: the failure that leaves the
+/// machine working is the one where a window stays, and a window that cannot be forced shut from
+/// the bar can still be closed by its own button.
+///
+/// A window that goes away on its own leaves the entry that named it, so the ordinary case never
+/// reaches `Manage::Close` at all.
+fn ask_to_close(
+    mgr: &mut ChannelTransport,
+    window: u32,
+    asked: &mut alloc::vec::Vec<(u32, u64)>,
+) {
     use librsproto::surface::{MgrWindowRef, OP_MGR_REQUEST_CLOSE};
-    if asked.contains(&window) {
+    let now = now_ns();
+    let armed = asked
+        .iter()
+        .position(|&(id, until)| id == window && now.is_some_and(|n| n < until));
+    if let Some(i) = armed {
         if insist_on_close(mgr, window) {
-            asked.retain(|id| *id != window);
+            asked.remove(i);
         }
         return;
     }
@@ -2864,7 +2908,12 @@ fn ask_to_close(mgr: &mut ChannelTransport, window: u32, asked: &mut alloc::vec:
         return;
     }
     Line::new().s(b"desktop-shell: asked window ").u(window as u64).s(b" to close").end();
-    asked.push(window);
+    // An expired entry for this window is replaced rather than joined: one window is being
+    // asked about once, however many times the question has been put.
+    asked.retain(|&(id, _)| id != window);
+    if let Some(n) = now {
+        asked.push((window, n.saturating_add(INSIST_WINDOW_NS)));
+    }
 }
 
 /// Destroy a window whose client did not answer — `Manage::Close`.
@@ -4110,7 +4159,11 @@ fn place_new_windows(
                 .unwrap_or((layout.work_x, layout.work_y, layout.work_w, layout.work_h));
             let (x, y) = centre_dialog(base, (created.width, created.height), layout);
             let place = MgrPlace { window: created.window, x, y };
-            let mut body = [0u8; 12];
+            // Sized from the type, not from a literal: `compositor::send_mgr_event` states that
+            // rule after a hand-written `[0u8; 16]` silently dropped every widened
+            // `PointerEvent`, and copying the number from the placement below would be the same
+            // shape waiting for the same widening (PR #267 review, optional 7).
+            let mut body = [0u8; core::mem::size_of::<MgrPlace>()];
             if place.write(&mut body).is_none() {
                 continue;
             }

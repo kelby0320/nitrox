@@ -105,8 +105,13 @@ impl Child {
     /// it is on screen and should not pretend to; `rsproto-surface-ops.md` says the manager can
     /// centre a dialog on its parent from what it already tracks.
     ///
-    /// `None` if the compositor refuses, if the tree measures to nothing, or if the memory could
-    /// not be had.
+    /// `None` for a role that is not one of the two parented ones, if the compositor refuses, if
+    /// the tree measures to nothing, or if the memory could not be had.
+    ///
+    /// **The role is checked rather than assumed** (PR #267 review, optional 4). A `Child` has
+    /// its size fixed at creation and never answers a `Configure`, so a `normal` created through
+    /// here would ignore every resize a manager asked of it for the rest of its life —
+    /// silently, because declining a `Configure` is legal.
     ///
     /// **Everything after the create destroys the window on the way out.** An abandoned child is
     /// worse than none: [`Session::create`] waits for the first `Configure`, so it is
@@ -122,6 +127,9 @@ impl Child {
         theme: &Theme,
         buffers: usize,
     ) -> Option<Self> {
+        if !matches!(role, Role::Popup { .. } | Role::Dialog { .. }) {
+            return None;
+        }
         let m = FontMetrics::new(font, theme.font_px);
         let size = measure(content, Constraints::loose(Size::new(MEASURE_MAX, MEASURE_MAX)), &m);
         // **Nothing, and everything, are both refusals.** Zero is a tree that draws nothing.
@@ -170,8 +178,17 @@ impl Child {
         self.router.hovered_key(&self.tree)
     }
 
-    /// Paint `content` and put it on screen **if anything changed**. `false` if the window
-    /// could not be drawn, which the caller should treat as the window being gone.
+    /// Paint `content` and put it on screen **if anything changed**. `false` if this frame could
+    /// not be drawn.
+    ///
+    /// **A failure is recoverable, and it has to be made so here.** The diff has already
+    /// advanced the retained tree by the time a buffer can be refused, so the damage for the
+    /// frame is spent: a caller that logged the failure and carried on — which is what both
+    /// callers do — would get `Ok(None)` from every later frame and a child stuck showing
+    /// whatever it last managed to commit, while remaining a configured, focusable window. So
+    /// the tree is cleared on the way out and the next attempt repaints everything. The
+    /// alternative reading, that `false` means the window is gone and the caller should destroy
+    /// it, is a contract neither caller followed (PR #267 review, optional 3).
     ///
     /// **Gated on the diff, and that is not merely thrift.** With two buffers the third commit
     /// blocks in `acquire` until the compositor releases one, and that block is inside the
@@ -194,20 +211,27 @@ impl Child {
             Ok(None) => return true, // nothing changed; what is on screen is still right
             Ok(Some(d)) => d,
             // A malformed tree is a bug in the caller's view, not a runtime condition — but a
-            // child window is not worth killing a process over, so it is reported as a window
-            // that cannot be drawn.
+            // child window is not worth killing a process over, so it is reported as a frame
+            // that could not be drawn. Nothing to clear: a rejected update leaves the tree
+            // exactly as it was.
             Err(_) => return false,
         };
         paint(&mut self.scratch, font, theme, content, &l, damage, &mut |_, _, _, _| {});
-        let Some(mut w) = session.window(self.id) else { return false };
-        let Ok(b) = self.pool.acquire(&mut w, self.size) else { return false };
-        if !self.pool.write(b, self.scratch.bytes()) {
-            return false;
+        let mut drawn = false;
+        if let Some(mut w) = session.window(self.id)
+            && let Ok(b) = self.pool.acquire(&mut w, self.size)
+            && self.pool.write(b, self.scratch.bytes())
+        {
+            let region =
+                (damage.origin.x as u32, damage.origin.y as u32, damage.size.w, damage.size.h);
+            drawn = session.window(self.id).is_some_and(|mut w| w.commit(b, region).is_ok());
         }
-        session.window(self.id).is_some_and(|mut w| {
-            w.commit(b, (damage.origin.x as u32, damage.origin.y as u32, damage.size.w, damage.size.h))
-                .is_ok()
-        })
+        if !drawn {
+            // The damage this frame described is spent, so the next one has to describe
+            // everything: `clear` is what a resize uses for the same reason.
+            self.tree.clear();
+        }
+        drawn
     }
 
     /// Route one event through *this* window's tree, and return what it produced.

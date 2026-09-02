@@ -70,7 +70,17 @@ application answered `CloseRequested` by exiting, so the timer never fired outsi
 person the shell's own question — and against it a timer destroys the window, and the buffer with
 it, two seconds after one click with no way to intervene. **A shell cannot tell "wedged" from
 "asking"; the person looking at the dialog can.** So the first click asks and the second insists,
-which is what a Force Quit is on every desktop this borrows from. `check-login` drives both.
+which is what a Force Quit is on every desktop this borrows from.
+
+**And the arming expires**, five seconds after the ask. Without that the shell would never learn
+that a client *answered*: a person who middle-clicked, read the question and chose "keep editing"
+left the entry armed for the life of the window, and a middle-click at any later moment went
+straight to `Manage::Close` with no question — the same lost buffer, with the two-second bound
+replaced by an unbounded one (PR #267 review). There is no signal that says a client declined —
+`CloseRequested` has no refusal by design, and inferring one from a dialog appearing is the
+coupling this milestone rejected — so the second click counts only while it is still part of the
+first gesture. A click after that asks again. `check-login` drives all three: the ask, the expiry,
+and the insist.
 
 **And a `dialog` is placed and not listed** (M12 Part A). It is *held* for the manager exactly as
 a `normal` is, so a shell that ignored one would leave every dialog waiting out the compositor's
