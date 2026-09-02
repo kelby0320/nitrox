@@ -3,7 +3,8 @@
 ## Status
 
 **Partly built, and checked 2026-09-01** — Milestone 7 Part E built the shell and M8 Part C
-added its second bar;
+added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
+click;
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
 
@@ -60,10 +61,35 @@ because the zones *are* the work area. A window dropped in one takes that zone's
 work area for an edge, a quarter for a corner. The compositor previews the target under the
 pointer and matches the table; which region means which rectangle never reaches it. Closing is the pair the milestone added at
 both ends: a client's own close button ends the client, and the window list's middle-click sends
-`Manage::RequestClose` — an *ask*, which a client with unsaved work could answer with a dialog —
-followed by `Manage::Close` two seconds later if nothing happened. **The insist is not exercised
-by any gate**, because no application in the image can be wedged on purpose; the trigger is
-recorded in [`display-arm-plan.md`](../planning/display-arm-plan.md).
+`Manage::RequestClose` — an *ask*, which a client with unsaved work answers with a dialog.
+
+**The insist is a second middle-click, not a clock** (M12 Part A). It was `Manage::Close` two
+seconds later, and that was safe for exactly as long as no client could decline: every
+application answered `CloseRequested` by exiting, so the timer never fired outside a wedge.
+`nxedit`'s confirmation is the first client that deliberately does not answer — it is asking the
+person the shell's own question — and against it a timer destroys the window, and the buffer with
+it, two seconds after one click with no way to intervene. **A shell cannot tell "wedged" from
+"asking"; the person looking at the dialog can.** So the first click asks and the second insists,
+which is what a Force Quit is on every desktop this borrows from.
+
+**And the arming expires**, five seconds after the ask. Without that the shell would never learn
+that a client *answered*: a person who middle-clicked, read the question and chose "keep editing"
+left the entry armed for the life of the window, and a middle-click at any later moment went
+straight to `Manage::Close` with no question — the same lost buffer, with the two-second bound
+replaced by an unbounded one (PR #267 review). There is no signal that says a client declined —
+`CloseRequested` has no refusal by design, and inferring one from a dialog appearing is the
+coupling this milestone rejected — so the second click counts only while it is still part of the
+first gesture. A click after that asks again. `check-login` drives all three: the ask, the expiry,
+and the insist.
+
+**And a `dialog` is placed and not listed** (M12 Part A). It is *held* for the manager exactly as
+a `normal` is, so a shell that ignored one would leave every dialog waiting out the compositor's
+200 ms deadline and then appearing where its client asked — which, for a client that cannot know
+where it is, is the corner. It is centred on its parent and clamped to the work area, which
+[`rsproto-surface-ops.md`](../spec/rsproto-surface-ops.md) says a manager can work out for itself
+from the `WindowCreated` it already gets and the geometry it already tracks. It gets no taskbar
+slot: an entry offering to close or minimise a question on its own is a question minimised behind
+its window, and its parent's slot stands for both.
 
 What is **not**: the **system tray** (§9), which is v2 and an inter-process protocol rather than
 a widget; and **live thumbnails**, an optimisation §9 gives a trigger rather than a v1 goal. Sections describing those describe intent,

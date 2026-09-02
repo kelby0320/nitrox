@@ -1,7 +1,9 @@
 # Nitrox: The Widget Toolkit
 
 **Status: built (2026-08-11, last checked 2026-09-01), and this document describes what
-exists.** M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
+exists.** M12 Part A added `window::Child` — the toolkit's first module that is not a function of
+values, and the one that closes §11's multi-window deferral for the windows an application opens
+beside its main one. M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
 the *text area* arrived in M10 Part C, six milestones after this section reserved a space for
 it — and a single line was never the same widget. M9 Part A added
 `title_bar` and, with it, `on_press_down` — the first handler in this toolkit that fires on the
@@ -23,7 +25,10 @@ M11 Part B, in the half that matters to this crate: there is one `Theme`, it is 
 because the compositor needs it too, and `Palette` folded into it. Where its values come from is
 Part C's. The **text
 area** left this list in **M10 Part C**: §8 said it would arrive when an application posed real
-requirements rather than hypothetical ones, and M10's editor posed them. The menu's **popup half** left this list in M5 Part B and left the toolkit
+requirements rather than hypothetical ones, and M10's editor posed them. **Multi-window
+applications** left it in **M12 Part A**, in the half a trigger asked for: an editor's
+confirmation is a real `dialog` window, and what a window rather than an application holds is
+`window::Child`. A *main* window is still each application's own loop. The menu's **popup half** left this list in M5 Part B and left the toolkit
 entirely in M6 C3: a menu is a `popup` *window* now, parented to its application's window,
 positioned by the client at the anchor `locate` gives and clipped by the **screen**. `nxterm`
 still uses `locate`; it no longer uses `offset`, which has no consumer outside this crate's own
@@ -711,8 +716,37 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   nothing needed a container that scrolls. The trigger stands, narrowed to what would actually
   produce one: **chrome that must stay put while content moves under it** — a path strip beside a
   scrolling pane, or the editor's gutter.
-- **Multi-window applications.** One `App` drives one window. Trigger: dialogs that are
-  real windows rather than `stack` overlays.
+- **Multi-window applications** — *here since M12 Part A*, for the windows an application opens
+  **beside** its main one. The trigger fired exactly as written: `nxedit` asks before discarding
+  an unsaved buffer, and it asks in a real `Role::Dialog` window rather than in a `stack` overlay.
+  One `App` still drives it — a dialog's button produces the same `Msg` type the main window's do
+  — and what is per-*window* rather than per-application moved into
+  [`libui::window::Child`](../../userspace/libui/src/window.rs): the compositor's id, the size,
+  the diff `Tree`, the `Router`, the `BufferPool` and the scratch framebuffer, with
+  `open`/`present`/`route`/`close` over them.
+
+  **It is not new mechanism.** `nxterm` had grown that struct for its menu in M6 Part C3, and an
+  editor's confirmation wanted the same six fields; two consumers is when a helper goes down a
+  layer (`userspace/CLAUDE.md`). What went down with it was what that struct had learned — that a
+  child window must be destroyed on any partial failure of its own creation, because a
+  *configured* window that never commits is an invisible focus candidate that eats every
+  keystroke, and that presenting must be gated on the diff or a third commit blocks in `acquire`
+  inside the render half of a loop that then stops pumping anything else.
+
+  **A `Child` is one of the two parented roles**, `popup` and `dialog` — the pair the compositor's
+  own `parent_of` matches and the spec calls "transient, parented". Its size is fixed at creation
+  and measured from its tree, so a tree containing a `dock` is refused: `Dock` measures as
+  everything it is offered, deliberately, so it has no natural size. A caller that wants one
+  wraps it in a `sized`.
+
+  **A main window is still each application's own loop**, and that is a deferral rather than an
+  omission: it owns the `sys_wait`, it must answer `Configure` by reallocating everything a
+  `Child` holds, and `nxterm`'s paints a `custom` grid whose damage feeds `libterm`. Trigger: the
+  next part that touches both applications' main loops.
+
+  **This is also the one thing in this crate that is not a function of values.** `libui` gained a
+  `libsurface` dependency for it, which the layering in §10 always allowed and nothing had needed.
+  Nothing else here can reach a syscall, and that is the property to protect.
 
 ---
 

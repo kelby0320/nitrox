@@ -21692,3 +21692,119 @@ not work the first time it is needed." It worked.
 **The lesson that generalises**: a document that only *describes* code can be wrong in ways code
 review normally catches for free, because nothing fails to compile. The check that found both of
 these was reading every claim as a claim and going to look.
+
+## 2026-09-01 — M12 Part A: the first dialog, and the timer it made unsafe
+
+`Role::Dialog` has existed since M2 Part A and `widget-toolkit.md` §11 has said since M4 that "one
+`App` drives one window", with the trigger written down: *dialogs that are real windows rather than
+`stack` overlays*. `nxedit` asking before it discards an unsaved buffer is that day. Four decisions
+came out of building it, and only the first was expected.
+
+**1. The second window is a value, and it went into the toolkit.** `nxterm` grew a `Popup` struct in
+M6 Part C3 — an id, a `BufferPool`, a scratch framebuffer, a diff `Tree`, a `Router`, and
+`open`/`present`/`close` over them — and the editor's confirmation wanted exactly those six fields.
+Two consumers is this project's rule for when a helper goes down a layer, so it became
+`libui::window::Child` and `nxterm`'s menu is now a use of it.
+
+It covers the two *parented* roles, `popup` and `dialog` — the pair the compositor's own `parent_of`
+matches — and not main windows, which stay each application's own loop: a main window owns the
+`sys_wait`, answers `Configure` by reallocating everything a `Child` holds, and `nxterm`'s paints a
+`custom` grid whose damage feeds `libterm`. Converting those is a change to the shape of every
+`main` in the tree with no new behaviour in it.
+
+It is also **the first module in `libui` that is not a function of values**, which is why the crate
+took a `libsurface` dependency the layering had always allowed and nothing had needed. It is not
+host-tested, for the reason `libsurface::buffers` gives for itself: every line is a call into a
+`Session` or into `paint`/`layout`/`Tree`/`Router`, and both halves are covered already.
+
+**2. A modified buffer never closes on `Close`, however many times it arrives.** The obvious
+spelling — *ask if not already asking, otherwise close* — reads fine and turns the **second**
+`CloseRequested` into an exit. A second one is exactly what a person clicking a taskbar entry twice
+produces, which since decision 4 is also how they force a wedged window shut. So the only route out
+of a modified buffer is the answer the person gave, and the control for it is a host test that fails
+under that spelling.
+
+**3. A dialog is placed by the shell and not listed by it.** `rsproto-surface-ops.md` already said
+a `dialog` is *held* for the manager exactly as a `normal` is, and `desktop-shell` filtered on
+`ROLE_NORMAL` — so the first dialog anyone created would have waited out the compositor's 200 ms
+deadline and appeared wherever its client asked, which for a client that cannot know where it is
+means the corner. It is centred on its parent and clamped to the work area; the spec had already
+observed that a manager can work this out from the `WindowCreated` it gets and the geometry it
+tracks. No taskbar entry: one would offer to close or minimise a question independently of the
+window it belongs to, and a minimised question is a window that cannot be closed and will not say
+why. This is where "listed" in the role's definition stops meaning "in a taskbar" — it means the
+manager places it.
+
+**4. Insisting on a close is a second click, not a clock — and this was forced rather than
+chosen.** M9 Part C gave the taskbar's middle-click a two-second grace period and then
+`Manage::Close`, and left the insist ungated with the trigger written down: *the first application
+that can be wedged on purpose*. An editor holding an unanswered question **is** that application,
+and from the shell's side it is indistinguishable from one that has stopped listening. Against it a
+timer destroys the window, and the buffer with it, two seconds after one click, with no way to
+intervene.
+
+A shell cannot tell "wedged" from "asking". The person looking at the dialog can. So the first
+middle-click asks and the second insists, which is what a Force Quit is on every desktop this
+borrows from. Considered and rejected: cancelling the grace when a `dialog` parented to that window
+appears — it reads well, works only for clients that ask in the way this one happens to, and makes a
+visible policy depend on a coincidence of roles.
+
+**And the arming expires after five seconds, which the first version of this got wrong** (PR #267
+review, blocking 1). It armed on the ask and disarmed only when the window went away — so a person
+who middle-clicked, read the question and chose *keep editing* left the entry armed for the life of
+the window, and a middle-click ten minutes later went straight to `Manage::Close` with no question
+and nothing on screen that had ever said the entry was armed. The lost buffer this decision exists
+to prevent, with the two-second bound replaced by an unbounded one.
+
+The shell cannot observe an answer: `CloseRequested` has no refusal by design, and inferring one
+from a dialog appearing or going away is the coupling rejected in the paragraph above. So the second
+click counts only while it is still *part of the first gesture* — which is the rule M12's kill ring
+already settles for cycling, and for the same reason: a continuation is valid immediately after the
+thing it continues, and a stale one has to be unreachable rather than merely unlikely. It is a clock
+the shell reads when a click arrives rather than one it wakes for, and unlike the grace period it
+*acts on nothing* when it expires — it forgets, and the next click asks again, which is the
+recoverable direction.
+
+`check-login` now drives all three — the ask, the expiry, and the insist — so `Manage::Close` is
+exercised end to end for the first time.
+
+## 2026-09-01 — parked events cannot wake a wait; and a bisect over a flaky step measures nothing
+
+Two things, and the order they were understood in is the point.
+
+**The real gap, by inspection.** `desktop-shell` blocks in `sys_wait` on the compositor's channel
+and the manager's. `libsurface` parks input that arrives while a *reply* is being awaited — inside
+the transport, not in a kernel queue — so a parked event cannot wake that wait. The loop has a belt
+and its comment says what it covers: `sent_request` is set when a **manager** request goes out, and
+the next iteration polls with a zero deadline. The session's own requests park in exactly the same
+way and set nothing — a `create` waiting for its first `Configure`, an `acquire` waiting for a
+buffer release. The fix is to ask rather than assume: pump before waiting, and do not block while
+anything is queued. It cannot spin, because the drain below empties what it counts.
+
+That belt was written against the *mechanism it was noticed in* rather than against the property
+that matters — anything the transport is holding — and a belt narrower than its own justification is
+one that gets found by a symptom somewhere else.
+
+**And the symptom it was blamed for was somebody else's.** Removing the close timer coincided with
+`check-login`'s launcher-row click failing: a click that lands on the modal and launches nothing.
+A clean worktree at HEAD passed, the branch failed twice, and that looked like a bisect. It was not
+one — the step is *intermittent*, so two failures against two passes measures nothing, and the same
+step failed again in CI after the pump fix had supposedly cured it.
+
+The actual hazard was already written down, in this shell's own source, about the *other* place it
+types: "injection is relative and unacknowledged, so a dropped PS/2 batch silently eats a keystroke
+— a desktop named `wok` instead of `work`, which is a gate failure that looks like a logic bug."
+The receipt that comment introduces was added for renaming and explicitly withheld from the
+launcher — "so the launcher's typing stays quiet" — and the quiet is what made this undiagnosable:
+`check-login` types six characters into the filter and immediately clicks a row, so a lost batch
+leaves the list showing something else and the click lands on nothing, with no line anywhere naming
+the missing key. The launcher's filter reports a count per character now, the gate waits for one per
+key, and `nxedit`'s name field — which had the same shape and a gate comment claiming a discipline
+it did not follow — got the same treatment.
+
+**What to take from it.** A timer that exists for one reason can be load-bearing for another, and
+removing it is how you find out — that part stands, and the pump fix stands on inspection. What does
+not stand is the causal story: an intermittent failure ran through a bisect and came out looking
+deterministic, and the conclusion survived three runs of confirmation because it was never tested
+against the hypothesis it displaced. When a fix and a flake are the same shape, the fix has to be
+justified by reading the code, and the flake by a receipt that says which half went missing.

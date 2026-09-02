@@ -2462,6 +2462,13 @@ and Part D is the milestone where something can.
       any client with a blocking operation), at which point the grace period and the
       `Manage::Close` that follows it can be driven from a gate.
 
+      **The trigger fired in M12 Part A, and it took the grace period with it.** An editor
+      holding an unanswered confirmation is a client that deliberately does not answer, which is
+      indistinguishable from a wedge — and against it a timer destroys the buffer the question
+      was about. Insisting is a *second middle-click* now, and `check-login` step 12 drives
+      `Manage::Close` end to end for the first time. This box's own reasoning still stands: the
+      shell asks before it destroys, and only the arbiter changed.
+
 ### Part D — `nxterm` honours `Configure`, and `libterm` reflows
 
 The blocker for everything sized: until this lands, maximise, snap and resize are no-ops on the
@@ -2798,7 +2805,8 @@ its second designed consumer was always a list of things on disk.
       was the taskbar's middle-click — which asks, waits out the two-second grace period, and
       then destroys the window with `Manage::Close`. That is the path the shell documents as
       being for a client that has stopped answering, and every close of this application would
-      have taken it.
+      have taken it. (The grace period is gone since M12 Part A — a second middle-click is what
+      insists now — which changes when that path is reached and not the point being made here.)
 
 ### Part C — the text area
 
@@ -3630,9 +3638,9 @@ convention and a lookup path, which is a second decision and not this one.
 Six parts, and the governing decisions below them, so each can be built rather than re-argued.
 The two taken before this pass — the clipboard's owner and the image format — are above.
 
-### Part A — dialogs, and the second window
+### Part A — dialogs, and the second window ✅ complete (2026-09-01)
 
-- [ ] **`Role::Dialog` gets its first *application*, and the toolkit grows a dimension.** The
+- [x] **`Role::Dialog` gets its first *application*, and the toolkit grows a dimension** ✅. The
       role has existed since M2 Part A and is created today by exactly one thing: `ui-testclient`,
       which makes one deliberately so that the held-configure and ignored-offset halves of its
       contract are asserted — added because a reviewer asked for it (PR #220, finding 2), and
@@ -3648,8 +3656,101 @@ The two taken before this pass — the clipboard's owner and the image format �
       nothing", which was false twice over and would have sent the building session looking for
       coverage that exists — PR #266 review, blocking 1.)
 
-- [ ] **Gate**: `check-login` drives a confirmation to both answers. A dialog that only ever gets
-      "yes" is half a control.
+      **What it became**: `nxedit` asks before discarding an unsaved buffer. `Msg::Close` no
+      longer ends the run when the buffer is modified — however many times it arrives, which is
+      the shape a second `CloseRequested` needs — and only `Discard` does. The dialog is a real
+      window with its own title bar, and its one title-bar button is *keep editing*: a frame must
+      not be a third way to discard.
+
+- [x] **`libui::window::Child`, which is where the dimension actually went** ✅. `nxterm` had
+      grown a `Popup` struct in M6 Part C3 — an id, a `BufferPool`, a scratch framebuffer, a
+      `Tree` and a `Router`, with `open`/`present`/`close` over them — and the confirmation wanted
+      the same six fields. Two consumers is when a helper goes down a layer, so `nxterm`'s went
+      down and became the menu's window unchanged.
+
+      **It is the first module in `libui` that is not a function of values**, which is why the
+      crate gained a `libsurface` dependency the layering had always allowed. It is not
+      host-tested, for the reason `libsurface::buffers` is not: every line is a call into a
+      `Session` or into `paint`/`layout`/`Tree`/`Router`, and both halves are tested already.
+      What is left is the order, which is what a gate sees.
+
+      **A main window is deliberately still each application's own loop** — it owns the
+      `sys_wait`, answers `Configure` by reallocating everything a `Child` holds, and `nxterm`'s
+      paints a `custom` grid. Trigger: the next part that touches both applications' main loops.
+
+- [x] **The shell places dialogs, and does not list them** ✅. A `dialog` is *held* for the
+      manager exactly as a `normal` is, and `desktop-shell` filtered on `ROLE_NORMAL` — so the
+      first dialog would have waited out the compositor's 200 ms deadline and appeared in the
+      corner. It is centred on its parent and clamped to the work area, which
+      `rsproto-surface-ops.md` already said a manager can work out for itself. No taskbar slot:
+      an entry that closes or minimises a question on its own is a question hidden behind its own
+      window.
+
+- [x] **And the insist became a second click rather than a clock** ✅ — the part of this nobody
+      predicted. `nxedit` holding a question is the first client in the tree that deliberately
+      does not answer `CloseRequested`, and from the shell's side that is indistinguishable from
+      a client that has stopped listening. Against it the two-second grace period destroys the
+      window, and the buffer with it, two seconds after one middle-click. A shell cannot tell
+      "wedged" from "asking"; the person looking at the dialog can. **M9 Part C named this
+      trigger** — "the first application that can be wedged on purpose" — and it fired here.
+
+      **The arming expires**, five seconds after the ask, which the first version did not do:
+      it disarmed only when the window went away, so answering *keep editing* left the entry
+      armed for the window's life and a later click destroyed it with no question — the same
+      lost buffer, unbounded (PR #267 review, blocking 1). A second click counts only while it
+      is still part of the first gesture, which is the rule M12's kill ring already settles for
+      cycling.
+
+- [x] **Gate** ✅: `check-login` steps 11 and 12. Step 11 drives the confirmation to **both**
+      answers from the editor's own close button — a dialog that only ever gets "yes" is half a
+      control — and asserts the dialog's origin is its parent's centre, clamped, rather than
+      merely reading the number back. Step 12 middle-clicks the taskbar twice: the first ask
+      reaches a client that declines it, the second destroys the window. **That is the first time
+      `Manage::Close` has been driven end to end**, which M9 Part C left open for want of a client
+      that could be wedged.
+
+      Step 12 also drives the **expiry**: the ask is answered with *keep editing*, the arming
+      is allowed to run out, and the next click is asserted to **ask again** rather than
+      destroy. That assertion is the control for the bug above — under the version review
+      caught, it printed "did not answer; closed it" instead. It is the one deliberate sleep in
+      a gate that is otherwise expect-driven, because an expiry is the absence of a state and
+      has no line to wait for.
+
+      **Ten host tests in `nxedit`, each run alone against a broken implementation**: closing a
+      modified buffer asking rather than exiting, a clean one closing at once, a *second* close
+      request not discarding (the control for the obvious wrong spelling), keep-editing changing
+      nothing but the question, saving removing the reason to ask, `Esc` and only `Esc`
+      answering, a dialog that will not open leaving the window alone, the tree measuring to
+      exactly its declared size, the two published button centres being where the buttons are,
+      and the dialog's own close button keeping the buffer. Plus two in `xtask` for the lines the
+      gate parses.
+
+      **The four button coordinates are published from `nxedit` and hardcoded in the gate**,
+      because a host tool in another workspace cannot link the crate — the same arrangement that
+      already hardcodes a title bar's height. The host test asserts **the literals themselves**,
+      not merely that the derived constants agree with the tree: both sides derive from
+      `CONFIRM_PAD`, so comparing them pinned nothing, and with `CONFIRM_PAD` at 40 every host
+      test passed while the gate went on clicking a `y` the buttons no longer covered (PR #267
+      review, finding 2). The claim that a padding change fails beside the change rather than
+      after a three-minute boot is true now, and was not.
+
+- [x] **Two bugs found on the way, and neither was in any of this** ✅.
+
+      **The parked-event gap**, which is real by inspection: `desktop-shell` blocks in
+      `sys_wait`, and input that `libsurface` parked inside the transport while a *session*
+      request awaited its reply is not in a kernel queue and cannot wake it. The `sent_request`
+      belt covers manager requests only. The shell pumps before it waits now and does not block
+      while anything is queued.
+
+      **And the launcher-row flake, which was blamed on it and was not it.** Removing the close
+      timer coincided with `check-login`'s row click failing; a clean worktree passed and the
+      branch failed twice, which looked like a bisect over an intermittent step and is not one.
+      It failed again in CI after the pump fix. The cause was the thing this shell's own source
+      names for its *other* typing path — an unacknowledged burst of injected keys — with the
+      receipt deliberately withheld from the launcher "so the launcher's typing stays quiet".
+      The filter reports a count per character now, the gate waits for one per key, and
+      `nxedit`'s name field got the same, its gate comment having claimed a discipline it did
+      not follow.
 
 ### Part B — the browser: file operations, and drag-and-drop within a window
 

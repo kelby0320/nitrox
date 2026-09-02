@@ -1540,6 +1540,63 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     Ok(())
 }
 
+/// Read `<id> of window <parent> at <x>,<y> <w>x<h>` — the tail of the shell's dialog placement.
+///
+/// A line of its own rather than the `placed window` one every other placement uses, because a
+/// dialog is placed by a different rule: centred on its parent rather than stepped along the
+/// cascade, so the line names the parent it was centred on.
+fn parse_dialog_placement(tail: &str) -> Option<(u32, u32, i32, i32, u32, u32)> {
+    let (id, rest) = tail.trim().split_once(" of window ")?;
+    let (parent, rest) = rest.split_once(" at ")?;
+    let (origin, size) = rest.split_once(' ')?;
+    let (x, y) = origin.split_once(',')?;
+    let (w, h) = size.trim().split_once('x')?;
+    Some((
+        id.parse().ok()?,
+        parent.parse().ok()?,
+        x.parse().ok()?,
+        y.parse().ok()?,
+        w.parse().ok()?,
+        h.parse().ok()?,
+    ))
+}
+
+/// Which slot of the taskbar `id` occupies, from the shell's own window-list line.
+///
+/// **Read rather than counted.** The bar shows the windows on the *current* desktop, in the
+/// order the shell holds them, and a gate that kept its own tally would drift the first time a
+/// window was closed or moved between desktops — which by this point in `check-login` has
+/// happened several times. The line is `… [20:nxfiles] [21:notes.txt*]`, so the slot is the
+/// position of the group whose id matches.
+fn taskbar_slot(list: &str, id: u32) -> Option<usize> {
+    list.split('[')
+        .skip(1)
+        .position(|group| group.split_once(':').is_some_and(|(n, _)| n.trim() == id.to_string()))
+}
+
+/// Type `text` into the applications modal, one character at a time, waiting for each.
+///
+/// **A receipt per character, because injection is relative and unacknowledged.** The modal's
+/// filter had no line of its own until M12 Part A — the shell's source said the receipt was
+/// "limited to renaming so the launcher's typing stays quiet" — so a burst of six keys followed
+/// immediately by a click on a row was six chances to lose a keystroke and no way to tell.
+/// The list would then be showing something else, the click would land on nothing, and the gate
+/// would fail three steps later at whatever depended on the launch. It did, intermittently, in
+/// CI and locally (PR #267).
+///
+/// The count is read and not asserted: what `/bin` holds is the image's business, and a gate
+/// that pinned the number of matches would fail the day a program is added. What is asserted is
+/// that the keystroke arrived at all.
+fn type_into_modal(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
+    for c in text.chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(qmp, &qcode)?;
+        session.expect("desktop-shell: applications modal listing ")?;
+    }
+    Ok(())
+}
+
 /// Middle-click at `(x, y)`, having first walked the pointer there and checked it arrived.
 ///
 /// **The position is verified with a left click before the middle one**, because the compositor
@@ -1877,11 +1934,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //    **`nxterm`, which is what makes the milestone visible**: a person types into the
     //    applications modal and a terminal opens. Part E launched a coreutil because the
     //    mechanism was the deliverable; Part F is the thing launched being worth looking at.
-    for c in "nxterm".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxterm")?;
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
@@ -1923,6 +1976,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     // Where a window-list entry sits: the first slot on the bottom bar.
     const LIST_CLICK: (i32, i32) = (90, 788);
+    // How wide one is — `desktop-shell::ENTRY_W`, so slot `i`'s centre is `ENTRY_W * i + 90`.
+    // Hardcoded like every other chrome metric this gate aims at, and for the same reason: a
+    // gate that read the shell's layout to know where to click could agree with a shell that
+    // had stopped drawing where it says (M11 decision 2).
+    const ENTRY_W: i32 = 180;
 
     // 6a2. **The title bar's buttons ask, and the shell disposes** (M9 Part B). A client cannot
     //      minimise or maximise itself — both are manager operations — so the button sends
@@ -2039,11 +2097,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: applications modal open")?;
     // Filtered to one row first, so the row being clicked is known without the gate having to
     // work out where `nxterm` sorts in the contents of `/bin`.
-    for c in "nxterm".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxterm")?;
     // **The modal hangs from the button now**, at (0, `BAR_H`), rather than covering the bar it
     // drops from — so the first row sits a field's height below the bar. `click_at` asserts the
     // press position before anything downstream is checked, which is what separates "the pointer
@@ -2730,11 +2784,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
-    for c in "nxfiles".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxfiles")?;
     press(&mut qmp, "ret")?;
     session.expect("desktop-shell: launched nxfiles into its own namespace")?;
     // **The theme reached the application** (M11 Part C): a value that travelled from a file on
@@ -2957,11 +3007,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.skip_to_end()?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
-    for c in "nxedit".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxedit")?;
     // **Enter, not a click on the row.** Clicking a row is proved above, where the terminal every
     // later step depends on is launched that way; what this step is about is what happens *after*
     // a launch that carries no file, so it takes the shortest route to one.
@@ -2972,7 +3018,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // placed is a window that exists.
     session.expect("desktop-shell: placed window ")?;
     let untitled = session.rest_of_line()?;
-    let (untitled_id, _, _) = parse_placement(&untitled)
+    let (untitled_id, untitled_x, untitled_y) = parse_placement(&untitled)
         .ok_or_else(|| format!("could not read the untitled editor's placement from {untitled:?}"))?;
     println!("  ok: the editor launched from the menu and stayed up (window {untitled_id})");
 
@@ -2986,11 +3032,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_key("ctrl", true)?;
     press(&mut qmp, "s")?;
     qmp.send_key("ctrl", false)?;
-    // Then the name, one key at a time — the same discipline every typed sequence here uses.
-    for c in "scratch".chars() {
+    // Then the name, one key at a time — and **waiting for each**, which the comment here
+    // claimed and the code did not do (M12 Part A). `nxedit` had no receipt for this field:
+    // naming a buffer is not editing it, so `buffer rev` never moves, and seven unacknowledged
+    // keystrokes were seven chances to end up asserting against a file called `scrath`.
+    for (i, c) in "scratch".chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
         press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxedit: name so far {} chars", i + 1))?;
     }
     press(&mut qmp, "ret")?;
     // **`/home`, which *is* the user's subtree from inside the session.** A session namespace
@@ -3000,6 +3050,207 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // zero bytes: the newline the editor adds is per line, and there are none.
     session.expect("nxedit: saved /home/scratch - 0 bytes")?;
     println!("  ok: an untitled buffer was named and written into the session's home");
+
+    // 11. **A confirmation dialog, driven to both answers** (M12 Part A). `Role::Dialog` has
+    //     existed since M2 Part A and no program a person runs had ever created one: the editor
+    //     answered every `CloseRequested` by exiting, and its own source said so — "an editor
+    //     with somewhere to put a question would ask it, and this one has no dialog to ask in".
+    //
+    //     **The dialog's geometry is hardcoded here**, the way this gate already hardcodes a
+    //     title bar's height and a list's row height, because it cannot link the crate that
+    //     defines them. `nxedit::CONFIRM_DISCARD_CX` and its three siblings are the source, and
+    //     `the_published_button_centres_are_where_the_buttons_are` is the host test that pins
+    //     these four numbers to the tree that is actually built — so a change to the dialog's
+    //     padding fails there, beside the change, rather than here after a three-minute boot.
+    const CONFIRM_W: i32 = 340;
+    const CONFIRM_H: i32 = 132;
+    const CONFIRM_DISCARD_CX: i32 = 91;
+    const CONFIRM_KEEP_CX: i32 = 249;
+    const CONFIRM_BUTTON_CY: i32 = 103;
+    // **And the editor's own size, `nxedit::START_SIZE`, because the geometry line cannot be
+    // read this late.** The shell logs at most `MAX_LOGGED_GEOMETRY` of them per session and
+    // this run passed that long ago — a bound that exists because the event is client-driven,
+    // and a gate is not a reason to raise it. This window was launched from the menu and nothing
+    // has resized it, so its size is the one the editor starts at.
+    const EDITOR_W: i32 = 560;
+    const EDITOR_H: i32 = 420;
+
+    // One keystroke is all it takes to have something to lose. The editor was saved a moment
+    // ago, so this is the difference between the buffer and the file and nothing else.
+    press(&mut qmp, "z")?;
+    session.expect("nxedit: buffer rev 1")?;
+
+    // **Its own close button, which used to be the end of the process.** The rightmost of the
+    // three title-bar controls, measured from the window's right edge — the same arithmetic 6a2
+    // uses, and the same one 6i used on `nxterm`, whose close button really does just exit.
+    let untitled_right = untitled_x + EDITOR_W;
+    let close_at = (untitled_right - 13, untitled_y + 13);
+    click_at(&mut qmp, &mut session, close_at.0, close_at.1)?;
+    // **The editor's line comes first, and it is ordered by construction rather than by luck.**
+    // It is printed *before* the dialog is asked for, because a dialog's first `Configure` is
+    // held for the manager — so a line printed after `Child::open` returned would be downstream
+    // of the shell, and the two processes would be racing to the console. They were, and the
+    // winner depended on the accelerator: TCG gave the shell both lines and KVM gave the client
+    // the second one, which is how this passed twice locally and failed in CI (PR #267).
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    session.expect("desktop-shell: placed dialog ")?;
+    let placed_dialog = session.rest_of_line()?;
+    let (_, parent_id, dx, dy, dw, dh) = parse_dialog_placement(&placed_dialog)
+        .ok_or_else(|| format!("could not read a dialog placement from {placed_dialog:?}"))?;
+    if parent_id != untitled_id {
+        return Err(format!(
+            "the editor asked about window {untitled_id}, and the shell placed a dialog on \
+             window {parent_id}"
+        )
+        .into());
+    }
+    if (dw as i32, dh as i32) != (CONFIRM_W, CONFIRM_H) {
+        return Err(format!(
+            "the dialog is {dw}x{dh}, and this gate aims at a {CONFIRM_W}x{CONFIRM_H} one \
+             — the four constants above came from `nxedit`'s published geometry and have \
+             drifted from it"
+        )
+        .into());
+    }
+    // **The centring is re-derived here, and that is the assertion rather than a second copy of
+    // a policy.** M10 Part E's rule — read the shell's geometry lines, do not recompute the
+    // cascade — is about placements this gate has no opinion on. This one it does: "centred on
+    // its parent, kept inside the work area" is the claim M12 Part A makes, and reading the
+    // number back without checking it would assert only that some number was printed.
+    let want_x = (untitled_x + (EDITOR_W - CONFIRM_W) / 2)
+        .clamp(work.0, work.0 + work.2 as i32 - CONFIRM_W);
+    let want_y = (untitled_y + (EDITOR_H - CONFIRM_H) / 2)
+        .clamp(work.1, work.1 + work.3 as i32 - CONFIRM_H);
+    if (dx, dy) != (want_x, want_y) {
+        return Err(format!(
+            "the dialog landed at {dx},{dy}; centred on window {untitled_id} at \
+             {untitled_x},{untitled_y} {EDITOR_W}x{EDITOR_H} and clamped to the work area \
+             it belongs at {want_x},{want_y}"
+        )
+        .into());
+    }
+    println!("  ok: an unsaved buffer asked instead of exiting, in a dialog centred on it");
+
+    // **The first answer**, and the one a person reaches for by accident: keep editing. The
+    // editor is still there afterwards, which is the whole point of asking.
+    click_at(&mut qmp, &mut session, dx + CONFIRM_KEEP_CX, dy + CONFIRM_BUTTON_CY)?;
+    session.expect("nxedit: close cancelled, still editing")?;
+    println!("  ok: `keep editing` dismissed the question and kept the editor");
+
+    // **And the second answer.** Asked again — the same button, the same window, because a
+    // question answered *no* must be askable again or the editor can never be closed at all.
+    click_at(&mut qmp, &mut session, close_at.0, close_at.1)?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    session.expect("desktop-shell: placed dialog ")?;
+    let placed_again = session.rest_of_line()?;
+    let (_, _, dx2, dy2, _, _) = parse_dialog_placement(&placed_again)
+        .ok_or_else(|| {
+            format!("could not read the second dialog placement from {placed_again:?}")
+        })?;
+    click_at(&mut qmp, &mut session, dx2 + CONFIRM_DISCARD_CX, dy2 + CONFIRM_BUTTON_CY)?;
+    session.expect("nxedit: discarding the unsaved buffer")?;
+    session.expect("nxedit: closing")?;
+    // **The list the destroy produces**, read here because it is the one line whose position in
+    // the stream is known: the editor exits, the compositor destroys its windows, and the shell
+    // redraws the bar. Step 12 needs a slot out of it, and asking for a list line later would
+    // wait for a change that nothing is going to make.
+    // **Read until the list reflects the destroy, not merely the next time it changes.** The
+    // bar is redrawn for several reasons and two of them fire here in order: the dialog goes
+    // first, which hands the keyboard back to the editor and marks the list dirty while the
+    // editor is still in it, and only then does the process exit and take its window. Four
+    // attempts is a bound rather than a guess — nothing produces that many — and it fails
+    // naming the last line it saw.
+    let mut after_close = String::new();
+    for _ in 0..4 {
+        session.expect("desktop-shell: window list on ")?;
+        after_close = session.rest_of_line()?;
+        if taskbar_slot(&after_close, untitled_id).is_none() {
+            break;
+        }
+    }
+    if taskbar_slot(&after_close, untitled_id).is_some() {
+        return Err(format!(
+            "window {untitled_id} is still in the taskbar after the editor said it was closing: \
+             {after_close:?}"
+        )
+        .into());
+    }
+    let slot = taskbar_slot(&after_close, edit_id).ok_or_else(|| {
+        format!(
+            "window {edit_id} is not in the taskbar list {after_close:?}, so it cannot be clicked"
+        )
+    })?;
+    println!("  ok: `discard` was the only thing that ended the run");
+
+    // 12. **Insisting is a second click, not a clock** (M12 Part A). M9 Part C left this
+    //     ungated on the stated grounds that "the release image has no client that can be made
+    //     to ignore a request", and named the trigger: *the first application that can be
+    //     wedged on purpose*. An editor holding an unanswered question is exactly that — from
+    //     the shell's side it is indistinguishable from a client that has stopped listening.
+    //
+    //     **Which is why the two-second grace period had to go.** Against this client a timer
+    //     destroys the window, and the buffer with it, two seconds after one click and with no
+    //     way to intervene. The shell cannot tell "wedged" from "asking"; the person looking at
+    //     the dialog can, so the second middle-click is what says "I meant it".
+    //
+    //     Driven on the editor from step 9, which is snapped to the right half and holds
+    //     `other.txt`. Clicking its document area both raises it and gives it the keyboard.
+    let doc = (work.0 + work.2 as i32 * 3 / 4, work.1 + work.3 as i32 / 2);
+    click_at(&mut qmp, &mut session, doc.0, doc.1)?;
+    press(&mut qmp, "z")?;
+    session.expect("nxedit: buffer rev 1")?;
+
+    // Its taskbar slot came off the shell's own list above: a slot is a *position*, and windows
+    // have been closed since the last time anything here counted, so `id * ENTRY_W` would land
+    // on somebody else's entry.
+    let entry = (ENTRY_W * slot as i32 + ENTRY_W / 2, LIST_CLICK.1);
+
+    // **`middle_click_at` verifies the pointer with a left click first**, which on a taskbar
+    // entry is a gesture in its own right — it raises the window, or minimises it if it already
+    // had the keyboard. Neither is asserted here, and neither matters: what the middle click
+    // does is the same either way, and a gate that pinned it would be asserting against which
+    // window happened to be focused three clicks earlier.
+    middle_click_at(&mut qmp, &mut session, entry.0, entry.1)?;
+    // **The compositor's line is the ordered one, not the shell's** — the same rule 6a3 states:
+    // the compositor logs before it replies, so it leads, and the shell's own line comes after
+    // its request returns, which is a race against the client it just woke. The shell's is
+    // checked against the whole transcript below, where order does not matter.
+    session.expect(&format!("compositor: asked window {edit_id} to close"))?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    session.expect("desktop-shell: placed dialog ")?;
+    let asked_dialog = session.rest_of_line()?;
+    let (_, _, ax, ay, _, _) = parse_dialog_placement(&asked_dialog)
+        .ok_or_else(|| format!("could not read the ask's dialog placement from {asked_dialog:?}"))?;
+    println!("  ok: the taskbar's ask reached a client that declined to answer it");
+
+    // **The person answers it, and the arming must not outlive the answer** (PR #267 review,
+    // blocking 1). The first version of this policy armed on the ask and disarmed only when the
+    // window went away, so *keep editing* left the entry armed for the life of the window and
+    // the next middle-click — at any distance in time — destroyed it with no question at all.
+    // That is the unbounded version of the very outcome this change replaced a two-second timer
+    // to avoid.
+    click_at(&mut qmp, &mut session, ax + CONFIRM_KEEP_CX, ay + CONFIRM_BUTTON_CY)?;
+    session.expect("nxedit: close cancelled, still editing")?;
+
+    // **A real wait, in a gate that is otherwise expect-driven.** There is no output that says
+    // an arming expired — expiry is the *absence* of a state — so the only way to observe it is
+    // to let the clock pass it. `INSIST_WINDOW_NS` is five seconds; six is past it with room,
+    // and it is the one sleep in this file that is waiting for a rule rather than for a message.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    middle_click_at(&mut qmp, &mut session, entry.0, entry.1)?;
+    // **Asked, not destroyed** — and this assertion *is* the control. Under the version the
+    // review caught, this click produced "did not answer; closed it" and the buffer went with
+    // the window; here the question is put again, which is what a click made long after the
+    // last one means.
+    session.expect(&format!("compositor: asked window {edit_id} to close"))?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
+    println!("  ok: the arming expired, so a later click asked again rather than destroying");
+
+    // **And a click while the ask is still in hand insists.** The window goes, the dialog goes
+    // with it — a dialog is destroyed with its parent — and the shell says which path it took.
+    middle_click_at(&mut qmp, &mut session, entry.0, entry.1)?;
+    session.expect(&format!("desktop-shell: window {edit_id} did not answer; closed it"))?;
+    println!("  ok: a second middle-click destroyed the window the first one only asked about");
 
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
@@ -3068,6 +3319,22 @@ fn cmd_check_login(accel: Accel) -> R<()> {
             )
             .into());
         }
+    }
+
+    // **And that it asked before it insisted** (M12 Part A) — order-independent for the same
+    // reason, and it is what makes step 12 a *policy* assertion rather than a coincidence: the
+    // shell reached `Manage::Close` on the second click, and it reached `RequestClose` on the
+    // first. A shell that destroyed the window straight away would produce the "did not answer"
+    // line the ordered half already matched, and none of this.
+    if !transcript.contains(&format!("desktop-shell: asked window {edit_id} to close")) {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err(format!(
+            "the shell destroyed window {edit_id} without ever reporting that it asked first: \
+             insisting must be the *second* middle-click, and the first must be a request the \
+             client is free to answer with a dialog"
+        )
+        .into());
     }
 
     // The shell said it asked — order-independent, because that line races the client it woke.
@@ -9200,5 +9467,43 @@ mod diag_tests {
              for revisiting whether the grid should follow the theme after all",
             theme.background
         );
+    }
+
+    #[test]
+    fn a_dialog_placement_reads_back_as_six_numbers() {
+        // The line `check-login` aims a click from. It carries the parent as well as the origin,
+        // because the assertion beside it is that the dialog was centred *on that window* — a
+        // parser that dropped the parent would leave the gate checking arithmetic against a
+        // window it had not identified.
+        assert_eq!(
+            parse_dialog_placement(" 21 of window 20 at 490,214 340x132"),
+            Some((21, 20, 490, 214, 340, 132))
+        );
+        // A negative origin is legal: the clamp keeps a dialog inside the work area, and the
+        // work area's own origin is not the screen's.
+        assert_eq!(
+            parse_dialog_placement("3 of window 2 at -4,24 100x50"),
+            Some((3, 2, -4, 24, 100, 50))
+        );
+        // And the shapes that must not silently parse as something else.
+        assert_eq!(parse_dialog_placement("21 at 490,214 340x132"), None, "no parent");
+        assert_eq!(parse_dialog_placement("21 of window 20 at 490 340x132"), None, "no comma");
+        assert_eq!(parse_dialog_placement(""), None);
+    }
+
+    #[test]
+    fn a_taskbar_slot_is_the_position_of_the_id_not_the_id() {
+        // **The distinction the gate depends on.** Ids are not slots — a window closed earlier
+        // in the run leaves the ones after it at lower positions — and clicking `id * ENTRY_W`
+        // would land on somebody else's entry as soon as anything had ever been closed.
+        let list = "desktop 1 of 2 [20:nxfiles] [24:notes.txt*] [31:untitled]";
+        assert_eq!(taskbar_slot(list, 20), Some(0));
+        assert_eq!(taskbar_slot(list, 24), Some(1));
+        assert_eq!(taskbar_slot(list, 31), Some(2));
+        assert_eq!(taskbar_slot(list, 21), None, "a window on another desktop has no slot");
+        // A title that contains a digit must not be mistaken for an id: the match is on the
+        // group's own `id:` prefix, not on the group containing the number anywhere.
+        assert_eq!(taskbar_slot("desktop 1 of 1 [7:file20.txt]", 20), None);
+        assert_eq!(taskbar_slot("desktop 1 of 1 (empty)", 20), None);
     }
 }

@@ -264,6 +264,7 @@ dependencies = [
  "libkern",
  "libm",
  "librsproto",
+ "libsurface",
 ]
 
 [[package]]

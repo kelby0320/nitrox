@@ -30,11 +30,11 @@ use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 use libui::diff::Tree;
 use libui::damage::union_opt;
-use libui::layout::{Constraints, Layout, layout, locate, measure};
+use libui::layout::{Layout, layout, locate};
 use libui::paint::FontMetrics;
 use libui::paint::{Theme, paint};
 use libui::route::Router;
-use alloc::boxed::Box;
+use libui::window::Child;
 use nxterm::{App, GRID_KEY, GRID_KIND, MENU_ITEM_KEY, Msg, rows_in};
 
 /// `alloc` backing — the element tree, the grid and the render all allocate.
@@ -71,7 +71,7 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
-/// The menu's window, alive only while the menu is open.
+/// Where the menu's window is anchored, and what it is.
 ///
 /// **A `popup`, not a layer.** `libui`'s `offset` clips at its parent's edge, which is right one
 /// level down and wrong for a menu — "a menu clipped to its window is not a menu"
@@ -79,161 +79,16 @@ fn fail(msg: &[u8]) -> ! {
 /// window, which worked only because it happened to fit inside the terminal. As a `popup` window
 /// it is parented to the terminal, positioned by *this* client at the anchor the layout gives,
 /// and clipped only by the screen.
-struct Popup {
-    id: u32,
-    /// The pixels, allocated and mapped by `libsurface` and unmapped when this is dropped.
-    pool: BufferPool,
-    /// Composed here and copied into whichever buffer is free — the same reason the terminal
-    /// window does it: the toolkit's damage describes the last frame, not the free buffer's.
-    scratch: MemFramebuffer,
-    /// Diff state, separate from the terminal's because this is a different tree.
-    tree: Tree,
-    /// Routing state, likewise: focus within the menu is not focus within the terminal.
-    router: Router,
-    /// Which item the pointer was over at the last paint.
-    ///
-    /// **Kept so a change can be *reported*, not so the view can be built** — the view reads
-    /// `router.inside()` directly, which is the one source. This is a receipt: a gate driving a
-    /// release image sees nothing of a highlight, and hover is the first thing in this system
-    /// that reacts to the pointer moving without a button held, so "the path works" needed
-    /// something to assert (M11 Part E batch 3).
-    hovered: Option<u64>,
-    size: Size,
-}
-
-impl Popup {
-    /// Create the menu's window at `anchor`, sized to what the menu measures.
-    ///
-    /// **Measured rather than guessed.** A popup window needs its extent before it exists, and
-    /// a hardcoded size would silently stop matching the menu the first time an item is added.
-    /// `Fill` measures as zero, so the backing layer does not inflate this.
-    fn open(
-        session: &mut Session<Box<ChannelTransport>>,
-        parent: u32,
-        anchor: Rect,
-        app: &App,
-        ui_font: &Font,
-        theme: &Theme,
-    ) -> Option<Self> {
-        // No hover yet: the pointer is over the *bar* item that opened this, not over the popup,
-        // and this call only measures the menu — which hover does not change the size of.
-        let menu = app.menu_view(theme, None);
-        let m = FontMetrics::new(ui_font, theme.font_px);
-        let size = measure(&menu, Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &m);
-        if size.w == 0 || size.h == 0 {
-            return None;
-        }
-        // Directly under the item it drops from, in the parent's coordinates — which is what
-        // the offset in `CreateWindow` means.
-        let id = session
-            .create(
-                &CreateWindowRequest::at(
-                    size.w,
-                    size.h,
-                    Role::Popup { parent },
-                    anchor.origin.x,
-                    anchor.bottom() as i32,
-                ),
-                BUFFERS,
-            )
-            .ok()?;
-
-        // **Everything after this destroys the window on the way out.** An abandoned popup is
-        // worse than no popup: `Session::create` waited for its first `Configure`, so it is
-        // *configured*, and a configured `popup` is focusable — it becomes the compositor's
-        // topmost focus candidate and stays there. Having committed nothing it is never drawn,
-        // so the result is an invisible window silently eating every keystroke, and the caller
-        // treats the failure as recoverable and carries on (PR #223 review, finding 4).
-        let built = (|| {
-            let scratch = compose_buffer(size)?;
-            let pool = BufferPool::new(&mut session.window(id)?, size, BUFFERS)?;
-            Some((pool, scratch))
-        })();
-        let Some((pool, scratch)) = built else {
-            if let Some(w) = session.window(id) {
-                let _ = w.destroy();
-            }
-            return None;
-        };
-        Some(Self {
-            id,
-            pool,
-            scratch,
-            tree: Tree::new(),
-            router: Router::new(),
-            hovered: None,
-            size,
-        })
-    }
-
-    /// Paint the menu and put it on screen **when something changed**, and say whether all is
-    /// well.
-    ///
-    /// **Gated on the diff, like the terminal window is.** Committing every frame instead is
-    /// not merely wasteful: with two buffers the third commit blocks in `acquire` until the
-    /// compositor releases one, and that block is inside the render half of the loop — so the
-    /// tty is never pumped and the shell's output never arrives. The terminal appeared to hang
-    /// with its menu open.
-    ///
-    /// The region is the whole window when it does repaint: it is tiny, and tracking damage
-    /// within it would be more state than it saves.
-    fn present(
-        &mut self,
-        session: &mut Session<Box<ChannelTransport>>,
-        app: &App,
-        ui_font: &Font,
-        theme: &Theme,
-    ) -> bool {
-        let now = self.router.hovered_key(&self.tree);
-        if now != self.hovered {
-            self.hovered = now;
-            // The item's key, which is a number this program chose — not a label, and not a
-            // position. There is nothing here a person typed.
-            #[cfg(feature = "test-harness")]
-            {
-                let mut l = libkern::debug::Line::new();
-                l.s(b"nxterm: menu hover ");
-                match now {
-                    Some(k) => {
-                        l.u(k);
-                    }
-                    None => {
-                        l.s(b"none");
-                    }
-                }
-                l.end();
-            }
-        }
-        let menu = app.menu_view(theme, now);
-        let bounds = Rect::new(0, 0, self.size.w, self.size.h);
-        let l = layout(&menu, bounds, &FontMetrics::new(ui_font, theme.font_px));
-        match self.tree.update(&menu, &l) {
-            Ok(None) => return true, // nothing changed; the frame on screen is still right
-            Ok(Some(_)) => {}
-            Err(_) => return false,
-        }
-        paint(&mut self.scratch, ui_font, theme, &menu, &l, bounds, &mut |_, _, _, _| {});
-        let Some(mut w) = session.window(self.id) else { return false };
-        let Ok(b) = self.pool.acquire(&mut w, self.size) else { return false };
-        if !self.pool.write(b, self.scratch.bytes()) {
-            return false;
-        }
-        session
-            .window(self.id)
-            .is_some_and(|mut w| w.commit(b, (0, 0, self.size.w, self.size.h)).is_ok())
-    }
-
-    /// Destroy the window and give the client's half of the pixels back.
-    ///
-    /// The compositor drops its mapping when the window goes; the mapping on *this* side is
-    /// the pool's, released when this value is dropped at the end of this function — a menu
-    /// opened and closed a hundred times would otherwise grow this process by a hundred
-    /// buffers.
-    fn close(self, session: &mut Session<Box<ChannelTransport>>) {
-        if let Some(w) = session.window(self.id) {
-            let _ = w.destroy();
-        }
-    }
+///
+/// **The window itself is a [`Child`]** (M12 Part A). This file held a `Popup` struct — an id, a
+/// pool, a scratch framebuffer, a tree and a router, with `open`/`present`/`close` over them —
+/// until an editor's confirmation dialog wanted the same six fields and the same three
+/// operations. Two consumers is when a helper goes down a layer, so it did; nothing about the
+/// menu changed, and the lessons that struct had learned went with it.
+fn menu_at(anchor: Rect) -> (i32, i32) {
+    // Directly under the item it drops from, in the parent's coordinates — which is what the
+    // offset in `CreateWindow` means for a popup.
+    (anchor.origin.x, anchor.bottom() as i32)
 }
 
 /// Paint `damage` of `app` into `fb`.
@@ -480,7 +335,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut router = Router::new();
     // The menu's window while it is open, and nothing at all while it is not — a popup is
     // transient by role, so closing the menu destroys it rather than hiding it.
-    let mut popup: Option<Popup> = None;
+    let mut popup: Option<Child> = None;
+    // Which item the pointer was over at the last paint of the menu.
+    //
+    // **Kept so a change can be *reported*, not so the view can be built** — the view reads
+    // `Child::hovered_key` directly, which is the one source. This is a receipt: a gate driving
+    // a release image sees nothing of a highlight, and hover is the first thing in this system
+    // that reacted to the pointer moving without a button held, so "the path works" needed
+    // something to assert (M11 Part E batch 3).
+    let mut menu_hovered: Option<u64> = None;
     // Set once, by the harness click below, to open the menu — see there.
     #[cfg(feature = "test-harness")]
     let mut opened_for_harness = false;
@@ -535,7 +398,19 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // anchor computed just above rather than the one from when the menu was toggled.
         match (app.menu_open, popup.is_some(), app.menu_anchor) {
             (true, false, Some(anchor)) => {
-                popup = Popup::open(&mut win, window_id, anchor, &app, &ui_font, &theme);
+                // **Measured from the menu with no hover**, because the pointer is over the
+                // *bar* item that opened this rather than over the popup — and a highlight does
+                // not change what a menu measures.
+                let menu = app.menu_view(&theme, None);
+                popup = Child::open(
+                    &mut win,
+                    Role::Popup { parent: window_id },
+                    menu_at(anchor),
+                    &menu,
+                    &ui_font,
+                    &theme,
+                    BUFFERS,
+                );
                 // **Where it is and how big**, because the gate has no other way to see a
                 // second window: it reads the serial log, and this is the only thing that
                 // says the menu became a window rather than a layer. The origin is in screen
@@ -543,13 +418,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 #[cfg(feature = "test-harness")]
                 if let Some(p) = popup.as_ref() {
                     let o = win
-                        .window(p.id)
+                        .window(p.id())
                         .and_then(|w| w.configured())
                         .map_or((0, 0), |c| (c.x, c.y));
                     libkern::debug::Line::new()
-                        .s(b"nxterm: menu popup ").u(p.id as u64)
+                        .s(b"nxterm: menu popup ").u(p.id() as u64)
                         .s(b" at ").i(o.0 as i64).s(b",").i(o.1 as i64)
-                        .s(b" ").u(p.size.w as u64).s(b"x").u(p.size.h as u64)
+                        .s(b" ").u(p.size().w as u64).s(b"x").u(p.size().h as u64)
                         .end();
                 }
                 if popup.is_none() {
@@ -563,13 +438,38 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if let Some(p) = popup.take() {
                     p.close(&mut win);
                 }
+                // The window is gone, so nothing is under the pointer in it. Left set, the next
+                // menu would open believing a row was already highlighted and report no change
+                // when one really was.
+                menu_hovered = None;
             }
             _ => {}
         }
-        if let Some(p) = popup.as_mut()
-            && !p.present(&mut win, &app, &ui_font, &theme)
-        {
-            kprint(b"nxterm: the menu popup could not be drawn\n");
+        if let Some(p) = popup.as_mut() {
+            let now = p.hovered_key();
+            if now != menu_hovered {
+                menu_hovered = now;
+                // The item's key, which is a number this program chose — not a label, and not a
+                // position. There is nothing here a person typed.
+                #[cfg(feature = "test-harness")]
+                {
+                    let mut l = libkern::debug::Line::new();
+                    l.s(b"nxterm: menu hover ");
+                    match now {
+                        Some(k) => {
+                            l.u(k);
+                        }
+                        None => {
+                            l.s(b"none");
+                        }
+                    }
+                    l.end();
+                }
+            }
+            let menu = app.menu_view(&theme, now);
+            if !p.present(&mut win, &menu, &ui_font, &theme) {
+                kprint(b"nxterm: the menu popup could not be drawn\n");
+            }
         }
 
         let ui_damage = match tree.update(&ui, &l) {
@@ -764,31 +664,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // different window. A record for a window that is not one of these two is not possible
         // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
         // dropped rather than routed into the terminal.
-        if popup.as_ref().is_some_and(|p| p.id == from) {
+        if popup.as_ref().is_some_and(|p| p.id() == from) {
             // **A press landed outside the menu, so it goes away** (M11 Part E batch 5). This is
             // the one thing a popup's owner cannot work out for itself: it never sees a press
             // aimed at another window, and until the compositor said so a menu stayed open over
             // whatever was clicked next.
+            //
+            // **Answered here rather than in `Child::route`**, because what a dismissal *means*
+            // is the caller's: this menu goes away, where another client's child window might
+            // save something first.
             if matches!(event, WindowEvent::Dismissed) {
                 app.menu_open = false;
                 continue;
             }
-            let menu =
-                app.menu_view(&theme, popup.as_ref().and_then(|p| p.router.hovered_key(&p.tree)));
-            let bounds = Rect::new(0, 0, popup.as_ref().map_or(0, |p| p.size.w), popup.as_ref().map_or(0, |p| p.size.h));
-            let ml = layout(&menu, bounds, &FontMetrics::new(&ui_font, theme.font_px));
-            let msgs: alloc::vec::Vec<Msg> = match event {
-                WindowEvent::Key(k) => popup
-                    .as_mut()
-                    .and_then(|p| p.router.key(&p.tree, &menu, k))
-                    .into_iter()
-                    .collect(),
-                WindowEvent::Pointer(pt) => popup
-                    .as_mut()
-                    .map(|p| p.router.pointer(&p.tree, &menu, &ml, pt).0)
-                    .unwrap_or_default(),
-                _ => alloc::vec::Vec::new(),
-            };
+            let menu = app.menu_view(&theme, popup.as_ref().and_then(|p| p.hovered_key()));
+            let msgs = popup
+                .as_mut()
+                .map(|p| p.route(&menu, &ui_font, &theme, &event))
+                .unwrap_or_default();
             for msg in msgs {
                 // **The routing proof.** A record arrived naming the popup's window, was routed
                 // through the popup's own tree, and produced a message — three things that were

@@ -145,7 +145,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     **M12 and M13 were scoped 2026-09-01**, when M11's list emptied into things that were not
     polish. **M12 — applications, deepened**: application depth (tabs, undo/redo, find, file
     operations and the confirmation dialogs that make it the first *application* to create a
-    `Role::Dialog`),
+    `Role::Dialog` — **Part A landed 2026-09-01**: `nxedit` asks before discarding, `libui`
+    grew `window::Child` for the windows an application opens beside its main one, the shell
+    places dialogs, and the taskbar's insist became a second click rather than a two-second
+    timer, because a client asking its user a question is indistinguishable from a wedged one),
     **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
     because "anything running may read what you last copied" is ambient authority — and
     **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather

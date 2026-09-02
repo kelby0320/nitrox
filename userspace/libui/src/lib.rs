@@ -16,9 +16,15 @@
 //! libdraw      ← pixels
 //! ```
 //!
-//! This crate does **not** depend on `libsurface` yet: Part A is pure — every function here
-//! is a function of values, with no syscall behind any of them. The runtime that drives a
-//! real window arrives with event routing in Part B, and that is what will reach downward.
+//! **One module reaches down, and the rest is a function of values.** [`element`], [`layout`],
+//! [`diff`], [`paint`], [`route`] and [`widget`] cannot make a syscall: they take values and
+//! return values, which is why they host-test in milliseconds. [`window`] is the exception, and
+//! it arrived in M12 Part A rather than in M4 — a second window is a `Session`, a `BufferPool`
+//! and a scratch framebuffer as much as it is a tree and a router, and two applications wanting
+//! the same six fields is when a helper goes down a layer.
+//!
+//! Until then this paragraph said the crate "does **not** depend on `libsurface` yet", with the
+//! *yet* doing the work: the layering above has always had this crate above that one.
 //!
 //! ## Build order
 //!
@@ -39,3 +45,4 @@ pub mod paint;
 pub mod reference;
 pub mod route;
 pub mod widget;
+pub mod window;

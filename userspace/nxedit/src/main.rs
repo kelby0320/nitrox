@@ -33,6 +33,7 @@ use libui::diff::Tree;
 use libui::layout::{Layout, layout};
 use libui::paint::{FontMetrics, Theme, paint};
 use libui::route::Router;
+use libui::window::Child;
 use nxedit::{App, Msg, to_bytes};
 
 use alloc::boxed::Box;
@@ -275,8 +276,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
+    // **The second window, and the whole of M12 Part A**: alive only while a question is being
+    // asked, because a `dialog` is transient by role — the compositor takes it with its parent,
+    // and a hidden one would still be a window in the stack. `Role::Dialog` has existed since M2
+    // Part A and no program a person runs had ever created one.
+    let mut confirm: Option<Child> = None;
+    // Which of the dialog's controls the pointer was over at its last paint — a receipt, the way
+    // `nxterm`'s menu hover is. Nothing is built from it; the view reads `hovered_key` directly.
+    let mut confirm_hovered: Option<u64> = None;
     let ev = win.wait_handle();
     let mut reported = app.revision();
+    // The same shape as `reported`, for the field that names an untitled buffer.
+    let mut reported_name = app.naming_len();
 
     loop {
         // **One line per edit, and it carries a count rather than the text.** A gate driving a
@@ -288,6 +299,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if rev != reported {
             reported = rev;
             libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
+        }
+        // **And the same for the name field**, which `revision` cannot see: naming a buffer is
+        // not editing it. Without this the seven keystrokes that name an untitled buffer are
+        // unacknowledged, and a dropped one arrives as a file with the wrong name.
+        let named = app.naming_len();
+        if named != reported_name {
+            reported_name = named;
+            if let Some(n) = named {
+                libkern::debug::Line::new().s(b"nxedit: name so far ").u(n as u64).s(b" chars").end();
+            }
         }
         // ---- render ----
         // The widget under the pointer, from the router that has always known and that nothing
@@ -315,6 +336,72 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
+        // ---- the question's window ----
+        //
+        // **Opened and destroyed with the question**, not shown and hidden: the role is
+        // transient, and there is nothing to keep alive between two closes of the same window.
+        // Reconciled here rather than where `Msg::Close` is handled so that there is exactly one
+        // place that turns `App::confirming` into a window — the alternative is a flag and a
+        // window that can disagree about whether a question is being asked.
+        match (app.confirming(), confirm.is_some()) {
+            (true, false) => {
+                // **Said before the window is asked for, not after it exists.** This used to
+                // carry the dialog's id, which meant printing it once `Child::open` returned —
+                // and that return is *downstream of the shell*, because a dialog's first
+                // `Configure` is held until a manager places it. So the editor's line and the
+                // shell's placement were two processes racing, and which won depended on the
+                // accelerator: TCG gave the shell both, KVM gave the client the second one and
+                // failed the gate that had watched TCG order twice (CI, PR #267).
+                //
+                // Printed here the order is a fact: the editor decides to ask, *then* asks for
+                // a window. The id belongs in the shell's line anyway — it is the shell that
+                // knows where the thing went.
+                kprint(b"nxedit: unsaved buffer - asking before closing\n");
+                // No hover yet: the pointer is wherever it was when the close was asked for, and
+                // this call only measures — which a highlight does not change.
+                let ask = app.confirm_view(&theme, None);
+                confirm = Child::open(
+                    &mut win,
+                    Role::Dialog { parent: window_id },
+                    // **(0, 0), because this client does not know where it is.** A dialog's
+                    // offset is a *preference* a manager overrides, and `rsproto-surface-ops.md`
+                    // is explicit that a manager can centre a dialog on its parent from what it
+                    // already tracks. A client that guessed would be guessing about a screen it
+                    // has never been told the shape of.
+                    (0, 0),
+                    &ask,
+                    &font,
+                    &theme,
+                    BUFFERS,
+                );
+                // **Unconditional, because `check-login` boots the release image.** A
+                // `test-harness` line does not exist in the binary that gate runs, and the line
+                // above is the only thing that says the editor asked rather than exited. It
+                // names neither the window nor the file: what is on screen is the person's
+                // business, and the path is already in the `opened` line above.
+                if confirm.is_none() {
+                    kprint(b"nxedit: could not open the confirmation dialog\n");
+                    app.confirm_failed();
+                }
+            }
+            (false, true) => {
+                if let Some(c) = confirm.take() {
+                    c.close(&mut win);
+                }
+                // The window is gone, so nothing in it is under the pointer.
+                confirm_hovered = None;
+            }
+            _ => {}
+        }
+        if let Some(c) = confirm.as_mut() {
+            let now = c.hovered_key();
+            confirm_hovered = now;
+            let ask = app.confirm_view(&theme, now);
+            if !c.present(&mut win, &ask, &font, &theme) {
+                kprint(b"nxedit: the confirmation dialog could not be drawn\n");
+            }
+        }
+
         // ---- the requests this frame owes ----
         if app.take_move_request()
             && let Some(mut w) = win.window(window_id)
@@ -327,6 +414,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             && w.start_resize(edges).is_err()
         {
             kprint(b"nxedit: the compositor refused the resize\n");
+        }
+        // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
+        // window id, so this cannot share the branch above: one flag would have moved whichever
+        // window the argument happened to be.
+        if app.take_confirm_move()
+            && let Some(c) = confirm.as_ref()
+            && let Some(mut w) = win.window(c.id())
+            && w.start_move().is_err()
+        {
+            kprint(b"nxedit: the compositor refused the dialog's move\n");
         }
         if let Some(state) = app.take_state_request()
             && let Some(mut w) = win.window(window_id)
@@ -389,6 +486,48 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         let mut resized = false;
         for (from, event) in events {
+            // **The dialog's window routes through the dialog's tree.** Same `App`, so an
+            // answer's `Msg` updates the same state the main window's messages do; a different
+            // tree and router, because they describe a different window. A record for a window
+            // that is neither is not possible — `Session` filtered it — but a stale one for a
+            // dialog just destroyed is, and it is dropped rather than routed into the buffer.
+            if confirm.as_ref().is_some_and(|c| c.id() == from) {
+                let ask = app.confirm_view(&theme, confirm_hovered);
+                let mut msgs = confirm
+                    .as_mut()
+                    .map(|c| c.route(&ask, &font, &theme, &event))
+                    .unwrap_or_default();
+                match event {
+                    // **`Esc` is the dialog's, and nothing else is.** No widget in this tree
+                    // takes a key — `Router::key` needs a focused widget and this one focuses
+                    // none — so the router answers nothing and the application decides, exactly
+                    // as it does for the naming field.
+                    WindowEvent::Key(k) => msgs.extend(app.confirm_key(k)),
+                    // Which window has the keyboard, for the dialog's own title bar. `route`
+                    // has already told the router; this is the half the view reads.
+                    WindowEvent::Focus(f) => app.confirm_focused = f,
+                    // **A dialog is not dismissed by a press elsewhere.** The event is a
+                    // popup's; a question stays until it is answered.
+                    WindowEvent::Dismissed => {}
+                    // The dialog's own frame draws a close button, which is `KeepEditing`. This
+                    // arrives only if a *manager* asks the dialog to close, and it means the
+                    // same thing: the question goes away and the buffer does not.
+                    WindowEvent::CloseRequested => msgs.push(Msg::KeepEditing),
+                    _ => {}
+                }
+                for m in msgs {
+                    // **Unconditional, because `check-login` boots the release image**, and
+                    // these two lines are the only outside sign of which answer was given. A
+                    // dialog that only ever gets one answer is half a control.
+                    match m {
+                        Msg::Discard => kprint(b"nxedit: discarding the unsaved buffer\n"),
+                        Msg::KeepEditing => kprint(b"nxedit: close cancelled, still editing\n"),
+                        _ => {}
+                    }
+                    app.update(m);
+                }
+                continue;
+            }
             if from != window_id {
                 continue;
             }
