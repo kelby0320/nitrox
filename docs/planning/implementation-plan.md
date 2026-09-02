@@ -153,7 +153,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     prompt shared by the four that need a name, a delete that asks first, and drag-and-drop
     *within* the window — which the compositor could not have carried, since it skips the source
     window when it looks for a drop target. Cut and paste are filed for Part E rather than built,
-    because a pair that holds something between two gestures is a clipboard),
+    because a pair that holds something between two gestures is a clipboard; **Part C landed
+    2026-09-02**: undo and redo grouped by word, line, deletion run, movement and save — the
+    grouping being the decision rather than the stack — plus find, sharing the very field the
+    save-as prompt uses),
     **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
     because "anything running may read what you last copied" is ambient authority — and
     **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather

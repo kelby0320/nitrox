@@ -3871,17 +3871,86 @@ The two taken before this pass — the clipboard's owner and the image format �
       cost three CI failures and two wrong attributions — see the decision log, which records it
       as likely rather than proven.
 
-### Part C — the editor: undo, redo and find
+### Part C — the editor: undo, redo and find ✅ complete (2026-09-02)
 
-- [ ] **Undo grouping is the decision**, not the stack. Per keystroke is unusable and per save is
-      useless; what a person expects is a word or a line. It belongs in `TextAreaState`, which
+- [x] **Undo grouping is the decision**, not the stack ✅. Per keystroke is unusable and per save
+      is useless; what a person expects is a word or a line. It lives in `TextAreaState`, which
       already owns the buffer, the cursor and the selection.
 
-- [ ] **Find reuses the shape the save-as field established** (M11 Part E batch 7): a mode in
-      which the keys are the field's rather than the buffer's. That was called "the first widget
-      that wants a key"; this is the second.
+      **The rules, and each is a group boundary somebody would notice if it were missing**: a run
+      of printable characters is one group; a **separator ends it**, so a word and its trailing
+      space come back together and the next word is its own step; **`Enter` ends it**, so a line
+      and its break are one; a run of **deletions** is a group of a different kind, so typing
+      after deleting does not extend the deletion; **any movement ends whatever was open**,
+      because the cursor moving means what comes next is a different edit wherever it lands; and
+      an edit that would do nothing — `Backspace` at the start of the buffer — opens no group at
+      all, because an undo press that visibly does nothing reads as a broken undo.
 
-- [ ] **Gate**: type, undo, redo, and read the file back from outside.
+      **And a save is a boundary the buffer cannot see**, so `end_group` is published and
+      `nxedit` calls it. That one was **found by the gate rather than by a host test**: the editor
+      opened an empty file, six characters were typed, it was saved, two more were typed — and
+      one undo emptied the buffer, because nothing had closed the group across the save. The
+      byte-count assertion caught it on the first run.
+
+      **Snapshots, not deltas**, and the trade is stated rather than assumed: a delta stack costs
+      the size of the change instead of the size of the file, and costs a separate inverse for
+      every kind of edit — each a way to be subtly wrong and none checkable by reading. Bounded
+      at `MAX_UNDO`, with `TODO(undo-deltas)` naming the trigger.
+
+- [x] **Find reuses the shape the save-as field established** ✅ (M11 Part E batch 7): a mode in
+      which the keys are the field's rather than the buffer's. That was called "the first widget
+      that wants a key"; this is the second — and it is the *same* field, `Field::{Naming,
+      Finding}`, because a second copy would be two places that can disagree about what `Esc`
+      does.
+
+      `Ctrl+F` opens it, `Enter` walks forward through every match and wraps, `Esc` gives the keys
+      back. The field **stays open** on a hit, which is what makes the second press the next match
+      rather than a re-type. A match is *selected* rather than merely scrolled to. An empty needle
+      matches nothing, because it is what the field holds before the first character and a search
+      that jumped on the way there would move the buffer under the person.
+
+      **One bug the tests found**: the search started one *byte* past the cursor, which lands
+      inside a multi-byte character — `str::get` then yields `None`, the rest of that line was
+      silently skipped, and find appeared to go backwards.
+
+- [x] **Gate** ✅: `check-login` step 8b, and the grouping is asserted **by byte count from
+      outside**, which is the one way it cannot be argued with. Two characters typed together are
+      one group, so one undo leaves seven bytes on disk rather than eight, and a redo brings both
+      back to nine. Per-*keystroke* grouping leaves eight; per-*save* grouping leaves seven after
+      the redo as well. Then `Ctrl+F`, a needle typed with a receipt per character, and the line
+      the match landed on.
+
+- [x] **What the review found, and one regression it led me into** ✅ (PR #269, no blockers).
+      Two were controls that could not fire: the `Ctrl+F` re-open guard is unreachable — a field
+      takes the keys before the chord match is looked at — and its comment described a
+      needle-across-`Esc` behaviour the editor does not have. And `Msg::Save` on an untitled
+      buffer was a **silent no-op while the find field was open**, because "already asking" was
+      written when naming was the only field there could be: the save button stayed clickable and
+      did nothing.
+
+      **Removing two unreachable guards broke something the existing suite caught.**
+      `delete_selection` does *two* jobs — it removes a selection, and it clears an anchor the
+      cursor has walked back onto — and restructuring `backspace` to call it only when there *is*
+      a selection brought PR #258's stale-anchor bug straight back. The test written for that bug
+      a milestone ago failed within seconds. It is the best argument in this part for writing the
+      test where the bug was rather than where the code is.
+
+      Plus two gate comments that overclaimed: the byte count discriminating per-*keystroke*
+      grouping is eight and not nine, and the `Esc` after a search is **not** asserted by anything
+      downstream — nothing types into that editor again.
+
+      **Thirteen host tests in `libui` and six in `nxedit`**, thirteen of them run alone against a
+      broken implementation: no separator boundary, no movement boundary, deletions sharing a kind
+      with typing, a no-op edit opening a group, an edit keeping the way forward, find starting one
+      raw byte on, find not wrapping, an unbounded history, undo reporting nothing, the find field
+      closing on its first match, `Ctrl+F` typing into the buffer, a failed search reporting
+      success, and undo leaving the buffer looking saved.
+
+      **The receipt names its field.** There are two now, and a gate waiting on "name so far"
+      while somebody is typing a search would wait for ever; `Field::label` is the one place that
+      spelling lives. A search's own receipt is the **line it landed on**, not the needle — what
+      somebody is looking for in their own file is theirs, the same rule that keeps the buffer's
+      receipt a count.
 
 ### Part D — tabs, in both applications
 

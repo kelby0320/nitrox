@@ -307,7 +307,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if named != reported_name {
             reported_name = named;
             if let Some(n) = named {
-                libkern::debug::Line::new().s(b"nxedit: name so far ").u(n as u64).s(b" chars").end();
+                // **The field says which it is** (M12 Part C), because there are two of them
+                // now and a gate waiting on "name so far" while somebody is typing a search
+                // would wait for ever. `Field::label` is the one place that spelling lives.
+                let what = app.field_kind().map_or("field", nxedit::Field::label);
+                libkern::debug::Line::new()
+                    .s(b"nxedit: ")
+                    .s(what.as_bytes())
+                    .s(b" so far ")
+                    .u(n as u64)
+                    .s(b" chars")
+                    .end();
             }
         }
         // ---- render ----
@@ -334,6 +344,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
                 fail(b"nxedit: Commit FAILED\n");
             }
+        }
+
+        // **What a search found, as a line number.** `check-login` boots the release image and
+        // has no rendered window to read; the needle stays the person's business, so the receipt
+        // is where it landed rather than what it was.
+        if let Some(hit) = app.take_find_report() {
+            let mut l = libkern::debug::Line::new();
+            match hit {
+                Some(line) => {
+                    l.s(b"nxedit: find hit at line ").u(line as u64);
+                }
+                None => {
+                    l.s(b"nxedit: find no match");
+                }
+            }
+            l.end();
         }
 
         // ---- the question's window ----
