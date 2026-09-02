@@ -1441,6 +1441,20 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
+**Cut and paste in the file browser — `TODO(file-clipboard)`.** `nxfiles`' *Edit* menu holds
+`copy`, which duplicates the selected entry under a name you type, and nothing else. Cut and
+paste are a **pair**, and a pair that holds something between two gestures is a clipboard however
+it is spelled — so building a private one-slot path buffer in the browser would be a second
+clipboard shipped before the real one. M12 decision 1 makes the clipboard a *resource server*
+precisely so that what you last copied is not readable by everything running, and Part E's own
+scope leaves the door open for this: "the type tag exists so a later image or a typed stream is a
+second kind rather than a second clipboard". A file path is that second kind. **Trigger: Part E's
+ring exists.**
+
+Nothing is missing meanwhile — moving a file into a folder is a drag, which is the gesture people
+reach for first — and the maintainer asked the question that produced this entry rather than
+assuming an answer (2026-09-02).
+
 **A dialog is not kept above the window it belongs to — `TODO(dialog-stacking)`.** A `dialog` is created on top of the stack and takes
 focus, so it starts above its parent; click the parent and the compositor raises it *over* its own
 question, which every desktop this borrows from prevents. Nothing is lost — the dialog is still

@@ -20,6 +20,12 @@ libkern = { path = "../libkern" }
 libstream = { path = "../libstream", features = ["io"] }
 libheap = { path = "../libheap" }
 
+# Test-only: the two keycodes these tests type are pinned against the keymap they have to
+# agree with, rather than against the comments beside them. Nothing in the browser decodes
+# keys itself — `TextFieldState::apply` does — so this is not a dependency of the program.
+[dev-dependencies]
+libinput = { path = "../libinput" }
+
 [lib]
 name = "nxfiles"
 path = "src/lib.rs"

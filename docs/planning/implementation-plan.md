@@ -148,7 +148,12 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     `Role::Dialog` — **Part A landed 2026-09-01**: `nxedit` asks before discarding, `libui`
     grew `window::Child` for the windows an application opens beside its main one, the shell
     places dialogs, and the taskbar's insist became a second click rather than a two-second
-    timer, because a client asking its user a question is indistinguishable from a wedged one),
+    timer, because a client asking its user a question is indistinguishable from a wedged one;
+    **Part B landed 2026-09-02**: `nxfiles` grew File and Edit menus over five operations, a
+    prompt shared by the four that need a name, a delete that asks first, and drag-and-drop
+    *within* the window — which the compositor could not have carried, since it skips the source
+    window when it looks for a drop target. Cut and paste are filed for Part E rather than built,
+    because a pair that holds something between two gestures is a clipboard),
     **copy and paste** — a clipboard *resource server* whose endpoint is a namespace binding,
     because "anything running may read what you last copied" is ambient authority — and
     **images**, decoding PNG in the guest so that a wallpaper is a file a person supplies rather

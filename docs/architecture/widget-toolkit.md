@@ -748,6 +748,16 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   `libsurface` dependency for it, which the layering in §10 always allowed and nothing had needed.
   Nothing else here can reach a syscall, and that is the property to protect.
 
+  **And a confirmation's *frame* is here too**, since M12 Part B: `dialog_frame` plus the
+  `DIALOG_*` metrics and the four aim points derived from them. A dialog is fixed-size rather than
+  measured — a gate presses its buttons and aims from the origin a shell logs, so buttons that
+  resized with the question would move under it — and the wrapper is also what lets the tree be a
+  `Child` at all, since `Dock` measures as everything it is offered and a tree containing one has
+  no natural size. It moved down when `nxfiles` grew the second confirmation: two applications
+  deriving the same four numbers would have given `check-login` two tables to keep in step, which
+  is the shape that goes wrong silently. Keys stay the caller's, for the reason `window_frame`
+  invents none.
+
 ---
 
 ## 12. How it was built, and what building it changed

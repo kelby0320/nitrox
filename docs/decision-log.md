@@ -21808,3 +21808,49 @@ not stand is the causal story: an intermittent failure ran through a bisect and 
 deterministic, and the conclusion survived three runs of confirmation because it was never tested
 against the hypothesis it displaced. When a fix and a flake are the same shape, the fix has to be
 justified by reading the code, and the flake by a receipt that says which half went missing.
+
+## 2026-09-02 — M12 Part B: the browser acts, and a drag that never leaves the client
+
+Five operations, two menus, and the one gesture M10 left for this milestone. Four decisions came
+out of it; the maintainer settled the first two.
+
+**1. A File menu and an Edit menu, not a toolbar and not shortcuts.** Buttons crowd a path strip
+in a 560-pixel window and the path is the first thing to be elided; shortcuts leave nothing on
+screen saying the operations exist, which is the discoverability M11 spent a milestone on. The
+maintainer's own division: *File* makes and unmakes things — new file, new folder, rename, delete
+— and *Edit* acts on what is selected. It is the split every file browser draws.
+
+**2. Cut and paste are not in it, and that is the answer to a question rather than an omission.**
+The maintainer asked how cut should work. It is a *pair*, and a pair that holds something between
+two gestures is a clipboard however it is spelled — so a private one-slot path buffer in the
+browser would be a second clipboard shipped weeks before the real one. M12 decision 1 makes the
+clipboard a resource server precisely so that what you last copied is not readable by everything
+running, and Part E's scope already leaves the hook: "the type tag exists so a later image or a
+typed stream is a second kind rather than a second clipboard". A file path is that second kind.
+Nothing is missing meanwhile, because moving a file into a folder is a drag.
+
+**3. A drop inside the window is a move, and the compositor could not have carried it anyway.**
+This reads like an implementation note and is a constraint: `compositor::input::highlight_target`
+skips the *source* window when it looks for a drop target, deliberately, because dropping a thing
+back where it came from is a no-op. So an intra-window drag has no route through the compositor
+and has to be the client's own — which is what M10 meant by "a drag inside one window is the
+toolkit's and is M12's".
+
+The interesting part is where the two drags meet. A press past the slop starts an **internal**
+drag; the payload reaches the compositor only when the pointer **leaves the window**. That
+boundary is the last moment the client can decide anything, because `StartDrag` hands over the
+grab and the client stops seeing motion for the rest of the gesture. Before this the handoff
+happened at the slop, so there was no window in which an internal drop could exist at all.
+
+**4. Three helpers went down a layer, and one of them had been open-coded three times.**
+`libfs::mkdir` — `mkdir`'s `make_one`, `copy_tree`'s destination, and now the browser's *new
+folder* were the same three lines: open the parent, ask it for the basename, close. And
+`libui::widget::dialog_frame` plus the `DIALOG_*` metrics, because a second confirmation would
+otherwise have given `check-login` two tables of aim points to keep in step — which is exactly the
+shape PR #267's review caught going wrong silently with one.
+
+**What the tests caught that a person would not have.** A rejected name leaves the prompt open so
+it can be corrected, and the explanation was being written into the notice slot *the prompt had
+replaced*: the answer existed and was never drawn. The test asserted the message rather than the
+absence of an operation, which is the difference between checking that nothing happened and
+checking that the person was told why.

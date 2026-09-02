@@ -3752,14 +3752,25 @@ The two taken before this pass — the clipboard's owner and the image format �
       `nxedit`'s name field got the same, its gate comment having claimed a discipline it did
       not follow.
 
-### Part B — the browser: file operations, and drag-and-drop within a window
+### Part B — the browser: file operations, and drag-and-drop within a window ✅ complete (2026-09-02)
 
-- [ ] **Rename, delete, copy, new folder**, each with the confirmation Part A makes possible.
-      `nxfiles` holds `/home` and performs them itself: it has the authority for its own subtree,
-      and routing them through the shell would be asking a supervisor to do what the application
-      is already entitled to.
+- [x] **Rename, delete, copy, new folder — and new file, which the maintainer added** ✅, from a
+      **File** menu and an **Edit** menu, settled 2026-09-02. `nxfiles` holds `/home` and performs
+      them itself: that binding *is* the authority these need, and routing them through the shell
+      would be asking a supervisor to do what the application is already entitled to. Opening a
+      *program* needs `/bin` and a namespace and stays the shell's; renaming a file in a directory
+      the browser can already list needs nothing it does not hold.
 
-- [ ] **Copy goes through `libfs::copy_file`**, which maps source and destination and copies
+      **Three shapes, not five.** The three that need a name — new file, new folder, rename, and
+      copy, so four — share one **prompt**: a field that replaces the path in the strip while it
+      is open, which is the shape `nxedit`'s save-as established. Delete needs a **question**
+      instead, which is Part A's dialog. Nothing needed a fifth mechanism.
+
+      **An operation with nothing selected is answered rather than ignored.** Three of the five
+      act on a row; a menu item that silently did nothing without one is a control that looks
+      live and is not.
+
+- [x] **Copy goes through `libfs::copy_file`** ✅, which maps source and destination and copies
       between the mappings with no heap at all, bounded by `MAX_COPY` (8 MiB) — a bound whose own
       doc settles the question, since "the pages themselves are demand-paged, so this bounds VA,
       not RAM", and which names a windowed copy as the refinement if a real workload exceeds it.
@@ -3769,11 +3780,63 @@ The two taken before this pass — the clipboard's owner and the image format �
       `read_file` — the one function here that *does* allocate the whole file, and the wrong one
       for a copy to call. PR #266 review, finding 4.)
 
-- [ ] **Drag-and-drop within a window** — the half M10 Part E did not build, where the compositor
-      is not involved because the payload never leaves the client.
+      **And nothing overwrites.** Rename, copy and move all pass `replace: false`: overwriting is
+      a second question, and a browser that answered it silently would be one whose most ordinary
+      mistake — typing a name that is already there — destroys a file.
 
-- [ ] **Gate**: `check-login` renames a file and reads the new name back with `nxsh`, the way the
-      editor's save is already checked from outside the application that did it.
+- [x] **Drag-and-drop within a window** ✅ — the half M10 Part E did not build. **The compositor
+      is not merely uninvolved, it could not be**: `highlight_target` skips the source window
+      deliberately, so a drag out of this list can never be delivered back to it. So the browser
+      keeps the gesture itself past the slop, tracks the row under the pointer, and hands it to
+      the compositor **only when the pointer leaves the window** — which is the last thing the
+      client can decide, because from `StartDrag` onwards the compositor owns the grab and the
+      client goes blind.
+
+      **A drop is a move**, settled with the maintainer: within one filesystem that is what a drag
+      means, and it is one `libfs::rename` rather than a copy and a delete that can half-happen.
+      Only a directory row is a target, and never the row the drag came from.
+
+      **The highlight borrows the list's hover face**, so a drop target and a pointer highlight
+      cannot come to look different and the widget needed no new state.
+
+- [x] **`libfs::mkdir`, because the browser was its second consumer** ✅ — and its third and
+      fourth were already there: `mkdir`'s `make_one` and `copy_tree` each open-coded the same
+      three lines. One helper now, with `--parents` staying the coreutil's flag.
+
+- [x] **And the dialog's frame moved down to `libui`** ✅. `nxedit` published five metrics and
+      four aim points for `check-login` to type; a second confirmation would have given the gate
+      two tables to keep in step, which is the shape that goes wrong silently. `dialog_frame` and
+      `DIALOG_*` are shared, and the host test that pins the aim points to a real tree moved with
+      them — so it guards both dialogs.
+
+- [x] **Cut and paste are deliberately absent** ✅ — `TODO(file-clipboard)`. They are a *pair*,
+      and a pair that holds something between two gestures is a clipboard however it is spelled;
+      building a private one in the browser would ship a second clipboard before Part E's real
+      one, which decision 1 made a resource server precisely so that what you last copied is not
+      readable by everything running. Part E's own words leave the hook: "the type tag exists so
+      a later image or a typed stream is a second kind rather than a second clipboard".
+
+- [x] **Gate** ✅: `check-login` step 9b — the File menu is opened *by clicking its bar item*, the
+      `rename` row is pressed, a name is typed with a receipt per character, and then the **serial
+      session** reads the file back under its new name with `open`. Asking the browser to re-list
+      would be asking the accused; the content is step 8's, so a rename that had copied or
+      truncated shows up here too.
+
+      **The menu row's height is divided out of the popup rather than derived from the theme**,
+      because a menu row is text plus padding and therefore follows `font_px` — which a theme file
+      sets, and which M11's decision 2 keeps out of the metrics a gate may assume. The browser
+      logs the popup's rectangle; the gate divides.
+
+      **Fourteen host tests in `nxfiles`**, seven of them run alone against a broken
+      implementation: no selection check, a path accepted as a name, delete performed without
+      asking, keeping deleting anyway, a file row as a drop target, the drag reaching the
+      compositor at the slop instead of at the edge, and the list taking keys while a name is
+      being typed.
+
+      **One bug the tests found before a person could**: a rejected name — empty, or one with a
+      separator — leaves the prompt open so it can be fixed, and the explanation was written into
+      the notice slot *the prompt had replaced*. The answer existed and was never drawn. The test
+      asserted the message rather than the absence of an operation, which is what caught it.
 
 ### Part C — the editor: undo, redo and find
 
