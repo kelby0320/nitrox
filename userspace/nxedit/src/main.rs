@@ -333,6 +333,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // window that can disagree about whether a question is being asked.
         match (app.confirming(), confirm.is_some()) {
             (true, false) => {
+                // **Said before the window is asked for, not after it exists.** This used to
+                // carry the dialog's id, which meant printing it once `Child::open` returned —
+                // and that return is *downstream of the shell*, because a dialog's first
+                // `Configure` is held until a manager places it. So the editor's line and the
+                // shell's placement were two processes racing, and which won depended on the
+                // accelerator: TCG gave the shell both, KVM gave the client the second one and
+                // failed the gate that had watched TCG order twice (CI, PR #267).
+                //
+                // Printed here the order is a fact: the editor decides to ask, *then* asks for
+                // a window. The id belongs in the shell's line anyway — it is the shell that
+                // knows where the thing went.
+                kprint(b"nxedit: unsaved buffer - asking before closing\n");
                 // No hover yet: the pointer is wherever it was when the close was asked for, and
                 // this call only measures — which a highlight does not change.
                 let ask = app.confirm_view(&theme, None);
@@ -350,20 +362,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     &theme,
                     BUFFERS,
                 );
-                match confirm.as_ref() {
-                    // **Unconditional, because `check-login` boots the release image.** A
-                    // `test-harness` line does not exist in the binary that gate runs, and this
-                    // is the only thing that says the editor asked rather than exited. It names
-                    // the window and not the file: what is on screen is the person's business,
-                    // and the path is already in the `opened` line above.
-                    Some(c) => libkern::debug::Line::new()
-                        .s(b"nxedit: unsaved buffer - asking, dialog window ")
-                        .u(c.id() as u64)
-                        .end(),
-                    None => {
-                        kprint(b"nxedit: could not open the confirmation dialog\n");
-                        app.confirm_failed();
-                    }
+                // **Unconditional, because `check-login` boots the release image.** A
+                // `test-harness` line does not exist in the binary that gate runs, and the line
+                // above is the only thing that says the editor asked rather than exited. It
+                // names neither the window nor the file: what is on screen is the person's
+                // business, and the path is already in the `opened` line above.
+                if confirm.is_none() {
+                    kprint(b"nxedit: could not open the confirmation dialog\n");
+                    app.confirm_failed();
                 }
             }
             (false, true) => {

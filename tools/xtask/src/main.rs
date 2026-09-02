@@ -3075,30 +3075,29 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let untitled_right = untitled_x + EDITOR_W;
     let close_at = (untitled_right - 13, untitled_y + 13);
     click_at(&mut qmp, &mut session, close_at.0, close_at.1)?;
-    // **The shell's line comes first, and that ordering is the mechanism rather than a
-    // coincidence.** A dialog's first `Configure` is *held* for the manager, so the client is
-    // blocked inside `Session::create` until the shell answers — the placement is therefore
-    // printed before the editor can say what it opened. Asserting the editor's line first
-    // consumed past this one and then waited forty-five seconds for it to come round again.
+    // **The editor's line comes first, and it is ordered by construction rather than by luck.**
+    // It is printed *before* the dialog is asked for, because a dialog's first `Configure` is
+    // held for the manager — so a line printed after `Child::open` returned would be downstream
+    // of the shell, and the two processes would be racing to the console. They were, and the
+    // winner depended on the accelerator: TCG gave the shell both lines and KVM gave the client
+    // the second one, which is how this passed twice locally and failed in CI (PR #267).
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
     let placed_dialog = session.rest_of_line()?;
-    let (placed_id, parent_id, dx, dy, dw, dh) = parse_dialog_placement(&placed_dialog)
+    let (_, parent_id, dx, dy, dw, dh) = parse_dialog_placement(&placed_dialog)
         .ok_or_else(|| format!("could not read a dialog placement from {placed_dialog:?}"))?;
-    session.expect("nxedit: unsaved buffer - asking, dialog window ")?;
-    let asked_line = session.rest_of_line()?;
-    let dialog_id: u32 = asked_line
-        .trim()
-        .parse()
-        .map_err(|_| format!("could not read the dialog's window id from {asked_line:?}"))?;
-    if placed_id != dialog_id || parent_id != untitled_id {
+    if parent_id != untitled_id {
         return Err(format!(
-            "the editor opened dialog {dialog_id} on window {untitled_id}, and the shell placed              dialog {placed_id} on window {parent_id}"
+            "the editor asked about window {untitled_id}, and the shell placed a dialog on \
+             window {parent_id}"
         )
         .into());
     }
     if (dw as i32, dh as i32) != (CONFIRM_W, CONFIRM_H) {
         return Err(format!(
-            "the dialog is {dw}x{dh}, and this gate aims at a {CONFIRM_W}x{CONFIRM_H} one — the              four constants above came from `nxedit`'s published geometry and have drifted from              it"
+            "the dialog is {dw}x{dh}, and this gate aims at a {CONFIRM_W}x{CONFIRM_H} one \
+             — the four constants above came from `nxedit`'s published geometry and have \
+             drifted from it"
         )
         .into());
     }
@@ -3113,7 +3112,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         .clamp(work.1, work.1 + work.3 as i32 - CONFIRM_H);
     if (dx, dy) != (want_x, want_y) {
         return Err(format!(
-            "the dialog landed at {dx},{dy}; centred on window {untitled_id} at              {untitled_x},{untitled_y} {EDITOR_W}x{EDITOR_H} and clamped to the work area it              belongs at {want_x},{want_y}"
+            "the dialog landed at {dx},{dy}; centred on window {untitled_id} at \
+             {untitled_x},{untitled_y} {EDITOR_W}x{EDITOR_H} and clamped to the work area \
+             it belongs at {want_x},{want_y}"
         )
         .into());
     }
@@ -3128,11 +3129,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // **And the second answer.** Asked again — the same button, the same window, because a
     // question answered *no* must be askable again or the editor can never be closed at all.
     click_at(&mut qmp, &mut session, close_at.0, close_at.1)?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
     let placed_again = session.rest_of_line()?;
     let (_, _, dx2, dy2, _, _) = parse_dialog_placement(&placed_again)
-        .ok_or_else(|| format!("could not read the second dialog placement from {placed_again:?}"))?;
-    session.expect("nxedit: unsaved buffer - asking, dialog window ")?;
+        .ok_or_else(|| {
+            format!("could not read the second dialog placement from {placed_again:?}")
+        })?;
     click_at(&mut qmp, &mut session, dx2 + CONFIRM_DISCARD_CX, dy2 + CONFIRM_BUTTON_CY)?;
     session.expect("nxedit: discarding the unsaved buffer")?;
     session.expect("nxedit: closing")?;
@@ -3197,9 +3200,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // does is the same either way, and a gate that pinned it would be asserting against which
     // window happened to be focused three clicks earlier.
     middle_click_at(&mut qmp, &mut session, entry.0, entry.1)?;
-    session.expect(&format!("desktop-shell: asked window {edit_id} to close"))?;
+    // **The compositor's line is the ordered one, not the shell's** — the same rule 6a3 states:
+    // the compositor logs before it replies, so it leads, and the shell's own line comes after
+    // its request returns, which is a race against the client it just woke. The shell's is
+    // checked against the whole transcript below, where order does not matter.
+    session.expect(&format!("compositor: asked window {edit_id} to close"))?;
+    session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
-    session.expect("nxedit: unsaved buffer - asking, dialog window ")?;
     println!("  ok: the taskbar's ask reached a client that declined to answer it");
 
     // **And the second click insists.** The window goes, the dialog goes with it — a dialog is
@@ -3275,6 +3282,22 @@ fn cmd_check_login(accel: Accel) -> R<()> {
             )
             .into());
         }
+    }
+
+    // **And that it asked before it insisted** (M12 Part A) — order-independent for the same
+    // reason, and it is what makes step 12 a *policy* assertion rather than a coincidence: the
+    // shell reached `Manage::Close` on the second click, and it reached `RequestClose` on the
+    // first. A shell that destroyed the window straight away would produce the "did not answer"
+    // line the ordered half already matched, and none of this.
+    if !transcript.contains(&format!("desktop-shell: asked window {edit_id} to close")) {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err(format!(
+            "the shell destroyed window {edit_id} without ever reporting that it asked first: \
+             insisting must be the *second* middle-click, and the first must be a request the \
+             client is free to answer with a dialog"
+        )
+        .into());
     }
 
     // The shell said it asked — order-independent, because that line races the client it woke.
