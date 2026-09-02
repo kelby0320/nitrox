@@ -170,19 +170,6 @@ impl Role {
         matches!(self, Role::Popup { .. })
     }
 
-    /// The window this one hangs from, for the roles that have one.
-    ///
-    /// **A popup's parent is not a stacking relationship here** — the compositor stacks by
-    /// creation order and clips a popup to the *screen* — but it is the one thing that makes
-    /// "outside this popup" answerable without also meaning "outside the button that opened it"
-    /// (M11 Part E batch 5).
-    pub const fn parent(&self) -> Option<u32> {
-        match self {
-            Role::Popup { parent } | Role::Dialog { parent } => Some(*parent),
-            _ => None,
-        }
-    }
-
     /// The edge and size this role reserves, if any.
     pub const fn strut(&self) -> Option<(Edge, u32)> {
         match self {
@@ -1235,8 +1222,18 @@ pub const OP_DROPPED: u16 = 0x0930;
 /// raises it and the popup hears about it — but clicking the desktop or a panel raises nothing,
 /// changes no focus, and left every popup in the system open (M11 Part E batch 5).
 ///
-/// **Sent for a press outside the popup and outside its parent**, so the button that opened a
-/// menu can close it by its own rules rather than racing a dismissal.
+/// **Sent for a press anywhere that is not the popup itself — its parent included.** A first
+/// version exempted the parent, meaning to protect the button that opened a menu from racing a
+/// dismissal, and that was wrong twice: a popup's parent is the whole *bar* rather than the
+/// button, so clicking the bar left the menu up — and dismissing is precisely what makes clicking
+/// that button a second time close the thing it opened. The press that *opens* a popup cannot
+/// dismiss it: the popup does not exist when that press is routed.
+///
+/// **Only the topmost popup is told.** With two up at once — a menu, and a rename prompt opened
+/// by a manager hotkey that reaches the shell whatever holds focus — a press outside both
+/// dismisses the upper one, and the next press dismisses the other. Self-healing rather than
+/// stuck, and the alternative is a client hearing about a press that landed on a popup covering
+/// it, which is not "outside" from where that client sits.
 pub const OP_DISMISSED: u16 = 0x0931;
 
 /// A drop payload that is one file.

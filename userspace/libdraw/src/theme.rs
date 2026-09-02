@@ -287,10 +287,10 @@ impl Theme {
                 "outline" => set(&mut t.outline, value),
                 "border" => set(&mut t.border, value),
                 "desktop" => set(&mut t.desktop, value),
-                // **Unquoted, because TOML types a quoted number as a string.** Accepting
-                // `font_px = "14"` would be accepting a file a real TOML reader disagrees with
+                // **Unquoted, because TOML types a quoted number as a string** — the same rule
+                // `font_px` states below, and the reason both arms exist: accepting
+                // `bevel = "12"` would be accepting a file a real TOML reader disagrees with
                 // this one about.
-                // Unquoted for the same reason `font_px` is: both are TOML numbers.
                 "bevel" if raw.starts_with('"') => false,
                 "bevel" => match value.parse::<u8>() {
                     Ok(v) if v <= MAX_BEVEL => {
@@ -299,6 +299,7 @@ impl Theme {
                     }
                     _ => false,
                 },
+                // Unquoted, for the reason the `bevel` arm above states.
                 "font_px" if raw.starts_with('"') => false,
                 "font_px" => match value.parse::<f32>() {
                     // **A size, not a number**, and bounded at both ends by what can be read:

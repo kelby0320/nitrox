@@ -398,12 +398,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             .end();
                     }
                 }
+                // A dismissal is a popup's event; this window is not one.
+                WindowEvent::Dismissed => {}
                 // **The shell asking, answered the way the close button is.** Exiting is the
                 // whole of it: the kernel closes this process's handles and the compositor
                 // tears its windows down with its session.
-                // A dismissal is a popup's event; this window is not one.
-            WindowEvent::Dismissed => {}
-            WindowEvent::CloseRequested => {
+                WindowEvent::CloseRequested => {
                     kprint(b"nxfiles: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }

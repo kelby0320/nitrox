@@ -29,11 +29,19 @@ of a value — which matters, because every colour begins with `#`.
 
 ```toml
 # The session's theme. Delete this file for the built-in one.
-background = "#0E141B"
-foreground = "#E0E6EC"
+background = "#FFFFFF"
+foreground = "#2F2F2F"
 font_px = 16
+bevel = 12
 font_ui = "/system/fonts/DejaVuSans.ttf"
 ```
+
+**Those are the built-in values**, and the first line is what the image build writes at the top of
+the shipped file — so this block is a fragment of the real thing rather than an illustration.
+Copying it and changing one colour is the intended way to start; copying a *stale* one and getting
+near-white widgets on a near-black ground is what this example used to do, because it still showed
+the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file also carries a
+`font_px` that is deliberately not the default — see `check-login`, which reads it back.
 
 | Key | Type | What it colours |
 |---|---|---|

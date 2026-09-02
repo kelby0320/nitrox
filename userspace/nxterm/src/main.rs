@@ -861,11 +861,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // as routing state.
                 app.focused = f;
             }
+            // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
+            WindowEvent::Dismissed => {}
             // **The shell asking, answered the same way the close button is.** There is nothing
             // to refuse with and nothing to save: what a client with unsaved work would do here
             // is open a dialog, which is why this arrives as a request rather than a destruction.
-            // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
-            WindowEvent::Dismissed => {}
             WindowEvent::CloseRequested => {
                 kprint(b"nxterm: asked to close, exiting\n");
                 app.update(Msg::Close);

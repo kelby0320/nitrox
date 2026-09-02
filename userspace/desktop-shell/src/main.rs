@@ -504,18 +504,6 @@ const MODAL_PITCH: usize = (MODAL_W as usize) * 4;
 /// How tall one entry is.
 const ROW_H: u32 = 20;
 
-/// The applications modal's element tree: a filter field over a list of `/bin` programs.
-///
-/// **The theme is passed in rather than built here**, and that is not tidiness. This function
-/// builds widgets while its caller *paints* them, and two themes in one frame is a thing the old
-/// `Theme`/`Palette` split made unwriteable and one type makes easy (PR #262 review, optional 5).
-///
-/// **The same mistake arrived a second time through the metrics**, which is worth stating here
-/// because this is where it was first argued: M11 Part C took the theme from a file and left
-/// every `layout()` measuring at a hardcoded 16, so text was laid out at one size and painted at
-/// another — clipped and overlapping for every size but the default. There is no size constant
-/// in this crate now; there is a theme, and both the measure and the paint come from it
-/// (PR #263 review, blocking 1).
 /// What the applications modal can ask for.
 ///
 /// **One variant, and it is still worth a type.** `Element<()>` was honest while nothing could be
@@ -533,6 +521,29 @@ enum ModalMsg {
     Scroll(librsproto::surface::PointerEvent),
 }
 
+/// The height the modal's list is laid out at — the space left after the filter field.
+///
+/// **One place, because two things have to agree about it** (PR #265 review, optional 10): the
+/// view lays the list out at this height, and `ListState::drag_to` converts a pointer's y against
+/// it. Open-coded at both, changing one would leave the thumb tracking a track that is not the
+/// one drawn — which is the failure `drag_to`'s own doc names. `nxfiles` routes both through
+/// `App::list_h`, and this is that shape.
+fn modal_list_h() -> u32 {
+    MODAL_H.saturating_sub(40)
+}
+
+/// The applications modal's element tree: a filter field over a list of `/bin` programs.
+///
+/// **The theme is passed in rather than built here**, and that is not tidiness. This function
+/// builds widgets while its caller *paints* them, and two themes in one frame is a thing the old
+/// `Theme`/`Palette` split made unwriteable and one type makes easy (PR #262 review, optional 5).
+///
+/// **The same mistake arrived a second time through the metrics**, which is worth stating here
+/// because this is where it was first argued: M11 Part C took the theme from a file and left
+/// every `layout()` measuring at a hardcoded 16, so text was laid out at one size and painted at
+/// another — clipped and overlapping for every size but the default. There is no size constant
+/// in this crate now; there is a theme, and both the measure and the paint come from it
+/// (PR #263 review, blocking 1).
 fn modal_view(
     query: &TextFieldState,
     rows: &[ListRow<'_>],
@@ -541,8 +552,7 @@ fn modal_view(
     theme: &Theme,
 ) -> Element<ModalMsg> {
     let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme);
-    // The list is given the space left after the field, so `visible` matches what is drawn.
-    let list_h = MODAL_H.saturating_sub(40);
+    let list_h = modal_list_h();
     // **Rows are clickable and they highlight** (M11 Part E batch 4). Until then this shell
     // looked at pointer events for exactly three things — the overview's thumbnails, the
     // applications button and the taskbar — and never at the modal's own window, so its rows
@@ -658,7 +668,6 @@ fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
     names
 }
 
-/// Render the top bar.
 /// `theme`, as the overview's sidebar wears it: the desktop's own ground, darkened, with the
 /// window ground as ink.
 ///
@@ -680,7 +689,7 @@ fn panel(theme: &Theme) -> Theme {
     Theme { background: theme.face, ..*theme }
 }
 
-/// The top bar's picture.
+/// Render the top bar.
 fn render_bar(theme: &Theme, font: &Font, clock: &str) -> MemFramebuffer {
     let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
         .expect("the bar pitch is wide enough for a row");
@@ -2230,8 +2239,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             if let ModalMsg::Scroll(p) = msg
                                 && p.buttons != 0
                             {
-                                let h = MODAL_H.saturating_sub(40);
-                                modal_list.drag_to(h, ROW_H, rows.len(), p.y);
+                                modal_list.drag_to(modal_list_h(), ROW_H, rows.len(), p.y);
                                 modal_dirty = true;
                             }
                             continue;

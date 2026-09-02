@@ -111,10 +111,6 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
     }
 }
 
-/// Write `bytes` to `path` the safe way: a temporary beside it, renamed over it.
-///
-/// The error is the message the status strip shows, so it is written for the person looking at
-/// the window rather than for a log.
 /// What the taskbar should call this window.
 ///
 /// **"untitled" rather than nothing** (M11 Part E batch 7). An empty title leaves the window list
@@ -125,6 +121,10 @@ fn window_title(path: &str) -> &str {
     if path.is_empty() { "untitled" } else { libfs::basename_str(path) }
 }
 
+/// Write `bytes` to `path` the safe way: a temporary beside it, renamed over it.
+///
+/// The error is the message the status strip shows, so it is written for the person looking at
+/// the window rather than for a log.
 fn save(ns: u64, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
     let mut temp = String::from(path);
     temp.push_str(TEMP_SUFFIX);
@@ -338,15 +338,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // a file is a syscall, so the application says it wants to save and the `main` that owns
         // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
         if let Some(text) = app.take_save() {
-            // **Re-read from the application**, because naming an untitled buffer changes it —
-            // as a drop does. The binary's copy is a cache of the application's answer, and a
-            // save that used the stale one would write the buffer to the file it was *not*
-            // just named.
-            // **Read from the application, not tracked beside it.** The path changes twice —
-            // a drop replaces the file, and naming an untitled buffer gives it one — and a copy
-            // `main` kept would be a second answer that has to be updated at both. There was
-            // one, and it was a `let` bound once at startup that a drop had to remember to
-            // refresh (M11 Part E batch 9).
+            // **Read from the application, not tracked beside it.** The path changes twice — a
+            // drop replaces the file, and naming an untitled buffer gives it one — so a copy
+            // `main` kept would be a second answer needing an update at both. There was one: a
+            // `let` bound once at startup that the drop path had to remember to refresh
+            // (M11 Part E batch 9).
             let editing = alloc::string::String::from(app.path());
             let bytes = to_bytes(&text);
             let result = save(root_ns, &editing, &bytes);
@@ -433,14 +429,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             .end();
                     }
                 }
+                // A dismissal is a popup's event; this window is not one.
+                WindowEvent::Dismissed => {}
                 // **Answered by exiting, and the unsaved buffer goes with it.** An editor with
                 // somewhere to put a question would ask it — that is what a `CloseRequested`
                 // rather than a destruction is *for* — and this one has no dialog to ask in.
                 // Naming the gap is the honest half; the confirmation belongs with the rest of
                 // the editor's second pass, which M12 owns.
-                // A dismissal is a popup's event; this window is not one.
-            WindowEvent::Dismissed => {}
-            WindowEvent::CloseRequested => {
+                WindowEvent::CloseRequested => {
                     kprint(b"nxedit: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }

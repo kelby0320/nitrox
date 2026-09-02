@@ -620,7 +620,10 @@ impl WindowStack {
         // **A `dialog` is not placed this way, though it also names a parent.** Its parent
         // carries desktop membership and lifetime — not its position (`display-substrate.md`
         // §4a, `ui-composition-model.md` §6). In placement terms it is an ordinary listed
-        // window, so it lands at the origin and a manager places it, exactly like a `normal`.
+        // window that a manager places, exactly like a `normal` — which since M11 Part E batch 8
+        // means it starts where it *asked* rather than at the origin, a preference the manager
+        // then overrides. The arm below says so; this paragraph used to say "lands at the
+        // origin" and was left behind by that change (PR #265 review, finding 3).
         let origin = match req.role {
             Role::Popup { parent } => {
                 // The parent is known to exist: checked directly above, and nothing between

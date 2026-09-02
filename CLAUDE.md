@@ -122,8 +122,8 @@ keeps `check-display`'s reference windows undisturbed — so it holds no keyboar
 typed reaches it.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
-release image and driving it to four moments — the greeter, the bare desktop, the applications
-modal, and two real windows — then writing what QEMU says is on the display to
+release image and driving it to five moments — the greeter, the bare desktop, the applications
+modal, two real windows, and the overview — then writing what QEMU says is on the display to
 `tools/build-cache/shot-*.png`. It costs a boot, and it is the only way to see the things
 `preview` cannot: the cursor, the window frames, the ground between windows, and how two windows
 sit next to each other. A tool rather than a gate — it asserts only enough to know the picture is

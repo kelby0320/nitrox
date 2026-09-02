@@ -257,7 +257,7 @@ fn print_help() {
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
            shot              boot the release image and photograph the desktop;\n  \
-           \x20                `shot all|greeter|desktop|apps|windows`\n  \
+           \x20                `shot all|greeter|desktop|apps|windows|overview`\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
@@ -3907,7 +3907,8 @@ fn cmd_preview(what: &str) -> R<()> {
     Ok(())
 }
 
-/// `cargo xtask shot [all|greeter|desktop|apps|windows]` — photograph the running desktop.
+/// `cargo xtask shot [all|greeter|desktop|apps|windows|overview]` — photograph the running
+/// desktop.
 ///
 /// **The other half of `preview`, and the half it said it could not be.** Part A's command
 /// renders the toolkit's own surfaces on the host in about a second, and its doc names what that
@@ -3922,8 +3923,10 @@ fn cmd_preview(what: &str) -> R<()> {
 /// drives it to each moment worth looking at, and writes what QEMU says is on the display.
 ///
 /// **Several moments per boot**, because the boot is the cost. One run gives the greeter, the
-/// bare desktop, the applications modal and a screen with real windows on it; a polish list is
-/// written against all four.
+/// bare desktop, the applications modal, a screen with real windows on it, and the overview — a
+/// polish list is written against all five. The overview is there because it is the one surface
+/// with no other way to be looked at: it covers the screen and closes when anything else is
+/// clicked.
 ///
 /// It is a tool and not a gate: it asserts only enough to know the picture is of a working
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be
@@ -5999,6 +6002,22 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libcrypto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libtime`'s calendar arithmetic and duration parsing — the same six tests, moved here with
+    // the module when it grew a second consumer (M11 Part E batch 9).
+    //
+    // **Adding a crate to the workspace does not add it to this list**, and that is the whole
+    // lesson: these tests ran as part of `-p coreutils --lib` while `time` was a module of it,
+    // and moving the module out silently stopped running them. Nothing failed — a moved test that
+    // nobody runs passes by not existing (PR #265 review, blocking 1). The century rules in
+    // `civil_from_days` are what was left unguarded, and they now feed a clock on the top bar as
+    // well as `date`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libtime")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;

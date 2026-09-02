@@ -1321,6 +1321,12 @@ a popup's parent is the whole *bar* rather than the button, and dismissing is ex
 clicking that button a second time close what it opened. The opening press cannot dismiss: the
 popup does not exist when it is routed.
 
+**Only the topmost popup is told.** Two can be up at once — `nxterm`'s menu, and the shell's
+rename prompt, which a manager hotkey opens whatever holds focus — and a press outside both
+dismisses the upper one; the next press dismisses the other. Self-healing rather than stuck, and
+deliberate: telling the lower one would be telling a client about a press that landed on a popup
+covering it, which is not "outside" from where that client sits.
+
 ## See also
 
 - [rsproto wire format](rsproto-wire-format.md) — the envelope every category shares
