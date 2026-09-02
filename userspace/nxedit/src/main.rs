@@ -490,13 +490,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The write happens here, not in `update`.** `update` is a function of values; writing
         // a file is a syscall, so the application says it wants to save and the `main` that owns
         // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
-        if let Some(text) = app.take_save() {
-            // **Read from the application, not tracked beside it.** The path changes twice — a
-            // drop replaces the file, and naming an untitled buffer gives it one — so a copy
-            // `main` kept would be a second answer needing an update at both. There was one: a
-            // `let` bound once at startup that the drop path had to remember to refresh
-            // (M11 Part E batch 9).
-            let editing = alloc::string::String::from(app.path());
+        if let Some((key, editing, text)) = app.take_save() {
+            // **The path comes back with the bytes**, from the buffer that asked to be saved.
+            // Reading `app.path()` here answers for whatever tab is current *now* — the top of
+            // the iteration after the whole batch was applied — so a `Ctrl+S` and a tab click in
+            // one drain wrote the other tab's bytes to the other tab's path (PR #270 review).
             let bytes = to_bytes(&text);
             let result = save(root_ns, &editing, &bytes);
             match result {
@@ -514,7 +512,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     .s(why.as_bytes())
                     .end(),
             }
-            app.saved(result);
+            app.saved(key, result);
             // Round again rather than waiting: the status strip has changed and nothing else is
             // going to arrive to prompt a redraw.
             continue;

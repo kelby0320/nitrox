@@ -2837,9 +2837,19 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
 
-        // The hover the drain settled on, applied now that no more events will be routed
-        // against the tree it would change.
-        if next_hover != modal_hover {
+        // The hover the drain settled on — applied only if **no gesture is still running**.
+        //
+        // **Deferring the sample was half the rule** (PR #270 review, blocking 1). It fixes the
+        // element-versus-tree mismatch *during* a batch, and then applies the new hover anyway:
+        // a batch of `[ENTER, MOTION, PRESS]` leaves `next_hover` on the row, because the motion
+        // sampled it before the press made `grabbed()` true. Repainting with it gives the row
+        // three children where it had two, the captured node a new id, and the release nothing
+        // to find — which is the whole bug, arriving one drain later than before.
+        //
+        // `Child` has no such hole because its `present` records `hovered_key()`, which under a
+        // grab is already the shown value and therefore a no-op. This is the same rule spelled
+        // out for a loop that owns its own tree.
+        if !modal_router.grabbed() && next_hover != modal_hover {
             modal_hover = next_hover;
             modal_dirty = true;
         }

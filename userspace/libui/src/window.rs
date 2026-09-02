@@ -206,7 +206,7 @@ impl Child {
     /// answering with the tree's own hover is what keeps all three the same shape for the whole
     /// of a gesture.
     pub fn hovered_key(&self) -> Option<u64> {
-        if self.router.grabbed() { self.shown } else { self.hover }
+        reported_hover(self.router.grabbed(), self.hover, self.shown)
     }
 
     /// Paint `content` and put it on screen **if anything changed**. `false` if this frame could
@@ -416,9 +416,10 @@ mod tests {
             y,
             ..Default::default()
         };
-        // What `Child::hovered_key` answers: the tree's hover while a gesture is running.
+        // **The shipped decision, not a copy of it.** `Child::hovered_key` delegates to this, so
+        // breaking the rule fails this test — which the first version of it did not.
         let seen = |router: &Router, live: Option<u64>, shown: Option<u64>| {
-            if router.grabbed() { shown } else { live }
+            reported_hover(router.grabbed(), live, shown)
         };
 
         // Frame one, drawn with nothing hovered.
@@ -457,9 +458,12 @@ mod tests {
     }
 
     #[test]
-    fn the_hover_does_not_move_while_a_button_is_held() {
-        // The rule the test above depends on, stated on its own: a widget may change under the
-        // pointer, but not while a button is down on it.
+    fn a_press_opens_a_capture_and_the_release_closes_it() {
+        // **The precondition the rule rests on**, and all this checks — named for that rather
+        // than for the rule itself, which it never asserted. `Child::hover` *does* move under a
+        // grab since M12 Part D; what does not move is what `hovered_key` reports, and
+        // `a_click_survives_a_motion_and_a_press_arriving_together` is where that is pinned
+        // (PR #270 review, optional 8).
         let cell = FixedCell { w: 8, h: 16 };
         let bounds = Rect::new(0, 0, 120, 60);
         let mut tree = Tree::new();
@@ -492,6 +496,22 @@ mod tests {
     fn _unused() -> Element<u32> {
         padding(Insets::all(0), text("x"))
     }
+}
+
+/// What a caller is told the hover is: the tree's while a gesture runs, the pointer's otherwise.
+///
+/// **A function so that one thing decides it** (PR #270 review, blocking 2). The rule had a test
+/// that re-implemented it with a local closure, so reverting the shipped code left all two hundred
+/// `libui` tests green — a guard for a mechanism rather than for the fix, on the third attempt at
+/// a bug whose first two attempts also looked right. The test calls this now, and breaking it
+/// fails.
+///
+/// **What is still not covered here** is the wiring: that [`Child::present`] records the hover it
+/// drew with and that [`Child::route`] tracks the live one. A `Child` cannot be built on the host
+/// at all — `BufferPool::new` is memory syscalls — so those two lines are the gate's, and this is
+/// the part that can be pinned without one.
+fn reported_hover(grabbed: bool, live: Option<u64>, shown: Option<u64>) -> Option<u64> {
+    if grabbed { shown } else { live }
 }
 
 /// A private framebuffer of `size` to compose a frame into.

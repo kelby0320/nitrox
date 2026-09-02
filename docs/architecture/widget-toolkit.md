@@ -24,11 +24,11 @@ assembles it by hand and is the first application to do so). **Theming** (§11) 
 M11 Part B, in the half that matters to this crate: there is one `Theme`, it is `libdraw`'s
 because the compositor needs it too, and `Palette` folded into it. Where its values come from is
 Part C's. The **text
-**tab strip** left it in **M12 Part D**, wanted by both applications in the same part. The **text
 area** left this list in **M10 Part C**: §8 said it would arrive when an application posed real
 requirements rather than hypothetical ones, and M10's editor posed them. It gained **undo, redo
 and find** in M12 Part C — where the decision was the *grouping*, not the stack: a word, a line, a
-run of deletions, and any movement or save between them. **Multi-window
+run of deletions, and any movement or save between them. The **tab strip** left the list in **M12
+Part D**, wanted by both applications in the same part. **Multi-window
 applications** left it in **M12 Part A**, in the half a trigger asked for: an editor's
 confirmation is a real `dialog` window, and what a window rather than an application holds is
 `window::Child`. A *main* window is still each application's own loop. The menu's **popup half** left this list in M5 Part B and left the toolkit
@@ -757,7 +757,9 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   pointer onto a widget usually arrives in the **same batch** as the press, so the live hover has
   already moved while the tree still holds the old one. `Child` keeps both values and answers with
   the shown one under a grab; `Router::grabbed` is published so a main window's loop can follow the
-  same rule, and it must also hold its own resample until after a batch is drained.
+  same rule. Such a loop needs **both** halves: hold the resample until after a batch is drained,
+  *and* refuse to apply it while a grab is still held. Deferring alone only moves the bug one drain
+  later, because the motion that opened the gesture has already sampled the new hover.
 
   **A `Child` is one of the two parented roles**, `popup` and `dialog` — the pair the compositor's
   own `parent_of` matches and the spec calls "transient, parented". Its size is fixed at creation

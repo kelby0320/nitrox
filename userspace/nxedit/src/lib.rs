@@ -74,9 +74,14 @@ pub const TAB_STRIP_KEY: u64 = 7;
 /// **Because a tab's key is an element key too.** `Router::hovered_key` walks up to the nearest
 /// keyed ancestor and reports *that* number, across the whole window's tree — so a tab keyed `2`
 /// and the save button keyed `2` are one number, and hovering the tab would draw the button
-/// hovered. Numbering buffers from a base well above the chrome's keys makes the two namespaces
-/// disjoint by construction rather than by remembering.
-pub const TAB_KEY_BASE: u64 = 1000;
+/// hovered.
+///
+/// **The top bit, not a large number.** This was `1000`, which is far from the chrome's keys and
+/// not *disjoint* from a list's — a browser keys its rows by index and a directory can hold more
+/// than a thousand entries, so row 1000 and the first tab would have been one number (PR #270
+/// review, optional 6). Setting the high bit makes the two namespaces disjoint by construction,
+/// which is what this doc already claimed.
+pub const TAB_KEY_BASE: u64 = 1 << 63;
 
 /// The element key on the confirmation dialog's title bar.
 ///
@@ -224,8 +229,17 @@ pub struct App {
     pub focused: bool,
     /// This window last asked to be maximised, so its maximise button now asks for normal.
     maximized: bool,
-    /// A save the binary owes the filesystem.
-    save_requested: bool,
+    /// A save the binary owes the filesystem, and **which buffer asked for it**.
+    ///
+    /// **The key, not a flag** (PR #270 review, worth fixing 3). A `bool` was right when there
+    /// was one buffer; with tabs, `take_save` and `path()` both read whatever is current when
+    /// `main` gets round to the write — the top of the *next* iteration, after the whole batch
+    /// has been applied. A `Ctrl+S` and a tab click in one drain therefore wrote the other tab's
+    /// bytes to the other tab's path, marked *that* buffer saved, and left the one the person
+    /// asked to save dirty with nothing to show anything had gone wrong. The batch is reachable
+    /// whenever the client is behind, which `pool.acquire` blocking on the third commit makes
+    /// ordinary. Same resolution rule as `confirming`: capture the subject when it is asked for.
+    save_requested: Option<u64>,
     /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
     state_requested: Option<u32>,
     /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
@@ -395,7 +409,7 @@ impl App {
             window: START_SIZE,
             focused: true,
             maximized: false,
-            save_requested: false,
+            save_requested: None,
             state_requested: None,
             move_requested: false,
             resize_requested: None,
@@ -574,15 +588,16 @@ impl App {
     /// `None` when nothing asked for one — **or when this buffer is blocked**, which is where
     /// the refusal is enforced rather than merely displayed. The status strip says why, so a
     /// person pressing save on a file that could not be read is answered rather than ignored.
-    pub fn take_save(&mut self) -> Option<String> {
-        if !core::mem::take(&mut self.save_requested) {
-            return None;
-        }
-        if let Some(why) = self.buf().blocked.clone() {
+    pub fn take_save(&mut self) -> Option<(u64, String, String)> {
+        let key = core::mem::take(&mut self.save_requested)?;
+        let Some(b) = self.buffers.iter().find(|b| b.key == key) else { return None };
+        if let Some(why) = b.blocked.clone() {
             self.status = alloc::format!("not saved — {why}");
             return None;
         }
-        Some(self.buf().text.text())
+        // **The path comes from the buffer that asked**, not from `path()`, which answers for
+        // whatever is current now.
+        Some((key, b.path.clone(), b.text.text()))
     }
 
     /// Take `path` as the file to edit, if this buffer can be given up.
@@ -614,10 +629,11 @@ impl App {
     /// **A failure changes nothing but the message.** The buffer stays as it is and stays
     /// modified, because the alternative — marking it saved and letting the person close the
     /// window — is the editor losing their work while telling them it did not.
-    pub fn saved(&mut self, result: Result<usize, &str>) {
+    pub fn saved(&mut self, key: u64, result: Result<usize, &str>) {
         match result {
             Ok(n) => {
-                let b = self.buf_mut();
+                let Some(i) = self.buffers.iter().position(|b| b.key == key) else { return };
+                let b = &mut self.buffers[i];
                 b.saved_at = b.text.revision();
                 // The file is now what the buffer holds, whatever it held before.
                 b.differs = false;
@@ -650,7 +666,7 @@ impl App {
                         self.status = String::from("name it, then Enter");
                     }
                 } else {
-                    self.save_requested = true;
+                    self.save_requested = Some(self.current);
                 }
             }
             // Nothing here: the payload is in the event the binary is holding, and *which*
@@ -726,9 +742,29 @@ impl App {
         // **While a name is being typed the keys are the field's**, buffer and chords included.
         // A `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
         // already being answered.
-        // **While a field is open the keys are the field's**, buffer and chords included. A
-        // `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
-        // already being answered.
+        // **The tab chords are the window's, and are checked first** — the rule `nxfiles`
+        // follows, made to agree here (PR #270 review, optional 7). The two applications grew
+        // the same widget in the same part and disagreed about this: a `Ctrl+T` during a find
+        // opened no tab, because the field's branch returned before the chords were looked at.
+        //
+        // The line is *what the chord acts on*. `Ctrl+T` and `Ctrl+W` act on the **window** and
+        // are checked before any field; `Ctrl+S`, `Ctrl+Z`, `Ctrl+Y` and `Ctrl+F` act on the
+        // **buffer**, and while a field is open the buffer is not what is being addressed — a
+        // `Ctrl+S` mid-name would ask to save the thing that has no name yet, which is exactly
+        // what is already being answered.
+        if k.modifiers & MOD_CTRL != 0
+            && matches!(k.keycode, NEW_TAB_KEYCODE | CLOSE_TAB_KEYCODE)
+        {
+            if k.keycode == NEW_TAB_KEYCODE {
+                self.update(Msg::NewTab);
+            } else {
+                let key = self.current;
+                self.update(Msg::CloseTab(key));
+            }
+            return;
+        }
+        // **While a field is open the rest of the keys are the field's**, buffer and chords
+        // included.
         //
         // **What was typed is read out before anything else is touched.** The field lives in
         // `self`, and both answers below reach for another part of `self` — the buffer, to name
@@ -767,8 +803,9 @@ impl App {
                             let b = self.buf_mut();
                             b.path = path;
                             b.name = name;
+                            let key = b.key;
                             self.field = None;
-                            self.save_requested = true;
+                            self.save_requested = Some(key);
                         }
                         // **The field stays open**, which is the whole of what makes Enter walk
                         // through the matches: a find that closed on its first hit would need
@@ -824,11 +861,7 @@ impl App {
                 // shape (PR #269 review, worth fixing 1). The field therefore always starts
                 // empty; carrying the last needle across an `Esc` would be a feature, and is
                 // not one anybody has asked for.
-                NEW_TAB_KEYCODE => self.update(Msg::NewTab),
-                CLOSE_TAB_KEYCODE => {
-                    let k = self.current;
-                    self.update(Msg::CloseTab(k));
-                }
+                // The tab chords were taken above, before any field could swallow them.
                 FIND_KEYCODE => {
                     self.field = Some((Field::Finding, TextFieldState::new()));
                     self.status = String::from("find, then Enter");
@@ -1228,15 +1261,15 @@ mod tests {
         let text = a.text();
         assert!(a.modified());
 
-        a.saved(Err("the file could not be replaced"));
+        a.saved(a.current_tab(), Err("the file could not be replaced"));
         assert_eq!(a.text(), text, "the buffer is what it was");
         assert!(a.modified(), "and it is still unsaved");
         assert!(a.status().contains("NOT saved"), "status was {:?}", a.status());
 
         // And a save that works clears exactly that.
         a.update(Msg::Save);
-        let owed = a.take_save().expect("a save was asked for");
-        a.saved(Ok(owed.len()));
+        let (saved_key, _, owed) = a.take_save().expect("a save was asked for");
+        a.saved(saved_key, Ok(owed.len()));
         assert!(!a.modified(), "a successful save is what marks it saved");
     }
 
@@ -1268,8 +1301,8 @@ mod tests {
 
         // Saving makes the file match the buffer, which is what clears it.
         a.update(Msg::Save);
-        let owed = a.take_save().expect("a blocked buffer is a different thing");
-        a.saved(Ok(owed.len()));
+        let (saved_key, _, owed) = a.take_save().expect("a blocked buffer is a different thing");
+        a.saved(saved_key, Ok(owed.len()));
         assert!(!a.modified());
         assert_eq!(a.title(), "dos.txt");
 
@@ -1395,7 +1428,11 @@ mod tests {
         assert_eq!(a.status(), "new file");
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
-        assert_eq!(a.take_save().as_deref(), Some("x"), "and it can be written");
+        assert_eq!(
+            a.take_save().map(|(_, p, t)| (p, t)),
+            Some((String::from("/home/new.txt"), String::from("x"))),
+            "and it can be written"
+        );
     }
 
     #[test]
@@ -1405,8 +1442,8 @@ mod tests {
         key(&mut a, KEY_X, 0);
         assert_eq!(a.title(), "* notes.txt");
         a.update(Msg::Save);
-        let owed = a.take_save().unwrap();
-        a.saved(Ok(owed.len()));
+        let (saved_key, _, owed) = a.take_save().unwrap();
+        a.saved(saved_key, Ok(owed.len()));
         assert_eq!(a.title(), "notes.txt");
         // Edited again after a save is modified again — the revision never goes backwards.
         key(&mut a, KEY_X, 0);
@@ -1418,7 +1455,11 @@ mod tests {
         let mut a = app();
         key(&mut a, SAVE_KEYCODE, MOD_CTRL);
         assert_eq!(a.text(), "hello", "nothing was typed");
-        assert_eq!(a.take_save().as_deref(), Some("hello"), "and a save is owed");
+        assert_eq!(
+            a.take_save().map(|(_, _, t)| t).as_deref(),
+            Some("hello"),
+            "and a save is owed"
+        );
 
         // **A digit, because a letter proves nothing here.** `libinput`'s keymap folds
         // `Ctrl`+letter to a control byte, which `TextAreaState::apply` already declines — so a
@@ -1509,8 +1550,8 @@ mod tests {
             key(&mut a, KEY_X, 0);
         }
         a.update(Msg::Save);
-        let owed = a.take_save().expect("a save was asked for");
-        a.saved(Ok(owed.len()));
+        let (saved_key, _, owed) = a.take_save().expect("a save was asked for");
+        a.saved(saved_key, Ok(owed.len()));
         key(&mut a, KEY_X, 0);
         assert_eq!(a.text(), "xxx");
 
@@ -1538,8 +1579,8 @@ mod tests {
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
-        let owed = a.take_save().expect("a save was asked for");
-        a.saved(Ok(owed.len()));
+        let (saved_key, _, owed) = a.take_save().expect("a save was asked for");
+        a.saved(saved_key, Ok(owed.len()));
         assert!(!a.modified());
 
         key(&mut a, UNDO_KEYCODE, MOD_CTRL);
@@ -1567,6 +1608,70 @@ mod tests {
 
         key(&mut a, libkern::abi::KEY_ESC, 0);
         assert_eq!(a.field_kind(), None, "and Escape ends it");
+    }
+
+    #[test]
+    fn a_tab_chord_during_a_find_still_opens_a_tab() {
+        // **The two applications agree about this now** (PR #270 review, optional 7). They grew
+        // the same widget in the same part and disagreed: `nxfiles` checked the tab chords before
+        // its prompt and this one let the field's branch return first, so `Ctrl+T` during a find
+        // did nothing. The line is what the chord acts on — a tab is the *window's*, and the
+        // buffer chords stay the field's while a field is open.
+        let mut a = app();
+        key(&mut a, FIND_KEYCODE, MOD_CTRL);
+        for code in [20u16, 19, 24] {
+            key(&mut a, code, 0);
+        }
+        assert_eq!(a.naming_len(), Some(3), "precondition: the field has the keys");
+
+        key(&mut a, NEW_TAB_KEYCODE, MOD_CTRL);
+        assert_eq!(a.tab_count(), 2, "the chord reached the window");
+
+        // And a buffer chord in the same state is still the field's: `Ctrl+S` while naming asks
+        // nothing new, because a name is what is already being asked for.
+        let mut a = App::new("", "/home");
+        a.absent();
+        a.update(Msg::Save);
+        assert_eq!(a.field_kind(), Some(Field::Naming));
+        key(&mut a, KEY_X, 0);
+        key(&mut a, SAVE_KEYCODE, MOD_CTRL);
+        assert_eq!(a.naming_len(), Some(1), "the name survives, and nothing was saved");
+        assert!(a.take_save().is_none());
+    }
+
+    #[test]
+    fn a_save_writes_the_buffer_that_asked_even_if_the_tab_changes_first() {
+        // **The batch is what makes this reachable**: `Ctrl+S` only records that a save is owed,
+        // and `main` performs it at the top of the *next* iteration — after every event in the
+        // drain has been applied. A tab click in the same drain used to move both the bytes and
+        // the path to the other buffer, so the wrong file was written, the wrong buffer was
+        // marked saved, and the one the person asked for stayed dirty with nothing to show for
+        // it (PR #270 review, worth fixing 3). Events queue whenever the client is behind, which
+        // `pool.acquire` blocking on the third commit makes ordinary.
+        let mut a = app(); // /home/notes.txt holding "hello"
+        a.accept_drop("/home/other.txt");
+        a.absent();
+        let notes = a.tabs()[0].0;
+        let other = a.tabs()[1].0;
+
+        a.update(Msg::SelectTab(notes));
+        key(&mut a, KEY_X, 0);
+        a.update(Msg::Save);
+        // …and the same drain carries a tab click.
+        a.update(Msg::SelectTab(other));
+
+        let (asked, path, text) = a.take_save().expect("a save was asked for");
+        assert_eq!(asked, notes, "the buffer that asked, not the one on screen");
+        assert_eq!(path, "/home/notes.txt");
+        assert_eq!(text, "xhello");
+
+        // And the result lands on that buffer too: marking the *current* one saved would leave
+        // the written one dirty and the untouched one claiming to match a file it never wrote.
+        a.saved(asked, Ok(text.len()));
+        a.update(Msg::SelectTab(notes));
+        assert!(!a.modified(), "the buffer that was written is the one marked saved");
+        a.update(Msg::SelectTab(other));
+        assert!(!a.modified(), "and the empty one was never dirty");
     }
 
     #[test]
@@ -1845,8 +1950,8 @@ mod tests {
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
-        let owed = a.take_save().expect("a save was asked for");
-        a.saved(Ok(owed.len()));
+        let (saved_key, _, owed) = a.take_save().expect("a save was asked for");
+        a.saved(saved_key, Ok(owed.len()));
         assert!(!a.modified());
 
         a.update(Msg::Close);

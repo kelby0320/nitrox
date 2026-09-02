@@ -116,7 +116,12 @@ pub const STRIP_INNER_KEY: u64 = 19;
 /// The element key on the tab strip.
 pub const TAB_STRIP_KEY: u64 = 24;
 /// Where pane keys start — see `nxedit::TAB_KEY_BASE`, whose reasoning is the same.
-pub const TAB_KEY_BASE: u64 = 1000;
+///
+/// **The top bit matters more here than there.** This browser keys its list rows by *index*, and
+/// a directory can hold any number of entries — so a base of a few thousand would put row `n` and
+/// a tab on the same number for a large enough folder, and hovering one would highlight the other
+/// (PR #270 review, optional 6). A row index cannot reach the high bit.
+pub const TAB_KEY_BASE: u64 = 1 << 63;
 /// The key that opens a tab: `t`. Pinned against the keymap by a test, as `nxedit`'s are.
 pub const NEW_TAB_KEYCODE: u16 = 20;
 /// The key that closes one: `w`.
@@ -354,7 +359,8 @@ pub struct App {
     current: u64,
     /// The next key to hand out — monotonic, so a stale message can never name a pane that has
     /// taken its place. Numbered from [`TAB_KEY_BASE`] so a tab's key cannot collide with the
-    /// chrome's element keys, which `Router::hovered_key` reports in one namespace.
+    /// chrome's element keys *or with a list row's index*, which `Router::hovered_key` reports in
+    /// one namespace.
     next_key: u64,
     /// The window's size in pixels — what the client commits.
     window: Size,
@@ -899,8 +905,13 @@ impl App {
             return;
         }
         // The tab chords, which are the keyboard's half of the strip. **Before the prompt
-        // check**, deliberately: `Ctrl+T` while naming something would otherwise type a `t`
-        // into the name, because the field takes every key it is given.
+        // check**, deliberately: without it the chord would not open a tab at all while a name
+        // is being typed, because the field's branch returns first.
+        //
+        // It would *not* type a `t` into the name, which is what this comment used to claim —
+        // `libinput`'s keymap folds Ctrl+letter into the C0 range and `TextFieldState::apply`
+        // drops anything below `0x20`, with the comment "Control characters are not text". The
+        // ordering is right for the other half (PR #270 review, worth fixing 5).
         if k.modifiers & MOD_CTRL != 0 {
             match k.keycode {
                 NEW_TAB_KEYCODE => self.update(Msg::NewTab),
@@ -2182,6 +2193,25 @@ mod tests {
     }
 
     #[test]
+    fn a_tabs_key_can_never_be_a_row_index() {
+        // **One namespace, two things numbering into it.** `Router::hovered_key` reports the
+        // nearest keyed ancestor across the whole window, and this browser keys its list rows by
+        // index — so a base merely *far* from the chrome's keys still collides in a big enough
+        // directory, and hovering row `n` would draw a tab hovered (PR #270 review, optional 6).
+        let mut a = app();
+        for _ in 0..4 {
+            a.update(Msg::NewTab);
+            let _ = a.take_goto();
+        }
+        for (key, _) in a.tabs() {
+            assert!(key >= TAB_KEY_BASE, "every tab is above the base");
+        }
+        // A row index is a `usize` that counts entries; it cannot reach the high bit, so the two
+        // ranges are disjoint by construction rather than by being far apart.
+        assert_eq!(TAB_KEY_BASE, 1 << 63);
+    }
+
+    #[test]
     fn a_browser_tab_closes_without_asking_and_the_last_one_closes_the_window() {
         // **Nothing to lose**: a listing is a view of the filesystem rather than unsaved work,
         // so there is no question to ask — which is the difference between this and the
@@ -2216,10 +2246,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_chord_while_naming_does_not_type_into_the_name() {
-        // **The chords are checked before the prompt**, because a field takes every key it is
-        // given — so `Ctrl+T` mid-name would have typed a `t` into the name *and* not opened a
-        // tab.
+    fn a_tab_chord_while_naming_still_opens_a_tab() {
+        // **The chords are checked before the prompt**, or the field's branch returns first and
+        // the chord does nothing at all while a name is being typed.
+        //
+        // The name is asserted unchanged as well, and that half is the *field's* doing rather
+        // than the ordering's: `apply` drops control characters. Kept because it says what the
+        // whole gesture leaves behind, and labelled so nobody reads it as what the ordering
+        // buys (PR #270 review, worth fixing 5).
         let mut a = app();
         a.update(Msg::Choose(Action::NewFolder));
         press_key(&mut a, KEY_X);

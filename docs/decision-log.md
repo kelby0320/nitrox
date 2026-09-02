@@ -22077,8 +22077,12 @@ hover, gives the captured node a different id, and `path_to_id` finds nothing on
 The rule is one line and it is the one that was missing: **while a gesture is in progress, what a
 caller is told about the hover is what the retained tree was built with.** `Child` keeps both — the
 live hover and the shown one — and answers with the shown one under a grab. `desktop-shell`'s modal
-gets the same by holding its resample until after the drain, so every event in one batch routes
-against the tree that is on screen.
+needs **both halves**: it holds its resample until after the drain, *and* refuses to apply it while
+a grab is still held. Holding alone only moves the bug one drain later — the motion that opened the
+gesture has already sampled the new hover, so the post-drain apply repaints with it and strands the
+capture exactly as before. (The first version of this entry said the modal "gets the same by
+holding its resample", which was not true; PR #270 review, blocking 1, demonstrated it at the
+loop-shape level. Corrected in place because the entry was still in an open PR.)
 
 **What is proven and what is not.** The mechanism is proven: a host test drives a motion and a press
 in one batch with a frame after them, and the control — answering with the live hover — loses the
@@ -22090,3 +22094,52 @@ session has already done twice.
 **And the method is the finding.** Both times this bug was chased by reasoning about timing it
 produced a confident wrong answer; both times a probe that printed the input and the output of the
 step in doubt answered it immediately. The probe is four lines and costs one run.
+
+## 2026-09-02 — what #270's review caught: a rule with no test, and a target that moved again
+
+Blocking 1 is the entry above: the shell applied the deferred hover *while grabbed*, so deferring
+alone moved the bug one drain later rather than fixing it. The rest are smaller, and two of them
+are the same shapes this milestone has now hit three times each.
+
+**A rule implemented in two places is a rule with no test.** The `Child` hover test built its
+expectation with a local closure that re-stated the rule — so reverting the implementation left all
+200 tests green. The fix is not a better assertion, it is **one function**: `reported_hover(grabbed,
+live, shown)`, called by `Child::hovered_key` and by the test. With the implementation reverted the
+control now fails, 199 passed and 1 failed. This is the fifth time this milestone that a control
+passed against a deliberately broken build; every one was a test that could reach the *answer*
+without going through the code that computes it.
+
+**Late target resolution, third occurrence.** `nxedit` said `save_requested: bool` and `main`
+answered "which buffer?" by reading `app.path()` at the top of the next iteration — after the whole
+batch had been applied. A `Ctrl+S` and a tab click arriving in one drain therefore wrote one tab's
+bytes to the other tab's path. `take_save` returns `(key, path, bytes)` now and `saved(key, …)`
+credits the buffer that asked. The control shows `left: "/home/other.txt"` against
+`right: "/home/notes.txt"`. #268's review named the class — "an operation's target is recomputed
+from state that can move between the gesture that chose it and the gesture that confirms it" — and
+it has since been true of a delete, a rename, a copy and now a save. **The shape to look for is a
+`bool` that means "something wants this"**: the boolean records that a thing was asked for and
+throws away *what it was asked about*.
+
+**Two agreements settled while they were cheap.**
+
+- **The key spaces are disjoint by construction now, not merely far apart.** Both applications said
+  `TAB_KEY_BASE = 1000` and both docs claimed that made a tab's key unable to collide with the
+  chrome's. It did — but `nxfiles` keys its *list rows by index*, and a directory can hold more than
+  a thousand entries, so row 1000 and the first tab would have been one number and hovering one
+  would have highlighted the other. `1 << 63` is a base a row index cannot reach. The reviewer's
+  phrasing is the lesson: the base was chosen for exactly this class, and it still failed to be what
+  it said it was.
+- **The two applications agree about a tab chord over an open field.** They grew the same widget in
+  the same part and disagreed: `nxfiles` checked `Ctrl+T`/`Ctrl+W` before its prompt, `nxedit` let
+  the field's branch return first, so a `Ctrl+T` during a find did nothing. The line is **what the
+  chord acts on** — a tab is the *window's* and is checked first; `Ctrl+S`, `Ctrl+Z`, `Ctrl+Y` and
+  `Ctrl+F` act on the buffer, and while a field is open the buffer is not what is being addressed.
+  Both directions are pinned by tests in `nxedit`.
+
+The review also killed a wrong comment. `nxfiles`' chord ordering was justified by "otherwise the
+field would swallow it as text", which the reviewer disproved: `Ctrl+T` folds to `0x14` and
+`TextFieldState::apply` drops anything below `0x20`, so the field would never have inserted it. The
+ordering is right for the *other* half — without it the chord would not open a tab at all while a
+prompt is up — and the test now says so in its name. **A comment that gives a true rule a false
+reason is worse than no comment**: it is what the next reader trusts when deciding whether the rule
+still applies.

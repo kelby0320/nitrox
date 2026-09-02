@@ -3984,10 +3984,12 @@ The two taken before this pass — the clipboard's owner and the image format �
       visibly did nothing. Dropping a file that is already open switches to its tab, because two
       tabs on one file are two buffers that can disagree about it.
 
-      **Tab keys are numbered from a base above the chrome's element keys.** `Router::hovered_key`
-      reports the nearest keyed ancestor across the *whole* window, so a tab keyed `2` and a
-      button keyed `2` are one number — hovering the tab would have drawn the button hovered.
-      Disjoint by construction rather than by remembering.
+      **Tab keys carry the top bit**, because `Router::hovered_key` reports the nearest keyed
+      ancestor across the *whole* window: a tab keyed `2` and a button keyed `2` are one number,
+      and hovering the tab would have drawn the button hovered. The base was `1000` — far from
+      the chrome's keys and *not disjoint* from the browser's, which keys its list rows by index
+      and can hold any number of them. `1 << 63` is what the claim needed to be true (review,
+      optional 6).
 
 - [x] **Gate** ✅: `check-login` step 9c — the drop from step 9 now makes a second tab, the first
       is clicked, and the save is asserted **from outside** to have reached that tab's file. That
@@ -4007,14 +4009,26 @@ The two taken before this pass — the clipboard's owner and the image format �
       one, and the next frame stranded the capture. It failed about one run in seven. A four-line
       probe in the guest answered it immediately, where two rounds of reasoning about timing had
       not. `Child` answers a gesture with the hover its **tree** was built with; the shell's modal
-      holds its resample until after the drain. The mechanism has a host test whose control loses
-      the click; the gate's improvement is eight consecutive runs, which is evidence and not
-      proof, and the log says so.
+      holds its resample until after the drain **and refuses to apply it while a grab is held** —
+      the review proved that deferring alone only moves the bug one drain later, because the
+      motion that opened the gesture has already sampled the new hover. The mechanism has a host
+      test whose control loses the click; the gate's improvement is eight consecutive runs, which
+      is evidence and not proof, and the log says so.
 
       **Eleven host tests** across the three crates, including the widget's two published
       metrics asserted against a real tree, tabs holding their own cursor and history, a question
       about one tab surviving a switch to another, and a tab chord not typing into an open name
       prompt.
+
+- [x] **Review fixes** ✅ (PR #270). Two blocking: the shell applying the deferred hover while
+      still grabbed, above; and a `Child` test that re-stated the rule in a local closure, so
+      reverting the implementation left all 200 green — fixed by extracting `reported_hover` and
+      calling it from both, after which the control fails. Then a save that named its buffer with
+      a `bool` and wrote one tab's bytes to another tab's path — **late target resolution, third
+      occurrence this milestone**; the key spaces made disjoint rather than distant; and the two
+      applications made to agree that a tab chord is the *window's* and is checked before an open
+      field, while the buffer chords stay the field's. A comment justifying that ordering with a
+      reason the reviewer disproved was replaced rather than kept.
 
 ### Part E — copy and paste
 
