@@ -286,6 +286,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut confirm_hovered: Option<u64> = None;
     let ev = win.wait_handle();
     let mut reported = app.revision();
+    // The same shape as `reported`, for the field that names an untitled buffer.
+    let mut reported_name = app.naming_len();
 
     loop {
         // **One line per edit, and it carries a count rather than the text.** A gate driving a
@@ -297,6 +299,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if rev != reported {
             reported = rev;
             libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
+        }
+        // **And the same for the name field**, which `revision` cannot see: naming a buffer is
+        // not editing it. Without this the seven keystrokes that name an untitled buffer are
+        // unacknowledged, and a dropped one arrives as a file with the wrong name.
+        let named = app.naming_len();
+        if named != reported_name {
+            reported_name = named;
+            if let Some(n) = named {
+                libkern::debug::Line::new().s(b"nxedit: name so far ").u(n as u64).s(b" chars").end();
+            }
         }
         // ---- render ----
         // The widget under the pointer, from the router that has always known and that nothing

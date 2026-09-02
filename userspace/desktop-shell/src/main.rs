@@ -2405,17 +2405,36 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             }
                         } else if query.apply(k.keycode, k.modifiers) {
                             modal_dirty = true;
-                            // **A receipt per character, while naming.** Injection is relative
-                            // and unacknowledged, so a dropped PS/2 batch silently eats a
-                            // keystroke — a desktop named `wok` instead of `work`, which is a
-                            // gate failure that looks like a logic bug. The greeter solved this
-                            // by typing one character at a time and waiting for each redraw;
-                            // this is the same receipt, and it is limited to renaming so the
-                            // launcher's typing stays quiet.
+                            // **A receipt per character.** Injection is relative and
+                            // unacknowledged, so a dropped PS/2 batch silently eats a keystroke
+                            // — a desktop named `wok` instead of `work`, which is a gate failure
+                            // that looks like a logic bug. The greeter solved this by typing one
+                            // character at a time and waiting for each redraw; this is the same
+                            // receipt.
+                            //
+                            // **The launcher gets one too, and it is a count** (M12 Part A).
+                            // This said the receipt was "limited to renaming so the launcher's
+                            // typing stays quiet", and the quiet was the problem: `check-login`
+                            // types six characters into the filter and immediately clicks a row,
+                            // so a batch lost anywhere in that burst leaves the list showing
+                            // something else and the click lands on nothing — a launcher row
+                            // that can be clicked and does nothing, intermittently, with no line
+                            // anywhere saying which key went missing. The gate waits for one of
+                            // these per character now.
+                            //
+                            // A *count*, where naming logs the text: a desktop's name is a label
+                            // the person is choosing and can see, and what somebody types into a
+                            // launcher is a program they are about to run. The number is what
+                            // says the keystroke arrived, which is the whole job.
                             if rename {
                                 Line::new()
                                     .s(b"desktop-shell: name so far ")
                                     .untrusted(query.text().as_bytes())
+                                    .end();
+                            } else {
+                                Line::new()
+                                    .s(b"desktop-shell: applications modal listing ")
+                                    .u(filter(&programs, query.text()).len() as u64)
                                     .end();
                             }
                         }

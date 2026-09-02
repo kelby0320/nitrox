@@ -21768,31 +21768,43 @@ recoverable direction.
 `check-login` now drives all three — the ask, the expiry, and the insist — so `Manage::Close` is
 exercised end to end for the first time.
 
-## 2026-09-01 — the close timer was holding up something else: parked events cannot wake a wait
+## 2026-09-01 — parked events cannot wake a wait; and a bisect over a flaky step measures nothing
 
-Taking the two-second grace period out of `desktop-shell` (above) broke `check-login` in a place
-that had nothing to do with closing: a click on a launcher row stopped launching, reproducibly, once
-per run. Bisecting against a clean worktree put it on the close-policy change; the mechanism was
-somewhere else entirely.
+Two things, and the order they were understood in is the point.
 
-`desktop-shell` blocks in `sys_wait` on the compositor's channel and the manager's. `libsurface`
-parks input that arrives while a *reply* is being awaited — inside the transport, not in a kernel
-queue — so a parked event cannot wake that wait. The loop has a belt for this and its comment says
-what it covers: `sent_request` is set when a **manager** request goes out, and the next iteration
-polls with a zero deadline. The session's own requests park in exactly the same way and set nothing
-— a `create` waiting for its first `Configure`, an `acquire` waiting for a buffer release.
+**The real gap, by inspection.** `desktop-shell` blocks in `sys_wait` on the compositor's channel
+and the manager's. `libsurface` parks input that arrives while a *reply* is being awaited — inside
+the transport, not in a kernel queue — so a parked event cannot wake that wait. The loop has a belt
+and its comment says what it covers: `sent_request` is set when a **manager** request goes out, and
+the next iteration polls with a zero deadline. The session's own requests park in exactly the same
+way and set nothing — a `create` waiting for its first `Configure`, an `acquire` waiting for a
+buffer release. The fix is to ask rather than assume: pump before waiting, and do not block while
+anything is queued. It cannot spin, because the drain below empties what it counts.
 
-Every such event was rescued by whatever wake came next, and after a taskbar close there was always
-one within two seconds. Remove the timer and the next wake is the *clock's minute*, so a press that
-landed while the modal was committing a frame sat in the transport for up to sixty seconds — which
-presents as a row that can be clicked and does nothing.
+That belt was written against the *mechanism it was noticed in* rather than against the property
+that matters — anything the transport is holding — and a belt narrower than its own justification is
+one that gets found by a symptom somewhere else.
 
-The fix is to ask rather than assume: pump before waiting, and do not block while anything is
-queued. It cannot spin, because the drain below empties what it counts.
+**And the symptom it was blamed for was somebody else's.** Removing the close timer coincided with
+`check-login`'s launcher-row click failing: a click that lands on the modal and launches nothing.
+A clean worktree at HEAD passed, the branch failed twice, and that looked like a bisect. It was not
+one — the step is *intermittent*, so two failures against two passes measures nothing, and the same
+step failed again in CI after the pump fix had supposedly cured it.
 
-**Two things worth keeping from this.** A timer that exists for one reason can be load-bearing for
-another, and removing it is how you find out — which is an argument for removing accidental ones
-rather than for keeping them. And the belt was written against the *mechanism it was noticed in*
-(manager requests) rather than against the property that matters (anything the transport is
-holding); a belt narrower than its own justification is one that will be found by a symptom
-somewhere else.
+The actual hazard was already written down, in this shell's own source, about the *other* place it
+types: "injection is relative and unacknowledged, so a dropped PS/2 batch silently eats a keystroke
+— a desktop named `wok` instead of `work`, which is a gate failure that looks like a logic bug."
+The receipt that comment introduces was added for renaming and explicitly withheld from the
+launcher — "so the launcher's typing stays quiet" — and the quiet is what made this undiagnosable:
+`check-login` types six characters into the filter and immediately clicks a row, so a lost batch
+leaves the list showing something else and the click lands on nothing, with no line anywhere naming
+the missing key. The launcher's filter reports a count per character now, the gate waits for one per
+key, and `nxedit`'s name field — which had the same shape and a gate comment claiming a discipline
+it did not follow — got the same treatment.
+
+**What to take from it.** A timer that exists for one reason can be load-bearing for another, and
+removing it is how you find out — that part stands, and the pump fix stands on inspection. What does
+not stand is the causal story: an intermittent failure ran through a bisect and came out looking
+deterministic, and the conclusion survived three runs of confirmation because it was never tested
+against the hypothesis it displaced. When a fix and a flake are the same shape, the fix has to be
+justified by reading the code, and the flake by a receipt that says which half went missing.

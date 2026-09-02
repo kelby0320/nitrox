@@ -1574,6 +1574,29 @@ fn taskbar_slot(list: &str, id: u32) -> Option<usize> {
         .position(|group| group.split_once(':').is_some_and(|(n, _)| n.trim() == id.to_string()))
 }
 
+/// Type `text` into the applications modal, one character at a time, waiting for each.
+///
+/// **A receipt per character, because injection is relative and unacknowledged.** The modal's
+/// filter had no line of its own until M12 Part A — the shell's source said the receipt was
+/// "limited to renaming so the launcher's typing stays quiet" — so a burst of six keys followed
+/// immediately by a click on a row was six chances to lose a keystroke and no way to tell.
+/// The list would then be showing something else, the click would land on nothing, and the gate
+/// would fail three steps later at whatever depended on the launch. It did, intermittently, in
+/// CI and locally (PR #267).
+///
+/// The count is read and not asserted: what `/bin` holds is the image's business, and a gate
+/// that pinned the number of matches would fail the day a program is added. What is asserted is
+/// that the keystroke arrived at all.
+fn type_into_modal(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
+    for c in text.chars() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(qmp, &qcode)?;
+        session.expect("desktop-shell: applications modal listing ")?;
+    }
+    Ok(())
+}
+
 /// Middle-click at `(x, y)`, having first walked the pointer there and checked it arrived.
 ///
 /// **The position is verified with a left click before the middle one**, because the compositor
@@ -1911,11 +1934,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //    **`nxterm`, which is what makes the milestone visible**: a person types into the
     //    applications modal and a terminal opens. Part E launched a coreutil because the
     //    mechanism was the deliverable; Part F is the thing launched being worth looking at.
-    for c in "nxterm".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxterm")?;
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
@@ -2078,11 +2097,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: applications modal open")?;
     // Filtered to one row first, so the row being clicked is known without the gate having to
     // work out where `nxterm` sorts in the contents of `/bin`.
-    for c in "nxterm".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxterm")?;
     // **The modal hangs from the button now**, at (0, `BAR_H`), rather than covering the bar it
     // drops from — so the first row sits a field's height below the bar. `click_at` asserts the
     // press position before anything downstream is checked, which is what separates "the pointer
@@ -2769,11 +2784,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
-    for c in "nxfiles".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxfiles")?;
     press(&mut qmp, "ret")?;
     session.expect("desktop-shell: launched nxfiles into its own namespace")?;
     // **The theme reached the application** (M11 Part C): a value that travelled from a file on
@@ -2996,11 +3007,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.skip_to_end()?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications modal open")?;
-    for c in "nxedit".chars() {
-        let mut qcode = String::new();
-        qcode.push(c);
-        press(&mut qmp, &qcode)?;
-    }
+    type_into_modal(&mut qmp, &mut session, "nxedit")?;
     // **Enter, not a click on the row.** Clicking a row is proved above, where the terminal every
     // later step depends on is launched that way; what this step is about is what happens *after*
     // a launch that carries no file, so it takes the shortest route to one.
@@ -3025,11 +3032,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     qmp.send_key("ctrl", true)?;
     press(&mut qmp, "s")?;
     qmp.send_key("ctrl", false)?;
-    // Then the name, one key at a time — the same discipline every typed sequence here uses.
-    for c in "scratch".chars() {
+    // Then the name, one key at a time — and **waiting for each**, which the comment here
+    // claimed and the code did not do (M12 Part A). `nxedit` had no receipt for this field:
+    // naming a buffer is not editing it, so `buffer rev` never moves, and seven unacknowledged
+    // keystrokes were seven chances to end up asserting against a file called `scrath`.
+    for (i, c) in "scratch".chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
         press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxedit: name so far {} chars", i + 1))?;
     }
     press(&mut qmp, "ret")?;
     // **`/home`, which *is* the user's subtree from inside the session.** A session namespace

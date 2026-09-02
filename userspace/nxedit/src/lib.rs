@@ -594,6 +594,17 @@ impl App {
         self.confirming
     }
 
+    /// How many characters have been typed into the name field, or `None` when it is not open.
+    ///
+    /// **The receipt for the one thing typed here that is not the buffer.** `revision` covers
+    /// edits; naming an untitled buffer changes nothing the revision counter can see, and a
+    /// gate driving a release image has no rendered field to read — so seven injected
+    /// keystrokes were seven chances to lose one and discover it as a file called `scrath`.
+    /// A count rather than the text, for the reason `revision` is a count.
+    pub fn naming_len(&self) -> Option<usize> {
+        self.naming.as_ref().map(|f| f.text().chars().count())
+    }
+
     /// Whether a `StartMove` is owed **on the dialog's window**. Clears the record.
     pub fn take_confirm_move(&mut self) -> bool {
         core::mem::take(&mut self.confirm_move_requested)

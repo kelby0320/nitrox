@@ -3734,15 +3734,23 @@ The two taken before this pass — the clipboard's owner and the image format �
       review, finding 2). The claim that a padding change fails beside the change rather than
       after a three-minute boot is true now, and was not.
 
-- [x] **One bug found on the way, and it was not in any of this** ✅. Removing the close timer
-      made `check-login`'s launcher-row click fail reproducibly, and the timer turned out to have
-      been holding up something else entirely: `desktop-shell` blocks in `sys_wait`, and input
-      that `libsurface` parked inside the transport while a *session* request awaited its reply
-      is not in a kernel queue and cannot wake it. The `sent_request` belt covers manager
-      requests only. Every such event used to be rescued by whatever wake came next, and after a
-      taskbar close that was always within two seconds. The shell now pumps before it waits and
-      does not block while anything is queued — a press that lands while a window is committing
-      a frame is no longer at the mercy of the next unrelated wake.
+- [x] **Two bugs found on the way, and neither was in any of this** ✅.
+
+      **The parked-event gap**, which is real by inspection: `desktop-shell` blocks in
+      `sys_wait`, and input that `libsurface` parked inside the transport while a *session*
+      request awaited its reply is not in a kernel queue and cannot wake it. The `sent_request`
+      belt covers manager requests only. The shell pumps before it waits now and does not block
+      while anything is queued.
+
+      **And the launcher-row flake, which was blamed on it and was not it.** Removing the close
+      timer coincided with `check-login`'s row click failing; a clean worktree passed and the
+      branch failed twice, which looked like a bisect over an intermittent step and is not one.
+      It failed again in CI after the pump fix. The cause was the thing this shell's own source
+      names for its *other* typing path — an unacknowledged burst of injected keys — with the
+      receipt deliberately withheld from the launcher "so the launcher's typing stays quiet".
+      The filter reports a count per character now, the gate waits for one per key, and
+      `nxedit`'s name field got the same, its gate comment having claimed a discipline it did
+      not follow.
 
 ### Part B — the browser: file operations, and drag-and-drop within a window
 
