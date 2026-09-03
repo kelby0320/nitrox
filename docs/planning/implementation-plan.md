@@ -174,7 +174,11 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     wallpaper is a `Role::Panel` with a zero reservation, which is bottom-most, unfocusable and
     claims no work area without any protocol change. **M12 is complete.** **M13 — the compositor's feel**: the shadow buffer first (with a
     measurement in front of it), then alpha, then the drop shadows and translucency that both
-    wait on it. The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
+    wait on it. **Part A is done** (2026-09-03): the measurement it opened with disproved its own
+    rationale twice — the aperture is not uncached, and the background fill was not where a frame's
+    time went — and the second wrong answer led to the one that was, a row-wise `memcpy` in
+    `blit_clipped` where the two formats match. Composing off-screen now *also* runs 3.7× faster
+    than painting the aperture did, by a mechanism the plan never named. The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
     without it would enlarge the flicker they sit on. **The control panel is trigger-gated**
     rather than scheduled: when settings outgrow a hand-edited file. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on

@@ -4282,14 +4282,64 @@ one diagnosis that explained both.
 
 **The work is ordered, and the order is the point.**
 
-- **Part A — the shadow buffer.** Compose into RAM and copy the finished damage rectangle to the
+- [x] **Part A — the shadow buffer.** ✅ 2026-09-03. Compose into RAM and copy the finished damage rectangle to the
   aperture in one pass. Today `libdraw::compose::compose` fills each damage rectangle with the
   background and *then* blits the surfaces back, directly into the framebuffer being scanned out —
   so every motion of a drag paints the union of the old and new rectangles background-first and
   the scanout catches it. That is the flicker reported on 2026-09-01, and probably also
-  "moving a window is slow" from 2026-08-28. **A measurement comes first**: the claim that this is
-  also *faster* — the per-pixel work moving off MMIO into cached RAM — is plausible and unproven,
-  and a milestone that opens by proving it is worth more than one that assumes it.
+  "moving a window is slow" from 2026-08-28.
+
+  **The measurement came first, and it killed the stated mechanism** (2026-09-03,
+  `cargo xtask bench-compose`). The claim that a shadow buffer is *also faster* — "the per-pixel
+  work moving off MMIO into cached RAM" — does not describe this system: nothing maps the aperture
+  uncached, and writing a row to it takes the same time as writing one to an anonymous mapping
+  (100% of it, under **both** accelerators). So the shadow buffer costs a copy and buys no memory
+  win: **118% of in-place under TCG, 123% under KVM**, and the delta is within measurement error
+  of exactly one copy of the damage area.
+
+  **The measurement then found the optimisation that was actually there**, in two steps, and it
+  restores the "also faster" claim by a route the plan never named. `compose` fills every damage
+  rectangle and *then* blits over it, so a drag writes most pixels twice — which is also why the
+  flicker exists at all: the fill is the flash. `compose_exposed` fills only what no opaque
+  surface covers, and **removing half the writes bought 6%** — which says the writes were never
+  the cost. They were in `blit_clipped`, per pixel: two `offset_of`s, six bounds checks, an unpack
+  to `Rgb` and a repack, against a `fill_rect` that computes one offset per row. A surface and the
+  framebuffer always share a format, and then a row is a `memcpy`. With that fast path, at the
+  same 470,400-pixel damage:
+
+  | arm | KVM before | KVM after | TCG before | TCG after |
+  | --- | --- | --- | --- | --- |
+  | in place (ships today) | 4.54 ms | **0.90 ms** | 43.6 ms | **7.0 ms** |
+  | shadow | 5.16 ms | 1.52 ms | 46.9 ms | 10.8 ms |
+  | exposed | 4.26 ms | 0.62 ms | 40.4 ms | 3.8 ms |
+  | exposed + shadow | 4.89 ms | **1.24 ms** | 43.7 ms | **7.6 ms** |
+
+  **So Part A ships both**, and lands at 1.24 ms against the 4.54 ms in place today — **3.7×
+  faster than what ships**, 5.7× under TCG — rather than the 14% penalty the first measurement
+  priced. The flicker fix is still justified by the flicker alone, which is the half no number
+  could ever have shown; it simply no longer has to be paid for.
+
+  **Built as `compositor::Screen`**, which owns the shadow and the aperture and is the only way to
+  reach the latter: `WindowStack::present_into` became `pub(crate)`, so the binary cannot paint the
+  display directly even by accident. That is the same guard the crate already puts around the
+  cursor, for the same reason — three of four paths had forgotten to redraw it — and it is what
+  keeps "every write goes through the shadow" a property rather than a convention. The buffer is
+  4.1 MB at 1280x800 and allocated with `try_reserve`: if it will not fit, `Screen` composes
+  straight to the display and says so on the console, because a compositor that aborts over a
+  *visual* defect has made things worse.
+
+  **Review found a hole in it** (PR #274): `subtract_from` guarded its capacity two ways that
+  disagreed, and could drop a rectangle instead of keeping it uncut — background nothing fills and
+  no surface covers. Masked in the default desktop by the wallpaper being a full-screen window,
+  exposed in every configuration that has no wallpaper. Fixed by making the subtraction
+  all-or-nothing, and pinned by a property test at every capacity rather than at 16. See the
+  decision log.
+
+  **What the tests do and do not establish.** The picture is pinned by an equivalence between the
+  buffered and unbuffered paths, and the copy's bound by a byte count — a deliberate mutation that
+  copied the whole shadow every frame drew the identical screen and was caught only by the count.
+  The ordering property itself has no automated test and is not claimed to: it is about what a
+  scanout can observe between two writes, and it was confirmed by a person looking at a drag.
 - **Part B — alpha.** `libdraw` says in as many words that there is no alpha channel and this is
   not the beginning of one; changing that is a substrate decision, not a batch. **It comes after
   Part A because Part A makes it cheap**: once compositing goes through RAM, blending is a small

@@ -225,6 +225,20 @@ impl MemFramebuffer {
         Self { geometry, bytes: vec![0u8; geometry.byte_len()] }
     }
 
+    /// A zeroed buffer of the given geometry, or `None` if it will not fit.
+    ///
+    /// **`new` is right for a test and wrong for a screen.** `vec![0; n]` aborts the process when
+    /// the allocation fails, which is tolerable for a 64x48 fixture and is not for a full display
+    /// — a 1280x800 shadow buffer is 4 MB, asked for on a machine with 256 MB, and a compositor
+    /// that dies there takes the session with it. The caller that can carry on without the buffer
+    /// should be able to find out that it has to.
+    pub fn try_new(geometry: Geometry) -> Option<Self> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(geometry.byte_len()).ok()?;
+        bytes.resize(geometry.byte_len(), 0);
+        Some(Self { geometry, bytes })
+    }
+
     /// A buffer of the given geometry, filled with `colour`.
     pub fn filled(geometry: Geometry, colour: Rgb) -> Self {
         let mut fb = Self::new(geometry);

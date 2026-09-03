@@ -29,9 +29,9 @@ pub mod server;
 
 use alloc::vec::Vec;
 
-use libdraw::compose::{SurfaceRef, compose};
+use libdraw::compose::{SurfaceRef, compose_exposed};
 use libdraw::format::{PixelFormat, Rgb};
-use libdraw::framebuffer::{Framebuffer, Geometry};
+use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
 use libdraw::theme::Theme;
 use librsproto::surface::{
@@ -1241,7 +1241,11 @@ impl WindowStack {
             }
             surfaces.push(SurfaceRef::new(b.geometry, w.origin, px));
         }
-        compose(fb, background, &surfaces, damage);
+        // **`compose_exposed`, not `compose`.** Every surface above has just been length-checked,
+        // so each one genuinely covers what it claims and the background under it is background
+        // nobody can see. Filling it anyway is the double-write that M13 Part A measured — and,
+        // on the way to the display, the flash the shadow buffer exists to hide.
+        compose_exposed(fb, background, &surfaces, damage);
     }
 
     /// Put `damage` on the screen: composite the stack, then draw the pointer over it.
@@ -1256,7 +1260,7 @@ impl WindowStack {
     /// **The cursor goes on last.** A cursor under a window is not a cursor, and compositing
     /// it into the stack would make it a window — with a position in the stacking order, a
     /// client that could cover it, and hit-testing that would have to skip it.
-    pub fn present_into<F, S>(
+    pub(crate) fn present_into<F, S>(
         &self,
         fb: &mut F,
         background: Rgb,
@@ -1278,6 +1282,144 @@ impl WindowStack {
             draw_cursor(fb, pointer, *r);
         }
     }
+}
+
+/// The display, and the buffer every frame is built in before it reaches it.
+///
+/// **The flicker, stated exactly.** [`compose_into`](WindowStack::compose_into) repaints a damage
+/// rectangle by painting background and then drawing over it. Done straight into the aperture, the
+/// scanout is free to read the region in between, and on a window drag — where the damage is the
+/// union of where the window was and where it now is — what it reads is the desktop background
+/// across the whole union. That is a flash of background under a moving window, reported
+/// 2026-09-01. Nothing about it is a race in the compositor: every frame it produces is correct,
+/// and the defect is that an *incomplete* one is visible.
+///
+/// So the fix is not a faster frame, it is an ordering property: **the display never holds a
+/// partly-composed frame**. A frame is built somewhere nobody is scanning out, and reaches the
+/// display as a copy — after which every intermediate state has already happened somewhere
+/// invisible. No amount of making the compose quicker substitutes for that, which is why M13
+/// Part A's measurement was framed as pricing it rather than justifying it.
+///
+/// **The display is private and there is no accessor**, for the reason
+/// [`present_into`](WindowStack::present_into) is `pub(crate)`: the shadow is only a mirror of the
+/// screen for as long as *every* write goes through it. One path that painted the aperture
+/// directly would leave the two disagreeing about a region, and the symptom would be stale pixels
+/// that persist until something else damages them — a bug that looks nothing like its cause. The
+/// crate has made this mistake once already with the cursor, where three of four paths forgot it;
+/// that comment is a few lines up and this is the same shape.
+pub struct Screen<F: Framebuffer> {
+    /// Where frames are composed. `None` when the buffer would not fit — see [`Screen::new`].
+    shadow: Option<MemFramebuffer>,
+    display: F,
+}
+
+impl<F: Framebuffer> Screen<F> {
+    /// Wrap `display`, allocating a shadow buffer the same shape.
+    ///
+    /// **Degrades rather than dies.** A full-screen buffer is megabytes (4.1 MB at 1280x800) and
+    /// the allocation can fail; a compositor that aborted there would take the graphical session
+    /// with it, to avoid a *visual* defect. Without the buffer this composes straight into the
+    /// display, which is exactly what shipped before this change: the flicker comes back and
+    /// everything else works. [`Screen::is_buffered`] reports which happened so the caller can say
+    /// so on the console rather than leaving it to be discovered by looking at the screen.
+    pub fn new(display: F) -> Self {
+        let shadow = MemFramebuffer::try_new(display.geometry());
+        Self { shadow, display }
+    }
+
+    /// A screen with no shadow buffer — the path [`Screen::new`] falls back to when the
+    /// allocation fails.
+    ///
+    /// Test-only because nothing else should choose it, and it exists at all because the
+    /// fallback is otherwise reachable only by exhausting memory. An untested fallback for an
+    /// out-of-memory condition is the one you find out about during an out-of-memory condition.
+    #[cfg(test)]
+    pub(crate) fn unbuffered(display: F) -> Self {
+        Self { shadow: None, display }
+    }
+
+    /// The composed pixels, for a test that needs to look at the display it wrapped.
+    #[cfg(test)]
+    pub(crate) fn display(&self) -> &F {
+        &self.display
+    }
+
+    /// Whether frames are being composed off-screen — false if the shadow buffer would not fit.
+    pub fn is_buffered(&self) -> bool {
+        self.shadow.is_some()
+    }
+
+    /// The display's shape.
+    pub fn geometry(&self) -> Geometry {
+        self.display.geometry()
+    }
+
+    /// Compose `stack` into the shadow, draw the pointer over it, and copy `damage` to the display.
+    ///
+    /// The one way a screen region is updated.
+    pub fn present<S>(
+        &mut self,
+        stack: &WindowStack,
+        background: Rgb,
+        source: &S,
+        damage: &[Rect],
+        pointer: Point,
+        outline: Option<Rect>,
+    ) where
+        S: BufferSource + ?Sized,
+    {
+        let Some(shadow) = self.shadow.as_mut() else {
+            stack.present_into(&mut self.display, background, source, damage, pointer, outline);
+            return;
+        };
+        stack.present_into(shadow, background, source, damage, pointer, outline);
+        let _ = copy_damage(&mut self.display, shadow, damage);
+    }
+}
+
+/// Copy each damage rectangle from `shadow` to `display`, row by row. Returns the bytes copied.
+///
+/// The two share a geometry — the shadow is built from the display's — so a row is the same byte
+/// range in both and no offset needs recomputing between them. Rectangles are clipped to the
+/// screen; overlapping ones are copied twice, which is wasteful in the same way and to the same
+/// degree that compositing them twice is.
+///
+/// **The count is returned for a test, and it is the only way to check the bound.** A copy that
+/// ignored damage and pushed the whole shadow every frame would draw *exactly the same picture* —
+/// the shadow is a faithful mirror, so copying more of it is invisible in the output and shows up
+/// only as a full-screen blit behind every one-pixel drag. There is nothing to assert on a screen;
+/// the work done has to be measured directly.
+#[must_use]
+fn copy_damage<F: Framebuffer + ?Sized>(
+    display: &mut F,
+    shadow: &MemFramebuffer,
+    damage: &[Rect],
+) -> usize {
+    let g = display.geometry();
+    let bounds = g.bounds();
+    let mut copied = 0;
+    for area in damage {
+        let Some(area) = area.intersect(&bounds) else { continue };
+        let width = area.size.w as usize * g.format.bytes_per_pixel();
+        for row in 0..area.size.h {
+            let y = area.origin.y as u32 + row;
+            let Some(off) = g.offset_of(area.origin.x as u32, y) else { continue };
+            let (src, dst) = (shadow.bytes(), display.bytes_mut());
+            // **Unreachable, and deliberately not the thing keeping this correct.** `area` is
+            // already clipped to the screen, so `off + width` cannot pass the end of a row, and
+            // the shadow was built from this geometry so both buffers are the same length. The
+            // check is here because reading past either would be worse than skipping — but a
+            // skip *is* a row of stale pixels, so it must never become the mechanism that bounds
+            // the copy. That is exactly how `subtract_from` grew a hole (PR #274 review): one
+            // invariant, two guards, and the quiet one won.
+            if off + width > src.len() || off + width > dst.len() {
+                continue;
+            }
+            dst[off..off + width].copy_from_slice(&src[off..off + width]);
+            copied += width;
+        }
+    }
+    copied
 }
 
 #[cfg(test)]
@@ -2149,6 +2291,120 @@ mod tests {
         let mut n = WindowStack::new();
         let req = CreateWindowRequest::new(1, 1, Role::Normal);
         assert_eq!(d.create(&req).unwrap(), n.create(&req).unwrap());
+    }
+
+    // ---- Screen: the shadow buffer (M13 Part A) ----
+
+    /// A stack with one window committed, striped so which source row landed where is readable
+    /// off the screen. Shared by the `Screen` tests below.
+    fn one_window(s: &mut WindowStack, src: &mut MapSource, w: u32, h: u32) -> u32 {
+        let id = shown(s, &CreateWindowRequest::new(w, h, Role::Normal));
+        s.attach(&attach(id, 0, w, h)).unwrap();
+        s.commit(&commit(id, 0)).unwrap();
+        src.put_striped(id, 0, Geometry::packed(w, h, PixelFormat::XRGB8888));
+        id
+    }
+
+    #[test]
+    fn composing_through_the_shadow_draws_what_composing_directly_draws() {
+        // **The equivalence the whole change rests on.** Everything else about `Screen` is a
+        // claim about *when* pixels appear; this is the claim that the same ones do.
+        let mut stack = WindowStack::new();
+        let mut src = MapSource::default();
+        one_window(&mut stack, &mut src, 8, 6);
+
+        let bg = Rgb::new(9, 9, 9);
+        let full = screen().geometry().bounds();
+        let pointer = Point::new(3, 2);
+
+        let mut buffered = Screen::new(screen());
+        assert!(buffered.is_buffered(), "a 32x16 shadow should fit");
+        buffered.present(&stack, bg, &src, &[full], pointer, None);
+
+        let mut direct = Screen::unbuffered(screen());
+        direct.present(&stack, bg, &src, &[full], pointer, None);
+
+        assert_eq!(buffered.display().bytes(), direct.display().bytes());
+        // Negative control: if neither drew anything, the line above compares two blank screens.
+        assert_ne!(buffered.display().bytes(), screen().bytes(), "nothing was drawn");
+    }
+
+    #[test]
+    fn only_the_damage_is_copied_to_the_display() {
+        // **Asserted as a byte count, because the picture cannot tell.** A copy that ignored
+        // damage and pushed the whole shadow would put the identical image on screen — the
+        // shadow mirrors the display faithfully — while turning every one-pixel drag back into a
+        // full-screen blit. This was written first as a pixel comparison and a deliberate
+        // copy-everything mutation passed it; see `copy_damage`'s doc.
+        let mut shadow = MemFramebuffer::new(screen().geometry());
+        shadow.clear(Rgb::new(7, 7, 7));
+        let mut display = screen();
+
+        let corner = Rect::new(0, 0, 4, 4);
+        assert_eq!(copy_damage(&mut display, &shadow, &[corner]), 4 * 4 * 4);
+        // …and the four rows that were copied are the right four.
+        assert_eq!(display.get_pixel(0, 0), Some(Rgb::new(7, 7, 7)));
+        assert_eq!(display.get_pixel(5, 0), Some(Rgb::new(0, 0, 0)));
+
+        // Clipped to the screen rather than refused, and counted as clipped.
+        let over = Rect::new(30, 14, 40, 40);
+        assert_eq!(copy_damage(&mut display, &shadow, &[over]), 2 * 2 * 4);
+        // Entirely outside: nothing at all.
+        assert_eq!(copy_damage(&mut display, &shadow, &[Rect::new(90, 90, 4, 4)]), 0);
+    }
+
+    #[test]
+    fn a_later_small_frame_leaves_the_rest_of_the_display_alone() {
+        // **What this checks is placement, end to end**: a second, small-damage `present` puts the
+        // right pixels at the right coordinates on the real display. It fails if `copy_damage`
+        // mislocates a row — losing the last row of each rectangle was the mutation that proved
+        // it live.
+        //
+        // **It does not bound the work, and the comment here used to say it did** (PR #274
+        // review). Two mutations pass it: recomposing the whole screen into the shadow while
+        // copying only the damage, and copying the whole shadow every frame. Both draw this exact
+        // picture, because the shadow is a faithful mirror — which is the same reason
+        // `only_the_damage_is_copied_to_the_display` had to become a byte count. The recompose
+        // side is bounded by `libdraw`'s `damage_bounds_what_is_repainted`, not by anything here.
+        //
+        // **Nor is it a test that the shadow's contents persist**, which this was first written
+        // as — a deliberate mutation clearing the shadow at the top of every present passed it. That mutation is not a bug either, which is the useful part: each
+        // damage rectangle is *fully* repainted (background where exposed, surfaces over it), so
+        // what the shadow held there beforehand never reaches the screen, and what it holds
+        // outside is never copied. The shadow is a staging buffer, not a cache, and there is no
+        // stale-content hazard to guard against.
+        let mut stack = WindowStack::new();
+        let mut src = MapSource::default();
+        one_window(&mut stack, &mut src, 8, 6);
+
+        let bg = Rgb::new(9, 9, 9);
+        let mut sc = Screen::new(screen());
+        let full = screen().geometry().bounds();
+        sc.present(&stack, bg, &src, &[full], Point::new(20, 12), None);
+        let after_full = sc.display().bytes().to_vec();
+
+        // A second frame damaging one corner, with nothing about the stack changed.
+        sc.present(&stack, bg, &src, &[Rect::new(0, 0, 2, 2)], Point::new(20, 12), None);
+        assert_eq!(sc.display().bytes(), &after_full[..], "the small frame disturbed the screen");
+        // Negative control: the full frame drew something, so the equality above is not two
+        // blank screens agreeing.
+        assert_ne!(after_full, screen().bytes(), "the first frame drew nothing");
+    }
+
+    #[test]
+    fn a_screen_with_no_shadow_still_paints() {
+        // The out-of-memory fallback is the old behaviour, not a broken one: the flicker returns
+        // and nothing else changes. A fallback that silently drew nothing would turn a memory
+        // shortage into a black screen.
+        let mut stack = WindowStack::new();
+        let mut src = MapSource::default();
+        one_window(&mut stack, &mut src, 8, 6);
+
+        let mut sc = Screen::unbuffered(screen());
+        assert!(!sc.is_buffered());
+        let full = screen().geometry().bounds();
+        sc.present(&stack, Rgb::new(9, 9, 9), &src, &[full], Point::new(20, 12), None);
+        assert_eq!(sc.display().get_pixel(0, 0), Some(row_colour(0)));
     }
 
     #[test]

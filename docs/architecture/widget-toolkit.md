@@ -610,7 +610,11 @@ new cursor rectangles on every move — both, because the cursor is *drawn over*
 stack rather than composited into it, so the pixels it covered are still on screen after it
 moves. That is also why `compose_into` is `pub(crate)` and `present_into` is the only way the
 server updates a region: three code paths recomposed without redrawing the pointer, and a click
-erased it until the mouse moved next. Per-client cursor shapes — a text I-beam over
+erased it until the mouse moved next. **M13 Part A applied the same guard one layer out**
+(2026-09-03): `present_into` is itself `pub(crate)` now, and the binary reaches the display only
+through `compositor::Screen`, which composes into a shadow buffer and copies the finished damage
+rectangles to the aperture. The reasoning is identical — the shadow mirrors the screen only while
+every write goes through it — and so is the enforcement. Per-client cursor shapes — a text I-beam over
 the grid, a resize arrow on an edge — are a protocol addition and are **not** in this
 milestone; a single arrow is what the terminal needs to be usable.
 

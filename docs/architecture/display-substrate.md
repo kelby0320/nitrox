@@ -2,7 +2,12 @@
 
 ## Status
 
-**Built, and checked 2026-08-30** — this document describes what exists. Every section below is
+**Built, and checked 2026-09-03** — this document describes what exists. One thing changed under
+it since: the compositor no longer paints the aperture as it composes. `compositor::Screen` builds
+each frame in a shadow buffer and copies the finished damage rectangles across, so the display
+never holds a partly-composed frame (M13 Part A). Nothing about §2–§4's ownership, protocol or
+buffer lifecycle moves — the aperture is still mapped once and written directly, just from one
+place instead of during compositing. Every section below is
 running code: the compositor owning the framebuffer and serving `/dev/draw` (§2, §3), surfaces and
 their buffer lifecycle (§4), window roles and struts (§4a), thumbnail capture (§4b), input from a
 PS/2 driver through `libinput` to a routed client (§5), global hotkeys (§5a), TrueType text (§6),

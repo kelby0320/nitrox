@@ -52,3 +52,10 @@ path = "src/inputclient.rs"
 [[bin]]
 name = "boot-probe"
 path = "src/bootprobe.rs"
+
+# The M13 Part A measurement: what composing a drag costs, and where. Its own binary because it
+# owns the screen for the length of a run — the bench image carries it *instead of* `boot-probe`,
+# and it fires the verdict itself.
+[[bin]]
+name = "compose-bench"
+path = "src/composebench.rs"

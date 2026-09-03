@@ -1413,6 +1413,20 @@ the file becomes cumbersome." Its scope and its gate are kept in
 — it belongs to no milestone and has no code to hang a marker on, which is the case that hatch was
 written for.
 
+**A cache attribute on a mapped device aperture — `TODO(framebuffer-cache-attr)`.** Userspace maps `/dev/framebuffer` **write-back cached**:
+`protection_to_page_flags` never sets `PageFlags::NO_CACHE`, and nothing carries a cache attribute
+from a `MemoryObject` to a user PTE — `NO_CACHE` is used only by `kvmap`, for kernel MMIO.
+
+Under QEMU this is harmless, and M13 Part A's benchmark measured it directly: writing a row to the
+aperture takes the same time as writing one to an anonymous mapping, under both accelerators. On
+real hardware it is a **correctness** problem rather than a performance one — a PCI framebuffer BAR
+wants write-combining or uncached, and a write-back mapping can leave writes sitting in cache or
+reorder them in ways a device does not expect.
+
+Fixing it needs a cache-attribute field on `MemoryObject`, a way for the namespace server to set
+it, and a PAT or MTRR story. **Trigger: the first boot on real hardware**, which is also the first
+time anybody could observe it.
+
 **An icon set — `TODO(icon-set)` <!-- check-deferrals: no-code-site -->.** The window controls are
 drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming
 convention, a size convention and a lookup path, which is a second decision after the one that

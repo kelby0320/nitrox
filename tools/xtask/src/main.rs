@@ -108,6 +108,14 @@ enum BuildMode {
     /// `no-ps2-irq`, which leaves the i8042's interrupt generation off so the tick-driven
     /// `ps2::poll` sweep is the only path from a keystroke to the guest.
     TestHarnessNoPs2Irq,
+    /// `bench-compose`: [`TestHarness`](Self::TestHarness) with `compose-bench` declared
+    /// **instead of** `boot-probe`.
+    ///
+    /// The substitution is the whole of the mode. A measurement needs the screen to itself —
+    /// another client drawing mid-frame is noise attributed to whichever arm was running — and
+    /// it needs to be the thing that ends the boot, because `boot-probe` fires the verdict and
+    /// a bench declared after it would never run.
+    Bench,
 }
 
 impl BuildMode {
@@ -120,7 +128,9 @@ impl BuildMode {
         match self {
             BuildMode::Normal => None,
             BuildMode::Selftest => Some("selftest"),
-            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq => Some("test-harness"),
+            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench => {
+                Some("test-harness")
+            }
         }
     }
 
@@ -134,7 +144,10 @@ impl BuildMode {
     /// gate asserts comes from `nxterm` — but it made "the same image" false at the point the
     /// comments claimed it.
     fn is_test_harness(self) -> bool {
-        matches!(self, BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq)
+        matches!(
+            self,
+            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench
+        )
     }
 
     /// The same, for the **kernel**, which has one feature userspace does not.
@@ -240,6 +253,7 @@ fn main() -> ExitCode {
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
+        Some("bench-compose") => cmd_bench_compose(accel),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
@@ -281,6 +295,7 @@ fn print_help() {
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
+           bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
            preview           render the toolkit here and write a PNG; `preview ui|term|all`\n  \
            shot              boot the release image and photograph the desktop;\n  \
            \x20                `shot all|greeter|desktop|apps|windows|overview`\n  \
@@ -402,6 +417,9 @@ const TEST_PROGRAMS: &[&str] = &[
     "ui-testclient",
     "input-testclient",
     "boot-probe",
+    // The M13 Part A measurement. In the same package as the rest: it is a test program, and a
+    // package per binary would claim an independence it does not have.
+    "compose-bench",
 ];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
@@ -1838,6 +1856,179 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
         dy -= sy;
     }
     Ok(())
+}
+
+/// `cargo xtask bench-compose` — what composing a drag costs, and where.
+///
+/// **Milestone 13 Part A opens with a measurement, and this runs it.** The plan's claim is that
+/// composing into RAM and copying the finished damage rectangle to the aperture is *also faster*
+/// than composing straight into the aperture, and records it as plausible and unproven. It is
+/// probably wrong as stated: this system maps the aperture **write-back cached**
+/// (`protection_to_page_flags` never sets `NO_CACHE`), so "the per-pixel work moving off MMIO
+/// into cached RAM" describes nothing here. E1 checks that by measurement rather than by reading
+/// page tables.
+///
+/// **A tool, not a gate**, like `shot` and `preview`. Timing under CI is noise and this tree has
+/// no precedent for a performance gate; what this produces is a *before* number to compare a
+/// later change against, and a distribution rather than a mean, because flicker is a tail
+/// phenomenon.
+///
+/// **Run it under both accelerators.** TCG models neither caches nor QEMU's dirty-tracking, so it
+/// measures instruction count — the shadow arm should be strictly slower there by about one copy,
+/// which is the *control*. KVM is where the real answer is, and if the two agree this is not
+/// measuring what it claims to.
+fn cmd_bench_compose(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::Bench)?;
+    let ovmf = locate_ovmf()?;
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let how = if matches!(accel, Accel::Kvm) { "KVM" } else { "TCG" };
+    println!("xtask: benchmarking compose under QEMU ({how})…\n");
+    let mut session = Session::spawn(cmd, "bench-compose")?;
+    // **A generous deadline, because this is deliberately slow work.** Four hundred composed
+    // frames under TCG is tens of seconds, and a run that timed out mid-distribution would report
+    // a percentile over a truncated tail — which reads as a result rather than as a failure.
+    let done = session
+        .expect_within("compose-bench: done", std::time::Duration::from_secs(300))?;
+    let transcript = session.finish();
+    let path = build_cache().join("guest-transcript-bench-compose.log");
+    let _ = fs::write(&path, &transcript);
+    if !done {
+        return Err(format!(
+            "the bench did not finish; transcript at {}",
+            path.display()
+        )
+        .into());
+    }
+    report_bench(&transcript)
+}
+
+/// Turn the guest's per-sample lines into the distributions the question is about.
+fn report_bench(transcript: &str) -> R<()> {
+    let mut aperture: Vec<u64> = Vec::new();
+    let mut anonymous: Vec<u64> = Vec::new();
+    let mut inplace: Vec<u64> = Vec::new();
+    let mut shadow: Vec<u64> = Vec::new();
+    let mut exposed: Vec<u64> = Vec::new();
+    let mut both: Vec<u64> = Vec::new();
+    let mut area: Vec<u64> = Vec::new();
+
+    for line in transcript.lines() {
+        let Some(rest) = line.split_once("compose-bench: ").map(|(_, r)| r) else { continue };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        match f.as_slice() {
+            ["e1", "aperture", n] => push_num(&mut aperture, n),
+            ["e1", "anonymous", n] => push_num(&mut anonymous, n),
+            ["e2", a, "inplace", w, "shadow", x, "exposed", y, "both", z] => {
+                push_num(&mut area, a);
+                push_num(&mut inplace, w);
+                push_num(&mut shadow, x);
+                push_num(&mut exposed, y);
+                push_num(&mut both, z);
+            }
+            _ => {}
+        }
+    }
+    if inplace.is_empty() {
+        return Err("no `compose-bench: e2` samples in the transcript".into());
+    }
+
+    println!("\n--- E1: is the aperture behaving like RAM? ---");
+    let (ap, an) = (median(&mut aperture), median(&mut anonymous));
+    println!("  one row, median ns:  aperture {ap}   anonymous {an}");
+    match (ap, an) {
+        (0, _) | (_, 0) => println!("  (no samples — E1 was skipped)"),
+        _ => {
+            let pct = (ap as f64 / an as f64) * 100.0;
+            println!("  aperture is {pct:.0}% of anonymous");
+            // **The interpretation is printed, because a bare ratio invites the reading the
+            // person already expected.** The plan's rationale needs the aperture to be *slower*;
+            // parity means it is ordinary cached memory and that rationale describes nothing.
+            if pct < 150.0 {
+                println!(
+                    "  → the aperture is behaving as cached RAM. \"off MMIO into cached RAM\"\n\
+                     \x20   is not a mechanism on this system; any win must come from elsewhere."
+                );
+            } else {
+                println!(
+                    "  → the aperture is materially slower than RAM, so the plan's stated\n\
+                     \x20   mechanism is live after all. Worth re-reading the page-table path."
+                );
+            }
+        }
+    }
+
+    println!("\n--- E2: in place vs shadow, one-pixel window drag ---");
+    println!("  {} frames per arm, median damage {} px", inplace.len(), median(&mut area));
+    let base = percentile(&mut inplace.clone(), 50);
+    for (name, v) in [
+        ("in place        ", &mut inplace),
+        ("shadow          ", &mut shadow),
+        ("exposed         ", &mut exposed),
+        ("exposed + shadow", &mut both),
+    ] {
+        if v.is_empty() {
+            continue;
+        }
+        let (p50, p90, p99) = (percentile(v, 50), percentile(v, 90), percentile(v, 99));
+        let rel = if base > 0 { pct_of(p50, base) } else { String::from("    -") };
+        println!("  {name}  p50 {p50:>9}  p90 {p90:>9}  p99 {p99:>9} ns   {rel} of in place");
+    }
+    println!(
+        "\n  **The flicker fix is an ordering property** — no background-only frame is ever on\n\
+         \x20 screen — and no number here can show it. What these decide is what it costs, and\n\
+         \x20 whether skipping the background fill pays for it."
+    );
+    Ok(())
+}
+
+/// `v` as a percentage of `base`, right-aligned for a column.
+fn pct_of(v: u64, base: u64) -> String {
+    format!("{:>4.0}%", (v as f64 / base as f64) * 100.0)
+}
+
+/// Parse one decimal sample, ignoring a line that does not carry one.
+fn push_num(into: &mut Vec<u64>, s: &str) {
+    if let Ok(n) = s.parse::<u64>() {
+        into.push(n);
+    }
+}
+
+/// The median, or 0 for no samples.
+fn median(v: &mut Vec<u64>) -> u64 {
+    percentile(v, 50)
+}
+
+/// The `p`th percentile by nearest rank, or 0 for no samples.
+///
+/// **Nearest rank rather than interpolation**, because these are timings and an interpolated
+/// value is a number no frame took.
+fn percentile(v: &mut [u64], p: usize) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    let idx = (v.len() * p).div_ceil(100).saturating_sub(1).min(v.len() - 1);
+    v[idx]
 }
 
 /// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right
@@ -8810,6 +9001,27 @@ after = [\"test-harness\"]\n\
 [service.boot-probe.restart]\n\
 policy = \"never\"\n";
 
+/// The `compose-bench` declaration, replacing [`BOOT_PROBE_TOML`] in a [`Bench`] image.
+///
+/// **`after` every display client in the image**, which is the point: `display-selftest`,
+/// `nxterm` and the two test clients all draw at startup, and a frame timed while one of them is
+/// compositing is noise attributed to whichever arm happened to be running. Ordering is the only
+/// tool available — there is no "the screen is quiet now" signal — so the bench goes last and
+/// ends the boot itself.
+///
+/// [`Bench`]: BuildMode::Bench
+const BENCH_TOML: &str = "\
+\n\
+# The M13 Part A measurement. Declared **instead of** `boot-probe` (see `BOOT_PROBE_TOML`): it owns\n\
+# the screen for the length of a run and fires the boot verdict itself.\n\
+[service.compose-bench]\n\
+executable = \"/bin/compose-bench\"\n\
+description = \"What composing a drag costs, and where (M13 Part A)\"\n\
+after = [\"test-harness\"]\n\
+\n\
+[service.compose-bench.restart]\n\
+policy = \"never\"\n";
+
 /// Build path for the packed initramfs CPIO archive.
 fn initramfs_path() -> PathBuf {
     build_cache().join("initramfs.cpio")
@@ -8945,6 +9157,13 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     let mut services = String::from(SERVICES_TOML);
     if mode.features().is_some() {
         services.push_str(BOOT_PROBE_TOML);
+    }
+    // **`compose-bench` instead of `boot-probe`, not beside it.** `boot-probe` fires the boot
+    // verdict, so anything declared after it never runs; and a measurement wants the screen to
+    // itself, which is why this mode exists at all rather than the bench being one more service
+    // in the harness image.
+    if matches!(mode, BuildMode::Bench) {
+        services = services.replace(BOOT_PROBE_TOML, BENCH_TOML);
     }
     cpio_entry(&mut buf, 2, "etc/services.toml", services.as_bytes());
     // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and

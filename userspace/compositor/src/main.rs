@@ -32,13 +32,14 @@
 
 extern crate alloc;
 
+use compositor::Screen;
 use compositor::input::InputRouter;
 use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
 use compositor::manager::{self, MgrOutcome};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
 use libdraw::format::Rgb;
-use libdraw::framebuffer::{Framebuffer, RawFramebuffer};
+use libdraw::framebuffer::RawFramebuffer;
 use libdraw::geom::{Point, Rect};
 use libinput::Interpreter;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
@@ -558,12 +559,12 @@ fn log_route(rec: &Outbound) {
 /// stack rather than being in it. `StartResize` has its own copy of this loop because
 /// `start_resize` hands back the rectangle rather than the change — the two shapes are worth
 /// merging the next time a third gesture draws one, and are not worth a signature change now.
-fn apply_outline(srv: &mut Server, fb: &mut RawFramebuffer, outline: Option<compositor::input::Outline>) {
+fn apply_outline(srv: &mut Server, screen: &mut Screen<RawFramebuffer>, outline: Option<compositor::input::Outline>) {
     let Some(o) = outline else { return };
     srv.outline = o.now;
     for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
         if !r.is_empty() {
-            repaint_region(srv, fb, r);
+            repaint_region(srv, screen, r);
         }
     }
 }
@@ -777,7 +778,7 @@ fn drain_stack_events(srv: &mut Server) {
 /// client waits forever in `Window::new`. The geometry is read from the stack at this moment
 /// rather than from what was stashed at creation, so a manager that placed the window first
 /// releases it *at the placed origin* — which is the entire point of holding it.
-fn release_configure(srv: &mut Server, fb: &mut RawFramebuffer, window: u32) -> bool {
+fn release_configure(srv: &mut Server, screen: &mut Screen<RawFramebuffer>, window: u32) -> bool {
     let Some(i) = srv.pending_configure.iter().position(|&(w, _)| w == window) else {
         return false;
     };
@@ -800,7 +801,7 @@ fn release_configure(srv: &mut Server, fb: &mut RawFramebuffer, window: u32) -> 
     //
     // The window's own rectangle, not the whole screen: nothing else changed, and the ordinary
     // release runs on every window creation while a manager is attached.
-    repaint_region(srv, fb, bounds);
+    repaint_region(srv, screen, bounds);
     announce_focus(srv);
     sent
 }
@@ -811,7 +812,7 @@ fn release_configure(srv: &mut Server, fb: &mut RawFramebuffer, window: u32) -> 
 /// wedged, slow to start, or simply not interested must cost a launch some latency, never a
 /// window — a client blocked forever in `Window::new` is the failure this deadline exists to
 /// rule out.
-fn fire_configure_deadlines(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+fn fire_configure_deadlines(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // Free when nothing is held, which is the overwhelming majority of iterations — and it has
     // to be free, because this runs every time round the serve loop rather than only on a
     // timeout. Reading the clock unconditionally would put a syscall in the hot path.
@@ -830,7 +831,7 @@ fn fire_configure_deadlines(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         let mut l = Line::new();
         l.s(b"compositor: no manager answer for window ").u(window as u64).s(b"; showing it");
         l.end();
-        release_configure(srv, fb, window);
+        release_configure(srv, screen, window);
     }
     fired
 }
@@ -1088,7 +1089,7 @@ const INPUT_DRAIN_MAX: usize = 128;
 /// ceiling piled up in a queue the input server had to give up on (2026-08-26). Coalescing costs
 /// nothing visually: the cursor is drawn at one place at a time, so painting the intermediate
 /// positions of a movement already finished is work whose result is immediately overwritten.
-fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     let mut out = alloc::vec::Vec::new();
     // The regions a restack disturbed this pass, plus the cursor's old and new positions. The
     // cursor's *old* position is where it was last painted, which is where this pass starts —
@@ -1138,7 +1139,7 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         damage.push(compositor::cursor_rect(cursor_now));
     }
     if !damage.is_empty() {
-        srv.stack.present_into(fb, BACKGROUND, srv, &damage, cursor_now, srv.outline);
+        screen.present(&srv.stack, BACKGROUND, srv, &damage, cursor_now, srv.outline);
     }
     alive
 }
@@ -1623,7 +1624,7 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
 }
 
 /// Handle one request on the manager channel. Returns `false` if the manager is gone.
-fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // SAFETY: reading our own manager slot and valid recv out-params.
     let ch = unsafe { MANAGER_CH };
     let rr = unsafe {
@@ -1747,14 +1748,14 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             // `None` is a request that named no window — `SetCurrentDesktop` — so there is
             // no held configure to release.
             if let Some(window) = window {
-                release_configure(srv, fb, window);
+                release_configure(srv, screen, window);
             }
             match dirty {
                 // Nothing on screen changed — placing a window that has not committed, which
                 // is the manager's ordinary case during the handshake.
                 Some(r) if r.size.w == 0 || r.size.h == 0 => {}
-                Some(r) => repaint_region(srv, fb, r),
-                None => repaint(srv, fb),
+                Some(r) => repaint_region(srv, screen, r),
+                None => repaint(srv, screen),
             }
             // **Focus may have moved.** A restack changes who is topmost-focusable, and the
             // clients on either side of that have to be told — the same announcement
@@ -1776,7 +1777,7 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                         for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges)
                         {
                             if !r.is_empty() {
-                                repaint_region(srv, fb, r);
+                                repaint_region(srv, screen, r);
                             }
                         }
                     }
@@ -1875,13 +1876,13 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             drain_stack_events(srv);
             if configure_window(srv, window, width, height, origin) {
                 if let Some(r) = moved.filter(|r| !r.is_empty()) {
-                    repaint_region(srv, fb, r);
+                    repaint_region(srv, screen, r);
                 }
                 if became_visible || was_held {
                     // Newly drawable, and newly a focus candidate — see `release_configure`.
                     let r = srv.stack.window(window).map(|w| w.bounds());
                     if let Some(r) = r {
-                        repaint_region(srv, fb, r);
+                        repaint_region(srv, screen, r);
                     }
                     announce_focus(srv);
                 }
@@ -1938,7 +1939,7 @@ fn open_manager(serve_end: u64, request_id: u64) -> bool {
 /// while the departed manager was watching; handing that backlog to whoever attaches next
 /// would tell a fresh manager about creations it never saw and, after enough churn, about
 /// windows that no longer exist — with no resync op to repair the picture.
-fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
+fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     srv.mgr_outbox.clear();
     // **The chord table goes with it**, for the reason the queued events do: it is routing
     // policy the departed manager asked for. Left behind, every registered chord keeps being
@@ -1957,7 +1958,7 @@ fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
         srv.outline = o.now;
         for r in o.was.into_iter().flat_map(compositor::outline_edges) {
             if !r.is_empty() {
-                repaint_region(srv, fb, r);
+                repaint_region(srv, screen, r);
             }
         }
     }
@@ -1966,7 +1967,7 @@ fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
     // demonstrably gone is latency bought for nothing.
     let waiting: alloc::vec::Vec<u32> = srv.pending_configure.iter().map(|&(w, _)| w).collect();
     for window in waiting {
-        release_configure(srv, fb, window);
+        release_configure(srv, screen, window);
     }
     // SAFETY: closing our own endpoint and clearing the slot.
     unsafe {
@@ -2051,9 +2052,9 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
 /// damage-bounded repaint was an optimisation the compositor did not yet exploit, "and this
 /// milestone has one client"; with an 812×480 terminal in the stack, recompositing 1280×800 on
 /// every request cost a permanently busy CPU. See the decision log, 2026-08-12.
-fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
-    let bounds = fb.geometry().bounds();
-    repaint_region(srv, fb, bounds);
+fn repaint(srv: &Server, screen: &mut Screen<RawFramebuffer>) {
+    let bounds = screen.geometry().bounds();
+    repaint_region(srv, screen, bounds);
 }
 
 /// Recompose `region` and draw the cursor over it.
@@ -2061,8 +2062,8 @@ fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
 /// **The cursor goes on last.** A cursor under a window is not a cursor, and compositing it
 /// into the stack would make it a window — with a position in the stacking order, a client
 /// that could cover it, and hit-testing that would have to skip it.
-fn repaint_region(srv: &Server, fb: &mut RawFramebuffer, region: Rect) {
-    srv.stack.present_into(fb, BACKGROUND, srv, &[region], srv.router.pointer(), srv.outline);
+fn repaint_region(srv: &Server, screen: &mut Screen<RawFramebuffer>, region: Rect) {
+    screen.present(&srv.stack, BACKGROUND, srv, &[region], srv.router.pointer(), srv.outline);
 }
 
 /// The wire error a rejected request reports.
@@ -2154,7 +2155,7 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
 }
 
 /// Serve one request on session `slot`. Returns `false` if the session should close.
-fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     let ch = unsafe { SESSION_CH[slot] };
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -2236,7 +2237,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                     // drawn where it used to be until something unrelated repainted
                     // (PR #248 review, finding 3).
                     if let Some(r) = damage.filter(|r| !r.is_empty()) {
-                        repaint_region(srv, fb, r);
+                        repaint_region(srv, screen, r);
                     }
                     Line::new()
                         .s(b"compositor: interactive move of window ")
@@ -2285,7 +2286,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                     // with no motion event after it would otherwise show nothing at all.
                     for r in outline.into_iter().flat_map(compositor::outline_edges) {
                         if !r.is_empty() {
-                            repaint_region(srv, fb, r);
+                            repaint_region(srv, screen, r);
                         }
                     }
                     Line::new()
@@ -2382,7 +2383,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                     Ok(outline) => {
                         // The highlight is drawn at once for the reason a resize's outline is:
                         // the pointer has already travelled during the round trip.
-                        apply_outline(srv, fb, outline);
+                        apply_outline(srv, screen, outline);
                         // **The kind and the display name, never the path.** What is being
                         // dragged is a file in somebody's home directory; the console is not the
                         // place for a record of which files they move around.
@@ -2594,10 +2595,10 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                 // Nothing changed on screen — an attach, or a destroy of a window that was
                 // never committed.
                 Some(r) if r.size.w == 0 || r.size.h == 0 => {}
-                Some(r) => repaint_region(srv, fb, r),
+                Some(r) => repaint_region(srv, screen, r),
                 // A request that could not name its region. Correct, and the thing this
                 // milestone stopped doing on every request.
-                None => repaint(srv, fb),
+                None => repaint(srv, screen),
             }
             if let Some((window, buffer)) = release {
                 // **Through the outbox, like everything else.** Sent directly it competed
@@ -2655,7 +2656,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
 }
 
 /// The serve loop: the forwarding endpoint plus every open session.
-fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
+fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Server) -> ! {
     kprint(b"compositor: serving /dev/draw\n");
     let mut parked = false;
     loop {
@@ -2670,7 +2671,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
         // the client is blocked on it; going straight back to `sys_wait` with it unsent means
         // sleeping until something unrelated happens — and having just emptied the pending
         // list, there is no longer a deadline to wake for.
-        if fire_configure_deadlines(srv, &mut fb) {
+        if fire_configure_deadlines(srv, &mut screen) {
             parked = flush_outboxes(srv);
         }
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
@@ -2745,7 +2746,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                 serve_signalled = true;
                 continue;
             }
-            if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut fb) {
+            if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut screen) {
                 // The input server died. Close the endpoint and carry on serving the
                 // display — the alternative is a compositor that exits because a mouse
                 // went away.
@@ -2757,20 +2758,20 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             }
             // SAFETY: reading our own manager slot.
             if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
-                if !serve_manager(srv, &mut fb) {
-                    close_manager(srv, &mut fb);
+                if !serve_manager(srv, &mut screen) {
+                    close_manager(srv, &mut screen);
                 }
                 continue;
             }
             // SAFETY: scanning our own slot table for the signalled endpoint.
             if let Some(slot) = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == h) }
-                && !serve_session(slot, srv, &mut fb)
+                && !serve_session(slot, srv, &mut screen)
             {
                 close_session(slot, srv);
                 // Through `repaint`, so the pointer survives a client dying under it. It did
                 // not: this composed directly and nothing redrew the cursor afterwards, so it
                 // stayed gone until the next mouse movement (PR #185 review, finding 1).
-                repaint(srv, &mut fb);
+                repaint(srv, &mut screen);
             }
         }
         // **Before the early `continue`.** Everything above may have queued messages, and
@@ -2849,7 +2850,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
 
     // Authority is the binding: a compositor is a process whose namespace has this.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (mut fb, info) = match unsafe { libdraw::acquire::acquire(root_ns) } {
+    let (aperture, info) = match unsafe { libdraw::acquire::acquire(root_ns) } {
         Ok(pair) => pair,
         Err(_) => {
             kprint(b"compositor: no /dev/framebuffer -- cannot serve\n");
@@ -2857,11 +2858,20 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         }
     };
     let _ = info;
+    // **From here on the aperture is unreachable except through `screen`.** Frames are composed
+    // in the shadow buffer and copied out, so nothing is ever scanned out half-painted (M13
+    // Part A). Without the buffer everything still works and the flicker returns, so the console
+    // says which it is: a screen that flickers should not be a thing anyone has to guess at.
+    let mut screen = Screen::new(aperture);
+    if !screen.is_buffered() {
+        kprint(b"compositor: no shadow buffer -- compositing straight to the display\n");
+    }
 
     let Some((kernel_end, serve_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
         kprint(b"compositor: channel create FAIL\n");
         exit(1);
     };
+    let screen_bounds = screen.geometry().bounds();
     let mut srv = Server {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
@@ -2869,7 +2879,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         repeat: None,
         pending_configure: alloc::vec::Vec::new(),
         announced_focus: None,
-        screen: fb.geometry().bounds(),
+        screen: screen_bounds,
         last_layout: None,
         outline: None,
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
@@ -2877,7 +2887,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         interp: Interpreter::new(),
         // The router clamps the cursor to the screen it was told about, so it has to be the
         // screen this compositor actually acquired — not a constant that happens to match.
-        router: InputRouter::new(fb.geometry().bounds()),
+        router: InputRouter::new(screen_bounds),
         input_ch: 0,
     };
     match connect_input(root_ns) {
@@ -2899,14 +2909,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     // The pointer is drawn here too, so it exists from the moment the compositor owns the
     // screen rather than from whenever the mouse first moves — which on a machine with no
     // client and no mouse activity was never.
-    repaint(&srv, &mut fb);
+    repaint(&srv, &mut screen);
 
     if !send_ready(ctrl, kernel_end) {
         kprint(b"compositor: Ready send FAIL\n");
         exit(1);
     }
 
-    serve_loop(serve_end, fb, &mut srv);
+    serve_loop(serve_end, screen, &mut srv);
 }
 
 #[panic_handler]
