@@ -242,11 +242,115 @@ pub fn place(
     true
 }
 
+/// Draw `src` onto `dst` with black composited over it at `coverage`.
+///
+/// **The overlay a system with no alpha channel can have.** `desktop-shell`'s overview is a
+/// full-screen *opaque* window — it does not sit over the desktop, it replaces it — so reading as
+/// an overlay means drawing what is behind it, darkened. [`Rgb::blend`] is the primitive, and
+/// nothing gains a stored channel.
+///
+/// **Here rather than in the shell**, which is where it was written and is the same argument
+/// [`place`] carries: the destination pitch and the source pitch are exactly the arithmetic that
+/// is invisible when wrong and expensive to discover by booting, and `tools/CLAUDE.md` asks for a
+/// host test wherever the answer does not need a guest (PR #273 review, optional 5).
+///
+/// Both geometries must name the same size and format; returns `false` otherwise, or if either
+/// buffer is shorter than its geometry claims.
+pub fn dim(src: &[u8], src_geom: Geometry, coverage: u8, dst: &mut [u8], dst_geom: Geometry) -> bool {
+    if src_geom.width != dst_geom.width
+        || src_geom.height != dst_geom.height
+        || src_geom.format != dst_geom.format
+        || src_geom.width == 0
+        || src_geom.height == 0
+    {
+        return false;
+    }
+    if src.len() < src_geom.pitch * src_geom.height as usize
+        || dst.len() < dst_geom.pitch * dst_geom.height as usize
+    {
+        return false;
+    }
+    let black = Rgb::new(0, 0, 0);
+    for y in 0..src_geom.height as usize {
+        for x in 0..src_geom.width as usize {
+            let so = y * src_geom.pitch + x * 4;
+            let word = u32::from_le_bytes([src[so], src[so + 1], src[so + 2], src[so + 3]]);
+            let under = src_geom.format.decode(word);
+            let out = dst_geom.format.encode(black.blend(under, coverage)).to_le_bytes();
+            let dof = y * dst_geom.pitch + x * 4;
+            dst[dof..dof + 4].copy_from_slice(&out);
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // ---- fit or centre (M12 Part F) ----
+
+    // ---- dimming an overlay ----
+
+    #[test]
+    fn dim_darkens_every_pixel_towards_black() {
+        let (src, sg) = flat(2, 2, Rgb::new(200, 100, 50));
+        let dg = sg;
+        let mut dst = alloc::vec![0u8; dg.pitch * 2];
+        assert!(dim(&src, sg, 128, &mut dst, dg));
+        // Half coverage of black: each channel roughly halves, rounded to nearest.
+        let c = at(&dst, dg, 0, 0);
+        assert_eq!(c, Rgb::new(100, 50, 25), "got {c:?}");
+        assert_eq!(at(&dst, dg, 1, 1), c, "every pixel, not only the first");
+    }
+
+    #[test]
+    fn dim_at_zero_is_the_picture_and_at_full_is_black() {
+        // The endpoints, because a coverage that is silently inverted looks plausible at 128 and
+        // is exactly wrong at both ends.
+        let (src, sg) = flat(2, 1, Rgb::new(10, 200, 30));
+        let mut dst = alloc::vec![0u8; sg.pitch];
+        assert!(dim(&src, sg, 0, &mut dst, sg));
+        assert_eq!(at(&dst, sg, 0, 0), Rgb::new(10, 200, 30), "0 is invisible black");
+        assert!(dim(&src, sg, 255, &mut dst, sg));
+        assert_eq!(at(&dst, sg, 0, 0), Rgb::new(0, 0, 0), "255 is opaque black");
+    }
+
+    #[test]
+    fn dim_honours_pitches_that_are_not_the_width() {
+        // Both of them, independently: a source read at the wrong stride shears the picture and a
+        // destination written at the wrong one shears the result, and neither is visible in the
+        // arithmetic.
+        let sg = Geometry::with_pitch(2, 2, 32, PixelFormat::XRGB8888).unwrap();
+        let mut src = alloc::vec![0u8; sg.pitch * 2];
+        let word = sg.format.encode(Rgb::new(80, 80, 80)).to_le_bytes();
+        for y in 0..2usize {
+            for x in 0..2usize {
+                let o = y * sg.pitch + x * 4;
+                src[o..o + 4].copy_from_slice(&word);
+            }
+        }
+        let dg = Geometry::with_pitch(2, 2, 64, PixelFormat::XRGB8888).unwrap();
+        let mut dst = alloc::vec![0u8; dg.pitch * 2];
+        assert!(dim(&src, sg, 128, &mut dst, dg));
+        assert_eq!(at(&dst, dg, 1, 1), Rgb::new(40, 40, 40), "row 1 is one destination pitch down");
+        // The padding between destination rows is untouched.
+        assert_eq!(&dst[8..64], &alloc::vec![0u8; 56][..]);
+    }
+
+    #[test]
+    fn dim_refuses_mismatched_geometries_and_short_buffers() {
+        let (src, sg) = flat(2, 2, Rgb::new(1, 2, 3));
+        let mut dst = alloc::vec![0u8; sg.pitch * 2];
+        let other = Geometry::with_pitch(4, 2, 16, PixelFormat::XRGB8888).unwrap();
+        assert!(!dim(&src, sg, 128, &mut dst, other), "a different size");
+        let bgr = Geometry::with_pitch(2, 2, 8, PixelFormat::XBGR8888).unwrap();
+        assert!(!dim(&src, sg, 128, &mut dst, bgr), "a different format");
+        let mut short = alloc::vec![0u8; 4];
+        assert!(!dim(&src, sg, 128, &mut short, sg), "a destination shorter than it claims");
+        assert!(!dim(&src[..4], sg, 128, &mut dst, sg), "a source shorter than it claims");
+    }
+
 
     /// A `w`×`h` image whose every pixel is `c`.
     fn flat(w: u32, h: u32, c: Rgb) -> (alloc::vec::Vec<u8>, Geometry) {

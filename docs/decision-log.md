@@ -22485,3 +22485,43 @@ fixture wants to be *awkward*, because awkward inputs discriminate, and content 
 right. When one thing has to be both, the discriminating property belongs in a host test and the
 gate keeps what is left. Noticing which half of an assertion stopped meaning anything is the part
 that is easy to skip.
+
+## 2026-09-02 — what #273's review caught: four stale comments and a fallback that said nothing
+
+No blocking findings. Two of the five are worth keeping as classes rather than as fixes.
+
+**A comment that outlives the code it justifies is worse than no comment**, and this change made
+four of them at once. The staging block still said the wallpaper was "generated rather than
+checked in" — every clause false, sitting directly above the call whose own doc argues the
+opposite at length, so a reader starting there gets the superseded reasoning and never reaches the
+new one. `desktop_preview` still said its miniature needs "no capture, no scaling, and no image
+decoding" six lines above the code that scales an image. And an `output_buffer_size()` comment
+called an overflow guard an interlace check, which would send the next reader looking for a
+property that is not there. The `assets/wallpapers/README.md` and the decision log were both
+correct; the comments nearest the code were the stragglers. **The nearer a comment is to the
+change, the more likely it is to be the one nobody re-read.**
+
+**A doc comment orphaned by an insert, for the sixth time.** `OVERVIEW_DIM` went in above
+`OVER_PITCH` and took its one-line doc, so rustdoc rendered both sentences on the new constant and
+left the old one bare. There is a memory note about this exact shape and it was read at the start
+of the session. Reading a rule is not applying it; what would have applied it is appending below
+the target item, which costs nothing and cannot do this.
+
+**And a fallback that reappeared as the bug it replaced.** `mini_wallpaper` returned `Option`, and
+on `None` every sidebar miniature fell back to a flat colour — which is exactly the defect this
+change exists to fix, arriving again with nothing printed and nothing failing. The reviewer's
+scenario was concrete: raise `MINI_W` past the screen's width, `box_downscale` refuses, the
+sidebar goes blue, and the gate still prints "overview ground is the wallpaper" and passes.
+
+The fix is not a gate line. `MINI_W` and `MINI_H` are compile-time constants, so **the compiler
+can refuse it**: a `const` assertion that a miniature is smaller than the screen it is a miniature
+of turns that scenario into a build error beside the constant, which is strictly better than a
+message somebody reads in a month. The residual case — a picture shorter than its own geometry —
+keeps the `kprint`, because that one is not decidable at build time.
+
+**Where the arithmetic went.** The dim composite was written as a loop in the shell, where no host
+test can reach it; it is `libdraw::scale::dim` now, with four tests including both endpoints of
+the coverage and a source and destination pitch that differ. M12 Part F moved `place` out for the
+same reason and wrote the reason down, and this change put a sibling straight back in — which is
+what the review noticed. A rule stated in one function's doc does not carry to the next function
+somebody writes.

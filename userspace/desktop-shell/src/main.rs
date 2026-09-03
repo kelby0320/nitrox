@@ -28,7 +28,7 @@
 
 extern crate alloc;
 
-use libdraw::format::{PixelFormat, Rgb};
+use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
@@ -3507,26 +3507,30 @@ fn render_overview(
     // glyph rasterisation uses, and no alpha channel is stored anywhere. GNOME blurs as well;
     // a blur is a separable convolution over a million pixels per open, and dimming alone is
     // what the request asked for.
-    let ground_pitch = SCREEN_W as usize * 4;
-    for y in 0..SCREEN_H as u32 {
-        for x in 0..SCREEN_W {
-            let c = match wallpaper {
-                Some(p) => {
-                    let off = y as usize * ground_pitch + x as usize * 4;
-                    match p.get(off..off + 4) {
-                        Some(b) => {
-                            let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                            let under = PixelFormat::XRGB8888.decode(word);
-                            Rgb::new(0, 0, 0).blend(under, OVERVIEW_DIM)
-                        }
-                        // A picture shorter than the screen cannot happen — one function builds
-                        // it at exactly this size — and falling back beats indexing past it.
-                        None => libdraw::scene::BACKGROUND,
-                    }
-                }
-                None => libdraw::scene::BACKGROUND,
-            };
-            fb.put_pixel(x, y, c);
+    // **`libdraw::scale::dim` does the composite**, not a loop here: the source pitch and the
+    // destination pitch are the arithmetic that is invisible when wrong and expensive to find by
+    // booting, which is the argument `place` already carries. It reports rather than falling
+    // back silently, so a ground that did not come out says so (PR #273 review, optional 5).
+    let mut dimmed = false;
+    if let Some(p) = wallpaper {
+        let src = Geometry::with_pitch(
+            SCREEN_W,
+            SCREEN_H as u32,
+            SCREEN_W as usize * 4,
+            PixelFormat::XRGB8888,
+        );
+        dimmed = src.is_some_and(|src| {
+            libdraw::scale::dim(p, src, OVERVIEW_DIM, fb.bytes_mut(), geometry)
+        });
+        if !dimmed {
+            kprint(b"desktop-shell: the overview could not dim the wallpaper\n");
+        }
+    }
+    if !dimmed {
+        for y in 0..SCREEN_H as u32 {
+            for x in 0..SCREEN_W {
+                fb.put_pixel(x, y, libdraw::scene::BACKGROUND);
+            }
         }
     }
     // **The wallpaper again, scaled once for every miniature that wants it.** Once rather than
@@ -3629,7 +3633,15 @@ fn mini_wallpaper(picture: &[u8]) -> Option<(alloc::vec::Vec<u8>, Geometry)> {
     let (w, h) = (MINI_W - 2, MINI_H - 2);
     let dst = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888)?;
     let mut out = alloc::vec![0u8; dst.pitch * h as usize];
-    libdraw::scale::box_downscale(picture, src, &mut out, dst).then_some((out, dst))
+    if !libdraw::scale::box_downscale(picture, src, &mut out, dst) {
+        // **Said rather than silently fallen back from** (PR #273 review, optional 5). A `None`
+        // here puts every miniature back to flat blue — which is precisely the bug this change
+        // exists to fix, reappearing with nothing printed and nothing failing. Every other
+        // failure around the wallpaper names itself; this one did not.
+        kprint(b"desktop-shell: the overview could not scale the wallpaper for a miniature\n");
+        return None;
+    }
+    Some((out, dst))
 }
 
 /// Capture a thumbnail of every window on `current`, replacing whatever `shots` held.
@@ -3796,8 +3808,13 @@ fn close_overview(
 /// it is a different feature from drawing where its windows are.
 ///
 /// What the shell does have is every window's origin, size and desktop, which it keeps for the
-/// taskbar. So this is arithmetic, not pixels: it needs no capture, no scaling, and no image
-/// decoding — which is what the same request looked like it needed.
+/// taskbar. So the *windows* are arithmetic rather than pixels: they need no capture, no scaling
+/// and no image decoding — which is what the same request looked like it needed.
+///
+/// **The ground beneath them is pixels, since 2026-09-02**, and that is the one clause above
+/// that stopped being true: a miniature's ground is the wallpaper, box-downscaled once for every
+/// row. A preview of a desktop that has a picture, drawn as flat blue, is a preview of a desktop
+/// nobody has (PR #273 review, optional 3).
 ///
 /// **Bordered boxes rather than filled ones**, so two overlapping windows read as two.
 fn desktop_preview(
@@ -3857,6 +3874,17 @@ const MINI_H: u32 = 60;
 /// Space around a miniature inside its row.
 const MINI_PAD: u32 = 6;
 
+// **The miniature is a size `box_downscale` will accept, and the compiler is what says so.**
+// That function refuses a destination larger than the source in either axis, and a refusal here
+// puts every preview back to a flat colour — which is precisely the bug this change exists to
+// fix, reappearing with nothing failing (PR #273 review, optional 5). A gate line would report
+// it; this makes it unbuildable, which is better: raising `MINI_W` past the screen's width is
+// then a compile error beside the constant rather than flat blue somebody notices in a month.
+const _: () = assert!(
+    MINI_W > 2 && MINI_H > 2 && MINI_W - 2 <= SCREEN_W && MINI_H - 2 <= SCREEN_H as u32,
+    "a sidebar miniature must be smaller than the screen it is a miniature of"
+);
+
 /// The overview's sidebar width, at the right-hand edge.
 const SIDE_W: u32 = 200;
 /// One desktop row in the sidebar.
@@ -3875,6 +3903,8 @@ const THUMB_PAD: u32 = 16;
 /// How many thumbnails fit across the grid.
 const THUMB_COLS: u32 = (SCREEN_W - SIDE_W) / (THUMB_W + THUMB_PAD);
 /// Bytes per row of the overview's own buffer.
+const OVER_PITCH: usize = (SCREEN_W as usize) * 4;
+
 /// How far the wallpaper is darkened under the overview, as a coverage of black.
 ///
 /// **Enough that light ink and pale thumbnails read over a photograph**, and not so much that
@@ -3882,8 +3912,6 @@ const THUMB_COLS: u32 = (SCREEN_W - SIDE_W) / (THUMB_W + THUMB_PAD);
 /// number rather than a theme key: it is the overview's own composition, like the sidebar's
 /// panel, and M11's decision 2 keeps chrome metrics out of what a theme file can set.
 const OVERVIEW_DIM: u8 = 150;
-
-const OVER_PITCH: usize = (SCREEN_W as usize) * 4;
 
 /// Where thumbnail `i` sits in the overview, in overview-local pixels.
 ///

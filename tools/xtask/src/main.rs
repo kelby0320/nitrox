@@ -5025,8 +5025,12 @@ fn wallpaper_png() -> R<Vec<u8>> {
         )
         .into());
     }
-    // `None` here means the decoder could not size the output — an interlaced or otherwise
-    // unusual file. Refused by name rather than defaulted to something.
+    // **An overflow guard, not an interlace check.** `png`'s own doc: "Returns `None` if the
+    // output buffer does not fit into the memory space of the machine." An interlaced RGB8 file
+    // returns `Some` and de-interlaces into the same layout, so this would pass it straight
+    // through — which is fine here, since the guest's decoder is the one that refuses
+    // interlacing and this is a host-side crop. The first version of this comment said the
+    // opposite (PR #273 review, optional 4).
     let size = reader
         .output_buffer_size()
         .ok_or_else(|| format!("{}: the decoder cannot size this image", path.display()))?;
@@ -9186,11 +9190,15 @@ fn assemble_image(
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
     }
-    // The wallpaper itself, **generated rather than checked in**: a binary asset in the repo is
-    // one nobody can review, and the properties a gate needs from it — its size, and that its
-    // pixels vary — are properties of the generator. It is a real PNG all the same, written by
-    // the `png` crate `preview` already uses, so the guest's decoder is reading an encoder it
-    // shares nothing with.
+    // The wallpaper itself. **The maintainer's photograph, committed as taken and cropped here**
+    // — see `wallpaper_png` for why the crop is a build step rather than a pre-cropped file, and
+    // `assets/wallpapers/README.md` for the picture's provenance.
+    //
+    // This block used to say "generated rather than checked in", which was the argument for the
+    // gradient that came before: no unreviewable binary should be load-bearing for a gate. The
+    // asset is *content* a person chose now, and the comment outlived it by one commit — a
+    // reader who starts here would have got the superseded reasoning and never reached the new
+    // one four thousand lines away (PR #273 review, worth fixing 2).
     {
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("wallpaper.png");
         let bytes = wallpaper_png()?;

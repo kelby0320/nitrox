@@ -157,7 +157,10 @@ ground made the picture disappear whenever you looked at the desktops. It draws 
 **dimmed** instead, which is what makes it read as an overlay without translucency, and each
 sidebar miniature draws the wallpaper **scaled and undimmed**: the ground is dimmed so the things
 over it read, and a miniature *is* the thing being read. The shell keeps the composed picture for
-this — four megabytes, against re-decoding the file on a gesture that should feel instant.
+this — four megabytes, against re-decoding the file on a gesture that should feel instant. The
+composite itself is [`libdraw::scale::dim`](../../userspace/libdraw/src/scale.rs), not a loop in
+the shell: a source pitch and a destination pitch are the arithmetic that is invisible when wrong
+and expensive to find by booting, which is the argument `place` already carries.
 
 ## 3. One process, several windows
 
