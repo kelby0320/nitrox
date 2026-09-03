@@ -172,6 +172,33 @@ pub trait Framebuffer {
         }
     }
 
+    /// Fill `rect`, clipped to the visible area, with `colour` at `alpha`.
+    ///
+    /// **A stored opacity, not a blend.** [`blend_pixel`](Self::blend_pixel) mixes a colour *into*
+    /// what is already there and leaves an opaque pixel; this writes a pixel that is still
+    /// translucent afterwards, for something further down the line to composite. The distinction
+    /// only exists for a buffer whose format has an alpha channel — for any other, `alpha` is
+    /// discarded and this is [`fill_rect`](Self::fill_rect), which is the right answer rather than
+    /// a refusal: a surface with no channel has no way to be anything but opaque.
+    ///
+    /// Written for the overview, which fills a translucent ground and then draws opaque content
+    /// over it (M13 Part C).
+    fn fill_rect_alpha(&mut self, rect: Rect, colour: Rgb, alpha: u8) {
+        let g = self.geometry();
+        let Some(clipped) = rect.intersect(&g.bounds()) else { return };
+        let word = g.format.encode_alpha(colour, alpha).to_le_bytes();
+        let bpp = g.format.bytes_per_pixel();
+        let bytes = self.bytes_mut();
+        for row in 0..clipped.size.h {
+            let y = clipped.origin.y as u32 + row;
+            let Some(start) = g.offset_of(clipped.origin.x as u32, y) else { continue };
+            for col in 0..clipped.size.w as usize {
+                let off = start + col * bpp;
+                bytes[off..off + 4].copy_from_slice(&word);
+            }
+        }
+    }
+
     /// Fill `rect` with a vertical gradient — `mid` lightened at the top, darkened at the
     /// bottom by `bevel` — painting only inside `clip`.
     ///

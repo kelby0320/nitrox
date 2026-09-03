@@ -241,6 +241,7 @@ fn main() -> ExitCode {
         // flags stripped, and anything else beginning with `-` is a flag this command does not
         // have — landing one in the name slot reports "no preview called `--offline`", which
         // names the wrong problem (PR #261 review, optional 3).
+        Some("tune") => cmd_tune(&qargs),
         Some("preview") => cmd_preview(
             qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
         ),
@@ -4866,6 +4867,212 @@ fn cmd_preview(what: &str) -> R<()> {
     Ok(())
 }
 
+/// `cargo xtask tune [--ground N] [--side N] [--radius N] [--strength N] [--drop N]` — try the
+/// overview's opacity and a window's shadow **without booting**.
+///
+/// **The loop `preview` exists for, pointed at the two things `preview` could not show** (M13
+/// Part C). `preview` renders the toolkit's own surfaces; the overview's translucency and a
+/// window's shadow are *compositing*, which happened only in the guest — so judging either cost a
+/// three-minute boot, and picking a number by eye needs half a dozen looks.
+///
+/// **The desktop underneath is the real one**, read back from `shot-windows.png` when a
+/// `cargo xtask shot` has left one there, and the wallpaper otherwise. That is what makes the
+/// answer trustworthy: the question is how much of the *actual* desktop should show through, and
+/// a mock of it would be a picture of my guess rather than of the screen. The overview's own
+/// content is stood in for — rectangles where thumbnails go — because the thing being judged is
+/// the ground behind them, not the labels on them.
+///
+/// It writes `tune-shadow.png` and `tune-overview.png`, and prints the values it used so a good
+/// one can be copied into `libdraw::theme::WINDOW_SHADOW` and `desktop-shell`'s constants.
+fn cmd_tune(args: &[String]) -> R<()> {
+    use libdraw::compose::{Shadow, SurfaceRef, compose_exposed};
+    use libdraw::format::{PixelFormat, Rgb};
+    use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+    use libdraw::geom::{Point, Rect};
+
+    let num = |name: &str, default: u32| -> R<u32> {
+        match args.iter().position(|a| a == name) {
+            Some(i) => args
+                .get(i + 1)
+                .ok_or_else(|| format!("{name} wants a number"))?
+                .parse::<u32>()
+                .map_err(|e| format!("{name}: {e}").into()),
+            None => Ok(default),
+        }
+    };
+    let theme_shadow = libdraw::theme::WINDOW_SHADOW;
+    let shadow = Shadow {
+        radius: num("--radius", theme_shadow.radius)?,
+        offset: Point::new(0, num("--drop", theme_shadow.offset.y as u32)? as i32),
+        colour: theme_shadow.colour,
+        strength: num("--strength", theme_shadow.strength as u32)?.min(255) as u8,
+    };
+    let ground_alpha = num("--ground", 210)?.min(255) as u8;
+    let side_alpha = num("--side", 150)?.min(255) as u8;
+
+    let (sw, sh) = (1280u32, 800u32);
+    let g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
+    let dir = build_cache();
+    fs::create_dir_all(&dir).ok();
+
+    // --- the desktop underneath: the real screen if one has been photographed ---
+    let mut desktop = MemFramebuffer::new(g);
+    let shot = dir.join("shot-windows.png");
+    let from_shot = read_rgb_png(&shot).ok().filter(|(w, h, _)| *w == sw && *h == sh);
+    match &from_shot {
+        Some((_, _, rgb)) => {
+            for y in 0..sh {
+                for x in 0..sw {
+                    let i = (y as usize * sw as usize + x as usize) * 3;
+                    desktop.put_pixel(x, y, Rgb::new(rgb[i], rgb[i + 1], rgb[i + 2]));
+                }
+            }
+        }
+        None => {
+            let (px, wg) = wallpaper_for_screen(sw, sh)?;
+            for y in 0..sh {
+                for x in 0..sw {
+                    let off = wg.offset_of(x, y).unwrap_or(0);
+                    let word =
+                        u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
+                    desktop.put_pixel(x, y, wg.format.decode(word));
+                }
+            }
+        }
+    }
+
+    // --- 1. the shadow, over a wallpaper with two mock windows ---
+    //
+    // Drawn fresh rather than over the screendump, because the screendump already *has* the
+    // shipped shadow baked into it: comparing a new one against it would be comparing two
+    // shadows and calling the sum an answer.
+    let (wp, wg) = wallpaper_for_screen(sw, sh)?;
+    let mut shot_fb = MemFramebuffer::new(g);
+    let faces = host_faces()?;
+    let ui = reference_frame(&faces, "ui")?;
+    let (uw, uh) = {
+        let ug = Framebuffer::geometry(&ui);
+        (ug.width, ug.height)
+    };
+    let panel = MemFramebuffer::filled(Geometry::packed(sw, 24, PixelFormat::XRGB8888), Rgb::new(0xEC, 0xEC, 0xEC));
+    let wall = SurfaceRef::new(wg, Point::new(0, 0), &wp);
+    let bar = SurfaceRef::new(panel.geometry(), Point::new(0, 0), panel.bytes());
+    let a = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120, 140), ui.bytes())
+        .with_shadow(shadow);
+    let b = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120 + uw as i32 / 2, 140 + uh as i32 / 2), ui.bytes())
+        .with_shadow(shadow);
+    compose_exposed(&mut shot_fb, Rgb::new(0x2A, 0x55, 0x70), &[wall, bar, a, b], &[g.bounds()]);
+    let (w1, h1, rgb1) = rgb_of(&shot_fb);
+    let p1 = dir.join("tune-shadow.png");
+    write_png(&p1, w1, h1, &rgb1)?;
+
+    // --- 2. the overview's ground and sidebar, over the real desktop ---
+    let mut over = desktop;
+    let side_w = 200u32;
+    // **The bars stay uncovered**, which is what the guest does — the shell's two panels sit above
+    // the overview popup, and a mock that dimmed them would show a picture the screen never has.
+    // Compare `shot-overview.png`: its top bar and taskbar are at full brightness.
+    let bar_h = 24u32;
+    let body = Rect::new(0, bar_h as i32, sw, sh - bar_h * 2);
+    let side = Rect::new((sw - side_w) as i32, bar_h as i32, side_w, sh - bar_h * 2);
+    // The ground first, then the sidebar over it, then opaque stand-ins for the thumbnails —
+    // the same order `render_overview` uses, so the layering is the shell's rather than a
+    // rearrangement of it.
+    blend_rect(&mut over, body, Rgb::new(0, 0, 0), ground_alpha);
+    blend_rect(&mut over, side, Rgb::new(0x1B, 0x3A, 0x4E), side_alpha);
+    for (i, r) in [Rect::new(60, 90, 420, 300), Rect::new(540, 210, 400, 280)].iter().enumerate() {
+        let tint = if i == 0 { Rgb::new(0xF2, 0xF2, 0xF2) } else { Rgb::new(0x10, 0x14, 0x18) };
+        over.fill_rect(*r, tint);
+    }
+    for row in 0..2u32 {
+        over.fill_rect(
+            Rect::new(side.origin.x + 12, bar_h as i32 + 16 + row as i32 * 90, side_w - 90, 70),
+            Rgb::new(0x9F, 0xB8, 0xC8),
+        );
+    }
+    let (w2, h2, rgb2) = rgb_of(&over);
+    let p2 = dir.join("tune-overview.png");
+    write_png(&p2, w2, h2, &rgb2)?;
+
+    println!(
+        "xtask: shadow radius {} drop {} strength {}  ->  {}",
+        shadow.radius,
+        shadow.offset.y,
+        shadow.strength,
+        p1.display()
+    );
+    println!(
+        "xtask: overview ground {ground_alpha} sidebar {side_alpha}  ->  {}{}",
+        p2.display(),
+        if from_shot.is_some() { "  (over the real screendump)" } else { "  (over the wallpaper — run `xtask shot` for the real desktop)" }
+    );
+    Ok(())
+}
+
+/// The staged wallpaper, cropped and scaled to a `sw`x`sh` screen, as XRGB8888 pixels.
+///
+/// The same crop the image build stages and the same downscale the shell performs, so the ground
+/// under a preview is the ground the guest would show.
+fn wallpaper_for_screen(
+    sw: u32,
+    sh: u32,
+) -> R<(Vec<u8>, libdraw::framebuffer::Geometry)> {
+    use libdraw::format::{PixelFormat, Rgb};
+    use libdraw::framebuffer::Geometry;
+    let path = repo_root().join(WALLPAPER_ASSET);
+    let (iw, ih, rgb) = read_rgb_png(&path)?;
+    let top = ((ih.saturating_sub(WALLPAPER_H)) / 2) as usize;
+    let src_g = Geometry::packed(iw, WALLPAPER_H.min(ih), PixelFormat::XRGB8888);
+    let mut src = vec![0u8; src_g.byte_len()];
+    for y in 0..src_g.height {
+        for x in 0..iw {
+            let i = ((top + y as usize) * iw as usize + x as usize) * 3;
+            let c = Rgb::new(rgb[i], rgb[i + 1], rgb[i + 2]);
+            let off = src_g.offset_of(x, y).unwrap_or(0);
+            src[off..off + 4].copy_from_slice(&src_g.format.encode(c).to_le_bytes());
+        }
+    }
+    let dst_g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
+    let mut dst = vec![0u8; dst_g.byte_len()];
+    if !libdraw::scale::box_downscale(&src, src_g, &mut dst, dst_g) {
+        return Err("the wallpaper would not scale to the preview screen".into());
+    }
+    Ok((dst, dst_g))
+}
+
+/// Fill `rect` by blending `colour` into what is already there — the host's stand-in for a
+/// translucent surface the compositor would blend at scanout.
+fn blend_rect(
+    fb: &mut libdraw::framebuffer::MemFramebuffer,
+    rect: libdraw::geom::Rect,
+    colour: libdraw::format::Rgb,
+    alpha: u8,
+) {
+    use libdraw::framebuffer::Framebuffer;
+    let bounds = Framebuffer::geometry(fb).bounds();
+    let Some(area) = rect.intersect(&bounds) else { return };
+    for y in area.origin.y..area.bottom() as i32 {
+        for x in area.origin.x..area.right() as i32 {
+            fb.blend_pixel(x as u32, y as u32, colour, alpha);
+        }
+    }
+}
+
+/// Read an 8-bit RGB PNG back as `(width, height, rgb)`.
+fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
+    let file = std::io::BufReader::new(fs::File::open(path)?);
+    let mut reader = png::Decoder::new(file).read_info()?;
+    let info = reader.info().clone();
+    if info.color_type != png::ColorType::Rgb || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!("{}: expected 8-bit RGB", path.display()).into());
+    }
+    let size = reader.output_buffer_size().ok_or("image too large")?;
+    let mut buf = vec![0u8; size];
+    let frame = reader.next_frame(&mut buf)?;
+    buf.truncate(frame.buffer_size());
+    Ok((info.width, info.height, buf))
+}
+
 /// `cargo xtask shot [all|greeter|desktop|apps|windows|overview]` — photograph the running
 /// desktop.
 ///
@@ -5487,6 +5694,20 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         )
         .into());
     }
+    // **The window above casts a shadow onto this one** (M13 Part C), so the reference has to
+    // carry it or the gate would be comparing against a picture the compositor never draws. Applied
+    // through `libdraw`'s own `draw_shadow` with `libdraw`'s own constant — the gate computes its
+    // expected answer, and a shadow that stopped reaching the screen now fails here rather than
+    // going unnoticed.
+    let mut term = term;
+    libdraw::compose::draw_shadow(
+        &mut term,
+        libdraw::geom::Rect::new(0, 0, sw, sh),
+        &libdraw::theme::WINDOW_SHADOW,
+        &libdraw::geom::Rect::new(0, 0, tw, th),
+    );
+    let term = term;
+
     let mut term_mismatches = 0usize;
     let mut term_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     let mut term_compared = 0usize;
@@ -5517,6 +5738,17 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // not a weakening: a compositor that stacked them the other way would fail the comparisons
     // above, so the ordering is still covered.
     let ui = reference_frame(&faces, "ui")?;
+    // The terminal's window shadows the toolkit's, for the same reason and from the same source.
+    // The scene's shadow reaches at most `radius` past the terminal, which is inside the terminal's
+    // own rectangle and therefore inside the region excluded below — so one shadow, not two.
+    let mut ui = ui;
+    libdraw::compose::draw_shadow(
+        &mut ui,
+        libdraw::geom::Rect::new(0, 0, tw, th),
+        &libdraw::theme::WINDOW_SHADOW,
+        &libdraw::geom::Rect::new(0, 0, uw, uh),
+    );
+    let ui = ui;
     let mut ui_mismatches = 0usize;
     let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     let mut ui_compared = 0usize;

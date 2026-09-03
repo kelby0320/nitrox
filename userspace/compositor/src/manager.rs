@@ -344,7 +344,9 @@ mod tests {
             (OP_MGR_LOWER, ref_body(ids[0], 0), ids[0]),
             (OP_MGR_SET_FOCUS, ref_body(ids[1], 0), ids[1]),
         ] {
-            let want = s.window(id).expect("in the stack").bounds();
+            // Painted bounds: a restacked window repaints its shadow too (M13 Part C).
+            let want = s.window(id).expect("in the stack").painted_bounds();
+            assert!(want.size.w > 8, "the premise: the damage includes the shadow");
             let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, op, &body) else {
                 panic!("expected Applied")
             };

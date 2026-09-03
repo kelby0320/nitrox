@@ -3470,7 +3470,8 @@ it is noticed on. Its own list, and its own milestone.
 - [x] **The stopping condition, and what "empty" turned out to mean** ✅ (2026-09-01). Decision 5
       says M11 ends when the list is empty. It is not literally empty; what is true is that
       **nothing left on it is polish**: real icons and a background image wait on the images item
-      filed for M12, and transparency waits on an alpha channel `libdraw` rules out today. Drop
+      filed for M12, and transparency waits on an alpha channel `libdraw` rules out today. (Both
+      landed in M13: images in M12 Part F, transparency in Parts B and C.) Drop
       shadows are the third, and they are held for a reason worth keeping — a shadow makes every
       window's damage region larger than the window, and the compositor clears before it draws
       straight into the scanned-out framebuffer, so shadows would make the flicker they sit on top
@@ -4366,10 +4367,34 @@ one diagnosis that explained both.
 
   **Nothing uses it yet** — the overview still fakes translucency with `dim()`. That is Part C, on
   purpose: a substrate chosen to suit its first caller is a substrate chosen badly.
-- **Part C — what alpha unlocks**, both of which M11 deferred *onto* it: drop shadows around
-  windows and menus, and the translucent overview sidebar. Shadows in particular must not come
-  first — a shadow makes every window's damage region larger than the window, which without Part A
-  enlarges exactly the flash it sits on top of.
+- [x] **Part C — what alpha unlocks.** ✅ 2026-09-03. Both of the things M11 deferred *onto* it:
+  drop shadows around windows and menus, and the translucent overview sidebar. Shadows in
+  particular must not come first — a shadow makes every window's damage region larger than the
+  window, which without Part A enlarges exactly the flash it sits on top of.
+
+  **Only one of the two needed alpha**, which is worth recording since both were filed against it.
+  A shadow is compositor-drawn: it knows the bounds, computes coverage and blends, and what it
+  actually needed was *ordering* — drawn immediately before its own surface, so everything below is
+  already painted. The overview did need a channel, and it deleted a workaround: it was a
+  full-screen opaque window redrawing the wallpaper dimmed, and is now one ARGB surface over the
+  live desktop. `libdraw::scale::dim` went with it. That is the case per-surface opacity could not
+  have served — the sidebar is see-through and its text is not.
+
+  **A shadow lives outside `bounds`**, so every rectangle in the compositor split in two:
+  `painted_bounds` for damage, `bounds` for hit-testing and for what a client is told. Ten damage
+  sites moved; `info()` and `ConfigureEvent` deliberately did not.
+
+  **Two things a person found that the tests did not.** The shadow shipped at twice the right
+  opacity *and* with the wrong falloff curve — `1 - (d/r)²` holds three quarters of its opacity
+  half a radius out, so no strength setting could have produced "lighter at the start, fading to
+  almost nothing". And a launched window had no shadow until it was clicked: the commit handler
+  clips a client's damage to `bounds`, which cannot contain one. Both are in the decision log; the
+  second's lesson is that a sweep for "where does damage come from" is not the same search as
+  "where is `bounds` called".
+
+  **`cargo xtask tune` came out of it** — both effects rendered on the host in a second instead of
+  a three-minute boot, with the overview half composited over the real screendump. `preview`'s
+  argument, aimed at the part `preview` structurally cannot reach.
 
 **Its gate is not `check-display`.** That gate compares a settled screen against a render, and
 none of this changes a settled screen — it changes what happens *between* settled screens. What
