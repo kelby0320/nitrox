@@ -22993,3 +22993,38 @@ covering all four: **a search proves something only when you have shown it can f
 
 The cheaper habit for this specific case: to ask whether a capability exists, grep the *library*
 that would own it, not the caller that would use it.
+
+## 2026-09-03 — M14 Part F: a generated label is a title, a name is not
+
+Two rough edges from the maintainer's list, and one decision each.
+
+**Capitalisation.** "applications", "no windows" and "desktop 1" become "Applications", "No
+Windows" and "Desktop 1". The decision is where the capital goes: in `desktop_label`'s *fallback*,
+not at the three places that draw its result. A desktop can be renamed (`Super+R`), and
+title-casing a name a person chose would be the shell editing their text. So a generated label is
+a title and a name is theirs — one function, one rule, and the three call sites stay dumb.
+
+**That change reached three gate expectations**, because `desktop_label` is embedded in the
+`window list on …` serial line the gates match on. Updating them is right rather than a nuisance:
+the line is a *receipt for what the bar shows*, so the two agreeing is the property, and a log
+that kept saying "desktop 1" while the screen said "Desktop 1" would be two sources for one
+string. The alternative — a display label and a log label — needs the fallback written twice.
+
+**The cursor's tail.** The old sprite cut its barb back to five columns and ran a **two**-pixel
+diagonal away from it. Two pixels stepping one column per row is a staircase, and against an
+eight-pixel-wide head it reads as a second, smaller shape hanging off the first — which is what
+"the tail is at a crooked angle" was describing. Three pixels, and the barb one column later so
+the tail leaves while the head is still wide, keeps the silhouette continuous.
+
+**It was chosen by rendering it, not by reading it.** The sprite is sixteen string literals, and
+whether a diagonal reads as a stroke or as a staircase is not a judgement anybody can make from
+`".##.##."`. Four versions were rendered magnified on the host, side by side over a desktop-grey
+ground, and the difference was obvious in the picture and invisible in the source. Same lesson as
+`xtask tune` a milestone earlier, arrived at from the other end: **the cheap way to judge
+something visual is to look at it, and the cost of looking is what decides whether anyone does.**
+
+**What is not tested, and why.** `desktop-shell` is a bin crate with no library and no unit tests,
+so `desktop_label`'s rule cannot be host-tested without restructuring it — out of scope for two
+rough edges. The capitalised fallback *is* pinned, by `check-login` asserting the serial line
+through a real boot; the "a user's name passes through verbatim" half is not pinned by anything.
+Stated rather than papered over.

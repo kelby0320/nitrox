@@ -316,6 +316,15 @@ pub const MAX_WINDOWS_PER_CONNECTION: usize = 64;
 ///
 /// Two colours so it is visible against both: `#` is the body, `.` the outline, ` ` is
 /// transparent. Drawn from a string because a bitmap you can read is a bitmap you can fix.
+/// **The tail leaves the head while the head is still wide** (M14 Part F), which is the whole of
+/// the redraw. The previous sprite cut the barb back to five columns and then ran a *two*-pixel
+/// diagonal away from it: two pixels stepping one column per row is a staircase, and against an
+/// eight-pixel head it read as a second, smaller shape hanging off the first at an odd angle —
+/// reported as "the tail is at a crooked angle", 2026-09-03. Three pixels, and a barb one column
+/// later, keeps the silhouette continuous.
+///
+/// Rendered magnified to choose it, against three alternatives, rather than judged by reading
+/// rows: a 2-versus-3-pixel diagonal is not a difference anyone can see in a string literal.
 const CURSOR: [&str; CURSOR_H as usize] = [
     ".",
     "..",
@@ -327,12 +336,12 @@ const CURSOR: [&str; CURSOR_H as usize] = [
     ".######.",
     ".#######.",
     ".########.",
-    ".#####....",
-    ".##.##.",
-    ".#. .##.",
-    "..   .##.",
-    "      .##.",
-    "       ..",
+    ".######...",
+    ".##..###.",
+    ".#.  .###.",
+    "..    .###.",
+    "       .##.",
+    "        ..",
 ];
 
 /// Cursor sprite width.

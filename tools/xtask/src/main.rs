@@ -2350,7 +2350,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `_` is the bar's mark for a minimized window. The desktop count is not asserted: the
     // lifecycle rule appends an empty desktop as soon as one has a window, so it is 2 here and
     // says nothing about minimising.
-    session.expect(&format!("desktop-shell: window list on desktop 1 of 2 [{term_id}:_ "))?;
+    session.expect(&format!("desktop-shell: window list on Desktop 1 of 2 [{term_id}:_ "))?;
 
     // Restore it from the list, which is where a minimized window comes back from, so the steps
     // below have a window to work with.
@@ -2391,7 +2391,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxterm: asked to close, exiting")?;
     session.expect("nxterm: closing")?;
     // The compositor tore the windows down with the session, and the list lost the entry.
-    session.expect("desktop-shell: window list on desktop 1 of 1 (empty)")?;
+    session.expect("desktop-shell: window list on Desktop 1 of 1 (empty)")?;
     println!("  ok: the taskbar asked, and the client closed itself");
     let first_term_id = term_id;
 
@@ -2580,7 +2580,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // and the one that went was the unnamed one.
     chord(&mut qmp, true, "1")?;
     session.expect("desktop-shell: moved window ")?;
-    session.expect("desktop-shell: window list on desktop 2 of 2 (empty)")?;
+    session.expect("desktop-shell: window list on Desktop 2 of 2 (empty)")?;
 
     // 6d. **The overview** (M8 Part E): frozen thumbnails of this desktop, a sidebar of the
     //     others, and a window moved by dropping its thumbnail on one.
@@ -10581,14 +10581,14 @@ mod diag_tests {
         // **The distinction the gate depends on.** Ids are not slots — a window closed earlier
         // in the run leaves the ones after it at lower positions — and clicking `id * ENTRY_W`
         // would land on somebody else's entry as soon as anything had ever been closed.
-        let list = "desktop 1 of 2 [20:nxfiles] [24:notes.txt*] [31:untitled]";
+        let list = "Desktop 1 of 2 [20:nxfiles] [24:notes.txt*] [31:untitled]";
         assert_eq!(taskbar_slot(list, 20), Some(0));
         assert_eq!(taskbar_slot(list, 24), Some(1));
         assert_eq!(taskbar_slot(list, 31), Some(2));
         assert_eq!(taskbar_slot(list, 21), None, "a window on another desktop has no slot");
         // A title that contains a digit must not be mistaken for an id: the match is on the
         // group's own `id:` prefix, not on the group containing the number anywhere.
-        assert_eq!(taskbar_slot("desktop 1 of 1 [7:file20.txt]", 20), None);
-        assert_eq!(taskbar_slot("desktop 1 of 1 (empty)", 20), None);
+        assert_eq!(taskbar_slot("Desktop 1 of 1 [7:file20.txt]", 20), None);
+        assert_eq!(taskbar_slot("Desktop 1 of 1 (empty)", 20), None);
     }
 }

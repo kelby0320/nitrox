@@ -197,7 +197,7 @@ fn bar_view(clock: &str) -> Element<()> {
     row(alloc::vec![
         sized(
             libdraw::geom::Size::new(APPS_BUTTON_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("applications")),
+            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("Applications")),
         ),
         // **Centred on the screen, not on what is left of it.** Two equal flexible gaps put the
         // clock in the middle of the space *between* them, so without the balancing slot on the
@@ -323,7 +323,12 @@ fn desktop_label(desktops: &[Desktop], current: u32) -> alloc::string::String {
     match desktops.get(idx) {
         Some(d) if !d.name.is_empty() => s.push_str(&d.name),
         _ => {
-            s.push_str("desktop ");
+            // **Capitalised, and a *name* is not** (M14 Part F). A generated label is a title —
+            // every desktop names its own the way "Applications" and "No Windows" do — but a name
+            // a person chose is theirs, and title-casing it would be the shell editing their text.
+            // So the capital belongs here, in the fallback, rather than at the three places that
+            // draw the result.
+            s.push_str("Desktop ");
             let n = idx + 1;
             if n >= 10 {
                 s.push((b'0' + (n / 10) as u8) as char);
@@ -451,7 +456,7 @@ fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str, theme: &Theme) -> El
         // bar rather than an empty one.
         cells.push(sized(
             libdraw::geom::Size::new(ENTRY_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("no windows")),
+            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("No Windows")),
         ));
     }
     // **A flexible gap, so the indicator is drawn where the hit-test looks for it.** `row`
