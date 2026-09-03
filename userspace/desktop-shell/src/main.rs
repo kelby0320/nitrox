@@ -81,7 +81,7 @@ use librsproto::surface::{
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
 use libui::element::{
-    Element, Insets, bevel, column, fill, offset, padding, row, sized, stack, text,
+    Element, Insets, bevel, column, custom, fill, offset, padding, row, sized, stack, text,
 };
 use libui::diff::Tree;
 use libui::layout::layout;
@@ -1332,7 +1332,23 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     true
 }
 
-/// Put the theme's wallpaper on screen, if it names one. Returns the window id.
+/// The wallpaper, once it is on screen.
+///
+/// **The composed picture is kept**, which costs four megabytes for the machine's life and buys
+/// the overview its ground: the overview is a full-screen opaque window, so without this it
+/// covers the wallpaper with a flat colour and the desktop appears to lose its picture whenever
+/// you look at the desktops (reported from a real session, 2026-09-02). The alternatives are
+/// re-reading and re-decoding the file on every open — tens of milliseconds on a gesture that
+/// should feel instant — or keeping the *decoded* image instead, which is twice the size.
+struct Wallpaper {
+    /// The window it lives in: named among the shell's own, and made sticky.
+    window: u32,
+    /// The screen-sized XRGB8888 composition, pitch `SCREEN_W * 4`. Ground, picture and
+    /// letterbox, exactly as committed.
+    picture: alloc::vec::Vec<u8>,
+}
+
+/// Put the theme's wallpaper on screen, if it names one.
 ///
 /// **`Role::Panel` with a zero reservation, and that is the whole of "bottom-most and out of the
 /// way".** It is the one role that cannot take focus, so a press on the picture raises nothing
@@ -1361,7 +1377,7 @@ fn open_wallpaper(
     ns: u64,
     session: &mut Session<ChannelTransport>,
     theme: &Theme,
-) -> Option<u32> {
+) -> Option<Wallpaper> {
     let path = theme.wallpaper.as_ref()?;
     let bytes = match libfs::read_file(ns, path.as_str().as_bytes()) {
         Ok(b) => b,
@@ -1490,7 +1506,7 @@ fn open_wallpaper(
         .s(b" window ")
         .u(id as u64)
         .end();
-    Some(id)
+    Some(Wallpaper { window: id, picture })
 }
 
 /// Read the session's theme from `THEME_PATH`, falling back to the built-in one.
@@ -1676,6 +1692,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // is bottom-first in the compositor's stack, so making it first is what makes it bottom-most
     // — no `Manage::Lower` needed, and nothing this shell raises later can get underneath it.
     let wallpaper = open_wallpaper(session_ns, &mut session, &theme);
+    // Read often enough to be worth naming once. `0` is not a window id, so it is the "none"
+    // every `ours`-style check already treats as absent.
+    let wallpaper_window = wallpaper.as_ref().map_or(0, |w| w.window);
 
     // `panel`, not `normal`: the role is what reserves the strut, so ordinary windows are
     // placed below the bar rather than under it. M6 Part A built that and nothing but a test
@@ -1990,7 +2009,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // **The gate could not have caught it**: `check-login` asserts the wallpaper line once,
         // at startup, and its `Super+2` comes hundreds of lines later. What catches it is the
         // step added below.
-        for surface in [Some(window), bottom, wallpaper].into_iter().flatten() {
+        for surface in [Some(window), bottom, Some(wallpaper_window).filter(|&w| w != 0)]
+            .into_iter()
+            .flatten()
+        {
             if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, surface, STICKY_DESKTOP) {
                 Line::new().s(b"desktop-shell: surface ").u(surface as u64).s(b" is sticky").end();
             } else {
@@ -2155,7 +2177,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // `panel`s and the modal a `popup`, so the role filter already covers them, but
             // naming them is what keeps that true if a future shell window is `normal`.
             let ours =
-                [window, bottom.unwrap_or(0), modal.unwrap_or(0), wallpaper.unwrap_or(0)];
+                [window, bottom.unwrap_or(0), modal.unwrap_or(0), wallpaper_window];
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
                 alloc::vec::Vec::new();
@@ -2888,6 +2910,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         overview = open_overview(
                             &mut session, window, &theme, &font, &shots, &desktops,
                             current_desktop, &entries, &mut over_addrs,
+                            wallpaper.as_ref().map(|w| w.picture.as_slice()),
                         );
                         if let Some(id) = overview {
                             stick(m, id, b"the overview");
@@ -3043,6 +3066,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 present_overview(
                     &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
                     &entries, &over_addrs,
+                    wallpaper.as_ref().map(|w| w.picture.as_slice()),
                 );
                 Line::new()
                     .s(b"desktop-shell: overview now showing ")
@@ -3462,6 +3486,7 @@ fn render_overview(
     desktops: &[Desktop],
     current: u32,
     entries: &[WinEntry],
+    wallpaper: Option<&[u8]>,
 ) -> MemFramebuffer {
     let geometry =
         Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::XRGB8888)
@@ -3470,11 +3495,49 @@ fn render_overview(
     let mut fb = MemFramebuffer::new(geometry);
     // A ground to draw on, so a thumbnail that fails to capture reads as a gap rather than as
     // whatever the allocation happened to hold.
-    for y in 0..SCREEN_H as u32 {
-        for x in 0..SCREEN_W {
-            fb.put_pixel(x, y, libdraw::scene::BACKGROUND);
+    //
+    // **The wallpaper, dimmed, when there is one.** The overview is a full-screen *opaque*
+    // window — there is no alpha channel anywhere in this system — so it does not sit over the
+    // desktop, it replaces it. Painting a flat colour therefore made the picture disappear
+    // whenever you looked at the desktops, which is not what an overview is: it is supposed to
+    // read as an overlay *on* the desktop (reported from a real session, 2026-09-02).
+    //
+    // **Dimmed rather than shown at full brightness**, which is what makes it read as behind
+    // something. `blend` composites black over each pixel at a coverage — the same primitive
+    // glyph rasterisation uses, and no alpha channel is stored anywhere. GNOME blurs as well;
+    // a blur is a separable convolution over a million pixels per open, and dimming alone is
+    // what the request asked for.
+    // **`libdraw::scale::dim` does the composite**, not a loop here: the source pitch and the
+    // destination pitch are the arithmetic that is invisible when wrong and expensive to find by
+    // booting, which is the argument `place` already carries. It reports rather than falling
+    // back silently, so a ground that did not come out says so (PR #273 review, optional 5).
+    let mut dimmed = false;
+    if let Some(p) = wallpaper {
+        let src = Geometry::with_pitch(
+            SCREEN_W,
+            SCREEN_H as u32,
+            SCREEN_W as usize * 4,
+            PixelFormat::XRGB8888,
+        );
+        dimmed = src.is_some_and(|src| {
+            libdraw::scale::dim(p, src, OVERVIEW_DIM, fb.bytes_mut(), geometry)
+        });
+        if !dimmed {
+            kprint(b"desktop-shell: the overview could not dim the wallpaper\n");
         }
     }
+    if !dimmed {
+        for y in 0..SCREEN_H as u32 {
+            for x in 0..SCREEN_W {
+                fb.put_pixel(x, y, libdraw::scene::BACKGROUND);
+            }
+        }
+    }
+    // **The wallpaper again, scaled once for every miniature that wants it.** Once rather than
+    // per row: `box_downscale` averages the whole source per destination pixel, so doing it per
+    // desktop would repeat a million reads for an identical answer.
+    let mini = wallpaper.and_then(|p| mini_wallpaper(p));
+
     // The sidebar's rows, drawn through the toolkit so they look like the rest of the shell.
     let mut rows: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
     for d in desktops {
@@ -3484,7 +3547,10 @@ fn render_overview(
         rows.push(sized(
             libdraw::geom::Size::new(SIDE_W, SIDE_ROW_H),
             row(alloc::vec![
-                padding(Insets::all(MINI_PAD), desktop_preview(entries, d.id, theme)),
+                padding(
+                    Insets::all(MINI_PAD),
+                    desktop_preview(entries, d.id, theme, mini.is_some())
+                ),
                 padding(Insets { top: 8, right: 8, bottom: 8, left: 0 }, text(label)),
             ]),
         ));
@@ -3504,7 +3570,33 @@ fn render_overview(
     // what the request called out. Translucency is what it asked for and that waits on an alpha
     // channel; a dark panel with light ink is what reads as deliberate without one.
     let side_theme = sidebar(theme);
-    paint(&mut fb, font, &side_theme, &side, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
+    // **The shell's first custom node**, and what it draws is the miniature's ground. Bounded by
+    // the clip as well as the node's rect: `paint` gives both, and a callback that honoured only
+    // the rect would draw a whole miniature over a partly-damaged sidebar.
+    paint(&mut fb, font, &side_theme, &side, &l, bounds, &mut |kind,
+                                                              rect,
+                                                              clip,
+                                                              fb: &mut MemFramebuffer| {
+        if kind != MINI_KIND {
+            return;
+        }
+        let Some((px, g)) = mini.as_ref() else { return };
+        for y in 0..g.height {
+            for x in 0..g.width {
+                let (dx, dy) = (rect.origin.x + x as i32, rect.origin.y + y as i32);
+                if dx < clip.origin.x
+                    || dy < clip.origin.y
+                    || dx >= clip.right() as i32
+                    || dy >= clip.bottom() as i32
+                {
+                    continue;
+                }
+                let off = y as usize * g.pitch + x as usize * 4;
+                let Some(b) = px.get(off..off + 4) else { continue };
+                let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                fb.put_pixel(dx as u32, dy as u32, PixelFormat::XRGB8888.decode(word));
+            }
+        }
     });
 
     // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
@@ -3524,6 +3616,32 @@ fn render_overview(
         }
     }
     fb
+}
+
+/// The wallpaper scaled to one sidebar miniature's interior, or `None` if it will not scale.
+///
+/// **Undimmed, unlike the overview's own ground.** The ground is dimmed so the things drawn over
+/// it read; a miniature *is* the thing being read, and a dimmed one would be a picture of a
+/// desktop nobody has.
+fn mini_wallpaper(picture: &[u8]) -> Option<(alloc::vec::Vec<u8>, Geometry)> {
+    let src = Geometry::with_pitch(
+        SCREEN_W,
+        SCREEN_H as u32,
+        SCREEN_W as usize * 4,
+        PixelFormat::XRGB8888,
+    )?;
+    let (w, h) = (MINI_W - 2, MINI_H - 2);
+    let dst = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888)?;
+    let mut out = alloc::vec![0u8; dst.pitch * h as usize];
+    if !libdraw::scale::box_downscale(picture, src, &mut out, dst) {
+        // **Said rather than silently fallen back from** (PR #273 review, optional 5). A `None`
+        // here puts every miniature back to flat blue — which is precisely the bug this change
+        // exists to fix, reappearing with nothing printed and nothing failing. Every other
+        // failure around the wallpaper names itself; this one did not.
+        kprint(b"desktop-shell: the overview could not scale the wallpaper for a miniature\n");
+        return None;
+    }
+    Some((out, dst))
 }
 
 /// Capture a thumbnail of every window on `current`, replacing whatever `shots` held.
@@ -3560,6 +3678,7 @@ fn recapture(
 /// creator and is *not* held for the manager — which is what a shell creating a window while
 /// holding its own manager channel needs, as Part C learned the hard way. And a popup takes
 /// keyboard focus, so Escape closes it; a `panel` never could.
+#[allow(clippy::too_many_arguments)]
 fn open_overview(
     session: &mut Session<ChannelTransport>,
     parent: u32,
@@ -3570,6 +3689,7 @@ fn open_overview(
     current: u32,
     entries: &[WinEntry],
     addrs: &mut [*mut u8; BUFFERS],
+    wallpaper: Option<&[u8]>,
 ) -> Option<u32> {
     let len = OVER_PITCH * SCREEN_H as usize;
     let id = session
@@ -3610,11 +3730,21 @@ fn open_overview(
         kprint(b"desktop-shell: overview buffers FAILED\n");
         return None;
     }
-    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs);
+    // **One line whichever way it went**, the shape `read_theme` uses: it says the overview
+    // *decided* about a ground without a gate having to assert which way, so "delete the
+    // wallpaper and the overview still opens" is a control that runs against the committed gate
+    // rather than one that needs a step edited out.
+    if wallpaper.is_some() {
+        kprint(b"desktop-shell: overview ground is the wallpaper\n");
+    } else {
+        kprint(b"desktop-shell: overview ground is the desktop colour\n");
+    }
+    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs, wallpaper);
     Some(id)
 }
 
 /// Render the overview into a free buffer and commit it.
+#[allow(clippy::too_many_arguments)]
 fn present_overview(
     session: &mut Session<ChannelTransport>,
     id: u32,
@@ -3625,9 +3755,11 @@ fn present_overview(
     current: u32,
     entries: &[WinEntry],
     addrs: &[*mut u8; BUFFERS],
+    wallpaper: Option<&[u8]>,
 ) {
     let len = OVER_PITCH * SCREEN_H as usize;
-    let bytes = render_overview(theme, font, shots, desktops, current, entries).into_bytes();
+    let bytes =
+        render_overview(theme, font, shots, desktops, current, entries, wallpaper).into_bytes();
     if bytes.len() != len {
         return;
     }
@@ -3676,16 +3808,39 @@ fn close_overview(
 /// it is a different feature from drawing where its windows are.
 ///
 /// What the shell does have is every window's origin, size and desktop, which it keeps for the
-/// taskbar. So this is arithmetic, not pixels: it needs no capture, no scaling, and no image
-/// decoding — which is what the same request looked like it needed.
+/// taskbar. So the *windows* are arithmetic rather than pixels: they need no capture, no scaling
+/// and no image decoding — which is what the same request looked like it needed.
+///
+/// **The ground beneath them is pixels, since 2026-09-02**, and that is the one clause above
+/// that stopped being true: a miniature's ground is the wallpaper, box-downscaled once for every
+/// row. A preview of a desktop that has a picture, drawn as flat blue, is a preview of a desktop
+/// nobody has (PR #273 review, optional 3).
 ///
 /// **Bordered boxes rather than filled ones**, so two overlapping windows read as two.
-fn desktop_preview(entries: &[WinEntry], desktop: u32, theme: &Theme) -> Element<()> {
+fn desktop_preview(
+    entries: &[WinEntry],
+    desktop: u32,
+    theme: &Theme,
+    wallpaper: bool,
+) -> Element<()> {
     // The screen's proportions, so the miniature is the shape of the thing it stands for.
     let (iw, ih) = (MINI_W - 2, MINI_H - 2);
     let mut layers = alloc::vec::Vec::with_capacity(4);
     layers.push(fill(theme.border));
-    layers.push(padding(Insets::all(1), fill(theme.desktop)));
+    // **The miniature's ground is what a desktop's ground actually is**, which since M12 Part F
+    // is a picture rather than a colour. A preview showing flat blue while the desktop behind it
+    // shows a photograph is a preview of something that does not exist — the same complaint the
+    // overview's own ground drew, one level down. A `custom` node because the picture is pixels:
+    // there is nothing here for the toolkit to lay out, and `render_overview`'s paint callback
+    // blits the thumbnail it scaled once.
+    layers.push(padding(
+        Insets::all(1),
+        if wallpaper {
+            custom(MINI_KIND, libdraw::geom::Size::new(iw, ih))
+        } else {
+            fill(theme.desktop)
+        },
+    ));
     for e in entries.iter().filter(|e| e.desktop == desktop && !e.minimized) {
         // Scaled by the same ratio in both axes as the screen, and clamped into the interior: a
         // window dragged partly off-screen must not draw outside the miniature that stands for
@@ -3709,12 +3864,26 @@ fn desktop_preview(entries: &[WinEntry], desktop: u32, theme: &Theme) -> Element
     sized(libdraw::geom::Size::new(MINI_W, MINI_H), stack(layers))
 }
 
+/// The `custom` node a sidebar miniature's ground is drawn as. See [`desktop_preview`].
+const MINI_KIND: u32 = 1;
+
 /// A sidebar miniature's size — the screen's 16:10, small enough for a row.
 const MINI_W: u32 = 96;
 /// See [`MINI_W`].
 const MINI_H: u32 = 60;
 /// Space around a miniature inside its row.
 const MINI_PAD: u32 = 6;
+
+// **The miniature is a size `box_downscale` will accept, and the compiler is what says so.**
+// That function refuses a destination larger than the source in either axis, and a refusal here
+// puts every preview back to a flat colour — which is precisely the bug this change exists to
+// fix, reappearing with nothing failing (PR #273 review, optional 5). A gate line would report
+// it; this makes it unbuildable, which is better: raising `MINI_W` past the screen's width is
+// then a compile error beside the constant rather than flat blue somebody notices in a month.
+const _: () = assert!(
+    MINI_W > 2 && MINI_H > 2 && MINI_W - 2 <= SCREEN_W && MINI_H - 2 <= SCREEN_H as u32,
+    "a sidebar miniature must be smaller than the screen it is a miniature of"
+);
 
 /// The overview's sidebar width, at the right-hand edge.
 const SIDE_W: u32 = 200;
@@ -3735,6 +3904,14 @@ const THUMB_PAD: u32 = 16;
 const THUMB_COLS: u32 = (SCREEN_W - SIDE_W) / (THUMB_W + THUMB_PAD);
 /// Bytes per row of the overview's own buffer.
 const OVER_PITCH: usize = (SCREEN_W as usize) * 4;
+
+/// How far the wallpaper is darkened under the overview, as a coverage of black.
+///
+/// **Enough that light ink and pale thumbnails read over a photograph**, and not so much that
+/// the picture stops being recognisable — the point is that the desktop is still *there*. A
+/// number rather than a theme key: it is the overview's own composition, like the sidebar's
+/// panel, and M11's decision 2 keeps chrome metrics out of what a theme file can set.
+const OVERVIEW_DIM: u8 = 150;
 
 /// Where thumbnail `i` sits in the overview, in overview-local pixels.
 ///

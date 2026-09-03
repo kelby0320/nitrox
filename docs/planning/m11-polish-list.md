@@ -94,6 +94,12 @@ a request is being met in a particular way.
 - [x] **Stretch 2** - Can we have a date and time centered on the top bar similar to Gnome?
       *(batch 9 — `YYYY-MM-DD HH:MM`, UTC, centred on the screen. No timezone database and no
       locale, so a localised form would be a fiction; it also agrees with what `date` prints.)*
+- [x] **The overview covered the wallpaper** *(reported 2026-09-02, after M12 Part F shipped the
+      background)*. It is a full-screen opaque window, so it replaced the desktop rather than
+      sitting over it. It draws the wallpaper dimmed now, and the sidebar miniatures draw it
+      scaled — which is the nearest thing to the translucency Stretch 3 below asks for that is
+      reachable without an alpha channel, and it arrived from driving the system rather than
+      from a list.
 - [~] **Stretch 3** - Transparency support.  Specifically for the desktop sidebar.  Instead of a solid white sidbar it would be nice if it was transparent and instead of line items (desktop 1, desktop 2, etc.) it had a small preview of the desktop similar to Gnome.  We could do scaled down windows in the same orientation as the actual desktop.  That would be very close to what Gnome looks like.  Or, if it's similar, we could just draw rectangles in instead of scaled down windows.  Whatever is easy.  The north star for this is the look of Gnome or Cosmic desktop.
 - [x] nxedit doesn't launch from the menu. *(batch 7 — it launched and exited: it required
       `argv[1]` and the modal passes none. It opens untitled now and asks for a name on save.)*
@@ -178,4 +184,6 @@ Capability rather than appearance. See
 [`display-arm-plan.md`](display-arm-plan.md) → Milestone 12.
 
 *(nothing new yet — and M12 has since closed the one item on the Open list above that was filed
-here rather than deferred: the desktop background's image half, in Part F.)*
+here rather than deferred: the desktop background's image half, in Part F — and since 2026-09-02
+the shipped wallpaper is one of the maintainer's own photographs rather than a generated fixture,
+which is what the request was actually about.)*

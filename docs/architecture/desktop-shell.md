@@ -138,7 +138,7 @@ GNOME 2 window list; GNOME 3's automatic workspace lifecycle is shelved rather t
 | **Top bar** | yes | workspaces button (left), applications button, clock (centre), tray (right, v2) | low |
 | **Bottom bar** | yes | window list, desktop indicator | **high** — every open, close, retitle, focus change |
 | **Applications modal** | no | search field, filtered entries | **highest** — the whole list is rebuilt per keystroke |
-| **Overview** | no | thumbnails of the current desktop, sidebar of the others | bursty |
+| **Overview** | no | thumbnails of the current desktop, sidebar of the others, over the dimmed wallpaper | bursty |
 
 The churn column is not decoration: it is what settled the toolkit question in §5 — and the
 wallpaper's zero is why it is the one surface here that builds no element tree at all: it is a
@@ -150,6 +150,17 @@ cannot take focus, a zero reservation subtracts nothing, and the compositor's st
 creation-ordered so creating it first puts it under everything. Like the bars it is made
 **sticky**, because a picture behind everything belongs to the screen rather than to one desktop.
 It is absent when the theme names no file, which is the shipped default.
+
+**And the overview keeps it.** The overview is a full-screen *opaque* window — there is no alpha
+channel anywhere in this system — so it does not sit over the desktop, it replaces it, and a flat
+ground made the picture disappear whenever you looked at the desktops. It draws the wallpaper
+**dimmed** instead, which is what makes it read as an overlay without translucency, and each
+sidebar miniature draws the wallpaper **scaled and undimmed**: the ground is dimmed so the things
+over it read, and a miniature *is* the thing being read. The shell keeps the composed picture for
+this — four megabytes, against re-decoding the file on a gesture that should feel instant. The
+composite itself is [`libdraw::scale::dim`](../../userspace/libdraw/src/scale.rs), not a loop in
+the shell: a source pitch and a destination pitch are the arithmetic that is invisible when wrong
+and expensive to find by booting, which is the argument `place` already carries.
 
 ## 3. One process, several windows
 

@@ -4162,11 +4162,21 @@ The two taken before this pass — the clipboard's owner and the image format �
       because a pitch and an origin are exactly the arithmetic that is invisible when wrong and
       expensive to discover by booting.
 
-- [x] **Gate** ✅: `check-login` asserts `wallpaper 1920x1080 drawn 1280x720 at 0,40 window N`.
+- [x] **Gate** ✅: `check-login` asserts `wallpaper 1920x1200 drawn 1280x800 at 0,0 window N`.
       The staged picture is **deliberately not the screen's size** — the same argument
-      `THEME_FONT_PX` rests on: 1920x1080 can only have come from an `IHDR` that was read, and
-      `1280x720 at 0,40` only from the fit having run on it. A stretch-to-fill would say
-      `1280x800 at 0,0`.
+      `THEME_FONT_PX` rests on: `1920x1200` can only have come from an `IHDR` that was read.
+
+      **The shipped wallpaper is a photograph the maintainer supplied** (2026-09-02), committed
+      at `assets/wallpapers/` as taken and centre-cropped to 16:10 by the build — so nothing is
+      lost and the crop is a dozen readable lines rather than a decision baked into a binary. It
+      replaced a generated gradient, whose argument (no unreviewable binary is load-bearing for a
+      gate) is weaker once the asset is *content* a person chose.
+
+      **What that cost the gate, stated rather than left to be noticed**: the *drawn* size no
+      longer tells fit from fill, because 16:10 into a 16:10 screen is `1280x800 at 0,0` under
+      either rule. The 16:9 gradient discriminated there — and cost 107 pixels of bare desktop
+      down each side of a real picture. What pins fit-versus-fill is `libdraw::scale`'s own
+      stretch control, which fails six tests in a second rather than one gate in three minutes.
 
 - [x] **Review fixes** ✅ (PR #272). One blocking: **the wallpaper was never made sticky**, so
       it lived on desktop 1 and every other desktop showed the bare ground colour — reading as

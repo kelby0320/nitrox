@@ -70,16 +70,25 @@ const THEME_FONT_PX: u8 = 14;
 /// is this path inside the session — the same relationship `THEME_PATH` has to `theme.toml`.
 const WALLPAPER_PATH: &str = "/home/wallpaper.png";
 
-/// The size of the generated wallpaper, and **deliberately not the screen's** — 1920x1080 into
-/// a 1280x800 screen is 16:9 into 16:10, so the fit is a real downscale *and* a real letterbox.
+/// The size the staged wallpaper is cropped to, and **deliberately not the screen's**.
 ///
 /// The same argument [`THEME_FONT_PX`] rests on: a picture the size of the screen would let a
-/// shell that never decoded anything report the right numbers. These two can only have come from
-/// an `IHDR` that was actually read, and the drawn size (1280x720, inset 40 rows) can only have
-/// come from the fit arithmetic having run on them.
+/// shell that never decoded anything report the right numbers, so the gate would pass with the
+/// decoder gone. 1920x1200 can only have come from an `IHDR` that was actually read.
+///
+/// **What it no longer distinguishes is fit from fill**, and that is worth stating rather than
+/// leaving for somebody to notice: 16:10 into a 16:10 screen draws at `1280x800 at 0,0` under
+/// either rule, so the *drawn* half of the shell's line stopped carrying weight when the shipped
+/// picture became the screen's shape. The decoded half still does, and what pins fit-versus-fill
+/// is `libdraw::scale`'s own control — the one that stretches to fill and takes six tests down
+/// with it. A gate cannot have both here: a picture whose drawn size discriminates is a picture
+/// with bars down the side, which is not what the desktop should look like.
 const WALLPAPER_W: u32 = 1920;
-/// See [`WALLPAPER_W`].
-const WALLPAPER_H: u32 = 1080;
+/// See [`WALLPAPER_W`]. 16:10, which is the screen's shape.
+const WALLPAPER_H: u32 = 1200;
+
+/// The photograph the wallpaper is cropped from — see `assets/wallpapers/README.md`.
+const WALLPAPER_ASSET: &str = "assets/wallpapers/scuba-divers.png";
 const DEMO_SALT: [u8; 8] = [0x9e, 0x3f, 0xa2, 0x5c, 0x71, 0x0b, 0xd4, 0x86];
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -1916,12 +1925,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // beside its position scans past output that was there — the same rule the theme's own line
     // above states, and the one M11 Part C learned the expensive way.
     //
-    // **Both numbers, because they answer different questions.** `1920x1080` can only have come
-    // from an `IHDR` the guest actually read — the staged picture is deliberately not the
-    // screen's size, so a shell that decoded nothing cannot report it, exactly as `THEME_FONT_PX`
-    // is deliberately not the built-in 16. `1280x720 at 0,40` can only have come from the fit
-    // arithmetic having run on those numbers: 16:9 into a 16:10 screen is a real downscale and a
-    // real letterbox, and a stretch-to-fill would say `1280x800 at 0,0`.
+    // **The decoded size is the half that discriminates.** `1920x1200` can only have come from
+    // an `IHDR` the guest actually read — the staged picture is deliberately not the screen's
+    // size, so a shell that decoded nothing cannot report it, exactly as `THEME_FONT_PX` is
+    // deliberately not the built-in 16.
+    //
+    // **The drawn size no longer tells fit from fill**, and that changed when the shipped
+    // wallpaper became a real photograph cropped to the screen's shape: 16:10 into 16:10 is
+    // `1280x800 at 0,0` under either rule. It was `1280x720 at 0,40` while the fixture was a
+    // 16:9 gradient, which discriminated — and cost 107 pixels of bare desktop down each side of
+    // a real picture, which is not what a desktop should look like. What pins fit-versus-fill is
+    // `libdraw::scale`'s own stretch control, where it belongs: it fails six tests in a second
+    // rather than one gate in three minutes. See [`WALLPAPER_W`].
     //
     // A picture is pixels a release-image boot has no reference for, which is what the plan says
     // about this gate; the dimensions are what can be asserted, and they pin the whole chain —
@@ -1933,7 +1948,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `window N` on the end is what makes this an assertion about a picture on screen rather
     // than about arithmetic.
     session.expect(&format!(
-        "desktop-shell: wallpaper {WALLPAPER_W}x{WALLPAPER_H} drawn 1280x720 at 0,40 window "
+        "desktop-shell: wallpaper {WALLPAPER_W}x{WALLPAPER_H} drawn 1280x800 at 0,0 window "
     ))?;
     // **Kept, because stickiness is asserted against this id** further down: a press on an empty
     // desktop has to name *this* window, and `win=none` is what a wallpaper stamped with
@@ -2494,6 +2509,24 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // overview to open. Escape closes it again so the serial login below is not typing at a
     // popup that holds the keyboard.
     click_at(&mut qmp, &mut session, 1200, 788)?;
+    // **Before the "overview open" line, because that is where it is** — `open_overview` reports
+    // its ground and the caller announces the window afterwards. An expectation placed beside
+    // its *topic* rather than beside its position in the stream scans past output that was
+    // there, which is the rule this file states about the theme and re-learns here.
+    //
+    // **The overview keeps the desktop's picture** (reported from a real session, 2026-09-02).
+    // It is a full-screen *opaque* window — there is no alpha channel in this system — so it
+    // does not sit over the desktop, it replaces it, and painting a flat colour made the
+    // wallpaper disappear whenever you looked at the desktops. It is the wallpaper dimmed now,
+    // and each sidebar miniature is the wallpaper scaled, because a preview showing flat blue
+    // while the desktop behind it shows a photograph is a preview of something that does not
+    // exist.
+    //
+    // **The line, not the pixels.** A release-image boot has no reference render to compare a
+    // photograph against; what this pins is that the picture was kept, passed down and used.
+    // `cargo xtask shot` is what shows the result, which is what that tool is for.
+    session.expect("desktop-shell: overview ground is the wallpaper")?;
+    println!("  ok: the overview kept the desktop's picture rather than covering it");
     session.expect("desktop-shell: overview open, window ")?;
     press(&mut qmp, "esc")?;
     session.expect("desktop-shell: overview closed")?;
@@ -4956,29 +4989,69 @@ fn encode_png(w: u32, h: u32, rgb: &[u8]) -> R<Vec<u8>> {
     Ok(out)
 }
 
-/// The staged wallpaper's bytes: a gradient at [`WALLPAPER_W`] × [`WALLPAPER_H`].
+/// The staged wallpaper's bytes: [`WALLPAPER_ASSET`], centre-cropped to 16:10.
 ///
-/// **A gradient rather than a flat fill**, and that is the one property the picture needs beyond
-/// its size: a solid colour would decode identically under a broken unfilter, because every
-/// predictor of a constant row is the constant. A gradient varies along both axes, so `Sub`,
-/// `Up`, `Average` and `Paeth` all produce different bytes and a decoder that got one wrong
-/// produces visible bands. The encoder chooses the filters, so this does not name them.
+/// **The repository keeps the photograph as supplied and the crop happens here.** It is 4:3 and
+/// the screen is 16:10, so fitting it whole leaves 107 pixels of desktop colour down each side —
+/// which is what it looked like, and not what a wallpaper should. Cropping in the build rather
+/// than committing a pre-cropped file means nothing is lost and the decision is a dozen lines
+/// somebody can read rather than something baked into a binary nobody can review.
 ///
-/// **Generated rather than checked in.** A binary asset in a repository is one nobody reviews,
-/// and every property a gate wants from this is a property of these fifteen lines.
+/// **Centre, and only vertically.** The crop takes the full width and drops equal numbers of
+/// rows from the top and bottom, which for this picture is empty water; a horizontal crop would
+/// have to decide which diver to lose.
+///
+/// This replaced a generated gradient, which existed so that no unreviewable binary was
+/// load-bearing for a gate. That argument is weaker than it sounds now the asset is *content* a
+/// person chose rather than a fixture: what the gate needs from it is its size, and that is
+/// asserted against [`WALLPAPER_W`] and [`WALLPAPER_H`] here, from the same crop that produced
+/// it.
 fn wallpaper_png() -> R<Vec<u8>> {
-    let (w, h) = (WALLPAPER_W, WALLPAPER_H);
-    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            // A blue-green wash with a red ramp across it — three channels that do not track
-            // each other, so a swapped channel is visible rather than symmetric.
-            rgb.push((x * 255 / w) as u8);
-            rgb.push((y * 255 / h) as u8);
-            rgb.push(((x + y) * 255 / (w + h)) as u8);
-        }
+    let path = repo_root().join(WALLPAPER_ASSET);
+    // `BufRead`, which the decoder wants: it reads chunk headers a few bytes at a time.
+    let file = std::io::BufReader::new(
+        fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
+    );
+    let mut reader = png::Decoder::new(file)
+        .read_info()
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let info = reader.info().clone();
+    if info.color_type != png::ColorType::Rgb || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "{}: the staged wallpaper must be 8-bit RGB, not {:?}/{:?}",
+            path.display(),
+            info.color_type,
+            info.bit_depth
+        )
+        .into());
     }
-    encode_png(w, h, &rgb)
+    // **An overflow guard, not an interlace check.** `png`'s own doc: "Returns `None` if the
+    // output buffer does not fit into the memory space of the machine." An interlaced RGB8 file
+    // returns `Some` and de-interlaces into the same layout, so this would pass it straight
+    // through — which is fine here, since the guest's decoder is the one that refuses
+    // interlacing and this is a host-side crop. The first version of this comment said the
+    // opposite (PR #273 review, optional 4).
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| format!("{}: the decoder cannot size this image", path.display()))?;
+    let mut src = vec![0u8; size];
+    let frame = reader.next_frame(&mut src).map_err(|e| format!("decode: {e}"))?;
+    let (sw, sh) = (frame.width, frame.height);
+    if sw != WALLPAPER_W || sh < WALLPAPER_H {
+        return Err(format!(
+            "{}: expected {WALLPAPER_W} wide and at least {WALLPAPER_H} tall, got {sw}x{sh}",
+            path.display()
+        )
+        .into());
+    }
+    let top = ((sh - WALLPAPER_H) / 2) as usize;
+    let row = sw as usize * 3;
+    let mut rgb = Vec::with_capacity(row * WALLPAPER_H as usize);
+    for y in 0..WALLPAPER_H as usize {
+        let o = (top + y) * row;
+        rgb.extend_from_slice(&src[o..o + row]);
+    }
+    encode_png(WALLPAPER_W, WALLPAPER_H, &rgb)
 }
 
 /// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
@@ -9117,11 +9190,15 @@ fn assemble_image(
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;
     }
-    // The wallpaper itself, **generated rather than checked in**: a binary asset in the repo is
-    // one nobody can review, and the properties a gate needs from it — its size, and that its
-    // pixels vary — are properties of the generator. It is a real PNG all the same, written by
-    // the `png` crate `preview` already uses, so the guest's decoder is reading an encoder it
-    // shares nothing with.
+    // The wallpaper itself. **The maintainer's photograph, committed as taken and cropped here**
+    // — see `wallpaper_png` for why the crop is a build step rather than a pre-cropped file, and
+    // `assets/wallpapers/README.md` for the picture's provenance.
+    //
+    // This block used to say "generated rather than checked in", which was the argument for the
+    // gradient that came before: no unreviewable binary should be load-bearing for a gate. The
+    // asset is *content* a person chose now, and the comment outlived it by one commit — a
+    // reader who starts here would have got the superseded reasoning and never reached the new
+    // one four thousand lines away (PR #273 review, worth fixing 2).
     {
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("wallpaper.png");
         let bytes = wallpaper_png()?;
