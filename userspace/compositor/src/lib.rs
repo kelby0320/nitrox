@@ -35,8 +35,8 @@ use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
 use libdraw::theme::Theme;
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, STICKY_DESKTOP,
-    WINDOW_FLAG_MINIMIZED,
+    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role,
+    SURFACE_FORMAT_ARGB8888, SURFACE_FORMAT_XRGB8888, STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
@@ -900,9 +900,18 @@ impl WindowStack {
     /// are reclaimed on destroy. Filed because the per-connection window cap made this the one
     /// thing here that is not bounded.
     pub fn attach(&mut self, req: &AttachBufferRequest) -> Result<(), StackError> {
-        let geometry =
-            Geometry::with_pitch(req.width, req.height, req.pitch as usize, PixelFormat::XRGB8888)
-                .ok_or(StackError::BadGeometry)?;
+        // **The tag decides whether this surface is opaque**, and nothing else does (M13 Part B).
+        // The wire decoder has already refused anything but these two, so an unrecognised value
+        // cannot arrive here — but defaulting to opaque on one that did would be the dangerous
+        // direction: a translucent surface treated as opaque loses the fill beneath it and
+        // composites against stale pixels, which reads as a colour rather than as an error.
+        let format = match req.format {
+            SURFACE_FORMAT_ARGB8888 => PixelFormat::ARGB8888,
+            SURFACE_FORMAT_XRGB8888 => PixelFormat::XRGB8888,
+            _ => return Err(StackError::BadGeometry),
+        };
+        let geometry = Geometry::with_pitch(req.width, req.height, req.pitch as usize, format)
+            .ok_or(StackError::BadGeometry)?;
         let w = self
             .windows
             .iter_mut()
@@ -2291,6 +2300,46 @@ mod tests {
         let mut n = WindowStack::new();
         let req = CreateWindowRequest::new(1, 1, Role::Normal);
         assert_eq!(d.create(&req).unwrap(), n.create(&req).unwrap());
+    }
+
+    // ---- alpha (M13 Part B) ----
+
+    #[test]
+    fn a_window_attached_in_argb_is_composited_translucent() {
+        // End to end from the wire tag: the attach request's `format` is the only thing that
+        // makes this window translucent, so this covers the mapping `attach` does as well as the
+        // blend itself. A tag ignored on the way in would show up here as a flat red square.
+        let mut stack = WindowStack::new();
+        let mut src = MapSource::default();
+        let id = shown(&mut stack, &CreateWindowRequest::new(8, 8, Role::Normal));
+        stack
+            .attach(&AttachBufferRequest {
+                window: id,
+                buffer: 0,
+                width: 8,
+                height: 8,
+                pitch: 32,
+                format: SURFACE_FORMAT_ARGB8888,
+            })
+            .unwrap();
+        stack.commit(&commit(id, 0)).unwrap();
+
+        let ink = Rgb::new(200, 40, 40);
+        let g = Geometry::with_pitch(8, 8, 32, PixelFormat::ARGB8888).unwrap();
+        let word = g.format.encode_alpha(ink, 128).to_le_bytes();
+        let mut px = vec![0u8; g.pitch * 8];
+        for p in px.chunks_exact_mut(4) {
+            p.copy_from_slice(&word);
+        }
+        src.0.insert((id, 0), px);
+
+        let bg = Rgb::new(9, 9, 9);
+        let mut fb = screen();
+        let full = fb.geometry().bounds();
+        stack.compose_into(&mut fb, bg, &src, &[full]);
+
+        assert_eq!(fb.get_pixel(1, 1), Some(ink.blend(bg, 128)));
+        assert_ne!(fb.get_pixel(1, 1), Some(ink), "the tag was ignored and it drew opaque");
     }
 
     // ---- Screen: the shadow buffer (M13 Part A) ----

@@ -13,8 +13,12 @@
 //! already in the buffer, and [`Font::draw_str`] passes the rasteriser's coverage straight
 //! through to it.
 //!
-//! **There is still no alpha channel**, and that is the point of the shape. Surfaces stay
-//! opaque XRGB8888 and compositing stays a copy; coverage is an argument to a blend, not a
+//! **Glyph coverage is still an argument rather than a channel**, and that is the point of the
+//! shape — M13 Part B added [`PixelFormat::ARGB8888`](crate::format::PixelFormat::ARGB8888) for
+//! surfaces that want to be translucent, and it changed nothing here. A rasterised glyph computes
+//! its coverage per pixel and blends immediately; storing it would mean carrying a channel from
+//! the rasteriser to the compositor to answer a question already answered. Text draws the same
+//! into an opaque surface and a translucent one; coverage is an argument to a blend, not a
 //! fourth byte in a pixel. What made the threshold necessary was the absence of the operation,
 //! not the absence of a channel.
 //!

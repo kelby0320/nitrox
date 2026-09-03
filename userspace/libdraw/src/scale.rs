@@ -244,7 +244,9 @@ pub fn place(
 
 /// Draw `src` onto `dst` with black composited over it at `coverage`.
 ///
-/// **The overlay a system with no alpha channel can have.** `desktop-shell`'s overview is a
+/// **The overlay a full-screen opaque window can have.** Written when the system had no alpha
+/// channel at all; M13 Part B added one, so a future overview can be a translucent surface over
+/// the real desktop and this function goes with it (Part C). Today `desktop-shell`'s overview is a
 /// full-screen *opaque* window — it does not sit over the desktop, it replaces it — so reading as
 /// an overlay means drawing what is behind it, darkened. [`Rgb::blend`] is the primitive, and
 /// nothing gains a stored channel.

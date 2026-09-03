@@ -178,7 +178,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     rationale twice — the aperture is not uncached, and the background fill was not where a frame's
     time went — and the second wrong answer led to the one that was, a row-wise `memcpy` in
     `blit_clipped` where the two formats match. Composing off-screen now *also* runs 3.7× faster
-    than painting the aperture did, by a mechanism the plan never named. The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
+    than painting the aperture did, by a mechanism the plan never named. **Part B is done** too
+    (2026-09-03): `libdraw` has an alpha channel, opt-in as `ARGB8888`, after the two cheaper
+    answers were tried — shadows need no substrate, and per-surface opacity dims a panel's text
+    along with its ground. Opaque surfaces keep Part A's row copy. The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
     without it would enlarge the flicker they sit on. **The control panel is trigger-gated**
     rather than scheduled: when settings outgrow a hand-edited file. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on

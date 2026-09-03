@@ -3497,7 +3497,8 @@ fn render_overview(
     // whatever the allocation happened to hold.
     //
     // **The wallpaper, dimmed, when there is one.** The overview is a full-screen *opaque*
-    // window — there is no alpha channel anywhere in this system — so it does not sit over the
+    // window — translucent surfaces exist since M13 Part B but the overview does not use one
+    // yet, which is Part C's work — so it does not sit over the
     // desktop, it replaces it. Painting a flat colour therefore made the picture disappear
     // whenever you looked at the desktops, which is not what an overview is: it is supposed to
     // read as an overlay *on* the desktop (reported from a real session, 2026-09-02).

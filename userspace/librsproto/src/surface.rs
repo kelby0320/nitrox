@@ -497,13 +497,25 @@ pub struct AttachBufferRequest {
     pub height: u32,
     /// Bytes per row. Not `width * 4`: the client may pad rows.
     pub pitch: u32,
-    /// Pixel format tag; see `docs/spec/rsproto-surface-ops.md`. Only `0` (XRGB8888) is
-    /// accepted today, and an unknown value is rejected rather than assumed.
+    /// Pixel format tag; see `docs/spec/rsproto-surface-ops.md`. `0` (XRGB8888) and `1`
+    /// (ARGB8888) are accepted, and an unknown value is rejected rather than assumed.
     pub format: u32,
 }
 
 /// Pixel format tag for `0x00RRGGBB`.
 pub const SURFACE_FORMAT_XRGB8888: u32 = 0;
+
+/// Pixel format tag for `0xAARRGGBB` — a surface that carries its own opacity.
+///
+/// **The extension the tag was added for.** `format` has been on the wire since M4 with exactly
+/// one accepted value and an explicit "unknown is rejected rather than assumed", so a second
+/// value costs no wire change and no version negotiation: a client built before M13 Part B sends
+/// `0` and gets what it always got, and one that sends `1` to a compositor built before it is
+/// refused rather than misread as opaque.
+///
+/// A surface in this format is composited a pixel at a time and cannot hide what is under it —
+/// see `libdraw::compose`. Ask for it only when translucency is wanted.
+pub const SURFACE_FORMAT_ARGB8888: u32 = 1;
 
 /// Write an `AttachBufferRequest` body.
 pub fn build_attach_buffer_request(out: &mut [u8], req: &AttachBufferRequest) -> Option<usize> {
@@ -535,7 +547,7 @@ pub fn parse_attach_buffer_request(body: &[u8]) -> Option<AttachBufferRequest> {
         pitch: get_u32(body, 16),
         format: get_u32(body, 20),
     };
-    if req.format != SURFACE_FORMAT_XRGB8888 {
+    if req.format != SURFACE_FORMAT_XRGB8888 && req.format != SURFACE_FORMAT_ARGB8888 {
         return None;
     }
     if (req.pitch as u64) < req.width as u64 * 4 {
@@ -2487,6 +2499,40 @@ mod tests {
         // bytes alone would put the caller's stack contents on the wire and two identical
         // requests would differ (PR #219 review, finding 4).
         assert_eq!(&buf[10..24], &[0u8; 14]);
+    }
+
+    #[test]
+    fn attach_accepts_the_two_known_formats_and_refuses_the_rest() {
+        // **The bytes are edited directly, not built.** A builder can only emit tags it knows
+        // about, so round-tripping one would test the encoder and leave the decoder's rejection —
+        // the half that protects an old compositor from a new client — unexercised. Byte 20 is
+        // the format word; see `docs/spec/rsproto-surface-ops.md`.
+        let mut buf = [0u8; ATTACH_BUFFER_REQUEST_LEN];
+        build_attach_buffer_request(
+            &mut buf,
+            &AttachBufferRequest {
+                window: 1,
+                buffer: 0,
+                width: 64,
+                height: 32,
+                pitch: 64 * 4,
+                format: SURFACE_FORMAT_XRGB8888,
+            },
+        )
+        .unwrap();
+
+        for tag in [SURFACE_FORMAT_XRGB8888, SURFACE_FORMAT_ARGB8888] {
+            buf[20..24].copy_from_slice(&tag.to_le_bytes());
+            let got = parse_attach_buffer_request(&buf).expect("a known format is accepted");
+            assert_eq!(got.format, tag, "the tag must survive the parse, not be normalised");
+        }
+        // **Rejected rather than treated as opaque**, which is the direction that matters: a
+        // translucent surface mistaken for an opaque one loses the background fill beneath it and
+        // composites against stale pixels, which reads as a colour rather than as an error.
+        for tag in [2u32, 3, 0xFFFF_FFFF, 0x8000_0000] {
+            buf[20..24].copy_from_slice(&tag.to_le_bytes());
+            assert!(parse_attach_buffer_request(&buf).is_none(), "format {tag} was accepted");
+        }
     }
 
     #[test]

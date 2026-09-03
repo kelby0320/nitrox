@@ -37,7 +37,8 @@ use librsproto::surface::{
     AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, OP_ATTACH_BUFFER,
     OP_COMMIT, OP_CONFIGURE,
     FocusEvent, KeyEvent, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_FOCUS_EVENT, OP_KEY_EVENT,
-    OP_POINTER_EVENT, OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_XRGB8888,
+    OP_POINTER_EVENT, OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_ARGB8888,
+    SURFACE_FORMAT_XRGB8888,
     build_attach_buffer_request, build_commit_request, build_create_window_request,
     build_destroy_window_request, parse_create_window_reply, parse_release_event,
 };
@@ -675,8 +676,36 @@ impl<T: Transport> WindowRef<'_, T> {
         pitch: u32,
         handle: u64,
     ) -> Result<(), UiError> {
-        let geometry = Geometry::with_pitch(width, height, pitch as usize, PixelFormat::XRGB8888)
-            .ok_or(UiError::Malformed)?;
+        self.attach_with_format(buffer_id, width, height, pitch, handle, PixelFormat::XRGB8888)
+    }
+
+    /// [`attach`](Self::attach), naming the buffer's pixel format.
+    ///
+    /// **`PixelFormat::ARGB8888` is what makes a window translucent** (M13 Part B), and it is the
+    /// only thing that does: the compositor reads opacity from the pixels, so there is no
+    /// separate "set opacity" request and no window attribute to keep in step with the buffer.
+    /// A client draws with [`PixelFormat::encode_alpha`] where it wants to see through, and with
+    /// the ordinary drawing routines everywhere else — [`PixelFormat::encode`] means an opaque
+    /// pixel in every format.
+    ///
+    /// **Cost, so the choice is made knowingly**: a translucent surface is composited a pixel at
+    /// a time rather than a row at a time, and it cannot hide what is beneath it, so the
+    /// compositor also paints the background under it. Ordinary windows should stay opaque.
+    ///
+    /// A format the compositor does not accept is refused at the wire decoder rather than
+    /// treated as opaque, so an old compositor rejects a new client instead of drawing it wrong.
+    pub fn attach_with_format(
+        &mut self,
+        buffer_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        handle: u64,
+        format: PixelFormat,
+    ) -> Result<(), UiError> {
+        let tag = if format.has_alpha() { SURFACE_FORMAT_ARGB8888 } else { SURFACE_FORMAT_XRGB8888 };
+        let geometry =
+            Geometry::with_pitch(width, height, pitch as usize, format).ok_or(UiError::Malformed)?;
         let mut body = [0u8; 32];
         let n = build_attach_buffer_request(
             &mut body,
@@ -686,7 +715,7 @@ impl<T: Transport> WindowRef<'_, T> {
                 width,
                 height,
                 pitch,
-                format: SURFACE_FORMAT_XRGB8888,
+                format: tag,
             },
         )
         .ok_or(UiError::Malformed)?;

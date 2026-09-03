@@ -78,9 +78,9 @@ pub fn compose<F: Framebuffer + ?Sized>(
 ///
 /// ## Why this is sound, and the one case where it is not
 ///
-/// Every surface here is opaque — `libdraw` has no alpha channel and says so — and
-/// [`blit_clipped`] writes every pixel of the intersection it is given. So background under a
-/// surface is background nobody can see.
+/// A surface in a format with no alpha channel is opaque, and [`blit_clipped`] writes every pixel
+/// of the intersection it is given. So background under such a surface is background nobody can
+/// see. A translucent surface is neither of those things and is excluded by [`covers`].
 ///
 /// The exception is a **malformed surface**: one whose `pixels` are shorter than its `geometry`
 /// claims. `blit_clipped` skips those pixels rather than reading past the buffer, and today the
@@ -141,19 +141,18 @@ const MAX_EXPOSED: usize = 16;
 /// Whether `surface` is one that skipping the fill underneath is safe for — see
 /// [`compose_exposed`]'s doc.
 ///
-/// **This checks only the buffer's length, and that is sound only while every surface is opaque.**
-/// `libdraw` has no alpha channel today, so "the blit writes every pixel of the intersection" and
-/// "the surface hides what is under it" are the same statement. They stop being the same the
-/// moment a surface can be translucent: a blended pixel *reads* what is beneath it, so skipping
-/// the background fill would blend the window against whatever the framebuffer last held instead
-/// of against the background — a colour-shifted window rather than a hole, which is harder to
-/// notice and harder to trace.
+/// **Two conditions, and the second arrived with alpha.** A surface hides what is under it only
+/// if its blit writes every pixel of the intersection *and* those writes do not depend on what
+/// was there. A short buffer breaks the first — [`blit_clipped`] skips the pixels it cannot read.
+/// An alpha channel breaks the second: a blended pixel reads the destination, so skipping the
+/// background fill would blend the window against whatever the framebuffer last held rather than
+/// against the background. That is a colour-shifted window instead of a hole — the same class of
+/// defect, harder to see and harder to trace.
 ///
-/// M13 Part B is alpha, and it lands in this milestone. **When it does, a surface counts as
-/// covering only while it is opaque**, and this function is where that has to be said (PR #274
-/// review).
+/// The PR #274 review asked for this to be named here before Part B landed, on the grounds that
+/// the Part B author would be standing in this function. They were; it was.
 fn covers(surface: &SurfaceRef<'_>) -> bool {
-    surface.pixels.len() >= surface.geometry.byte_len()
+    !surface.geometry.format.has_alpha() && surface.pixels.len() >= surface.geometry.byte_len()
 }
 
 /// Cut `cut` out of every rectangle in `region`, in place — **or leave `region` untouched**.
@@ -249,10 +248,48 @@ fn blit_clipped<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, a
     // compositor actually spends a drag's time on, which is not obvious until it is measured:
     // removing *half the pixel writes* from a frame (`compose_exposed`) bought 6%, because the
     // writes were never the cost. See the M13 Part A entry in `docs/decision-log.md`.
-    if src.format == fb.geometry().format {
+    if src.format.has_alpha() {
+        blit_blended(fb, surface, visible);
+    } else if src.format == fb.geometry().format {
         blit_rows(fb, surface, visible);
     } else {
         blit_pixels(fb, surface, visible);
+    }
+}
+
+/// Composite `visible` from a surface that carries its own opacity, a pixel at a time.
+///
+/// **The slow path, taken only by surfaces that asked for it** (M13 Part B). Blending has to read
+/// the destination before writing it, so it cannot be a row copy and cannot be reordered with the
+/// surfaces below — which is exactly why the alpha channel is opt-in and `XRGB8888` remains the
+/// default. A desktop of ordinary windows never reaches this function.
+///
+/// [`Framebuffer::blend_pixel`] already handles the three coverage classes, and the two extremes
+/// matter here rather than being tidiness: a fully transparent pixel writes nothing, and a fully
+/// opaque one is a plain store rather than a read-modify-write. A surface that is mostly one or
+/// the other — the usual shape, a translucent panel carrying opaque text — pays the blend only on
+/// the pixels that need it.
+fn blit_blended<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
+    let src = surface.geometry;
+    let bpp = src.format.bytes_per_pixel();
+    for row in 0..visible.size.h {
+        let dst_y = visible.origin.y + row as i32;
+        let src_y = (dst_y - surface.origin.y) as u32;
+        for col in 0..visible.size.w {
+            let dst_x = visible.origin.x + col as i32;
+            let src_x = (dst_x - surface.origin.x) as u32;
+            let Some(off) = src.offset_of(src_x, src_y) else { continue };
+            if off + bpp > surface.pixels.len() {
+                continue;
+            }
+            let word = u32::from_le_bytes([
+                surface.pixels[off],
+                surface.pixels[off + 1],
+                surface.pixels[off + 2],
+                surface.pixels[off + 3],
+            ]);
+            fb.blend_pixel(dst_x as u32, dst_y as u32, src.format.decode(word), src.format.alpha_of(word));
+        }
     }
 }
 
@@ -381,6 +418,119 @@ mod tests {
     /// `screen()`, which hands back a framebuffer rather than its shape.
     fn screen_geom() -> Geometry {
         Geometry::with_pitch(64, 48, 64 * 4, PixelFormat::XRGB8888).unwrap()
+    }
+
+    // ---- alpha (M13 Part B) ----
+
+    /// A `w`x`h` `ARGB8888` surface at `(x, y)`, one colour at one opacity.
+    fn translucent(
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        c: Rgb,
+        alpha: u8,
+    ) -> (Geometry, alloc::vec::Vec<u8>, Point) {
+        let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::ARGB8888).unwrap();
+        let word = g.format.encode_alpha(c, alpha).to_le_bytes();
+        let mut px = alloc::vec![0u8; g.pitch * h as usize];
+        for p in px.chunks_exact_mut(4) {
+            p.copy_from_slice(&word);
+        }
+        (g, px, Point::new(x, y))
+    }
+
+    #[test]
+    fn a_translucent_surface_blends_with_what_is_under_it() {
+        let g = screen_geom();
+        let bg = Rgb::new(0, 0, 0);
+        let (sg, px, o) = translucent(4, 4, 10, 8, Rgb::new(200, 100, 50), 128);
+        let surfaces = [SurfaceRef::new(sg, o, &px)];
+
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &surfaces, &[g.bounds()]);
+
+        // Half of the source over a black background — the same arithmetic `Rgb::blend` does,
+        // asserted against `blend` rather than against hand-computed numbers so this pins the
+        // *plumbing* (channel positions, which operand is which) and not the mixing rule.
+        assert_eq!(fb.get_pixel(5, 5), Some(Rgb::new(200, 100, 50).blend(bg, 128)));
+        // Not the source, and not the background: a wrong alpha position would give one of those.
+        assert_ne!(fb.get_pixel(5, 5), Some(Rgb::new(200, 100, 50)));
+        assert_ne!(fb.get_pixel(5, 5), Some(bg));
+        // Outside the surface, background as usual.
+        assert_eq!(fb.get_pixel(20, 20), Some(bg));
+    }
+
+    #[test]
+    fn a_fully_opaque_argb_surface_draws_what_an_xrgb_one_draws() {
+        // **The equivalence that catches a misplaced alpha channel.** At alpha 255 the two
+        // formats describe the same picture, so any disagreement is plumbing rather than blending
+        // — and `blend_pixel`'s 255 arm makes this a plain store, so it also checks that the fast
+        // arm of the slow path writes what the fast path would.
+        let g = screen_geom();
+        let bg = Rgb::new(9, 9, 9);
+        let colour = Rgb::new(200, 100, 50);
+
+        let (ag, apx, ao) = translucent(4, 4, 10, 8, colour, 255);
+        let mut argb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut argb, bg, &[SurfaceRef::new(ag, ao, &apx)], &[g.bounds()]);
+
+        let (xg, xpx, xo) = surface(4, 4, 10, 8, colour);
+        let mut xrgb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut xrgb, bg, &[SurfaceRef::new(xg, xo, &xpx)], &[g.bounds()]);
+
+        assert_eq!(argb.bytes(), xrgb.bytes());
+        assert_eq!(argb.get_pixel(5, 5), Some(colour), "neither drew the surface");
+    }
+
+    #[test]
+    fn a_fully_transparent_surface_leaves_the_background_showing() {
+        let g = screen_geom();
+        let bg = Rgb::new(9, 9, 9);
+        let (sg, px, o) = translucent(4, 4, 10, 8, Rgb::new(200, 100, 50), 0);
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px)], &[g.bounds()]);
+        assert_eq!(fb.get_pixel(5, 5), Some(bg));
+    }
+
+    #[test]
+    fn a_translucent_surface_blends_against_the_background_not_the_last_frame() {
+        // **The trap PR #274's review predicted for this part, made a test.** `compose_exposed`
+        // skips the background fill where a surface will cover it — sound only while the blit
+        // ignores what was there. A blended pixel does not, so a translucent surface must *not*
+        // count as covering: with the fill skipped it would mix with whatever the framebuffer
+        // last held, which is a plausible-looking colour rather than an obvious hole.
+        //
+        // Both framebuffers start holding a previous frame, which is what makes the difference
+        // visible at all — on a fresh buffer the stale pixels would be black and the bug could
+        // pass for a dark blend.
+        let g = screen_geom();
+        let bg = Rgb::new(9, 9, 9);
+        let stale = Rgb::new(240, 0, 240);
+        let (sg, px, o) = translucent(4, 4, 10, 8, Rgb::new(200, 100, 50), 128);
+        let surfaces = [SurfaceRef::new(sg, o, &px)];
+
+        let mut plain = crate::framebuffer::MemFramebuffer::new(g);
+        plain.clear(stale);
+        compose(&mut plain, bg, &surfaces, &[g.bounds()]);
+        let mut exposed = crate::framebuffer::MemFramebuffer::new(g);
+        exposed.clear(stale);
+        compose_exposed(&mut exposed, bg, &surfaces, &[g.bounds()]);
+
+        assert_eq!(plain.bytes(), exposed.bytes(), "the fill under a translucent surface was skipped");
+        assert_ne!(exposed.get_pixel(5, 5), Some(Rgb::new(200, 100, 50).blend(stale, 128)));
+    }
+
+    #[test]
+    fn an_opaque_surface_still_covers_and_a_translucent_one_does_not() {
+        // `covers` decides whether the fill underneath can be skipped, and it is the whole reason
+        // the test above passes. Asserted directly so a change to either condition is visible
+        // here rather than only as a picture two functions away.
+        let (og, opx, oo) = surface(0, 0, 8, 8, Rgb::new(1, 2, 3));
+        assert!(covers(&SurfaceRef::new(og, oo, &opx)));
+        let (tg, tpx, to) = translucent(0, 0, 8, 8, Rgb::new(1, 2, 3), 255);
+        assert!(!covers(&SurfaceRef::new(tg, to, &tpx)), "opaque *pixels* are not an opaque format");
+        assert!(!covers(&SurfaceRef::new(og, oo, &opx[..4])), "a short buffer covers nothing");
     }
 
     /// `subtract_from` never loses a pixel, at any capacity — the invariant the hole broke.

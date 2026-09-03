@@ -338,6 +338,7 @@ mod tests {
             red: crate::format::Channel::new(11, 5),
             green: crate::format::Channel::new(5, 6),
             blue: crate::format::Channel::new(0, 5),
+            alpha: None,
         };
         assert!(Geometry::with_pitch(4, 2, 16, rgb565).is_none());
         assert!(Geometry::with_pitch(4, 2, 16, PixelFormat::XRGB8888).is_some());
@@ -507,6 +508,7 @@ mod tests {
             red: crate::format::Channel::new(11, 5),
             green: crate::format::Channel::new(5, 6),
             blue: crate::format::Channel::new(0, 5),
+            alpha: None,
         };
         let src = Rgb::new(0x9C, 0x41, 0x7B);
         for w in 0..=0xFFFFu32 {

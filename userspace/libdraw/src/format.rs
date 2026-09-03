@@ -105,11 +105,14 @@ impl Rgb {
 
     /// `self` composited over `under` at `coverage`, where 0 is invisible and 255 is opaque.
     ///
-    /// **There is no alpha channel anywhere in this crate**, and this is not the beginning of
-    /// one. Surfaces are opaque XRGB8888 and compositing is a copy; what needs blending is a
-    /// *source* that arrives with per-pixel coverage — a rasterised glyph — against a
-    /// destination already in the buffer. Coverage is an argument, not a stored channel, so
-    /// nothing gains a fourth byte and `compose` stays a memcpy.
+    /// **The operation is unchanged; where the coverage comes from is what M13 Part B widened.**
+    /// This used to say there was no alpha channel anywhere in the crate and that this was not
+    /// the beginning of one. The first half is now false — [`PixelFormat::ARGB8888`] exists — and
+    /// the reasoning that produced it is still worth reading, because it is why the channel is
+    /// opt-in rather than universal. Coverage is an argument here, and a stored channel is only
+    /// one of the things that can supply it: a rasterised glyph passes coverage it computed, and
+    /// a translucent surface passes coverage it stored. Opaque surfaces name a format with no
+    /// alpha channel, and for them `compose` is still a memcpy.
     ///
     /// **Rounded rather than truncated**, and the reason is not the endpoints. `+ 127` before
     /// the divide makes this round-to-nearest (255 is odd, so no value is ever an exact tie).
@@ -146,6 +149,14 @@ pub struct PixelFormat {
     pub green: Channel,
     /// The blue channel's position.
     pub blue: Channel,
+    /// The alpha channel's position, or `None` for a format whose pixels are all opaque.
+    ///
+    /// **`None` is not "alpha zero", it is "the question does not arise"** — and every reader
+    /// goes through [`PixelFormat::alpha_of`], which answers 255 for such a format. That is what
+    /// keeps a format without the channel from being a special case at each use: an opaque
+    /// surface and a fully-opaque translucent one composite through the same expression, and only
+    /// the *fast path* distinguishes them.
+    pub alpha: Option<Channel>,
 }
 
 impl PixelFormat {
@@ -155,6 +166,24 @@ impl PixelFormat {
         red: Channel::new(16, 8),
         green: Channel::new(8, 8),
         blue: Channel::new(0, 8),
+        alpha: None,
+    };
+
+    /// `0xAARRGGBB` — [`XRGB8888`](PixelFormat::XRGB8888)'s unused byte, given a meaning.
+    ///
+    /// **Opt-in, and the default stays opaque** (M13 Part B). A surface in this format composites
+    /// per pixel, blending against what is already on the screen; one in `XRGB8888` is copied a
+    /// row at a time. Every ordinary window wants the second, and the milestone that made the
+    /// copy 5x faster is the one immediately before this — so making alpha universal would have
+    /// spent that on every window in order to serve the few that are translucent.
+    ///
+    /// The framebuffer itself is never this format: the screen has nothing behind it.
+    pub const ARGB8888: PixelFormat = PixelFormat {
+        bits_per_pixel: 32,
+        red: Channel::new(16, 8),
+        green: Channel::new(8, 8),
+        blue: Channel::new(0, 8),
+        alpha: Some(Channel::new(24, 8)),
     };
 
     /// `0x00BBGGRR` — the channel-swapped layout, which some firmware reports.
@@ -163,6 +192,7 @@ impl PixelFormat {
         red: Channel::new(0, 8),
         green: Channel::new(8, 8),
         blue: Channel::new(16, 8),
+        alpha: None,
     };
 
     /// Build a format from Limine's framebuffer response fields.
@@ -188,6 +218,10 @@ impl PixelFormat {
             red: Channel::new(red_mask_shift, red_mask_size),
             green: Channel::new(green_mask_shift, green_mask_size),
             blue: Channel::new(blue_mask_shift, blue_mask_size),
+            // **A scanout target has nothing behind it**, so whatever Limine reports in the
+            // fourth byte is not an alpha channel in any sense this crate uses. Reading one here
+            // would make the *screen* blend against itself.
+            alpha: None,
         })
     }
 
@@ -196,13 +230,54 @@ impl PixelFormat {
         (self.bits_per_pixel as usize) / 8
     }
 
-    /// Pack a colour into this format's pixel word.
+    /// Pack a colour into this format's pixel word, **fully opaque**.
     ///
     /// Bits belonging to no channel are left **zero**. That matters for the gate: a
     /// pixel whose unused byte carried leftover data would hash differently run to
     /// run, and §7 requires compositing to be deterministic to the byte.
+    ///
+    /// **An alpha channel is filled with 255, not left at zero**, and that choice is what stops
+    /// this from being a trap. `encode` takes an [`Rgb`], which carries no opacity, so the only
+    /// question is what a caller *means* by encoding a colour with no alpha to speak of — and it
+    /// means an opaque pixel every time. Zero would read as fully transparent, so every drawing
+    /// routine in the crate would silently produce an invisible picture the moment a surface
+    /// opted into [`ARGB8888`](PixelFormat::ARGB8888). Use [`encode_alpha`](Self::encode_alpha)
+    /// to say otherwise.
     pub const fn encode(&self, c: Rgb) -> u32 {
-        self.red.encode(c.r) | self.green.encode(c.g) | self.blue.encode(c.b)
+        self.encode_alpha(c, 255)
+    }
+
+    /// Pack a colour and an opacity into this format's pixel word.
+    ///
+    /// `alpha` is discarded by a format with no alpha channel — such a surface has no way to be
+    /// anything but opaque, and refusing would make every caller branch on the format to draw a
+    /// pixel. Ask [`has_alpha`](Self::has_alpha) if the distinction matters.
+    pub const fn encode_alpha(&self, c: Rgb, alpha: u8) -> u32 {
+        let rgb = self.red.encode(c.r) | self.green.encode(c.g) | self.blue.encode(c.b);
+        match self.alpha {
+            Some(a) => rgb | a.encode(alpha),
+            None => rgb,
+        }
+    }
+
+    /// This format's opacity for `pixel` — **255 when the format has no alpha channel**.
+    ///
+    /// Total on purpose: "no channel" and "opaque" are the same answer to the only question a
+    /// compositor asks of a pixel, so no caller has to check which kind of format it holds.
+    pub const fn alpha_of(&self, pixel: u32) -> u8 {
+        match self.alpha {
+            Some(a) => a.decode(pixel),
+            None => 255,
+        }
+    }
+
+    /// Whether pixels in this format carry their own opacity.
+    ///
+    /// The question a compositor asks to decide between copying a row and blending a pixel, and
+    /// the one [`compose_exposed`](crate::compose::compose_exposed) asks to decide whether a
+    /// surface can be trusted to hide what is under it.
+    pub const fn has_alpha(&self) -> bool {
+        self.alpha.is_some()
     }
 
     /// Unpack a colour from this format's pixel word.
@@ -256,6 +331,7 @@ mod tests {
             red: Channel::new(11, 5),
             green: Channel::new(5, 6),
             blue: Channel::new(0, 5),
+            alpha: None,
         };
         let white = Rgb::new(255, 255, 255);
         assert_eq!(rgb565.decode(rgb565.encode(white)), white);
@@ -371,5 +447,56 @@ mod tests {
         let b = Rgb::new(0, 0, 255);
         assert_ne!(a.blend(b, 64), b.blend(a, 64));
         assert_eq!(a.blend(b, 64), b.blend(a, 255 - 64), "…and they are each other's mirror");
+    }
+
+    #[test]
+    fn encoding_a_colour_into_an_alpha_format_makes_it_opaque() {
+        // **The footgun this exists to disarm.** `Rgb` carries no opacity, so if `encode` left
+        // the alpha bits at zero — which is what "bits belonging to no channel are zero" would
+        // have meant here — every existing drawing routine would paint invisibly the moment a
+        // surface opted into ARGB8888. There are dozens of `encode` callers and none of them
+        // would have been wrong to write.
+        let c = Rgb::new(0x12, 0x34, 0x56);
+        assert_eq!(PixelFormat::ARGB8888.encode(c), 0xFF12_3456);
+        assert_eq!(PixelFormat::ARGB8888.alpha_of(PixelFormat::ARGB8888.encode(c)), 255);
+        // And the colour bits are XRGB's, so the two formats differ only in the top byte.
+        assert_eq!(PixelFormat::ARGB8888.encode(c) & 0x00FF_FFFF, PixelFormat::XRGB8888.encode(c));
+    }
+
+    #[test]
+    fn a_format_with_no_alpha_channel_reads_as_fully_opaque() {
+        // Total rather than optional: "no channel" and "opaque" are the same answer, so no
+        // caller has to know which kind of format it is holding. A format that reported the
+        // stored byte instead would make an XRGB framebuffer blend against itself, since QEMU
+        // leaves that byte at zero — every pixel would read as transparent.
+        for word in [0x0000_0000, 0x0012_3456, 0xFFFF_FFFF, 0x0000_00FF] {
+            assert_eq!(PixelFormat::XRGB8888.alpha_of(word), 255);
+            assert_eq!(PixelFormat::XBGR8888.alpha_of(word), 255);
+        }
+        assert!(!PixelFormat::XRGB8888.has_alpha());
+        assert!(PixelFormat::ARGB8888.has_alpha());
+    }
+
+    #[test]
+    fn encode_alpha_round_trips_through_decode_and_alpha_of() {
+        for a in [0u8, 1, 64, 128, 254, 255] {
+            let c = Rgb::new(0xDE, 0xAD, 0xBE);
+            let w = PixelFormat::ARGB8888.encode_alpha(c, a);
+            assert_eq!(PixelFormat::ARGB8888.decode(w), c);
+            assert_eq!(PixelFormat::ARGB8888.alpha_of(w), a);
+        }
+        // A format without the channel discards the opacity rather than refusing it — a caller
+        // drawing into an opaque surface should not have to branch on the format to do it.
+        assert_eq!(PixelFormat::XRGB8888.encode_alpha(Rgb::new(1, 2, 3), 7), PixelFormat::XRGB8888.encode(Rgb::new(1, 2, 3)));
+    }
+
+    #[test]
+    fn a_framebuffer_from_limine_never_has_an_alpha_channel() {
+        // **The screen has nothing behind it.** Limine reports a fourth mask on some firmware,
+        // and reading it as alpha would make the compositor blend the display against itself —
+        // every `blend_pixel` would mix with a byte QEMU leaves at zero, i.e. paint nothing.
+        let f = PixelFormat::from_limine(32, 16, 8, 8, 8, 0, 8).expect("32bpp is supported");
+        assert!(!f.has_alpha());
+        assert_eq!(f, PixelFormat::XRGB8888);
     }
 }

@@ -61,6 +61,9 @@ pub struct BufferPool {
     maps: Vec<Mapping>,
     /// The size every buffer is being brought to. Buffers reach it one at a time.
     size: Size,
+    /// The format every buffer is attached in — carried so that a resize re-attaches in the
+    /// format the window was built with rather than silently reverting to opaque.
+    format: PixelFormat,
 }
 
 impl BufferPool {
@@ -74,7 +77,23 @@ impl BufferPool {
         size: Size,
         count: usize,
     ) -> Option<Self> {
-        let mut pool = BufferPool { maps: Vec::new(), size };
+        Self::in_format(window, size, count, PixelFormat::XRGB8888)
+    }
+
+    /// [`new`](Self::new), in a chosen pixel format.
+    ///
+    /// `PixelFormat::ARGB8888` gives a translucent window — see
+    /// [`WindowRef::attach_with_format`](crate::WindowRef::attach_with_format) for what that
+    /// costs. The format is remembered, so the re-attach a resize performs keeps it: a pool that
+    /// reverted to opaque on the first resize would produce a window that is see-through until
+    /// someone drags its edge.
+    pub fn in_format<T: Transport>(
+        window: &mut WindowRef<'_, T>,
+        size: Size,
+        count: usize,
+        format: PixelFormat,
+    ) -> Option<Self> {
+        let mut pool = BufferPool { maps: Vec::new(), size, format };
         for id in 0..count as u32 {
             if pool.install(window, id, size).is_none() {
                 return None;
@@ -142,7 +161,10 @@ impl BufferPool {
         let pitch = pitch_of(size)?;
         let len = pitch.checked_mul(size.h as usize)?;
         let (handle, addr) = shared_buffer(len)?;
-        if window.attach(id, size.w, size.h, pitch as u32, handle).is_err() {
+        if window
+            .attach_with_format(id, size.w, size.h, pitch as u32, handle, self.format)
+            .is_err()
+        {
             // **Both halves go back**, which the shape this was copied from did not do: the
             // handle is transferred by a *successful* send, so a failed one leaves it this
             // process's to close. Every caller today either exits or destroys its window, so it
