@@ -23049,3 +23049,29 @@ so `desktop_label`'s rule cannot be host-tested without restructuring it — out
 rough edges. The capitalised fallback *is* pinned, by `check-login` asserting the serial line
 through a real boot; the "a user's name passes through verbatim" half is not pinned by anything.
 Stated rather than papered over.
+
+## 2026-09-03 — typing into a prompt before it exists
+
+`check-login` failed once on `nxfiles: name so far 1 chars`, with `name so far 0 chars` sitting in
+the transcript: the rename prompt opened and the keystroke did not reach it. Seen under TCG earlier
+the same day and written off as TCG being slow, which it was not.
+
+**The step clicked to open the prompt and typed immediately.** A click has to travel to `nxfiles`,
+come back as a window, be configured, and be given the keyboard by the compositor. A character
+injected before the end of that lands in whatever held focus before, and is gone.
+
+**The gate already knew how to do this.** Six steps earlier, the *desktop* rename waits —
+`chord(r)` then `expect("desktop-shell: naming this desktop")` — before typing a single character.
+The browser's rename skipped it. The fix is that same wait, on the receipt `nxfiles` already emits
+when its prompt opens.
+
+**Three properties of this bug are worth separating**, because they are usually confused. It is not
+a lost message: the keystroke was delivered, to the wrong window. It is not a slow guest: waiting
+longer never helps, because nothing is coming. And it is not the flake class that
+`expect_all` fixes — that one is two lines racing for the *serial console* in an order the system
+does not fix, where the fix is to stop asserting an order. This is a real ordering requirement
+being ignored: the prompt must exist before it can be typed into, and the gate has to wait for it.
+
+**"It passes more often than it fails" is the reason to fix it, not to leave it.** One failure in
+several runs is a gate that will fail in CI on somebody else's branch, where it reads as their
+bug.
