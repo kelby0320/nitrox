@@ -22921,3 +22921,75 @@ claimed. A timing flake cannot be closed by running it again until it is green.
 first only where one line's producer sends the message that causes the other's — every
 `configure_window` → `nxterm: resized` pair in that file is a genuine chain. A launch is not: the
 parent and the child are downstream of one spawn and of nothing else.
+
+## 2026-09-03 — M14 scoped, and five decisions taken before it starts
+
+The applications milestone, from the maintainer's list after living with M13's desktop. Recorded
+here rather than only in `display-arm-plan.md` because a plan's boxes get ticked and rewritten,
+and the *rejected* alternatives go with them — which is how the next person to propose one gets no
+answer. Same reason the M12/M13 scoping entry exists.
+
+**The north star is a comparison, which is the useful kind.** The three applications should be
+about equivalent to the versions of GNOME Terminal, Text Editor and Files *that ship* — not to
+their power-user configurations. That is a bar anybody can check against a machine they already
+own, and it settles arguments the plan would otherwise have to.
+
+**1. An application is a thing that says it is one.** The applications modal lists `/bin`, which is
+every program on the system — services, servers and CLI tools. It becomes a directory of desktop
+entries: one TOML manifest per graphical application, naming `exec` and a display `name`. The
+reason this is the conventional answer everywhere is that *"is this graphical?"* cannot be read off
+a binary; it is a claim somebody has to make. **Rejected:** a `/bin` vs `/apps` split (a program's
+*location* then encodes policy, and there is still nowhere to put a display name or an icon); an
+ELF note (invisible, needs tooling, same gap); a list inside the shell (a second place to update,
+and the shell has no business knowing application names).
+
+**2. An accelerator is declared once.** A menu that *says* `Ctrl+C` and a handler that *implements*
+it are two statements of one fact and they drift. The item carries it as data and the handler
+matches the same value. This is a convention every future application inherits, which is why it is
+here and not only in a part's checkbox.
+
+**3. The file chooser is a widget over a listing.** `libui`'s `diff`/`paint`/`route`/`widget`
+cannot make a syscall, and rather than bend that, the chooser renders entries it is *given*.
+
+**4. Quit means every window of the application**, including the answer for unsaved work — decided
+once rather than three times in three applications.
+
+**5. A single click selects, a double click opens.** `route` has no clock, so the toolkit gets a
+*pure* click tracker fed a position and a time.
+
+**Part G was promoted from a stretch by finding its premise wrong.** The plan was to highlight
+`nxsh` with `nxsh`'s own lexer, so that "the two cannot disagree". `nxsh::lex` will not do it: it
+is **fallible** (`Result<Spanned>`, and while a person types, an unterminated string is the normal
+state of the buffer) and **parser-mode-driven** (`peek(mode)`, with `Regex` produced only after
+`~=`), so a highlighter with no parser cannot pick the mode. **A lexer answers "what does this
+program mean"; a highlighter answers "what does this text look like", over text that is not a
+program yet.** A tolerant table-driven scanner does the second, is total over garbage by
+construction, and makes each further language a table rather than code — so the part covers nxsh,
+TOML, Markdown and Rust instead of one, and the layering risk that made it a stretch is gone.
+
+## 2026-09-03 — what an empty grep proves, which is nothing
+
+M14's details pass opened with a section titled "three things the list assumed that the code does
+not". **Two of the three were wrong**, and review caught both. A correction that is itself wrong is
+worse than no correction, because the next session trusts it.
+
+- "There are two ad-hoc menu bars and no widget." `libui::widget::menu_bar` and `menu_item` exist
+  and both applications import and use them. What is duplicated is the *drop-down* half, which
+  `menu_bar`'s own doc names as deliberately absent.
+- "`mtime` is not plumbed through `libfs`." `libfs::list_dir` returns `OwnedEntry`, which carries
+  `mtime` and `kind`, and `nxfiles` already calls it. The information dies one level *higher*, in
+  a projection whose own doc says it is deliberate.
+
+**Both came from a grep that returned nothing.** The `libfs` one searched for `mtime|modified|
+DirEntry`; the type is `OwnedEntry`, so the pattern could not match and the empty result was read
+as absence. The menu one searched an application's own source for `menu`, saw locally-defined
+helpers, and never asked whether the toolkit had the thing they were built on.
+
+**So: an empty result is a claim about the pattern, not about the tree.** Before writing "X does
+not exist", run a *positive control* — grep for something that must be there, and check the corpus
+and the spelling actually produce hits. This is the fourth sweep failure in three parts of this
+milestone and the first where the pattern, rather than the corpus, was the fault. The general form
+covering all four: **a search proves something only when you have shown it can find something.**
+
+The cheaper habit for this specific case: to ask whether a capability exists, grep the *library*
+that would own it, not the caller that would use it.

@@ -184,7 +184,22 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     along with its ground. Opaque surfaces keep Part A's row copy. **Part C closes the milestone**
     the same day: windows and menus cast shadows, and the overview is a translucent surface over
     the live desktop rather than an opaque one redrawing it. **M13 is complete.** The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
-    without it would enlarge the flicker they sit on. **The control panel is trigger-gated**
+    without it would enlarge the flicker they sit on.
+    **M14 — the applications, and what a menu is** — detail-passed 2026-09-03 from the
+    maintainer's list after living with the desktop, with the north star stated as a comparison:
+    the three applications should be about equivalent to the versions of GNOME Terminal, Text
+    Editor and Files that ship, which is a bar anyone can check against a machine they own. Eight
+    parts, built F, H, A, B, C, D, E, G — H split out of F when costing showed desktop entries
+    cross the namespace, and F is what is left, which is genuinely small. Five governing decisions — an
+    application is a thing that *says* it is one (desktop entries, because "is this graphical?"
+    cannot be read off a binary), an accelerator is declared once so its label and its binding
+    cannot drift, the file chooser is a widget over a listing rather than a browser inside a
+    toolkit that may not make syscalls, Quit means every window, and a single click selects while
+    a double click opens. **Part G — syntax highlighting — was wanted as a stretch and promoted the
+    same day**: costing it found that reusing `nxsh`'s lexer does not work (it is fallible, and
+    parser-mode-driven, while a highlighter must be total over text that is not a program yet), and
+    the table-driven scanner that replaces it makes each further language a table rather than code
+    — so it covers nxsh, TOML, Markdown and Rust instead of one. **The control panel is trigger-gated**
     rather than scheduled: when settings outgrow a hand-edited file. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
