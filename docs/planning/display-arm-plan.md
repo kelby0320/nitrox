@@ -4551,29 +4551,76 @@ testable, and no syscall in a module that forbids them.
 - [ ] **`nxedit`: an unsaved-changes dot on the tab, and a prompt on close** —
       `TODO(dialog-save-answer)` is half of this already.
 
-### Part G — syntax highlighting *(stretch)*
+### Part G — syntax highlighting
 
-- [ ] **`nxedit` highlights `nxsh` scripts** — wanted, explicitly not required, and to be dropped
-      if it grows.
+Wanted as a stretch on 2026-09-03 and **promoted the same day**, when costing it turned up a
+premise that was wrong in the direction that makes it cheaper.
 
-      **It is cheap for one reason: `nxsh` already exposes its lexer.** `nxsh::lex` is a public
-      module with a `Lexer`, so the highlighter reads the *same* tokens the interpreter does and
-      the two cannot disagree about what a string or a comment is. A second tokenizer written
-      against the grammar by eye is the version that is expensive and wrong.
+**The first design was to reuse `nxsh`'s own lexer**, on the argument that the highlighter would
+then read the same tokens the interpreter does and the two could not disagree. That argument does
+not survive reading `nxsh::lex`:
 
-      **The layering is the part to settle before writing any of it.** `nxedit` depending on
-      `nxsh` is an application reaching into another application's crate, which
-      `userspace/CLAUDE.md` names as the shape its rule exists to catch. The answer is the rule's
-      own: the lexer is the *language's definition* rather than a helper, and moves to a crate
-      below both. **If that move turns out to be large, the stretch is dropped** — that is what
-      makes it a stretch, and the trigger is written down here rather than discovered halfway.
+- **The lexer is fallible.** `peek` and `bump` return `Result<Spanned>` with a `LexError`. While a
+  person is typing, an unterminated string is the *normal* state of the buffer — so a highlighter
+  built on it stops colouring at the first quote and starts again when the pair closes, which is
+  worse than no colour at all.
+- **It is parser-mode-driven.** `peek(mode)` / `bump(mode)`, and the mode is the *parser's* choice:
+  `Mode::Word` for a command's arguments, expression mode elsewhere, with `Regex` produced only
+  immediately after `~=`. A standalone highlighter has no parser and therefore cannot pick the
+  mode, so barewords, flags and regex literals would all be read as the wrong thing.
 
-- [ ] **The text area renders styled spans**, which is the toolkit half and the part that would
-      survive the stretch being dropped for `nxsh` and taken later for something else.
+**A lexer answers "what does this program mean". A highlighter answers "what does this text look
+like", over text that is not a program yet.** They are different jobs, and the second one has to be
+total over garbage.
+
+- [ ] **One tolerant, table-driven scanner** — the shape small editors use. A language is a table:
+      line-comment markers, block-comment delimiters, string rules (delimiter, escape, whether it
+      spans lines), a keyword list, whether numbers are lexed. One scanner drives all of them and
+      is total by construction: an unterminated string simply runs to the end and is coloured as a
+      string, which is what every editor does and what a person typing one expects to see.
+
+      **The cost that matters is that it is paid once.** The scanner is the work; a language after
+      it is a table.
+
+- [ ] **The languages this system actually contains**, rather than a generic list: **nxsh**,
+      **TOML** (`init.toml`, `services.toml`, `theme.toml`, every profile manifest), **Markdown**
+      (every document in `docs/`), and **Rust**. Anything else, and any file with no extension, is
+      plain text — which is a supported answer rather than a gap.
+
+      **Markdown is the one that stretches the table**, and is named here as the drop candidate
+      rather than discovered as a distortion: its structure is line-prefixed (`#`, `>`) and fenced
+      rather than keyword-and-string. A line-prefix rule plus a fence rule covers the useful part,
+      and a fence is the same multi-line state block comments already need — but if it starts
+      bending the table into a general grammar, Markdown goes and the other three stay.
+
+- [ ] **A file's language comes from its extension**, which forces a decision this repository has
+      been deferring: `docs/spec/shell-language.md` says in as many words that `.nx` is "a
+      placeholder, not a real decision". Highlighting cannot dispatch on a placeholder, so this
+      part settles it — deliberately, in the spec, rather than by whatever string the first `match`
+      arm happens to contain.
+
+- [ ] **Token colours live in `Theme`**, and this is the one place M11's "not a colour of its own"
+      rule genuinely does not apply: a keyword and a comment are not derivable from a window's
+      ground and its ink. Six or so entries with defaults in `Theme::light()`, which also means a
+      `theme.toml` can change them the day anyone wants to.
+
+- [ ] **The text area renders styled runs.** The enabling half, and the one worth building even if
+      every language were dropped. `text_area` already splits each line into pieces to place the
+      selection and the caret, so "a line is a sequence of runs" exists; what does not is a colour
+      on one — `Node::Text` carries only a `String`. So an ink wrapper that `paint::draw` threads
+      through its subtree, and the highlight's split points merged into the ones the widget already
+      computes.
+
+- [ ] **Multi-line constructs are the fiddly part, and the only one.** A block comment or a fenced
+      code block makes line *N*'s colours depend on where line *N−1* ended. So a start-state is
+      cached per line, and an edit re-scans downward until the computed state matches the cached
+      one. Getting this wrong is how colours go stale above or below an edit — the failure mode to
+      write a test for rather than to look for by eye.
 
 ### What M14 is not
 
-Icons for window controls (still filed behind an icon set: a naming convention, a size convention
+A syntax highlighter that understands *structure* — no folding, no bracket matching, no symbol
+list, and emphatically no completion. Part G colours tokens. Icons for window controls (still filed behind an icon set: a naming convention, a size convention
 and a lookup path). The control panel, which stays trigger-gated on settings outgrowing a
 hand-edited file. Split panes, profiles, or a terminal that is configurable at all. `nxfiles`
 growing a second view mode. Anything that needs the network.
