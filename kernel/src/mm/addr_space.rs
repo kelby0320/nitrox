@@ -828,6 +828,14 @@ fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
 /// [`PageFlags`]. `NO_EXECUTE` is inverted because the hardware default
 /// is executable (NX is opt-in), but [`Protection`]'s default is
 /// non-executable (W^X by default).
+///
+/// **No cache attribute is carried, so every user mapping is write-back** — including
+/// `/dev/framebuffer`, whose aperture is a device window that on real hardware wants
+/// write-combining or uncached. Harmless under QEMU, and measured to be so: M13 Part A's
+/// benchmark writes a row to the aperture and a row to an anonymous mapping in the same time.
+/// A correctness problem on real hardware, where a write-back mapping of a PCI BAR can leave
+/// writes in cache or reorder them. `TODO(framebuffer-cache-attr)` — it needs a cache-attribute
+/// field on `MemoryObject`, a way to set it, and a PAT or MTRR story.
 fn protection_to_page_flags(prot: Protection) -> PageFlags {
     let mut f = PageFlags::empty();
     if prot.contains(Protection::WRITE) {
