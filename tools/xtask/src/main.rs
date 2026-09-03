@@ -3147,14 +3147,28 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: applications modal open")?;
     type_into_modal(&mut qmp, &mut session, "nxfiles")?;
     press(&mut qmp, "ret")?;
-    session.expect("desktop-shell: launched nxfiles into its own namespace")?;
     // **The theme reached the application** (M11 Part C): a value that travelled from a file on
     // disk, through one reader in the shell, onto the setup record every launch already carries,
     // and into a window. It is asserted here because it is the first thing the client says — it
     // reads what the session told it before it reads a directory.
     // **The same number at both ends**, which is what says the theme crossed the wire rather than
     // each end reaching for its own default.
-    session.expect(&format!("nxfiles: theme font_px {shell_px}"))?;
+    //
+    // **Unordered against the shell's own line**, for the reason the `nxedit` launch below
+    // already carries and this one did not: the shell logs *after* `send_setup_env` returns, so
+    // the application is already running and can reach the serial console first. Held as a
+    // sequence, this passed for two milestones and then failed in CI on 2026-09-03 — timing out
+    // on `nxfiles: theme font_px 14` while that exact line sat in the transcript it printed,
+    // which is the symptom `expect_all`'s own doc predicts.
+    //
+    // **The race was always there; what changed is only how often it is lost.** M13 Part C grew
+    // every window's damage by a shadow's radius, so the shell has more repainting to do around
+    // the launch — a plausible nudge and not a proven one. Worth stating that way round, because
+    // "the change caused it" would suggest reverting something, and what was actually wrong is
+    // an assertion that asked the system to guarantee an order it never had.
+    let launched = String::from("desktop-shell: launched nxfiles into its own namespace");
+    let themed = format!("nxfiles: theme font_px {shell_px}");
+    session.expect_all(&[&launched, &themed])?;
     // **And that it is the staged one**, which is what gates the *file*. `THEME_FONT_PX` is not
     // the built-in size, so a shell that stopped putting the theme on the setup record — or a
     // client that stopped reading it — reports 16 and fails here. **This is the one line the

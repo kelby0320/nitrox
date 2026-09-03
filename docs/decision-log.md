@@ -22889,3 +22889,35 @@ none either: substituting the exact curve it was written to replace also passed,
 function. Both are now pinned — the curve by *ratios* against its own edge value, so the assertion
 survives a change of strength or radius and only a change of shape breaks it. **A gate that
 computes its expected answer cannot also be the regression test for the computation.**
+
+## 2026-09-03 — a gate that asked for an order the system never had
+
+CI failed `check-login --kvm` on PR #276, timing out on `nxfiles: theme font_px 14` — with that
+exact line sitting in the transcript it printed. That symptom is described verbatim in
+`Session::expect_all`'s own doc, written 2026-08-31 for the same class: two processes react to one
+event, are scheduled independently on four vCPUs, and the order they reach the serial console in is
+not a property of the system. Asserted as a sequence, such a pair passes until the day the other
+one wins, and then fails by scanning *past* the line it will ask for next.
+
+**The pair was `desktop-shell`'s launch line and the launched application's first output.** The
+shell logs `launched nxfiles into its own namespace` *after* `send_setup_env` returns — so the
+application is already running by then and can print first. The `nxedit` launch forty lines below
+already carried exactly this reasoning and used `expect_all`; the `nxfiles` one did not, and had
+been winning the race for two milestones.
+
+**The race was always there; what changed is how often it is lost.** M13 Part C grew every window's
+damage by a shadow's radius, so the shell has more repainting to do around a launch. That is a
+plausible nudge rather than a proven cause, and the distinction matters: "the change caused it"
+points at reverting something, when what was actually wrong is an assertion that asked the system
+to guarantee an order it never had. Nothing in the guest was touched.
+
+**A local pass proves nothing here and the fix has to be structural.** The gate passed four times
+locally before and after, under KVM, which is the same evidence it offered the day it failed. What
+does count as a control is reversing the two patterns in the `expect_all` array: the run still
+reports them in the order the *guest* emitted them and still passes, which is the property being
+claimed. A timing flake cannot be closed by running it again until it is green.
+
+**The general shape:** `expect` asserts causation, `expect_all` asserts arrival. Reach for the
+first only where one line's producer sends the message that causes the other's — every
+`configure_window` → `nxterm: resized` pair in that file is a genuine chain. A launch is not: the
+parent and the child are downstream of one spawn and of nothing else.
