@@ -22700,3 +22700,98 @@ The same shape was then looked for elsewhere in the change. `copy_damage` has a 
 its own clipping already makes unreachable; it stays, because reading past a buffer is worse than
 skipping a row, but it is now commented as *not* the thing bounding the copy — a skip there is a
 row of stale pixels, and it must never quietly become load-bearing.
+
+## 2026-09-03 — alpha, opt-in, and the two cheaper answers that were tried first
+
+M13 Part B. `libdraw` said in as many words that there was no alpha channel anywhere in it and
+that this was not the beginning of one. There is one now — `PixelFormat::ARGB8888` — and the
+reasoning that produced the old sentence is exactly why it is **opt-in** rather than universal.
+
+**Part C's two consumers were worked backwards from, and two cheaper answers were tested first.**
+
+- **Drop shadows need nothing.** A shadow is drawn by the compositor around a window it already
+  knows the bounds of, with coverage computed per pixel; `Rgb::blend` has existed since M5 Part A,
+  and Part A of this milestone made the compose target readable RAM. No channel, no protocol.
+- **Per-surface opacity — one `u8` per window — is not enough**, and the reason is specific. The
+  overview's sidebar wants a translucent *ground* with crisp text on it. A single opacity dims the
+  whole surface, text included, which is a washed-out panel rather than glass. That is the exact
+  shape both Part C items ask for, so the cheaper mechanism fails on the thing it was proposed for.
+
+So the plan's original word — alpha — was right, having survived the alternatives rather than
+having been assumed.
+
+**Opt-in is what keeps Part A's win.** Part A made an opaque blit a row-wise `memcpy` and the whole
+compose five times faster. A universal alpha channel would have spent that on every ordinary window
+to serve the few that are translucent, since a blended pixel must read the destination and cannot
+be a row copy. `XRGB8888` stays the default and stays a memcpy; a surface pays per-pixel
+compositing only by asking for it.
+
+**No new wire field.** `AttachBuffer` has carried a `format` word since M4 with one accepted value
+and an explicit "unknown is rejected rather than assumed", so a second value cost nothing: an old
+client sends `0` and is unaffected, and a new client meeting an old compositor is *refused* rather
+than drawn opaque. That direction matters — a translucent surface mistaken for an opaque one loses
+the background fill beneath it and composites against stale pixels, which reads as a slightly wrong
+colour rather than as an error. The format is also the *only* thing that says a surface is
+translucent: no "set opacity" request, no window attribute, because a second place to say it is a
+second place for it to disagree with the pixels.
+
+**`encode` writes full opacity, and that is the decision that stops this being a trap.** `Rgb`
+carries no alpha, so what a caller means by encoding a colour is an opaque pixel — every time.
+Leaving those bits zero, which "bits belonging to no channel are zero" would have implied, would
+have made every existing drawing routine in the crate paint *invisibly* the moment a surface opted
+in. There are dozens of `encode` callers and not one of them would have been wrong to write.
+`alpha_of` is total in the same spirit: a format with no alpha channel reports 255, so "no channel"
+and "opaque" are one answer and no caller branches on which kind of format it holds.
+
+**The review's prediction for this part was made a test.** PR #274 asked that `covers()` name its
+opacity assumption before Part B landed, because a translucent surface passing it would blend
+against stale pixels instead of the background. It now has two conditions rather than one, and the
+test that pins it starts both framebuffers holding a *previous frame* — on a fresh buffer the stale
+pixels would be black and the bug could pass for a dark blend.
+
+**The gate is the reference scene.** A sixth element was added, translucent, over two opaque
+surfaces and the background, with opacity sweeping 0..255 across it so that all three of
+`blend_pixel`'s arms are in one number. The guest's self-hash matches the host's constant and
+`check-display`'s screendump matches pixel for pixel, so the blend is bit-identical between a host
+build and an `x86_64-unknown-nitrox` one — which is the class of difference (integer width,
+rounding) that a blend is most likely to have and that no host test could find.
+
+**What was deliberately not built.** Nothing uses translucency yet; the overview still fakes it
+with `dim()` over a full-screen opaque window. Converting it is Part C, where it has a picture to
+be judged against. Building the substrate and its consumer in one part would have meant choosing
+the substrate to suit one caller.
+
+## 2026-09-03 — a phrase sweep cannot find a phrase the wrap has split
+
+PR #275's review found three places still asserting the system has no alpha channel, in a sweep
+this change had deliberately performed. A fourth turned up when the sweep was redone properly, in
+`spec/theme-toml-schema.md` — a *spec* doc, which carries a higher bar than the architecture doc
+the review named.
+
+**The grep could not have found them, and that is the lesson.** It searched for `"no alpha
+channel"` and similar multi-word phrases. Every doc in this repository is hard-wrapped at about
+95 columns, so the sentence in `desktop-shell.md` reads `there is no alpha` / `channel anywhere in
+this system` across a line break, and no multi-word pattern matches it. The other two were missed
+differently and just as avoidably: the search covered `userspace/` and `docs/` and simply did not
+include `tools/`.
+
+**So a claim sweep searches for the shortest distinctive token, over the whole tree.** Here that
+is `alpha` — 194 hits, of which about forty needed reading and five needed changing. Reading forty
+lines is the cost of the sweep; a phrase that matches only the unwrapped instances gives a clean
+result and a false one, which is worse than not sweeping, because it is evidence of thoroughness
+where there was none.
+
+**A related habit that did work**, and is worth keeping alongside: the same review confirmed the
+five mutations this change claimed, and found the *client* half of the feature had none — two
+mutations of `libsurface` left all forty-eight of its tests green. A feature reached through a
+library has two halves and it is easy to negative-control only the one where the logic looks
+interesting.
+
+**And one correction to a suggested fix.** The review proposed testing `BufferPool`'s format
+threading with the existing transport double, calling the cost near zero. It is not reachable:
+`BufferPool::install` allocates through `sys_memory_create`, so the struct cannot be constructed
+on the host at all and the module has no tests of any kind. What was added instead is the half
+that *is* reachable — `attach_with_format`'s wire tag, both formats and the refusal — plus a note
+in `buffers.rs` saying plainly that the resize property is reasoning rather than a tested claim.
+Writing the test that cannot exist is not an option; letting a doc imply it exists is the thing to
+avoid.

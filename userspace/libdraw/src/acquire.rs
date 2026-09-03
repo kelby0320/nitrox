@@ -85,6 +85,11 @@ pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
         red: Channel::new(info.red_shift, info.red_size),
         green: Channel::new(info.green_shift, info.green_size),
         blue: Channel::new(info.blue_shift, info.blue_size),
+        // **The display is never an alpha format**, whatever the firmware reports in the fourth
+        // byte — there is nothing behind the screen for a pixel to blend with. Reading one here
+        // would make every `blend_pixel` mix against a byte the hardware leaves at zero, which
+        // is to say paint nothing at all.
+        alpha: None,
     };
     Geometry::with_pitch(info.width, info.height, info.pitch as usize, format)
         .ok_or(AcquireError::ImpossibleGeometry)

@@ -151,8 +151,9 @@ creation-ordered so creating it first puts it under everything. Like the bars it
 **sticky**, because a picture behind everything belongs to the screen rather than to one desktop.
 It is absent when the theme names no file, which is the shipped default.
 
-**And the overview keeps it.** The overview is a full-screen *opaque* window — there is no alpha
-channel anywhere in this system — so it does not sit over the desktop, it replaces it, and a flat
+**And the overview keeps it.** The overview is a full-screen *opaque* window — translucent
+surfaces exist since M13 Part B, but converting the overview to one is Part C's work and has not
+happened — so it does not sit over the desktop, it replaces it, and a flat
 ground made the picture disappear whenever you looked at the desktops. It draws the wallpaper
 **dimmed** instead, which is what makes it read as an overlay without translucency, and each
 sidebar miniature draws the wallpaper **scaled and undimmed**: the ground is dimmed so the things

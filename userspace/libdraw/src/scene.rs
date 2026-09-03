@@ -37,6 +37,7 @@
 //! | A non-trivial screen **stride** | rows written at `width × bpp` instead of `pitch` |
 //! | Surface strides that differ from the screen's | the same bug on the read side |
 //! | One surface in the **opposite channel order** | a blit that copies words instead of translating |
+//! | One **translucent** surface, overlapping two others | a blend that rounds, saturates or reads the wrong operand differently on the target |
 //! | Content varying in **both** axes | transposed rows or columns, which a solid fill cannot detect |
 //!
 //! That last row is the one worth dwelling on: a solid fill, or a pattern that varies
@@ -95,8 +96,15 @@ fn fill_pattern(geometry: Geometry, seed: u8) -> Vec<u8> {
                 seed.wrapping_add((y as u8).wrapping_mul(23)),
                 (x as u8).wrapping_mul(5) ^ (y as u8).wrapping_mul(3) ^ seed,
             );
+            // **Opacity varies across the surface too, and reaches both extremes** (M13 Part B).
+            // `blend_pixel` takes a different path at 0, at 255 and in between, so a surface at
+            // one fixed opacity would exercise one of the three and hash identically whichever
+            // it was. Sweeping 0..=255 along a diagonal puts all three in the picture and makes
+            // a rounding difference between host and target show up as a changed hash.
+            let alpha = ((x.wrapping_mul(11) ^ y.wrapping_mul(37)) & 0xFF) as u8;
             let off = geometry.offset_of(x, y).expect("in bounds by construction");
-            px[off..off + 4].copy_from_slice(&geometry.format.encode(colour).to_le_bytes());
+            let word = geometry.format.encode_alpha(colour, alpha);
+            px[off..off + 4].copy_from_slice(&word.to_le_bytes());
         }
     }
     px
@@ -110,9 +118,10 @@ struct Element {
 }
 
 /// The scene's surfaces, in stacking order (bottom first).
-fn elements() -> [Element; 5] {
+fn elements() -> [Element; 6] {
     let xrgb = PixelFormat::XRGB8888;
     let xbgr = PixelFormat::XBGR8888;
+    let argb = PixelFormat::ARGB8888;
     [
         // Fully on-screen, padded stride of its own.
         Element {
@@ -138,7 +147,19 @@ fn elements() -> [Element; 5] {
             origin: Point::new(54, 25),
             seed: 0xB6,
         },
-        // Entirely off-screen: must contribute nothing.
+        // **Translucent, and placed over two other surfaces and the background** (M13 Part B).
+        // Topmost so that what it blends with is settled: the pixels beneath it are the first
+        // two elements and the ground, so this one number covers blending against a surface and
+        // blending against the background. It also has a padded stride of its own, because the
+        // per-pixel blend path reads its source with different arithmetic from the row copy and
+        // would not inherit the stride coverage the opaque elements give.
+        Element {
+            geometry: Geometry::with_pitch(22, 13, 100, argb).unwrap(),
+            origin: Point::new(12, 8),
+            seed: 0x5A,
+        },
+        // Entirely off-screen: must contribute nothing. **Last on purpose** — the test that
+        // drops it drops the final element, so a new element goes above this line.
         Element {
             geometry: Geometry::packed(10, 10, xrgb),
             origin: Point::new(SCREEN_WIDTH as i32 + 4, 2),
@@ -171,6 +192,10 @@ pub fn render_reference() -> MemFramebuffer {
 /// display self-test once it exists (plan M1 Part C). If they ever disagree, the
 /// commit that broke it is the one that fails, rather than the two quietly diverging.
 ///
+/// **Last changed 2026-09-03**, when M13 Part B added a translucent element to the scene — the
+/// sixth in the table above, blending over two opaque surfaces and the background at an opacity
+/// that varies across it. The number moved because the picture did.
+///
 /// Changing the scene changes this number. That is expected — but it should be a
 /// deliberate edit accompanied by a reason, never a value pasted in to make a red
 /// test go green.
@@ -179,7 +204,7 @@ pub fn render_reference() -> MemFramebuffer {
 /// is cleared to comes from the theme, and the theme's ground between windows went from
 /// `#0E141B` to `#2A5570` — so every pixel of the scene not covered by a surface changed. That
 /// is the reason, and it is the whole reason: no surface moved.
-pub const REFERENCE_HASH: u64 = 0xfbed_408c_1eae_50a5;
+pub const REFERENCE_HASH: u64 = 0xbe4c_6dbe_8ed2_8ecd;
 
 /// Hash the reference scene.
 pub fn reference_hash() -> u64 {
@@ -238,7 +263,7 @@ mod tests {
         let surfaces: Vec<SurfaceRef<'_>> = elements
             .iter()
             .zip(pixels.iter())
-            .take(4) // drop the off-screen one
+            .take(elements.len() - 1) // drop the off-screen one, which is last by construction
             .map(|(e, px)| SurfaceRef::new(e.geometry, e.origin, px))
             .collect();
         compose_full(&mut fb, BACKGROUND, &surfaces);

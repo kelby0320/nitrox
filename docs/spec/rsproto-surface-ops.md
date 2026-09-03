@@ -7,6 +7,8 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 2 Part A
 (`docs/planning/display-arm-plan.md`); the namespace surface completed in Part B.
+`AttachBuffer` gained a second accepted pixel format in M13 Part B (2026-09-03) — an
+extension the `format` word was reserved for, so no envelope or offset changed.
 `CreateWindow`, `AttachBuffer`, `Commit`, `Release`, `DestroyWindow`, `KeyEvent` and
 `PointerEvent` are defined, and
 three paths resolve: `/dev/draw/new` for a session, `/dev/draw/<N>/info` for a window's
@@ -364,7 +366,23 @@ Request, 24 bytes. The `MemoryObject` handle rides the message's transfer slot.
 | 8 | 4 | `width` |
 | 12 | 4 | `height` |
 | 16 | 4 | `pitch` — bytes per row, **not** `width * 4` |
-| 20 | 4 | `format` — `0` = `XRGB8888`; anything else is rejected |
+| 20 | 4 | `format` — `0` = `XRGB8888`, `1` = `ARGB8888`; anything else is rejected |
+
+**The format decides whether the surface is opaque, and nothing else does** (M13 Part B). An
+`ARGB8888` surface carries an opacity byte per pixel and the compositor blends it against what is
+already on the screen; an `XRGB8888` one is copied. There is no separate "set opacity" request and
+no window attribute, because a second place to say it is a second place for it to disagree with
+the pixels.
+
+A client should ask for `ARGB8888` only when it wants translucency. A translucent surface is
+composited a pixel at a time rather than a row at a time, and it cannot hide what is beneath it,
+so the compositor paints the background under it as well.
+
+**An unknown tag is rejected rather than treated as opaque.** That direction is deliberate: a
+translucent surface mistaken for an opaque one loses the fill beneath it and composites against
+whatever the framebuffer last held, which reads as a slightly wrong colour rather than as an
+error. So a client built against a newer compositor is refused by an older one instead of drawn
+incorrectly, and a client built against an older one keeps sending `0` and is unaffected.
 
 The client picks the buffer id so it can name it in a later `Commit` without waiting for a
 reply. A `pitch` too small to hold a row is **rejected**: accepting it would alias rows in

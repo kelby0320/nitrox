@@ -2,8 +2,9 @@
 
 ## Status
 
-**Built, and checked 2026-09-03** — this document describes what exists. One thing changed under
-it since: the compositor no longer paints the aperture as it composes. `compositor::Screen` builds
+**Built, and checked 2026-09-03** — this document describes what exists. Two things changed under
+it since: a surface may name `ARGB8888` and be composited translucent (M13 Part B — §6's resolved
+note carries the extension), and the compositor no longer paints the aperture as it composes. `compositor::Screen` builds
 each frame in a shadow buffer and copies the finished damage rectangles across, so the display
 never holds a partly-composed frame (M13 Part A). Nothing about §2–§4's ownership, protocol or
 buffer lifecycle moves — the aperture is still mapped once and written directly, just from one
@@ -266,6 +267,14 @@ the font**, which is the opposite of what this section assumed.
 > back cannot blend anything at all, which makes it a `Framebuffer` capability question rather
 > than a second glyph loop. No alpha channel was added: coverage is an argument, surfaces stay
 > opaque, and `compose` stays a copy.
+
+> **Extended 2026-09-03** (M13 Part B): a surface may now name `ARGB8888` and carry its own
+> opacity, so the sentence above is no longer the whole story — but the shape it argued for is
+> exactly why the channel is *opt-in*. Glyph coverage is still an argument and text still stores
+> nothing; what gained a channel is the one thing that genuinely has to carry opacity across a
+> process boundary, a translucent client surface. `XRGB8888` remains the default, and for it
+> `compose` is still a row copy. The framebuffer itself never has an alpha channel: there is
+> nothing behind the screen.
 
 **The font file lives on the root filesystem**, not the initramfs. The initramfs carries what
 is needed to reach a mounted root and no more; a client that draws text starts long after

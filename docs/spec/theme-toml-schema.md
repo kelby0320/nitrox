@@ -91,7 +91,8 @@ which is what makes that deferral observable from the outside.
 
 **What the decoder accepts**: bit depth 8, every colour type (greyscale, RGB, palette,
 greyscale+alpha, RGBA), not interlaced, and at most 64 megapixels. An alpha channel is read past
-and dropped: nothing in this system composites with alpha yet, and a wallpaper is drawn on
+and dropped — not because the system cannot composite with alpha, which it has been able to since
+M13 Part B, but because a wallpaper is drawn on
 nothing.
 
 A path is **absolute, at most 128 bytes, and free of control characters, `"` and `\`**; a longer

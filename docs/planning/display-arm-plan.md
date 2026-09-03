@@ -4340,11 +4340,32 @@ one diagnosis that explained both.
   copied the whole shadow every frame drew the identical screen and was caught only by the count.
   The ordering property itself has no automated test and is not claimed to: it is about what a
   scanout can observe between two writes, and it was confirmed by a person looking at a drag.
-- **Part B — alpha.** `libdraw` says in as many words that there is no alpha channel and this is
-  not the beginning of one; changing that is a substrate decision, not a batch. **It comes after
-  Part A because Part A makes it cheap**: once compositing goes through RAM, blending is a small
-  change to a loop that already exists, where doing it first means writing the blend against the
-  scanned-out aperture and then rewriting it.
+- [x] **Part B — alpha.** ✅ 2026-09-03. `libdraw` said in as many words that there was no alpha
+  channel and this was not the beginning of one; changing that is a substrate decision, not a
+  batch. **It comes after Part A because Part A makes it cheap**: once compositing goes through
+  RAM, blending is a small change to a loop that already exists, where doing it first means
+  writing the blend against the scanned-out aperture and then rewriting it.
+
+  **Two cheaper answers were tested before the plan's word was taken.** Drop shadows need no
+  substrate at all — the compositor computes coverage around bounds it already knows, and
+  `Rgb::blend` has existed since M5 Part A. Per-surface opacity, one `u8` per window, fails on the
+  thing it was proposed for: the sidebar wants a translucent *ground* with crisp text, and a single
+  opacity dims the text too. So `PixelFormat::ARGB8888` it is — **opt-in**, because a blended pixel
+  must read the destination and so cannot be the row copy that Part A just made five times faster.
+  `XRGB8888` stays the default and stays a memcpy.
+
+  No new wire field: `AttachBuffer`'s `format` word has carried "unknown is rejected rather than
+  assumed" since M4, so a second accepted value costs no negotiation and an old compositor refuses
+  a new client rather than drawing it opaque. The format is the *only* thing that marks a surface
+  translucent — no separate opacity request to disagree with the pixels.
+
+  Gated by the reference scene, which gained a sixth element: translucent, over two opaque
+  surfaces and the background, opacity sweeping 0..255 so all three of `blend_pixel`'s arms are in
+  one hash. Guest self-hash and `check-display` screendump both agree with the host, so the blend
+  is bit-identical on target.
+
+  **Nothing uses it yet** — the overview still fakes translucency with `dim()`. That is Part C, on
+  purpose: a substrate chosen to suit its first caller is a substrate chosen badly.
 - **Part C — what alpha unlocks**, both of which M11 deferred *onto* it: drop shadows around
   windows and menus, and the translucent overview sidebar. Shadows in particular must not come
   first — a shadow makes every window's damage region larger than the window, which without Part A

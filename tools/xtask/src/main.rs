@@ -2706,7 +2706,8 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // there, which is the rule this file states about the theme and re-learns here.
     //
     // **The overview keeps the desktop's picture** (reported from a real session, 2026-09-02).
-    // It is a full-screen *opaque* window — there is no alpha channel in this system — so it
+    // It is a full-screen *opaque* window — a translucent one has been possible since M13 Part
+    // B, but the overview is not one yet (Part C) — so it
     // does not sit over the desktop, it replaces it, and painting a flat colour made the
     // wallpaper disappear whenever you looked at the desktops. It is the wallpaper dimmed now,
     // and each sidebar miniature is the wallpaper scaled, because a preview showing flat blue

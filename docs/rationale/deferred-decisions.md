@@ -853,6 +853,13 @@ alive against a case nothing has.
 to a blend, not a fourth byte in a pixel. Surfaces stay opaque and `compose` stays a copy. What
 made the threshold necessary was the absence of the *operation*, not of a channel.
 
+**One was added 2026-09-03** (M13 Part B), and the distinction above is what kept it small.
+`PixelFormat::ARGB8888` is opt-in: a *client surface* can carry opacity across a process boundary,
+because that is the one place the information cannot be recomputed at the point of use. Glyph
+coverage still is recomputed, so text stores nothing and this entry's reasoning stands where it
+was aimed. The default stays `XRGB8888` and for it `compose` is still a row copy — which matters
+more after Part A than before, since making that copy the fast path is what Part A bought.
+
 **Input methods and accessibility** remain deferred, and accessibility is a **gap rather than
 an oversight** — no accessible tree, no screen-reader surface, and retrofitting one is
 substantially harder than designing it in (`widget-toolkit.md` §11). Trigger: neither has one
