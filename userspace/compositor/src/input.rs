@@ -2194,9 +2194,19 @@ mod tests {
         warp(&mut r, &mut s, 50, 50);
         let mut out = Vec::new();
         let routed = r.route(&button(true), &mut s, &mut out);
+        // **`painted_bounds`, not a literal** (M13 Part C): a raised window repaints its shadow
+        // along with itself, so the rectangle is larger than the window. Written as the window's
+        // own painted bounds rather than the new numbers, so it says "this window and nothing
+        // else" at any shadow size — and the containment check below is what keeps that from
+        // being a tautology, by asserting the region really did grow past the window.
+        let want = s.window(lower).expect("in the stack").painted_bounds();
+        assert!(
+            want.origin.x < 0 && want.size.w > 100,
+            "the premise: a raised window's damage includes its shadow, got {want:?}"
+        );
         assert_eq!(
             routed.restacked,
-            Some(Rect::new(0, 0, 100, 100)),
+            Some(want),
             "the caller must recompose, and only where the raised window is"
         );
         assert_eq!(s.focus_candidate(), Some(lower), "the raise *is* the focus change");

@@ -160,8 +160,15 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
             }
             // Every rectangle before any of them go, because those are what have to be
             // repainted — and afterwards there is nothing to read them from.
+            //
+            // **Painted bounds, so a shadow goes when its window does** (M13 Part C, PR #276
+            // review). `server.rs`'s `DestroyWindow` arm moved with the rest of the damage sites
+            // and this one did not, because the sweep that found them grepped `.bounds()` in the
+            // files it already had open and this module was not among them. The symptom would
+            // have been a dark halo left where a manager-closed window used to be, sitting there
+            // until something unrelated repainted that region.
             let before: alloc::vec::Vec<(u32, Rect)> =
-                stack.windows().iter().map(|w| (w.id, w.bounds())).collect();
+                stack.windows().iter().map(|w| (w.id, w.painted_bounds())).collect();
             match stack.destroy(req.window) {
                 // **Exactly what a client's own `DestroyWindow` does**, descendants included:
                 // this is the same removal reached by a different caller, not a second kind of
@@ -344,7 +351,9 @@ mod tests {
             (OP_MGR_LOWER, ref_body(ids[0], 0), ids[0]),
             (OP_MGR_SET_FOCUS, ref_body(ids[1], 0), ids[1]),
         ] {
-            let want = s.window(id).expect("in the stack").bounds();
+            // Painted bounds: a restacked window repaints its shadow too (M13 Part C).
+            let want = s.window(id).expect("in the stack").painted_bounds();
+            assert!(want.size.w > 8, "the premise: the damage includes the shadow");
             let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, op, &body) else {
                 panic!("expected Applied")
             };
@@ -376,7 +385,9 @@ mod tests {
         // the manager needs a way to remove a window it does not own — which is the whole point
         // of the manager channel, and is what `DestroyWindow` deliberately is not.
         let (mut s, ids) = stack_with(2);
-        let want = s.window(ids[0]).expect("in the stack").bounds();
+        // Painted bounds: closing a window repaints its shadow too (M13 Part C).
+        let want = s.window(ids[0]).expect("in the stack").painted_bounds();
+        assert!(want.origin.x < 0, "the premise: the region reaches outside the window");
         let MgrOutcome::Applied { window, dirty } =
             dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0))
         else {
@@ -409,8 +420,8 @@ mod tests {
             .unwrap();
         s.mark_configured(popup);
         let want = crate::union(
-            s.window(parent).unwrap().bounds(),
-            s.window(popup).unwrap().bounds(),
+            s.window(parent).unwrap().painted_bounds(),
+            s.window(popup).unwrap().painted_bounds(),
         );
 
         let MgrOutcome::Applied { dirty, .. } =

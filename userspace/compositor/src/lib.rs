@@ -29,7 +29,7 @@ pub mod server;
 
 use alloc::vec::Vec;
 
-use libdraw::compose::{SurfaceRef, compose_exposed};
+use libdraw::compose::{Shadow, SurfaceRef, compose_exposed};
 use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
@@ -204,7 +204,45 @@ impl Window {
     }
 }
 
+/// The shadow an ordinary window and a menu cast (M13 Part C).
+///
+/// **One shadow, not a per-role palette.** A menu wants a tighter one than a window on most
+/// desktops, and that is a refinement with no request behind it; a second set of numbers here
+/// would be two things to keep looking like each other.
+///
+/// The numbers live in `libdraw` because `check-display` needs them too — it renders what the
+/// screen should show and compares the guest against it, so a window's shadow has to be computed
+/// on both sides from one source. Which *roles* cast one is the decision that stays here.
+use libdraw::theme::WINDOW_SHADOW;
+
+/// The shadow `role` casts, if it casts one.
+///
+/// **Panels do not.** A bar is docked to a screen edge and a wallpaper *is* the ground; a shadow
+/// on either is a dark band along the edge of the screen with nothing above it to cast one. The
+/// three that do are the three that float: an application window, a menu, and a dialog.
+const fn shadow_for(role: Role) -> Option<Shadow> {
+    match role {
+        Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => Some(WINDOW_SHADOW),
+        Role::Panel { .. } => None,
+    }
+}
+
 impl Window {
+    /// Everything this window puts on screen, **its shadow included** — what damage is computed
+    /// from.
+    ///
+    /// **Deliberately not [`bounds`](Self::bounds)**, and the split is the point. `bounds` is
+    /// where the window *is*: what a click hits, what its client is told its geometry is, what
+    /// covers the background. This is what repainting has to cover. One rectangle serving both
+    /// would make the shadow clickable and would tell a client it is sixteen pixels bigger than
+    /// it asked to be.
+    pub fn painted_bounds(&self) -> Rect {
+        match shadow_for(self.role) {
+            Some(sh) => sh.around(self.bounds()),
+            None => self.bounds(),
+        }
+    }
+
     /// The window's bounds in screen space, from its committed buffer if there is one.
     pub fn bounds(&self) -> Rect {
         let (w, h) = self
@@ -875,9 +913,9 @@ impl WindowStack {
     fn move_to(&mut self, id: u32, origin: Point, log: bool) -> Result<Damage, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         let uncommitted = w.committed.is_none();
-        let was = w.bounds();
+        let was = w.painted_bounds();
         w.origin = origin;
-        let now = w.bounds();
+        let now = w.painted_bounds();
         if log && was != now {
             self.geometry_log.push(id);
         }
@@ -952,12 +990,12 @@ impl WindowStack {
             return Err(StackError::NoSuchBuffer);
         }
         let previous = w.committed;
-        let was = w.bounds();
+        let was = w.painted_bounds();
         w.committed = Some(req.buffer);
         // **A commit can resize the window.** The committed buffer's geometry is what
         // `bounds()` reports, so a client that reflows and commits a taller buffer has
         // changed its on-screen rectangle without any manager involvement at all.
-        if w.bounds() != was {
+        if w.painted_bounds() != was {
             self.geometry_log.push(req.window);
         }
         // Re-committing the same buffer releases nothing: the client already knows it owns
@@ -1064,7 +1102,7 @@ impl WindowStack {
             return Ok(Damage(Rect::new(0, 0, 0, 0)));
         }
         let w = self.windows.remove(i);
-        let rect = w.bounds();
+        let rect = w.painted_bounds();
         self.windows.push(w);
         Ok(Damage(rect))
     }
@@ -1080,7 +1118,7 @@ impl WindowStack {
             return Ok(Damage(Rect::new(0, 0, 0, 0)));
         }
         let w = self.windows.remove(i);
-        let rect = w.bounds();
+        let rect = w.painted_bounds();
         self.windows.insert(0, w);
         Ok(Damage(rect))
     }
@@ -1103,7 +1141,7 @@ impl WindowStack {
         }
         let i = self.windows.iter().position(|w| w.id == id).expect("checked above");
         let w = self.windows.remove(i);
-        let rect = w.bounds();
+        let rect = w.painted_bounds();
         // Recomputed *after* the removal: taking `id` out shifts everything above it down by
         // one, so an index captured before would place the window one slot too high whenever
         // `id` sat below `other`.
@@ -1248,7 +1286,11 @@ impl WindowStack {
             if px.len() < b.geometry.byte_len() {
                 continue;
             }
-            surfaces.push(SurfaceRef::new(b.geometry, w.origin, px));
+            let surface = SurfaceRef::new(b.geometry, w.origin, px);
+            surfaces.push(match shadow_for(w.role) {
+                Some(sh) => surface.with_shadow(sh),
+                None => surface,
+            });
         }
         // **`compose_exposed`, not `compose`.** Every surface above has just been length-checked,
         // so each one writes every pixel it claims. That was the whole argument until M13 Part B;
@@ -1843,7 +1885,9 @@ mod tests {
     #[test]
     fn a_raise_that_does_reorder_reports_the_window_it_moved() {
         let (mut s, _src, (bottom, _top)) = overlapping_pair();
-        let want = s.window(bottom).expect("in the stack").bounds();
+        // Painted bounds: a raised window repaints its shadow with it (M13 Part C).
+        let want = s.window(bottom).expect("in the stack").painted_bounds();
+        assert!(want.size.w > 20, "the premise: the region includes the shadow");
         assert_eq!(s.raise(bottom).expect("in the stack").rect(), want);
     }
 
@@ -2090,13 +2134,27 @@ mod tests {
         src.put(w, 0, geom(8, 8), Rgb::new(1, 2, 3));
         s.commit(&commit(w, 0)).unwrap();
 
+        // **The union of where it was and where it is, each including its shadow** (M13 Part C).
+        // Written as the arithmetic rather than as the resulting numbers, so it still reads as
+        // "both positions and nothing more" — and the two checks below it are what stop that from
+        // being a restatement of the implementation: the region must strictly contain both window
+        // rectangles, and `bounds` must not have grown.
+        let shadow = super::WINDOW_SHADOW;
         let dirty = s.place(w, Point::new(20, 10)).unwrap();
-        assert_eq!(dirty.rect(), Rect::new(0, 0, 28, 18), "the union of (0,0,8,8) and (20,10,8,8)");
-        assert_eq!(s.window(w).unwrap().bounds(), Rect::new(20, 10, 8, 8));
+        assert_eq!(
+            dirty.rect(),
+            union(shadow.around(Rect::new(0, 0, 8, 8)), shadow.around(Rect::new(20, 10, 8, 8))),
+            "the union of (0,0,8,8) and (20,10,8,8), each with its shadow"
+        );
+        assert!(dirty.rect().size.w > 28 && dirty.rect().size.h > 18, "the shadow is included");
+        assert_eq!(s.window(w).unwrap().bounds(), Rect::new(20, 10, 8, 8), "bounds must not grow");
 
         // A move that changes nothing still names the window's own rectangle rather than
         // nothing — the union of a rect with itself — which is correct and costs one window.
-        assert_eq!(s.place(w, Point::new(20, 10)).unwrap().rect(), Rect::new(20, 10, 8, 8));
+        assert_eq!(
+            s.place(w, Point::new(20, 10)).unwrap().rect(),
+            shadow.around(Rect::new(20, 10, 8, 8))
+        );
     }
 
     #[test]
@@ -2203,10 +2261,20 @@ mod tests {
         let full = fb.geometry().bounds();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
 
-        assert_eq!(fb.get_pixel(0, 0), Some(red), "the lower window");
+        // **Two of these are darkened by `b`'s shadow now** (M13 Part C), and saying so is more
+        // honest than moving the sample points: `b` casts over the whole of this 32x16 screen, so
+        // there is nowhere outside it to look. What this test claims is *stacking* — whose pixels
+        // are where — and that claim survives a shadow as "recognisably the lower window's red,
+        // and darker than the raw colour". The two inside `b` are exact, because a surface is
+        // never darkened by its own shadow.
+        let lower = fb.get_pixel(0, 0).unwrap();
+        assert!(lower.r > lower.g && lower.r > lower.b, "the lower window: {lower:?}");
+        assert!(lower.r < red.r, "the lower window is darkened by the upper's shadow: {lower:?}");
         assert_eq!(fb.get_pixel(6, 6), Some(blue), "the upper window wins the overlap");
         assert_eq!(fb.get_pixel(10, 10), Some(blue));
-        assert_eq!(fb.get_pixel(20, 2), Some(Rgb::BLACK), "background elsewhere");
+        let elsewhere = fb.get_pixel(20, 2).unwrap();
+        assert_ne!(elsewhere, blue, "background elsewhere, not the window");
+        assert_ne!(elsewhere, red, "background elsewhere, not the window");
     }
 
     #[test]
@@ -2303,6 +2371,70 @@ mod tests {
         let mut n = WindowStack::new();
         let req = CreateWindowRequest::new(1, 1, Role::Normal);
         assert_eq!(d.create(&req).unwrap(), n.create(&req).unwrap());
+    }
+
+    // ---- shadows (M13 Part C) ----
+
+    #[test]
+    fn a_window_casts_a_shadow_and_a_panel_does_not() {
+        // **Which roles float.** A bar is docked to a screen edge and the wallpaper *is* the
+        // ground; a shadow on either is a dark band along the edge of the screen with nothing
+        // above it to cast one. Asserted through `compose_into` rather than against
+        // `shadow_for` directly, so it covers the wiring as well as the decision.
+        for (make_role, shadowed) in [
+            ((|_| Role::Normal) as fn(u32) -> Role, true),
+            ((|p| Role::Popup { parent: p }) as fn(u32) -> Role, true),
+            ((|p| Role::Dialog { parent: p }) as fn(u32) -> Role, true),
+            ((|_| Role::Panel { dock: Edge::Top, reserve: 0 }) as fn(u32) -> Role, false),
+        ] {
+            let mut s = WindowStack::new();
+            let mut src = MapSource::default();
+            // A parent for the two roles that need one, kept off the sample points below.
+            let parent = shown(&mut s, &CreateWindowRequest::new(2, 2, Role::Normal));
+            let _ = s.place(parent, Point::new(60, 40));
+            let role = make_role(parent);
+            let id = shown(&mut s, &CreateWindowRequest::new(8, 8, role));
+            s.attach(&attach(id, 0, 8, 8)).unwrap();
+            src.put(id, 0, geom(8, 8), Rgb::new(200, 30, 30));
+            s.commit(&commit(id, 0)).unwrap();
+            let _ = s.place(id, Point::new(12, 4));
+
+            let ground = Rgb::new(120, 120, 120);
+            let mut fb = screen();
+            let full = fb.geometry().bounds();
+            s.compose_into(&mut fb, ground, &src, &[full]);
+
+            // Just left of the window, where a shadow would fall and the window does not reach.
+            let beside = fb.get_pixel(10, 6).unwrap();
+            assert_eq!(
+                beside != ground,
+                shadowed,
+                "{role:?} should {} cast a shadow, got {beside:?} against {ground:?}",
+                if shadowed { "" } else { "not" }
+            );
+            // Either way the window's own pixels are untouched by it.
+            assert_eq!(fb.get_pixel(14, 6), Some(Rgb::new(200, 30, 30)), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_windows_damage_grows_by_its_shadow_and_its_reported_geometry_does_not() {
+        // The split that keeps a shadow from being clickable or from being told to a client.
+        // `info` is what a client asks for its own size; `painted_bounds` is what repainting
+        // needs. A single rectangle serving both would break one of the two.
+        let mut s = WindowStack::new();
+        let id = shown(&mut s, &CreateWindowRequest::new(40, 30, Role::Normal));
+        s.attach(&attach(id, 0, 40, 30)).unwrap();
+        s.commit(&commit(id, 0)).unwrap();
+        let _ = s.place(id, Point::new(100, 60));
+
+        let w = s.window(id).expect("in the stack");
+        assert_eq!(w.bounds(), Rect::new(100, 60, 40, 30));
+        assert_eq!(w.painted_bounds(), WINDOW_SHADOW.around(Rect::new(100, 60, 40, 30)));
+
+        let info = s.info(id).expect("a window reports its geometry");
+        assert_eq!((info.width, info.height), (40, 30), "a client is told its own size");
+        assert_eq!((info.x, info.y), (100, 60), "and its own origin");
     }
 
     // ---- alpha (M13 Part B) ----
@@ -2718,10 +2850,16 @@ mod tests {
         );
         assert_eq!(fb.get_pixel(63, 31), Some(row_colour(31)), "including its last pixel");
         assert_eq!(fb.get_pixel(0, 0), Some(row_colour(0)), "and its first");
-        assert_eq!(
-            fb.get_pixel(64, 0),
-            Some(Rgb::new(0x0E, 0x14, 0x1B)),
-            "and stop at its edge"
+        // Past the right edge the surface stops — but its shadow does not, so this pixel is the
+        // background darkened rather than the background exactly (M13 Part C). Asserted as "not
+        // the surface's own row colour and no brighter than the ground", which is what "stops at
+        // its edge" means once a window casts one.
+        let past = fb.get_pixel(64, 0).unwrap();
+        let ground = Rgb::new(0x0E, 0x14, 0x1B);
+        assert_ne!(past, row_colour(0), "the surface must stop at its edge");
+        assert!(
+            past.r <= ground.r && past.g <= ground.g && past.b <= ground.b,
+            "past the edge is ground, shadowed at most: {past:?}"
         );
     }
 

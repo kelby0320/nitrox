@@ -2,12 +2,14 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-02** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-03** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
 click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
 Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
 reservation, holding a PNG the theme names and this shell decodes, because the shell holds
-`/home` and a theme where the compositor holds neither (see [`clipboard.md`](clipboard.md) and
+`/home` and a theme where the compositor holds neither; **M13 Part C made the overview a
+translucent `ARGB8888` surface over the live desktop**, replacing the dimmed copy of the wallpaper
+it used to redraw (see [`clipboard.md`](clipboard.md) and
 `display-arm-plan.md` M12 decision 2);
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
@@ -138,7 +140,7 @@ GNOME 2 window list; GNOME 3's automatic workspace lifecycle is shelved rather t
 | **Top bar** | yes | workspaces button (left), applications button, clock (centre), tray (right, v2) | low |
 | **Bottom bar** | yes | window list, desktop indicator | **high** — every open, close, retitle, focus change |
 | **Applications modal** | no | search field, filtered entries | **highest** — the whole list is rebuilt per keystroke |
-| **Overview** | no | thumbnails of the current desktop, sidebar of the others, over the dimmed wallpaper | bursty |
+| **Overview** | no | thumbnails of the current desktop, sidebar of the others, over the live desktop dimmed by its own translucency | bursty |
 
 The churn column is not decoration: it is what settled the toolkit question in §5 — and the
 wallpaper's zero is why it is the one surface here that builds no element tree at all: it is a
@@ -151,17 +153,26 @@ creation-ordered so creating it first puts it under everything. Like the bars it
 **sticky**, because a picture behind everything belongs to the screen rather than to one desktop.
 It is absent when the theme names no file, which is the shipped default.
 
-**And the overview keeps it.** The overview is a full-screen *opaque* window — translucent
-surfaces exist since M13 Part B, but converting the overview to one is Part C's work and has not
-happened — so it does not sit over the desktop, it replaces it, and a flat
-ground made the picture disappear whenever you looked at the desktops. It draws the wallpaper
-**dimmed** instead, which is what makes it read as an overlay without translucency, and each
-sidebar miniature draws the wallpaper **scaled and undimmed**: the ground is dimmed so the things
-over it read, and a miniature *is* the thing being read. The shell keeps the composed picture for
-this — four megabytes, against re-decoding the file on a gesture that should feel instant. The
-composite itself is [`libdraw::scale::dim`](../../userspace/libdraw/src/scale.rs), not a loop in
-the shell: a source pitch and a destination pitch are the arithmetic that is invisible when wrong
-and expensive to find by booting, which is the argument `place` already carries.
+**And the overview sits over it.** The overview is a full-screen **`ARGB8888`** window (M13
+Part C) — the one surface this shell creates that is not opaque. Its ground is a single
+`fill_rect_alpha` of black at 210/255, so what shows through is the *live* desktop the compositor
+already has underneath: wallpaper, windows and all. The sidebar is filled at 150 over that, which
+is why it reads as a lighter sheet laid on the ground rather than a hole cut in it, and the rows
+are drawn with `paint_over` — `paint` without its clear — so the text and the miniatures on the
+panel stay opaque. **That combination is what needed a per-pixel alpha channel rather than a
+per-window opacity**: the panel is see-through and its content is not, and one opacity for the
+whole surface cannot say both.
+
+Each sidebar miniature still draws the wallpaper **scaled**, and that is not the same picture: a
+row is a desktop that is *not* being composited, so there is nothing underneath it to show
+through. The shell keeps the decoded wallpaper for those — four megabytes, against re-decoding the
+file on a gesture that should feel instant.
+
+**What this replaced is worth recording.** Until Part C the overview was a full-screen *opaque*
+window, so to look like an overlay it had to redraw the desktop itself: the wallpaper, dimmed,
+composited by a `libdraw::scale::dim` that existed for this one caller and is now deleted. A flat
+ground made the picture disappear whenever you looked at the desktops (reported 2026-09-02); the
+dimmed copy was the nearest thing to translucency reachable without a channel.
 
 ## 3. One process, several windows
 

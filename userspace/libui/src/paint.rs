@@ -90,6 +90,31 @@ pub fn paint<F, Msg, C>(
     draw(fb, font, theme, element, layout, damage, custom);
 }
 
+/// [`paint`], **without clearing to the theme's ground first**.
+///
+/// For a caller that has already put something there and means to keep it. The overview's sidebar
+/// is the one that asked for it (M13 Part C): its ground is filled at a partial opacity so the
+/// desktop shows through, and the rows are then drawn opaque over it. Clearing would replace that
+/// translucent ground with a solid one and the panel would stop being see-through.
+///
+/// **Not the default, and not a flag on [`paint`].** Every ordinary window wants the clear — it is
+/// what makes a damage rectangle a repaint rather than an accumulation — so the caller that does
+/// not want it should have to say so by name.
+pub fn paint_over<F, Msg, C>(
+    fb: &mut F,
+    font: &Font,
+    theme: &Theme,
+    element: &Element<Msg>,
+    layout: &Layout,
+    damage: Rect,
+    custom: &mut C,
+) where
+    F: Framebuffer + ?Sized,
+    C: FnMut(u32, Rect, Rect, &mut F),
+{
+    draw(fb, font, theme, element, layout, damage, custom);
+}
+
 /// Draw a window control inside `rect`, clipped to `clip`.
 ///
 /// **Centred in a square derived from the box** rather than sized in pixels, so the glyphs stay

@@ -54,6 +54,7 @@ cargo xtask test           # host-side unit tests
 cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
 cargo xtask test-interactive # boot the RELEASE image and drive a real login + shell
 cargo xtask preview        # render the toolkit on the host to a PNG — no boot, no QEMU
+cargo xtask tune           # …and the compositing preview: shadows and the overview's opacity
 cargo xtask shot           # boot the release image and photograph the whole desktop
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
@@ -128,6 +129,17 @@ modal, two real windows, and the overview — then writing what QEMU says is on 
 `preview` cannot: the cursor, the window frames, the ground between windows, and how two windows
 sit next to each other. A tool rather than a gate — it asserts only enough to know the picture is
 of a working desktop.
+
+`cargo xtask tune` is the same idea aimed at what `preview` structurally cannot show, and it
+exists because judging a *composited* effect used to cost a boot each time. It writes
+`tune-shadow.png` and `tune-overview.png` in about a second, taking `--radius`, `--strength`,
+`--drop`, `--ground` and `--side` and defaulting each to the value that ships — so a bare run is a
+picture of the current screen. **The overview half composites over the real screendump** when a
+`cargo xtask shot` has left one in `build-cache`, which is what makes an opacity judgement
+trustworthy: the question is how much of the actual desktop should show through. The shadow half
+draws a mock scene instead, because the screendump already has the shipped shadow baked into it
+and layering a second one would be comparing two shadows and calling the sum an answer. It is a
+tool for *relative* judgements between candidates; confirm the pick with `shot`.
 
 `cargo xtask preview` writes `tools/build-cache/preview-{ui,term}.png` — the same renders
 `check-display` compares the guest against, drawn here and made viewable. **It exists so that a

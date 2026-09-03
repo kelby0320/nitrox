@@ -86,7 +86,7 @@ use libui::element::{
 use libui::diff::Tree;
 use libui::layout::layout;
 use libui::route::Router;
-use libui::paint::{FontMetrics, Theme, paint};
+use libui::paint::{FontMetrics, Theme, paint, paint_over};
 use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
@@ -3489,52 +3489,25 @@ fn render_overview(
     wallpaper: Option<&[u8]>,
 ) -> MemFramebuffer {
     let geometry =
-        Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::XRGB8888)
+        Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::ARGB8888)
             .unwrap_or_else(|| fail(b"desktop-shell: bad overview geometry\n"));
     use libdraw::framebuffer::Framebuffer as _;
     let mut fb = MemFramebuffer::new(geometry);
-    // A ground to draw on, so a thumbnail that fails to capture reads as a gap rather than as
-    // whatever the allocation happened to hold.
+    // **A translucent ground, so the overview sits *on* the desktop rather than replacing it**
+    // (M13 Part C). This window used to be opaque and full-screen, which meant that to look like
+    // an overlay it had to redraw the desktop itself — the wallpaper, dimmed, scaled and composited
+    // here. That was the nearest thing to translucency reachable without an alpha channel, and it
+    // was reported as the picture disappearing whenever you opened the overview (2026-09-02).
     //
-    // **The wallpaper, dimmed, when there is one.** The overview is a full-screen *opaque*
-    // window — translucent surfaces exist since M13 Part B but the overview does not use one
-    // yet, which is Part C's work — so it does not sit over the
-    // desktop, it replaces it. Painting a flat colour therefore made the picture disappear
-    // whenever you looked at the desktops, which is not what an overview is: it is supposed to
-    // read as an overlay *on* the desktop (reported from a real session, 2026-09-02).
+    // Now the compositor has the real desktop underneath — live windows and all — and this fills a
+    // dark colour at a partial opacity over it. The wallpaper is no longer read, scaled or copied
+    // for this; `libdraw::scale::dim` went with it. What remains is one fill.
     //
-    // **Dimmed rather than shown at full brightness**, which is what makes it read as behind
-    // something. `blend` composites black over each pixel at a coverage — the same primitive
-    // glyph rasterisation uses, and the dimmed result is an ordinary opaque picture — nothing
-    // here stores a channel, even though a surface could since M13 Part B. GNOME blurs as well;
-    // a blur is a separable convolution over a million pixels per open, and dimming alone is
-    // what the request asked for.
-    // **`libdraw::scale::dim` does the composite**, not a loop here: the source pitch and the
-    // destination pitch are the arithmetic that is invisible when wrong and expensive to find by
-    // booting, which is the argument `place` already carries. It reports rather than falling
-    // back silently, so a ground that did not come out says so (PR #273 review, optional 5).
-    let mut dimmed = false;
-    if let Some(p) = wallpaper {
-        let src = Geometry::with_pitch(
-            SCREEN_W,
-            SCREEN_H as u32,
-            SCREEN_W as usize * 4,
-            PixelFormat::XRGB8888,
-        );
-        dimmed = src.is_some_and(|src| {
-            libdraw::scale::dim(p, src, OVERVIEW_DIM, fb.bytes_mut(), geometry)
-        });
-        if !dimmed {
-            kprint(b"desktop-shell: the overview could not dim the wallpaper\n");
-        }
-    }
-    if !dimmed {
-        for y in 0..SCREEN_H as u32 {
-            for x in 0..SCREEN_W {
-                fb.put_pixel(x, y, libdraw::scene::BACKGROUND);
-            }
-        }
-    }
+    // **Dark rather than clear**, which is what makes it read as *behind* something. GNOME blurs
+    // as well; a blur is a separable convolution over a million pixels per open, and dimming alone
+    // is what the request asked for.
+    fb.fill_rect_alpha(geometry.bounds(), OVERVIEW_GROUND, OVERVIEW_GROUND_ALPHA);
+
     // **The wallpaper again, scaled once for every miniature that wants it.** Once rather than
     // per row: `box_downscale` averages the whole source per destination pixel, so doing it per
     // desktop would repeat a million reads for an identical answer.
@@ -3566,16 +3539,23 @@ fn render_overview(
     );
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&side, bounds, &metrics);
-    // **A dark panel over the ground, not a white sheet on it** (M11 Part E batch 10). `paint`
-    // clears to `background`, which since the theme turned light is the white an application
-    // draws on — so the sidebar was a white column down the side of a blue desktop, which is
-    // what the request called out. Translucency is what it asked for and that waits on an alpha
-    // channel; a dark panel with light ink is what reads as deliberate without one.
+    // **A translucent panel with opaque ink on it** — Stretch 3, finally as asked (M13 Part C).
+    // M11 batch 10 could only make it a *dark* panel: `paint` clears to `background`, which since
+    // the theme turned light is the white an application draws on, so the sidebar was a white
+    // column down the side of the desktop. A dark panel read as deliberate without translucency.
+    //
+    // The ground is filled here at its own opacity — lower than the overview's, so the sidebar
+    // reads as a lighter sheet of glass over the darkened desktop — and the rows are then drawn
+    // with `paint_over`, which is `paint` without the clear. That ordering is the whole trick and
+    // it is why this needed a per-pixel alpha channel rather than a per-window opacity: the panel
+    // is see-through and the text on it is not, and one opacity for the whole surface could not
+    // say both.
     let side_theme = sidebar(theme);
+    fb.fill_rect_alpha(bounds, side_theme.background, OVERVIEW_SIDE_ALPHA);
     // **The shell's first custom node**, and what it draws is the miniature's ground. Bounded by
     // the clip as well as the node's rect: `paint` gives both, and a callback that honoured only
     // the rect would draw a whole miniature over a partly-damaged sidebar.
-    paint(&mut fb, font, &side_theme, &side, &l, bounds, &mut |kind,
+    paint_over(&mut fb, font, &side_theme, &side, &l, bounds, &mut |kind,
                                                               rect,
                                                               clip,
                                                               fb: &mut MemFramebuffer| {
@@ -3717,7 +3697,19 @@ fn open_overview(
             ok = false;
             break;
         };
-        if w.attach(i as u32, SCREEN_W, SCREEN_H as u32, OVER_PITCH as u32, handle).is_err() {
+        // **ARGB, which is what makes the overview an overlay** (M13 Part C). Everything else
+        // this shell creates is opaque; this one window is composited per pixel so the live
+        // desktop shows through its ground.
+        if w.attach_with_format(
+            i as u32,
+            SCREEN_W,
+            SCREEN_H as u32,
+            OVER_PITCH as u32,
+            handle,
+            PixelFormat::ARGB8888,
+        )
+        .is_err()
+        {
             ok = false;
             break;
         }
@@ -3913,7 +3905,22 @@ const OVER_PITCH: usize = (SCREEN_W as usize) * 4;
 /// the picture stops being recognisable — the point is that the desktop is still *there*. A
 /// number rather than a theme key: it is the overview's own composition, like the sidebar's
 /// panel, and M11's decision 2 keeps chrome metrics out of what a theme file can set.
-const OVERVIEW_DIM: u8 = 150;
+/// The overview's ground: this colour, at [`OVERVIEW_GROUND_ALPHA`], over the live desktop.
+const OVERVIEW_GROUND: libdraw::format::Rgb = libdraw::format::Rgb::new(0, 0, 0);
+
+/// How opaque the overview's ground is — the desktop shows through the remainder.
+///
+/// **Dark enough that a thumbnail reads against it**, which is the constraint: the overview's job
+/// is to show windows, and a ground you can see the real desktop through too clearly puts a second
+/// copy of every window behind its own thumbnail.
+const OVERVIEW_GROUND_ALPHA: u8 = 210;
+
+/// How opaque the sidebar's ground is.
+///
+/// **Less than [`OVERVIEW_GROUND_ALPHA`], deliberately.** A panel that is *more* see-through than
+/// the ground it sits on reads as a lighter sheet laid over it, which is what a sidebar is; the
+/// other way round it would read as a hole.
+const OVERVIEW_SIDE_ALPHA: u8 = 150;
 
 /// Where thumbnail `i` sits in the overview, in overview-local pixels.
 ///

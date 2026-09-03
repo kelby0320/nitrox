@@ -27,6 +27,30 @@
 
 use crate::format::Rgb;
 
+/// The shadow a floating window casts (M13 Part C).
+///
+/// **Here rather than in the compositor**, because two things must agree about it: the compositor
+/// draws it, and `cargo xtask check-display` renders what the screen should look like and compares
+/// the guest against that pixel for pixel. A second copy of these numbers would let the gate and
+/// the screen drift while both looked right on their own — the failure `tools/CLAUDE.md` calls
+/// "two call sites that obviously build the same thing".
+///
+/// **Not a `Theme` field**, though: a shadow is not a colour. It is black at a coverage, the way a
+/// glyph's antialiased edge is, so a palette that had to name it would be naming an effect. Which
+/// *roles* cast one stays the compositor's decision.
+///
+/// **Chosen by eye against a real desktop**, with `cargo xtask tune` (M13 Part C). The first
+/// values were roughly twice this opacity and read as a drawn border rather than as depth; the
+/// curve was the larger half of that — see [`draw_shadow`](crate::compose::draw_shadow). At 60,
+/// the shadow is 24% opaque where it meets the window and under 6% half a radius out.
+pub const WINDOW_SHADOW: crate::compose::Shadow = crate::compose::Shadow {
+    radius: 16,
+    // Dropped, not centred: a shadow directly under a window reads as a glow.
+    offset: crate::geom::Point::new(0, 4),
+    colour: crate::format::Rgb::new(0, 0, 0),
+    strength: 60,
+};
+
 /// The colours and text size everything on screen is drawn from.
 ///
 /// **A `const fn` constructor per theme**, which is what lets the compositor keep its cursor and

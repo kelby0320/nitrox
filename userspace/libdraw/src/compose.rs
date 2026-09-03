@@ -23,17 +23,157 @@ pub struct SurfaceRef<'a> {
     pub origin: Point,
     /// The surface's pixels, at least `geometry.byte_len()` bytes.
     pub pixels: &'a [u8],
+    /// The shadow cast around this surface, if it casts one.
+    ///
+    /// **A property of the surface rather than an argument to `compose`**, and that is what keeps
+    /// this change from touching every caller. A shadow has to be drawn *between* surfaces — over
+    /// everything below this one and under this one itself — so it cannot be a separate pass; but
+    /// carrying it here means [`compose`] and [`compose_exposed`] grew no parameter, every
+    /// existing construction still says `None`, and the equivalence tests between them keep
+    /// meaning what they meant.
+    pub shadow: Option<Shadow>,
 }
 
 impl<'a> SurfaceRef<'a> {
-    /// A surface at `origin` over `pixels`.
+    /// A surface at `origin` over `pixels`, casting no shadow.
     pub const fn new(geometry: Geometry, origin: Point, pixels: &'a [u8]) -> Self {
-        Self { geometry, origin, pixels }
+        Self { geometry, origin, pixels, shadow: None }
+    }
+
+    /// The same surface, casting `shadow`.
+    pub const fn with_shadow(self, shadow: Shadow) -> Self {
+        Self { shadow: Some(shadow), ..self }
     }
 
     /// The surface's bounds in screen space.
     pub const fn bounds(&self) -> Rect {
         Rect::new(self.origin.x, self.origin.y, self.geometry.width, self.geometry.height)
+    }
+
+    /// Everything this surface puts on screen, its shadow included.
+    ///
+    /// **What damage has to be computed from.** [`bounds`](Self::bounds) is where the surface
+    /// *is* — what a click hits, what covers the background — and it is deliberately not this.
+    /// Expanding one rectangle to serve both would make the shadow clickable.
+    pub const fn painted_bounds(&self) -> Rect {
+        match self.shadow {
+            Some(sh) => sh.around(self.bounds()),
+            None => self.bounds(),
+        }
+    }
+}
+
+/// A soft dark edge drawn around a surface, under it and over everything below it.
+///
+/// **Drawn by the compositor rather than carried in a client's pixels.** The alternative — a
+/// client drawing its own shadow into a translucent margin, which is how client-side decorations
+/// usually work — would put the shadow inside the window's bounds, and then the compositor's
+/// answer to "what did the pointer hit" would include a region nobody can see or click. Here the
+/// shadow is outside `bounds` by construction and hit-testing needs to know nothing about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shadow {
+    /// How far the shadow reaches beyond the surface, in pixels.
+    pub radius: u32,
+    /// How far the shadow is displaced, in pixels — positive `y` drops it downward.
+    pub offset: Point,
+    /// The shadow's colour, blended at a coverage that falls off with distance.
+    pub colour: Rgb,
+    /// Coverage directly against the surface's edge, where the falloff begins.
+    pub strength: u8,
+}
+
+impl Shadow {
+    /// The rectangle this shadow can paint into, around a surface at `bounds`.
+    ///
+    /// **Unioned with `bounds`, which matters at an offset larger than the radius.** Callers use
+    /// this as the region to repaint, and an offset that displaces the shadow further than it
+    /// reaches would start the rectangle *inside* the window — leaving a band of the window itself
+    /// unrepainted after a move. The shipped values cannot do that; `cargo xtask tune --drop 20`
+    /// invites exactly that comparison, and someone liking the result would edit the constant
+    /// (PR #276 review, optional 9). Cheaper to make the union unconditional than to make the
+    /// constraint a rule nobody reads.
+    pub const fn around(&self, bounds: Rect) -> Rect {
+        let r = self.radius as i32;
+        let cast = Rect::new(
+            bounds.origin.x + self.offset.x - r,
+            bounds.origin.y + self.offset.y - r,
+            bounds.size.w + self.radius * 2,
+            bounds.size.h + self.radius * 2,
+        );
+        let (l, t) = (min_i32(cast.origin.x, bounds.origin.x), min_i32(cast.origin.y, bounds.origin.y));
+        let r_edge = max_i32(cast.right() as i32, bounds.right() as i32);
+        let b_edge = max_i32(cast.bottom() as i32, bounds.bottom() as i32);
+        Rect::new(l, t, (r_edge - l) as u32, (b_edge - t) as u32)
+    }
+}
+
+/// `const` min, which `Ord::min` is not.
+const fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { a } else { b }
+}
+
+/// `const` max, which `Ord::max` is not.
+const fn max_i32(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
+}
+
+/// Draw `shadow` around `bounds` on `fb`, painting only inside `clip`.
+///
+/// **The falloff is `strength * (1 - d/r)²`**, where `d` is the distance from the surface's edge.
+/// The shape matters more than the constant: this starts at `strength` and is already down to a
+/// quarter of it a *quarter* of the way out, so most of the radius is a faint tail. The obvious
+/// cheaper curve — `strength * (r² - d²) / r²`, which needs no `d` and therefore no square root —
+/// was what shipped first, and it holds three quarters of its opacity half way out. That reads as
+/// a dark band with a sudden edge rather than as a shadow, which is what a real desktop's looks
+/// nothing like (reported 2026-09-03).
+///
+/// **Still integer, which is the constraint that matters.** `d` comes from `isqrt`, not from a
+/// float: `check-display` compares a host build against an `x86_64-unknown-nitrox` one pixel for
+/// pixel, so a floating-point operation here would be the one place in compositing where the two
+/// could legitimately disagree.
+///
+/// Pixels inside the surface itself are skipped: the surface is about to be blitted over them, so
+/// darkening them first is work with no output, and for a *translucent* surface it would be work
+/// with the wrong output.
+///
+/// **Public because `check-display` calls it.** That gate renders what each reference window
+/// should contain and compares the guest's screen against it, and a window above now darkens the
+/// one below — so the host has to apply the same shadow rather than tolerate the difference.
+/// `tools/CLAUDE.md`: the gate is "the place a gate's expected answer is *computed*, not stored".
+pub fn draw_shadow<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, shadow: &Shadow, clip: &Rect) {
+    if shadow.radius == 0 || shadow.strength == 0 {
+        return;
+    }
+    let cast = Rect::new(
+        bounds.origin.x + shadow.offset.x,
+        bounds.origin.y + shadow.offset.y,
+        bounds.size.w,
+        bounds.size.h,
+    );
+    let Some(area) = shadow.around(bounds).intersect(clip) else { return };
+    let r = shadow.radius as i64;
+    let rr = r * r;
+    for y in area.origin.y..area.bottom() as i32 {
+        for x in area.origin.x..area.right() as i32 {
+            // Inside the surface: the blit is about to cover this pixel.
+            if x >= bounds.origin.x
+                && y >= bounds.origin.y
+                && x < bounds.right() as i32
+                && y < bounds.bottom() as i32
+            {
+                continue;
+            }
+            let dx = (cast.origin.x - x).max(x - (cast.right() as i32 - 1)).max(0) as i64;
+            let dy = (cast.origin.y - y).max(y - (cast.bottom() as i32 - 1)).max(0) as i64;
+            let d2 = dx * dx + dy * dy;
+            if d2 >= rr {
+                continue;
+            }
+            // `isqrt` floors, so a pixel is never darker than its true distance would make it.
+            let t = r - (d2 as u64).isqrt() as i64;
+            let coverage = (shadow.strength as i64 * t * t / rr) as u8;
+            fb.blend_pixel(x as u32, y as u32, shadow.colour, coverage);
+        }
     }
 }
 
@@ -61,7 +201,7 @@ pub fn compose<F: Framebuffer + ?Sized>(
         let Some(area) = area.intersect(&screen) else { continue };
         fb.fill_rect(area, background);
         for surface in surfaces {
-            blit_clipped(fb, surface, &area);
+            paint_surface(fb, surface, &area);
         }
     }
 }
@@ -118,9 +258,24 @@ pub fn compose_exposed<F: Framebuffer + ?Sized>(
             fb.fill_rect(*piece, background);
         }
         for surface in surfaces {
-            blit_clipped(fb, surface, &area);
+            paint_surface(fb, surface, &area);
         }
     }
+}
+
+/// One surface and the shadow it casts, in the order they belong on screen.
+///
+/// **The shadow goes down first, immediately before its own surface.** That is the whole of the
+/// ordering rule: everything below this surface has already been painted, so the shadow falls on
+/// it, and the surface then covers the part of its own shadow that the offset put underneath it.
+/// A separate pass over all the shadows — before or after the surfaces — would put every shadow
+/// under every window or over every window, and both are visibly wrong the moment two windows
+/// overlap.
+fn paint_surface<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, area: &Rect) {
+    if let Some(shadow) = &surface.shadow {
+        draw_shadow(fb, surface.bounds(), shadow, area);
+    }
+    blit_clipped(fb, surface, area);
 }
 
 /// How many rectangles the exposed region is allowed to become.
@@ -418,6 +573,185 @@ mod tests {
     /// `screen()`, which hands back a framebuffer rather than its shape.
     fn screen_geom() -> Geometry {
         Geometry::with_pitch(64, 48, 64 * 4, PixelFormat::XRGB8888).unwrap()
+    }
+
+    // ---- shadows (M13 Part C) ----
+
+    /// The shadow the tests below cast: reaching 6px, dropped 2px, black.
+    fn shade() -> Shadow {
+        Shadow { radius: 6, offset: Point::new(0, 2), colour: Rgb::new(0, 0, 0), strength: 160 }
+    }
+
+    #[test]
+    fn a_shadow_darkens_outside_the_surface_and_never_inside_it() {
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let ink = Rgb::new(200, 30, 30);
+        let (sg, px, o) = surface(20, 16, 12, 10, ink);
+        let surfaces = [SurfaceRef::new(sg, o, &px).with_shadow(shade())];
+
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &surfaces, &[g.bounds()]);
+
+        // Inside the surface: the surface's own colour, untouched by its shadow.
+        assert_eq!(fb.get_pixel(25, 20), Some(ink));
+        // Just outside its left edge: darker than the background.
+        let left = fb.get_pixel(19, 20).unwrap();
+        assert!(left.r < bg.r, "no shadow beside the surface: {left:?}");
+        // Far away: the background exactly.
+        assert_eq!(fb.get_pixel(5, 5), Some(bg));
+    }
+
+    #[test]
+    fn the_shadow_falls_off_fast_near_the_surface_and_leaves_a_faint_tail() {
+        // **The shape, not the constants** (PR #276 review, finding 5). The curve this replaced —
+        // `strength * (r² - d²) / r²`, which needs no square root — holds three quarters of its
+        // opacity half a radius out, so every window wore a dark band with a sudden edge and
+        // turning `strength` down produced a fainter band rather than a shadow. Substituting it
+        // back passed all 549 host tests, and `check-display` cannot catch it either because the
+        // gate computes its expected shadow through this same function.
+        //
+        // Asserted as ratios against the edge value, so the numbers here survive a change of
+        // `strength` or `radius` and only a change of *curve* breaks them. The old curve gives
+        // 94% / 75% / 44% at these three points; this one gives 56% / 25% / 6%.
+        let g = screen_geom();
+        let bg = Rgb::new(255, 255, 255);
+        let sh = Shadow { radius: 16, offset: Point::new(0, 0), colour: Rgb::new(0, 0, 0), strength: 200 };
+        let (sg, px, o) = surface(24, 8, 8, 8, Rgb::new(200, 30, 30));
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(sh)], &[g.bounds()]);
+
+        // Coverage read off a white ground: 255 - the pixel's value.
+        let cov = |d: i32| 255 - fb.get_pixel((24 - 1 - d) as u32, 12).unwrap().r as i32;
+        let edge = cov(0);
+        assert!(edge > 150, "the premise: the edge is dark, got {edge}");
+        let at = |d: i32| cov(d) * 100 / edge;
+        assert!(at(4) < 70, "a quarter out should be well under three quarters, got {}%", at(4));
+        assert!(at(8) < 40, "half way out should be a faint tail, got {}%", at(8));
+        assert!(at(12) < 15, "three quarters out is nearly nothing, got {}%", at(12));
+    }
+
+    #[test]
+    fn a_shadow_fades_with_distance_and_stops_at_its_radius() {
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let (sg, px, o) = surface(20, 16, 12, 10, Rgb::new(200, 30, 30));
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(shade())], &[g.bounds()]);
+
+        // Walking left from the edge, each step is lighter than the last, and the last is the
+        // background: a falloff that saturated, or one that stopped short, fails one or the other.
+        let mut last = 0u8;
+        for (i, x) in (14..20).rev().enumerate() {
+            let v = fb.get_pixel(x, 20).unwrap().r;
+            if i > 0 {
+                assert!(v > last, "shadow did not lighten at x={x}: {v} after {last}");
+            }
+            last = v;
+        }
+        assert_eq!(fb.get_pixel(13, 20), Some(bg), "the shadow reached past its radius");
+    }
+
+    #[test]
+    fn a_shadow_falls_on_the_window_below_it_and_under_its_own() {
+        // **The ordering rule, and the only test that can see it.** A pass that drew every shadow
+        // before every surface would put this shadow under the lower window; one that drew them
+        // all afterwards would put it over the upper window. Both draw the same picture when only
+        // one window is on screen.
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let under = Rgb::new(240, 240, 240);
+        let over = Rgb::new(200, 30, 30);
+        let (ug, upx, uo) = surface(4, 4, 40, 30, under);
+        let (og, opx, oo) = surface(20, 16, 12, 10, over);
+        let surfaces = [
+            SurfaceRef::new(ug, uo, &upx),
+            SurfaceRef::new(og, oo, &opx).with_shadow(shade()),
+        ];
+
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &surfaces, &[g.bounds()]);
+
+        // On the lower window, beside the upper one: darkened.
+        let on_under = fb.get_pixel(19, 20).unwrap();
+        assert!(on_under.r < under.r, "the shadow did not fall on the window below: {on_under:?}");
+        // The upper window itself is untouched by its own shadow.
+        assert_eq!(fb.get_pixel(25, 20), Some(over));
+    }
+
+    #[test]
+    fn compose_exposed_draws_the_same_picture_as_compose_with_shadows() {
+        // The equivalence again, now that a surface can paint outside its own bounds. The exposed
+        // region is cut by `bounds`, so the ground under a shadow is still filled — and if it
+        // were not, the shadow would blend against whatever the buffer last held.
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let stale = Rgb::new(240, 0, 240);
+        let (ag, apx, ao) = surface(4, 4, 20, 16, Rgb::new(80, 160, 80));
+        let (bg2, bpx, bo) = surface(26, 18, 20, 16, Rgb::new(200, 30, 30));
+        let surfaces = [
+            SurfaceRef::new(ag, ao, &apx).with_shadow(shade()),
+            SurfaceRef::new(bg2, bo, &bpx).with_shadow(shade()),
+        ];
+
+        let mut plain = crate::framebuffer::MemFramebuffer::new(g);
+        plain.clear(stale);
+        compose(&mut plain, bg, &surfaces, &[g.bounds()]);
+        let mut exposed = crate::framebuffer::MemFramebuffer::new(g);
+        exposed.clear(stale);
+        compose_exposed(&mut exposed, bg, &surfaces, &[g.bounds()]);
+
+        assert_eq!(plain.bytes(), exposed.bytes(), "the ground under a shadow was skipped");
+        assert_ne!(plain.get_pixel(2, 20), Some(stale), "nothing was drawn to compare");
+    }
+
+    #[test]
+    fn damage_bounds_a_shadow_the_way_it_bounds_a_surface() {
+        // A shadow is painted through the same clip as everything else, or a partial repaint
+        // would leave a band of the old one behind.
+        let g = screen_geom();
+        let bg = Rgb::new(120, 120, 120);
+        let (sg, px, o) = surface(20, 16, 12, 10, Rgb::new(200, 30, 30));
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        fb.clear(bg);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(shade())],
+                &[Rect::new(20, 16, 12, 10)]);
+        // Only the surface's own rectangle was damaged, so its shadow is nowhere.
+        assert_eq!(fb.get_pixel(19, 20), Some(bg), "the shadow escaped the damage rectangle");
+    }
+
+    #[test]
+    fn a_shadow_offset_past_its_radius_still_covers_the_surface() {
+        // `around` is what damage is computed from, so it must never start inside the window: an
+        // offset larger than the radius would otherwise leave a band of the window itself
+        // unrepainted after a move. Not reachable with the shipped constants — which is exactly
+        // why it needs a test rather than a person (PR #276 review, optional 9).
+        let bounds = Rect::new(40, 30, 20, 16);
+        let far = Shadow { radius: 4, offset: Point::new(0, 30), colour: Rgb::new(0, 0, 0), strength: 80 };
+        let r = far.around(bounds);
+        assert!(
+            r.origin.x <= bounds.origin.x
+                && r.origin.y <= bounds.origin.y
+                && r.right() >= bounds.right()
+                && r.bottom() >= bounds.bottom(),
+            "{r:?} does not contain {bounds:?}"
+        );
+        // …and it still reaches the displaced shadow, which is the other half of its job.
+        assert!(r.bottom() >= bounds.bottom() + 30 + 4);
+    }
+
+    #[test]
+    fn painted_bounds_includes_the_shadow_and_bounds_does_not() {
+        // **The split damage rests on.** One rectangle serving both would make the shadow
+        // clickable, since hit-testing asks `bounds`.
+        let (sg, px, o) = surface(20, 16, 12, 10, Rgb::new(1, 2, 3));
+        let plain = SurfaceRef::new(sg, o, &px);
+        assert_eq!(plain.painted_bounds(), plain.bounds());
+
+        let shadowed = plain.with_shadow(shade());
+        assert_eq!(shadowed.bounds(), Rect::new(20, 16, 12, 10), "bounds must not grow");
+        // 6px each way, dropped 2: x 14..38, y 12..34.
+        assert_eq!(shadowed.painted_bounds(), Rect::new(14, 12, 24, 22));
     }
 
     // ---- alpha (M13 Part B) ----

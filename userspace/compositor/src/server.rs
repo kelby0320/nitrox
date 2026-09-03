@@ -267,7 +267,15 @@ pub fn dispatch(
             // occupied and the new one does not would keep the old pixels until something
             // unrelated forced a repaint. Before damage-bounded repaint the unconditional
             // full recomposite covered that; now it has to be said (PR #192 review, finding 3).
-            let was = stack.window(req.window).map(|w| w.bounds());
+            //
+            // **`painted_bounds` and whether it was on screen at all**, both since M13 Part C. A
+            // window's shadow is outside its bounds, so a rectangle clipped to `bounds` — which is
+            // every ordinary commit — cannot repaint one. That is invisible until the *first*
+            // commit, where it is the whole of the bug: a launching window drew its own pixels and
+            // no shadow, and the shadow appeared later when a click or a drag happened to damage
+            // the larger rectangle. Reported from a real session, 2026-09-03.
+            let was = stack.window(req.window).map(|w| (w.bounds(), w.painted_bounds()));
+            let was_drawn = stack.window(req.window).is_some_and(|w| w.committed.is_some());
             match stack.commit(&req) {
                 Ok(previous) => {
                     // **The damage the client sent**, translated into screen coordinates and
@@ -291,13 +299,23 @@ pub fn dispatch(
                             req.damage_h,
                         );
                         let bounds = w.bounds();
+                        // **A window nothing has drawn yet repaints all of itself, shadow and
+                        // all**, whatever damage it named: the client is describing what changed
+                        // inside its buffer, and what changed on *screen* is the whole window
+                        // appearing. Before shadows this was invisible, because the client's first
+                        // damage is its whole buffer in practice and the buffer was the whole of
+                        // what the window painted.
+                        if !was_drawn {
+                            return w.painted_bounds();
+                        }
                         // **A window that changed shape repaints both shapes, whatever it
                         // said.** The vacated band cannot be in the client's damage — the
                         // client is describing its *new* buffer — and a rectangle cannot
                         // express "old minus new", so the union of the two is the tightest
-                        // correct answer.
-                        if let Some(before) = was.filter(|b| *b != bounds) {
-                            return union(before, bounds);
+                        // correct answer. Painted bounds on both sides, so the shadow moves
+                        // with the shape rather than being left where the old one was.
+                        if let Some((_, before)) = was.filter(|(b, _)| *b != bounds) {
+                            return union(before, w.painted_bounds());
                         }
                         let moved = Rect::new(
                             bounds.origin.x.saturating_add(local.origin.x),
@@ -348,7 +366,7 @@ pub fn dispatch(
                 return Outcome::Failed(SurfaceError::NotFound);
             }
             let before: Vec<(u32, Rect)> =
-                stack.windows().iter().map(|w| (w.id, w.bounds())).collect();
+                stack.windows().iter().map(|w| (w.id, w.painted_bounds())).collect();
             match stack.destroy(window) {
                 Ok(()) => {
                     // Destroy is transitive, so this connection's descendants of `window`
@@ -585,6 +603,16 @@ mod tests {
         let mut stack = WindowStack::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert_applied(attach(&mut a, &mut stack, w, 0), None);
+        // **The first commit is the exception, and it is asserted rather than stepped over**
+        // (M13 Part C): a window nothing has drawn yet repaints all of itself, shadow included,
+        // because what changed on screen is the whole window appearing rather than whatever the
+        // client redrew inside its buffer.
+        let first = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (2, 3, 4, 5)));
+        let painted = stack.window(w).expect("in the stack").painted_bounds();
+        assert_eq!(first, Some(painted), "a window's first frame paints its shadow too");
+        assert!(painted.origin.x < 0, "the premise: painted bounds reach outside the window");
+
+        // Every commit after it names its own damage and no more, which is the field's point.
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (2, 3, 4, 5)));
         assert_eq!(d, Some(Rect::new(2, 3, 4, 5)));
     }
@@ -597,6 +625,8 @@ mod tests {
         let mut stack = WindowStack::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert_applied(attach(&mut a, &mut stack, w, 0), None);
+        // Past the first commit, which repaints the window whole — see the test above.
+        assert_applied(commit(&mut a, &mut stack, w, 0), None);
         // The window is 8×8 at the origin; the client claims 400×400 of damage.
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (0, 0, 400, 400)));
         assert_eq!(d, Some(Rect::new(0, 0, 8, 8)));
@@ -643,9 +673,16 @@ mod tests {
             "the premise: the child is larger than its parent",
         );
 
+        // Both windows' *painted* bounds, captured before the destroy: what has to be repainted
+        // is what vanished, and since M13 Part C a window's shadow vanishes with it.
+        let want = union(
+            stack.window(parent).expect("still here").painted_bounds(),
+            stack.window(popup).expect("still here").painted_bounds(),
+        );
         let d = dirty_of(destroy(&mut a, &mut stack, parent)).expect("destroy names a region");
         assert!(stack.window(popup).is_none(), "the premise: destroy took the child too");
-        assert_eq!(d, Rect::new(0, 0, 16, 16), "the union of both, not the parent's 8×8");
+        assert_eq!(d, want, "the union of both, not the parent's 8×8");
+        assert!(want.size.w > 16, "the premise: a destroyed window erases its shadow as well");
     }
 
     #[test]
@@ -666,9 +703,14 @@ mod tests {
 
         // A 4×4 buffer replaces the 8×8 one. The client honestly damages its whole new buffer.
         assert_applied(attach_sized(&mut a, &mut stack, w, 1, 4, 4), None);
+        let before = stack.window(w).expect("in the stack").painted_bounds();
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 1, (0, 0, 4, 4)))
             .expect("a commit names a region");
-        assert_eq!(d, Rect::new(0, 0, 8, 8), "only the new 4x4 was repainted, vacating a band");
+        let after = stack.window(w).expect("in the stack").painted_bounds();
+        // The union of what it painted before and what it paints now — the shadow moved in with
+        // the shape, so both sides are painted bounds (M13 Part C).
+        assert_eq!(d, union(before, after), "only the new 4x4 was repainted, vacating a band");
+        assert!(d.size.w > 8, "the premise: the vacated band and the shadow are both in it");
     }
 
     #[test]

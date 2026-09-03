@@ -22795,3 +22795,129 @@ that *is* reachable — `attach_with_format`'s wire tag, both formats and the re
 in `buffers.rs` saying plainly that the resize property is reasoning rather than a tested claim.
 Writing the test that cannot exist is not an option; letting a doc imply it exists is the thing to
 avoid.
+
+## 2026-09-03 — M13 Part C: what alpha unlocked, and a curve that mattered more than a constant
+
+Drop shadows around windows and menus, and the overview finally translucent. Both were deferred
+*onto* an alpha channel by M11; only one of them turned out to need it.
+
+**Shadows need no alpha at all**, and saying so is the useful half. The compositor knows a window's
+bounds, computes coverage per pixel and blends — the same operation glyph antialiasing has used
+since M5 Part A, made sound for compositing by Part A of this milestone, which put the compose
+target in readable RAM. What shadows needed was ordering, not a channel: a shadow is drawn
+immediately before its own surface, so everything below it has already been painted and the surface
+then covers the part of its own shadow the offset put underneath. A separate pass over all the
+shadows — before or after the surfaces — puts every shadow under every window or over every window,
+and both are visibly wrong the moment two windows overlap.
+
+**The overview did need it, and it deleted a workaround.** It was a full-screen *opaque* window
+that redrew the wallpaper, dimmed, because that was the nearest thing to an overlay reachable
+without alpha. It is now one ARGB surface: a dark ground at 210/255 over the live desktop, a
+sidebar at 150 so it reads as a lighter sheet laid over that, and thumbnails opaque on top.
+`libdraw::scale::dim` and its tests went with it. **This is the case per-surface opacity could not
+have served** — the sidebar is see-through and the text on it is not — which is exactly the
+argument Part B was chosen on, now with a caller behind it.
+
+**A curve, not a constant, was what read as wrong.** The first falloff was
+`strength * (1 - (d/r)²)`, chosen because it needs no square root. It holds three quarters of its
+opacity half a radius out, so every window wore a dark band with a sudden edge, and turning the
+strength down made it a fainter band rather than a shadow. `strength * (1 - d/r)²` is down to a
+quarter at a quarter of the way out. The maintainer's report named the shape directly — "lighter
+at the start and fading to almost nothing by the end" — and no amount of tuning the number I had
+exposed would have produced it. `d` comes from `isqrt` rather than a float, because
+`check-display` compares a host build against an `x86_64-unknown-nitrox` one pixel for pixel and a
+floating-point operation here is the one place in compositing where the two could legitimately
+disagree.
+
+**A shadow is outside `bounds`, and that split every rectangle in the compositor in two.**
+`bounds` is where a window *is* — what a click hits, what a client is told its geometry is, what
+covers the background — and `painted_bounds` is what repainting has to cover. Ten damage sites moved
+to the second; `info()` and the manager's `ConfigureEvent` deliberately did not, because a shadow
+that reached those would be clickable and would tell a client it is sixteen pixels bigger than it
+asked to be.
+
+**One site was missed, and a person found it before the tests did.** The commit handler clips a
+client's damage to `bounds`, which by construction cannot contain a shadow. Invisible for every
+ordinary frame — and the whole of the bug on the *first* commit, where what changed on screen is
+the window appearing rather than whatever the client redrew. Launched windows had no shadow until a
+click or a drag happened to damage the larger rectangle. The lesson is about the sweep rather than
+the site: nine damage sites were found by grepping `.bounds()` in the compositor crate, and this
+one computes its rectangle from a *client's* numbers, so it does not look like the others and did
+not match. **A sweep for "where does damage come from" is not the same search as "where is
+`bounds` called".**
+
+**`cargo xtask tune`.** Judging either of these cost a three-minute boot, and picking a number by
+eye needs half a dozen looks — so the shadow shipped at roughly twice the right opacity and with
+the wrong curve, and both were caught only when a person ran it. The command renders both effects
+on the host in about a second. Its overview half composites over the **real screendump**, which is
+what makes an opacity judgement mean anything; its shadow half draws a mock, because the screendump
+already contains the shipped shadow and layering a second one would be comparing two shadows. This
+is `preview`'s argument from M11 Part A applied to the part `preview` structurally could not
+reach — it renders the toolkit's own surfaces, and both of these are *compositing*.
+
+## 2026-09-03 — the same sweep, missed the same way, one file over
+
+PR #276's review found `Manage::Close` still computing damage from `bounds()` — the tenth damage
+site, in `manager.rs`, which this change's own sweep did not reach. Its sibling, the client
+`DestroyWindow` arm in `server.rs`, moved with the other nine. The symptom would have been a dark
+halo left where a manager-closed window used to be, sitting there until something unrelated
+repainted that region.
+
+**This is the second miss in the same change, and the two have opposite causes**, which is what
+makes the pair worth recording rather than either alone. The first — the commit handler — was
+missed because it *computes its rectangle from a client's numbers* and so does not look like a
+damage site at all. This one looks exactly like a damage site and was missed because the search
+never opened the file: nine sites were found by grepping `.bounds()` in the files already open,
+and `manager.rs` was not among them.
+
+So the rule from the first miss ("where does damage come from" is not "where is `bounds` called")
+was true and insufficient. **A sweep is defined by its corpus before it is defined by its pattern.**
+`grep -rn` over the whole crate would have found this in the same second as the others; the
+per-file greps that felt more targeted were the reason it survived. This is now the third sweep in
+three parts to fail on its corpus rather than its pattern — Part B's missed `tools/` entirely and
+missed hard-wrapped prose — and the corrective is mechanical: search the tree, then narrow.
+
+**Two tests were pinning the wrong rectangle** and had to move with the fix, which is worth
+noticing on its own: a test that asserts today's behaviour will happily assert a bug, and neither
+of these would have failed if the bug had been introduced deliberately.
+
+**And two things that reverted silently.** `fill_rect_alpha` — the single primitive the translucent
+overview rests on — had no test, and replacing `encode_alpha(c, a)` with `encode(c)` passed all 549
+host tests while making the overview opaque again. The falloff curve, this part's headline fix, had
+none either: substituting the exact curve it was written to replace also passed, and
+`check-display` cannot catch it because the gate computes its expected shadow through the same
+function. Both are now pinned — the curve by *ratios* against its own edge value, so the assertion
+survives a change of strength or radius and only a change of shape breaks it. **A gate that
+computes its expected answer cannot also be the regression test for the computation.**
+
+## 2026-09-03 — a gate that asked for an order the system never had
+
+CI failed `check-login --kvm` on PR #276, timing out on `nxfiles: theme font_px 14` — with that
+exact line sitting in the transcript it printed. That symptom is described verbatim in
+`Session::expect_all`'s own doc, written 2026-08-31 for the same class: two processes react to one
+event, are scheduled independently on four vCPUs, and the order they reach the serial console in is
+not a property of the system. Asserted as a sequence, such a pair passes until the day the other
+one wins, and then fails by scanning *past* the line it will ask for next.
+
+**The pair was `desktop-shell`'s launch line and the launched application's first output.** The
+shell logs `launched nxfiles into its own namespace` *after* `send_setup_env` returns — so the
+application is already running by then and can print first. The `nxedit` launch forty lines below
+already carried exactly this reasoning and used `expect_all`; the `nxfiles` one did not, and had
+been winning the race for two milestones.
+
+**The race was always there; what changed is how often it is lost.** M13 Part C grew every window's
+damage by a shadow's radius, so the shell has more repainting to do around a launch. That is a
+plausible nudge rather than a proven cause, and the distinction matters: "the change caused it"
+points at reverting something, when what was actually wrong is an assertion that asked the system
+to guarantee an order it never had. Nothing in the guest was touched.
+
+**A local pass proves nothing here and the fix has to be structural.** The gate passed four times
+locally before and after, under KVM, which is the same evidence it offered the day it failed. What
+does count as a control is reversing the two patterns in the `expect_all` array: the run still
+reports them in the order the *guest* emitted them and still passes, which is the property being
+claimed. A timing flake cannot be closed by running it again until it is green.
+
+**The general shape:** `expect` asserts causation, `expect_all` asserts arrival. Reach for the
+first only where one line's producer sends the message that causes the other's — every
+`configure_window` → `nxterm: resized` pair in that file is a genuine chain. A launch is not: the
+parent and the child are downstream of one spawn and of nothing else.

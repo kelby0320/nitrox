@@ -790,7 +790,9 @@ fn release_configure(srv: &mut Server, screen: &mut Screen<RawFramebuffer>, wind
     };
     let (width, height) = w.size;
     let origin = w.origin;
-    let bounds = w.bounds();
+    // **Painted bounds, because this rectangle is damage**: a window becoming drawable has to
+    // repaint its shadow as well as itself.
+    let bounds = w.painted_bounds();
     srv.stack.mark_configured(window);
     let sent = configure_window(srv, window, width, height, origin);
     // **Both of these belong here rather than at the call sites**, because releasing is what
@@ -1880,7 +1882,7 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool 
                 }
                 if became_visible || was_held {
                     // Newly drawable, and newly a focus candidate — see `release_configure`.
-                    let r = srv.stack.window(window).map(|w| w.bounds());
+                    let r = srv.stack.window(window).map(|w| w.painted_bounds());
                     if let Some(r) = r {
                         repaint_region(srv, screen, r);
                     }

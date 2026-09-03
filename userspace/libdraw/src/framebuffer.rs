@@ -157,9 +157,28 @@ pub trait Framebuffer {
     /// vacuous left this path silently correct — two copies of the same arithmetic,
     /// only one of them covered.
     fn fill_rect(&mut self, rect: Rect, colour: Rgb) {
+        // **One loop, not two.** `encode(c)` *is* `encode_alpha(c, 255)`, so this and
+        // [`fill_rect_alpha`](Self::fill_rect_alpha) were byte-identical arithmetic in two
+        // places — the shape this file's own history warns about, where one copy was silently
+        // correct while the other was broken (PR #276 review, optional 7).
+        self.fill_rect_alpha(rect, colour, 255);
+    }
+
+    /// Fill `rect`, clipped to the visible area, with `colour` at `alpha`.
+    ///
+    /// **A stored opacity, not a blend.** [`blend_pixel`](Self::blend_pixel) mixes a colour *into*
+    /// what is already there and leaves an opaque pixel; this writes a pixel that is still
+    /// translucent afterwards, for something further down the line to composite. The distinction
+    /// only exists for a buffer whose format has an alpha channel — for any other, `alpha` is
+    /// discarded and this is [`fill_rect`](Self::fill_rect), which is the right answer rather than
+    /// a refusal: a surface with no channel has no way to be anything but opaque.
+    ///
+    /// Written for the overview, which fills a translucent ground and then draws opaque content
+    /// over it (M13 Part C).
+    fn fill_rect_alpha(&mut self, rect: Rect, colour: Rgb, alpha: u8) {
         let g = self.geometry();
         let Some(clipped) = rect.intersect(&g.bounds()) else { return };
-        let word = g.format.encode(colour).to_le_bytes();
+        let word = g.format.encode_alpha(colour, alpha).to_le_bytes();
         let bpp = g.format.bytes_per_pixel();
         let bytes = self.bytes_mut();
         for row in 0..clipped.size.h {
@@ -450,6 +469,37 @@ mod tests {
             fb.fill_rect(Rect::new(1, 1, 3, 1), Rgb::new(0xAA, 0xBB, 0xCC));
         }
         assert_eq!(raw.bytes(), mem.bytes());
+    }
+
+    #[test]
+    fn a_translucent_fill_stores_the_opacity_it_was_given() {
+        // **The single primitive the translucent overview rests on, and it had no test** (PR #276
+        // review, finding 4). Replacing `encode_alpha(colour, alpha)` with `encode(colour)` here
+        // makes every overview opaque again — half of M13 Part C reverted — and passed all 549
+        // host tests, because `desktop-shell` is a bin with no unit tests and nothing between
+        // them covered it.
+        use crate::format::PixelFormat;
+        let g = Geometry::with_pitch(8, 4, 40, PixelFormat::ARGB8888).unwrap();
+        let mut fb = MemFramebuffer::new(g);
+        let c = Rgb::new(0x20, 0x40, 0x60);
+        fb.fill_rect_alpha(Rect::new(1, 1, 4, 2), c, 0x99);
+
+        let word = |x: u32, y: u32| {
+            let o = g.offset_of(x, y).unwrap();
+            u32::from_le_bytes([fb.bytes()[o], fb.bytes()[o + 1], fb.bytes()[o + 2], fb.bytes()[o + 3]])
+        };
+        assert_eq!(g.format.alpha_of(word(1, 1)), 0x99, "the opacity was not stored");
+        assert_eq!(g.format.decode(word(1, 1)), c, "…and the colour still is");
+        assert_eq!(word(0, 1), 0, "outside the rectangle is untouched");
+
+        // A format with no alpha channel discards it and this *is* `fill_rect` — the claim the
+        // doc makes, and what lets `fill_rect` delegate here.
+        let og = Geometry::with_pitch(8, 4, 40, PixelFormat::XRGB8888).unwrap();
+        let mut a = MemFramebuffer::new(og);
+        let mut b = MemFramebuffer::new(og);
+        a.fill_rect_alpha(Rect::new(1, 1, 4, 2), c, 0x99);
+        b.fill_rect(Rect::new(1, 1, 4, 2), c);
+        assert_eq!(a.bytes(), b.bytes());
     }
 
     #[test]
