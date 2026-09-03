@@ -4328,6 +4328,13 @@ one diagnosis that explained both.
   straight to the display and says so on the console, because a compositor that aborts over a
   *visual* defect has made things worse.
 
+  **Review found a hole in it** (PR #274): `subtract_from` guarded its capacity two ways that
+  disagreed, and could drop a rectangle instead of keeping it uncut — background nothing fills and
+  no surface covers. Masked in the default desktop by the wallpaper being a full-screen window,
+  exposed in every configuration that has no wallpaper. Fixed by making the subtraction
+  all-or-nothing, and pinned by a property test at every capacity rather than at 16. See the
+  decision log.
+
   **What the tests do and do not establish.** The picture is pinned by an equivalence between the
   buffered and unbuffered paths, and the copy's bound by a byte count — a deliberate mutation that
   copied the whole shadow every frame drew the identical screen and was caught only by the count.

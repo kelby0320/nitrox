@@ -22657,3 +22657,46 @@ system has ever driven is emulated.
 Filed rather than fixed: it needs a cache-attribute field on `MemoryObject`, a way for the
 namespace server to set it, and a PAT or MTRR story — none of which M13 is about. **Trigger: the
 first boot on real hardware**, which is also the first time anybody could observe it.
+
+## 2026-09-03 — one invariant, two guards, and the quiet one won
+
+PR #274's review found a hole in `compose_exposed`: an arrangement of five ordinary windows on a
+bare desktop left a block of pixels that nothing filled and no surface covered, so the framebuffer
+kept whatever it last held. Reproduced exactly from the review's arrangement before it was fixed.
+
+**The bound was enforced twice, and the two did not agree.** `subtract_from` represents the
+un-covered background as at most `MAX_EXPOSED` rectangles; cutting a surface out of one leaves up
+to four, so a busy arrangement runs out of room. There was a guard — `n + 4 > MAX_EXPOSED`, keep
+the piece uncut — and, separately, a `push` that discarded silently when the array was full. The
+guard fired at `n >= 13` and `push` needed `n < 16`, so `n` could reach exactly 16 and every
+remaining piece was then *dropped*. The doc directly above said the opposite in as many words:
+"stops cutting and leaves the rectangles it has — which fills more background than strictly
+necessary and is therefore always correct". It was not always correct; it under-filled.
+
+**The fix is one mechanism, not a better second one.** The subtraction now writes into a scratch
+array and installs it only if every piece fitted; running out of room returns with the region
+untouched. The failure mode is then an over-fill — painting background a surface is about to cover
+— which costs only the work the function exists to save. *All of it or none of it* is a property;
+two cooperating guards are a coincidence that holds until someone edits one of them.
+
+**The test that should have existed was a property, not a case.** `subtract_from` now takes a
+slice, so its capacity is the region's own length, and a test runs it at every size from 1 to 16
+asserting both directions: no point that was exposed may be lost unless the cut took it, and no
+point may appear. At capacity 1 it can barely subtract at all and must still be correct. The
+reviewer's independent check is what pointed here — setting `MAX_EXPOSED = 5` made the *existing*
+equivalence test fail, which says the bound was load-bearing when nothing should have rested on it.
+Reintroducing the exact bug is now caught by two tests.
+
+**Why it was invisible.** A full-screen opaque bottom-most surface masks it entirely — the first
+subtraction empties the region and `n` never grows — and the default desktop has one, because M12
+Part F made the wallpaper a window. So every gate passed, `shot` looked right, and a person
+watching a drag saw nothing. The configurations that expose it are the ones the code explicitly
+supports: `Theme::light()` ships no wallpaper, `wallpaper = ""` means none, and every failure
+branch of `open_wallpaper` returns `None`. **A defect masked by a default is not a defect deferred**
+— it is one that will surface as stale pixels in a configuration nobody was testing, which is
+precisely the symptom `Screen`'s own doc warns about two files away.
+
+The same shape was then looked for elsewhere in the change. `copy_damage` has a bounds check that
+its own clipping already makes unreachable; it stays, because reading past a buffer is worse than
+skipping a row, but it is now commented as *not* the thing bounding the copy — a skip there is a
+row of stale pixels, and it must never quietly become load-bearing.

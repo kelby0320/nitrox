@@ -9012,7 +9012,7 @@ policy = \"never\"\n";
 /// [`Bench`]: BuildMode::Bench
 const BENCH_TOML: &str = "\
 \n\
-# The M13 Part A measurement. Declared **instead of** `boot-probe` (see `BENCH_TOML`): it owns\n\
+# The M13 Part A measurement. Declared **instead of** `boot-probe` (see `BOOT_PROBE_TOML`): it owns\n\
 # the screen for the length of a run and fires the boot verdict itself.\n\
 [service.compose-bench]\n\
 executable = \"/bin/compose-bench\"\n\

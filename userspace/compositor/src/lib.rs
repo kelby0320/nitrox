@@ -1405,6 +1405,13 @@ fn copy_damage<F: Framebuffer + ?Sized>(
             let y = area.origin.y as u32 + row;
             let Some(off) = g.offset_of(area.origin.x as u32, y) else { continue };
             let (src, dst) = (shadow.bytes(), display.bytes_mut());
+            // **Unreachable, and deliberately not the thing keeping this correct.** `area` is
+            // already clipped to the screen, so `off + width` cannot pass the end of a row, and
+            // the shadow was built from this geometry so both buffers are the same length. The
+            // check is here because reading past either would be worse than skipping — but a
+            // skip *is* a row of stale pixels, so it must never become the mechanism that bounds
+            // the copy. That is exactly how `subtract_from` grew a hole (PR #274 review): one
+            // invariant, two guards, and the quiet one won.
             if off + width > src.len() || off + width > dst.len() {
                 continue;
             }
@@ -2348,13 +2355,20 @@ mod tests {
 
     #[test]
     fn a_later_small_frame_leaves_the_rest_of_the_display_alone() {
-        // The end-to-end form of `only_the_damage_is_copied_to_the_display`: through `present`
-        // rather than against `copy_damage`, so a future `present` that recomposed or copied more
-        // than it was asked to is caught here even if it stopped going through that function.
+        // **What this checks is placement, end to end**: a second, small-damage `present` puts the
+        // right pixels at the right coordinates on the real display. It fails if `copy_damage`
+        // mislocates a row — losing the last row of each rectangle was the mutation that proved
+        // it live.
         //
-        // **It is not a test that the shadow's contents persist**, which this was first written
-        // as and does not check — a deliberate mutation clearing the shadow at the top of every
-        // present passed it. That mutation is not a bug either, which is the useful part: each
+        // **It does not bound the work, and the comment here used to say it did** (PR #274
+        // review). Two mutations pass it: recomposing the whole screen into the shadow while
+        // copying only the damage, and copying the whole shadow every frame. Both draw this exact
+        // picture, because the shadow is a faithful mirror — which is the same reason
+        // `only_the_damage_is_copied_to_the_display` had to become a byte count. The recompose
+        // side is bounded by `libdraw`'s `damage_bounds_what_is_repainted`, not by anything here.
+        //
+        // **Nor is it a test that the shadow's contents persist**, which this was first written
+        // as — a deliberate mutation clearing the shadow at the top of every present passed it. That mutation is not a bug either, which is the useful part: each
         // damage rectangle is *fully* repainted (background where exposed, surfaces over it), so
         // what the shadow held there beforehand never reaches the screen, and what it holds
         // outside is never copied. The shadow is a staging buffer, not a cache, and there is no

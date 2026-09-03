@@ -12,6 +12,16 @@
 //! allocation. §7 forbids exactly that. It also means a host buffer and a guest
 //! framebuffer with *different* strides hash identically for the same image, which is
 //! what lets the two sides be compared at all.
+//!
+//! **The *pixel's* padding is not excluded, which is a different thing.** A row contributes
+//! `width × bpp` bytes, and in `XRGB8888` that includes the X byte — so the hash is sensitive to
+//! bits the display ignores. Nothing in tree writes them: every producer goes through
+//! [`PixelFormat::encode`](crate::format::PixelFormat::encode), which leaves X zero, and
+//! `compose`'s row-copy blit preserves what it finds. A future client that `memcpy`s ARGB data
+//! straight into an XRGB surface would draw a correct picture and move `REFERENCE_HASH` anyway,
+//! which is a confusing way to fail (PR #274 review). Masking X here would cost a pass over every
+//! pixel to defend against a client that does not exist; the note is the cheaper half, and the
+//! trigger for doing more is the first client that trips it.
 
 use crate::framebuffer::Framebuffer;
 
