@@ -22525,3 +22525,135 @@ the coverage and a source and destination pitch that differ. M12 Part F moved `p
 same reason and wrote the reason down, and this change put a sibling straight back in — which is
 what the review noticed. A rule stated in one function's doc does not carry to the next function
 somebody writes.
+
+## 2026-09-03 — M13 Part A's measurement: two wrong rationales and a 3.7x frame
+
+The plan said a measurement comes first, and recorded the reason: the claim that composing through
+RAM is *also faster* than composing into the aperture was "plausible and unproven". It is now
+measured — `cargo xtask bench-compose` — and it was wrong.
+
+**The stated mechanism does not exist on this system.** "The per-pixel work moving off MMIO into
+cached RAM" requires the aperture to be uncached, and it is not: `protection_to_page_flags` never
+sets `PageFlags::NO_CACHE`, and nothing carries a cache attribute from a `MemoryObject` to a user
+PTE — `NO_CACHE` is used only by `kvmap`, for kernel MMIO. That was found by reading, and then
+*checked by measuring* rather than left as a reading: writing one row to the aperture and one to an
+anonymous mapping takes the same time to within 1%, under both accelerators.
+
+**So the shadow buffer costs a copy and buys nothing back**: 118% of in-place at the median under
+TCG, 123% under KVM. The delta is 515 µs under KVM for a 1.88 MB damage area — 3.6 GB/s, which is
+within measurement error of exactly one copy at the rate the same run measured for plain stores.
+The two accelerators agreeing is the *informative* result here rather than a broken instrument:
+once the aperture is known to be ordinary RAM, both arms are RAM-to-RAM and there is no
+accelerator-specific effect left to find.
+
+**Part A proceeds anyway, on the flicker alone.** That was always the stronger half: the flicker is
+a visible defect and an ordering property — no background-only frame is ever on screen — and no
+number could have shown it either way. What the measurement changes is the honesty of the
+justification, and it removes a "faster" claim that would otherwise have been quoted back as
+settled.
+
+**And it found a better optimisation than the one that was planned** — then, in measuring *that*,
+found the one that mattered. `compose` fills each damage rectangle with the background and *then*
+blits the surfaces over it, so in a drag most pixels are written twice, which is also *why the
+flicker exists at all*: the fill is the flash. `compose_exposed` fills only the part of the damage
+no opaque surface covers, and a host test asserts it draws the identical picture.
+
+**It removed half the pixel writes from a frame and bought 6%.** That is the finding, and it only
+looks like a disappointment until it is read the right way round: if halving the writes changes
+almost nothing, *the writes were never the cost*. The cost was `blit_clipped`, which for every
+pixel did two `offset_of`s, six bounds checks, an unpack to `Rgb` and a repack — while `fill_rect`
+computes an offset once per row and stores a pre-encoded word. The blit was roughly twelve times
+the per-pixel price of the fill, so the fill was never where a drag's time went.
+
+**A surface and the framebuffer always share a pixel format** — both come from the same
+Limine-reported mode — and when they do, `decode` followed by `encode` is a round trip that lands
+on the bytes it started from, so a row is a `memcpy`. With that fast path in `blit_clipped`, at the
+same 470,400-pixel median damage:
+
+| arm | KVM before | KVM after | TCG before | TCG after |
+| --- | --- | --- | --- | --- |
+| in place (ships today) | 4.54 ms | **0.90 ms** | 43.6 ms | **7.0 ms** |
+| shadow | 5.16 ms | 1.52 ms | 46.9 ms | 10.8 ms |
+| exposed | 4.26 ms | 0.62 ms | 40.4 ms | 3.8 ms |
+| exposed + shadow | 4.89 ms | **1.24 ms** | 43.7 ms | **7.6 ms** |
+
+**So the "also faster" claim is true after all, by a mechanism the plan never named.** Part A can
+ship the shadow buffer for the ordering *and* the skipped fill for the work, and land at 1.24 ms
+against the 4.54 ms in place today — **3.7× faster than what ships**, 5.7× under TCG — rather than
+the 14% penalty the first measurement priced. The plan's conclusion survives; every step of its
+reasoning was replaced.
+
+**Two things worth trusting the numbers for.** The shadow copy's cost appears three times as a
+difference between arms — shadow − in place, and exposed + shadow − exposed, before and after the
+blit changed — and lands on 624, 623 and 623 µs. A term that stays fixed in absolute size while
+the frame around it gets five times cheaper is the arithmetic behaving exactly as a copy should,
+and it is why `shadow`'s *ratio* rises from 114% to 170% while costing not one nanosecond more.
+And the fast path is pinned by a differential test against the per-pixel path it replaces, because
+every caller now takes it — no test of `compose`'s output can tell the two apart, so nothing else
+stands between a wrong row calculation and a silently wrong picture. Two deliberate mutations of
+the row maths were confirmed to fail it.
+
+**The general shape.** A measurement asked to confirm a hoped-for win usually confirms it; this one
+was framed as "establish the price", and that framing is why it produced live findings instead of a
+number nobody argues with. It was wrong twice on the way — the aperture was not uncached, and the
+fill was not the cost — and each wrong answer was worth more than the confirmation would have been.
+The plan's instinct, to open the milestone by proving the claim, was right; the value came from
+being willing to have it disproved.
+
+## 2026-09-03 — the shadow buffer, and making the aperture unreachable
+
+M13 Part A, built on the measurement above. `compositor::Screen` owns the shadow buffer and the
+aperture; `WindowStack::present_into` dropped to `pub(crate)`, so the binary can no longer paint
+the display at all and every frame necessarily goes through the staging buffer.
+
+**That access rule is the design, not tidiness.** The shadow is only equivalent to the screen while
+*every* write goes through it, and a single path painting the aperture directly would leave the two
+disagreeing about a region — showing as stale pixels that persist until something else damages
+them, a symptom that looks nothing like its cause. The crate had already learned this shape: the
+cursor is drawn by `present_into` because three of the four paths that recomposed had forgotten to
+redraw it, and the fix was to make composing unreachable from outside rather than to remember
+harder. This is the same move one layer out, and the compiler found both call sites immediately.
+
+**It degrades instead of aborting.** A 1280x800 shadow is 4.1 MB, asked for on a 256 MB machine, so
+it is allocated through `MemFramebuffer::try_new` (`try_reserve`) and `Screen` falls back to
+compositing straight to the display — precisely the behaviour that shipped before — announcing it
+on the console. A compositor that panicked there would take the graphical session down to avoid a
+*visual* defect, which is the wrong trade in every direction. This is the `MAX_PIXELS` lesson from
+M12 Part F applied before rather than after: `vec![0; n]` aborts, and a screen-sized allocation is
+not a fixture.
+
+**What is tested, and the one thing that is not.** The buffered and unbuffered paths are asserted
+to draw the same picture; the copy's damage bound is asserted as a **byte count**, because a copy
+that pushed the whole shadow every frame draws the *identical screen* — the shadow being a faithful
+mirror is exactly what makes over-copying invisible — and would silently put a full-screen blit
+behind every one-pixel drag. That test was written first as a pixel comparison, and a deliberate
+copy-everything mutation passed it; four mutations are now recorded against these tests, three
+caught.
+
+**The fourth was not caught, and was not a bug.** Clearing the shadow at the top of every present
+changes nothing observable: each damage rectangle is *fully* repainted, so what the shadow held
+there beforehand never reaches the screen, and what it holds outside is never copied. The shadow is
+a staging buffer, not a cache. A test had been written asserting persistence "between frames" on
+the assumption there was a stale-content hazard; the mutation showed there is none, and the test
+now says what it actually checks. **A negative control that passes has told you something** — here,
+that a guarantee the design seemed to need is not one it relies on.
+
+**The ordering property has no automated test, and that is stated rather than papered over.** It is
+a claim about what a scanout can observe *between* two writes; `check-display` compares settled
+screens and cannot see it. It was confirmed by a person looking at a drag, which the plan said in
+advance would be the gate.
+
+## 2026-09-03 — a write-back mapping of a display aperture, filed
+
+Found while designing the above: userspace maps `/dev/framebuffer` **write-back cached**, because
+nothing plumbs a cache attribute from a `MemoryObject` to a user PTE.
+
+Under QEMU this is harmless and is why the aperture measures identically to RAM. On real hardware
+it is a **correctness** problem, not a performance one: a PCI framebuffer BAR wants write-combining
+or uncached, and a WB mapping can leave writes sitting in cache with nothing to flush them, or
+reorder them in ways a device does not expect. It is invisible today because the only display this
+system has ever driven is emulated.
+
+Filed rather than fixed: it needs a cache-attribute field on `MemoryObject`, a way for the
+namespace server to set it, and a PAT or MTRR story — none of which M13 is about. **Trigger: the
+first boot on real hardware**, which is also the first time anybody could observe it.
