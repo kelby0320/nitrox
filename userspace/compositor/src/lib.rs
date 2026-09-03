@@ -1251,8 +1251,11 @@ impl WindowStack {
             surfaces.push(SurfaceRef::new(b.geometry, w.origin, px));
         }
         // **`compose_exposed`, not `compose`.** Every surface above has just been length-checked,
-        // so each one genuinely covers what it claims and the background under it is background
-        // nobody can see. Filling it anyway is the double-write that M13 Part A measured — and,
+        // so each one writes every pixel it claims. That was the whole argument until M13 Part B;
+        // it is now half of one, because `attach` can put a *translucent* surface in this list and
+        // a blended pixel reads what is under it. `covers` carries both conditions, and the fill
+        // beneath a translucent surface is still painted — this call is correct for two reasons
+        // now, and the second is not visible from here (PR #275 review, finding 4). Filling it anyway is the double-write that M13 Part A measured — and,
         // on the way to the display, the flash the shadow buffer exists to hide.
         compose_exposed(fb, background, &surfaces, damage);
     }

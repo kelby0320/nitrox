@@ -138,8 +138,9 @@ impl PngError {
 ///
 /// **The same pair every other surface in this crate is**, so a decoded picture goes into
 /// [`box_downscale`](crate::scale::box_downscale) or a blit without a conversion step. The
-/// alpha channel is *dropped* rather than kept: nothing in this system composites with alpha
-/// yet — `libdraw` has no blend — and a wallpaper is drawn on nothing, so there is nothing for
+/// alpha channel is *dropped* rather than kept, and the reason is the picture rather than the
+/// substrate: `libdraw` blends (since M5 Part A) and surfaces can carry alpha (since M13 Part B),
+/// but a wallpaper is drawn on nothing, so there is nothing for
 /// it to blend with. Keeping a channel no code reads would be a promise this cannot honour.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Image {

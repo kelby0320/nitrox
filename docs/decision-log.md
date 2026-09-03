@@ -22760,3 +22760,38 @@ rounding) that a blend is most likely to have and that no host test could find.
 with `dim()` over a full-screen opaque window. Converting it is Part C, where it has a picture to
 be judged against. Building the substrate and its consumer in one part would have meant choosing
 the substrate to suit one caller.
+
+## 2026-09-03 — a phrase sweep cannot find a phrase the wrap has split
+
+PR #275's review found three places still asserting the system has no alpha channel, in a sweep
+this change had deliberately performed. A fourth turned up when the sweep was redone properly, in
+`spec/theme-toml-schema.md` — a *spec* doc, which carries a higher bar than the architecture doc
+the review named.
+
+**The grep could not have found them, and that is the lesson.** It searched for `"no alpha
+channel"` and similar multi-word phrases. Every doc in this repository is hard-wrapped at about
+95 columns, so the sentence in `desktop-shell.md` reads `there is no alpha` / `channel anywhere in
+this system` across a line break, and no multi-word pattern matches it. The other two were missed
+differently and just as avoidably: the search covered `userspace/` and `docs/` and simply did not
+include `tools/`.
+
+**So a claim sweep searches for the shortest distinctive token, over the whole tree.** Here that
+is `alpha` — 194 hits, of which about forty needed reading and five needed changing. Reading forty
+lines is the cost of the sweep; a phrase that matches only the unwrapped instances gives a clean
+result and a false one, which is worse than not sweeping, because it is evidence of thoroughness
+where there was none.
+
+**A related habit that did work**, and is worth keeping alongside: the same review confirmed the
+five mutations this change claimed, and found the *client* half of the feature had none — two
+mutations of `libsurface` left all forty-eight of its tests green. A feature reached through a
+library has two halves and it is easy to negative-control only the one where the logic looks
+interesting.
+
+**And one correction to a suggested fix.** The review proposed testing `BufferPool`'s format
+threading with the existing transport double, calling the cost near zero. It is not reachable:
+`BufferPool::install` allocates through `sys_memory_create`, so the struct cannot be constructed
+on the host at all and the module has no tests of any kind. What was added instead is the half
+that *is* reachable — `attach_with_format`'s wire tag, both formats and the refusal — plus a note
+in `buffers.rs` saying plainly that the resize property is reasoning rather than a tested claim.
+Writing the test that cannot exist is not an option; letting a doc imply it exists is the thing to
+avoid.

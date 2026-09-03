@@ -59,6 +59,16 @@ pub enum UiError {
     TooFewBuffers,
     /// No buffer with that id.
     NoSuchBuffer,
+    /// A pixel format with no wire tag — see
+    /// [`attach_with_format`](WindowRef::attach_with_format).
+    ///
+    /// **Refused rather than approximated.** The tag and the client's own geometry are two
+    /// descriptions of the same buffer, and deriving one from the other by a single property
+    /// lets them disagree: a format that is neither of the two named ones would go out as
+    /// `XRGB8888` while the client kept drawing in its own channel order, and the compositor
+    /// would blit it as RGB. Red and blue swap on every pixel with nothing on the path reporting
+    /// anything (PR #275 review, finding 2).
+    UnsupportedFormat,
     /// The compositor answered this request with an error.
     ///
     /// Distinct from [`UiError::BadReply`]: the reply is well-formed and *is* for this
@@ -692,8 +702,15 @@ impl<T: Transport> WindowRef<'_, T> {
     /// a time rather than a row at a time, and it cannot hide what is beneath it, so the
     /// compositor also paints the background under it. Ordinary windows should stay opaque.
     ///
-    /// A format the compositor does not accept is refused at the wire decoder rather than
-    /// treated as opaque, so an old compositor rejects a new client instead of drawing it wrong.
+    /// **Only the two formats the protocol names are accepted**, and anything else is refused
+    /// here with [`UiError::UnsupportedFormat`] rather than sent under the nearest tag. There is
+    /// no tag for `XBGR8888`, so approximating it as `XRGB8888` would leave the client drawing in
+    /// one channel order and the compositor blitting in the other — red and blue swapped on every
+    /// pixel, with nothing on the path reporting anything.
+    ///
+    /// A format a *newer* client names and an older compositor does not is refused at the wire
+    /// decoder for the same reason, so an old compositor rejects a new client instead of drawing
+    /// it wrong.
     pub fn attach_with_format(
         &mut self,
         buffer_id: u32,
@@ -703,7 +720,16 @@ impl<T: Transport> WindowRef<'_, T> {
         handle: u64,
         format: PixelFormat,
     ) -> Result<(), UiError> {
-        let tag = if format.has_alpha() { SURFACE_FORMAT_ARGB8888 } else { SURFACE_FORMAT_XRGB8888 };
+        // **Matched against the named formats, not derived from one bit of them.** The tag and
+        // the geometry below describe the same buffer, and the two must agree or the compositor
+        // draws something the client did not send — see [`UiError::UnsupportedFormat`].
+        let tag = if format == PixelFormat::ARGB8888 {
+            SURFACE_FORMAT_ARGB8888
+        } else if format == PixelFormat::XRGB8888 {
+            SURFACE_FORMAT_XRGB8888
+        } else {
+            return Err(UiError::UnsupportedFormat);
+        };
         let geometry =
             Geometry::with_pitch(width, height, pitch as usize, format).ok_or(UiError::Malformed)?;
         let mut body = [0u8; 32];
@@ -1562,6 +1588,48 @@ mod tests {
             w.s.transport.sent.iter().filter(|(op, _, _)| *op == OP_COMMIT).collect();
         assert_eq!(commits.len(), 2);
         assert!(commits.iter().all(|(_, _, h)| h.is_none()), "a commit transfers nothing");
+    }
+
+    #[test]
+    fn the_format_a_client_asks_for_is_the_tag_that_goes_on_the_wire() {
+        // **The client half of translucency had no negative control** (PR #275 review, finding
+        // 3): making `attach_with_format` send `SURFACE_FORMAT_XRGB8888` unconditionally left
+        // every test in this crate green while every translucent window a client asked for came
+        // back opaque. Byte 20 of the attach body is the format word — see
+        // `docs/spec/rsproto-surface-ops.md`.
+        fn tag_of(w: &One) -> u32 {
+            let (_, body, _) =
+                w.s.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_ATTACH_BUFFER).unwrap();
+            u32::from_le_bytes(body[20..24].try_into().unwrap())
+        }
+
+        let mut w = window(2);
+        assert_eq!(tag_of(&w), SURFACE_FORMAT_XRGB8888, "the plain attach is opaque");
+
+        w.w().attach_with_format(0, 64, 32, 64 * 4, 300, PixelFormat::ARGB8888).unwrap();
+        assert_eq!(tag_of(&w), SURFACE_FORMAT_ARGB8888);
+        // …and the client's own record agrees with what it sent, which is the pair that must not
+        // drift: the compositor draws from the tag and the client draws into the geometry.
+        assert!(w.w().buffer_geometry(0).unwrap().format.has_alpha());
+
+        w.w().attach_with_format(0, 64, 32, 64 * 4, 301, PixelFormat::XRGB8888).unwrap();
+        assert_eq!(tag_of(&w), SURFACE_FORMAT_XRGB8888);
+        assert!(!w.w().buffer_geometry(0).unwrap().format.has_alpha());
+    }
+
+    #[test]
+    fn a_format_with_no_wire_tag_is_refused_rather_than_approximated() {
+        // **The bug finding 2 found.** The tag used to be derived from `has_alpha()`, so
+        // `XBGR8888` — a public const in `libdraw`, and the natural thing to pass on firmware
+        // that reports BGR — went out as `XRGB8888` while the client kept drawing in BGR order.
+        // Red and blue swapped on every pixel, with nothing on the path reporting anything.
+        let mut w = window(2);
+        let before = w.s.transport.sent.len();
+        let e = w.w().attach_with_format(0, 64, 32, 64 * 4, 302, PixelFormat::XBGR8888);
+        assert_eq!(e, Err(UiError::UnsupportedFormat));
+        assert_eq!(w.s.transport.sent.len(), before, "a refused attach must send nothing");
+        // The buffer keeps the geometry it had: a refused attach changes nothing either side.
+        assert_eq!(w.w().buffer_geometry(0).unwrap().format, PixelFormat::XRGB8888);
     }
 
     #[test]

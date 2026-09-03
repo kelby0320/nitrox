@@ -3505,7 +3505,8 @@ fn render_overview(
     //
     // **Dimmed rather than shown at full brightness**, which is what makes it read as behind
     // something. `blend` composites black over each pixel at a coverage — the same primitive
-    // glyph rasterisation uses, and no alpha channel is stored anywhere. GNOME blurs as well;
+    // glyph rasterisation uses, and the dimmed result is an ordinary opaque picture — nothing
+    // here stores a channel, even though a surface could since M13 Part B. GNOME blurs as well;
     // a blur is a separable convolution over a million pixels per open, and dimming alone is
     // what the request asked for.
     // **`libdraw::scale::dim` does the composite**, not a loop here: the source pitch and the

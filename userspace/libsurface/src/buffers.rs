@@ -87,6 +87,13 @@ impl BufferPool {
     /// costs. The format is remembered, so the re-attach a resize performs keeps it: a pool that
     /// reverted to opaque on the first resize would produce a window that is see-through until
     /// someone drags its edge.
+    ///
+    /// **That last sentence is reasoning, not a tested property, and this module is where to say
+    /// so.** [`install`](Self::install) allocates through `sys_memory_create`, so a `BufferPool`
+    /// cannot be built on the host at all and nothing here has a `#[test]` — the transport double
+    /// that covers `attach_with_format` does not reach this far (PR #275 review, finding 3). What
+    /// stands in for a test is that `install` is the only place this struct attaches anything, so
+    /// `self.format` has one reader. A guest exercise arrives with Part C, the first caller.
     pub fn in_format<T: Transport>(
         window: &mut WindowRef<'_, T>,
         size: Size,

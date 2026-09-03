@@ -522,6 +522,34 @@ mod tests {
     }
 
     #[test]
+    fn a_short_translucent_surface_blends_what_it_has_and_skips_the_rest() {
+        // **The one line of the alpha path with no negative control** (PR #275 review, optional
+        // 5). `blit_blended` mirrors `blit_pixels`' short-buffer skip, and the compositor drops
+        // short surfaces before compose ever sees them, so this is defensive — but "defensive"
+        // is a claim about a code path, and an untested one reads past a client's buffer if the
+        // comparison is ever written the wrong way round.
+        let g = screen_geom();
+        let bg = Rgb::new(9, 9, 9);
+        let ink = Rgb::new(200, 100, 50);
+        let (sg, px, o) = translucent(2, 2, 10, 8, ink, 128);
+
+        // Two whole rows and a fragment: enough that some pixels blend and the rest do not.
+        let short = &px[..sg.pitch * 2 + 5];
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, short)], &[g.bounds()]);
+
+        // A pixel the buffer covers blended; one past its end is the background the fill left,
+        // not a read past the end and not an untouched pixel.
+        assert_eq!(fb.get_pixel(3, 2), Some(ink.blend(bg, 128)));
+        assert_eq!(fb.get_pixel(3, 6), Some(bg));
+        // The control: with the whole buffer that second pixel *does* blend, so the assertion
+        // above is about the truncation rather than about the geometry.
+        let mut full = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut full, bg, &[SurfaceRef::new(sg, o, &px)], &[g.bounds()]);
+        assert_eq!(full.get_pixel(3, 6), Some(ink.blend(bg, 128)));
+    }
+
+    #[test]
     fn an_opaque_surface_still_covers_and_a_translucent_one_does_not() {
         // `covers` decides whether the fill underneath can be skipped, and it is the whole reason
         // the test above passes. Asserted directly so a change to either condition is visible
