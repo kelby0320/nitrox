@@ -258,10 +258,7 @@ mod tests {
         (v, g)
     }
 
-
     // ---- fit or centre (M12 Part F) ----
-
-    // ---- dimming an overlay ----
 
     #[test]
     fn place_centres_a_small_picture_and_grounds_the_rest() {

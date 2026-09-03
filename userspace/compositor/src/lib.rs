@@ -234,7 +234,7 @@ impl Window {
     /// **Deliberately not [`bounds`](Self::bounds)**, and the split is the point. `bounds` is
     /// where the window *is*: what a click hits, what its client is told its geometry is, what
     /// covers the background. This is what repainting has to cover. One rectangle serving both
-    /// would make the shadow clickable and would tell a client it is fourteen pixels bigger than
+    /// would make the shadow clickable and would tell a client it is sixteen pixels bigger than
     /// it asked to be.
     pub fn painted_bounds(&self) -> Rect {
         match shadow_for(self.role) {

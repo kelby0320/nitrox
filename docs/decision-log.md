@@ -22854,3 +22854,38 @@ what makes an opacity judgement mean anything; its shadow half draws a mock, bec
 already contains the shipped shadow and layering a second one would be comparing two shadows. This
 is `preview`'s argument from M11 Part A applied to the part `preview` structurally could not
 reach — it renders the toolkit's own surfaces, and both of these are *compositing*.
+
+## 2026-09-03 — the same sweep, missed the same way, one file over
+
+PR #276's review found `Manage::Close` still computing damage from `bounds()` — the tenth damage
+site, in `manager.rs`, which this change's own sweep did not reach. Its sibling, the client
+`DestroyWindow` arm in `server.rs`, moved with the other nine. The symptom would have been a dark
+halo left where a manager-closed window used to be, sitting there until something unrelated
+repainted that region.
+
+**This is the second miss in the same change, and the two have opposite causes**, which is what
+makes the pair worth recording rather than either alone. The first — the commit handler — was
+missed because it *computes its rectangle from a client's numbers* and so does not look like a
+damage site at all. This one looks exactly like a damage site and was missed because the search
+never opened the file: nine sites were found by grepping `.bounds()` in the files already open,
+and `manager.rs` was not among them.
+
+So the rule from the first miss ("where does damage come from" is not "where is `bounds` called")
+was true and insufficient. **A sweep is defined by its corpus before it is defined by its pattern.**
+`grep -rn` over the whole crate would have found this in the same second as the others; the
+per-file greps that felt more targeted were the reason it survived. This is now the third sweep in
+three parts to fail on its corpus rather than its pattern — Part B's missed `tools/` entirely and
+missed hard-wrapped prose — and the corrective is mechanical: search the tree, then narrow.
+
+**Two tests were pinning the wrong rectangle** and had to move with the fix, which is worth
+noticing on its own: a test that asserts today's behaviour will happily assert a bug, and neither
+of these would have failed if the bug had been introduced deliberately.
+
+**And two things that reverted silently.** `fill_rect_alpha` — the single primitive the translucent
+overview rests on — had no test, and replacing `encode_alpha(c, a)` with `encode(c)` passed all 549
+host tests while making the overview opaque again. The falloff curve, this part's headline fix, had
+none either: substituting the exact curve it was written to replace also passed, and
+`check-display` cannot catch it because the gate computes its expected shadow through the same
+function. Both are now pinned — the curve by *ratios* against its own edge value, so the assertion
+survives a change of strength or radius and only a change of shape breaks it. **A gate that
+computes its expected answer cannot also be the regression test for the computation.**

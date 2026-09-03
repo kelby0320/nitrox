@@ -5694,6 +5694,24 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         )
         .into());
     }
+    // **And nested with room for a shadow**, which nesting alone does not give (M13 Part C, PR
+    // #276 review, finding 6). Each window's shadow is applied to the reference *below* it and
+    // then that window's rectangle is excluded from the comparison — so a shadow that reached
+    // past the window above it would land in a region the exclusion does not cover, and the gate
+    // would report unexplained pixel mismatches instead of the real cause. One font-size change
+    // to the terminal reference is all it takes.
+    let sh_reach = libdraw::theme::WINDOW_SHADOW;
+    let reach_x = sh_reach.radius;
+    let reach_y = sh_reach.radius + sh_reach.offset.y.max(0) as u32;
+    if !(sw + reach_x <= tw && sh + reach_y <= th && tw + reach_x <= uw && th + reach_y <= uh) {
+        return Err(format!(
+            "a reference window's shadow would fall outside the window above it: scene \
+             {sw}x{sh}, terminal {tw}x{th}, toolkit {uw}x{uh}, and a shadow reaches {reach_x} \
+             sideways and {reach_y} down. Each window must clear the one below it by that much, \
+             or the exclusions below stop covering what the guest paints"
+        )
+        .into());
+    }
     // **The window above casts a shadow onto this one** (M13 Part C), so the reference has to
     // carry it or the gate would be comparing against a picture the compositor never draws. Applied
     // through `libdraw`'s own `draw_shadow` with `libdraw`'s own constant — the gate computes its

@@ -38,6 +38,7 @@ use crate::format::Rgb;
 /// **Not a `Theme` field**, though: a shadow is not a colour. It is black at a coverage, the way a
 /// glyph's antialiased edge is, so a palette that had to name it would be naming an effect. Which
 /// *roles* cast one stays the compositor's decision.
+///
 /// **Chosen by eye against a real desktop**, with `cargo xtask tune` (M13 Part C). The first
 /// values were roughly twice this opacity and read as a drawn border rather than as depth; the
 /// curve was the larger half of that — see [`draw_shadow`](crate::compose::draw_shadow). At 60,
@@ -49,7 +50,6 @@ pub const WINDOW_SHADOW: crate::compose::Shadow = crate::compose::Shadow {
     colour: crate::format::Rgb::new(0, 0, 0),
     strength: 60,
 };
-
 
 /// The colours and text size everything on screen is drawn from.
 ///

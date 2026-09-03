@@ -84,15 +84,37 @@ pub struct Shadow {
 
 impl Shadow {
     /// The rectangle this shadow can paint into, around a surface at `bounds`.
+    ///
+    /// **Unioned with `bounds`, which matters at an offset larger than the radius.** Callers use
+    /// this as the region to repaint, and an offset that displaces the shadow further than it
+    /// reaches would start the rectangle *inside* the window — leaving a band of the window itself
+    /// unrepainted after a move. The shipped values cannot do that; `cargo xtask tune --drop 20`
+    /// invites exactly that comparison, and someone liking the result would edit the constant
+    /// (PR #276 review, optional 9). Cheaper to make the union unconditional than to make the
+    /// constraint a rule nobody reads.
     pub const fn around(&self, bounds: Rect) -> Rect {
         let r = self.radius as i32;
-        Rect::new(
+        let cast = Rect::new(
             bounds.origin.x + self.offset.x - r,
             bounds.origin.y + self.offset.y - r,
             bounds.size.w + self.radius * 2,
             bounds.size.h + self.radius * 2,
-        )
+        );
+        let (l, t) = (min_i32(cast.origin.x, bounds.origin.x), min_i32(cast.origin.y, bounds.origin.y));
+        let r_edge = max_i32(cast.right() as i32, bounds.right() as i32);
+        let b_edge = max_i32(cast.bottom() as i32, bounds.bottom() as i32);
+        Rect::new(l, t, (r_edge - l) as u32, (b_edge - t) as u32)
     }
+}
+
+/// `const` min, which `Ord::min` is not.
+const fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { a } else { b }
+}
+
+/// `const` max, which `Ord::max` is not.
+const fn max_i32(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
 }
 
 /// Draw `shadow` around `bounds` on `fb`, painting only inside `clip`.
@@ -581,6 +603,35 @@ mod tests {
     }
 
     #[test]
+    fn the_shadow_falls_off_fast_near_the_surface_and_leaves_a_faint_tail() {
+        // **The shape, not the constants** (PR #276 review, finding 5). The curve this replaced —
+        // `strength * (r² - d²) / r²`, which needs no square root — holds three quarters of its
+        // opacity half a radius out, so every window wore a dark band with a sudden edge and
+        // turning `strength` down produced a fainter band rather than a shadow. Substituting it
+        // back passed all 549 host tests, and `check-display` cannot catch it either because the
+        // gate computes its expected shadow through this same function.
+        //
+        // Asserted as ratios against the edge value, so the numbers here survive a change of
+        // `strength` or `radius` and only a change of *curve* breaks them. The old curve gives
+        // 94% / 75% / 44% at these three points; this one gives 56% / 25% / 6%.
+        let g = screen_geom();
+        let bg = Rgb::new(255, 255, 255);
+        let sh = Shadow { radius: 16, offset: Point::new(0, 0), colour: Rgb::new(0, 0, 0), strength: 200 };
+        let (sg, px, o) = surface(24, 8, 8, 8, Rgb::new(200, 30, 30));
+        let mut fb = crate::framebuffer::MemFramebuffer::new(g);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(sh)], &[g.bounds()]);
+
+        // Coverage read off a white ground: 255 - the pixel's value.
+        let cov = |d: i32| 255 - fb.get_pixel((24 - 1 - d) as u32, 12).unwrap().r as i32;
+        let edge = cov(0);
+        assert!(edge > 150, "the premise: the edge is dark, got {edge}");
+        let at = |d: i32| cov(d) * 100 / edge;
+        assert!(at(4) < 70, "a quarter out should be well under three quarters, got {}%", at(4));
+        assert!(at(8) < 40, "half way out should be a faint tail, got {}%", at(8));
+        assert!(at(12) < 15, "three quarters out is nearly nothing, got {}%", at(12));
+    }
+
+    #[test]
     fn a_shadow_fades_with_distance_and_stops_at_its_radius() {
         let g = screen_geom();
         let bg = Rgb::new(120, 120, 120);
@@ -667,6 +718,26 @@ mod tests {
                 &[Rect::new(20, 16, 12, 10)]);
         // Only the surface's own rectangle was damaged, so its shadow is nowhere.
         assert_eq!(fb.get_pixel(19, 20), Some(bg), "the shadow escaped the damage rectangle");
+    }
+
+    #[test]
+    fn a_shadow_offset_past_its_radius_still_covers_the_surface() {
+        // `around` is what damage is computed from, so it must never start inside the window: an
+        // offset larger than the radius would otherwise leave a band of the window itself
+        // unrepainted after a move. Not reachable with the shipped constants — which is exactly
+        // why it needs a test rather than a person (PR #276 review, optional 9).
+        let bounds = Rect::new(40, 30, 20, 16);
+        let far = Shadow { radius: 4, offset: Point::new(0, 30), colour: Rgb::new(0, 0, 0), strength: 80 };
+        let r = far.around(bounds);
+        assert!(
+            r.origin.x <= bounds.origin.x
+                && r.origin.y <= bounds.origin.y
+                && r.right() >= bounds.right()
+                && r.bottom() >= bounds.bottom(),
+            "{r:?} does not contain {bounds:?}"
+        );
+        // …and it still reaches the displaced shadow, which is the other half of its job.
+        assert!(r.bottom() >= bounds.bottom() + 30 + 4);
     }
 
     #[test]

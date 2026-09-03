@@ -423,9 +423,19 @@ every commit a full-screen recomposite — and **not** an isolation barrier: com
 each surface from its own buffer, so a rectangle covering a neighbour cannot read or write a
 neighbour's pixels.
 
+**Two exceptions, both of which repaint more than was asked for and neither of which a client
+needs to handle.**
+
 A window whose new buffer is a **different size** from its old one is repainted over the union
 of both, whatever it named: the region it vacated cannot be described in coordinates of a
 buffer that no longer covers it.
+
+A window with **no previous commit** is repainted over all of itself, whatever it named —
+including anything the compositor paints *around* it, such as a drop shadow. The client is
+describing what changed inside its buffer; what changed on screen is the whole window appearing.
+Until M13 Part C the two coincided, because a window painted exactly its own rectangle and a
+client's first damage is its whole buffer in practice. What made the difference observable was a
+window that launched with no shadow and grew one when it was next clicked (2026-09-03).
 
 ### `Release` (`0x0903`)
 
