@@ -183,7 +183,17 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     answers were tried — shadows need no substrate, and per-surface opacity dims a panel's text
     along with its ground. Opaque surfaces keep Part A's row copy. **Part C closes the milestone**
     the same day: windows and menus cast shadows, and the overview is a translucent surface over
-    the live desktop rather than an opaque one redrawing it. **M13 is complete.** The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
+    the live desktop rather than an opaque one redrawing it. **M13 is complete.**
+    **M14 — the applications, and what a menu is** — detail-passed 2026-09-03 from the
+    maintainer's list after living with the desktop, with the north star stated as a comparison:
+    the three applications should be about equivalent to the versions of GNOME Terminal, Text
+    Editor and Files that ship, which is a bar anyone can check against a machine they own. Seven
+    parts (F first, small and self-contained; G a stretch), and five governing decisions — an
+    application is a thing that *says* it is one (desktop entries, because "is this graphical?"
+    cannot be read off a binary), an accelerator is declared once so its label and its binding
+    cannot drift, the file chooser is a widget over a listing rather than a browser inside a
+    toolkit that may not make syscalls, Quit means every window, and a single click selects while
+    a double click opens. The order is load-bearing — the shadow buffer makes alpha cheap, and shadows
     without it would enlarge the flicker they sit on. **The control panel is trigger-gated**
     rather than scheduled: when settings outgrow a hand-edited file. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on

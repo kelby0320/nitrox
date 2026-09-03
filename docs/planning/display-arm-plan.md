@@ -4431,3 +4431,149 @@ Multiple outputs, USB HID, dynamic linking and the process-memory-model bundle, 
 `WidgetRecord` typed-UI research bet, the full `std` cluster, and 3D or accelerated rendering of
 any kind. Each is tracked in [`phase-4-desktop.md`](phase-4-desktop.md) or
 `deferred-decisions.md`.
+
+## Milestone 14 — the applications, and what a menu is
+
+Named 2026-09-03, from the maintainer's own list after living with M13's desktop. **The north
+star is stated as a comparison**, which is the useful kind: nxterm, nxedit and nxfiles should be
+about equivalent in functionality to GNOME Terminal, GNOME Text Editor and GNOME Files — not to
+their power-user configurations, to *the version you get*. That is a bar anybody can check
+against a machine they already have, and it decides arguments this plan would otherwise have to.
+
+**Three things the list assumed that the code does not**, found while costing it and worth
+recording because each moves an item between "fix" and "build":
+
+- **nxterm has no tabs at all.** M12 Part D's heading says "in both applications" and means
+  `nxedit` and `nxfiles`; the terminal was never in it. So "Ctrl-Shift-T isn't opening tabs" is a
+  missing feature and the single largest item here, not a binding that came loose.
+- **Sort by date needs no substrate.** `librsproto::file::DirEntry` has carried `mtime` since the
+  directory protocol existed; it is simply not plumbed through `libfs` into the browser.
+- **There are two ad-hoc menu bars and no widget.** `nxterm` and `nxfiles` each grew their own;
+  `nxedit` has none. Adding three more menus on that footing triples the inconsistency, which is
+  why Part A exists and why it comes before everything that hangs off it.
+
+### The governing decisions
+
+**1. An application is a thing that says it is one.** The applications modal lists `/bin`, which
+is every program on the system — services, servers and CLI tools included. It becomes a directory
+of **desktop entries**: one TOML manifest per graphical application, staged by the image build,
+naming `exec` and a display `name`. The shell lists those.
+
+The reason this is the conventional answer everywhere is that *"is this graphical?"* is not a
+property that can be read off a binary — it is a claim somebody has to make. Three alternatives
+were considered and rejected: a `/bin` vs `/apps` split (a program's *location* then encodes
+policy, and there is still nowhere to put a display name), an ELF note (invisible, needs tooling,
+same gap), and a list inside the shell (a second place to update, and the shell has no business
+knowing application names). The manifest also answers two other items at once — it is where
+"Files" comes from instead of `nxfiles`, and it is where an icon goes when the open polish item
+for real window-control icons is finally built.
+
+**2. An accelerator is declared once.** A menu that *says* `Ctrl+C` and a key handler that
+*implements* it are two statements of one fact, and they drift. A menu item carries its
+accelerator as data; the application's key handler matches against the same value. The label and
+the binding cannot disagree because there is only one of them.
+
+**3. The file chooser is a widget over a listing, not a browser inside the toolkit.** `libui`'s
+`diff`/`paint`/`route`/`widget` cannot make a syscall and that rule is not being bent for this.
+The chooser renders and routes over entries it is *given*; the application lists the directory
+through `libfs`. What does move down is the part both consumers genuinely share — **listing and
+sort order become `libfs` functions**, below the browser and the chooser both, which is the rule
+this project already applies ("a helper with two consumers belongs below both"). Sorting in two
+places is how two directory views disagree about what "newest" means.
+
+**4. Quit means every window of the application**, decided once here rather than three times in
+three applications — including what happens to unsaved work, which is the half that makes it a
+decision rather than a loop over windows.
+
+**5. A single click selects and a double click opens** (reported 2026-09-03). A double click is a
+toolkit concept — every list wants it — but `route` has no clock. So `libui` gains a small pure
+click tracker the application feeds a position and a time, which answers "first or second". Pure,
+testable, and no syscall in a module that forbids them.
+
+### Part F — the desktop *(first, because it is small and self-contained)*
+
+- [ ] **Desktop entries**, per decision 1: the manifest format, the staged directory, the image
+      build that writes it, and the shell reading it instead of `/bin`.
+- [ ] **Capitalisation**: "Applications", "Desktop *N*", "No Windows".
+- [ ] **The cursor sprite's tail is at a crooked angle** — reported 2026-09-03. `CURSOR` is a
+      hand-written row array in the compositor; this is a redraw of it, and the sprite test that
+      pins its width is the guard that it stays inside `cursor_rect`.
+
+### Part A — the menu bar as a toolkit widget
+
+- [ ] **One menu bar in `libui`**: a bar, drop-downs, separators, disabled items, keyboard
+      navigation (arrows, Esc, Enter) and **accelerator labels** per decision 2. The accelerator
+      shown in the item is what makes a menu teachable rather than a place to hunt.
+- [ ] **The two ad-hoc bars retire into it**, `nxterm`'s and `nxfiles`'s, which is the point of
+      building it rather than a third one.
+- [ ] **File and Edit in all three applications**, wired to actions that already exist — Copy,
+      Paste, Select All, Undo, Redo, Find, Close Tab, Quit. New capability lands in later parts;
+      this part is the shape.
+- [ ] **`nxedit`'s menu bar goes above the tab strip**, not below it (reported 2026-09-03).
+
+### Part B — tabs in the terminal, and New Window everywhere
+
+- [ ] **`nxterm` grows tabs**, which it has never had: the strip widget exists (M12 Part D), the
+      split does not. What a *window* holds versus what a *tab* holds is the same line `nxedit`
+      and `nxfiles` drew, and getting it wrong is how a second tab inherits the first's scrollback.
+- [ ] **New Tab, Close Tab and the chords**, including `Ctrl+Shift+T`.
+- [ ] **New Window in all three.** One process, several top-level windows — the protocol allows
+      it and nothing has done it; the taskbar and window list are where that shows.
+- [ ] **Quit**, per decision 4.
+
+### Part C — the file chooser
+
+- [ ] **Open File and Save As**, as one widget used by both, per decision 3.
+- [ ] **`libfs` grows listing and sort**, with `mtime` and kind carried through from `DirEntry`.
+- [ ] **Save As is not Save with a prompt**: it changes what the buffer *is*, which is the tab's
+      title, the unsaved marker and where the next Save goes.
+
+### Part D — the browser deepened
+
+- [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
+      the image build for now; first-login creation is the right answer once there are real
+      users, and is filed rather than built.
+- [ ] **Sort: A–Z, Z–A, oldest first, newest first** — through `libfs`, per decision 3.
+- [ ] **Cut, copy and paste of files** — `TODO(file-clipboard)`, left as a pair in M12 when only
+      copy existed. Wants **multi-select**, which is its own interaction.
+- [ ] **Single click selects, double click opens**, per decision 5.
+- [ ] **Show hidden files**, a **typeable location bar**, and **Properties** (size and mtime,
+      both already on the wire).
+- [ ] **A delete confirmation.**
+
+### Part E — the terminal and editor deepened
+
+- [ ] **`nxterm`: Find, and Clear Scrollback.**
+- [ ] **`nxterm`: the scroll wheel and a scrollbar** — `TODO(scroll-grab)`.
+- [ ] **`nxterm`: double click selects a word, triple selects a line.**
+- [ ] **`nxedit`: Replace**, beside the Find that M12 Part C built.
+- [ ] **`nxedit`: a status bar with line and column**, and **go to line**.
+- [ ] **`nxedit`: an unsaved-changes dot on the tab, and a prompt on close** —
+      `TODO(dialog-save-answer)` is half of this already.
+
+### Part G — syntax highlighting *(stretch)*
+
+- [ ] **`nxedit` highlights `nxsh` scripts** — wanted, explicitly not required, and to be dropped
+      if it grows.
+
+      **It is cheap for one reason: `nxsh` already exposes its lexer.** `nxsh::lex` is a public
+      module with a `Lexer`, so the highlighter reads the *same* tokens the interpreter does and
+      the two cannot disagree about what a string or a comment is. A second tokenizer written
+      against the grammar by eye is the version that is expensive and wrong.
+
+      **The layering is the part to settle before writing any of it.** `nxedit` depending on
+      `nxsh` is an application reaching into another application's crate, which
+      `userspace/CLAUDE.md` names as the shape its rule exists to catch. The answer is the rule's
+      own: the lexer is the *language's definition* rather than a helper, and moves to a crate
+      below both. **If that move turns out to be large, the stretch is dropped** — that is what
+      makes it a stretch, and the trigger is written down here rather than discovered halfway.
+
+- [ ] **The text area renders styled spans**, which is the toolkit half and the part that would
+      survive the stretch being dropped for `nxsh` and taken later for something else.
+
+### What M14 is not
+
+Icons for window controls (still filed behind an icon set: a naming convention, a size convention
+and a lookup path). The control panel, which stays trigger-gated on settings outgrowing a
+hand-edited file. Split panes, profiles, or a terminal that is configurable at all. `nxfiles`
+growing a second view mode. Anything that needs the network.
