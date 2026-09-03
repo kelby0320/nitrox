@@ -4440,17 +4440,23 @@ about equivalent in functionality to GNOME Terminal, GNOME Text Editor and GNOME
 their power-user configurations, to *the version you get*. That is a bar anybody can check
 against a machine they already have, and it decides arguments this plan would otherwise have to.
 
-**Three things the list assumed that the code does not**, found while costing it and worth
-recording because each moves an item between "fix" and "build":
+**Three things the list assumed about the code**, found while costing it and worth recording
+because each moves an item between "fix" and "build". Two of them were first written down *wrong*,
+in the opposite direction — see the 2026-09-03 decision-log entry on what an empty grep proves:
 
 - **nxterm has no tabs at all.** M12 Part D's heading says "in both applications" and means
   `nxedit` and `nxfiles`; the terminal was never in it. So "Ctrl-Shift-T isn't opening tabs" is a
   missing feature and the single largest item here, not a binding that came loose.
-- **Sort by date needs no substrate.** `librsproto::file::DirEntry` has carried `mtime` since the
-  directory protocol existed; it is simply not plumbed through `libfs` into the browser.
-- **There are two ad-hoc menu bars and no widget.** `nxterm` and `nxfiles` each grew their own;
-  `nxedit` has none. Adding three more menus on that footing triples the inconsistency, which is
-  why Part A exists and why it comes before everything that hangs off it.
+- **Sort by date needs no substrate, and less plumbing than it first looked.** `libfs::list_dir`
+  already returns `OwnedEntry`, which already carries `mtime` and `kind`, and `nxfiles` already
+  calls it. The information is lost one level *above* `libfs`, in `nxfiles::App::entry_of`, which
+  projects an `OwnedEntry` down to `Entry { name, is_dir }` — deliberately, and its doc says so.
+  So the work is widening that projection and a sort function, not a listing layer.
+- **The menu *bars* are already the toolkit's; the drop-downs are not.** `libui::widget::menu_bar`
+  and `menu_item` exist and both `nxterm` and `nxfiles` use them. What each application duplicates
+  is the **popup half** — open/close state, the anchor capture, the `window::Child` plumbing, row
+  keying and dismissal — which `menu_bar`'s own doc names as deliberately absent: "an open menu is
+  a `popup` **window**." That half is Part A's actual job, and it is the larger one.
 
 ### The governing decisions
 
@@ -4476,10 +4482,11 @@ the binding cannot disagree because there is only one of them.
 **3. The file chooser is a widget over a listing, not a browser inside the toolkit.** `libui`'s
 `diff`/`paint`/`route`/`widget` cannot make a syscall and that rule is not being bent for this.
 The chooser renders and routes over entries it is *given*; the application lists the directory
-through `libfs`. What does move down is the part both consumers genuinely share — **listing and
-sort order become `libfs` functions**, below the browser and the chooser both, which is the rule
-this project already applies ("a helper with two consumers belongs below both"). Sorting in two
-places is how two directory views disagree about what "newest" means.
+through `libfs::list_dir`, which already exists — it moved out of `list` in M10 Part B under
+exactly this rule, when the browser became its second consumer. **What is new is sort**, which
+becomes a `libfs` function for the same reason: sorting in two places is how two directory views
+come to disagree about what "newest" means. Both consumers also need `nxfiles`'s own `Entry` to
+stop discarding `mtime` and `kind` on the way up, which is where the information actually dies.
 
 **4. Quit means every window of the application**, decided once here rather than three times in
 three applications — including what happens to unsaved work, which is the half that makes it a
@@ -4490,26 +4497,52 @@ toolkit concept — every list wants it — but `route` has no clock. So `libui`
 click tracker the application feeds a position and a time, which answers "first or second". Pure,
 testable, and no syscall in a module that forbids them.
 
-### Part F — the desktop *(first, because it is small and self-contained)*
+**Build order: F, H, A, B, C, D, E, G.** The letters are the order they were *named* in; this is
+the order they are built in, and the two are not the same because Part H split out of F once
+costing showed it crosses the namespace.
 
-- [ ] **Desktop entries**, per decision 1: the manifest format, the staged directory, the image
-      build that writes it, and the shell reading it instead of `/bin`.
+### Part F — the desktop's rough edges *(first, and genuinely small)*
+
 - [ ] **Capitalisation**: "Applications", "Desktop *N*", "No Windows".
 - [ ] **The cursor sprite's tail is at a crooked angle** — reported 2026-09-03. `CURSOR` is a
       hand-written row array in the compositor; this is a redraw of it, and the sprite test that
       pins its width is the guard that it stays inside `cursor_rect`.
 
+### Part H — what an application is
+
+Split out of Part F, which was chosen to go first *because* it was small. This is not: it reaches
+the namespace, and the box that hid that was one line long.
+
+- [ ] **Desktop entries**, per decision 1: the manifest format, the staged directory, the image
+      build that writes it, and the shell reading it instead of `/bin`.
+- [ ] **And a path the session can resolve**, which is the part the one-line box concealed. `/bin`
+      reaches a session only because the profile server *projects* packages' `bin/` into it — as
+      `desktop-shell`'s own comment says, "`/bin` is a forwarded directory, not a set of
+      bindings" — and `desktop-session-mgr` binds nothing of its own (its only `ns_lookup` is
+      `/svc/auth`). So a directory of desktop entries needs either a second projection or a
+      binding, and deciding which is the real work here.
+
 ### Part A — the menu bar as a toolkit widget
 
-- [ ] **One menu bar in `libui`**: a bar, drop-downs, separators, disabled items, keyboard
-      navigation (arrows, Esc, Enter) and **accelerator labels** per decision 2. The accelerator
-      shown in the item is what makes a menu teachable rather than a place to hunt.
-- [ ] **The two ad-hoc bars retire into it**, `nxterm`'s and `nxfiles`'s, which is the point of
-      building it rather than a third one.
-- [ ] **File and Edit in all three applications**, wired to actions that already exist — Copy,
-      Paste, Select All, Undo, Redo, Find, Close Tab, Quit. New capability lands in later parts;
-      this part is the shape.
-- [ ] **`nxedit`'s menu bar goes above the tab strip**, not below it (reported 2026-09-03).
+- [ ] **The drop-down half becomes a widget**, which is the whole of this part. `menu_bar` and
+      `menu_item` already exist and both applications use them; what each one duplicates is the
+      *open menu* — open/close state, the anchor capture (a `Rect` in one, a `[Option<Rect>; 2]`
+      in the other), the `window::Child` plumbing, row keying and dismissal. `menu_bar`'s doc
+      calls that half deliberately absent because "an open menu is a `popup` **window**"; two
+      copies later, it is time for it to be one thing.
+- [ ] **Separators, disabled items, keyboard navigation** (arrows, Esc, Enter) and **accelerator
+      labels** per decision 2 — the accelerator shown in the item is what makes a menu teachable
+      rather than a place to hunt.
+- [ ] **The two hand-rolled popups retire into it.** Not the bars, which are already the
+      toolkit's.
+- [ ] **`nxedit` gets a menu bar**, which it has none of, and it goes **above** the tab strip —
+      matching `nxfiles`, which already docks its bar above its strip. A placement decision for a
+      bar this part creates, not a fix to one that exists.
+- [ ] **File and Edit in all three applications, wired to actions that already exist** — Copy,
+      Paste, Undo, Redo, Find, Close Tab. Deliberately **not** Select All (nothing in `userspace/`
+      implements one — Part E builds it) and **not** Quit (decision 4, built in Part B). A menu
+      item whose action this part invents is how two answers to "what happens to unsaved work"
+      get written in two places.
 
 ### Part B — tabs in the terminal, and New Window everywhere
 
@@ -4546,6 +4579,8 @@ testable, and no syscall in a module that forbids them.
 - [ ] **`nxterm`: Find, and Clear Scrollback.**
 - [ ] **`nxterm`: the scroll wheel and a scrollbar** — `TODO(scroll-grab)`.
 - [ ] **`nxterm`: double click selects a word, triple selects a line.**
+- [ ] **Select All, in the terminal and the editor** — which nothing in `userspace/` implements
+      today, so it is built here and only *wired* by Part A's menus.
 - [ ] **`nxedit`: Replace**, beside the Find that M12 Part C built.
 - [ ] **`nxedit`: a status bar with line and column**, and **go to line**.
 - [ ] **`nxedit`: an unsaved-changes dot on the tab, and a prompt on close** —
