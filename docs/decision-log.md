@@ -23010,42 +23010,39 @@ the line is a *receipt for what the bar shows*, so the two agreeing is the prope
 that kept saying "desktop 1" while the screen said "Desktop 1" would be two sources for one
 string. The alternative — a display label and a log label — needs the fallback written twice.
 
-**The cursor's tail took three attempts, and the first two failed the same way**: they treated a
-geometric complaint as an aesthetic one.
+**The cursor's tail took four attempts, and the last one was the first to measure anything.**
 
-The report was "the tail is at a crooked angle". The first redraw widened the tail from two pixels
-to three and moved the barb, on the theory that a two-pixel diagonal staircases and reads as
-broken. That is true and it was not the problem. The maintainer's second report was exact — *"the
-bottom of the triangle should have equal spacing on either side of the tail; the tail should point
-straight at the tip"* — and it is checkable rather than a matter of taste.
+The report was "the tail is at a crooked angle". Attempt one widened the stroke from two pixels to
+three, on the theory that a two-pixel diagonal staircases. Attempt two, after a sharper report —
+*"equal spacing either side of the tail; the tail should point straight at the tip"* — reasoned
+that those two constraints are jointly satisfiable only for a symmetric head, concluded that a
+12-wide sprite cannot hold an aimed tail, and grew the sprite to 18x26. That was wrong too, and
+the maintainer's answer was the one that ended it: **there is a reference, in a screenshot already
+in the tree.** MATE's pointer, over "Create Document".
 
-**The tail was never aimed at anything.** It ran *parallel* to the head's 45-degree edge, offset
-to the left of it — and a line parallel to one through the tip is a line that never meets the tip.
-Both the original sprite and the first redraw had this; widening the stroke could not have fixed
-it.
+**Measured rather than argued.** Classifying the screenshot's dark pixels — which is
+background-independent, where a fill/background test is not — gives MATE's outline exactly: a
+vertical left edge, a 45-degree right edge, a barb, and a **two-pixel tail advancing one column
+per two rows**, with the head about 63% of the total height, in a sprite 12 wide.
 
-**And the two constraints cannot both hold at 12x16, which is the finding.** "Equal spacing either
-side" makes the head symmetric about the tail's axis. "Aimed at the tip" puts the tail on a ray
-from (0,0). On a twelve-wide sprite, a ray from the tip that is still on the sprite at its last row
-is at most 37 degrees from vertical — so an aimed tail has nowhere to travel and reads as a
-vertical stub. Three separate attempts produced a triangle with a foot before the arithmetic was
-done rather than iterated against.
+**The tail's slope was the entire defect.** Every version, original included, ran the tail at 45
+degrees — one column per row — so it splayed away from the head twice as fast as it should and
+read as a separate shape. The head was never wrong. Two of the three failed attempts changed the
+head.
 
-So the sprite grew to **18x26**, where an aimed tail travels far enough to be a diagonal. That is
-not a workaround: 12x16 was small by any modern standard — mainstream cursors are 24x24 or larger
-— and the size was the constraint the whole time.
+**And the size was never wrong either.** 12 wide is MATE's width; the original's 12x16 against
+MATE's 12x19 is a difference of three rows, all tail. Attempt two's 18x26 was a 60% enlargement
+justified by a geometric argument that was internally valid and answered a question nobody had
+asked.
 
-**Rasterised from a seven-point polygon, not typed.** "The tail is a ray from the tip" is a
-statement about geometry, and typing pixel rows is not how you honour one; the first two attempts
-are what typing pixel rows produces. The generator stays out of the tree — this is a constant, and
-a build-time dependency for a sprite would be the wrong trade — but it is why the shape is right
-rather than approximately right.
-
-**The method lesson is the reverse of the one M13 Part C recorded.** There, a visual defect needed
-looking at, because no number could express "too prominent". Here, looking was what kept producing
-wrong answers: the defect was *stated as geometry* and could have been settled with arithmetic in
-one round instead of three. **Render to judge taste; compute to satisfy a constraint.** Reaching
-for the renderer first, three times, was the mistake.
+**The method note, and it is the sharp one.** Three attempts were spent iterating a *rendered
+picture* against a description. The fourth measured a reference and was right immediately. Both
+of the earlier method notes in this milestone — M13 Part C's "look at it, because no number
+expresses *too prominent*" and this entry's own earlier draft, "compute to satisfy a constraint" —
+were reaching for the wrong tool. The rule that covers all of it: **when a reference exists,
+measure it.** Rendering is for choosing between candidates you have already constrained, and
+computing is for constraints you have already got right. Neither substitutes for looking at the
+thing being copied, and the reference had been sitting in `tools/build-cache/` since 2026-09-01.
 
 **What is not tested, and why.** `desktop-shell` is a bin crate with no library and no unit tests,
 so `desktop_label`'s rule cannot be host-tested without restructuring it — out of scope for two

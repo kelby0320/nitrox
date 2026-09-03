@@ -4510,19 +4510,17 @@ costing showed it crosses the namespace.
       `window list on …` serial line — which is correct rather than a nuisance: that line is a
       receipt for what the bar shows, so the two agreeing is the property.
 - [x] **The cursor sprite's tail is at a crooked angle** ✅ — reported 2026-09-03, and it took
-      three attempts because the first two read a *geometric* complaint as an aesthetic one. The
-      tail ran **parallel** to the head's 45-degree edge and offset from it — and a line parallel
-      to one through the tip never meets the tip. Widening the stroke, which was attempt one, could
-      not have fixed that.
+      four attempts because the first three did not measure anything. The maintainer supplied a
+      reference — MATE's pointer, in a screenshot already in `tools/build-cache/` — and extracting
+      its outline settled it in one pass: a **two-pixel tail advancing one column per two rows**,
+      head 63% of the height, sprite 12 wide.
 
-      **The sprite grew to 18x26**, because the two stated constraints — equal spacing either side
-      of the tail, and the tail aimed at the tip — cannot both hold at 12x16: on a twelve-wide
-      sprite an aimed ray is at most 37 degrees from vertical, so the tail reads as a stub. 12x16
-      was small anyway; mainstream cursors are 24x24 or larger.
+      **The tail's slope was the whole defect.** Every version including the original ran it at 45
+      degrees, so it splayed away twice as fast as it should. The head was never wrong; two of the
+      three failed attempts changed the head, and one grew the sprite to 18x26 to satisfy a
+      geometric argument that was valid and beside the point.
 
-      **Rasterised from a polygon, not typed** — see the decision log for why that is the point
-      rather than a flourish, and for the method note it produced: *render to judge taste, compute
-      to satisfy a constraint.*
+      See the decision log for the method note: **when a reference exists, measure it.**
 
 ### Part H — what an application is
 

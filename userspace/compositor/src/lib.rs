@@ -325,54 +325,42 @@ pub const MAX_WINDOWS_PER_CONNECTION: usize = 64;
 ///
 /// Rendered magnified to choose it, against three alternatives, rather than judged by reading
 /// rows: a 2-versus-3-pixel diagonal is not a difference anyone can see in a string literal.
-/// **A pointer whose tail is a ray from its own tip** (M14 Part F). The tail's centre-line is
-/// `x = 0.5625 y` through the tip, so extending it upward hits the point the cursor is actually
-/// indicating — which is what "the tail should point straight at the tip" asks for, and what
-/// neither the original sprite nor its first redraw did: both ran the tail *parallel* to the
-/// head's 45-degree edge, offset from it, which is a line that never meets the tip at all.
+/// **Measured off MATE's pointer**, from a screenshot the maintainer supplied (2026-09-01
+/// 10-51-25, over "Create Document"). Its outline was extracted by classifying dark pixels, which
+/// is background-independent, and the numbers that came out are the whole of this sprite: a
+/// vertical left edge, a 45-degree right edge, a barb, and then a **two-pixel tail that advances
+/// one column per two rows** — with the head occupying about 63% of the total height.
 ///
-/// **That is why the sprite grew** from 12x16. A ray from the tip that is still on a 12-wide
-/// sprite at its last row is at most 37 degrees from vertical, so an aimed tail had nowhere to
-/// go and read as a vertical stub rather than a tail. At 18x26 it travels far enough to be a
-/// diagonal. 12x16 was small anyway — mainstream cursors are 24x24 or larger.
+/// **The tail's slope is the entire defect this fixes.** Every earlier version ran the tail at
+/// 45 degrees, one column per row, so it splayed away from the head twice as fast as it should
+/// and read as a separate shape at a crooked angle. Nothing was wrong with the head, and two
+/// redraws that changed the head were fixing the wrong thing.
 ///
-/// Rasterised from a seven-point polygon rather than typed, because "the tail is a ray from the
-/// tip" is a statement about geometry and typing pixels is not how you honour one. The generator
-/// lives in the M14 Part F decision-log entry's description, not in the tree: this is a constant,
-/// and a build-time dependency for sixteen string literals would be the wrong trade.
+/// **The size is MATE's too** — 12 wide, and MATE's is 12x19 to this 12x16. An earlier attempt at
+/// 18x26 was too big; the reference settles it, where three rounds of judgement did not.
 const CURSOR: [&str; CURSOR_H as usize] = [
-    "...",
-    ".#..",
-    ".##..",
-    ".###..",
-    ".####..",
-    ".#####..",
-    ".######..",
-    ".#######..",
-    ".########..",
-    ".#########..",
-    ".##########..",
-    ".###########..",
-    ".############..",
-    ".#############.",
-    ".#############.",
-    ".############..",
-    ".######.####..",
-    ".####...#####..",
-    ".##... ..#####.",
-    ".#..    ..####..",
-    "...      .#####.",
-    "         ..####..",
-    "          .#####.",
-    "          ..####..",
-    "           .#####.",
-    "           .......",
+    ".",
+    "..",
+    ".#.",
+    ".##.",
+    ".###.",
+    ".####.",
+    ".#####.",
+    ".######.",
+    ".#######.",
+    ".########.",
+    ".####.....",
+    ".#####.",
+    ".##.##.",
+    ".#..##.",
+    "..  .##.",
+    "    ....",
 ];
 
 /// Cursor sprite width.
-pub const CURSOR_W: u32 = 18;
+pub const CURSOR_W: u32 = 12;
 /// Cursor sprite height.
-pub const CURSOR_H: u32 = 26;
+pub const CURSOR_H: u32 = 16;
 
 /// The cursor's fill colour (`#` in the sprite).
 ///

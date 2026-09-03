@@ -5638,11 +5638,9 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     let body = (0xFFu8, 0xFFu8, 0xFFu8);
     let mut cursor_px = 0usize;
     // The compositor's `CURSOR_H` / `CURSOR_W`, which this crate cannot import — it depends on
-    // `libdraw`, `libui` and `libterm`, not on `compositor`. Kept generous rather than exact so a
-    // resized sprite widens the search instead of silently walking off it (M14 Part F grew it
-    // from 12x16 to 18x26).
-    for y in cy..(cy + 26).min(h) {
-        for x in cx..(cx + 18).min(w) {
+    // `libdraw`, `libui` and `libterm`, not on `compositor`.
+    for y in cy..(cy + 16).min(h) {
+        for x in cx..(cx + 12).min(w) {
             let i = (y as usize * w as usize + x as usize) * 3;
             if (pixels[i], pixels[i + 1], pixels[i + 2]) == body {
                 cursor_px += 1;
