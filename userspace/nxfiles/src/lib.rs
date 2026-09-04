@@ -993,25 +993,8 @@ impl App {
         // for a drop target, deliberately, because dropping a thing where it came from is a
         // no-op (`compositor::input::highlight_target`).
         if self.dragging {
-            if !self.inside(x, y) {
-                // **Handed over at the edge, not at the slop.** The compositor runs the drag
-                // from here — it draws the outline and delivers to whatever accepts the payload
-                // — and the client goes blind for the rest of the gesture, which is why the
-                // handoff has to be the *last* thing this window decides.
-                let name = self.pressed.take().map(|(n, _, _)| n);
-                self.dragging = false;
-                self.over = None;
-                self.drag =
-                    name.and_then(|n| self.pane().entries.iter().find(|e| e.name == n).cloned());
-                return if self.drag.is_some() { Gesture::HandOff } else { Gesture::None };
-            }
-            let was = self.over;
-            // **Only a directory is a target**, so the highlight never offers a landing place
-            // that would do nothing — the same rule the compositor follows for windows that do
-            // not take the payload.
-            self.over =
-                self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
-            return if was == self.over { Gesture::None } else { Gesture::Moved };
+            let name = self.pressed.as_ref().map(|(n, _, _)| n.clone()).unwrap_or_default();
+            return self.drag_moved(x, y, &name);
         }
         let Some((name, ox, oy)) = self.pressed.clone() else { return Gesture::None };
         if (ox, oy) == (0, 0) {
@@ -1029,9 +1012,48 @@ impl App {
             return Gesture::None;
         }
         self.dragging = true;
+        // **The motion that crosses the slop can also be the one that leaves**, and until
+        // 2026-09-04 nothing checked that: the hand-off lived in the already-dragging branch,
+        // which only a *later* motion reaches — so a gesture that left the window in one step
+        // armed a drag and then sat there with nothing to move it on. A person dragging quickly
+        // out of the window got nothing, and `check-login` saw it whenever its six injected
+        // motions coalesced into two and the second landed outside, which is a function of how
+        // busy the guest is and looked exactly like a flake.
+        //
+        // Delegating rather than repeating the test, so the two paths cannot come to disagree
+        // about what "left the window" means.
+        if !self.inside(x, y) {
+            return self.drag_moved(x, y, &name);
+        }
         self.over =
             self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
         Gesture::Moved
+    }
+
+    /// What a motion means to a drag already under way: still inside, or handed over.
+    ///
+    /// **Split out so the slop-crossing motion can run it too** — it was inline in
+    /// `pointer_moved`'s already-dragging branch, which the *second* motion is the first to
+    /// reach. See the call site above for what that cost.
+    fn drag_moved(&mut self, x: i32, y: i32, name: &str) -> Gesture {
+        if !self.inside(x, y) {
+            // **Handed over at the edge, not at the slop.** The compositor runs the drag from
+            // here — it draws the outline and delivers to whatever accepts the payload — and the
+            // client goes blind for the rest of the gesture, which is why the hand-off has to be
+            // the *last* thing this window decides.
+            self.pressed = None;
+            self.dragging = false;
+            self.over = None;
+            self.drag = self.pane().entries.iter().find(|e| e.name == name).cloned();
+            return if self.drag.is_some() { Gesture::HandOff } else { Gesture::None };
+        }
+        let was = self.over;
+        // **Only a directory is a target**, so the highlight never offers a landing place that
+        // would do nothing — the same rule the compositor follows for windows that do not take
+        // the payload.
+        self.over =
+            self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
+        if was == self.over { Gesture::None } else { Gesture::Moved }
     }
 
     /// The entry the binary owes a `StartDrag` for. Clears the record.
@@ -2585,6 +2607,87 @@ mod tests {
             Some(0),
             "the click was dropped because the repaint between its halves re-identified the word"
         );
+    }
+
+    /// A press on a row produces `Grab` — the message every drag test injects by hand.
+    ///
+    /// **Every other drag test here starts at `a.update(Msg::Grab(i))`**, which tests what the
+    /// browser does *once* a gesture has started and says nothing about whether a press starts
+    /// one. That is the shape of "test the component, not the path", and it is why the whole
+    /// drag could be broken with every drag test green.
+    #[test]
+    fn a_press_on_a_row_grabs_it() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let view = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&view, &l).expect("the view is diffable");
+        let mut router = libui::route::Router::new();
+
+        let (msgs, _) = router.pointer(
+            &tree,
+            &view,
+            &l,
+            librsproto::surface::PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons: 1,
+                flags: librsproto::surface::POINTER_PRESSED,
+                x: 120,
+                y: row_y(&a, 1),
+                ..Default::default()
+            },
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Grab(_))),
+            "a press on a row produced {msgs:?}, so no drag can start from one"
+        );
+    }
+
+    /// A drag that leaves the window in **one** motion still hands off.
+    ///
+    /// **Reported from a real session** — "click and drag doesn't work" — and it was not a flake,
+    /// though it looked like one for weeks. The hand-off lived only in the already-dragging
+    /// branch, which the *second* motion is the first to reach, so a motion that both crossed the
+    /// slop and left the window armed a drag and then sat there. Dragging slowly worked, which is
+    /// what made it look intermittent; `check-login` hit it whenever its injected motions
+    /// coalesced.
+    #[test]
+    fn a_drag_that_leaves_in_one_motion_still_hands_off() {
+        let mut a = app();
+        a.update(Msg::Grab(2)); // a.txt, a file
+        // The first motion only records the origin — that much was never in doubt.
+        assert_eq!(a.pointer_moved(120, row_y(&a, 2), 1), Gesture::None);
+        // **One motion, past the slop and past the window's right edge.**
+        let far = a.window_size().w as i32 + 200;
+        assert_eq!(
+            a.pointer_moved(far, row_y(&a, 2) + 240, 1),
+            Gesture::HandOff,
+            "a drag that left the window in one step never asked the compositor to carry it"
+        );
+        assert!(a.take_drag().is_some(), "and it carries the entry that was pressed");
+    }
+
+    /// **The negative control**: a drag that stays inside is still the browser's own.
+    ///
+    /// Without it, a version that handed off on every slop crossing would pass the test above and
+    /// break dragging a file onto a folder in the same window.
+    #[test]
+    fn a_drag_that_stays_inside_does_not_hand_off() {
+        let mut a = app();
+        a.update(Msg::Grab(2));
+        assert_eq!(a.pointer_moved(120, row_y(&a, 2), 1), Gesture::None);
+        let inside = a.pointer_moved(120, row_y(&a, 1), 1);
+        assert!(
+            matches!(inside, Gesture::Moved | Gesture::None),
+            "a drag inside the window is the browser's own, not the compositor's: {inside:?}"
+        );
+        assert!(a.take_drag().is_none(), "nothing was handed over");
+        // …and it still hands off when it does leave.
+        let far = a.window_size().w as i32 + 200;
+        assert_eq!(a.pointer_moved(far, row_y(&a, 1), 1), Gesture::HandOff);
     }
 
 }
