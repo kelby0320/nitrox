@@ -276,11 +276,26 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         Err(_) => fail(b"nxedit: connect to /dev/draw FAILED\n"),
     };
     let mut win = Session::new(transport);
-    let window_id =
-        match win.create(&CreateWindowRequest::new(size.w, size.h, Role::Normal), BUFFERS) {
-            Ok(w) => w,
-            Err(_) => fail(b"nxedit: CreateWindow FAILED\n"),
-        };
+    // **The first window is a `Child` too** (M14 Part B), which is what makes several of them
+    // possible: everything a window needs to be drawn and routed lives in that value, so a second
+    // one is a second value rather than a second copy of this loop.
+    let mut top = {
+        let ui = app.view(&theme, None);
+        match Child::open_sized(
+            &mut win,
+            Role::Normal,
+            (0, 0),
+            size,
+            &ui,
+            &font,
+            &theme,
+            BUFFERS,
+        ) {
+            Some(t) => t,
+            None => fail(b"nxedit: CreateWindow FAILED\n"),
+        }
+    };
+    let window_id = top.id();
     // **Set once, and it is the name alone.** The modified marker lives in the window's own
     // title bar; retitling on every keystroke would be a message per keystroke to say something
     // the window already shows.
@@ -299,23 +314,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         kprint(b"nxedit: DeclareAcceptor refused\n");
     }
 
-    let mut scratch = match compose_buffer(size) {
-        Some(fb) => fb,
-        None => fail(b"nxedit: impossible window geometry\n"),
-    };
-    let mut pool = {
-        let Some(mut w) = win.window(window_id) else {
-            fail(b"nxedit: our own window is gone\n");
-        };
-        match BufferPool::new(&mut w, size, BUFFERS) {
-            Some(p) => p,
-            None => fail(b"nxedit: buffer alloc FAILED\n"),
-        }
-    };
-
     let mut bounds = Rect::new(0, 0, size.w, size.h);
-    let mut tree = Tree::new();
-    let mut router = Router::new();
     // **The second window, and the whole of M12 Part A**: alive only while a question is being
     // asked, because a `dialog` is transient by role — the compositor takes it with its parent,
     // and a hidden one would still be a window in the stack. `Role::Dialog` has existed since M2
@@ -403,7 +402,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // ---- render ----
         // The widget under the pointer, from the router that has always known and that nothing
         // had ever asked (M11 Part E batch 3).
-        let ui = app.view(&theme, router.hovered_key(&tree));
+        let ui = app.view(&theme, top.hovered_key());
         let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
         // Where each menu drops from, read every frame rather than when one opens: a bar word's
         // position is a fact about the layout, and before the first one there is nowhere to put a
@@ -411,25 +410,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         app.menus.set_anchors(
             (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
         );
-        let damage = match tree.update(&ui, &l) {
-            Ok(d) => d,
-            // A malformed tree is a bug in `view`, not a runtime condition.
-            Err(_) => fail(b"nxedit: the view is not diffable\n"),
-        };
-        if let Some(d) = damage {
-            draw(&mut scratch, &ui, &l, &font, &theme, d);
-            let Some(mut w) = win.window(window_id) else {
-                fail(b"nxedit: our own window is gone\n");
-            };
-            let Ok(b) = pool.acquire(&mut w, app.window_size()) else {
-                fail(b"nxedit: no buffer to draw into\n");
-            };
-            if !pool.write(b, scratch.bytes()) {
-                fail(b"nxedit: the frame did not fit its buffer\n");
-            }
-            if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
-                fail(b"nxedit: Commit FAILED\n");
-            }
+        // **The window is a `libui::window::Child` since M14 Part B**, top-level role and all —
+        // the same value the menu and the dialog below have always been. What this loop keeps is
+        // what a *main* window has and they do not: the `sys_wait`, a `Configure` to answer, and
+        // the layout, which the menu bar's anchors are read from and which is therefore computed
+        // here and handed on rather than computed twice.
+        if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
+            fail(b"nxedit: the window could not be drawn\n");
         }
 
         // **What a search found, as a line number.** `check-login` boots the release image and
@@ -817,20 +804,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // and reading it as dispatch that already happens is the mistake: today the
                     // save button has **no keyboard path**, which is worth knowing before M12
                     // adds one (PR #259 review, optional 7).
-                    if let Some(msg) = router.key(&tree, &ui, k) {
+                    if let Some(msg) = top.route_key(&ui, k) {
                         app.update(msg);
                     } else {
                         app.update(Msg::Key(k));
                     }
                 }
                 WindowEvent::Pointer(p) => {
-                    let (msgs, _) = router.pointer(&tree, &ui, &l, p);
+                    let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {
                         app.update(m);
                     }
                 }
                 WindowEvent::Focus(f) => {
-                    router.set_window_focused(f);
+                    top.route(&ui, &font, &theme, &WindowEvent::Focus(f));
                     app.focused = f;
                 }
                 WindowEvent::Configure { width, height, .. } => {
@@ -859,7 +846,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // like a press, so the text area takes it and the title bar does not — and the
                 // buffer is only given up if there is nothing to lose.
                 WindowEvent::Drop { ref path, ref name, x, y, .. } => {
-                    let taken = router.drop_at(&tree, &ui, &l, x, y).is_some();
+                    let taken = top.drop_at(&ui, &l, x, y);
                     libkern::debug::Line::new()
                         .s(b"nxedit: drop of ")
                         .untrusted(name.as_bytes())
@@ -878,12 +865,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         if resized {
             size = app.window_size();
-            match compose_buffer(size) {
-                Some(fb) => scratch = fb,
-                None => fail(b"nxedit: impossible window geometry\n"),
+            // **`Child::resize` reallocates and throws the retained tree away**, which is what a
+            // resize means: a tree diffed against a layout from the old bounds reports damage in
+            // the old coordinates. `Some(false)` is the memory refusing, which leaves the window
+            // at its old size and still drawing.
+            if top.resize(&mut win, size) == Some(false) {
+                fail(b"nxedit: impossible window geometry\n");
             }
             bounds = Rect::new(0, 0, size.w, size.h);
-            tree = Tree::new();
         }
     }
 }

@@ -49,7 +49,7 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
-use librsproto::surface::{CreateWindowRequest, Role};
+use librsproto::surface::{CreateWindowRequest, Role, KeyEvent};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, Transport, WindowEvent};
 
@@ -419,6 +419,29 @@ impl Child {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Route a key, returning the message it produced.
+    ///
+    /// **Separate from [`route`](Self::route) because a main window needs the `None`**: a key no
+    /// widget claimed is not nothing to an editor, it is a keystroke for the buffer. `route`
+    /// answers with a list because that is what a pointer event produces.
+    pub fn route_key<Msg: Clone>(&self, content: &Element<Msg>, k: KeyEvent) -> Option<Msg> {
+        self.router.key(&self.tree, content, k)
+    }
+
+    /// Whether a drop at `(x, y)` landed on a widget that declared itself an acceptor.
+    ///
+    /// `l` must be the layout `content` was presented with — see
+    /// [`present_laid_out`](Self::present_laid_out) for why a main window has one to hand.
+    pub fn drop_at<Msg: Clone>(
+        &mut self,
+        content: &Element<Msg>,
+        l: &Layout,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        self.router.drop_at(&self.tree, content, l, x, y).is_some()
     }
 
     /// Destroy the window and give this side's pixels back.
