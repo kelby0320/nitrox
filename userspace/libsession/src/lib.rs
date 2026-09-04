@@ -275,10 +275,19 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     let mut has_clipboard = false;
     if profile_endpoint != 0 {
         let bin = b"/bin";
-        // SAFETY: valid namespace handle, path pointer, and endpoint handle; no subtree
-        // base (0/0) — the profile server is bound at its own root.
+        // **Scoped**, like every other bind of this endpoint (M14 Part H): the server projects
+        // more than one package directory and tells them apart by the suffix's first component.
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
         let pr = unsafe {
-            syscall6(SYS_NS_BIND, ns, bin.as_ptr() as u64, bin.len() as u64, profile_endpoint, 0, 0)
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                bin.as_ptr() as u64,
+                bin.len() as u64,
+                profile_endpoint,
+                bin.as_ptr() as u64,
+                bin.len() as u64,
+            )
         };
         if pr != 0 {
             kprint(b"libsession: /bin bind FAIL (session has no programs)\n");

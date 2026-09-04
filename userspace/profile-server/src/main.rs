@@ -28,6 +28,7 @@ use librsproto::error::error_body;
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, parse_resolve_request, resolve_reply,
 };
+use profile_server::projection::split_suffix;
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use profile_server::manifest::{self, Package};
 
@@ -220,7 +221,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     sr == 0
 }
 
-/// Build the merged `/bin` view by reading each package's `bin/` **through the fs-server**
+/// Build the merged view of one projection by reading each package's `<dir>/` **through the fs-server**
 /// — a real `readdir` of what is on disk, not a recital of the manifest. Packages are read
 /// in manifest order and the first provider of a name wins, which is the same precedence
 /// resolve uses; a listing that disagreed with what a spawn would find would be worse than
@@ -235,14 +236,14 @@ fn build_index(root_ns: u64, packages: &[Package], dir: &str) -> Vec<Entry> {
     for (i, pkg) in packages.iter().enumerate() {
         let path = format!("{}/{dir}", pkg.path);
         let mut buf = [0u8; 4096]; // >= IPC_MSG_SIZE, what `Dir::open` requires
-        let mut dir = match librsproto::session::Dir::open(root_ns, path.as_bytes(), &mut buf) {
+        let mut listing = match librsproto::session::Dir::open(root_ns, path.as_bytes(), &mut buf) {
             Ok(d) => d,
             Err(_) => {
                 kprint(b"profile-server: package subdirectory unreadable (skipped)\n");
                 continue;
             }
         };
-        let _ = dir.read_dir(|e| {
+        let _ = listing.read_dir(|e| {
             if e.name != b"." && e.name != b".." {
                 let name = match core::str::from_utf8(e.name) {
                     Ok(n) => String::from(n),
@@ -263,7 +264,7 @@ fn build_index(root_ns: u64, packages: &[Package], dir: &str) -> Vec<Entry> {
             }
             true
         });
-        dir.close();
+        listing.close();
     }
     out
 }
@@ -307,48 +308,6 @@ fn index(root_ns: u64, packages: &[Package], dir: &str) -> &'static [Entry] {
     }
 }
 
-/// The package subdirectories this server projects beyond `bin`, each under a namespace path of
-/// the same name.
-///
-/// **A fixed list rather than "whatever a package contains"**, because the alternative makes the
-/// *contents* of a store package decide what appears in a session's namespace — and a package is
-/// data, not policy. A projection is a name this server offers; a package either fills it or does
-/// not.
-const PROJECTED: [&str; 1] = ["applications"];
-
-/// Split a resolve suffix into the package subdirectory it names and the entry within it.
-///
-/// **`/bin` is bound with no subtree base and every other projection with one**, which is what
-/// lets one endpoint serve several names. `/bin/list` arrives as `list`; `/applications` arrives
-/// as `applications` and `/applications/nxterm.toml` as `applications/nxterm.toml`, because that
-/// bind carries `applications` as its base.
-///
-/// **Matched against [`PROJECTED`] rather than split on the first slash**, which was the first
-/// version and is wrong at the root: opening the directory itself yields a *bare* `applications`,
-/// indistinguishable by shape from a program of that name in `/bin`. The list makes it
-/// distinguishable by name instead. The one collision left — a program actually called
-/// `applications` — is a name this server would then shadow, and is recorded here rather than
-/// guarded against.
-fn projection_of(suffix: &str) -> &'static str {
-    let s = suffix.strip_prefix('/').unwrap_or(suffix);
-    PROJECTED.into_iter().find(|d| *d == s).unwrap_or("bin")
-}
-
-fn split_suffix(suffix: &str) -> (&str, &str) {
-    // A subtree base is an *absolute* path — the kernel's `SubtreeBase::from_path` rejects a bare
-    // component — so a scoped bind forwards `/applications/x`, not `applications/x`. `/bin` is
-    // unscoped and forwards a bare `list`, so this strip is what lets one rule read both.
-    let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
-    for d in PROJECTED {
-        if suffix == d {
-            return (d, "");
-        }
-        if let Some(rest) = suffix.strip_prefix(d).and_then(|r| r.strip_prefix('/')) {
-            return (d, rest);
-        }
-    }
-    ("bin", suffix)
-}
 
 /// Resolve `suffix` (e.g. `heartbeat`) to its store `FileObject` handle (requested rights
 /// + `TRANSFER`, so it can be re-exported). `0` if the profile provides no such program.
@@ -362,7 +321,7 @@ fn resolve_in_store(root_ns: u64, packages: &[Package], suffix: &[u8], rights: u
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let (dir, name) = split_suffix(raw);
+    let Some((dir, name)) = split_suffix(raw) else { return 0 };
     if name.is_empty() {
         return 0;
     }
@@ -709,12 +668,18 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
                     // minting a channel is a reply of a different shape.
                     Some(r)
                         if core::str::from_utf8(r.suffix)
-                            .is_ok_and(|x| split_suffix(x).1.is_empty()) =>
+                            .ok()
+                            .and_then(split_suffix)
+                            .is_some_and(|(_, name)| name.is_empty()) =>
                     {
                         // Remember which view this session will list.
-                        let d = core::str::from_utf8(r.suffix).unwrap_or("");
-                        // SAFETY: single-threaded; read back by `open_dir_session` below.
-                        unsafe { PENDING_DIR = projection_of(d) };
+                        let d = core::str::from_utf8(r.suffix)
+                            .ok()
+                            .and_then(split_suffix)
+                            .map_or("bin", |(d, _)| d);
+                        // Already inside this block's `unsafe`; single-threaded, read back by
+                        // `open_dir_session` a few lines below.
+                        PENDING_DIR = d;
                         (m.op, m.request_id, 0, true)
                     }
                     Some(r) => {

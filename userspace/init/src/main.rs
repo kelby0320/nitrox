@@ -738,9 +738,23 @@ fn bind_profile_server(root_ns: u64) -> bool {
     //    Userspace Server; the binding takes its own reference, so init closes its
     //    endpoint handle after. The retained duplicate keeps the *same* endpoint alive,
     //    so a later bind of it shares this registration rather than minting a rival.
-    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    //
+    // **Scoped to `/bin`, not whole-tree** (M14 Part H). The profile server projects more than
+    // one of a package's directories now, and it tells them apart by the first component of the
+    // suffix — so every bind of it carries a base naming the directory it projects. Unscoped,
+    // `/bin/applications` would forward as a bare `applications` and reach the *applications*
+    // projection, which is an alias nobody asked for.
+    // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
     let br = unsafe {
-        syscall4(SYS_NS_BIND, root_ns, b"/bin".as_ptr() as u64, 4, endpoint)
+        syscall6(
+            SYS_NS_BIND,
+            root_ns,
+            b"/bin".as_ptr() as u64,
+            4,
+            endpoint,
+            b"/bin".as_ptr() as u64,
+            4,
+        )
     };
     // SAFETY: closing init's endpoint handle (the binding holds its own reference).
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };

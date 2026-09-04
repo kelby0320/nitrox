@@ -23129,22 +23129,35 @@ removing one takes them away, with no list anywhere to keep in step. The alterna
 image build writes — needs the build to know every application on the system, which is the
 coupling the content-addressed store exists to remove.
 
-**One endpoint, two names, and the subtree base is what distinguishes them.** `/bin` is bound
-unscoped, so a lookup of `/bin/list` reaches the server as `list`. `/applications` is bound with
-`/applications` as its subtree base, so a lookup reaches it as `/applications/nxterm.toml`. The
-server strips the leading slash and matches the first component against a **fixed list** of
-projections.
+**One endpoint, two names, and *every bind is scoped*.** The first component of the forwarded
+suffix names the projection: `/bin` bound with base `/bin` forwards `bin` and `bin/list`;
+`/applications` bound with base `/applications` forwards `applications` and
+`applications/nxterm.toml`. No default, no bare form.
 
-Two things that had to be got right there, both found by booting:
+Three things had to be got right there, and the third was found by review after the first two were
+found by booting:
 
 - **A subtree base is an absolute path.** `SubtreeBase::from_path` runs `validate_path`, which
   rejects a bare component, so binding with base `applications` fails with `InvalidArgument` and
-  the session silently has no `/applications`. The bind says so on the console now; it did not
-  before, and a bind that fails quietly is a feature that is simply absent.
+  the session silently has no `/applications`. The bind says so on the console now; a bind that
+  fails quietly is a feature that is simply absent.
 - **Splitting on the first slash is not enough.** Opening the directory *itself* yields a bare
-  `applications`, which is shape-identical to a program of that name in `/bin`. Matching against a
-  fixed list of projection names instead is what disambiguates. The residual collision — a program
-  actually called `applications` — is recorded rather than guarded against.
+  `applications`, shape-identical to a program of that name. Matching whole names against a fixed
+  list is what disambiguates.
+- **And leaving `/bin` unscoped left an alias, which the first two fixes hid rather than
+  removed** (PR #279 review). With `/bin` bound whole-tree, a bare suffix meant `bin` — so
+  `/bin/applications` forwarded as `applications` and landed on the applications projection's
+  *root*, putting all of it inside every namespace that binds `/bin`. That is precisely the
+  application namespaces this same change documented as deliberately not having it. The claim was
+  in a current-behaviour architecture doc and in a deferral entry, and was false of the code in the
+  same commit.
+
+  **The mechanism error underneath it** is worth naming separately: the docs said the subtree base
+  was "what lets the server tell one request from the other". It is not — the projection *name*
+  is, which is exactly why an unscoped `/bin` could produce that name. They also said the forwarded
+  suffix carries a leading slash; `join_subtree` takes `base[1..]`, so it never does, and the
+  `strip_prefix('/')` written to handle it was dead code. A mechanism described wrongly will
+  eventually be relied on wrongly, and here it took one commit.
 
 **The projected set is the server's, not the package's.** It is a `const` list, so a package
 either fills a projection the server offers or does not. Deriving it from "whatever directories a

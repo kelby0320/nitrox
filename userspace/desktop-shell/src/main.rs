@@ -86,6 +86,7 @@ use libui::element::{
 use libui::diff::Tree;
 use libui::layout::layout;
 use libui::route::Router;
+use desktop_shell::{Application, matches_app, parse_entry};
 use libui::paint::{FontMetrics, Theme, paint, paint_over};
 use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
@@ -628,38 +629,8 @@ fn filter<'a>(apps: &'a [Application], q: &str) -> alloc::vec::Vec<&'a Applicati
     apps.iter().filter(|a| matches_app(a, q)).collect()
 }
 
-/// Whether `app` is shown for query `q` — matched against **both** the display name and the
-/// program.
-///
-/// **Both, because both are things a person types.** Somebody who knows the desktop types
-/// "editor"; somebody who knows the system types `nxedit`. Matching only the name would make the
-/// second fail, and this system's users are more likely than most to be the second kind.
-fn matches_app(app: &Application, q: &str) -> bool {
-    matches(&app.name, q) || matches(&app.exec, q)
-}
 
-/// One graphical application, from a desktop entry under `/applications`.
-///
-/// **The display name and the program are different strings, and that is the point** (M14 Part
-/// H). The modal showed `/bin` — every service, server and CLI tool on the system, under the
-/// name of its binary. It shows what a package *declares* is an application now, under the name
-/// that package gives it.
-pub struct Application {
-    /// What a person sees: "Files".
-    pub name: alloc::string::String,
-    /// What gets spawned: `nxfiles`, resolved through `/bin` like anything else.
-    pub exec: alloc::string::String,
-}
 
-/// Whether one string is shown for query `q`. Case-insensitive on ASCII, because a display name
-/// is capitalised ("Files") and nobody types the capital.
-fn matches(name: &str, q: &str) -> bool {
-    if q.is_empty() {
-        return true;
-    }
-    let (n, q) = (name.to_ascii_lowercase(), q.to_ascii_lowercase());
-    n.contains(&q)
-}
 
 /// The modal's rows: what `q` matches, **keyed by index into the unfiltered list**.
 ///
@@ -723,37 +694,6 @@ fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
     apps
 }
 
-/// Parse a desktop entry: `name` and `exec`, both required.
-///
-/// The same shape `Theme`'s reader uses — `key = "value"` a line at a time, `#` a comment —
-/// rather than a TOML library, because this is two keys and the system has no TOML crate.
-/// **Both required**: an entry with no `exec` names nothing to launch, and one with no `name`
-/// would fall back to the binary's, which is the thing this part exists to stop showing.
-fn parse_entry(text: &str) -> Option<Application> {
-    let (mut name, mut exec) = (None, None);
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else { continue };
-        let v = v.trim();
-        // A quoted value, and only a quoted value — `trim_matches('"')` would accept `"x` and
-        // `x"`, which is the trap `theme.rs` records having fallen into.
-        let Some(v) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else { continue };
-        match k.trim() {
-            "name" => name = Some(alloc::string::String::from(v)),
-            "exec" => exec = Some(alloc::string::String::from(v)),
-            _ => {}
-        }
-    }
-    match (name, exec) {
-        (Some(name), Some(exec)) if !name.is_empty() && !exec.is_empty() => {
-            Some(Application { name, exec })
-        }
-        _ => None,
-    }
-}
 
 /// `theme`, as the overview's sidebar wears it: the desktop's own ground, darkened, with the
 /// window ground as ink.
@@ -972,9 +912,21 @@ fn build_app_namespace(
     // before anything asks.
     if profile != 0 {
         let bpath = b"/bin";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        // **Scoped**, which is what keeps this bind from also handing over `/applications`
+        // (PR #279 review, blocking 1). Unscoped, `/bin/applications` forwarded as a bare
+        // `applications` and reached the applications projection's root — so the omission
+        // documented four lines up was not an omission at all.
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
         let br = unsafe {
-            syscall4(SYS_NS_BIND, ns, bpath.as_ptr() as u64, bpath.len() as u64, profile)
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                bpath.as_ptr() as u64,
+                bpath.len() as u64,
+                profile,
+                bpath.as_ptr() as u64,
+                bpath.len() as u64,
+            )
         };
         if br != 0 {
             kprint(b"desktop-shell: application /bin bind FAIL\n");
@@ -2130,14 +2082,14 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     }
 
 
-    // The modal's entries, read once. `desktop-shell.md` §4: they are `/bin` programs, and
+    // The modal's entries, read once. `desktop-shell.md` §4: they are desktop entries, and
     // that falls out of decisions already made — they are ordinary files in the namespace, so
     // type-to-filter runs over them with no special mechanism.
     let programs = read_applications(session_ns);
     Line::new()
-        .s(b"desktop-shell: /bin lists ")
+        .s(b"desktop-shell: /applications lists ")
         .u(programs.len() as u64)
-        .s(b" programs")
+        .s(b" application(s)")
         .end();
     let mut modal: Option<u32> = None;
     let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
