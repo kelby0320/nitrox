@@ -55,7 +55,7 @@ use libsurface::{Session, Transport, WindowEvent};
 
 use crate::diff::Tree;
 use crate::element::Element;
-use crate::layout::{Constraints, layout, measure};
+use crate::layout::{Constraints, Layout, layout, measure};
 use crate::paint::{FontMetrics, Theme, paint};
 use crate::route::Router;
 
@@ -89,6 +89,8 @@ pub struct Child {
     scratch: MemFramebuffer,
     /// The shared buffers, and the mappings that are unmapped when this value drops.
     pool: BufferPool,
+    /// How many buffers the pool was built with, so a resize can rebuild it the same way.
+    buffers: usize,
     /// The live hover: what the pointer is actually over.
     hover: Option<u64>,
     /// The hover the retained tree was **last built with**.
@@ -146,6 +148,8 @@ impl Child {
         if !matches!(role, Role::Popup { .. } | Role::Dialog { .. }) {
             return None;
         }
+        // A measured size is a *child's* rule; a top-level asks for one. See `open_sized`.
+        let _ = ();
         let m = FontMetrics::new(font, theme.font_px);
         let size = measure(content, Constraints::loose(Size::new(MEASURE_MAX, MEASURE_MAX)), &m);
         // **Nothing, and everything, are both refusals.** Zero is a tree that draws nothing.
@@ -179,9 +183,95 @@ impl Child {
             router: Router::new(),
             scratch,
             pool,
+            buffers,
             hover: None,
             shown: None,
         })
+    }
+
+    /// Open a window at a size the **caller** chose, in any role.
+    ///
+    /// **The difference from [`open`](Self::open) is where the size comes from**, and that is the
+    /// whole of why a top-level could not go through it (M14 Part B). A popup or a dialog is as
+    /// big as its contents and is created from a `measure`; a top-level is as big as the
+    /// application asked for, contains a `dock` more often than not — which measures as *whatever
+    /// it is offered* — and is then reshaped by a manager for the rest of its life.
+    ///
+    /// **The role check `open` carries is answered rather than removed.** Its reason was that a
+    /// `Normal` created that way "would ignore every resize a manager asked of it for the rest of
+    /// its life — silently, because declining a `Configure` is legal". A window opened here can
+    /// answer one: [`resize`](Self::resize) is what `open` had no equivalent of.
+    pub fn open_sized<T: Transport, Msg>(
+        session: &mut Session<T>,
+        role: Role,
+        at: (i32, i32),
+        size: Size,
+        content: &Element<Msg>,
+        font: &Font,
+        theme: &Theme,
+        buffers: usize,
+    ) -> Option<Self> {
+        if size.w == 0 || size.h == 0 {
+            return None;
+        }
+        let id = session
+            .create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers)
+            .ok()?;
+        let built = (|| {
+            let scratch = compose_buffer(size)?;
+            let pool = BufferPool::new(&mut session.window(id)?, size, buffers)?;
+            Some((pool, scratch))
+        })();
+        let Some((pool, scratch)) = built else {
+            // **Everything after the create destroys the window on the way out**, for `open`'s
+            // reason: `Session::create` waits for the first `Configure`, so an abandoned window
+            // is *configured* and therefore a focus candidate — and having committed nothing it
+            // is never drawn, so it is an invisible window silently eating every keystroke.
+            if let Some(w) = session.window(id) {
+                let _ = w.destroy();
+            }
+            return None;
+        };
+        let mut me = Self {
+            id,
+            size,
+            tree: Tree::new(),
+            router: Router::new(),
+            scratch,
+            pool,
+            buffers,
+            hover: None,
+            shown: None,
+        };
+        // Draw once, so a window that has been created is never a window that has never
+        // committed — see the destroy above for what that costs.
+        me.present(session, content, font, theme).then_some(me)
+    }
+
+    /// Take a new size from a `Configure`, reallocating what depends on it.
+    ///
+    /// **`None` if nothing changed**, so a caller can skip the work for a `Configure` that repeats
+    /// a size — which is every `Configure` that follows a move. `Some(false)` means the memory
+    /// could not be had and the window is left at its old size, which is the only answer that
+    /// keeps drawing.
+    ///
+    /// **The retained tree is thrown away, not resized.** A tree diffed against a layout from the
+    /// old bounds reports damage in the old coordinates; starting again reports the whole window,
+    /// which is what a resize is.
+    pub fn resize<T: Transport>(&mut self, session: &mut Session<T>, size: Size) -> Option<bool> {
+        if size == self.size {
+            return None;
+        }
+        let Some(scratch) = compose_buffer(size) else { return Some(false) };
+        let Some(mut w) = session.window(self.id) else { return Some(false) };
+        let Some(pool) = BufferPool::new(&mut w, size, self.buffers) else {
+            return Some(false);
+        };
+        self.scratch = scratch;
+        self.pool = pool;
+        self.size = size;
+        self.tree = Tree::new();
+        Some(true)
     }
 
     /// The compositor's id for this window — what an event names.
@@ -239,10 +329,34 @@ impl Child {
         // **What this frame is being drawn with**, recorded before it is drawn: the caller built
         // `content` from `hovered_key` a moment ago, so this is the hover the retained tree is
         // about to hold. Under a grab it is already `shown` and this is a no-op.
-        self.shown = self.hovered_key();
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
         let l = layout(content, bounds, &FontMetrics::new(font, theme.font_px));
-        let damage = match self.tree.update(content, &l) {
+        self.present_laid_out(session, content, &l, font, theme)
+    }
+
+    /// [`present`](Self::present), for a caller that has already laid the tree out.
+    ///
+    /// **A main window needs its own layout** — the anchors its menu bar's popups hang from come
+    /// from `locate` against it — and laying out twice a frame to hand one copy to each is work
+    /// with no answer in it. This is the seam that lets a window's owner keep the layout it
+    /// computed (M14 Part B); `present` is this with the layout computed here, which is what a
+    /// popup or a dialog wants.
+    ///
+    /// `l` must be the layout of `content` at this window's size, or the damage this reports
+    /// describes a tree that was never drawn.
+    pub fn present_laid_out<T: Transport, Msg>(
+        &mut self,
+        session: &mut Session<T>,
+        content: &Element<Msg>,
+        l: &Layout,
+        font: &Font,
+        theme: &Theme,
+    ) -> bool {
+        // **What this frame is being drawn with**, recorded before it is drawn: the caller built
+        // `content` from `hovered_key` a moment ago, so this is the hover the retained tree is
+        // about to hold. Under a grab it is already `shown` and this is a no-op.
+        self.shown = self.hovered_key();
+        let damage = match self.tree.update(content, l) {
             Ok(None) => return true, // nothing changed; what is on screen is still right
             Ok(Some(d)) => d,
             // A malformed tree is a bug in the caller's view, not a runtime condition — but a
@@ -251,7 +365,7 @@ impl Child {
             // exactly as it was.
             Err(_) => return false,
         };
-        paint(&mut self.scratch, font, theme, content, &l, damage, &mut |_, _, _, _| {});
+        paint(&mut self.scratch, font, theme, content, l, damage, &mut |_, _, _, _| {});
         let mut drawn = false;
         if let Some(mut w) = session.window(self.id)
             && let Ok(b) = self.pool.acquire(&mut w, self.size)
