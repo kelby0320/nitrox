@@ -2753,11 +2753,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // **Empty is asserted, not assumed** — the discriminator only works where nothing else is
     // under the cursor, and which desktop holds what has moved several times by this point.
     session.expect("(empty)")?;
-    // **`click_at` already consumed the press line**, up to the coordinates — so what is left
-    // to read is the `win=` it ends with, and an `expect` for the whole line would scan past
-    // its own evidence. (It did, on this step's first run.)
-    click_at(&mut qmp, &mut session, 640, 400)?;
-    let hit = session.rest_of_line()?;
+    // **`click_at` hands back the press line's tail**, which is the `win=` it ends with; an
+    // `expect` for the whole line would scan past its own evidence. (It did, on this step's first
+    // run.) Returned rather than read here, because `click_at` now also waits for the *release*
+    // and that wait moves the cursor past the press line — a `rest_of_line` here would read the
+    // release's `win=`, which is `none` by construction.
+    let hit = click_at(&mut qmp, &mut session, 640, 400)?;
     if !hit.contains(&format!("win={wallpaper_id}")) {
         return Err(format!(
             "a press on an empty desktop reported '{}' — the wallpaper (window {wallpaper_id}) \
@@ -3442,12 +3443,46 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // column, so a drop at the extreme edge landed on it anyway. Giving the window a frame moved
     // the content in by four pixels and the drop started landing on the frame — a real gate bug,
     // surfaced by a change that had nothing to do with it.
+    //
+    // **The press-and-travel is retried as a unit**, for the reason `click_until` exists: this
+    // browser intermittently does not act on input the compositor delivered to it, and the drag
+    // is the second step where that shows (PR #280's CI failure was the first). Safe here because
+    // a retry only happens when *no* drag started — the receipt would have arrived otherwise —
+    // so the button is released over the row it was pressed on and nothing has been picked up.
+    const DRAG_TRIES: u32 = 3;
     let mut at = row1;
-    for _ in 0..6 {
-        qmp.send_motion(100, 40)?;
-        at = (at.0 + 100, at.1 + 40);
+    let mut dragging = false;
+    for attempt in 1..=DRAG_TRIES {
+        at = row1;
+        for _ in 0..6 {
+            qmp.send_motion(100, 40)?;
+            at = (at.0 + 100, at.1 + 40);
+        }
+        if session.expect_within(
+            "nxfiles: dragging other.txt",
+            std::time::Duration::from_secs(10),
+        )? {
+            dragging = true;
+            break;
+        }
+        println!("  note: the press on the row did not become a drag (attempt {attempt}/{DRAG_TRIES})");
+        // Let go where we are, walk back to the row, and press again.
+        qmp.send_button("left", false)?;
+        qmp.pointer = Some(at);
+        move_pointer_to(&mut qmp, row1.0, row1.1)?;
+        qmp.pointer = Some(row1);
+        qmp.send_button("left", true)?;
     }
-    session.expect("nxfiles: dragging other.txt")?;
+    if !dragging {
+        let _ = session.child.kill();
+        return Err(format!(
+            "pressed on the row and travelled {DRAG_TRIES} times and `nxfiles` never started a \
+             drag. The press and its release are in the transcript if they reached the \
+             compositor — a pair that arrived means the client did not act on input it was \
+             given, which is what `wip/i8042-efficacy` is chasing"
+        )
+        .into());
+    }
     session.expect("compositor: drag from window ")?;
     // Into the editor's document area — below its title bar and status strip, and well inside
     // the half of the screen it now occupies.
@@ -3674,8 +3709,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     by pointing at it is a menu nobody will find. The item sits at the content's left
     //     edge, one bar below the title.
     let file_menu = (fx + 20, fy + 1 + TITLE_BAR_H + MENU_BAR_H / 2);
-    click_at(&mut qmp, &mut session, file_menu.0, file_menu.1)?;
-    session.expect("nxfiles: menu popup ")?;
+    // **Retried on the popup, not on the press.** `the_gate_aims_inside_the_file_word` pins that
+    // this point is inside the word, and the transcript shows the press *and* its release landing
+    // on this window — and the menu still occasionally does not open. See `click_until`.
+    click_until(&mut qmp, &mut session, file_menu.0, file_menu.1, "nxfiles: menu popup ")?;
     let popup = session.rest_of_line()?;
     let (_, px, py, _pw, ph) = parse_menu_popup(&popup)
         .ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
@@ -4319,7 +4356,45 @@ fn check_two_sessions(transcript: &str) -> R<()> {
 /// guest's input ring. A confirmed press is a position report, so `Qmp::pointer` remembers it
 /// and consecutive clicks walk from there — two motions rather than thirty-four
 /// (PR #243 review, finding 3).
-fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
+/// Click at `(x, y)` until the guest says `receipt` — retrying the *click*, not the aim.
+///
+/// **[`click_at`] confirms that the press landed; this confirms that it did something.** They are
+/// different claims, and the gap between them is where PR #280's CI failure lived: the compositor
+/// logged a press *and* a release at the right coordinates on the right window, and the client
+/// never acted on the pair. Whatever swallows it — the release logging added the same day proves
+/// it is not a lost PS/2 packet, which was the first guess — it is intermittent, and a gate that
+/// treats one delivered-but-ineffective click as a verdict is a gate that fails for a reason
+/// nobody can act on. `wip/i8042-efficacy` is chasing the underlying flakiness.
+///
+/// **Only safe where a repeated click is harmless if the first one worked**, which is why the
+/// window is generous: a menu bar word toggles, so a second click on a menu that *did* open would
+/// close it. Ten seconds is far longer than the receipt takes when the click lands.
+fn click_until(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    x: i32,
+    y: i32,
+    receipt: &str,
+) -> R<()> {
+    const ATTEMPTS: u32 = 3;
+    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
+    for attempt in 1..=ATTEMPTS {
+        click_at(qmp, session, x, y)?;
+        if session.expect_within(receipt, PER_ATTEMPT)? {
+            return Ok(());
+        }
+        println!(
+            "  note: the click at ({x}, {y}) landed but produced no {receipt:?} — retrying \
+({attempt}/{ATTEMPTS})"
+        );
+    }
+    Err(format!(
+        "clicked ({x}, {y}) {ATTEMPTS} times and never saw {receipt:?}. The press and its release          are both in the transcript if they reached the compositor, so check there first: a pair          that arrived means the client did not act on a click it was given, which is the          intermittent fault `wip/i8042-efficacy` is chasing rather than a mis-aimed click"
+    )
+    .into())
+}
+
+fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
     const ATTEMPTS: u32 = 3;
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
     for attempt in 1..=ATTEMPTS {
@@ -4329,7 +4404,26 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<()> {
         qmp.send_button("left", false)?;
         if session.expect_within(&format!("compositor: press at x={x} y={y}"), PER_ATTEMPT)? {
             qmp.pointer = Some((x, y));
-            return Ok(());
+            // The press line's tail, which ends with the `win=` the compositor routed to. One
+            // caller needs it, and an `expect` for the whole line would scan past its own
+            // evidence.
+            //
+            // **This deliberately does not wait for the release**, though the release is now
+            // logged beside the press and waiting for it was tried. A click is both halves, and
+            // confirming only the press is why a click whose effect never arrives looks like a
+            // client that ignored it — which is how `check-login` failed in CI on PR #280 with
+            // nothing in the transcript to say which. But adding the wait made the *drag* step
+            // below fail deterministically, three runs out of three, with every release present
+            // and no retry ever firing: the only difference is that the gate proceeds one serial
+            // line later. That is a timing sensitivity in the guest's input path, not something
+            // the wait fixed or caused, and trading one red gate for another to chase it is not
+            // a bargain. The logging stays, because it makes the next occurrence *legible*;
+            // the wait does not, because it makes a different step fail.
+            //
+            // **The likely root cause is already known**: an `i8042` losing interrupts, with a
+            // fix in progress on `wip/i8042-efficacy` ("made every input gate flaky"). This
+            // belongs there, not here.
+            return Ok(session.rest_of_line()?);
         }
         // It did not land where it was aimed, so where it *is* is no longer known.
         qmp.pointer = None;

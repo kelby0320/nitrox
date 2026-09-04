@@ -23334,3 +23334,53 @@ untestable. It is a plain toggle now.
 **The doc-comment orphan, for the seventh time in this repository.** Inserting `transcript` above
 `finish` took `finish`'s `///` block with it. The habit that avoids it is to append below an
 existing item rather than above it.
+
+---
+
+## 2026-09-04 — a click the compositor delivered and the client did not act on (M14 Part A, CI)
+
+`check-login` went red in CI on PR #280's second commit, timing out on `nxfiles: menu popup ` —
+the click that opens the browser's File menu. It passes locally most of the time, which is the
+part that made it worth writing down.
+
+**Three hypotheses, in the order they were tried, and only the third survived.**
+
+**Geometry — ruled out by a test that now stays.** The gate spells the browser's chrome as
+constants and aims at `(fx + 20, …)`, and this part changed what a bar word *is*, from a `button`
+to a `menu_item` with different padding. Nothing connected that hardcoded 20 to the layout, so
+`the_gate_aims_inside_the_file_word` now does: it builds the real tree, locates both bar words,
+and asserts the gate's own arithmetic lands inside *File* and outside *Edit*. It passed, so the
+aim was never the problem — but the next time a bar's padding changes, the failure is a host test
+that names the number rather than a QEMU timeout that names nothing.
+
+**A lost release — ruled out, and ruling it out required a change.** A click is a press *and* a
+release, and `on_press` fires on the release; the compositor logged only presses. So a lost
+release and a client that ignored the click were indistinguishable in the transcript, and QEMU's
+PS/2 queue dropping a whole packet is a documented failure on this path. The compositor now logs
+releases beside presses — a button is not a keystroke, so this says no more about a person than
+the press already did — and the answer came back immediately: **both halves are in the transcript,
+at the right coordinates, on the right window, and the client still did nothing.**
+
+**The wait that was supposed to fix it broke something else.** Before the release logging proved
+otherwise, `click_at` was changed to confirm the release and re-send a missing one. That made the
+`nxfiles` *drag* step fail deterministically — three runs out of three, with every release present
+and no retry ever firing, the only difference being that the gate proceeds one serial line later.
+That is a timing sensitivity in the guest's input path which the wait neither caused nor fixed,
+and trading one red gate for another to chase it is not a bargain. **The wait was dropped; the
+logging was kept**, because the logging is what made the diagnosis possible and costs nothing.
+
+**What shipped is a retry on the effect rather than on the aim.** `click_at` has always retried
+until the *press* landed where it was aimed; `click_until` retries the whole click until the guest
+produces a named receipt. They are different claims — "the pointer was there" and "something
+happened" — and the gap between them is exactly where this failure lived. It is used for the one
+step that flakes, because a repeated click is only safe where the first one doing nothing is the
+premise: a bar word toggles, so the window is ten seconds, far longer than the receipt takes when
+the click lands. Two runs since — one TCG, one KVM — hit the fault and recovered, which is the
+only evidence that the retry addresses the real thing rather than the schedule.
+
+**It is a workaround, and the underlying fault is elsewhere.** A compositor that delivered both
+halves of a click to a window whose client did not act on it is a real bug, not a gate problem.
+`wip/i8042-efficacy` is already chasing input-gate flakiness from the interrupt end
+("made every input gate flaky"), and this belongs with it rather than here. What this milestone
+owes it is the evidence: the release line, and a gate that says "landed but produced no receipt"
+instead of timing out forty-five seconds later on an unrelated expectation.

@@ -2469,4 +2469,37 @@ mod tests {
         check(&mut a, None, &mut tree, "back to shut");
     }
 
+    /// The bar words are where `check-login` aims, which is a hardcoded number in a gate.
+    ///
+    /// **A gate cannot link this crate**, so it spells the browser's chrome metrics as constants
+    /// and aims at `(fx + 20, fy + 1 + TITLE_BAR_H + MENU_BAR_H / 2)` for the File menu. Nothing
+    /// connected that number to the layout until now — and M14 Part A changed what a bar word
+    /// *is*, from a `button` to a `menu_item` with different padding. If the word ever moves out
+    /// from under that point the gate fails in QEMU with no explanation; here it fails in a
+    /// second and says which number is wrong.
+    #[test]
+    fn the_gate_aims_inside_the_file_word() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let view = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+        let file =
+            libui::layout::locate(&view, &l, MENU_BAR_KEY).expect("the File word is keyed");
+        let edit =
+            libui::layout::locate(&view, &l, MENU_BAR_KEY + 1).expect("the Edit word is keyed");
+
+        // The gate's own arithmetic, in window-local coordinates.
+        let (ax, ay) = (20, 1 + TITLE_BAR_H as i32 + MENU_BAR_H as i32 / 2);
+        assert!(
+            file.contains(ax, ay),
+            "check-login aims at ({ax}, {ay}) for the File menu and the word is at {file:?}"
+        );
+        // …and it is not so close to Edit that a pixel of drift chooses the other menu.
+        assert!(
+            !edit.contains(ax, ay),
+            "the aim point is inside Edit as well: File {file:?}, Edit {edit:?}"
+        );
+    }
+
 }
