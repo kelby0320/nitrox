@@ -21,20 +21,19 @@
 
 extern crate alloc;
 
-use libdraw::format::PixelFormat;
-use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_ui};
 use libkern::debug::Line;
 use libkern::{exit, kprint};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
-use librsproto::surface::{CreateWindowRequest, Role};
-use libsurface::buffers::BufferPool;
+use librsproto::surface::{Role};
+
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
-use libui::diff::Tree;
-use libui::layout::{Layout, layout, locate};
-use libui::paint::{FontMetrics, Theme, paint};
-use libui::route::Router;
+
+use libui::layout::{layout, locate};
+use libui::paint::{FontMetrics, Theme};
+
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
 use nxedit::{App, MENU_BAR_KEY, MENU_COUNT, Msg, to_bytes};
@@ -67,11 +66,6 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
-/// A private framebuffer of `size` to compose a frame into.
-fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
-    let pitch = (size.w as usize).checked_mul(4)?;
-    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
-}
 
 /// Read the file into `app`, or say why it could not be.
 ///
@@ -145,18 +139,6 @@ fn save(ns: u64, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
     Ok(bytes.len())
 }
 
-/// Paint `damage` of `app` into `fb`.
-fn draw(
-    fb: &mut MemFramebuffer,
-    ui: &libui::element::Element<Msg>,
-    l: &Layout,
-    font: &Font,
-    theme: &Theme,
-    damage: Rect,
-) {
-    // No `custom` nodes: everything this application draws is a widget the toolkit owns.
-    paint(fb, font, theme, ui, l, damage, &mut |_, _, _, _: &mut MemFramebuffer| {});
-}
 
 /// Block until the compositor has something to say.
 fn wait_one(h: u64) {
@@ -414,7 +396,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         })
     }
 
-    let mut quitting = false;
+    let mut quit_pending = false;
     let mut wins = alloc::vec![Win {
         top,
         app,
@@ -437,11 +419,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Destructured rather than dotted through, which is what keeps six hundred lines readable
         // across the conversion: every name below means what it meant when there was one window,
         // and the difference is that they are borrowed out of one of several.
+        // Set by a window that owes a frame *now* — see the sites that set it.
+        let mut redraw_now = false;
         for wi in 0..wins.len() {
         let Win {
             top,
             app,
-            size,
+            // The resize acts on the window whose `Configure` it was, in the dispatch below.
+            size: _,
             bounds,
             confirm,
             confirm_hovered,
@@ -755,6 +740,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             // Round again rather than waiting: the buffer or the status strip has changed and
             // nothing else is going to arrive to prompt a redraw.
+            // **Round again without waiting**, which is what this `continue` meant
+            // when the body serviced one window. Inside the per-window loop it means
+            // "next window", and the wait below would then block with a frame owed —
+            // the stale-listing bug PR #257 removed, reintroduced by the conversion
+            // (PR #283 review, worth fixing 4). The flag is what carries the old
+            // meaning across the new shape.
+            redraw_now = true;
             continue;
         }
 
@@ -786,13 +778,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             app.saved(key, result);
             // Round again rather than waiting: the status strip has changed and nothing else is
             // going to arrive to prompt a redraw.
+            // **Round again without waiting**, which is what this `continue` meant
+            // when the body serviced one window. Inside the per-window loop it means
+            // "next window", and the wait below would then block with a frame owed —
+            // the stale-listing bug PR #257 removed, reintroduced by the conversion
+            // (PR #283 review, worth fixing 4). The flag is what carries the old
+            // meaning across the new shape.
+            redraw_now = true;
             continue;
         }
 
-        if app.closing() {
-            kprint(b"nxedit: closing\n");
-            exit(0);
-        }
 
         }
 
@@ -826,7 +821,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         if quit_asked {
             kprint(b"nxedit: quitting\n");
-            quitting = true;
+            quit_pending = true;
         }
 
         // **Quit asks one window at a time.** Each is asked exactly as its own close button asks
@@ -835,10 +830,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // every remaining window open (M14 decision 4); that is why this stops at the first
         // window that is asking rather than sending `Close` to all of them at once, which would
         // put a dialog on every window and take the first answer as the verdict for all.
-        if quitting
-            && let Some(w) = wins.iter_mut().find(|w| !w.app.confirming() && !w.app.closing())
-        {
-            w.app.update(Msg::Close);
+        // **Nothing is asked while a question is open.** The first version skipped the window
+        // that was confirming and asked the *next* one, which put a dialog on every window at
+        // once — the alternative decision 4 explicitly rejected, arrived at by accident (PR #283
+        // review, blocking 2).
+        if quit_pending && !wins.iter().any(|w| w.app.confirming()) {
+            if let Some(w) = wins.iter_mut().find(|w| !w.app.closing()) {
+                w.app.update(Msg::Close);
+            }
         }
 
         // **A window that has finished closing goes**, and the last one takes the process.
@@ -861,6 +860,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         if wins.is_empty() {
             kprint(b"nxedit: closing\n");
             exit(0);
+        }
+
+        // **A frame is owed, so do not block for an event.** Without this the window that
+        // asked would not repaint until the next event happened to arrive — in practice the
+        // key's own release, which is why this reads as a lag rather than a hang.
+        if redraw_now {
+            continue;
         }
 
         // ---- events ----
@@ -990,7 +996,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // dialog that only ever gets one answer is half a control.
                     match m {
                         Msg::Discard => kprint(b"nxedit: discarding the unsaved buffer\n"),
-                        Msg::KeepEditing => kprint(b"nxedit: close cancelled, still editing\n"),
+                        // **Cancelling aborts the quit**, which is decision 4's whole content and
+                        // which nothing did until PR #283's review: `quitting` was set and never
+                        // cleared, so the dialog reopened on the very next frame and could not be
+                        // dismissed at all. Answering *this* question is answering the quit,
+                        // because the quit is what asked it.
+                        Msg::KeepEditing => {
+                            kprint(b"nxedit: close cancelled, still editing\n");
+                            if quit_pending {
+                                kprint(b"nxedit: quit cancelled\n");
+                            }
+                            quit_pending = false;
+                        }
                         _ => {}
                     }
                     app.update(m);
@@ -1074,7 +1091,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // resize means: a tree diffed against a layout from the old bounds reports damage in
             // the old coordinates. `Some(false)` is the memory refusing, which leaves the window
             // at its old size and still drawing.
-            if top.resize(&mut win, *size) == Some(false) {
+            if top.resize(*size) == Some(false) {
                 fail(b"nxedit: impossible window geometry\n");
             }
             *bounds = Rect::new(0, 0, size.w, size.h);

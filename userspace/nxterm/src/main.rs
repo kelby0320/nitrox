@@ -19,23 +19,23 @@ extern crate alloc;
 
 mod backend;
 
-use libdraw::format::PixelFormat;
-use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+
+use libdraw::framebuffer::{Framebuffer, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_mono, load_ui};
 use libkern::debug::Line;
 use libkern::{exit, kprint};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
-use librsproto::surface::{CreateWindowRequest, Role};
-use libsurface::buffers::BufferPool;
+use librsproto::surface::{Role};
+
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
-use libui::diff::Tree;
+
 use libui::damage::union_opt;
-use libui::layout::{Layout, layout, locate};
+use libui::layout::{layout, locate};
 use libui::paint::FontMetrics;
-use libui::paint::{Theme, paint};
-use libui::route::Router;
+use libui::paint::{Theme};
+
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome, Menu};
 use nxterm::{App, GRID_KEY, GRID_KIND, MENU_BAR_KEY, MENU_COUNT, Msg, rows_in};
@@ -53,17 +53,6 @@ const COLS: usize = 80;
 const ROWS: usize = 24;
 
 
-/// A private framebuffer of `size` to compose a frame into.
-///
-/// **Drawn here and copied into whichever buffer is free**, rather than painted directly into
-/// it: the toolkit's damage describes what changed since the *last frame*, and the free buffer
-/// holds the frame before that. Painting a one-row damage straight into it would leave the row
-/// from two frames ago everywhere else. `libui::damage`'s per-buffer accumulation is the real
-/// answer; a copy is correct now and is one `memcpy` of a window.
-fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
-    let pitch = (size.w as usize).checked_mul(4)?;
-    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
-}
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
@@ -110,46 +99,6 @@ fn chose(msg: Msg) {
     }
 }
 
-/// Paint `damage` of `app` into `fb`.
-///
-/// The join between the two damage systems: `paint` walks the widget tree and calls back for
-/// the `custom` node with the clip it survived, and that clip becomes the rows `libterm`
-/// renders. Nothing here decides *what* changed — the diff and the grid did that.
-fn draw(
-    fb: &mut MemFramebuffer,
-    app: &App,
-    ui: &libui::element::Element<Msg>,
-    l: &Layout,
-    ui_font: &Font,
-    mono_font: &Font,
-    theme: &Theme,
-    damage: Rect,
-) {
-    let origin = app.grid_origin();
-    let m = app.metrics;
-    let grid = app.grid();
-    let palette = app.palette;
-    let top = app.view_line();
-    paint(fb, ui_font, theme, ui, l, damage, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
-        if kind != GRID_KIND {
-            return;
-        }
-        // **The cells do not always fill the node** (M9 Part D). A maximised window is exactly
-        // the work area and the grid is the whole cells that fit, so up to a cell's width and a
-        // cell's height of the node is not covered by any row — and `render_view` paints cells,
-        // nothing else. Left alone that margin holds whatever the last frame put there, which
-        // after a resize is a strip of the old window.
-        //
-        // Filled only when the node really is bigger than its cells, so the ordinary
-        // one-row-per-keystroke damage costs nothing extra.
-        let cells = m.pixel_size(grid.cols(), grid.rows());
-        if rect.size.w > cells.w || rect.size.h > cells.h {
-            fb.fill_rect(clip, palette.background);
-        }
-        let rows = rows_in(clip, origin, &m, grid.rows());
-        libterm::render::render_view(fb, grid, mono_font, &m, &palette, origin, top, &rows);
-    });
-}
 
 /// Print the text of grid row `row`, trailing blanks trimmed.
 ///
@@ -472,7 +421,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         })
     }
 
-    let mut quitting = false;
+    let mut quit_pending = false;
 
     // **The tty, and the shell on the other end of it.** Part C's whole point: the terminal is
     // obtained like any program's, this process becomes its backend, and the terminal itself is
@@ -900,7 +849,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             if w.app.take_quit() {
                 kprint(b"nxterm: quitting\n");
-                quitting = true;
+                quit_pending = true;
             }
         }
         for _ in 0..opened {
@@ -921,7 +870,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **Quit closes every window**, and each closes as its own close button does. A terminal
         // has nothing unsaved to ask about, so no window can refuse — the editor is where
         // decision 4's interesting half lives.
-        if quitting {
+        if quit_pending {
             for w in wins.iter_mut() {
                 w.app.update(Msg::Close);
             }
@@ -995,8 +944,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
-        // Set by a `Configure` that actually changed the shape; acted on once, below.
-        let mut resized = false;
         for (from, event) in events {
             // **Which window is this for?** A record naming none of them is dropped rather than
             // routed into whichever window happened to be first.
@@ -1005,13 +952,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }) else {
                 continue;
             };
-            let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered } =
+            let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered: _ } =
                 &mut wins[wi];
             let window_id = top.id();
-            // Rebuilt for *this* window: routing is against a layout, and a layout of another
-            // window's tree would report a widget that is not the one under the pointer.
+            // Rebuilt for *this* window: routing is against this window's tree, and another
+            // window's would report a widget that is not the one under the pointer. **No layout
+            // here** — `Child::route` lays the content out itself.
             let ui = app.view(&theme, top.hovered_key());
-            let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
+            // **Per event, not per drain** (PR #283 review, worth fixing 6). Declared outside, one
+            // `Configure` left it set for every later event in the same batch — and those belong
+            // to *other* windows, each of which would then be told to repaint its whole grid.
+            let mut resized = false;
         // **The menu's window routes through the menu's tree.** Same `App`, so an item's `Msg`
         // updates the same state; different tree, layout and router, because they describe a
         // different window. A record for a window that is not one of these two is not possible
@@ -1211,7 +1162,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let size = app.window_size();
                 // `Child::resize` throws the retained tree away: a tree diffed against a layout
                 // from the old bounds reports damage in the old coordinates.
-                if top.resize(&mut win, size) == Some(false) {
+                if top.resize(size) == Some(false) {
                     fail(b"nxterm: impossible window geometry\n");
                 }
                 *bounds = Rect::new(0, 0, size.w, size.h);

@@ -3543,7 +3543,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         .next()
         .map(|(i, m)| listing[i + m.len()..].lines().next().unwrap_or("").to_string())
         .unwrap_or_default();
-    let count: usize = last.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    // **The entries, not the number.** The number after `of ` is `desktops.len()`, which this
+    // gate switched to 2 several steps ago and which is satisfied whatever the taskbar holds — so
+    // reading it made this assertion decoration that could not fail (PR #283 review, blocking 3).
+    // The windows are the bracketed `[id:label]` items.
+    let count = last.matches('[').count();
     if count < 3 {
         let _ = session.child.kill();
         return Err(format!(
@@ -3553,6 +3557,22 @@ fn cmd_check_login(accel: Accel) -> R<()> {
         .into());
     }
     println!("  ok: the shell's window list counts it too ({count} windows)");
+
+    // **Closing one window must not take the others with it**, which is the whole of why the
+    // conversion had to be uniform — and was broken anyway until PR #283's review: an `exit(0)`
+    // left inside the per-window loop ran against *each* window's `App`, so closing either one
+    // ended the process and discarded whatever the other held. Nothing caught it because this
+    // gate had never closed a second window.
+    //
+    // `Ctrl+W` on the new window: it has one tab, and closing the last tab closes the window.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "w")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: closed a window")?;
+    // …and the editor is still running, which is the half that would have been lost. The
+    // *first* window answers, so the process did not exit with the second.
+    session.expect("desktop-shell: window list on cli of ")?;
+    println!("  ok: closing one window left the other open");
 
     // **Give the first window the keyboard back**, because the new one took it — which is right,
     // and is exactly what makes the rest of this gate's typing land in the wrong place otherwise.
@@ -4991,6 +5011,11 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // **The shell's line comes first, and structurally so**: `open_window` gives the new
     // window's first tab a tty and a shell before it returns, so the terminal cannot report a
     // window it has not finished building.
+    // **The shell's line comes first, and structurally so**: `open_window` gives the new window's
+    // first tab a tty and a shell before it returns, so the terminal cannot report a window it has
+    // not finished building. **Nothing between the last two**, because the third comes from a
+    // freshly spawned `nxsh` and its order against this process's own `kprint` is a race — the
+    // rule this gate's own closing comment states (PR #283 review, optional 9).
     session.expect("nxterm: hosting a shell")?;
     session.expect("nxterm: opened another window")?;
     session.expect("nxsh: interactive shell")?;

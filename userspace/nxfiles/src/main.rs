@@ -17,18 +17,17 @@
 
 extern crate alloc;
 
-use libdraw::format::PixelFormat;
-use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_ui};
 use libkern::{exit, kprint};
-use librsproto::surface::{CreateWindowRequest, Role};
-use libsurface::buffers::BufferPool;
+use librsproto::surface::{Role};
+
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
-use libui::diff::Tree;
-use libui::layout::{Layout, layout, locate};
-use libui::paint::{FontMetrics, Theme, paint};
-use libui::route::Router;
+
+use libui::layout::{layout, locate};
+use libui::paint::{FontMetrics, Theme};
+
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
 use nxfiles::{
@@ -159,15 +158,6 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
-/// A private framebuffer of `size` to compose a frame into.
-///
-/// Drawn here and copied into whichever buffer is free, for the reason `nxterm` gives: the
-/// toolkit's damage describes what changed since the *last frame*, and the free buffer holds
-/// the frame before that.
-fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
-    let pitch = (size.w as usize).checked_mul(4)?;
-    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
-}
 
 /// Read `path` and hand the listing to `app`.
 ///
@@ -226,19 +216,6 @@ fn ask_shell_to_open(root_ns: u64, path: &str) -> bool {
     ok
 }
 
-/// Paint `damage` of `app` into `fb`.
-fn draw(
-    fb: &mut MemFramebuffer,
-    ui: &libui::element::Element<Msg>,
-    l: &Layout,
-    font: &Font,
-    theme: &Theme,
-    damage: Rect,
-) {
-    // No `custom` nodes: everything this application draws is a widget the toolkit owns, which
-    // is the difference between it and `nxterm` — and the point of building it second.
-    paint(fb, font, theme, ui, l, damage, &mut |_, _, _, _: &mut MemFramebuffer| {});
-}
 
 /// `HOME` from the setup record, or `/` for a process that was told nothing.
 fn home_of(env: &libstream::wire::Record) -> String {
@@ -423,7 +400,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         })
     }
 
-    let mut quitting = false;
+    let mut quit_pending = false;
     let mut wins = alloc::vec![Win {
         top,
         app,
@@ -442,11 +419,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         //
         // Destructured rather than dotted through, which is what keeps this loop readable across
         // the conversion: every name below means what it meant when there was one window.
+        // Set by a window that owes a frame *now* — see the sites that set it.
+        let mut redraw_now = false;
         for wi in 0..wins.len() {
         let Win {
             top,
             app,
-            size,
+            // The resize acts on the window whose `Configure` it was, in the dispatch below.
+            size: _,
             bounds,
             menu,
             menu_shown,
@@ -679,6 +659,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // The notice `navigate` cleared is the answer to what just happened, so it is put
             // back after the listing rather than before it.
             app.operated(said);
+            // **Round again without waiting**, which is what this `continue` meant
+            // when the body serviced one window. Inside the per-window loop it means
+            // "next window", and the wait below would then block with a frame owed —
+            // the stale-listing bug PR #257 removed, reintroduced by the conversion
+            // (PR #283 review, worth fixing 4). The flag is what carries the old
+            // meaning across the new shape.
+            redraw_now = true;
             continue;
         }
         // **The listing is read here, not in `update`.** `update` is a function of values; a
@@ -698,14 +685,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // until the *next* event happens to arrive. In practice that is the key's own
             // release a moment later, which is why hand testing and the gate both pass — and
             // why it is worth removing rather than reasoning about (PR #257 review, finding 4).
+            // **Round again without waiting**, which is what this `continue` meant
+            // when the body serviced one window. Inside the per-window loop it means
+            // "next window", and the wait below would then block with a frame owed —
+            // the stale-listing bug PR #257 removed, reintroduced by the conversion
+            // (PR #283 review, worth fixing 4). The flag is what carries the old
+            // meaning across the new shape.
+            redraw_now = true;
             continue;
         }
 
         // **Asked to close, by its own button or by the shell.**
-        if app.closing() {
-            kprint(b"nxfiles: closing\n");
-            exit(0);
-        }
 
         }
 
@@ -720,7 +710,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             if w.app.take_quit() {
                 kprint(b"nxfiles: quitting\n");
-                quitting = true;
+                quit_pending = true;
             }
         }
         for _ in 0..opened {
@@ -738,7 +728,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **Quit closes every window.** This browser has nothing unsaved to ask about, so there
         // is no dialog to cancel and no window that can refuse — the editor is where decision 4's
         // interesting half lives, and this is the same rule with nothing in its way.
-        if quitting {
+        if quit_pending {
             for w in wins.iter_mut() {
                 w.app.update(Msg::Close);
             }
@@ -764,6 +754,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             exit(0);
         }
 
+        // **A frame is owed, so do not block for an event.** Without this the window that
+        // asked would not repaint until the next event happened to arrive — in practice the
+        // key's own release, which is why this reads as a lag rather than a hang.
+        if redraw_now {
+            continue;
+        }
+
         // ---- events ----
         if win.events_pending() == 0 {
             wait_one(ev);
@@ -779,7 +776,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
         }
-        let mut resized = false;
         for (from, event) in events {
             // **Which window is this for?** A record naming none of them is dropped rather than
             // routed into whichever window happened to be first.
@@ -803,10 +799,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 ..
             } = &mut wins[wi];
             let window_id = top.id();
-            // Rebuilt for *this* window: routing is against a layout, and a layout of another
-            // window's tree would report a widget that is not the one under the pointer.
+            // Rebuilt for *this* window: routing is against this window's tree, and another
+            // window's would report a widget that is not the one under the pointer. **No layout
+            // here** — `Child::route` lays the content out itself, and this browser has no
+            // `drop_at` to hand one to.
             let ui = app.view(&theme, top.hovered_key());
-            let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
             let mut resized = false;
             // **The menu's window routes through the menu's tree.** Same `App`, so a row's `Msg`
             // updates the same state a click in the list does; a different tree and router,
@@ -989,7 +986,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // `Child::resize` reallocates and throws the retained tree away: a tree diffed
             // against a layout from the old bounds reports damage in the old coordinates, and
             // starting again reports the whole window, which is what a resize is.
-            if top.resize(&mut win, *size) == Some(false) {
+            if top.resize(*size) == Some(false) {
                 fail(b"nxfiles: impossible window geometry\n");
             }
             *bounds = Rect::new(0, 0, size.w, size.h);

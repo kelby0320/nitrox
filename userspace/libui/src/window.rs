@@ -1,4 +1,4 @@
-//! A window an application opens **beside** its main one — a menu, or a dialog.
+//! A window an application owns: its main one, a menu, or a dialog.
 //!
 //! ## Why this is here at all
 //!
@@ -15,19 +15,23 @@
 //!
 //! ## What a `Child` is, and what it is not
 //!
-//! A **child** is one of the two parented roles — [`Role::Popup`] and [`Role::Dialog`] — which
-//! is not a category this module invented: the compositor's own `parent_of` matches exactly
-//! those two, and `rsproto-surface-ops.md` calls both "transient, parented". A child has a size
-//! fixed at creation, no `Configure` to honour, no second event source, and a whole widget tree
-//! with nothing custom in it. That is what makes it a value an application can hold, open and
-//! drop.
+//! A `Child` is **any window a client owns** — its main one included, since M14 Part B. It
+//! bundles the six things a window needs to be drawn and routed: an id, a size, a retained tree,
+//! a router, a compose buffer and a pool. That is what makes it a value an application can hold,
+//! open, resize and drop — and what makes a *second* window a second value rather than a second
+//! copy of a main loop.
 //!
-//! **A main window is not one of these**, and is deliberately still driven by each application's
-//! own loop: it owns the `sys_wait`, it must answer `Configure` by reallocating everything here,
-//! and `nxterm`'s also paints a `custom` grid whose damage feeds `libterm`. Converting those is
-//! a change to the shape of every `main` in the tree with no new behaviour in it, and it does
-//! not belong in the same change as the first dialog. **Trigger: the next part that touches
-//! both applications' main loops** — M12 Part D's tabs is the obvious one.
+//! **It began as the two parented roles only** — [`Role::Popup`] and [`Role::Dialog`], the pair
+//! the compositor's own `parent_of` matches and `rsproto-surface-ops.md` calls "transient,
+//! parented" — and the restriction was load-bearing rather than fussy: such a window has its size
+//! fixed at creation and no `Configure` to honour, and a `normal` created that way would ignore
+//! every resize a manager asked of it for the rest of its life, silently, because declining a
+//! `Configure` is legal. [`Child::open_sized`] and [`Child::resize`] are what *answer* that, so
+//! the check went and the reason for it did not.
+//!
+//! **A main window's loop is still each application's own**, and always will be: it owns the
+//! `sys_wait`, it decides what a `Configure` means to its content, and `nxterm`'s paints a
+//! `custom` grid whose damage feeds `libterm` — which is why [`Child::present_custom`] exists.
 //!
 //! ## Not host-tested, for the reason [`libsurface::buffers`] is not
 //!
@@ -79,7 +83,8 @@ const MEASURE_MAX: u32 = u32::MAX / 4;
 pub struct Child {
     /// The compositor's id for this window.
     id: u32,
-    /// Its size, fixed at creation.
+    /// Its size. Fixed at creation for a popup or a dialog, which never answer a `Configure`;
+    /// changed by [`resize`](Self::resize) for a top-level, which must.
     size: Size,
     /// The retained tree this window's frames diff against.
     tree: Tree,
@@ -89,8 +94,6 @@ pub struct Child {
     scratch: MemFramebuffer,
     /// The shared buffers, and the mappings that are unmapped when this value drops.
     pool: BufferPool,
-    /// How many buffers the pool was built with, so a resize can rebuild it the same way.
-    buffers: usize,
     /// The live hover: what the pointer is actually over.
     hover: Option<u64>,
     /// The hover the retained tree was **last built with**.
@@ -149,7 +152,6 @@ impl Child {
             return None;
         }
         // A measured size is a *child's* rule; a top-level asks for one. See `open_sized`.
-        let _ = ();
         let m = FontMetrics::new(font, theme.font_px);
         let size = measure(content, Constraints::loose(Size::new(MEASURE_MAX, MEASURE_MAX)), &m);
         // **Nothing, and everything, are both refusals.** Zero is a tree that draws nothing.
@@ -183,7 +185,6 @@ impl Child {
             router: Router::new(),
             scratch,
             pool,
-            buffers,
             hover: None,
             shown: None,
         })
@@ -239,7 +240,6 @@ impl Child {
             router: Router::new(),
             scratch,
             pool,
-            buffers,
             hover: None,
             shown: None,
         };
@@ -259,12 +259,13 @@ impl Child {
     /// old bounds reports damage in the old coordinates; starting again reports the whole window,
     /// which is what a resize is.
     ///
-    /// **The pool is kept**, and that is not an omission: `BufferPool::acquire` is handed the size
-    /// every frame and replaces a buffer left at the old shape when it next needs one. Building a
-    /// *new* pool here is what the first version did, and the compositor rejected it — it still
-    /// holds the buffers the old pool attached. The rejection was silent enough that the resize
-    /// reported success and the window simply stopped committing frames.
-    pub fn resize<T: Transport>(&mut self, session: &mut Session<T>, size: Size) -> Option<bool> {
+    /// **The pool is kept, and there is no `Session` here for that reason.** `BufferPool::acquire`
+    /// is handed the size every frame and replaces a buffer left at the old shape when it next
+    /// needs one. Building a *new* pool here is what the first version did — it took a `Session`
+    /// to do it — and the compositor rejected it, because it still holds the buffers the old pool
+    /// attached. The rejection was silent enough that the resize reported success and the window
+    /// simply stopped committing frames; `check-login`'s reflow step caught it three resizes in.
+    pub fn resize(&mut self, size: Size) -> Option<bool> {
         if size == self.size {
             return None;
         }
@@ -280,7 +281,8 @@ impl Child {
         self.id
     }
 
-    /// Its size in pixels, which does not change.
+    /// Its size in pixels. Constant for a popup or a dialog; a top-level's changes with
+    /// every `Configure` it answers through [`resize`](Self::resize).
     pub fn size(&self) -> Size {
         self.size
     }
@@ -420,10 +422,11 @@ impl Child {
     /// layout, and a layout of a different tree would report a widget that is not the one under
     /// the pointer.
     ///
-    /// **Three variants and no default action.** A `Configure` is not answered because a child's
-    /// size is fixed; a `Dismissed` means "close me", which is the caller's to act on because
-    /// only the caller knows what the window was *for*; and no child declares a drop acceptor,
-    /// so no `Drop` can arrive here.
+    /// **Three variants and no default action.** A `Configure` is not answered *here* — a popup's
+    /// size is fixed, and a top-level's owner decides what a new size means to its content before
+    /// calling [`resize`](Self::resize); a `Dismissed` means "close me", which is the caller's to
+    /// act on because only the caller knows what the window was *for*; and a `Drop` is routed by
+    /// [`drop_at`](Self::drop_at), against a layout only the owner has.
     pub fn route<Msg: Clone>(
         &mut self,
         content: &Element<Msg>,

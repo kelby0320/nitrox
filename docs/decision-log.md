@@ -23672,3 +23672,53 @@ and adding New Window and Quit moved `Rename` from 5 to 8. Both times the failur
 rename prompt that never opened, several steps from the menu it was about.
 `the_gate_clicks_the_row_it_means` makes that number wrong in a second instead of in a
 three-minute boot — the same job `the_gate_aims_inside_the_file_word` does for the bar word.
+
+---
+
+## 2026-09-04 — what PR #283's review found: three lines the conversion needed to move
+
+Three blocking findings, and the first two are the same kind of mistake: a line that was correct
+while there was one window, left in place by a change whose whole subject was that there are now
+several. `nxterm` moved both; `nxedit` and `nxfiles` moved neither.
+
+**`exit(0)` stayed inside the per-window loop**, so closing *any* window ended the process and
+discarded whatever every other window held. This is exactly the failure the "uniform or nothing"
+decision existed to prevent, described in this log and in the PR as the reason for that decision —
+and then shipped anyway, in two of the three applications. It survived because **no gate had ever
+closed a second window**: `check-login` reached the removal path only through Quit. It closes one
+now, with `Ctrl+W` on a one-tab window, and reinstating the `exit(0)` makes it fail.
+
+**Cancelling a Quit did not abort it.** `quit_pending` was set and never cleared, so a *Keep
+editing* answer closed the dialog and the next frame asked again — a question that could not be
+dismissed. Worse in the other direction with two windows: the search for the next window to ask
+*skipped* the one that was confirming, so a second dialog went up while the first was open, which
+is precisely the alternative decision 4 rejected. Nothing tested it, and the plan already had
+decision 4 ticked as built. Answering the question now answers the quit, because the quit is what
+asked it; and nothing is asked at all while any window is confirming.
+
+**And an assertion that could not fail.** The new gate step read the number after
+`window list on cli of `, which is `desktops.len()` — not a window count. `check-login` switches
+desktops early, so the comparison was satisfied whatever the taskbar held, and the line printed
+"3 windows" from a number that meant desktops. It counts the bracketed entries now. The
+`placed window` expectation beside it was genuine, so the feature was not unguarded; the half
+described as *the shell's own account of the list* was decoration.
+
+**A `continue` that changed meaning without changing text.** Inside a single-window body it meant
+"round again, do not wait". Inside `for wi in 0..wins.len()` it means "next window", and the wait
+below then blocks with a frame owed — reintroducing the stale-listing bug PR #257's review had
+removed, in the very code whose comment still explains why that bug was worth removing rather than
+reasoning about. A flag carries the old meaning across the new shape.
+
+**The rule these four share** is that the conversion changed what a *scope* means, and every line
+that depended on the old scope kept compiling. A rename would have been caught by the compiler; a
+reshaping of control flow is caught by nothing. The four negative controls the reviewer ran on the
+library-side tests all fired — the tests written were fine, and the ones not written were the
+binaries', where the mistakes were.
+
+Also fixed: eleven warnings across the three binaries (a `buffers` field and a `Session` parameter
+left over from the pool-rebuilding version the reflow gate caught, `compose_buffer` and `draw` now
+dead, unused imports, `nxterm`'s `resized` declared per drain rather than per event — which would
+have made one window's `Configure` repaint another's grid entirely), and the toolkit's own
+documentation, which still said a `Child` is one of the two parented roles with a size fixed at
+creation. That paragraph is rewritten to say what changed *and why the old restriction existed*,
+because the restriction was load-bearing: `open_sized` and `resize` answer it rather than remove it.
