@@ -23474,3 +23474,75 @@ were written for. Six `check-login` runs under KVM went from retrying in three o
 **And both flakes were this one bug.** The menu click and the file drag had been treated as
 separate intermittent faults in separate steps; a drag begins with a press on a list row, which
 highlights under the pointer exactly as a menu word does.
+
+---
+
+## 2026-09-04 — tabs in the terminal, and a drag that had been called a flake twice (M14 Part B, batch 1)
+
+**`nxterm` has tabs.** The strip widget has existed since M12 Part D, wanted by two applications
+at once; the terminal was not one of them and takes it now against the widget unchanged, which is
+the useful half of that story — a widget built for two consumers took a third with no argument.
+
+**The line between a tab and a window is the one `nxedit` and `nxfiles` drew.** A `Term` holds
+what a person would be surprised to see shared: the screen, the scrollback, where the view is
+scrolled to, what is selected, and the bytes typed but not yet sent. `App` keeps the window — its
+size, its chrome, its menus, whether it has the keyboard. The plan named the failure exactly
+("getting it wrong is how a second tab inherits the first's scrollback") and the test is written
+against *inheritance* rather than absence, because tabs built by adding a strip over one grid look
+right until you type in the second one and the first scrolls.
+
+**A tab's other half is a tty and a shell, and `nxterm`'s library makes no syscalls.**
+`Msg::NewTab` adds a `Term` with an empty grid and nothing else; the binary keeps a backend per
+tab and reconciles the two every frame, so a tab arriving by any route is served the same way.
+Paired by key, never by index — a message naming a position outlives the frame that produced it.
+`/dev/tty` turned out to need no server work at all: `OP_NS_RESOLVE` opens a *new* terminal per
+resolve, so a tab is one more `attach` and one more `spawn_shell`.
+
+**`wait_two` became `wait_any`.** One `sys_wait` over the compositor and every tab, because a
+shell printing in a background tab must not wait for the foreground one to say something.
+
+**Gated end to end**, because the split of grids is host-testable and "a new tab gets its own tty
+and its own shell" is not: `check-terminal` presses `Ctrl+Shift+T` and waits for a *second
+shell's* banner. The receipt is the shell's rather than the tab's — a strip with two words in it
+is exactly what a terminal that opened a tab and gave it nothing to talk to would draw.
+
+**`the_window_is_the_grid_plus_its_chrome` earned itself.** It adds the chrome up rather than
+checking the parts it remembers, and it caught `grid_origin` still pointing at where the grid used
+to start — which would have drawn the grid underneath the new strip.
+
+### The drag bug, and how it survived being looked at three times
+
+A quick drag out of `nxfiles` did nothing. `pointer_moved` had the hand-off inside the
+already-dragging branch, which only the *second* motion reaches — so a motion that both crossed
+the slop and left the window armed a drag and then sat there with nothing to move it on. Dragging
+slowly worked, because a later motion inside the window did the hand-off.
+
+**It had been failing `check-login` for weeks and I called it a flake twice.** The rate moved
+whenever unrelated things changed, which is exactly what a latent timing-sensitive bug does: the
+tab strip made `nxterm` 24 pixels taller, which made the guest slower, which made the gate's six
+injected motions coalesce into two — and the second landed outside the window. I compared the
+branch against `main`, saw 4 failures in 9 against 0 in 4, and concluded my own change had
+perturbed timing. That was true and useless: **timing was the amplifier, and I never asked what
+the gesture did.**
+
+What settled it in one run was a probe printing every motion the browser saw:
+
+    nxfiles: PROBE grab row 1 armed=1
+    nxfiles: PROBE moved to 120,128 pressed=1 dragging=0
+    nxfiles: PROBE moved to 720,368 pressed=1 dragging=0
+
+Two motions, not six, and the second already outside a 560-wide window. **The maintainer found it
+first, from using it** — "clicking a file opens the file rather than selecting it, and I think as
+a result click and drag doesn't work". The first half is expected until Part E builds decision 5;
+the second half was this.
+
+**The gap that let it live is a test shape, not an oversight.** Every drag test in `nxfiles`
+begins at `a.update(Msg::Grab(i))` — testing what the browser does once a gesture is under way,
+and saying nothing about whether a press starts one. So the entire drag could be broken with every
+drag test green. There is now one that routes a real press through the `Router` and asserts `Grab`
+comes out, one that drives the reported gesture, and a negative control that a drag staying inside
+is still the browser's own.
+
+**The rule worth keeping**: when a gate's failure *rate* moves with unrelated changes, that is
+evidence the fault is real and timing-sensitive — not evidence that it is noise. Twice I read it
+the other way round.

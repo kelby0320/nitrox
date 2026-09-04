@@ -35,7 +35,8 @@ requirements rather than hypothetical ones, and M10's editor posed them. It gain
 and find** in M12 Part C — where the decision was the *grouping*, not the stack: a word, a line, a
 run of deletions, and any movement or save between them, and **paste** in **M12 Part E** — one
 undo step, and returning the range it occupies so a kill-ring cycle can replace it. The **tab
-strip** left the list in **M12 Part D**, wanted by both applications in the same part. **Multi-window
+strip** left the list in **M12 Part D**, wanted by two applications in the same part — and taken
+by the third, `nxterm`, in M14 Part B. **Multi-window
 applications** left it in **M12 Part A**, in the half a trigger asked for: an editor's
 confirmation is a real `dialog` window, and what a window rather than an application holds is
 `window::Child`. A *main* window is still each application's own loop. The menu's **popup half** left this list in M5 Part B and left the toolkit
@@ -813,8 +814,11 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   nothing needed a container that scrolls. The trigger stands, narrowed to what would actually
   produce one: **chrome that must stay put while content moves under it** — a path strip beside a
   scrolling pane, or the editor's gutter.
-- **A tab strip** — *here since M12 Part D*. §8's rule is that a widget exists because an
-  application needed it; two wanted this one at once, which clears that bar rather than being it.
+- **A tab strip** — *here since M12 Part D*, and in all three applications since M14 Part B.
+  §8's rule is that a widget exists because an application needed it; two wanted this one at
+  once, which clears that bar rather than being it. The terminal was not one of them and grew
+  tabs two milestones later, against the widget unchanged — which is the useful half of the
+  story: a widget built for two consumers took a third with no argument.
   `tab_strip` gives every tab a **fixed** width, because tabs that shared the strip out would move
   each other whenever one opened — the tab a person is reaching for sliding away as they reach.
   Enough of them run off the end: `TODO(tab-overflow)`, whose fix is the scrolling container
