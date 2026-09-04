@@ -2,8 +2,10 @@
 
 ## Status
 
-**Built, and checked 2026-08-25** — Milestone 7 (Parts A–F). Graduated from `design/` on
-2026-08-25, revision 2.
+**Built, and checked 2026-09-04** — Milestone 7 (Parts A–F). Graduated from `design/` on
+2026-08-25, revision 2. One thing changed under it since: the session namespace also binds
+`/applications`, which is where the applications modal's entries come from (M14 Part H); §3 records
+why an *application's* namespace deliberately does not.
 
 What exists: [`auth-service`](../../userspace/auth-service) answers `Auth::Authenticate` at
 `/svc/auth`; [`desktop-session-mgr`](../../userspace/desktop-session-mgr) draws the greeter,
@@ -275,6 +277,19 @@ why two terminals do not contend: each mints its own, on its own backend. `nxsh`
 handed-down terminal when its parent gives one and resolves `/dev/tty` otherwise, which is the
 second shape's mechanism confirmed, without the first clause: the name stays present, because
 minting is what it is for.
+
+**What an application namespace deliberately lacks: `/applications`** (M14 Part H). The *session*
+namespace has it — it is where the applications modal's entries come from — and an application's
+does not, so `nxsh` on the serial console can list the installed applications and the same `nxsh`
+inside `nxterm` cannot. That asymmetry is the design rather than an oversight: nothing in an
+application reads it, and an application holds no authority to spawn in the first place, which is
+why `Desktop::Open` exists. A binding whose only justification is that it would be harmless is a
+hole in a sandbox with nothing on the other side of it.
+
+It is also a symptom of a gap this document does not fill: there is one kind of account, restricted
+by design, and no session that sees the system rather than one user's corner of it. Filed as
+`TODO(admin-visibility)` in `deferred-decisions.md`, triggered by the first tool that needs to see
+past a single user.
 
 **One edge is left, and it is an attenuation problem rather than a naming one.** A terminal
 minted *without* attaching a backend sits on the **console** backend, and `drive` gives each

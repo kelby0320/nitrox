@@ -906,6 +906,14 @@ fn build_app_namespace(
         return 0;
     }
 
+    // **No `/applications`, deliberately** — `TODO(admin-visibility)`. The *session* namespace has
+    // it and this one does not, so `nxsh` on the serial console can list the installed
+    // applications and the same `nxsh` inside `nxterm` cannot. Nothing in an application reads it,
+    // and an application holds no authority to spawn in the first place — `Desktop::Open` exists
+    // because of that — so the binding would be a hole in a sandbox with nothing on the other side
+    // of it. The asymmetry is a symptom of a larger gap (there is no account that sees more than
+    // its own corner of the system); see `deferred-decisions.md`.
+    //
     // `/system/fonts`, read-only, so an application can render text. The same subtree bind the
     // session itself gets — an application that could not draw text would be a window of
     // rectangles.
