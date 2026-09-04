@@ -2502,6 +2502,21 @@ mod tests {
         );
     }
 
+    /// Every widget id in the tree, in walk order.
+    fn ids(t: &libui::diff::Tree) -> Vec<u64> {
+        fn walk(w: &libui::diff::Widget, out: &mut Vec<u64>) {
+            out.push(w.id);
+            for c in &w.children {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = t.root() {
+            walk(root, &mut out);
+        }
+        out
+    }
+
     /// A click on the menu bar opens the menu even when its two halves fall in different frames.
     ///
     /// **This is `click-not-acted-on` as the browser experiences it** — the intermittent
@@ -2552,7 +2567,13 @@ mod tests {
         // re-identifies the nodes inside the word, which is what a highlight does.
         let lit = a.view(&theme, Some(MENU_BAR_KEY));
         let l2 = libui::layout::layout(&lit, Rect::new(0, 0, size.w, size.h), &cell);
+        let before = ids(&tree);
         tree.update(&lit, &l2).expect("the view is diffable");
+        // **The precondition, asserted rather than assumed** (PR #281 review, optional 4). If
+        // `menu_item` ever stops changing shape on hover there is nothing to survive, and this
+        // test would go quietly green while proving nothing — which is the exact trap its first
+        // version fell into for a different reason.
+        assert_ne!(ids(&tree), before, "the repaint re-identified nothing, so this proves nothing");
 
         // The release, in that new frame.
         let (msgs, _) = router.pointer(&tree, &lit, &l2, ev(0, 0));

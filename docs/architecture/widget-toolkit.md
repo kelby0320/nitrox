@@ -594,7 +594,9 @@ otherwise.
 
 **It captures the node carrying a pointer handler**, searched from the hit outwards, so a widget
 that handles its own events (`nxterm`'s grid is a `custom` node with `on_pointer`) captures
-exactly itself.
+exactly itself. That node keeps its id across a hover change because `reconcile` keeps an id
+whenever the *kind* matches, and a `menu_item` is a `Stack` lit or resting — **not** because
+applications key it, which they do and which the regression test passes without.
 
 **It used to capture whatever `hit_test` returned, which is the deepest node** — a button's
 label, not the button — and that lost clicks. A press is also what establishes hover, so the next
@@ -840,10 +842,18 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 
   **While a gesture is in progress, a `Child` reports the hover its *tree* was built with**, not
   the one the pointer is over — a correctness rule rather than a nicety (M12 Parts B and D).
-  `Router` records a capture as a **tree id**, and `hit_test` names the *deepest* node under the
-  cursor; a hovered `menu_item` draws three layers where a quiet one draws one, so a frame
-  presented between a press and its release gives that node a new id, `path_to_id` finds nothing,
-  and the click is silently lost.
+  `Router` records a capture as a **tree id**, and an id survives only while its node does:
+  `reconcile` treats a node of a different kind as new and rebuilds everything under it, keys
+  included. So a frame presented between a press and its release can re-identify the captured
+  node, after which `path_to_id` finds nothing and the click is silently lost.
+
+  **Since 2026-09-04 the capture is the node carrying the handler** rather than the deepest one
+  under the cursor (§8.2), so the common case — a `menu_item` or `button` growing layers when
+  hovered — survives that repaint on the router's own account. This rule now covers the rest: a
+  hover change that reshapes an **ancestor** of the handler rebuilds it too. It is belt and
+  braces, and its end-to-end host coverage was deliberately reduced when the router fix landed;
+  `window.rs`'s `the_presented_hover_is_what_a_gesture_sees_while_it_is_held` says what is pinned
+  and what is not.
 
   Part B froze the hover from the press onwards and that was too late: the motion that brings the
   pointer onto a widget usually arrives in the **same batch** as the press, so the live hover has

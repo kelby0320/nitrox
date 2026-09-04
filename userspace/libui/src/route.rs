@@ -122,14 +122,18 @@ impl Router {
     /// Whether a button is being held on a widget — a gesture is in progress.
     ///
     /// **What a caller needs it for is the shape of its own tree.** A capture is a *tree id*, and
-    /// this toolkit's widgets change shape under the pointer: a hovered `menu_item` draws three
-    /// layers where a quiet one draws one, so the deepest node under the cursor — which is what
-    /// `hit_test` and therefore the capture names — is a different node with a different id. Then
-    /// `path_to_id` finds nothing on release and the click is silently lost.
+    /// an id survives only while its node does: `reconcile` treats a node of a different kind as
+    /// new and rebuilds everything under it, keys included. So a caller that retains a tree must
+    /// not rebuild it with a *different* hover while this is true, or a repaint can re-identify
+    /// the captured node — after which `path_to_id` finds nothing on release and the click is
+    /// silently lost. [`crate::window::Child`] does that for the windows it owns; a main window's
+    /// loop has to do it itself, which is what this is published for (M12 Part B).
     ///
-    /// So a caller that retains a tree must not rebuild it with a *different* hover while this is
-    /// true. [`crate::window::Child`] does that for the windows it owns; a main window's loop has
-    /// to do it itself, which is what this is published for (M12 Part B).
+    /// **The common case no longer needs it** (2026-09-04). The capture is the node carrying the
+    /// handler, not the deepest node under the cursor, so a widget that merely grows layers when
+    /// hovered — every `menu_item` and `button` — keeps its own id across that repaint and the
+    /// gesture survives on the router's own account. What is left for this rule is a hover change
+    /// that reshapes an **ancestor** of the handler, which rebuilds it along with everything else.
     pub fn grabbed(&self) -> bool {
         self.capture.is_some()
     }
@@ -247,7 +251,7 @@ impl Router {
     /// Drop focus, capture and the hovered widget if they name widgets the tree no longer
     /// has.
     ///
-    /// **The router calls this itself**, from the top of every routing entry point, and that is
+    /// **The router calls this itself**, from the top of [`pointer`](Self::pointer), and that is
     /// the whole of the change (M14): it was `pub` and documented "called after every diff", and
     /// in three applications and a test client *nothing called it* — a contract with no
     /// enforcement and no honourers, which is worse than no contract, because it reads like the
@@ -257,7 +261,8 @@ impl Router {
     /// The router is not on the destroy path, and asking the tree cannot go out of date the way
     /// a callback can — the same reasoning the compositor's `InputRouter` uses for window ids.
     ///
-    /// **From `pointer` only.** `key` takes `&self`, and a stale *focus* is already tolerated
+    /// **`pointer` and nowhere else**, `key` and `drop_at` included. `key` takes `&self`, and a
+    /// stale *focus* is already tolerated
     /// everywhere it is read: `focus_next` starts from an end rather than refusing to move, and
     /// routing a key to a widget that is gone finds no handler and returns `None`. Widening
     /// `key`'s signature to prune there would touch every caller to fix nothing.
@@ -360,10 +365,12 @@ impl Router {
         // Whether *this* press is the one that opened it is read before the assignment, and is
         // what `on_press_down` fires on — see the dispatch below.
         self.forget_stale(tree);
-        // The innermost node under the cursor, computed once: the capture below is derived from
-        // it, and **click-to-focus is decided by it directly** rather than by `target`, which
-        // since M14 is the handler-bearing ancestor. See the focus branch for why that
-        // distinction is load-bearing.
+        // The innermost node under the cursor. The capture below is derived from it, and
+        // **click-to-focus is decided by it directly** rather than by `target`, which since M14 is
+        // the handler-bearing ancestor — see the focus branch for why that distinction is
+        // load-bearing. (The crossing pass and the post-release re-derive hit-test again for
+        // themselves; they ask at different moments in the same call and must not share an
+        // answer taken before this event was applied.)
         let hit_now = hit_test(tree.root(), layout, at);
         let opens_capture = pressed && self.capture.is_none();
         if opens_capture {
@@ -385,7 +392,10 @@ impl Router {
             // is the reproduction.
             //
             // The handler-bearing node survives all of that: it is the same kind of node lit or
-            // not, and it is the one applications key. **Searching from the hit itself**, so a
+            // not — which is what actually preserves the id, `reconcile` keeping it whenever the
+            // kind matches. (Applications do key these nodes, and that is *not* what saves them:
+            // removing the key from the regression test leaves it passing. PR #281 review.)
+            // **Searching from the hit itself**, so a
             // widget that handles its own events — `nxterm`'s grid is a `custom` node with
             // `on_pointer` — captures exactly what it captured before.
             self.capture =

@@ -23446,7 +23446,10 @@ fault inside `libui` in one run, after which a host test reproduced it in a mill
 **The fix.** Capture the nearest handler-bearing node, searched from the hit outwards — so a
 widget handling its own events (`nxterm`'s grid, a `custom` node with `on_pointer`) captures
 exactly what it captured before, and only handler-less leaves move outward. That node is the same
-kind lit or not, and it is the one applications key, so it survives the re-identification.
+kind lit or not — which is what preserves the id, since `reconcile` keeps it whenever the kind
+matches. **Not because applications key it**: they do, and removing the key from the regression
+test leaves it passing, so the key is a coincidence of style rather than the mechanism (PR #281
+review).
 
 **One thing had to move with it.** Click-to-focus read `target`, which is now the handler-bearing
 ancestor — so focus would land on the outer `Stack` that PR #223 exists to keep it off ("clicking
