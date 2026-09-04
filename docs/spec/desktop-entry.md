@@ -51,8 +51,9 @@ Entries sit **beside the binaries they name**, in the same store package:
 
 The profile server projects `applications/` at `/applications` exactly as it projects `bin/` at
 `/bin` — merged across the profile's packages in manifest order, first provider wins. A session
-gets it from one extra `sys_ns_bind`, and the two binds differ only in that `/applications`
-carries a **subtree base** so the server can tell which projection a request is for. See
+gets it from one extra `sys_ns_bind`. **Both binds carry a subtree base**, so the first component
+of the forwarded suffix names the projection — there is no bare form, and therefore no path
+through `/bin` that reaches this one. See
 [`profiles-and-namespace-projection.md`](../architecture/profiles-and-namespace-projection.md).
 
 **A package carries its own applications**, which is the point of putting them here rather than
