@@ -4927,6 +4927,24 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     session.expect("nxterm: menu chose Paste")?;
     println!("  ok: Down skipped the greyed row and Enter chose the next one");
 
+    // **A second tab is a second terminal**, which is the only part of M14 Part B a host test
+    // cannot reach: the split of grids and outboxes is pinned in `nxterm`'s own tests, but that
+    // a new tab is given its *own* tty and its *own* shell happens in the binary and needs a
+    // boot. `Ctrl+Shift+T` — Shift because `Ctrl+T` belongs to whatever is running in the
+    // terminal.
+    //
+    // The receipt is the shell's, not the tab's: a strip with two words in it would be drawn by
+    // a terminal that opened a tab and gave it nothing to talk to, which is exactly the failure
+    // worth catching.
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(&mut qmp, "t")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxterm: hosting a shell")?;
+    session.expect("nxsh: interactive shell")?;
+    println!("  ok: Ctrl+Shift+T opened a second tab with a shell of its own");
+
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
 

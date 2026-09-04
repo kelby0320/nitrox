@@ -4595,13 +4595,32 @@ the namespace, and the box that hid that was one line long.
 
 ### Part B — tabs in the terminal, and New Window everywhere
 
-- [ ] **`nxterm` grows tabs**, which it has never had: the strip widget exists (M12 Part D), the
-      split does not. What a *window* holds versus what a *tab* holds is the same line `nxedit`
-      and `nxfiles` drew, and getting it wrong is how a second tab inherits the first's scrollback.
-- [ ] **New Tab, Close Tab and the chords**, including `Ctrl+Shift+T`.
+**Two batches.** Tabs landed first and on their own; New Window is the "shape of every `main`"
+conversion `widget-toolkit.md` §11 has had a trigger written for since M12 Part A, and bundling
+the two would have made one review of two unrelated things.
+
+- [x] **`nxterm` grows tabs** ✅, which it has never had: the strip widget existed (M12 Part D),
+      the split did not. What a *window* holds versus what a *tab* holds is the same line `nxedit`
+      and `nxfiles` drew, and getting it wrong is how a second tab inherits the first's
+      scrollback — so `Term` holds the grid, the scrollback, the view, the selection and the
+      outbox, and `App` keeps the window. A tab's other half is a tty and a shell, which this
+      crate cannot make: `main` reconciles a backend per tab, by key.
+- [x] **New Tab, Close Tab and the chords** ✅, including `Ctrl+Shift+T` — with Shift for the
+      reason `Ctrl+Shift+C` has it, since `Ctrl+T` belongs to whatever is running in the terminal.
+      Closing the last tab closes the window, matching `nxedit` rather than inventing a second
+      answer. Gated end to end: `check-terminal` presses the chord and waits for a *second
+      shell's* banner, because a strip with two words in it is what a terminal that opened a tab
+      and gave it nothing to talk to would draw.
 - [ ] **New Window in all three.** One process, several top-level windows — the protocol allows
       it and nothing has done it; the taskbar and window list are where that shows.
 - [ ] **Quit**, per decision 4.
+- [x] **A drag that left the window in one motion never asked to be carried** ✅ — not a Part B
+      item, found while chasing what looked like a `check-login` flake and reported independently
+      from a real session ("click and drag doesn't work"). The hand-off lived in the
+      already-dragging branch, which the *second* motion is the first to reach. Slow drags worked;
+      quick ones died. The tab strip made `nxterm` 24px taller, which made the guest slower, which
+      made the gate's injected motions coalesce — which is how a real bug spent weeks being called
+      a flake.
 
 ### Part C — the file chooser
 

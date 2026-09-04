@@ -48,6 +48,32 @@ pub struct Backend {
     gone: bool,
 }
 
+impl Drop for Backend {
+    /// **Closing the channel is how the terminal ends**, and it had to become a `Drop` when tabs
+    /// arrived (PR #282 review, blocking 3).
+    ///
+    /// While there was one backend for the life of the process, nothing ever dropped one and the
+    /// handle went with the exit. A closed *tab* drops one, and a raw `u64` dropped silently is a
+    /// handle this process still holds: the tty server never sees `PeerClosed`, the terminal is
+    /// never finished, and the `nxsh` on it blocks on a read forever. Ten opened and closed tabs
+    /// would leave ten shells and ten terminals with nothing attached to them.
+    ///
+    /// **The same shape the server already records from the other side** — `tty-server`'s
+    /// `attach_backend` returns the orphaned channel to its caller precisely because "closing it
+    /// is not bookkeeping, it is how the *previous* emulator learns its terminal has ended".
+    ///
+    /// On `Drop` rather than at the one call site that closes tabs, because a handle whose
+    /// release depends on somebody remembering is one that leaks the first time a second caller
+    /// arrives.
+    fn drop(&mut self) {
+        // SAFETY: `channel` is a handle this process owns for the life of this `Backend`, and
+        // nothing else holds a copy — `attach` moves the far end to the server and keeps this.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, self.channel);
+        }
+    }
+}
+
 /// Wait one PO and read `(status, value)` out of its `IoResult`.
 fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
