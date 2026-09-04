@@ -4547,25 +4547,45 @@ the namespace, and the box that hid that was one line long.
 
 ### Part A — the menu bar as a toolkit widget
 
-- [ ] **The drop-down half becomes a widget**, which is the whole of this part. `menu_bar` and
-      `menu_item` already exist and both applications use them; what each one duplicates is the
+- [x] **The drop-down half becomes a widget** ✅, which is the whole of this part. `menu_bar` and
+      `menu_item` already existed and both applications used them; what each one duplicated is the
       *open menu* — open/close state, the anchor capture (a `Rect` in one, a `[Option<Rect>; 2]`
       in the other), the `window::Child` plumbing, row keying and dismissal. `menu_bar`'s doc
-      calls that half deliberately absent because "an open menu is a `popup` **window**"; two
-      copies later, it is time for it to be one thing.
-- [ ] **Separators, disabled items, keyboard navigation** (arrows, Esc, Enter) and **accelerator
-      labels** per decision 2 — the accelerator shown in the item is what makes a menu teachable
-      rather than a place to hunt.
-- [ ] **The two hand-rolled popups retire into it.** Not the bars, which are already the
-      toolkit's.
-- [ ] **`nxedit` gets a menu bar**, which it has none of, and it goes **above** the tab strip —
+      called that half deliberately absent because "an open menu is a `popup` **window**"; two
+      copies later it became one thing. `userspace/libui/src/menu.rs`, and
+      [`widget-toolkit.md`](../architecture/widget-toolkit.md) §8.1.
+- [x] **Separators, disabled items, keyboard navigation** (arrows, Esc, Enter) and **accelerator
+      labels** per decision 2 ✅ — the accelerator shown in the item is what makes a menu teachable
+      rather than a place to hunt. Arrowing **skips separators and disabled rows in both
+      directions**, so it never lands somewhere Enter would do nothing.
+- [x] **The two hand-rolled popups retire into it** ✅. Not the bars, which were already the
+      toolkit's. `nxterm`'s `menu_at` retired with them: "directly under the word it drops from"
+      is the same sentence in every menu, and it was written twice.
+- [x] **`nxedit` gets a menu bar** ✅, which it had none of, and it goes **above** the tab strip —
       matching `nxfiles`, which already docks its bar above its strip. A placement decision for a
       bar this part creates, not a fix to one that exists.
-- [ ] **File and Edit in all three applications, wired to actions that already exist** — Copy,
+- [x] **File and Edit in all three applications, wired to actions that already exist** ✅ — Copy,
       Paste, Undo, Redo, Find, Close Tab. Deliberately **not** Select All (nothing in `userspace/`
       implements one — Part E builds it) and **not** Quit (decision 4, built in Part B). A menu
-      item whose action this part invents is how two answers to "what happens to unsaved work"
+      item whose action this part invented is how two answers to "what happens to unsaved work"
       get written in two places.
+- [x] **Decision 2 made true rather than aspirational** ✅, which was not a box here and is the
+      part's most load-bearing change. `accel_match` returns the message whose *menu item* claims
+      a key, so all three applications route their `Ctrl`-chords through the same table the popup
+      draws. Before, a label and a `match` on keycodes were two statements of one fact and could
+      drift with nothing failing.
+- [x] **Availability is shown, not discovered on refusal** ✅. `nxfiles` refused Rename, Delete
+      and Copy with nothing selected *after* they were chosen — the strip said "nothing is
+      selected", which is the answer to a question the menu should not have asked. Those rows are
+      greyed now, as are Close Tab on a lone tab and Cut/Copy in `nxedit` with no selection. The
+      old guards stay as second guards, because a caller arriving another way must get the same
+      answer.
+- [x] **Two gates learned to find a row instead of computing one** ✅. `check-terminal` aimed at
+      "the upper quarter" and `check-login` divided the popup's height by a row count; a
+      **separator** occupies height without being a row, so neither arithmetic survives. Both now
+      walk down the popup and stop when the guest's hover receipt names the row they mean —
+      evidence rather than assertion, which is the same rule the position tracking already
+      followed. `nxfiles` grew the receipt `nxterm` already had.
 
 ### Part B — tabs in the terminal, and New Window everywhere
 

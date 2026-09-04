@@ -33,6 +33,8 @@ use librsproto::surface::{
     KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
+use alloc::vec;
+use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
     Edge, Element, Insets, column, dock, docked, offset, padding, row, sized, stack, text,
     with_spacing,
@@ -144,6 +146,26 @@ pub const UNDO_KEYCODE: u16 = 44;
 pub const REDO_KEYCODE: u16 = 21;
 /// The key that opens the find field: `f`.
 pub const FIND_KEYCODE: u16 = 33;
+/// How many menus the bar carries. `File` and `Edit`.
+pub const MENU_COUNT: usize = 2;
+
+/// The menu bar's height in pixels — one row of chrome, matching the browser's.
+pub const MENU_BAR_H: u32 = 24;
+
+/// Where the menu bar's words are keyed from: `MENU_BAR_KEY + i` for menu `i`.
+pub const MENU_BAR_KEY: u64 = 40;
+
+/// The element key on the menu bar itself.
+///
+/// **Not optional.** `diff` rejects a parent whose children are *partly* keyed, and the dock's
+/// other two `Top` children have carried keys since they were written — so an unkeyed bar makes
+/// the whole window undiffable and nothing draws at all. `nxfiles` keys its bar for the same
+/// reason; this one was missed and `check-login` said `nxedit: the view is not diffable`.
+pub const BAR_KEY: u64 = 15;
+
+/// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
+pub const MENU_ROW_KEY: u64 = 100;
+
 /// The key that opens a tab: `t`.
 pub const NEW_TAB_KEYCODE: u16 = 20;
 /// The key that closes one: `w`. Closing the last tab closes the window, which is what the
@@ -239,6 +261,12 @@ pub struct App {
     buffers: Vec<Buffer>,
     /// Which buffer's tab is current, by [`Buffer::key`].
     current: u64,
+    /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
+    ///
+    /// **New in M14 Part A**: this editor had no menu bar at all, only chords and a save button,
+    /// so everything it could do was either advertised nowhere or advertised once in a status
+    /// line. `nxterm` and `nxfiles` had one each and a hand-rolled popup apiece.
+    pub menus: MenuState,
     /// The next key to hand out. Monotonic, so a key is never reused and a stale message can
     /// never name a buffer that has taken its place.
     next_key: u64,
@@ -434,6 +462,28 @@ pub enum Msg {
     CloseTab(u64),
     /// `Ctrl+T`: an untitled buffer in a tab of its own.
     NewTab,
+    /// A word on the menu bar was pressed: open that menu, or close it if it was already open.
+    MenuBar(usize),
+    /// Undo the last edit — `Ctrl+Z`, or Edit ▸ Undo.
+    ///
+    /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
+    /// chord and [`libui::menu::accel_match`] routes it, so the label and the binding are one
+    /// statement rather than two that can drift (M14 decision 2). The five below are the same.
+    Undo,
+    /// Redo what was undone — `Ctrl+Y`. See [`Undo`](Msg::Undo).
+    Redo,
+    /// Open the find field — `Ctrl+F`. See [`Undo`](Msg::Undo).
+    Find,
+    /// Copy the selection — `Ctrl+C`. See [`Undo`](Msg::Undo).
+    Copy,
+    /// Cut the selection — `Ctrl+X`. See [`Undo`](Msg::Undo).
+    Cut,
+    /// Paste the newest clipboard entry — `Ctrl+V`. See [`Undo`](Msg::Undo).
+    ///
+    /// **Not the cycle**, which is `Ctrl+Shift+V` and is a continuation gesture rather than an
+    /// action: it only means anything immediately after a paste, so it is not a menu row and is
+    /// matched before the table is consulted.
+    Paste,
 }
 
 impl Buffer {
@@ -462,6 +512,7 @@ impl App {
         App {
             buffers: alloc::vec![Buffer::new(TAB_KEY_BASE, path)],
             current: TAB_KEY_BASE,
+            menus: MenuState::new(MENU_COUNT),
             next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
@@ -788,8 +839,44 @@ impl App {
         if !matches!(msg, Msg::Key(_)) {
             self.cycling = None;
         }
+        // **Choosing dismisses the menu, whichever row it was** — a menu that stayed open would
+        // cover the thing it just acted on. Asked of the table rather than repeated in the arms,
+        // so a row added later cannot forget. A message that is not a row leaves it alone, which
+        // is what keeps `MenuBar` able to open one.
+        if self
+            .menus()
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
+        {
+            self.menus.close();
+        }
         match msg {
             Msg::Key(k) => self.key(k),
+            Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::Undo => {
+                let ok = self.buf_mut().text.undo();
+                self.status = String::from(if ok { "undone" } else { "nothing to undo" });
+            }
+            Msg::Redo => {
+                let ok = self.buf_mut().text.redo();
+                self.status = String::from(if ok { "redone" } else { "nothing to redo" });
+            }
+            // **Reached only when no field is open** by the chord, because a field takes the keys
+            // before the chord match is looked at — so `Ctrl+F` while finding is swallowed by the
+            // field (the keymap folds it to a control byte, which `apply` declines) and never
+            // arrives. The first version guarded against re-opening, and that guard could not
+            // fire: a guard that cannot fire reads as protecting an invariant it does not (PR
+            // #269 review, worth fixing 1). **The menu row can reach it while a field is open**,
+            // which is new — and re-opening find while finding is the same as opening it, so the
+            // field starts empty either way and there is still nothing to guard.
+            Msg::Find => {
+                self.field = Some((Field::Finding, TextFieldState::new()));
+                self.status = String::from("find, then Enter");
+            }
+            Msg::Copy => self.copy(false),
+            Msg::Cut => self.copy(true),
+            Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
             // **Saving an untitled buffer asks for a name first.** The write itself is the
             // binary's, as always; what changes here is that there may be nowhere to write to
             // yet, and inventing a path would be a file somebody did not choose.
@@ -977,61 +1064,92 @@ impl App {
             return;
         }
         if k.modifiers & MOD_CTRL != 0 {
-            match k.keycode {
-                // **Through `update`, not straight to the flag**, so the untitled case asks for a
-                // name here too — a chord and a button that did different things would be the
-                // same control answering twice.
-                SAVE_KEYCODE => self.update(Msg::Save),
-                UNDO_KEYCODE => {
-                    let ok = self.buf_mut().text.undo();
-                    self.status = String::from(if ok {
-                        "undone"
-                    } else {
-                        "nothing to undo"
-                    });
-                }
-                REDO_KEYCODE => {
-                    let ok = self.buf_mut().text.redo();
-                    self.status = String::from(if ok {
-                        "redone"
-                    } else {
-                        "nothing to redo"
-                    });
-                }
-                // **Reached only when no field is open**, because a field takes the keys
-                // before this match is looked at — so `Ctrl+F` while finding is swallowed by
-                // the field (the keymap folds it to a control byte, which `apply` declines) and
-                // never arrives here. The first version guarded against re-opening, and that
-                // guard could not fire: a guard that cannot fire reads as protecting an
-                // invariant it does not, which is the note PR #258's review left on the same
-                // shape (PR #269 review, worth fixing 1). The field therefore always starts
-                // empty; carrying the last needle across an `Esc` would be a feature, and is
-                // not one anybody has asked for.
-                // The tab chords were taken above, before any field could swallow them.
-                FIND_KEYCODE => {
-                    self.field = Some((Field::Finding, TextFieldState::new()));
-                    self.status = String::from("find, then Enter");
-                }
-                COPY_KEYCODE => self.copy(false),
-                CUT_KEYCODE => self.copy(true),
-                // **Shift is the cycle**, and the two arrive as one keycode with one bit
-                // between them — M12 decision 6's "third binding", settled here because the
-                // decision says it is a part-level detail.
-                PASTE_KEYCODE => {
-                    self.clip_request = Some(if is_cycle_chord(k) {
-                        ClipRequest::Cycle
-                    } else {
-                        ClipRequest::Paste
-                    });
-                }
-                // **Every other chord is swallowed, not passed on.** `Ctrl+X` folding to a
-                // printable character would otherwise type it, which is how an editor inserts
-                // junk when a person reaches for a shortcut it does not have.
-                _ => {}
+            // **The cycle is taken before the table**, because it is not a menu row: `Ctrl+Shift+V`
+            // continues a paste rather than starting an action, and it means nothing except
+            // immediately after one. `Accel::matches` is exact on modifiers, so `Ctrl+V` and
+            // `Ctrl+Shift+V` could not be confused — but a *continuation* has no business in a
+            // list of things you can choose.
+            if is_cycle_chord(k) {
+                self.clip_request = Some(ClipRequest::Cycle);
+                return;
             }
+            // **Matched against the menu table rather than a `match` on keycodes** (M14 decision
+            // 2). The constants above are still the source of truth — the table names them — but
+            // there is now one statement of "Ctrl+Z undoes" rather than a label in a menu and a
+            // branch here that could stop agreeing with it.
+            if let Some(msg) = libui::menu::accel_match(&self.menus(), &k) {
+                self.update(msg);
+                return;
+            }
+            // **Every other chord is swallowed, not passed on.** `Ctrl+X` folding to a
+            // printable character would otherwise type it, which is how an editor inserts junk
+            // when a person reaches for a shortcut it does not have. This used to be a `match`
+            // with a `_` arm; the table above answers the named ones now, so what is left is the
+            // fall-through and it needs no arms.
             return;
         }
         self.buf_mut().text.apply(k.keycode, k.modifiers);
+    }
+
+    /// The bar's menus, in bar order.
+    ///
+    /// **Built rather than stored**, and it takes `&self` because half the rows depend on state:
+    /// Cut and Copy need a selection, and Save is pointless on a buffer that matches the disk.
+    /// The chords are the same constants the keyboard used to `match` on — the table is where
+    /// they are declared now, and [`libui::menu::accel_match`] is what reads it back.
+    pub fn menus(&self) -> Vec<Menu<Msg>> {
+        let has_selection = self.buf().text.selected_text().is_some();
+        vec![
+            Menu {
+                title: "File",
+                items: vec![
+                    Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
+                    Item::new(
+                        "Close Tab",
+                        Accel::ctrl(CLOSE_TAB_KEYCODE, "W"),
+                        Msg::CloseTab(self.current),
+                    ),
+                    Item::Separator,
+                    // **Enabled on a clean buffer too.** Saving one is a no-op on disk, but an
+                    // untitled buffer is "dirty or not" independently of whether it has a path,
+                    // and a Save that greyed out would hide the *name* prompt behind a state a
+                    // person cannot see. `nxfiles`'s greying is about a selection, which is
+                    // visible; this is not.
+                    Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save),
+                    Item::Separator,
+                    // No Quit: decision 4 settles what quitting means over unsaved work, and
+                    // Part B builds it. This is the window's close button as a menu row, which
+                    // already asks before discarding.
+                    Item::plain("Close Window", Msg::Close),
+                ],
+            },
+            Menu {
+                title: "Edit",
+                items: vec![
+                    Item::new("Undo", Accel::ctrl(UNDO_KEYCODE, "Z"), Msg::Undo),
+                    Item::new("Redo", Accel::ctrl(REDO_KEYCODE, "Y"), Msg::Redo),
+                    Item::Separator,
+                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::Cut)
+                        .enabled(has_selection),
+                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy)
+                        .enabled(has_selection),
+                    Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste),
+                    Item::Separator,
+                    Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find),
+                ],
+            },
+        ]
+    }
+
+    /// The open menu's popup, framed — the root of a second window, not a layer in this one.
+    pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        let menus = self.menus();
+        match menus.get(which) {
+            Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
+            None => {
+                libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui)
+            }
+        }
     }
 
     /// The state a `RequestState` is owed for. Clears the record.
@@ -1134,10 +1252,12 @@ impl App {
 
     /// The height the text area is laid out at — the window less its chrome and the grip.
     pub fn area_h(&self) -> u32 {
-        // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`.
-        self.window
-            .h
-            .saturating_sub(TITLE_BAR_H + TAB_STRIP_H + STATUS_H + GRIP_W + WINDOW_FRAME_H)
+        // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`. And
+        // `MENU_BAR_H` since M14 Part A: a bar that took its height out of the text area would
+        // be chrome the person paid for in rows of their document.
+        self.window.h.saturating_sub(
+            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + STATUS_H + GRIP_W + WINDOW_FRAME_H,
+        )
     }
 
     /// What the title bar shows: the file's name, marked when the buffer differs from the disk.
@@ -1254,6 +1374,25 @@ impl App {
             title,
             dock(
                 alloc::vec![
+                    // **The menu bar is above the tab strip** (M14 Part A). A dock's `Top`
+                    // children stack in order, so being first is what puts it there — and the
+                    // order is the decision: `nxfiles` docks its bar above its strip, and a
+                    // person who learned where the menus are in one window should not have to
+                    // look somewhere else in the next. A bar *below* a tab strip also reads as
+                    // belonging to the tab rather than to the window, which it does not.
+                    docked(
+                        Edge::Top,
+                        libui::menu::bar(
+                            &self.menus(),
+                            &self.menus,
+                            MENU_BAR_KEY,
+                            hovered,
+                            Msg::MenuBar,
+                            &ui,
+                            MENU_BAR_H,
+                        )
+                        .key(BAR_KEY),
+                    ),
                     docked(
                         Edge::Top,
                         sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),
@@ -1780,10 +1919,63 @@ mod tests {
         // **A copy that pushed an empty entry would move the ring's serial** under every client
         // that was mid-cycle, and push whatever was last copied one place further back — for a
         // gesture that had nothing to copy.
+        //
+        // **Two guards since M14 Part A, and they say different things.** The Edit row is greyed
+        // with no selection, so `Ctrl+C` is declined by the table before it reaches anything —
+        // the chord and the row agree, which is the whole of decision 2. Reaching `copy` some
+        // other way still gets the explanation.
         let mut a = app();
+        let before = String::from(a.status());
         key(&mut a, COPY_KEYCODE, MOD_CTRL);
         assert_eq!(a.take_clip_request(), None);
+        assert_eq!(a.status(), before, "a greyed row's chord does nothing, silently");
+        // The row is greyed, which is what makes the silence legible rather than a bug.
+        let edit = a.menus().into_iter().find(|m| m.title == "Edit").expect("an Edit menu");
+        for row in ["Cut", "Copy"] {
+            assert!(
+                edit.items.iter().any(|it| matches!(
+                    it,
+                    Item::Action { label, enabled: false, .. } if *label == row
+                )),
+                "{row} is offered with nothing selected"
+            );
+        }
+        // And the message is still there for a caller that arrives another way.
+        a.update(Msg::Copy);
+        assert_eq!(a.take_clip_request(), None);
         assert_eq!(a.status(), "nothing to copy");
+        // **The negative control**: with a selection the same chord does reach the clipboard,
+        // so the silence above is about the selection and not about the chord being unwired.
+        select(&mut a, "ell");
+        key(&mut a, COPY_KEYCODE, MOD_CTRL);
+        assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(String::from("ell"))));
+    }
+
+    /// The chord a menu row advertises is the chord the editor honours.
+    ///
+    /// **The point of routing keys through the table** (M14 decision 2): before, the label and
+    /// the `match` on keycodes were two statements, and this test could not have been written
+    /// against one of them.
+    #[test]
+    fn every_advertised_chord_does_what_its_row_says() {
+        let mut a = app();
+        select(&mut a, "ell");
+        let table = a.menus();
+        let mut checked = 0;
+        for it in table.iter().flat_map(|m| m.items.iter()) {
+            let Item::Action { accel: Some(acc), msg, label, enabled: true, .. } = it else {
+                continue;
+            };
+            checked += 1;
+            let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
+            assert_eq!(
+                libui::menu::accel_match(&table, &ev).as_ref(),
+                Some(msg),
+                "{label} advertises {} and it reaches something else",
+                acc.label()
+            );
+        }
+        assert_eq!(checked, 9, "every row but Close Window carries a chord");
     }
 
     #[test]
@@ -2339,4 +2531,33 @@ mod tests {
         let (msgs, _) = router.pointer(&tree, &ui, &l, at(0, 0));
         assert_eq!(msgs, alloc::vec![Msg::KeepEditing]);
     }
+    /// The window's own tree survives being diffed frame to frame.
+    ///
+    /// **The class of bug this catches cost a QEMU round trip** (M14 Part A): `diff` rejects a
+    /// parent whose children are *partly* keyed, and adding one unkeyed sibling to a keyed row
+    /// makes the whole window undiffable — so nothing draws at all, in a way no layout or paint
+    /// test can see. The states below are the ones a menu bar introduces: shut, open, and a word
+    /// under the pointer, each of which changes a row's shape.
+    #[test]
+    fn the_window_tree_diffs_across_the_menu_states() {
+        let mut a = app();
+        let theme = UiTheme::default();
+        let mut tree = libui::diff::Tree::new();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let mut check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
+            let size = a.window_size();
+            let e = a.view(&theme, hovered);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            tree.update(&e, &l).unwrap_or_else(|err| panic!("{what}: {err:?}"));
+        };
+        check(&mut a, None, &mut tree, "with the menu shut");
+        check(&mut a, Some(MENU_BAR_KEY), &mut tree, "with a bar word hovered");
+        a.update(Msg::MenuBar(0));
+        check(&mut a, Some(MENU_BAR_KEY), &mut tree, "with File open and hovered");
+        a.update(Msg::MenuBar(1));
+        check(&mut a, None, &mut tree, "with Edit open and nothing hovered");
+        a.update(Msg::MenuBar(1));
+        check(&mut a, None, &mut tree, "back to shut");
+    }
+
 }

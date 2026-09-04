@@ -23171,3 +23171,95 @@ most to be the second kind, and matching only the display name would have made t
 **What an entry is not.** Not a capability. Listing an application does not grant the right to run
 it, and running one does not require an entry — `/bin/nxterm` resolves whether or not
 `nxterm.toml` exists. Authority stays where it always is: in what a namespace contains.
+
+---
+
+## 2026-09-04 — a menu is a value, and an accelerator is declared once (M14 Part A)
+
+**`userspace/libui/src/menu.rs`.** A drop-down menu is now a table of items — label, optional
+chord, message, availability — plus separators, the open/anchor/cursor state, the keyboard, and
+two builders that turn the table into a bar and into a popup. All three applications took it.
+
+**What was actually duplicated, and it was not the bar.** `menu_bar` and `menu_item` had existed
+since M4 and every application used them. The half each one had written for itself was the *open
+menu*: open/close state, the anchor capture — a `Rect` in `nxterm`, a two-element array in
+`nxfiles` — the row keying, and the dismissal. `menu_bar`'s own doc called that absence
+deliberate on the grounds that "an open menu is a `popup` **window**", which is true and was
+never the question: the window is still each application's, and everything the window *contains*
+is now one thing. `nxedit` had none of it and therefore no menus at all.
+
+**Decision 2 was aspirational until this part.** "An accelerator is declared once" was written
+down in the M14 details pass as a governing decision, and nothing enforced it: a menu that *says*
+`Ctrl+C` and a `match k.keycode` that *implements* it are two statements of one fact, and the
+pair drifts with nothing failing — the menu keeps advertising a chord the handler stopped
+honouring. `accel_match` returns the message whose menu item claims a key, and all three
+applications route their `Ctrl`-chords through it against the same table the popup draws. Each
+gained a test that walks the table and asserts every advertised chord reaches its own row's
+message; none of those tests could have been written before, because there was no single table to
+walk.
+
+**Disabled items do not match a chord**, for the reason arrowing skips them: an item that would
+do nothing if clicked should do nothing if typed. This changed one existing behaviour, and it is
+worth naming because it looks like a regression. `nxedit`'s `Ctrl+C` with nothing selected used
+to put "nothing to copy" in the status strip; it is now silent, because the Edit row is greyed.
+The greying is the feedback, which is how every editor behaves — and the strip's message is still
+there for a caller that reaches `copy` another way.
+
+**Availability is shown rather than discovered on refusal.** `nxfiles` had five operations, three
+of which act on a selection, and choosing one without a selection put "nothing is selected" in
+the strip. That was the honest answer to a question the menu should not have asked. Those rows
+are greyed now, as are Close Tab on a lone tab and Cut/Copy in `nxedit`. **The old guards stay**,
+because a caller arriving by another path must get the same answer — a guard removed on the
+grounds that the UI prevents it is a guard removed on the grounds that the UI is the only caller.
+
+**A disabled row is not dimmed, and that is a gap rather than a decision.** `paint` draws every
+`Text` in `theme.foreground`; there is no per-element ink. So "unavailable" shows as a row that
+does not light under the pointer and that arrowing skips — half the affordance. The colour
+arrives with the ink wrapper Part G adds for syntax highlighting, and `menu_row`'s doc says so
+where somebody would look.
+
+**Every row is keyed, separators included — and this is the part that cost a QEMU round trip.**
+`diff` rejects a parent whose children are only *partly* keyed (`DiffError::MixedKeying`), so an
+unkeyed rule among keyed rows makes the whole popup undiffable. That does not show up as a wrong
+picture: it shows up as `Child::present` returning false every frame, so the menu opens, reports
+its size to the log, and never draws. The same mistake one level out — an unkeyed menu bar docked
+beside two keyed siblings — made `nxedit`'s *whole window* undiffable, which `check-login` caught
+as `nxedit: the view is not diffable`.
+
+**The gates could not see it, and now they can.** `check-display` renders the reference through
+`layout` and `paint` with no diff at all, so adding the menu to `reference.rs` — which was worth
+doing, and pins the right-aligned accelerator column and the stretched separator pixel for pixel
+— proved nothing about diffability. What catches it is a host test per tree:
+`the_popup_diffs_from_one_highlight_to_the_next` in `libui`, and
+`the_window_tree_diffs_across_the_menu_states` in each of the three applications. Both were
+negative-controlled by removing the key and watching them fail.
+
+**Two gates learned to find a row instead of computing one.** `check-terminal` aimed at "the upper
+quarter of the popup" and `check-login` divided the popup's height by a row count. A **separator**
+occupies height without being a row, so neither arithmetic survives — and the failure is silent
+in the worst way, because a click that lands on the wrong row still lands on *a* row. Both gates
+now walk down the popup and stop when the guest's hover receipt names the row they mean, which
+is the rule the position tracking already followed: evidence, not assertion. `nxfiles` grew the
+receipt `nxterm` already had, unconditionally, because `check-login` boots the release image.
+
+**A walk has to record where it went**, which is a deliberate exception to "only a confirmed press
+updates the tracked position". `move_pointer_to` walks a delta from that position and does not
+update it, so the first version of the walk re-walked the whole delta every iteration and ran the
+pointer off the popup. A dropped packet now costs one four-pixel step of drift and the walk takes
+one more; the receipt is what confirms the position, so nothing downstream trusts the estimate.
+
+**What is deliberately not here.** No Select All — nothing in `userspace/` implements one, and
+Part E builds it. No Quit — decision 4 settles what quitting means over unsaved work and Part B
+builds it. A menu item whose action this part invented is how two answers to "what happens to
+unsaved work" get written in two places. `nxterm`'s File menu therefore holds one row, and that
+is the honest shape of a terminal with no tabs until Part B.
+
+**Clear and Reset are under `nxterm`'s Edit menu**, not a Terminal menu of their own, because two
+menus is what this part scopes and of the two they are edits to what is on screen. GNOME Terminal
+puts them under `Terminal`; if a third menu arrives they move there, and the accelerator table
+does not care which menu an item is in.
+
+**`nxedit`'s bar goes above its tab strip**, matching `nxfiles`. A person who learned where the
+menus are in one window should not have to look somewhere else in the next, and a bar *below* a
+tab strip reads as belonging to the tab rather than to the window. It cost the editor's text area
+24 pixels, taken from the window rather than from the document.

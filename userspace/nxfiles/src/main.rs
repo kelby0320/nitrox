@@ -30,8 +30,9 @@ use libui::layout::{Layout, layout, locate};
 use libui::paint::{FontMetrics, Theme, paint};
 use libui::route::Router;
 use libui::window::Child;
+use libui::menu::{Item, KeyOutcome};
 use nxfiles::{
-    App, EDIT_MENU_KEY, Entry, FILE_MENU_KEY, FileOp, Gesture, Menu, Msg, TITLE,
+    App, Entry, FileOp, Gesture, MENU_BAR_KEY, MENU_COUNT, Msg, TITLE,
 };
 
 use alloc::boxed::Box;
@@ -357,7 +358,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // popup cannot serve both: choosing `Edit` while `File` is open has to replace the window,
     // not redraw it at the other anchor.
     let mut menu: Option<Child> = None;
-    let mut menu_shown: Option<Menu> = None;
+    let mut menu_shown: Option<usize> = None;
     let mut menu_hovered: Option<u64> = None;
     // The delete question's window, alive only while one is being asked (M12 Part A's shape).
     let mut confirm: Option<Child> = None;
@@ -375,7 +376,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Where each menu drops from, read every frame rather than when one opens: a bar item's
         // position is a fact about the layout, and before the first one there is nowhere to put
         // a popup at all.
-        app.menu_anchor = [locate(&ui, &l, FILE_MENU_KEY), locate(&ui, &l, EDIT_MENU_KEY)];
+        app.menus.set_anchors(
+            (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
+        );
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
             // A malformed tree is a bug in `view`, not a runtime condition.
@@ -431,21 +434,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Opened and destroyed with the menu, because `popup` is a transient role: the
         // compositor takes it with its parent, it holds the keyboard while it is up, and a
         // hidden one would still be a window in the stack.
-        if menu_shown != app.menu() {
+        if menu_shown != app.menus.open() {
             if let Some(m) = menu.take() {
                 m.close(&mut win);
             }
             menu_hovered = None;
-            menu_shown = app.menu();
+            menu_shown = app.menus.open();
             if let Some(which) = menu_shown {
-                let anchor = app.menu_anchor[usize::from(which != Menu::File)];
-                match anchor {
+                match app.menus.anchor() {
                     Some(a) => {
                         let view = app.menu_view(which, &theme, None);
                         menu = Child::open(
                             &mut win,
                             Role::Popup { parent: window_id },
-                            (a.origin.x, a.bottom() as i32),
+                            a,
                             &view,
                             &font,
                             &theme,
@@ -482,7 +484,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // window that silently never appears.
                     None => {
                         kprint(b"nxfiles: could not open the menu\n");
-                        app.dismiss_menu();
+                        app.menus.close();
                         menu_shown = None;
                     }
                 }
@@ -490,7 +492,26 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         if let Some(m) = menu.as_mut() {
             let now = m.hovered_key();
-            menu_hovered = now;
+            if now != menu_hovered {
+                menu_hovered = now;
+                // **Which row the pointer is over, unconditionally** (M14 Part A). `check-login`
+                // boots the release image, so a `test-harness` line would not exist in the binary
+                // it runs — and since the File menu grew a separator, dividing the popup's height
+                // by a row count names the wrong row. The gate walks down and stops when this
+                // says it is over the one it means to click. A key is a number this program
+                // chose: not a label, not a position, and nothing anybody typed.
+                let mut l = libkern::debug::Line::new();
+                l.s(b"nxfiles: menu hover ");
+                match now {
+                    Some(k) => {
+                        l.u(k);
+                    }
+                    None => {
+                        l.s(b"none");
+                    }
+                }
+                l.end();
+            }
             let view = menu_shown.map(|w| app.menu_view(w, &theme, now));
             if let Some(view) = view
                 && !m.present(&mut win, &view, &font, &theme)
@@ -638,8 +659,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // owner cannot work out for itself, because it never sees a press aimed
                 // elsewhere (M11 Part E batch 5).
                 if matches!(event, WindowEvent::Dismissed) {
-                    app.dismiss_menu();
+                    app.menus.close();
                     continue;
+                }
+                // **Arrows, Esc and Enter drive the open menu**, which is possible only here: a
+                // popup holds the keyboard while it is up, so these arrive naming *its* window
+                // and never reach the browser's router below. `Chose` carries the row, and the
+                // message comes from the same table the popup drew — so Enter and a click on the
+                // same row cannot do different things.
+                if let WindowEvent::Key(k) = event {
+                    let table = app.menus();
+                    match app.menus.key(&k, &table) {
+                        KeyOutcome::Chose(i) => {
+                            if let Some(msg) = menu_shown
+                                .and_then(|w| table.get(w))
+                                .and_then(|m| m.items.get(i))
+                                .and_then(|it| match it {
+                                    Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
+                                    _ => None,
+                                })
+                            {
+                                app.update(msg);
+                            }
+                            continue;
+                        }
+                        KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
+                        KeyOutcome::Ignored => {}
+                    }
                 }
                 let msgs = match (menu_shown, menu.as_mut()) {
                     (Some(which), Some(m)) => {

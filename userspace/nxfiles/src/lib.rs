@@ -30,6 +30,8 @@ use librsproto::surface::{
     KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
+use alloc::vec;
+use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
     Edge, Element, Insets, column, dock, docked, offset, padding, row, sized, stack, text,
     with_spacing,
@@ -37,7 +39,7 @@ use libui::element::{
 use libui::widget::{
     DIALOG_GAP, GRIP_W, ListRow, ListState, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H,
     TextFieldState, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view,
-    menu_bar, menu_item, popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame,
+    popup_frame, resize_grip, tab_strip, text_field, title_bar, window_frame,
 };
 
 /// What this window is called, in its own title bar and in the shell's window list.
@@ -93,20 +95,17 @@ pub const DRAG_SLOP: i32 = 4;
 /// The menu bar's height in pixels — one row of chrome above the path strip.
 pub const MENU_BAR_H: u32 = 24;
 
-/// The element key on the *File* menu's bar item.
-pub const FILE_MENU_KEY: u64 = 10;
-/// The element key on the *Edit* menu's bar item.
-pub const EDIT_MENU_KEY: u64 = 11;
-/// The element keys on the menu rows, in the order they are drawn.
-pub const MENU_NEW_FILE_KEY: u64 = 12;
-/// See [`MENU_NEW_FILE_KEY`].
-pub const MENU_NEW_FOLDER_KEY: u64 = 13;
-/// See [`MENU_NEW_FILE_KEY`].
-pub const MENU_RENAME_KEY: u64 = 14;
-/// See [`MENU_NEW_FILE_KEY`].
-pub const MENU_DELETE_KEY: u64 = 15;
-/// See [`MENU_NEW_FILE_KEY`].
-pub const MENU_COPY_KEY: u64 = 16;
+/// Where the menu bar's words are keyed from: `MENU_BAR_KEY + i` for menu `i`.
+///
+/// [`libui::layout::locate`] turns each into the rectangle its popup hangs under.
+pub const MENU_BAR_KEY: u64 = 10;
+
+/// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
+///
+/// **Keys are what make hover possible**: `Router::inside` reports the id of the keyed widget
+/// under the pointer, so an unkeyed row is one the router cannot name (M11 Part E batch 3). A
+/// separate range from the bar's, because a row and a word are different widgets.
+pub const MENU_ROW_KEY: u64 = 100;
 /// The element key on the name field that replaces the path while a prompt is open.
 pub const PROMPT_KEY: u64 = 17;
 /// The element key on the menu bar.
@@ -140,23 +139,11 @@ pub const CONFIRM_KEEP_KEY: u64 = 23;
 /// **Two, because the operations divide in two**: *File* makes and unmakes things, *Edit* acts
 /// on what is selected. It is the division every file browser draws, and it is the reason `copy`
 /// does not sit beside `delete`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Menu {
-    /// New file, new folder, rename, delete.
-    File,
-    /// Copy. **Cut and paste are not here** and that is deliberate — see [`Action`].
-    Edit,
-}
-
-impl Menu {
-    /// The bar item's key, so a caller can find where the menu drops from.
-    pub fn key(self) -> u64 {
-        match self {
-            Menu::File => FILE_MENU_KEY,
-            Menu::Edit => EDIT_MENU_KEY,
-        }
-    }
-}
+///
+/// **They are indices into [`App::menus`] since M14 Part A**, not an enum. The enum existed to
+/// give each menu a key and a popup tree; both are the toolkit's now, and a `Menu` that only
+/// said "File or Edit" was a second spelling of `0` and `1`.
+pub const MENU_COUNT: usize = 2;
 
 /// What a menu row asks for.
 ///
@@ -413,18 +400,16 @@ pub struct App {
     /// A flag rather than an `exit` here: `update` is a function of values and has no way to
     /// tear down a session.
     closing: bool,
-    /// Which menu is open, and nothing while none is.
+    /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     ///
     /// The window it drops into is the binary's, opened and destroyed with this — the same
     /// arrangement `nxterm`'s menu has had since M6 Part C3, and a [`libui::window::Child`]
     /// since M12 Part A.
-    menu: Option<Menu>,
-    /// Where each bar item was drawn, read every frame by the binary.
     ///
-    /// **Read every frame rather than when the menu opens**, because an item's position is a
-    /// fact about the layout and not about the menu — and before the first layout there is
-    /// nowhere to put a popup at all. Indexed `[File, Edit]`.
-    pub menu_anchor: [Option<Rect>; 2],
+    /// **The toolkit's, since M14 Part A.** This was an `Option<Menu>` and a two-element array
+    /// here, a `bool` and a `Rect` in `nxterm`, and the same open/close/anchor/dismiss logic in
+    /// both — plus, in neither, the arrow keys a menu is supposed to have.
+    pub menus: MenuState,
     /// A name being typed, and what it is for.
     ///
     /// **`Some` is a mode**, exactly as `nxedit`'s naming field is: while it is open the keys
@@ -496,8 +481,8 @@ pub enum Msg {
     /// **One message for both**, as `nxterm` has: which of them it was is not something this
     /// application acts on differently.
     Close,
-    /// A menu bar item was pressed: open that menu, or close it if it was already open.
-    ToggleMenu(Menu),
+    /// A word on the menu bar was pressed: open that menu, or close it if it was already open.
+    MenuBar(usize),
     /// A menu row was chosen.
     Choose(Action),
     /// The delete dialog's *delete* answer.
@@ -538,8 +523,7 @@ impl App {
             move_requested: false,
             resize_requested: None,
             closing: false,
-            menu: None,
-            menu_anchor: [None, None],
+            menus: MenuState::new(MENU_COUNT),
             prompt: None,
             confirm: None,
             confirm_focused: true,
@@ -668,6 +652,19 @@ impl App {
 
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
+        // **Choosing dismisses the menu, whichever row it was** — a menu that stayed open would
+        // cover the thing it just acted on. Asked of the table rather than repeated in the arms,
+        // so a row added later cannot forget: `choose` used to clear it, and New Tab and Close
+        // Tab arriving from the bar in M14 Part A do not go through `choose`. A message that is
+        // not a row leaves it alone, which is what keeps `MenuBar` able to open one.
+        if self
+            .menus()
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
+        {
+            self.menus.close();
+        }
         match msg {
             Msg::Activate(i) => {
                 let i = i as usize;
@@ -719,9 +716,7 @@ impl App {
             // **Toggling, so the same press that opened it closes it.** A bar item that only
             // opened would leave the menu up until something else dismissed it, and the
             // dismissal a popup gets is a press on *another* window.
-            Msg::ToggleMenu(m) => {
-                self.menu = if self.menu == Some(m) { None } else { Some(m) };
-            }
+            Msg::MenuBar(i) => self.menus.toggle(i),
             Msg::Choose(a) => self.choose(a),
             Msg::SelectTab(k) => {
                 if self.panes.iter().any(|p| p.key == k) {
@@ -780,8 +775,11 @@ impl App {
     /// act on a row, and a menu item that silently does nothing when none is chosen is a control
     /// that looks live and is not — the defect M8's overview shipped three of. The strip says so
     /// instead.
+    ///
+    /// **Since M14 Part A the row is also greyed**, so this branch is now the second guard
+    /// rather than the only one — and it stays, because a caller reaching `choose` some other
+    /// way must get the same answer as one reaching it from a menu.
     fn choose(&mut self, a: Action) {
-        self.menu = None;
         let selected =
             self.pane().list.selected.and_then(|i| self.pane().entries.get(i)).cloned();
         if a.needs_selection() && selected.is_none() {
@@ -912,15 +910,15 @@ impl App {
         // `libinput`'s keymap folds Ctrl+letter into the C0 range and `TextFieldState::apply`
         // drops anything below `0x20`, with the comment "Control characters are not text". The
         // ordering is right for the other half (PR #270 review, worth fixing 5).
+        //
+        // **Matched against the menu table rather than a `match` on keycodes** (M14 decision 2).
+        // The keycode constants are still the source of truth — the table names them — but there
+        // is now one statement of "Ctrl+W closes a tab" rather than a label in the menu and a
+        // branch here that could stop agreeing with it. The `Ctrl` guard stays around it: every
+        // other chord is swallowed rather than folded into a printable character.
         if k.modifiers & MOD_CTRL != 0 {
-            match k.keycode {
-                NEW_TAB_KEYCODE => self.update(Msg::NewTab),
-                CLOSE_TAB_KEYCODE => {
-                    let key = self.current;
-                    self.update(Msg::CloseTab(key));
-                }
-                // Every other chord is swallowed rather than folded into a printable character.
-                _ => {}
+            if let Some(msg) = libui::menu::accel_match(&self.menus(), &k) {
+                self.update(msg);
             }
             return;
         }
@@ -1078,14 +1076,41 @@ impl App {
         self.resize_requested.take()
     }
 
-    /// Which menu is open, for the binary that owns the popup's window.
-    pub fn menu(&self) -> Option<Menu> {
-        self.menu
-    }
-
-    /// Close whichever menu is open — what a dismissal from the compositor means.
-    pub fn dismiss_menu(&mut self) {
-        self.menu = None;
+    /// The bar's menus, in bar order.
+    ///
+    /// **Built rather than stored**, and it takes `&self` because half the rows depend on state:
+    /// the ones that act on a selection are disabled without one, and Close Tab is disabled on
+    /// the last tab. Before M14 Part A every row looked available and the ones that were not
+    /// were refused *after* being chosen — a menu that lets you pick something and then declines
+    /// is the shape that reads as broken.
+    pub fn menus(&self) -> Vec<Menu<Msg>> {
+        let selected = self.pane().list.selected.is_some();
+        let act = |label: &'static str, a: Action| {
+            Item::plain(label, Msg::Choose(a)).enabled(!a.needs_selection() || selected)
+        };
+        vec![
+            Menu {
+                title: "File",
+                items: vec![
+                    Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
+                    Item::new(
+                        "Close Tab",
+                        Accel::ctrl(CLOSE_TAB_KEYCODE, "W"),
+                        Msg::CloseTab(self.current),
+                    )
+                    // **The last tab does not close**, which is the strip's existing rule said
+                    // out loud: `CloseTab` on a lone tab is already a no-op, and a row that
+                    // silently did nothing was the half of the affordance that was missing.
+                    .enabled(self.panes.len() > 1),
+                    Item::Separator,
+                    act("New File", Action::NewFile),
+                    act("New Folder", Action::NewFolder),
+                    act("Rename", Action::Rename),
+                    act("Delete", Action::Delete),
+                ],
+            },
+            Menu { title: "Edit", items: vec![act("Copy", Action::Copy)] },
+        ]
     }
 
     /// The name a delete is asking about, for the binary that owns the dialog's window.
@@ -1239,20 +1264,17 @@ impl App {
         )
         .key(TITLE_KEY);
 
-        // The menu bar: two names, each of which drops a list of things to do.
-        let bar_item = |label: &str, m: Menu| {
-            button(
-                label,
-                Msg::ToggleMenu(m),
-                WidgetState { hovered: hovered == Some(m.key()), ..Default::default() },
-                &ui,
-            )
-            .key(m.key())
-        };
-        let bar = menu_bar(
-            alloc::vec![bar_item("File", Menu::File), bar_item("Edit", Menu::Edit)],
-            MENU_BAR_H,
+        // The menu bar: two names, each of which drops a list of things to do. **The toolkit's
+        // since M14 Part A** — the words were `button`s here, which is not what a menu bar's
+        // word is, and the popup under them was a second copy of `nxterm`'s.
+        let bar = libui::menu::bar(
+            &self.menus(),
+            &self.menus,
+            MENU_BAR_KEY,
+            hovered,
+            Msg::MenuBar,
             &ui,
+            MENU_BAR_H,
         );
 
         // The path strip: where you are, and the one control that leaves it — **or the name
@@ -1390,20 +1412,15 @@ impl App {
     /// before the binary closes the window, so any further event from an *Edit* popup in the same
     /// batch would have routed against the File tree. Nothing could be made of it, and a shape
     /// that depends on nobody making anything of it is one to remove rather than to argue about.
-    pub fn menu_view(&self, which: Menu, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let item = |label: &str, a: Action, key: u64| {
-            menu_item(label, Msg::Choose(a), hovered == Some(key), ui).key(key)
-        };
-        let items = match which {
-            Menu::Edit => column(alloc::vec![item("copy", Action::Copy, MENU_COPY_KEY)]),
-            Menu::File => column(alloc::vec![
-                item("new file", Action::NewFile, MENU_NEW_FILE_KEY),
-                item("new folder", Action::NewFolder, MENU_NEW_FOLDER_KEY),
-                item("rename", Action::Rename, MENU_RENAME_KEY),
-                item("delete", Action::Delete, MENU_DELETE_KEY),
-            ]),
-        };
-        popup_frame(padding(Insets::all(2), items), ui)
+    pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        let menus = self.menus();
+        match menus.get(which) {
+            Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
+            // Not reachable while a popup exists — the window is opened and destroyed with the
+            // menu — but the type demands an answer and a caller should not have to think about
+            // which index is live.
+            None => popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
+        }
     }
 
     /// The confirmation dialog's tree — a second window, and the browser's only question.
@@ -1991,28 +2008,90 @@ mod tests {
         // that holds something between two gestures is a clipboard, and M12 Part E builds the
         // real one. An `Edit` menu that grew them here would be a second.
         let mut a = app();
-        a.update(Msg::ToggleMenu(Menu::File));
-        let file: Element<Msg> = a.menu_view(Menu::File, &UiTheme::default(), None);
-        for (key, item) in [
-            (MENU_NEW_FILE_KEY, "new file"),
-            (MENU_NEW_FOLDER_KEY, "new folder"),
-            (MENU_RENAME_KEY, "rename"),
-            (MENU_DELETE_KEY, "delete"),
+        a.update(Msg::MenuBar(0));
+        let file: Element<Msg> = a.menu_view(0, &UiTheme::default(), None);
+        // **Row keys are positional now**, so the labels are read in order — which also pins the
+        // separator's place, since a rule occupies a row index without being one.
+        // The label *and its chord*, because `labelled` concatenates the row's text and the
+        // accelerator column is text in the same row — which makes this the place the advertised
+        // chords are pinned as strings rather than as `Accel` values.
+        for (i, item) in [
+            (0, "New TabCtrl+T"),
+            (1, "Close TabCtrl+W"),
+            (3, "New File"),
+            (4, "New Folder"),
+            (5, "Rename"),
+            (6, "Delete"),
         ] {
-            assert_eq!(labelled(&file, key), item, "the File menu's row {key}");
+            assert_eq!(labelled(&file, MENU_ROW_KEY + i), item, "the File menu's row {i}");
         }
-        // Copy is not in it — it acts on a selection rather than making or unmaking something.
-        assert_eq!(labelled(&file, MENU_COPY_KEY), "");
+        // Row 2 is the separator: it is keyed by nothing, so nothing is found at its index.
+        assert_eq!(labelled(&file, MENU_ROW_KEY + 2), "", "row 2 is a rule, not an item");
 
-        a.update(Msg::ToggleMenu(Menu::Edit));
-        let edit: Element<Msg> = a.menu_view(Menu::Edit, &UiTheme::default(), None);
-        assert_eq!(labelled(&edit, MENU_COPY_KEY), "copy");
+        a.update(Msg::MenuBar(1));
+        let edit: Element<Msg> = a.menu_view(1, &UiTheme::default(), None);
+        assert_eq!(labelled(&edit, MENU_ROW_KEY), "Copy");
         // **And nothing else is here**: cut and paste are a pair that holds something between
         // two gestures, which is a clipboard however it is spelled, and M12 Part E builds the
         // real one. An `Edit` menu that grew them now would be a second clipboard.
-        for key in [MENU_NEW_FILE_KEY, MENU_RENAME_KEY, MENU_DELETE_KEY] {
-            assert_eq!(labelled(&edit, key), "", "the Edit menu holds one thing");
-        }
+        assert_eq!(labelled(&edit, MENU_ROW_KEY + 1), "", "the Edit menu holds one thing");
+    }
+
+    /// A row that would be refused is drawn unavailable rather than offered.
+    ///
+    /// **The half of the affordance that was missing** (M14 Part A). `choose` has always answered
+    /// "nothing is selected" in the strip; what it could not do is stop the row looking live.
+    #[test]
+    fn rows_that_need_a_selection_are_disabled_without_one() {
+        // **An empty directory is how there is no selection**: `show` selects the first row of
+        // any listing that has one, so this is the real state a person reaches rather than a
+        // constructed one.
+        let mut a = App::new("/empty");
+        a.show("/empty", alloc::vec![]);
+        let needs = |a: &App, title: &str| -> Vec<bool> {
+            a.menus()
+                .into_iter()
+                .find(|m| m.title == title)
+                .expect("the menu exists")
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Action { msg: Msg::Choose(act), enabled, .. } => {
+                        act.needs_selection().then_some(*enabled)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(needs(&a, "File"), alloc::vec![false, false], "Rename and Delete, with nothing selected");
+        assert_eq!(needs(&a, "Edit"), alloc::vec![false], "Copy, with nothing selected");
+        // **The negative control.** Give it a listing and the same three become available —
+        // without it this test would pass for a version that disabled everything unconditionally.
+        a.show("/empty", alloc::vec![Entry::file("a"), Entry::file("b")]);
+        assert_eq!(needs(&a, "File"), alloc::vec![true, true]);
+        assert_eq!(needs(&a, "Edit"), alloc::vec![true]);
+        // …and the ones that do not need a selection were never affected either way.
+        let file = a.menus().into_iter().next().expect("File");
+        assert!(
+            matches!(file.items[3], Item::Action { enabled: true, .. }),
+            "New File does not act on a selection"
+        );
+    }
+
+    /// Close Tab is offered only when closing one leaves a browser behind.
+    #[test]
+    fn close_tab_is_unavailable_on_the_last_tab() {
+        let mut a = app();
+        let enabled = |a: &App| match &a.menus()[0].items[1] {
+            Item::Action { label, enabled, .. } => {
+                assert_eq!(*label, "Close Tab");
+                *enabled
+            }
+            Item::Separator => panic!("row 1 is Close Tab"),
+        };
+        assert!(!enabled(&a), "the lone tab does not close");
+        a.update(Msg::NewTab);
+        assert!(enabled(&a), "with two, either can go");
     }
 
     #[test]
@@ -2020,18 +2099,32 @@ mod tests {
         // A bar item that only opened would leave the menu up until something else dismissed
         // it, and what dismisses a popup is a press on another window.
         let mut a = app();
-        assert_eq!(a.menu(), None);
-        a.update(Msg::ToggleMenu(Menu::File));
-        assert_eq!(a.menu(), Some(Menu::File));
-        a.update(Msg::ToggleMenu(Menu::File));
-        assert_eq!(a.menu(), None, "the same item closes it");
+        assert_eq!(a.menus.open(), None);
+        a.update(Msg::MenuBar(0));
+        assert_eq!(a.menus.open(), Some(0));
+        a.update(Msg::MenuBar(0));
+        assert_eq!(a.menus.open(), None, "the same item closes it");
         // And the other item swaps rather than stacking.
-        a.update(Msg::ToggleMenu(Menu::File));
-        a.update(Msg::ToggleMenu(Menu::Edit));
-        assert_eq!(a.menu(), Some(Menu::Edit));
-        // Choosing anything puts the menu away, or it would sit over the answer.
-        a.update(Msg::Choose(Action::NewFile));
-        assert_eq!(a.menu(), None);
+        a.update(Msg::MenuBar(0));
+        a.update(Msg::MenuBar(1));
+        assert_eq!(a.menus.open(), Some(1));
+        // Choosing anything puts the menu away, or it would sit over the answer. **Every row,
+        // not the one this used to check** — the rule is asked of the table now, so this walks it.
+        for msg in a
+            .menus()
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .filter_map(|it| match it {
+                Item::Action { msg, .. } => Some(msg.clone()),
+                Item::Separator => None,
+            })
+            .collect::<Vec<_>>()
+        {
+            let mut a = app();
+            a.update(Msg::MenuBar(0));
+            a.update(msg.clone());
+            assert_eq!(a.menus.open(), None, "{msg:?} left the menu open");
+        }
     }
 
     #[test]
@@ -2347,4 +2440,33 @@ mod tests {
         assert!(a.list_h() > before);
         assert!(!a.resize(Size::new(800, 600)), "the same size is not a change");
     }
+    /// The window's own tree survives being diffed frame to frame.
+    ///
+    /// **The class of bug this catches cost a QEMU round trip** (M14 Part A): `diff` rejects a
+    /// parent whose children are *partly* keyed, and adding one unkeyed sibling to a keyed row
+    /// makes the whole window undiffable — so nothing draws at all, in a way no layout or paint
+    /// test can see. The states below are the ones a menu bar introduces: shut, open, and a word
+    /// under the pointer, each of which changes a row's shape.
+    #[test]
+    fn the_window_tree_diffs_across_the_menu_states() {
+        let mut a = app();
+        let theme = UiTheme::default();
+        let mut tree = libui::diff::Tree::new();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let mut check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
+            let size = a.window_size();
+            let e = a.view(&theme, hovered);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            tree.update(&e, &l).unwrap_or_else(|err| panic!("{what}: {err:?}"));
+        };
+        check(&mut a, None, &mut tree, "with the menu shut");
+        check(&mut a, Some(MENU_BAR_KEY), &mut tree, "with a bar word hovered");
+        a.update(Msg::MenuBar(0));
+        check(&mut a, Some(MENU_BAR_KEY), &mut tree, "with File open and hovered");
+        a.update(Msg::MenuBar(1));
+        check(&mut a, None, &mut tree, "with Edit open and nothing hovered");
+        a.update(Msg::MenuBar(1));
+        check(&mut a, None, &mut tree, "back to shut");
+    }
+
 }

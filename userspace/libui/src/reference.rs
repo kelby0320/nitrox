@@ -164,6 +164,14 @@ pub fn view() -> Element<Msg> {
                 // whether or not the ring code exists.
                 button("Run", Msg::Run, WidgetState { active: true, ..Default::default() }, &theme)
                     .flex(0),
+                // **An open menu, drawn inline rather than as a window** (M14 Part A). The
+                // widget is a function of values; that it is normally hosted in a `popup` is the
+                // application's business and not what needs pinning. What this catches is the
+                // thing a host test cannot see: the accelerator column right-aligned by a flexed
+                // spacer, the separator's rule stretching to the popup's width, and the
+                // highlighted row — all of which are layout arithmetic that reads correct and
+                // draws wrong.
+                reference_menu(&theme),
                 custom(CUSTOM_KIND, Size::new(64, 24)).flex(1),
                 // **Masked, with the caret mid-string.** Both are things a field can get
                 // wrong in a way only a picture shows: a mask built per byte would draw the
@@ -233,6 +241,29 @@ fn reference_area(theme: &Theme) -> Element<Msg> {
         text_area(&mut a, AREA_H, ROW_H, true, theme),
     )
 }
+
+/// The open menu the reference draws: two rows with chords, a separator, and a disabled row.
+///
+/// **Row 1 is the highlighted one**, because an unhighlighted menu paints the same whether or not
+/// the highlight code exists — the same argument `button("Run", …)` makes for its focus ring.
+fn reference_menu(theme: &Theme) -> Element<Msg> {
+    use crate::menu::{Accel, Item, Menu, MenuState, popup};
+    let m: Menu<Msg> = Menu {
+        title: "File",
+        items: vec![
+            Item::new("New Tab", Accel::ctrl_shift(20, "T"), Msg::File),
+            Item::new("Close", Accel::ctrl(46, "W"), Msg::Edit),
+            Item::Separator,
+            Item::plain("Quit", Msg::Run).enabled(false),
+        ],
+    };
+    let mut st = MenuState::new(1);
+    st.toggle(0);
+    popup(&m, &st, MENU_ROW_KEY, Some(MENU_ROW_KEY), theme)
+}
+
+/// Where the reference menu's row keys start. Above the other widgets' so nothing collides.
+const MENU_ROW_KEY: u64 = 900;
 
 /// Paint the custom node: a pattern varying along both axes, clipped to `clip`.
 ///

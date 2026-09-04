@@ -3494,7 +3494,13 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let ed = (work.0 + (work.2 / 2) as i32, work.1);
     // Tab `i`'s label area: 4 is `WINDOW_CONTENT_X`, `TAB_W` per tab, and 40 into the label —
     // clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
-    let tab = |i: i32| (ed.0 + 4 + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + TAB_STRIP_H / 2);
+    // **Below the editor's menu bar since M14 Part A**, which put one above the strip to match
+    // the browser. The strip did not move relative to anything it contains; the whole of it moved
+    // down by a bar, and a gate that aimed at the old y clicked the menus instead — which is how
+    // this failed, silently, as a tab that never became current.
+    let tab = |i: i32| {
+        (ed.0 + 4 + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H / 2)
+    };
     let tab0 = tab(0);
     click_at(&mut qmp, &mut session, tab0.0, tab0.1)?;
     session.expect("nxedit: tab ")?;
@@ -3674,15 +3680,50 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let (_, px, py, _pw, ph) = parse_menu_popup(&popup)
         .ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
 
-    // **The row height is divided out of the popup rather than derived from the theme.** A menu
-    // row is text plus padding, so its height follows `font_px` — which a theme file sets, and
-    // which M11's decision 2 keeps *out* of the metrics a gate is allowed to assume. Four rows,
-    // and the frame is a one-pixel border with two of padding on each side.
+    // **The row is found rather than computed** (M14 Part A). This used to divide the popup's
+    // height by a row count, which was already careful about not deriving a row height from the
+    // theme — `font_px` is a metric M11's decision 2 keeps out of a gate's assumptions. The File
+    // menu now holds a **separator**, which occupies height without being a row, so no division
+    // names the right one. The client says which row the pointer is over, so the gate walks down
+    // the popup and stops when the guest agrees it is over `Rename`.
     const MENU_FRAME: i32 = 3;
-    const FILE_MENU_ROWS: i32 = 4;
-    let row_h = (ph as i32 - 2 * MENU_FRAME) / FILE_MENU_ROWS;
-    // `rename` is the third row: new file, new folder, rename, delete.
-    let rename_at = (px + 20, py + MENU_FRAME + row_h * 2 + row_h / 2);
+    // `Rename` is `MENU_ROW_KEY + 5`: New Tab, Close Tab, a rule, New File, New Folder, Rename.
+    const RENAME_ROW: u64 = 105;
+    let rx = px + 20;
+    let mut ry = py + MENU_FRAME;
+    let mut rename_at = None;
+    // **Each step records where it went**, which is the exception the terminal gate's own walk
+    // states: `move_pointer_to` walks a delta from the tracked position and does not update it,
+    // so a loop that left it alone would re-walk the whole delta every time and run the pointer
+    // off the popup. The receipt is what confirms the position; this is only what keeps the
+    // steps four pixels apart.
+    while ry < py + ph as i32 - MENU_FRAME {
+        move_pointer_to(&mut qmp, rx, ry)?;
+        qmp.pointer = Some((rx, ry));
+        // A poll rather than a wait: the receipt lands on the frame after the motion, and a step
+        // that arrived on another row says so just as fast.
+        if session.expect_within(
+            &format!("nxfiles: menu hover {RENAME_ROW}"),
+            std::time::Duration::from_millis(300),
+        )? {
+            rename_at = Some((rx, ry));
+            break;
+        }
+        ry += 4;
+    }
+    let Some(rename_at) = rename_at else {
+        return Err(format!(
+            "the pointer walked {}..{} down the File menu and the guest never reported row \
+             {RENAME_ROW} under it",
+            py + MENU_FRAME,
+            py + ph as i32 - MENU_FRAME
+        )
+        .into());
+    };
+    // The guest has just said the pointer is over the row, so the position is known by evidence.
+    // `move_pointer_to` records nothing itself — injection is relative, and an unacknowledged
+    // move leaves the host believing something it cannot check.
+    qmp.pointer = Some(rename_at);
     click_at(&mut qmp, &mut session, rename_at.0, rename_at.1)?;
     // **Wait for the menu popup to be gone before typing**, which the desktop-rename step at
     // step 6 already does in its own way and this one did not.
@@ -4724,36 +4765,79 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // it lands on produces a message. Before part 1 the record could not say which window it
     // was for; before part 2 the client could not hold both windows at once.
     //
-    // The upper quarter, so it lands on the first item rather than near the boundary between
-    // the two. The press position is asserted before the effect, for the reason the click above
-    // states: it separates "the pointer was not there" from "the pointer was there and nothing
-    // happened".
-    let (cx, cy) = (px + pw as i32 / 2, py + ph as i32 / 4);
-    // The pointer is already at a *confirmed* position from the click above, so this walks a
-    // few motions rather than re-pinning — and a retry here is cheap for the same reason.
-    // Nothing dismisses this popup but choosing from it, so an attempt that lands elsewhere
-    // leaves it open for the next one.
+    // The press position is asserted before the effect, for the reason the click above states:
+    // it separates "the pointer was not there" from "the pointer was there and nothing happened".
+    //
     // **Hover before the click, and it has to be in that order** (M11 Part E batch 3). Hover is
     // the first thing in this system that reacts to the pointer without a button held, and it is
     // invisible to a gate: the highlight is pixels, and this boot has no reference render of a
-    // menu to compare against. So the client says which item it is over — `MENU_CLEAR_KEY`, the
-    // one the click then activates.
+    // menu to compare against. So the client says which row it is over, and the click activates
+    // that one. Moving and clicking as one step does not show it: choosing closes the menu, and
+    // the popup is destroyed before it would have painted itself hovered.
     //
-    // Moving and clicking as one step does not show it: choosing `Clear` closes the menu, and
-    // the popup is destroyed at the top of the next iteration *before* it would have painted
-    // itself hovered. So the pointer arrives first and the receipt is waited for.
+    // **The row is found rather than computed** (M14 Part A). It used to be "the upper quarter",
+    // which worked while the menu had two equal rows. It has five now — two of them with an
+    // accelerator column, one of them a separator, and the first two greyed until something is
+    // selected — so a fraction of the height names a different row depending on the theme's text
+    // size. The hover receipt already says *which* row the pointer is over, so this walks down
+    // the popup and stops when the guest says it is over the one it means to click.
     //
-    // **It is a claim about the path, not the widget.** `menu_item` painting a highlight when
-    // told to is a host test; that `Router::inside` is fed by real PS/2 motion, through the
-    // compositor, into a popup's own router, and reaches the view, is only observable here — and
-    // it had never happened before this batch, because nothing asked the router.
-    move_pointer_to(&mut qmp, cx, cy)?;
-    session.expect("nxterm: menu hover 2")?;
+    // **`Clear`, which is `MENU_ROW_KEY + 3`.** Copy and Paste are above it: Copy is disabled
+    // with nothing selected and would produce no message when clicked, which is correct
+    // behaviour and useless as a proof that a click reached a row.
+    const CLEAR_ROW: u64 = 103;
+    //
+    // **Each step records where it went**, which is a deliberate exception to the rule that only
+    // a *confirmed* press updates the tracked position. `move_pointer_to` walks a delta from that
+    // position and does not update it, so a loop that left it alone would re-walk the whole delta
+    // every iteration and run the pointer off the popup — which is what the first version of this
+    // did. A dropped packet here costs one four-pixel step of drift, and the walk simply takes
+    // one more; the receipt below is what actually confirms the position, so nothing downstream
+    // trusts the estimate.
+    let cx = px + pw as i32 / 2;
+    let mut cy = py + 3;
+    let mut found = None;
+    while cy < py + ph as i32 - 3 {
+        move_pointer_to(&mut qmp, cx, cy)?;
+        qmp.pointer = Some((cx, cy));
+        // Short, because this is a poll rather than a wait: the receipt is emitted on the frame
+        // after the motion, and a step that landed on another row will say so just as fast.
+        if session.expect_within(
+            &format!("nxterm: menu hover {CLEAR_ROW}"),
+            std::time::Duration::from_millis(300),
+        )? {
+            found = Some(cy);
+            break;
+        }
+        cy += 4;
+    }
+    let Some(cy) = found else {
+        // **Every line the popup said, because "never saw 103" alone does not distinguish the
+        // ways this fails**: the pointer never reached the popup, it reached it and the row
+        // numbering differs, or the popup could not draw at all. The first time this fired it
+        // was the third — `nxterm: the menu popup could not be drawn`, twenty times over,
+        // because the tree was not diffable — and a message that said only "never saw 103"
+        // pointed at the walk rather than at the widget.
+        let seen: Vec<String> = session
+            .transcript()
+            .lines()
+            .filter(|l| l.contains("nxterm: menu"))
+            .map(str::to_string)
+            .collect();
+        return Err(format!(
+            "the pointer walked {}..{} down the menu popup and the guest never reported row \
+             {CLEAR_ROW} under it; it reported: {}",
+            py + 3,
+            py + ph as i32 - 3,
+            if seen.is_empty() { String::from("nothing") } else { seen.join(", ") }
+        )
+        .into());
+    };
     // **The receipt is also the position proof**, which is why the tracked position is set here
     // rather than assumed. `move_pointer_to` deliberately does not record where it went — only a
-    // *confirmed* press does, because injection is relative and an unacknowledged move leaves
-    // the host believing something it cannot check. Here the guest has just said it is over the
-    // item, so the position is known by evidence rather than by assertion.
+    // *confirmed* press does, because injection is relative and an unacknowledged move leaves the
+    // host believing something it cannot check. Here the guest has just said it is over the row,
+    // so the position is known by evidence rather than by assertion.
     //
     // Skipping this cost an afternoon: the click below then walked its delta from the position
     // the *previous* click had confirmed, doubling the movement, landing at the corner, and
@@ -6833,6 +6917,15 @@ impl Session {
     }
 
     /// Kill the guest and hand back the transcript.
+    /// Everything the guest has said so far, without consuming any of it.
+    ///
+    /// For a failure message that has to say *what did* happen rather than only what did not —
+    /// [`finish`](Self::finish) takes the session, which a `return Err` in the middle of a gate
+    /// cannot do.
+    fn transcript(&self) -> String {
+        self.out.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
     fn finish(mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();
