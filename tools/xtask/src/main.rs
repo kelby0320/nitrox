@@ -5648,7 +5648,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     let mut cursor_px = 0usize;
     // The compositor's `CURSOR_H` / `CURSOR_W`, which this crate cannot import — it depends on
     // `libdraw`, `libui` and `libterm`, not on `compositor`.
-    for y in cy..(cy + 16).min(h) {
+    for y in cy..(cy + 17).min(h) {
         for x in cx..(cx + 12).min(w) {
             let i = (y as usize * w as usize + x as usize) * 3;
             if (pixels[i], pixels[i + 1], pixels[i + 2]) == body {

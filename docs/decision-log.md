@@ -23035,6 +23035,27 @@ MATE's 12x19 is a difference of three rows, all tail. Attempt two's 18x26 was a 
 justified by a geometric argument that was internally valid and answered a question nobody had
 asked.
 
+**Then two more rounds on the tail alone**, both from the maintainer looking at it magnified, and
+both worth recording because neither is a thing a description would have produced.
+
+*The borders were fused.* With the slope right, the tail still read as leaning left. The cause is
+visible only up close: the leg's fill and the tail's fill were **one** column apart, so a single
+outline pixel was the right border of one and the left border of the other. Fused on that side,
+free on the other. Two columns apart now, so each keeps its own — which is what the extra row of
+height buys, and the whole of why the sprite is 12x17 rather than 12x16.
+
+*And then two pixels of fill, not three.* Three were tried on the theory that a two-pixel diagonal
+staircases; with the borders unfused it reads cleanly at two, and three sat heavy beside the head.
+The white was narrowed from the right edge and the outline left alone.
+
+**The last pixels were the maintainer's, and that is the note worth keeping.** Four rounds of
+"describe it, guess, render, show" had converged slowly and expensively. What finished it was a
+throwaway script — edit the sprite as ASCII, get a magnified render and the Rust literal — handed
+over so the person holding the judgement could turn the loop themselves. Three edits later it was
+done. **When the judgement is somebody else's, the thing to build is not a better guess; it is the
+loop they can drive.** `xtask tune` was the same insight for the shadows, one milestone earlier,
+and it did not get applied here until four attempts had been spent.
+
 **The method note, and it is the sharp one.** Three attempts were spent iterating a *rendered
 picture* against a description. The fourth measured a reference and was right immediately. Both
 of the earlier method notes in this milestone — M13 Part C's "look at it, because no number

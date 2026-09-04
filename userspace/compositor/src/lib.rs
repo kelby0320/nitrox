@@ -325,19 +325,34 @@ pub const MAX_WINDOWS_PER_CONNECTION: usize = 64;
 ///
 /// Rendered magnified to choose it, against three alternatives, rather than judged by reading
 /// rows: a 2-versus-3-pixel diagonal is not a difference anyone can see in a string literal.
-/// **Measured off MATE's pointer**, from a screenshot the maintainer supplied (2026-09-01
-/// 10-51-25, over "Create Document"). Its outline was extracted by classifying dark pixels, which
-/// is background-independent, and the numbers that came out are the whole of this sprite: a
-/// vertical left edge, a 45-degree right edge, a barb, and then a **two-pixel tail that advances
-/// one column per two rows** — with the head occupying about 63% of the total height.
+/// **The triangle is MATE's; the tail is MATE's slope with more pixels spent on it.**
 ///
-/// **The tail's slope is the entire defect this fixes.** Every earlier version ran the tail at
-/// 45 degrees, one column per row, so it splayed away from the head twice as fast as it should
-/// and read as a separate shape at a crooked angle. Nothing was wrong with the head, and two
-/// redraws that changed the head were fixing the wrong thing.
+/// The head was measured off MATE's pointer — a screenshot the maintainer supplied, 2026-09-01
+/// 10-51-25, over "Create Document" — by classifying its dark pixels, which is
+/// background-independent where a fill test is not. Vertical left edge, 45-degree right edge,
+/// barb at about 63% of the height. That part is unchanged and should stay unchanged.
 ///
-/// **The size is MATE's too** — 12 wide, and MATE's is 12x19 to this 12x16. An earlier attempt at
-/// 18x26 was too big; the reference settles it, where three rounds of judgement did not.
+/// **What took four more attempts was the tail, and two things were wrong with it.**
+///
+/// *The slope.* Every earlier version ran the tail at 45 degrees — one column per row — so it
+/// splayed away from the head twice as fast as MATE's, which advances **one column per two rows**.
+///
+/// *The border.* Once the slope was right the tail still read as leaning left, and the reason is
+/// visible only at magnification: the leg's fill and the tail's fill were **one** column apart, so
+/// a single outline pixel served as the right border of one and the left border of the other. The
+/// tail was fused to the leg on that side and free on the other. They are two columns apart now,
+/// so each keeps its own border — which is what the extra row of height buys, and the whole of
+/// why the sprite is 12x17 rather than 12x16.
+///
+/// The tail is **two pixels of fill wide**. Three were tried first, on the theory that a
+/// two-pixel diagonal staircases visibly — but with the borders no longer shared it reads cleanly
+/// at two, and three sat heavy beside the head.
+///
+/// **The last few pixels were chosen by the maintainer**, not argued into place, using
+/// `tools/build-cache/cursor-sprite.py`: edit the art, get a magnified render and the literal
+/// below. Four rounds of description had converged slowly; handing over the loop finished it in
+/// three. That is the note worth keeping — when the judgement is somebody else's, the useful
+/// thing to build is not a better guess, it is the loop they can turn themselves.
 const CURSOR: [&str; CURSOR_H as usize] = [
     ".",
     "..",
@@ -349,18 +364,19 @@ const CURSOR: [&str; CURSOR_H as usize] = [
     ".######.",
     ".#######.",
     ".########.",
-    ".####.....",
+    ".#####....",
     ".#####.",
-    ".##.##.",
-    ".#..##.",
-    "..  .##.",
-    "    ....",
+    ".##..##.",
+    ".#...##..",
+    "... ..##.",
+    "     .##.",
+    "     ....",
 ];
 
 /// Cursor sprite width.
 pub const CURSOR_W: u32 = 12;
 /// Cursor sprite height.
-pub const CURSOR_H: u32 = 16;
+pub const CURSOR_H: u32 = 17;
 
 /// The cursor's fill colour (`#` in the sprite).
 ///
