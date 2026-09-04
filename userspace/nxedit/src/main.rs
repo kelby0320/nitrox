@@ -174,6 +174,32 @@ fn wait_one(h: u64) {
     };
 }
 
+/// Tell the compositor what a newly created window of this editor is.
+///
+/// **Extracted so a second window gets the same treatment** (M14 Part B). It was two blocks
+/// inline before the loop, which was fine while a window was created once — and would have been
+/// the first thing New Window quietly failed to do: an untitled bar, and a window that refuses
+/// every drop because it never said it takes files.
+fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32, path: &str) {
+    // **Set once, and it is the name alone.** The modified marker lives in the window's own
+    // title bar; retitling on every keystroke would be a message per keystroke to say something
+    // the window already shows.
+    if let Some(mut w) = win.window(id)
+        && w.set_title(window_title(path)).is_err()
+    {
+        kprint(b"nxedit: SetTitle refused\n");
+    }
+    // **What this window takes, said once** (M10 Part E). Files only: a directory has no contents
+    // to put in a buffer, and an editor that accepted one would have to invent an answer for it.
+    // The compositor matches against this while the pointer moves, so a drag carrying a folder is
+    // never highlighted over this window at all.
+    if let Some(mut w) = win.window(id)
+        && w.declare_acceptor(nxedit::ACCEPTOR, librsproto::surface::DROP_KIND_FILE).is_err()
+    {
+        kprint(b"nxedit: DeclareAcceptor refused\n");
+    }
+}
+
 /// The theme the shell handed this application, or the built-in one.
 ///
 /// **Absent is normal rather than an error**: a client started outside a graphical session — by
@@ -269,7 +295,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     if !path.is_empty() {
         open_into(&mut app, root_ns, &path);
     }
-    let mut size = app.window_size();
+    let size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => Box::new(t),
@@ -279,7 +305,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // **The first window is a `Child` too** (M14 Part B), which is what makes several of them
     // possible: everything a window needs to be drawn and routed lives in that value, so a second
     // one is a second value rather than a second copy of this loop.
-    let mut top = {
+    let top = {
         let ui = app.view(&theme, None);
         match Child::open_sized(
             &mut win,
@@ -295,64 +321,107 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             None => fail(b"nxedit: CreateWindow FAILED\n"),
         }
     };
-    let window_id = top.id();
-    // **Set once, and it is the name alone.** The modified marker lives in the window's own
-    // title bar; retitling on every keystroke would be a message per keystroke to say something
-    // the window already shows.
-    if let Some(mut w) = win.window(window_id)
-        && w.set_title(window_title(&path)).is_err()
-    {
-        kprint(b"nxedit: SetTitle refused\n");
-    }
-    // **What this window takes, said once** (M10 Part E). Files only: a directory has no
-    // contents to put in a buffer, and an editor that accepted one would have to invent an
-    // answer for it. The compositor matches against this while the pointer moves, so a drag
-    // carrying a folder is never highlighted over this window at all.
-    if let Some(mut w) = win.window(window_id)
-        && w.declare_acceptor(nxedit::ACCEPTOR, librsproto::surface::DROP_KIND_FILE).is_err()
-    {
-        kprint(b"nxedit: DeclareAcceptor refused\n");
-    }
+    dress(&mut win, top.id(), &path);
 
-    let mut bounds = Rect::new(0, 0, size.w, size.h);
+    let bounds = Rect::new(0, 0, size.w, size.h);
     // **The second window, and the whole of M12 Part A**: alive only while a question is being
     // asked, because a `dialog` is transient by role — the compositor takes it with its parent,
     // and a hidden one would still be a window in the stack. `Role::Dialog` has existed since M2
     // Part A and no program a person runs had ever created one.
-    let mut confirm: Option<Child> = None;
+    let confirm: Option<Child> = None;
     // **The menu's window** — a third top-level window and this editor's first popup (M14 Part
     // A). Alive only while a menu is open, for the reason the dialog above is: a `popup` is
     // transient by role, the compositor takes it with its parent, and it holds the keyboard
     // while it is up.
-    let mut menu: Option<Child> = None;
+    let menu: Option<Child> = None;
     // Which menu the live popup was opened for, so a *change* — not merely open-versus-shut —
     // rebuilds the window at the new word. Without it, clicking File then Edit would move the
     // rows and leave the window under the first word.
-    let mut menu_shown: Option<usize> = None;
-    let mut menu_hovered: Option<u64> = None;
+    let menu_shown: Option<usize> = None;
+    let menu_hovered: Option<u64> = None;
     // Which of the dialog's controls the pointer was over at its last paint — a receipt, the way
     // `nxterm`'s menu hover is. Nothing is built from it; the view reads `hovered_key` directly.
-    let mut confirm_hovered: Option<u64> = None;
+    let confirm_hovered: Option<u64> = None;
     let ev = win.wait_handle();
-    let mut reported = app.revision();
+    let reported = app.revision();
     // The same shape as `reported`, for the field that names an untitled buffer.
-    let mut reported_name = app.naming_len();
+    let reported_name = app.naming_len();
     // **The title follows the current tab** (M12 Part D). It used to be set once, because there
     // was one file for the life of the process; a window whose taskbar entry still names the tab
     // you switched away from is the window list lying about what is on screen.
-    let mut reported_title = String::from(window_title(&path));
+    let reported_title = String::from(window_title(&path));
     // Which tab was last reported, so a switch is one line and a redraw is none.
-    let mut reported_tab = app.current_tab();
+    let reported_tab = app.current_tab();
+
+    /// Everything one window of this editor is.
+    ///
+    /// **A window, not the application** (M14 Part B). What is here is what a second window would
+    /// need a second of: its own buffers and tabs (`app`), its own surface and retained tree
+    /// (`top`), its own menu and its own question, and its own receipts — a gate reading one
+    /// stream has to be able to tell two windows' lines apart, which is what `id` in each is for.
+    ///
+    /// What is *not* here is the `Session`, the font and the theme: one connection, one face and
+    /// one palette serve every window this process owns.
+    struct Win {
+        top: Child,
+        app: App,
+        size: Size,
+        bounds: Rect,
+        confirm: Option<Child>,
+        confirm_hovered: Option<u64>,
+        menu: Option<Child>,
+        menu_shown: Option<usize>,
+        menu_hovered: Option<u64>,
+        reported: u64,
+        reported_name: Option<usize>,
+        reported_title: String,
+        reported_tab: u64,
+    }
+
+    let mut wins = alloc::vec![Win {
+        top,
+        app,
+        size,
+        bounds,
+        confirm,
+        confirm_hovered,
+        menu,
+        menu_shown,
+        menu_hovered,
+        reported,
+        reported_name,
+        reported_title,
+        reported_tab,
+    }];
 
     loop {
+        // **Destructured rather than dotted through**, which is what keeps this loop readable
+        // after the conversion: every name below means what it meant when there was one window,
+        // and the difference is that they are now borrowed out of a value there can be several of.
+        let Win {
+            top,
+            app,
+            size,
+            bounds,
+            confirm,
+            confirm_hovered,
+            menu,
+            menu_shown,
+            menu_hovered,
+            reported,
+            reported_name,
+            reported_title,
+            reported_tab,
+        } = &mut wins[0];
+        let window_id = top.id();
         // **One line per edit, and it carries a count rather than the text.** A gate driving a
         // release image cannot read this window — the pixels are the only echo an editor has —
         // so without a receipt it would type at whatever speed it liked and discover a dropped
         // keystroke as a wrong file three steps later. What somebody types into an editor is
         // theirs; the number says a keystroke landed and nothing else.
         let rev = app.revision();
-        if rev != reported {
-            reported = rev;
+        if rev != *reported {
+            *reported = rev;
             libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
         }
         // **And the same for the name field**, which `revision` cannot see: naming a buffer is
@@ -361,20 +430,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Retitled only when it changes, which is what keeps this one message per *switch*
         // rather than one per frame.
         let want_title = String::from(window_title(app.path()));
-        if want_title != reported_title
+        if want_title != *reported_title
             && let Some(mut w) = win.window(window_id)
         {
             if w.set_title(&want_title).is_err() {
                 kprint(b"nxedit: SetTitle refused\n");
             }
-            reported_title = want_title;
+            *reported_title = want_title;
         }
         // **One line per tab the person lands on.** A gate driving a release image cannot see a
         // strip; what it can see is which file the editor says it is showing, which is the only
         // thing a tab switch changes that anybody outside can check.
         let showing = app.current_tab();
-        if showing != reported_tab {
-            reported_tab = showing;
+        if showing != *reported_tab {
+            *reported_tab = showing;
             libkern::debug::Line::new()
                 .s(b"nxedit: tab ")
                 .u(showing)
@@ -383,8 +452,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 .end();
         }
         let named = app.naming_len();
-        if named != reported_name {
-            reported_name = named;
+        if named != *reported_name {
+            *reported_name = named;
             if let Some(n) = named {
                 // **The field says which it is** (M12 Part C), because there are two of them
                 // now and a gate waiting on "name so far" while somebody is typing a search
@@ -403,7 +472,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // The widget under the pointer, from the router that has always known and that nothing
         // had ever asked (M11 Part E batch 3).
         let ui = app.view(&theme, top.hovered_key());
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+        let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
         // Where each menu drops from, read every frame rather than when one opens: a bar word's
         // position is a fact about the layout, and before the first one there is nowhere to put a
         // popup at all — which is exactly what "could not open the menu" means without this.
@@ -438,20 +507,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // ---- the menu's window ----
         //
         // Opened and destroyed with the menu, and rebuilt when *which* menu is open changes.
-        if menu_shown != app.menus.open() {
+        if *menu_shown != app.menus.open() {
             if let Some(m) = menu.take() {
                 m.close(&mut win);
             }
-            menu_hovered = None;
-            menu_shown = app.menus.open();
+            *menu_hovered = None;
+            *menu_shown = app.menus.open();
             if let Some(which) = menu_shown {
                 match app.menus.anchor() {
                     Some(at) => {
                         // Measured with no hover: the pointer is over the *bar word* that opened
                         // this rather than over the popup, and a highlight does not change what a
                         // menu measures.
-                        let view = app.menu_view(which, &theme, None);
-                        menu = Child::open(
+                        let view = app.menu_view(*which, &theme, None);
+                        *menu = Child::open(
                             &mut win,
                             Role::Popup { parent: window_id },
                             at,
@@ -463,22 +532,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                     // No anchor yet means no layout yet, which cannot happen after the first
                     // frame — and if it did, an unplaced menu is better than one at the origin.
-                    None => menu = None,
+                    None => *menu = None,
                 }
                 if menu.is_none() {
                     // Not fatal: the editor is usable without its menu, and saying so beats a
                     // window that silently never appears.
                     kprint(b"nxedit: could not open the menu\n");
                     app.menus.close();
-                    menu_shown = None;
+                    *menu_shown = None;
                 }
             }
         }
         if let Some(m) = menu.as_mut() {
             let now = m.hovered_key();
-            menu_hovered = now;
+            *menu_hovered = now;
             if let Some(which) = menu_shown {
-                let view = app.menu_view(which, &theme, now);
+                let view = app.menu_view(*which, &theme, now);
                 if !m.present(&mut win, &view, &font, &theme) {
                     kprint(b"nxedit: the menu could not be drawn\n");
                 }
@@ -509,7 +578,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // No hover yet: the pointer is wherever it was when the close was asked for, and
                 // this call only measures — which a highlight does not change.
                 let ask = app.confirm_view(&theme, None);
-                confirm = Child::open(
+                *confirm = Child::open(
                     &mut win,
                     Role::Dialog { parent: window_id },
                     // **(0, 0), because this client does not know where it is.** A dialog's
@@ -538,13 +607,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     c.close(&mut win);
                 }
                 // The window is gone, so nothing in it is under the pointer.
-                confirm_hovered = None;
+                *confirm_hovered = None;
             }
             _ => {}
         }
         if let Some(c) = confirm.as_mut() {
             let now = c.hovered_key();
-            confirm_hovered = now;
+            *confirm_hovered = now;
             let ask = app.confirm_view(&theme, now);
             if !c.present(&mut win, &ask, &font, &theme) {
                 kprint(b"nxedit: the confirmation dialog could not be drawn\n");
@@ -742,9 +811,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         KeyOutcome::Ignored => {}
                     }
                 }
-                let msgs = match (menu_shown, menu.as_mut()) {
+                let msgs = match (*menu_shown, menu.as_mut()) {
                     (Some(which), Some(m)) => {
-                        let view = app.menu_view(which, &theme, menu_hovered);
+                        let view = app.menu_view(which, &theme, *menu_hovered);
                         m.route(&view, &font, &theme, &event)
                     }
                     _ => Vec::new(),
@@ -755,7 +824,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 continue;
             }
             if confirm.as_ref().is_some_and(|c| c.id() == from) {
-                let ask = app.confirm_view(&theme, confirm_hovered);
+                let ask = app.confirm_view(&theme, *confirm_hovered);
                 let mut msgs = confirm
                     .as_mut()
                     .map(|c| c.route(&ask, &font, &theme, &event))
@@ -857,22 +926,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // already has the file or makes a new one. The title follows the current tab
                     // at the top of the loop, so this no longer sets it by hand.
                     if taken && app.accept_drop(path) {
-                        open_into(&mut app, root_ns, path);
+                        open_into(app, root_ns, path);
                     }
                 }
                 WindowEvent::InputLost => kprint(b"nxedit: input dropped\n"),
             }
         }
         if resized {
-            size = app.window_size();
+            *size = app.window_size();
             // **`Child::resize` reallocates and throws the retained tree away**, which is what a
             // resize means: a tree diffed against a layout from the old bounds reports damage in
             // the old coordinates. `Some(false)` is the memory refusing, which leaves the window
             // at its old size and still drawing.
-            if top.resize(&mut win, size) == Some(false) {
+            if top.resize(&mut win, *size) == Some(false) {
                 fail(b"nxedit: impossible window geometry\n");
             }
-            bounds = Rect::new(0, 0, size.w, size.h);
+            *bounds = Rect::new(0, 0, size.w, size.h);
         }
     }
 }
