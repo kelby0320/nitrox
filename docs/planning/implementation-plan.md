@@ -208,11 +208,18 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     tab strip. Decision 2 became true rather than aspirational in the same change: `accel_match`
     routes a chord through the table the popup draws, so a label and its binding are one
     statement. The smaller half is that rows which used to be refused *after* being chosen are
-    greyed before. **Part B is half done** (2026-09-04): `nxterm` grows tabs, each with its own
-    grid, scrollback and shell, opened with `Ctrl+Shift+T`; New Window and Quit are the other half
-    and wait on the "shape of every `main`" conversion the toolkit doc has had a trigger for since
-    M12 Part A. The same change turned up a real drag bug that had been dismissed as a gate flake
-    twice. **Part G — syntax highlighting — was wanted as a stretch and promoted the
+    greyed before. **Part B is done** (2026-09-04): `nxterm` grows tabs, each with its own
+    grid, scrollback and shell, opened with `Ctrl+Shift+T`; then all three applications open second
+    top-level windows, which the protocol has allowed since M2 and nothing had done — the "shape of
+    every `main`" conversion the toolkit doc has had a trigger for since M12 Part A, done uniformly
+    because a first window kept as the loop's own would take the rest with it when closed. Quit
+    means every window, asking each exactly as its own close button asks. The same change turned up
+    a real drag bug that had been dismissed as a gate flake twice. **Part C is done** (2026-09-04):
+    a file chooser in `libui`, one tree for both Open File and Save As, rendering over a listing the
+    application read — decision 3 held without an exception, so `libfs` grew the sort that keeps two
+    directory views from disagreeing about what "newest" means. Save As changes what the buffer
+    *is* rather than prompting for a destination, which is what makes the tab's label, the unsaved
+    marker and the next `Ctrl+S` follow it. **Part G — syntax highlighting — was wanted as a stretch and promoted the
     same day**: costing it found that reusing `nxsh`'s lexer does not work (it is fallible, and
     parser-mode-driven, while a highlighter must be total over text that is not a program yet), and
     the table-driven scanner that replaces it makes each further language a table rather than code

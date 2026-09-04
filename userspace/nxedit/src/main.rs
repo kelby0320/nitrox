@@ -351,6 +351,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         bounds: Rect,
         confirm: Option<Child>,
         confirm_hovered: Option<u64>,
+        chooser: Option<Child>,
+        chooser_hovered: Option<u64>,
         menu: Option<Child>,
         menu_shown: Option<usize>,
         menu_hovered: Option<u64>,
@@ -386,6 +388,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             bounds: Rect::new(0, 0, size.w, size.h),
             confirm: None,
             confirm_hovered: None,
+            chooser: None,
+            chooser_hovered: None,
             menu: None,
             menu_shown: None,
             menu_hovered: None,
@@ -404,6 +408,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         bounds,
         confirm,
         confirm_hovered,
+        chooser: None,
+        chooser_hovered: None,
         menu,
         menu_shown,
         menu_hovered,
@@ -430,6 +436,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             bounds,
             confirm,
             confirm_hovered,
+            chooser,
+            chooser_hovered,
             menu,
             menu_shown,
             menu_hovered,
@@ -576,6 +584,93 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if !m.present(&mut win, &view, &font, &theme) {
                     kprint(b"nxedit: the menu could not be drawn\n");
                 }
+            }
+        }
+
+        // ---- the chooser's window ----
+        //
+        // **Listed here, drawn there** (M14 decision 3): `libui::chooser` renders over entries it
+        // is given, and reading a directory is a syscall it cannot make. So the application says
+        // which directory it wants and this does the listing — the same seam the tabs use for
+        // their ttys and `nxfiles` uses for its own panes.
+        // **A chosen file opens in a tab**, which is what `accept_drop` already decided a file
+        // arriving from outside means: the buffers you have open are not given up for it.
+        if let Some(path) = app.take_open()
+            && app.accept_drop(&path)
+        {
+            open_into(app, root_ns, &path);
+        }
+        if let Some(dir) = app.take_chooser_list() {
+            let rows = match libfs::list_dir(root_ns, dir.as_bytes()) {
+                Ok(mut entries) => {
+                    // **Ordered by `libfs`**, which is the point of putting the order there:
+                    // this chooser and the browser cannot come to disagree about one.
+                    libfs::sort(&mut entries, libfs::Order::NameAsc);
+                    entries
+                        .iter()
+                        .filter_map(|e| {
+                            let name = String::from_utf8_lossy(e.name()).into_owned();
+                            (!name.is_empty()).then_some((
+                                name,
+                                e.kind == librsproto::file::DIRENT_KIND_DIR,
+                            ))
+                        })
+                        .collect()
+                }
+                // **An unreadable directory is shown empty rather than refused.** The chooser is
+                // already open and the path strip says where it is looking; closing it would
+                // lose the person's place for a directory they can simply back out of.
+                Err(_) => {
+                    kprint(b"nxedit: could not list that directory\n");
+                    alloc::vec::Vec::new()
+                }
+            };
+            app.show_chooser(&dir, rows);
+        }
+        match (app.chooser().is_some(), chooser.is_some()) {
+            (true, false) => {
+                // **The receipt names the directory and counts what is in it**, because a chooser
+                // that listed nothing draws exactly like one that listed a directory and opened
+                // over it — the unreadable case above is *deliberately* an empty list. A gate
+                // matching on "a chooser opened" would pass for the failure it exists to catch.
+                if let Some(c) = app.chooser() {
+                    libkern::debug::Line::new()
+                        .s(b"nxedit: choosing a file in ")
+                        .untrusted(c.dir.as_bytes())
+                        .s(b" - ")
+                        .u(c.entries.len() as u64)
+                        .s(b" entries")
+                        .end();
+                }
+                let view = app.chooser_view(&theme, None);
+                *chooser = Child::open(
+                    &mut win,
+                    Role::Dialog { parent: window_id },
+                    (0, 0),
+                    &view,
+                    &font,
+                    &theme,
+                    BUFFERS,
+                );
+                if chooser.is_none() {
+                    kprint(b"nxedit: could not open the chooser\n");
+                    app.update(Msg::ChooserCancel);
+                }
+            }
+            (false, true) => {
+                if let Some(c) = chooser.take() {
+                    c.close(&mut win);
+                }
+                *chooser_hovered = None;
+            }
+            _ => {}
+        }
+        if let Some(c) = chooser.as_mut() {
+            let now = c.hovered_key();
+            *chooser_hovered = now;
+            let view = app.chooser_view(&theme, now);
+            if !c.present(&mut win, &view, &font, &theme) {
+                kprint(b"nxedit: the chooser could not be drawn\n");
             }
         }
 
@@ -893,6 +988,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 w.top.id() == from
                     || w.menu.as_ref().is_some_and(|m| m.id() == from)
                     || w.confirm.as_ref().is_some_and(|c| c.id() == from)
+                    || w.chooser.as_ref().is_some_and(|c| c.id() == from)
             }) else {
                 continue;
             };
@@ -903,6 +999,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 bounds,
                 confirm,
                 confirm_hovered,
+                chooser,
+                chooser_hovered,
                 menu,
                 menu_shown,
                 menu_hovered,
@@ -963,6 +1061,50 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 };
                 for msg in msgs {
                     app.update(msg);
+                }
+                continue;
+            }
+            // **The chooser's window routes through the chooser's tree.** Same `App`, so a row's
+            // message updates the same state; a different tree and router, because they describe
+            // a different window.
+            if chooser.as_ref().is_some_and(|c| c.id() == from) {
+                // A dialog is not dismissed by a press elsewhere — a question stays until it is
+                // answered — but a manager asking it to close means the same as *Cancel*.
+                let mut msgs = match chooser.as_mut() {
+                    Some(c) => {
+                        let view = app.chooser_view(&theme, *chooser_hovered);
+                        c.route(&view, &font, &theme, &event)
+                    }
+                    None => Vec::new(),
+                };
+                match event {
+                    // **The keyboard is the application's here**, as it is for the naming field:
+                    // `Child::route` sends a key to a *focused widget's* handler, and what a
+                    // keystroke means to a chooser — an answer, a move, or a character — is not
+                    // something the toolkit can decide.
+                    WindowEvent::Key(k) => {
+                        app.chooser_key(k);
+                        // **A receipt per character**, the discipline every typed sequence in this
+                        // system's gates follows and the one `nxfiles`'s rename field grew a line
+                        // for: an unacknowledged burst is a dropped keystroke discovered as a
+                        // wrong filename several steps later. Under KVM the guest is fast enough
+                        // that injected keys arrive bunched, which is exactly where that happens.
+                        // Only while saving, because that is the mode with a field to type into.
+                        if let Some(c) = app.chooser()
+                            && c.mode == libui::chooser::Mode::Save
+                        {
+                            libkern::debug::Line::new()
+                                .s(b"nxedit: chooser name so far ")
+                                .u(c.state.name.text().chars().count() as u64)
+                                .s(b" chars")
+                                .end();
+                        }
+                    }
+                    WindowEvent::CloseRequested => msgs.push(Msg::ChooserCancel),
+                    _ => {}
+                }
+                for m in msgs {
+                    app.update(m);
                 }
                 continue;
             }
