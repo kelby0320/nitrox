@@ -330,7 +330,7 @@ mod tests {
     use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
 
     /// A menu row is a widget whose *shape* changes under the pointer: quiet it draws one layer,
-    /// hovered it draws three. That is what makes the id a capture records go stale.
+    /// hovered it draws three.
     fn menu(hovered: Option<u64>) -> Element<u32> {
         let theme = Theme::default();
         crate::element::column(alloc::vec![
@@ -339,13 +339,48 @@ mod tests {
         ])
     }
 
+    /// The freeze decision itself, as a table.
+    ///
+    /// **The two tests below stopped discriminating it on 2026-09-04** and this is what replaces
+    /// that, honestly and at less coverage than before (PR #281 review, worth fixing 2). Since
+    /// `Router` captures the node carrying the handler rather than the deepest one, a click over a
+    /// row that merely grows layers survives a mid-gesture repaint on the router's own account —
+    /// so those tests pass with the freeze switched off, where on the previous commit they failed.
+    ///
+    /// **What is left uncovered, said plainly rather than papered over.** The freeze still matters
+    /// for a repaint that re-identifies the *handler* node, which needs a hover change to alter an
+    /// **ancestor**. No host test drives that end to end: `Child` cannot be built here, and a
+    /// simulation of it cannot either, because before a grab exists `Child::route` deliberately
+    /// builds its element from the *live* hover and routes it against a tree built from the
+    /// presented one — with an ancestor-level hover change those two disagree structurally and
+    /// `hit_test`, which walks tree and layout in lockstep, is unsound before the rule under test
+    /// is even reached. Manufacturing that shape to get a guard would have introduced a second
+    /// hazard to test the first.
+    ///
+    /// So this pins the *decision* — which catches reverting `reported_hover` to `live`, the
+    /// likelier regression — and the end-to-end half is deliberately not claimed.
+    #[test]
+    fn the_presented_hover_is_what_a_gesture_sees_while_it_is_held() {
+        // Not grabbed: what is live is what is reported, so hover tracks the pointer normally.
+        assert_eq!(reported_hover(false, Some(2), None), Some(2));
+        assert_eq!(reported_hover(false, None, Some(1)), None);
+        // Grabbed: what the retained tree was built with, whatever the pointer has since done.
+        assert_eq!(reported_hover(true, Some(2), None), None, "the tree holds no hover yet");
+        assert_eq!(reported_hover(true, None, Some(1)), Some(1), "…and it is not resampled");
+        assert_eq!(reported_hover(true, Some(2), Some(1)), Some(1), "the presented one wins");
+    }
+
     #[test]
     fn a_click_survives_a_repaint_between_the_press_and_the_release() {
-        // **The bug this exists to prevent, reproduced at the level it lives at.** A capture is a
-        // tree id of the *deepest* node under the cursor. Rebuild the tree with a different hover
-        // between the press and the release and that node is a different node with a different
-        // id, `path_to_id` finds nothing, and the release produces no message at all — which
-        // presents as a menu row that can be clicked and does nothing, once in every few runs.
+        // **A click survives a repaint between its press and its release**, which is the property
+        // and is worth a test wherever it is enforced from.
+        //
+        // **It no longer discriminates the hover freeze**, and saying so is the point of this
+        // note: since 2026-09-04 the router captures the handler-bearing node rather than the
+        // deepest one, so a row that merely grows layers keeps its id and this passes with the
+        // freeze switched off — on the previous commit it failed. See
+        // `the_presented_hover_is_what_a_gesture_sees_while_it_is_held` for what covers the
+        // freeze now and what is deliberately left uncovered (PR #281 review, worth fixing 2).
         //
         // `Child` cannot be built here (every one of its methods is a syscall or a `Session`), so
         // this drives the two pieces it wires together: a retained `Tree` and a `Router`, with
@@ -442,7 +477,9 @@ mod tests {
         }
         assert_eq!(live, Some(2), "the pointer is over the second row");
         assert!(router.grabbed(), "and holding it");
-        assert_eq!(seen(&router, live, shown), None, "but the gesture sees what the tree holds");
+        // **Not asserted here any more.** `seen` *is* `reported_hover`, so a line asserting what
+        // it returns asserts a function against itself; the decision is pinned as a table in
+        // `the_presented_hover_is_what_a_gesture_sees_while_it_is_held` instead (PR #281 review).
 
         // A frame happens now — the one that used to strand the capture.
         let ui = menu(seen(&router, live, shown));
