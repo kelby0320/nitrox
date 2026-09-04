@@ -22993,3 +22993,117 @@ covering all four: **a search proves something only when you have shown it can f
 
 The cheaper habit for this specific case: to ask whether a capability exists, grep the *library*
 that would own it, not the caller that would use it.
+
+## 2026-09-03 — M14 Part F: a generated label is a title, a name is not
+
+Two rough edges from the maintainer's list, and one decision each.
+
+**Capitalisation.** "applications", "no windows" and "desktop 1" become "Applications", "No
+Windows" and "Desktop 1". The decision is where the capital goes: in `desktop_label`'s *fallback*,
+not at its six call sites — two of which draw it (the bottom bar, the overview's sidebar) and four
+of which put it on the serial console. A desktop can be renamed (`Super+R`), and
+title-casing a name a person chose would be the shell editing their text. So a generated label is
+a title and a name is theirs — one function, one rule, and the three call sites stay dumb.
+
+**That change reached three gate expectations**, because `desktop_label` is embedded in the
+`window list on …` serial line the gates match on. Updating them is right rather than a nuisance:
+the line is a *receipt for what the bar shows*, so the two agreeing is the property, and a log
+that kept saying "desktop 1" while the screen said "Desktop 1" would be two sources for one
+string. The alternative — a display label and a log label — needs the fallback written twice.
+
+**The cursor's tail took four attempts, and the last one was the first to measure anything.**
+
+The report was "the tail is at a crooked angle". Attempt one widened the stroke from two pixels to
+three, on the theory that a two-pixel diagonal staircases. Attempt two, after a sharper report —
+*"equal spacing either side of the tail; the tail should point straight at the tip"* — reasoned
+that those two constraints are jointly satisfiable only for a symmetric head, concluded that a
+12-wide sprite cannot hold an aimed tail, and grew the sprite to 18x26. That was wrong too, and
+the maintainer's answer was the one that ended it: **there is a reference, in a screenshot already
+in the tree.** MATE's pointer, over "Create Document".
+
+**Measured rather than argued.** Classifying the screenshot's dark pixels — which is
+background-independent, where a fill/background test is not — gives MATE's outline exactly: a
+vertical left edge, a 45-degree right edge, a barb, and a **two-pixel tail advancing one column
+per two rows**, with the head about 63% of the total height, in a sprite 12 wide.
+
+**The tail's slope was the entire defect.** Every version, original included, ran the tail at 45
+degrees — one column per row — so it splayed away from the head twice as fast as it should and
+read as a separate shape. The head was never wrong. Two of the three failed attempts changed the
+head.
+
+**And the size was never wrong either.** 12 wide is MATE's width; the original's 12x16 against
+MATE's 12x19 is a difference of three rows, all tail. Attempt two's 18x26 was a 60% enlargement
+justified by a geometric argument that was internally valid and answered a question nobody had
+asked.
+
+**Then two more rounds on the tail alone**, both from the maintainer looking at it magnified, and
+both worth recording because neither is a thing a description would have produced.
+
+*The borders were fused.* With the slope right, the tail still read as leaning left. The cause is
+visible only up close: the leg's fill and the tail's fill were **one** column apart, so a single
+outline pixel was the right border of one and the left border of the other. Fused on that side,
+free on the other. Two columns apart now, so each keeps its own — which is what the extra row of
+height buys, and the whole of why the sprite is 12x17 rather than 12x16.
+
+*And then two pixels of fill, not three.* Three were tried on the theory that a two-pixel diagonal
+staircases; with the borders unfused it reads cleanly at two, and three sat heavy beside the head.
+The white was narrowed from the right edge and the outline left alone.
+
+**The last pixels were the maintainer's, and that is the note worth keeping.** Four rounds of
+"describe it, guess, render, show" had converged slowly and expensively. What finished it was a
+throwaway script — edit the sprite as ASCII, get a magnified render and the Rust literal — handed
+over so the person holding the judgement could turn the loop themselves. Three edits later it was
+done. **When the judgement is somebody else's, the thing to build is not a better guess; it is the
+loop they can drive.** `xtask tune` was the same insight for the shadows, one milestone earlier,
+and it did not get applied here until four attempts had been spent.
+
+**The method note, and it is the sharp one.** Three attempts were spent iterating a *rendered
+picture* against a description. The fourth measured a reference and was right immediately. Both
+of the earlier method notes in this milestone — M13 Part C's "look at it, because no number
+expresses *too prominent*" and this entry's own earlier draft, "compute to satisfy a constraint" —
+were reaching for the wrong tool. The rule that covers all of it: **when a reference exists,
+measure it.** Rendering is for choosing between candidates you have already constrained, and
+computing is for constraints you have already got right. Neither substitutes for looking at the
+thing being copied, and the reference had been sitting in `tools/build-cache/` since 2026-09-01.
+
+**What is not tested, and why.** `desktop-shell` is a bin crate with no library and no unit tests,
+so `desktop_label`'s rule cannot be host-tested without restructuring it — out of scope for two
+rough edges. The capitalised fallback *is* pinned, by `check-login` asserting the serial line
+through a real boot; the "a user's name passes through verbatim" half is not pinned by anything.
+Stated rather than papered over.
+
+## 2026-09-03 — typing into a prompt before it exists
+
+`check-login` failed once on `nxfiles: name so far 1 chars`, with `name so far 0 chars` sitting in
+the transcript: the rename prompt opened and the keystroke did not reach it. Seen under TCG earlier
+the same day and written off as TCG being slow, which it was not.
+
+**The step clicked to open the prompt and typed immediately**, and what holds the keyboard in
+between is the thing the first version of this entry got wrong. It is not the prompt: the prompt is
+a keyboard *mode* inside the browser's own window, not a window at all. It is the **menu popup** —
+a `popup` takes focus and is topmost, so until `nxfiles` closes it every key routes there, and a
+letter yields no message and is dropped.
+
+**Which made the first fix a narrowing rather than a closing** (PR #278 review). It waited for
+`nxfiles: name so far 0 chars`, and `nxfiles` printed that in its *render* section, ~70 lines and
+one whole section before `m.close()` ran on the menu in the same loop iteration. The gate resumed
+at a point where the popup was guaranteed still alive. The receipt now comes after the close, so it
+at least means the destroy has been *sent* — the compositor processing it is a further round trip
+nothing observable can prove, and `compositor: focus win=… has=1`, which would be the real signal,
+is capped out by `log_route`'s eight-line limit long before this step.
+
+**The gate already knew how to do this.** Six steps earlier, the *desktop* rename waits —
+`chord(r)` then `expect("desktop-shell: naming this desktop")` — before typing a single character.
+The browser's rename skipped it. The fix is that same wait, on the receipt `nxfiles` already emits
+when its prompt opens.
+
+**Three properties of this bug are worth separating**, because they are usually confused. It is not
+a lost message: the keystroke was delivered, to the wrong window. It is not a slow guest: waiting
+longer never helps, because nothing is coming. And it is not the flake class that
+`expect_all` fixes — that one is two lines racing for the *serial console* in an order the system
+does not fix, where the fix is to stop asserting an order. This is a real ordering requirement
+being ignored: the prompt must exist before it can be typed into, and the gate has to wait for it.
+
+**"It passes more often than it fails" is the reason to fix it, not to leave it.** One failure in
+several runs is a gate that will fail in CI on somebody else's branch, where it reads as their
+bug.

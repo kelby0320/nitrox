@@ -4501,12 +4501,26 @@ testable, and no syscall in a module that forbids them.
 the order they are built in, and the two are not the same because Part H split out of F once
 costing showed it crosses the namespace.
 
-### Part F — the desktop's rough edges *(first, and genuinely small)*
+### Part F — the desktop's rough edges ✅ complete (2026-09-03)
 
-- [ ] **Capitalisation**: "Applications", "Desktop *N*", "No Windows".
-- [ ] **The cursor sprite's tail is at a crooked angle** — reported 2026-09-03. `CURSOR` is a
-      hand-written row array in the compositor; this is a redraw of it, and the sprite test that
-      pins its width is the guard that it stays inside `cursor_rect`.
+- [x] **Capitalisation**: "Applications", "Desktop *N*", "No Windows" ✅. The capital goes in
+      `desktop_label`'s *fallback* rather than at the three sites that draw it, because a desktop
+      can be renamed (`Super+R`) and title-casing a name a person chose would be the shell editing
+      their text. **It reached three gate expectations**, since the label is embedded in the
+      `window list on …` serial line — which is correct rather than a nuisance: that line is a
+      receipt for what the bar shows, so the two agreeing is the property.
+- [x] **The cursor sprite's tail is at a crooked angle** ✅ — reported 2026-09-03, and it took
+      four attempts because the first three did not measure anything. The maintainer supplied a
+      reference — MATE's pointer, in a screenshot already in `tools/build-cache/` — and extracting
+      its outline settled it in one pass: a **two-pixel tail advancing one column per two rows**,
+      head 63% of the height, sprite 12 wide.
+
+      **The tail's slope was the whole defect.** Every version including the original ran it at 45
+      degrees, so it splayed away twice as fast as it should. The head was never wrong; two of the
+      three failed attempts changed the head, and one grew the sprite to 18x26 to satisfy a
+      geometric argument that was valid and beside the point.
+
+      See the decision log for the method note: **when a reference exists, measure it.**
 
 ### Part H — what an application is
 

@@ -2350,7 +2350,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `_` is the bar's mark for a minimized window. The desktop count is not asserted: the
     // lifecycle rule appends an empty desktop as soon as one has a window, so it is 2 here and
     // says nothing about minimising.
-    session.expect(&format!("desktop-shell: window list on desktop 1 of 2 [{term_id}:_ "))?;
+    session.expect(&format!("desktop-shell: window list on Desktop 1 of 2 [{term_id}:_ "))?;
 
     // Restore it from the list, which is where a minimized window comes back from, so the steps
     // below have a window to work with.
@@ -2391,7 +2391,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxterm: asked to close, exiting")?;
     session.expect("nxterm: closing")?;
     // The compositor tore the windows down with the session, and the list lost the entry.
-    session.expect("desktop-shell: window list on desktop 1 of 1 (empty)")?;
+    session.expect("desktop-shell: window list on Desktop 1 of 1 (empty)")?;
     println!("  ok: the taskbar asked, and the client closed itself");
     let first_term_id = term_id;
 
@@ -2580,7 +2580,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // and the one that went was the unnamed one.
     chord(&mut qmp, true, "1")?;
     session.expect("desktop-shell: moved window ")?;
-    session.expect("desktop-shell: window list on desktop 2 of 2 (empty)")?;
+    session.expect("desktop-shell: window list on Desktop 2 of 2 (empty)")?;
 
     // 6d. **The overview** (M8 Part E): frozen thumbnails of this desktop, a sidebar of the
     //     others, and a window moved by dropping its thumbnail on one.
@@ -3671,6 +3671,22 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `rename` is the third row: new file, new folder, rename, delete.
     let rename_at = (px + 20, py + MENU_FRAME + row_h * 2 + row_h / 2);
     click_at(&mut qmp, &mut session, rename_at.0, rename_at.1)?;
+    // **Wait for the menu popup to be gone before typing**, which the desktop-rename step at
+    // step 6 already does in its own way and this one did not.
+    //
+    // The thing holding the keyboard is not the prompt — the prompt is a keyboard *mode* inside
+    // the browser's own window. It is the **menu popup**: a `popup` takes focus and is topmost,
+    // so until `nxfiles` closes it every key goes there and a letter yields no message. A
+    // character injected before the close is dropped, and the gate then times out on "name so far
+    // 1 chars" with "0 chars" sitting in the transcript. Seen under TCG and then under KVM on
+    // 2026-09-03 (PR #278 review, blocking 1 — the first fix waited for a receipt that `nxfiles`
+    // printed *before* closing the menu, which narrowed the window without closing it).
+    //
+    // `nxfiles` now emits this after the close rather than before, so it means the destroy has
+    // been sent. The compositor processing it is a further round trip nothing here can observe;
+    // `compositor: focus win=… has=1` would be the real signal and `log_route` caps routed-input
+    // lines at eight, long past by this point in the gate.
+    session.expect("nxfiles: name so far 0 chars")?;
 
     // **A receipt per character**, the discipline every typed sequence in this gate follows —
     // and `nxfiles` grew the line to make it possible, for the reason the launcher's filter did
@@ -5637,7 +5653,9 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     let (cx, cy) = (w / 2, h / 2);
     let body = (0xFFu8, 0xFFu8, 0xFFu8);
     let mut cursor_px = 0usize;
-    for y in cy..(cy + 16).min(h) {
+    // The compositor's `CURSOR_H` / `CURSOR_W`, which this crate cannot import — it depends on
+    // `libdraw`, `libui` and `libterm`, not on `compositor`.
+    for y in cy..(cy + 17).min(h) {
         for x in cx..(cx + 12).min(w) {
             let i = (y as usize * w as usize + x as usize) * 3;
             if (pixels[i], pixels[i + 1], pixels[i + 2]) == body {
@@ -10581,14 +10599,14 @@ mod diag_tests {
         // **The distinction the gate depends on.** Ids are not slots — a window closed earlier
         // in the run leaves the ones after it at lower positions — and clicking `id * ENTRY_W`
         // would land on somebody else's entry as soon as anything had ever been closed.
-        let list = "desktop 1 of 2 [20:nxfiles] [24:notes.txt*] [31:untitled]";
+        let list = "Desktop 1 of 2 [20:nxfiles] [24:notes.txt*] [31:untitled]";
         assert_eq!(taskbar_slot(list, 20), Some(0));
         assert_eq!(taskbar_slot(list, 24), Some(1));
         assert_eq!(taskbar_slot(list, 31), Some(2));
         assert_eq!(taskbar_slot(list, 21), None, "a window on another desktop has no slot");
         // A title that contains a digit must not be mistaken for an id: the match is on the
         // group's own `id:` prefix, not on the group containing the number anywhere.
-        assert_eq!(taskbar_slot("desktop 1 of 1 [7:file20.txt]", 20), None);
-        assert_eq!(taskbar_slot("desktop 1 of 1 (empty)", 20), None);
+        assert_eq!(taskbar_slot("Desktop 1 of 1 [7:file20.txt]", 20), None);
+        assert_eq!(taskbar_slot("Desktop 1 of 1 (empty)", 20), None);
     }
 }
