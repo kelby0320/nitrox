@@ -326,8 +326,9 @@ fn desktop_label(desktops: &[Desktop], current: u32) -> alloc::string::String {
             // **Capitalised, and a *name* is not** (M14 Part F). A generated label is a title —
             // every desktop names its own the way "Applications" and "No Windows" do — but a name
             // a person chose is theirs, and title-casing it would be the shell editing their text.
-            // So the capital belongs here, in the fallback, rather than at the three places that
-            // draw the result.
+            // So the capital belongs here, in the fallback, rather than at the call sites — of
+            // which there are six: the bottom bar and the overview's sidebar draw it, and four
+            // serial lines carry it.
             s.push_str("Desktop ");
             let n = idx + 1;
             if n >= 10 {

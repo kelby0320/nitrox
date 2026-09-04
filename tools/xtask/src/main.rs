@@ -3671,14 +3671,21 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `rename` is the third row: new file, new folder, rename, delete.
     let rename_at = (px + 20, py + MENU_FRAME + row_h * 2 + row_h / 2);
     click_at(&mut qmp, &mut session, rename_at.0, rename_at.1)?;
-    // **Wait for the prompt before typing into it**, which the desktop-rename step at step 6
-    // already does (`expect("desktop-shell: naming this desktop")`) and this one did not. A click
-    // that opens the prompt has to travel to `nxfiles`, come back as a window, be configured, and
-    // be given the keyboard by the compositor; a character injected before that lands in whatever
-    // held focus before and is simply gone. The symptom is a timeout on "name so far 1 chars"
-    // with "name so far 0 chars" sitting in the transcript — the prompt opened, the keystroke did
-    // not reach it. Seen under TCG and then under KVM on 2026-09-03; it passes far more often
-    // than it fails, which is what makes waiting for the receipt worth more than a retry.
+    // **Wait for the menu popup to be gone before typing**, which the desktop-rename step at
+    // step 6 already does in its own way and this one did not.
+    //
+    // The thing holding the keyboard is not the prompt — the prompt is a keyboard *mode* inside
+    // the browser's own window. It is the **menu popup**: a `popup` takes focus and is topmost,
+    // so until `nxfiles` closes it every key goes there and a letter yields no message. A
+    // character injected before the close is dropped, and the gate then times out on "name so far
+    // 1 chars" with "0 chars" sitting in the transcript. Seen under TCG and then under KVM on
+    // 2026-09-03 (PR #278 review, blocking 1 — the first fix waited for a receipt that `nxfiles`
+    // printed *before* closing the menu, which narrowed the window without closing it).
+    //
+    // `nxfiles` now emits this after the close rather than before, so it means the destroy has
+    // been sent. The compositor processing it is a further round trip nothing here can observe;
+    // `compositor: focus win=… has=1` would be the real signal and `log_route` caps routed-input
+    // lines at eight, long past by this point in the gate.
     session.expect("nxfiles: name so far 0 chars")?;
 
     // **A receipt per character**, the discipline every typed sequence in this gate follows —

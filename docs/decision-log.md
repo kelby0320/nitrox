@@ -23000,7 +23000,8 @@ Two rough edges from the maintainer's list, and one decision each.
 
 **Capitalisation.** "applications", "no windows" and "desktop 1" become "Applications", "No
 Windows" and "Desktop 1". The decision is where the capital goes: in `desktop_label`'s *fallback*,
-not at the three places that draw its result. A desktop can be renamed (`Super+R`), and
+not at its six call sites — two of which draw it (the bottom bar, the overview's sidebar) and four
+of which put it on the serial console. A desktop can be renamed (`Super+R`), and
 title-casing a name a person chose would be the shell editing their text. So a generated label is
 a title and a name is theirs — one function, one rule, and the three call sites stay dumb.
 
@@ -23077,9 +23078,19 @@ Stated rather than papered over.
 the transcript: the rename prompt opened and the keystroke did not reach it. Seen under TCG earlier
 the same day and written off as TCG being slow, which it was not.
 
-**The step clicked to open the prompt and typed immediately.** A click has to travel to `nxfiles`,
-come back as a window, be configured, and be given the keyboard by the compositor. A character
-injected before the end of that lands in whatever held focus before, and is gone.
+**The step clicked to open the prompt and typed immediately**, and what holds the keyboard in
+between is the thing the first version of this entry got wrong. It is not the prompt: the prompt is
+a keyboard *mode* inside the browser's own window, not a window at all. It is the **menu popup** —
+a `popup` takes focus and is topmost, so until `nxfiles` closes it every key routes there, and a
+letter yields no message and is dropped.
+
+**Which made the first fix a narrowing rather than a closing** (PR #278 review). It waited for
+`nxfiles: name so far 0 chars`, and `nxfiles` printed that in its *render* section, ~70 lines and
+one whole section before `m.close()` ran on the menu in the same loop iteration. The gate resumed
+at a point where the popup was guaranteed still alive. The receipt now comes after the close, so it
+at least means the destroy has been *sent* — the compositor processing it is a further round trip
+nothing observable can prove, and `compositor: focus win=… has=1`, which would be the real signal,
+is capped out by `log_route`'s eight-line limit long before this step.
 
 **The gate already knew how to do this.** Six steps earlier, the *desktop* rename waits —
 `chord(r)` then `expect("desktop-shell: naming this desktop")` — before typing a single character.

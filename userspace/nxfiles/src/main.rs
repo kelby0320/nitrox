@@ -372,21 +372,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // had ever asked (M11 Part E batch 3).
         let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
-        // **One line per character typed into the name prompt.** Injection is relative and
-        // unacknowledged, so without a receipt a gate types at whatever speed it likes and finds
-        // out about a dropped keystroke as a wrong filename several steps later. A count, not
-        // the text — what somebody is naming a file is theirs, and the listing shows it anyway.
-        let typed = app.prompt_len();
-        if typed != reported_prompt {
-            reported_prompt = typed;
-            if let Some(n) = typed {
-                libkern::debug::Line::new()
-                    .s(b"nxfiles: name so far ")
-                    .u(n as u64)
-                    .s(b" chars")
-                    .end();
-            }
-        }
         // Where each menu drops from, read every frame rather than when one opens: a bar item's
         // position is a fact about the layout, and before the first one there is nowhere to put
         // a popup at all.
@@ -511,6 +496,34 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 && !m.present(&mut win, &view, &font, &theme)
             {
                 kprint(b"nxfiles: the menu could not be drawn\n");
+            }
+        }
+
+        // **One line per character typed into the name prompt.** Injection is relative and
+        // unacknowledged, so without a receipt a gate types at whatever speed it likes and finds
+        // out about a dropped keystroke as a wrong filename several steps later. A count, not
+        // the text — what somebody is naming a file is theirs, and the listing shows it anyway.
+        //
+        // **Emitted here rather than in `render`, which is where it was**, so the *first* one —
+        // `0 chars`, the one a gate waits on before it starts typing — comes out after the menu
+        // popup has been told to close rather than before. A `popup` holds the keyboard while it
+        // is up, and the prompt is a keyboard *mode* inside this window rather than a window of
+        // its own, so a key injected between the receipt and the close was routed to the menu and
+        // dropped. `check-login` timed out on that (PR #278 review, blocking 1).
+        //
+        // **What it proves and what it does not.** The destroy has been *sent* when this prints;
+        // the compositor processing it is a separate round trip this cannot see. That is strictly
+        // stronger than before and is not a guarantee — `compositor: focus win=… has=1` would be
+        // the real one, and `log_route` caps routed-input lines at eight, long past by here.
+        let typed = app.prompt_len();
+        if typed != reported_prompt {
+            reported_prompt = typed;
+            if let Some(n) = typed {
+                libkern::debug::Line::new()
+                    .s(b"nxfiles: name so far ")
+                    .u(n as u64)
+                    .s(b" chars")
+                    .end();
             }
         }
 

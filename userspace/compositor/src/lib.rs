@@ -1836,7 +1836,7 @@ mod tests {
         MemFramebuffer::new(Geometry::with_pitch(32, 16, 140, PixelFormat::XRGB8888).unwrap())
     }
 
-    /// A screen with room for the 12×16 cursor sprite away from its edges — [`screen`] is
+    /// A screen with room for the 12×17 cursor sprite away from its edges — [`screen`] is
     /// 32×16, so a sprite anywhere but the top-left corner falls off it.
     fn big_screen() -> MemFramebuffer {
         MemFramebuffer::new(Geometry::with_pitch(96, 96, 400, PixelFormat::XRGB8888).unwrap())
