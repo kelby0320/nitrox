@@ -127,7 +127,7 @@ fn draw(
 ) {
     let origin = app.grid_origin();
     let m = app.metrics;
-    let grid = &app.grid;
+    let grid = app.grid();
     let palette = app.palette;
     let top = app.view_line();
     paint(fb, ui_font, theme, ui, l, damage, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
@@ -160,8 +160,8 @@ fn draw(
 fn report_row(app: &App, row: usize) {
     let mut buf = [0u8; 256];
     let mut n = 0;
-    for col in 0..app.grid.cols() {
-        let Some(cell) = app.grid.view_cell(app.view_line(), row, col) else { break };
+    for col in 0..app.grid().cols() {
+        let Some(cell) = app.grid().view_cell(app.view_line(), row, col) else { break };
         let mut enc = [0u8; 4];
         let s = cell.ch.encode_utf8(&mut enc);
         if n + s.len() > buf.len() {
@@ -178,19 +178,21 @@ fn report_row(app: &App, row: usize) {
     }
 }
 
-/// Block until either handle has something.
+/// Block until any of `handles` has something.
 ///
-/// Both in one `sys_wait`, which is the whole point: waiting on them in turn would mean a
-/// keystroke could not be seen while the shell was quiet, or the reverse.
-fn wait_two(a: u64, b: u64) {
-    let handles = [a, b];
-    let mut results = [0u8; 48];
-    // SAFETY: a valid two-handle array and a result buffer sized for two records.
+/// **All of them in one `sys_wait`, which is the whole point**: waiting on them in turn would
+/// mean a keystroke could not be seen while a shell was quiet, or the reverse. With tabs it is
+/// the compositor's handle plus *one per tab* (M14 Part B) — a shell printing in a background tab
+/// must not have to wait for the foreground one to say something.
+fn wait_any(handles: &[u64]) {
+    // 24 bytes per record, which is what the two-handle version sized itself from.
+    let mut results = alloc::vec![0u8; handles.len() * 24];
+    // SAFETY: a valid handle array and a result buffer sized for one record per handle.
     unsafe {
         libkern::syscall4(
             libkern::SYS_WAIT,
             handles.as_ptr() as u64,
-            2,
+            handles.len() as u64,
             results.as_mut_ptr() as u64,
             u64::MAX,
         )
@@ -427,27 +429,68 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // to talk to. Failing the window instead would turn a tty-server problem into a blank
     // screen, which is the harder thing to diagnose.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let mut backend = match unsafe { backend::attach(root_ns) } {
-        Some((terminal, b)) => {
-            // SAFETY: `root_ns` is live and `terminal` is a channel this process owns until the
-            // spawn moves it.
-            // **Said on success as well as failure.** This path only ever reported when it
-            // went wrong, so a release image could not tell a terminal hosting a shell from a
-            // window that opened with nothing in it — which is exactly what a missing `/bin`
-            // in an application namespace looks like, and what M7 Part F hit first. The grid
-            // report that would otherwise show it is `test-harness`-only.
-            if unsafe { backend::spawn_shell(root_ns, terminal, &env) } < 0 {
-                kprint(b"nxterm: no shell\n");
+    /// A tab's other half: the tty this process is the backend for, and the shell on it.
+    ///
+    /// **Paired with a `Term` by key**, not by index, for the reason the key exists at all: a tab
+    /// closing renumbers every one after it, and a backend matched by position would end up
+    /// feeding the wrong grid. `reconcile_backends` is the only thing that pairs them.
+    struct TabBackend {
+        key: u64,
+        backend: backend::Backend,
+    }
+
+    /// Give every tab that has no backend a terminal and a shell.
+    ///
+    /// **The seam that keeps `nxterm`'s library a function of values.** `Msg::NewTab` adds a
+    /// `Term` with an empty grid and nothing else; this notices the tab with no tty and supplies
+    /// one. Called every frame rather than beside the message, so a tab arriving by any route —
+    /// a chord, a menu row, or something later — is served the same way.
+    ///
+    /// # Safety
+    ///
+    /// `root_ns` must be this process's live root namespace.
+    unsafe fn reconcile_backends(
+        app: &mut App,
+        backends: &mut alloc::vec::Vec<TabBackend>,
+        root_ns: u64,
+        env: &libstream::wire::Record,
+    ) {
+        // Tabs that went away take their backend with them: dropping it closes the channel, and
+        // that close is how the tty server learns this emulator is done with that terminal.
+        backends.retain(|b| app.tabs_mut().iter().any(|t| t.key() == b.key));
+        let want: alloc::vec::Vec<u64> = app
+            .tabs_mut()
+            .iter()
+            .map(|t| t.key())
+            .filter(|k| !backends.iter().any(|b| b.key == *k))
+            .collect();
+        for key in want {
+            // SAFETY: the caller's contract — `root_ns` is this process's live root namespace.
+            match unsafe { backend::attach(root_ns) } {
+                Some((terminal, b)) => {
+                    // SAFETY: `terminal` is a channel this process owns until the spawn moves it.
+                    // **Said on success as well as failure.** This path only ever reported when
+                    // it went wrong, so a release image could not tell a terminal hosting a shell
+                    // from a window that opened with nothing in it — which is exactly what a
+                    // missing `/bin` in an application namespace looks like, and what M7 Part F
+                    // hit first. The grid report that would otherwise show it is
+                    // `test-harness`-only.
+                    if unsafe { backend::spawn_shell(root_ns, terminal, env) } < 0 {
+                        kprint(b"nxterm: no shell\n");
+                    }
+                    backends.push(TabBackend { key, backend: b });
+                }
+                // **The tab stays and says so.** Refusing to open it would be the harder thing to
+                // diagnose: a chord that appears to do nothing, versus a tab that is visibly there
+                // and explains itself.
+                None => app.feed_tab(key, b"nxterm: no terminal available\r\n"),
             }
-            // The success line is emitted by `spawn_shell` itself, beside the send that earns
-            // it — see the note there.
-            Some(b)
         }
-        None => {
-            app.feed(b"nxterm: no terminal available\r\n");
-            None
-        }
-    };
+    }
+
+    let mut backends: alloc::vec::Vec<TabBackend> = alloc::vec::Vec::new();
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    unsafe { reconcile_backends(&mut app, &mut backends, root_ns, &env) };
 
     loop {
         // ---- render ----
@@ -584,7 +627,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // translation from the grid's screen rows is `App::damage_rows`', because it is the
         // half that knows where the view is anchored.
         let origin = app.grid_origin();
-        let cols = app.grid.cols();
+        let cols = app.grid().cols();
         for row in app.damage_rows() {
             let r = app.metrics.row_rect(row, cols);
             let r = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
@@ -715,74 +758,110 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // has sent comes in and goes through the parser. Done here rather than in the event
         // arm because output arrives unprompted — the shell prints when it likes, and a
         // terminal that only looked after a keystroke would show a prompt one keypress late.
-        if let Some(b) = &mut backend {
-            let out = app.take_outbox();
-            if !out.is_empty() && !b.typed(&out) {
+        // **Every tab, both directions.** What was typed goes out to the tab it was typed into;
+        // whatever any shell has sent comes in and goes through *that tab's* parser. A background
+        // tab's output is drawn into its own grid and shows the moment you switch to it — which is
+        // the whole of what having tabs means here.
+        //
+        // Done here rather than in the event arm because output arrives unprompted: a shell prints
+        // when it likes, and a terminal that only looked after a keystroke would show a prompt one
+        // keypress late.
+        let mut ended: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for tb in backends.iter_mut() {
+            let out = app
+                .tabs_mut()
+                .iter_mut()
+                .find(|t| t.key() == tb.key)
+                .map(|t| t.take_outbox())
+                .unwrap_or_default();
+            if !out.is_empty() && !tb.backend.typed(&out) {
                 kprint(b"nxterm: input did not reach the tty\n");
             }
-            while let Some(bytes) = b.output() {
+            while let Some(bytes) = tb.backend.output() {
                 #[cfg(feature = "test-harness")]
-                let before = app.grid.cursor().0;
-                app.feed(bytes);
+                let before = app.grid().cursor().0;
+                #[cfg(feature = "test-harness")]
+                let current = tb.key == app.current_tab();
+                app.feed_tab(tb.key, bytes);
                 // Under the harness only: report a line once the cursor has left it, which is
-                // what makes `check-terminal` able to assert on the grid's *contents*.
+                // what makes `check-terminal` able to assert on the grid's *contents*. **The
+                // current tab only** — the gate reads one grid, and reporting a background tab's
+                // rows into the same stream would make "what is on screen" ambiguous.
                 #[cfg(feature = "test-harness")]
-                {
-                    // **Every row the cursor passed**, not just the one it started on: a
-                    // single message routinely completes several lines, and reporting only
-                    // the first prints a blank when the chunk begins with a newline — which
-                    // is exactly what the shell's banner does.
-                    let now = app.grid.cursor().0;
-                    // **Rows the cursor left, and the row it is on.** Both, because they
-                    // answer different questions and the gate asks both: a line the shell
-                    // *finished* is only in the first set (the banner, which arrives in a
-                    // chunk that ends two rows below it), and a line still being typed is
-                    // only in the second (`/> whoami`, which never completes until Enter).
+                if current {
+                    // **Every row the cursor passed**, not just the one it started on: a single
+                    // message routinely completes several lines, and reporting only the first
+                    // prints a blank when the chunk begins with a newline — which is exactly what
+                    // the shell's banner does.
+                    //
+                    // **Rows the cursor left, and the row it is on.** Both, because they answer
+                    // different questions and the gate asks both: a line the shell *finished* is
+                    // only in the first set (the banner, which arrives in a chunk that ends two
+                    // rows below it), and a line still being typed is only in the second
+                    // (`/> whoami`, which never completes until Enter).
+                    let now = app.grid().cursor().0;
                     for row in before..now {
                         report_row(&app, row);
                     }
                     report_row(&app, now);
                 }
             }
-            if b.is_gone() {
-                kprint(b"nxterm: the terminal ended\n");
-                exit(0);
+            if tb.backend.is_gone() {
+                ended.push(tb.key);
             }
         }
+        // **A shell that exited closes its tab**, and the last one closes the window — which is
+        // the same rule `Msg::CloseTab` follows, reached from the other side. Before tabs this
+        // was an unconditional `exit(0)`, and that is still what happens when the last tab's
+        // shell ends.
+        for key in ended {
+            kprint(b"nxterm: the terminal ended\n");
+            app.update(Msg::CloseTab(key));
+        }
+        if app.closing() {
+            kprint(b"nxterm: closing\n");
+            exit(0);
+        }
+        // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+        unsafe { reconcile_backends(&mut app, &mut backends, root_ns, &env) };
 
         // ---- wait for something to do ----
         //
-        // **Two sources.** `wait_event` blocks on the compositor alone, which would render the
-        // shell's output only after the next keystroke — a prompt one keypress late. So the
-        // window's handle and the backend's go into one `sys_wait`, and the events are drained
-        // non-blockingly afterwards. A terminal with no backend keeps the simple path.
+        // **One `sys_wait` over the compositor and every tab.** `wait_event` blocks on the
+        // compositor alone, which would render a shell's output only after the next keystroke — a
+        // prompt one keypress late. So the window's handle and *every* backend's go in together
+        // and the events are drained non-blockingly afterwards. A terminal with no backend at all
+        // keeps the simple path.
         let mut events: alloc::vec::Vec<(u32, WindowEvent)> = alloc::vec::Vec::new();
-        match backend.as_ref().map(|b| b.channel).filter(|_| win.wait_handle() != 0) {
-            Some(bch) => {
-                loop {
-                    match win.poll_event() {
-                        // **The id is kept.** With the menu open this session holds two
-                        // windows, and a click on the menu is not a click on the terminal.
-                        Ok(Some(ev)) => events.push(ev),
-                        Ok(None) => break,
-                        Err(_) => {
-                            kprint(b"nxterm: the compositor went away\n");
-                            exit(0);
-                        }
+        let win_handle = win.wait_handle();
+        if !backends.is_empty() && win_handle != 0 {
+            loop {
+                match win.poll_event() {
+                    // **The id is kept.** With the menu open this session holds two windows, and
+                    // a click on the menu is not a click on the terminal.
+                    Ok(Some(ev)) => events.push(ev),
+                    Ok(None) => break,
+                    Err(_) => {
+                        kprint(b"nxterm: the compositor went away\n");
+                        exit(0);
                     }
                 }
-                if events.is_empty() {
-                    wait_two(win.wait_handle(), bch);
-                    continue; // round again: drain both sources from the top
-                }
             }
-            None => match win.wait_event() {
+            if events.is_empty() {
+                let mut handles = alloc::vec::Vec::with_capacity(backends.len() + 1);
+                handles.push(win_handle);
+                handles.extend(backends.iter().map(|b| b.backend.channel));
+                wait_any(&handles);
+                continue; // round again: drain every source from the top
+            }
+        } else {
+            match win.wait_event() {
                 Ok(ev) => events.push(ev),
                 Err(_) => {
                     kprint(b"nxterm: the compositor went away\n");
                     exit(0);
                 }
-            },
+            }
         }
 
         // Set by a `Configure` that actually changed the shape; acted on once, below.
@@ -945,7 +1024,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // the history to one and say so here. It is the only assertion about the reflow
                 // that a gate on a release image can make: a terminal's rows are somebody's
                 // session, and the serial log is not the place for them.
-                let lines_before = app.grid.logical_lines();
+                let lines_before = app.grid().logical_lines();
                 if let Some(r) = app.resize(Size::new(width, height)) {
                     resized = true;
                     libkern::debug::Line::new()
@@ -954,13 +1033,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         .s(b"x")
                         .u(u64::from(height))
                         .s(b", grid ")
-                        .u(app.grid.cols() as u64)
+                        .u(app.grid().cols() as u64)
                         .s(b"x")
-                        .u(app.grid.rows() as u64)
+                        .u(app.grid().rows() as u64)
                         .s(b", lines ")
                         .u(lines_before as u64)
                         .s(b"->")
-                        .u(app.grid.logical_lines() as u64)
+                        .u(app.grid().logical_lines() as u64)
                         // **The eviction, because without it the difference is unattributable.**
                         // Narrowing makes more rows out of the same text, so a deep history
                         // loses its oldest to the ring rather than to the rewrap — and a reader
@@ -994,7 +1073,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // A tree diffed against a layout from the old bounds reports damage in the old
             // coordinates. Starting again reports the whole window, which is what a resize is.
             tree = Tree::new();
-            app.grid.damage_all();
+            app.damage_all();
         }
     }
 }

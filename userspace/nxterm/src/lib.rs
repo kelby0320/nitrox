@@ -42,7 +42,7 @@ use libui::widget::{
     title_bar, window_frame,
 };
 use libui::menu::{Accel, Item, Menu, MenuState};
-use libui::widget::{Theme as UiTheme, ScrollState, scrollbar};
+use libui::widget::{TAB_STRIP_H, Theme as UiTheme, ScrollState, scrollbar};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -115,7 +115,10 @@ pub const SCROLL_W: u32 = 12;
 const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W;
 
 /// And vertically: the title bar, the menu bar, and the frame.
-const CHROME_H: u32 = BAR_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
+const CHROME_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
+
+/// The element key on the tab strip.
+pub const TAB_STRIP_KEY: u64 = 7;
 
 /// The key that copies the selection, with **Ctrl and Shift** held: `c`.
 ///
@@ -125,6 +128,17 @@ const CHROME_H: u32 = BAR_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
 /// `nxedit::SAVE_KEYCODE` is one, and pinned against `libinput`'s table by a test rather than
 /// by this comment.
 pub const COPY_KEYCODE: u16 = 46;
+/// The key that opens a tab: `t`, with **Ctrl and Shift**.
+///
+/// **Shift for [`COPY_KEYCODE`]'s reason**, not for symmetry: `Ctrl+T` belongs to whatever is
+/// running in the terminal — it is `transpose-chars` in a readline shell — and a terminal that
+/// took it would be taking a binding from the program it exists to host. Every terminal emulator
+/// spells new-tab with Shift for exactly this.
+pub const NEW_TAB_KEYCODE: u16 = 20;
+/// The key that closes one: `w`, with Ctrl and Shift — see [`NEW_TAB_KEYCODE`]. Closing the last
+/// tab closes the window, which is what the chord means everywhere else it exists.
+pub const CLOSE_TAB_KEYCODE: u16 = 17;
+
 /// The key that pastes: `v`, with Ctrl and Shift — see [`COPY_KEYCODE`].
 pub const PASTE_KEYCODE: u16 = 47;
 
@@ -133,6 +147,17 @@ pub const PASTE_KEYCODE: u16 = 47;
 pub enum Msg {
     /// A word on the menu bar was clicked: open that menu, or close it if it was the open one.
     MenuBar(usize),
+    /// Open a tab — `Ctrl+Shift+T`, or File ▸ New Tab.
+    ///
+    /// **The tty is not this crate's**: opening a tab adds a `Term` with an empty grid, and the
+    /// binary notices a tab with no backend and gives it one. That seam is what keeps `update` a
+    /// function of values.
+    NewTab,
+    /// Close the tab with this key — `Ctrl+Shift+W`, or File ▸ Close Tab. Closing the last one
+    /// closes the window.
+    CloseTab(u64),
+    /// Make the tab with this key current — a click on the strip.
+    SelectTab(u64),
     /// Copy the selection to the clipboard — `Ctrl+Shift+C`, or Edit ▸ Copy.
     ///
     /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
@@ -219,13 +244,76 @@ pub struct Resized {
 /// How many menus the bar carries. `File` and `Edit`.
 pub const MENU_COUNT: usize = 2;
 
-/// Everything the terminal is.
-pub struct App {
+/// Where tab keys start. Far from the element keys so a tab and a widget cannot be confused in
+/// a debug line; `nxedit` numbers its buffers the same way and for the same reason.
+pub const TAB_KEY_BASE: u64 = 1 << 62;
+
+/// One tab: a terminal, and everything that is *its* rather than the window's.
+///
+/// **The line between this and [`App`] is the one `nxedit` and `nxfiles` drew** (M12 Part D), and
+/// getting it wrong is how a second tab inherits the first's scrollback. What belongs here is
+/// what a person would be surprised to see shared: the screen, the scrollback, where the view is
+/// scrolled to, what is selected, and the bytes typed but not yet sent. What stays on `App` is
+/// the window — its size, its chrome, its menus, whether it has the keyboard.
+///
+/// **The shell is deliberately absent.** A tab's other half is a tty and a process, and this
+/// crate makes no syscalls; `main` keeps a backend per tab and reconciles the two by [`key`].
+///
+/// [`key`]: Self::key
+pub struct Term {
+    /// Identity across frames and across the tab strip.
+    ///
+    /// **Not the index**: closing a tab renumbers every one after it, and a message naming an
+    /// index outlives the frame that produced it — the same reasoning `nxedit::Buffer` records.
+    key: u64,
     /// The screen, the cursor, and the scrollback.
     pub grid: Grid,
     /// Bytes to grid operations. Held across writes because a sequence can be split across
     /// them — which is the ordinary case once a real backend is delivering in chunks.
     parser: Parser,
+    /// Where the scrollback view is anchored, or `None` to follow the cursor.
+    view_top: Option<u64>,
+    /// Whether the view moved this frame, so the whole grid is repainted rather than only the
+    /// rows the parser touched.
+    view_moved: bool,
+    /// Bytes the user typed, waiting for the binary to send them to *this* tab's tty.
+    outbox: Vec<u8>,
+}
+
+impl Term {
+    /// A tab with an empty grid of `cols` x `rows`.
+    fn new(key: u64, cols: usize, rows: usize) -> Self {
+        Self {
+            key,
+            grid: Grid::new(cols, rows),
+            parser: Parser::new(),
+            view_top: None,
+            view_moved: false,
+            outbox: Vec::new(),
+        }
+    }
+
+    /// This tab's identity, which is what `main` matches a backend against.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// Bytes typed into this tab, taken exactly once.
+    pub fn take_outbox(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.outbox)
+    }
+}
+
+/// Everything the terminal is.
+pub struct App {
+    /// The open tabs, in the order the strip draws them. **Never empty**: closing the last one
+    /// closes the window, so every method below can assume there is a current tab.
+    tabs: Vec<Term>,
+    /// Which tab is current, by [`Term::key`].
+    current: u64,
+    /// The next key to hand out. Monotonic, so a key is never reused and a stale message can
+    /// never name a tab that has taken its place.
+    next_key: u64,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     ///
     /// **The toolkit's, since M14 Part A.** This was a `bool` and a `Rect` here, a two-element
@@ -246,13 +334,6 @@ pub struct App {
     pub metrics: Metrics,
     /// Colours for the cells.
     pub palette: Palette,
-    /// Bytes the user typed, waiting for the binary to send them to the tty.
-    ///
-    /// **An outbox rather than a call**, because this half has no syscalls: `update` is a
-    /// function of values, and "send this to a channel" is not one. It is the same shape as
-    /// the toolkit's messages — the application says what happened, the shell of a `main`
-    /// performs it.
-    outbox: Vec<u8>,
     /// The terminal has been asked to close, and the binary owes an exit.
     ///
     /// **A flag rather than an `exit` here.** `update` is a function of values — it has no
@@ -276,14 +357,6 @@ pub struct App {
     /// and "send a request on a channel" is a syscall. The application says what happened; the
     /// `main` that owns the session performs it.
     move_requested: bool,
-    /// Where the viewport is, or `None` to follow the output.
-    ///
-    /// **`None` is not "line zero".** Following the bottom and being anchored at whatever the
-    /// bottom currently is are different states: the first stays at the bottom as output
-    /// arrives, the second is exactly what the user asked for when they scrolled away from it.
-    /// Collapsing them is how a terminal ends up scrolling itself back to where you were
-    /// reading half a second ago.
-    view_top: Option<u64>,
     /// This window last asked to be maximised, so its maximise button now asks for normal.
     ///
     /// See [`Msg::RequestState`]'s arm in [`update`](App::update) for why it is what was
@@ -301,20 +374,6 @@ pub struct App {
     window: Size,
     /// What the terminal owes the clipboard — see [`ClipRequest`].
     clip_request: Option<ClipRequest>,
-    /// The whole viewport repaints — it moved, or the selection changed.
-    ///
-    /// **Not [`Grid::damage_all`], which was the first attempt** and is wrong for a reason
-    /// worth keeping: the grid's dirty flags name *screen* rows, and a view scrolled far
-    /// enough back holds none of them. Scrolling to the top of the history therefore damaged
-    /// every row the grid could name and not one row the user could see — the screen stayed on
-    /// the old page under a thumb that had moved. The two damage spaces meet in
-    /// [`damage_rows`](App::damage_rows) and nowhere else, so this is the half that lives here.
-    ///
-    /// **A selection change is the second cause, since M12 Part E**, and it is the *same*
-    /// mistake seen from a new direction: `Grid::select_from` damages every screen row, which
-    /// for a view scrolled back into the history is every row but the ones being looked at. A
-    /// drag in the scrollback would have highlighted nothing.
-    view_moved: bool,
 }
 
 impl App {
@@ -326,8 +385,9 @@ impl App {
             // whose grid is exactly `cols` x `rows` — and stays so after the first `Configure`.
             window: Size::new(g.w + CHROME_W, g.h + CHROME_H),
             maximized: false,
-            grid: Grid::new(cols, rows),
-            parser: Parser::new(),
+            tabs: alloc::vec![Term::new(TAB_KEY_BASE, cols, rows)],
+            current: TAB_KEY_BASE,
+            next_key: TAB_KEY_BASE + 1,
             menus: MenuState::new(MENU_COUNT),
             focused: true,
             metrics,
@@ -336,13 +396,10 @@ impl App {
             // `libui`'s `Palette` into the shared `Theme`; this one stays where it is, because
             // it is defined by what programs expect rather than by how this system looks.
             palette: Palette::default(),
-            outbox: Vec::new(),
             move_requested: false,
             resize_requested: None,
             state_requested: None,
             closing: false,
-            view_top: None,
-            view_moved: false,
             clip_request: None,
         }
     }
@@ -379,11 +436,11 @@ impl App {
         self.window = size;
         let cols = (size.w.saturating_sub(CHROME_W) / self.metrics.cell_w).max(1) as usize;
         let rows = (size.h.saturating_sub(CHROME_H) / self.metrics.cell_h).max(1) as usize;
-        let reflow = self.grid.resize(cols, rows);
+        let reflow = self.tab_mut().grid.resize(cols, rows);
         // **Through the map, not around it.** `view_top` is an absolute line number and the
         // rewrap changed how many lines exist above it.
-        self.view_top = self.view_top.map(|t| self.grid.clamp_view(reflow.map_line(t)));
-        self.view_moved = true;
+        self.tab_mut().view_top = self.tab_mut().view_top.map(|t| self.tab_mut().grid.clamp_view(reflow.map_line(t)));
+        self.tab_mut().view_moved = true;
         Some(Resized { evicted: reflow.evicted_lines() })
     }
 
@@ -391,7 +448,10 @@ impl App {
     pub fn grid_origin(&self) -> libdraw::geom::Point {
         libdraw::geom::Point::new(
             WINDOW_CONTENT_X as i32,
-            (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H) as i32,
+            // **`TAB_STRIP_H` since M14 Part B**, and leaving it out draws the grid *underneath*
+            // the strip — which `the_window_is_the_grid_plus_its_chrome` caught, because it adds
+            // the chrome up rather than checking the parts it remembers.
+            (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H) as i32,
         )
     }
 
@@ -400,11 +460,8 @@ impl App {
     /// The one call Part C replaces: today the loopback hands it what the keyboard produced,
     /// and then it will be what the tty server wrote.
     pub fn feed(&mut self, bytes: &[u8]) {
-        let mut out = [Op::Print('\0'); MAX_PER_BYTE];
-        for &b in bytes {
-            let n = self.parser.feed(b, &mut out);
-            self.grid.apply_all(&out[..n]);
-        }
+        let key = self.current;
+        self.feed_tab(key, bytes);
     }
 
     /// Queue `bytes` for the program on the other end.
@@ -417,7 +474,7 @@ impl App {
             return;
         }
         self.snap_to_bottom();
-        self.outbox.extend_from_slice(bytes);
+        self.tab_mut().outbox.extend_from_slice(bytes);
     }
 
     /// Whether a `StartMove` is owed, clearing it.
@@ -442,15 +499,15 @@ impl App {
 
     /// Take everything the user has typed since this was last called.
     pub fn take_outbox(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.outbox)
+        core::mem::take(&mut self.tab_mut().outbox)
     }
 
     /// Follow the output again, repainting if that moved the view.
     pub fn snap_to_bottom(&mut self) {
-        if self.view_top.is_some_and(|t| self.grid.clamp_view(t) != self.grid.top_line()) {
-            self.view_moved = true;
+        if self.tab_mut().view_top.is_some_and(|t| self.tab_mut().grid.clamp_view(t) != self.tab_mut().grid.top_line()) {
+            self.tab_mut().view_moved = true;
         }
-        self.view_top = None;
+        self.tab_mut().view_top = None;
     }
 
     /// The absolute line number of the viewport's first row.
@@ -459,9 +516,9 @@ impl App {
     /// where lines go, and an anchor kept in step by a callback is an anchor that is wrong
     /// whenever somebody adds a second path into the grid.
     pub fn view_line(&self) -> u64 {
-        match self.view_top {
-            Some(t) => self.grid.clamp_view(t),
-            None => self.grid.top_line(),
+        match self.tab().view_top {
+            Some(t) => self.tab().grid.clamp_view(t),
+            None => self.tab().grid.top_line(),
         }
     }
 
@@ -475,14 +532,121 @@ impl App {
     /// case: [`Grid::take_damage`]'s contract is "I am about to draw these rows", which a full
     /// repaint satisfies, and leaving it unread would carry stale rows into the next frame.
     pub fn damage_rows(&mut self) -> Vec<usize> {
-        let back = (self.grid.top_line() - self.view_line()) as usize;
-        let rows = self.grid.rows();
-        let moved = core::mem::take(&mut self.view_moved);
-        let dirty = self.grid.take_damage();
+        let back = (self.tab_mut().grid.top_line() - self.view_line()) as usize;
+        let rows = self.tab_mut().grid.rows();
+        let moved = core::mem::take(&mut self.tab_mut().view_moved);
+        let dirty = self.tab_mut().grid.take_damage();
         if moved {
             return (0..rows).collect();
         }
         dirty.into_iter().filter_map(|s| s.checked_add(back).filter(|v| *v < rows)).collect()
+    }
+
+    /// The current tab. **Never `None`** — `tabs` is never empty, and a `current` that named a
+    /// closed tab would be a bug this would hide rather than report.
+    fn tab(&self) -> &Term {
+        self.tabs.iter().find(|t| t.key == self.current).unwrap_or(&self.tabs[0])
+    }
+
+    /// The current tab, mutably. See [`tab`](Self::tab).
+    fn tab_mut(&mut self) -> &mut Term {
+        let cur = self.current;
+        match self.tabs.iter().position(|t| t.key == cur) {
+            Some(i) => &mut self.tabs[i],
+            None => &mut self.tabs[0],
+        }
+    }
+
+    /// The current tab's grid — the screen, the cursor and the scrollback.
+    pub fn grid(&self) -> &Grid {
+        &self.tab().grid
+    }
+
+    /// Every tab, for the binary that owns the ttys behind them.
+    pub fn tabs_mut(&mut self) -> &mut [Term] {
+        &mut self.tabs
+    }
+
+    /// What the strip draws: a label and a key per tab, current first-class.
+    pub fn tab_labels(&self) -> Vec<(u64, alloc::string::String)> {
+        // **Numbered rather than named.** A terminal tab is named after what is running in it,
+        // and nothing tells this application that yet — the shell would have to set a title. A
+        // number is the honest label until it does, and it is the one thing that distinguishes
+        // two tabs showing the same prompt.
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.key, alloc::format!("Terminal {}", i + 1)))
+            .collect()
+    }
+
+    /// Which tab is current.
+    pub fn current_tab(&self) -> u64 {
+        self.current
+    }
+
+    /// The current tab's grid, mutably.
+    ///
+    /// **Published for tests and for the selection**, which is the one thing outside this crate
+    /// that drives the grid rather than reading it.
+    pub fn grid_mut(&mut self) -> &mut Grid {
+        &mut self.tab_mut().grid
+    }
+
+    /// Repaint the current tab's grid entirely — what a resize means.
+    pub fn damage_all(&mut self) {
+        self.tab_mut().grid.damage_all();
+    }
+
+    /// Feed bytes from tab `key`'s tty into *that tab's* parser.
+    ///
+    /// **Named rather than current**, which is the whole of what makes a background tab work: a
+    /// shell prints when it likes, and routing its output to whatever tab happens to be on screen
+    /// would interleave two sessions into one grid.
+    pub fn feed_tab(&mut self, key: u64, bytes: &[u8]) {
+        let Some(i) = self.tabs.iter().position(|t| t.key == key) else { return };
+        let t = &mut self.tabs[i];
+        let mut out = [Op::Print('\0'); MAX_PER_BYTE];
+        for &b in bytes {
+            let n = t.parser.feed(b, &mut out);
+            t.grid.apply_all(&out[..n]);
+        }
+    }
+
+    /// Open a tab and make it current, returning its key.
+    ///
+    /// **The grid is a fresh one of the same shape**, which is the whole of what a tab is here:
+    /// a second terminal in the same window. Inheriting the first's scrollback is the mistake
+    /// this split exists to prevent, and it is a mistake you make by *sharing* rather than by
+    /// forgetting to copy — so nothing is copied.
+    pub fn open_tab(&mut self) -> u64 {
+        let key = self.next_key;
+        self.next_key += 1;
+        let (cols, rows) = (self.tab().grid.cols(), self.tab().grid.rows());
+        self.tabs.push(Term::new(key, cols, rows));
+        self.current = key;
+        key
+    }
+
+    /// Close tab `key`. Returns whether anything was closed.
+    ///
+    /// **Closing the last tab closes the window**, which is what the chord means everywhere else
+    /// it exists — `nxedit` settled that in M12 Part D and this follows it rather than inventing
+    /// a second answer. The window's own close path is the one that runs, so an application that
+    /// grows something to ask about unsaved work asks here too.
+    pub fn close_tab(&mut self, key: u64) -> bool {
+        let Some(i) = self.tabs.iter().position(|t| t.key == key) else { return false };
+        if self.tabs.len() == 1 {
+            self.closing = true;
+            return true;
+        }
+        self.tabs.remove(i);
+        if self.current == key {
+            // The one that took its place, or the last if it was the end — never an index that
+            // no longer exists.
+            self.current = self.tabs[i.min(self.tabs.len() - 1)].key;
+        }
+        true
     }
 
     /// Apply a message from the chrome.
@@ -499,12 +663,23 @@ impl App {
         }
         match msg {
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::NewTab => {
+                self.open_tab();
+            }
+            Msg::CloseTab(key) => {
+                self.close_tab(key);
+            }
+            Msg::SelectTab(key) => {
+                if self.tabs.iter().any(|t| t.key == key) {
+                    self.current = key;
+                }
+            }
             // **Nothing selected is not a request.** A copy that pushed an empty entry would move
             // the ring's serial under every client that was mid-cycle, for a gesture that had
             // nothing to copy. The Edit row is disabled in that state too, so this is the second
             // of two guards rather than the only one — the chord reaches here with no menu open.
             Msg::Copy => {
-                if let Some(text) = self.grid.selected_text() {
+                if let Some(text) = self.tab_mut().grid.selected_text() {
                     self.clip_request = Some(ClipRequest::Copy(text));
                 }
             }
@@ -538,10 +713,10 @@ impl App {
                 self.feed(b"\x1b[2J\x1b[H");
             }
             Msg::Reset => {
-                let (cols, rows) = (self.grid.cols(), self.grid.rows());
-                self.grid = Grid::new(cols, rows);
-                self.parser = Parser::new();
-                self.view_top = None;
+                let (cols, rows) = (self.tab_mut().grid.cols(), self.tab_mut().grid.rows());
+                self.tab_mut().grid = Grid::new(cols, rows);
+                self.tab_mut().parser = Parser::new();
+                self.tab_mut().view_top = None;
             }
             Msg::Scroll(p) => self.scroll_to(p),
             Msg::Key(k) => self.key(k),
@@ -578,15 +753,15 @@ impl App {
             if p.flags & POINTER_PRESSED != 0 {
                 // A press with no drag selects nothing and *clears* what was selected — which
                 // is what a click anywhere else in the window means too.
-                self.grid.select_from(line, col);
+                self.tab_mut().grid.select_from(line, col);
                 // **The viewport, not the screen** — see [`view_moved`](Self::view_moved).
-                self.view_moved = true;
+                self.tab_mut().view_moved = true;
             }
             return;
         }
         if p.kind == POINTER_MOTION && p.buttons & 1 != 0 {
-            self.grid.extend(line, col);
-            self.view_moved = true;
+            self.tab_mut().grid.extend(line, col);
+            self.tab_mut().view_moved = true;
         }
     }
 
@@ -601,13 +776,13 @@ impl App {
         }
         let col = (x as u32 / self.metrics.cell_w) as usize;
         let row = (y as u32 / self.metrics.cell_h) as usize;
-        if row >= self.grid.rows() {
+        if row >= self.tab().grid.rows() {
             return None;
         }
         // Clamped rather than refused: a drag that runs off the right edge means "to the end of
         // the line", which is what every text selection does and what a `None` here would turn
         // into a gesture that stops moving.
-        Some((self.view_line() + row as u64, col.min(self.grid.cols())))
+        Some((self.view_line() + row as u64, col.min(self.tab().grid.cols())))
     }
 
     /// Type what a key produced, if it is a key that types.
@@ -641,8 +816,8 @@ impl App {
         //
         // The return value is the repaint: clearing nothing must not damage the viewport, or
         // every keystroke in a terminal with no selection would repaint every row.
-        if self.grid.clear_selection() {
-            self.view_moved = true;
+        if self.tab_mut().grid.clear_selection() {
+            self.tab_mut().view_moved = true;
         }
         let mut out = [0u8; libterm::encode::MAX_ENCODED];
         let n = libterm::encode::encode(k.keycode, k.modifiers, &mut out);
@@ -659,7 +834,8 @@ impl App {
             return;
         }
         let s = self.scroll();
-        self.scroll_to_line(self.grid.oldest_line() + s.offset_at(self.track_h(), p.y) as u64);
+        let line = self.tab().grid.oldest_line() + s.offset_at(self.track_h(), p.y) as u64;
+        self.scroll_to_line(line);
     }
 
     /// Anchor the viewport at absolute line `top`, clamped, repainting if that moved it.
@@ -667,21 +843,21 @@ impl App {
     /// The one place the view changes, so that the mouse wheel and a `Shift-PageUp` are a
     /// coordinate conversion away from working rather than a second copy of this.
     pub fn scroll_to_line(&mut self, top: u64) {
-        let want = self.grid.clamp_view(top);
+        let want = self.tab_mut().grid.clamp_view(top);
         if want != self.view_line() {
-            self.view_moved = true;
+            self.tab_mut().view_moved = true;
         }
         // **Recorded even at the bottom**, rather than becoming `None` again: dragging the thumb
         // to the end means "show me the last screen", and a program printing afterwards must not
         // pull the view along with it. Following resumes when the user types.
-        self.view_top = Some(want);
+        self.tab_mut().view_top = Some(want);
     }
 
     /// The scrollbar's state: the viewport is a window onto the scrollback plus the screen.
     pub fn scroll(&self) -> ScrollState {
-        let rows = self.grid.rows() as u32;
-        let oldest = self.grid.oldest_line();
-        let back = (self.grid.top_line() - oldest) as u32;
+        let rows = self.tab().grid.rows() as u32;
+        let oldest = self.tab().grid.oldest_line();
+        let back = (self.tab().grid.top_line() - oldest) as u32;
         ScrollState {
             offset: (self.view_line() - oldest) as u32,
             visible: rows,
@@ -730,10 +906,19 @@ impl App {
         vec![
             Menu {
                 title: "File",
-                // No Close Tab: the terminal has no tabs until Part B. No Quit: decision 4
-                // settles what "quit" means to an application with unsaved work, and settling
-                // it here as "the window goes" would be one of two answers in two places.
-                items: vec![Item::plain("Close Window", Msg::Close)],
+                items: vec![
+                    Item::new("New Tab", Accel::ctrl_shift(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
+                    // **Enabled on the last tab too**, unlike `nxfiles`: there closing the last
+                    // tab is a no-op, so the row would offer nothing; here it closes the window,
+                    // which is what the chord means everywhere else it exists.
+                    Item::new(
+                        "Close Tab",
+                        Accel::ctrl_shift(CLOSE_TAB_KEYCODE, "W"),
+                        Msg::CloseTab(self.current),
+                    ),
+                    Item::Separator,
+                    Item::plain("Close Window", Msg::Close),
+                ],
             },
             Menu {
                 title: "Edit",
@@ -742,7 +927,7 @@ impl App {
                     // copy path already declines an empty selection, and a row that looks
                     // available but declines is the thing that reads as a broken menu.
                     Item::new("Copy", Accel::ctrl_shift(COPY_KEYCODE, "C"), Msg::Copy)
-                        .enabled(self.grid.has_selection()),
+                        .enabled(self.tab().grid.has_selection()),
                     Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
                     Item::Separator,
                     Item::plain("Clear", Msg::Clear),
@@ -756,7 +941,7 @@ impl App {
     /// handed down, rather than being fetched from a default in the middle of a view.
     pub fn view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
-        let grid_px = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
+        let grid_px = self.metrics.pixel_size(self.tab().grid.cols(), self.tab().grid.rows());
 
         // **The bar is `libui::menu`'s, and so is what hangs off it.** It was one hand-rolled
         // `button` labelled "Terminal"; the word a menu bar carries is not a button, and the
@@ -770,6 +955,27 @@ impl App {
             &ui,
             BAR_H,
         );
+        // **The tab strip, below the menu bar and above the grid** (M14 Part B). Same order as
+        // `nxedit` and `nxfiles`, which is the point: a person who learned where the tabs are in
+        // one window should not have to look somewhere else in the next.
+        //
+        // **Always drawn, even with one tab.** Both siblings do, and a strip that appeared on the
+        // second tab would move every row of the grid down the moment you opened one — a terminal
+        // reflowing its scrollback because you pressed a chord.
+        let labels = self.tab_labels();
+        let tabs: Vec<libui::widget::Tab<'_>> = labels
+            .iter()
+            .map(|(key, label)| libui::widget::Tab { key: *key, label, marked: false })
+            .collect();
+        let strip = libui::widget::tab_strip(
+            &tabs,
+            self.current,
+            hovered,
+            Msg::SelectTab,
+            Msg::CloseTab,
+            &ui,
+        );
+
         // **The title bar is the terminal's own chrome** (M9 Part A), and since Part C all three
         // of its buttons do something: minimise and maximise ask the shell, close is this
         // client's own answer.
@@ -798,6 +1004,10 @@ impl App {
             dock(
                 vec![
                 docked(Edge::Top, bar.key(BAR_KEY)),
+                docked(
+                    Edge::Top,
+                    sized(Size::new(0, TAB_STRIP_H), strip).key(TAB_STRIP_KEY),
+                ),
                 docked(
                     Edge::Right,
                     // **Sized, so the bar ends where the grip begins.** The dock's right slot
@@ -951,10 +1161,10 @@ mod tests {
         a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
         a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
         a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 0, 0, 5 * w, h / 2)));
-        assert_eq!(a.grid.selected_text().as_deref(), Some("hello"), "the drag selected");
+        assert_eq!(a.grid().selected_text().as_deref(), Some("hello"), "the drag selected");
         a.update(Msg::GridPointer(ptr(POINTER_MOTION, 0, 0, 9 * w, h / 2)));
         assert_eq!(
-            a.grid.selected_text().as_deref(),
+            a.grid().selected_text().as_deref(),
             Some("hello"),
             "and a pointer merely passing over it afterwards did not extend it"
         );
@@ -977,8 +1187,8 @@ mod tests {
         // and nothing would be able to interrupt a running program.
         let mut a = app();
         a.feed(b"hello");
-        a.grid.select_from(0, 0);
-        a.grid.extend(0, 5);
+        a.grid_mut().select_from(0, 0);
+        a.grid_mut().extend(0, 5);
         press(&mut a, COPY_KEYCODE, MOD_CTRL);
         assert_eq!(a.take_clip_request(), None, "a plain Ctrl+C is not a copy");
         assert_eq!(a.take_outbox(), alloc::vec![0x03], "it is the interrupt byte");
@@ -999,10 +1209,10 @@ mod tests {
         // Without it a highlight stays on screen over text that has scrolled away under it.
         let mut a = app();
         a.feed(b"hello");
-        a.grid.select_from(0, 0);
-        a.grid.extend(0, 5);
+        a.grid_mut().select_from(0, 0);
+        a.grid_mut().extend(0, 5);
         press(&mut a, 30, 0); // `a`
-        assert_eq!(a.grid.selection(), None);
+        assert_eq!(a.grid().selection(), None);
     }
 
     #[test]
@@ -1016,7 +1226,7 @@ mod tests {
         for i in 0..40 {
             a.feed(alloc::format!("line {i}\r\n").as_bytes());
         }
-        a.scroll_to_line(a.grid.oldest_line());
+        a.scroll_to_line(a.grid().oldest_line());
         let _ = a.damage_rows();
         let h = a.metrics.cell_h as i32;
         a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
@@ -1142,11 +1352,11 @@ mod tests {
         let want = Size::new(1280, 752);
         assert!(a.resize(want).is_some(), "a new size is a change");
         assert_eq!(a.window_size(), want, "committed at exactly what was asked for");
-        assert_eq!(a.grid.cols(), ((1280 - SCROLL_W) / m.cell_w) as usize);
-        assert_eq!(a.grid.rows(), ((752 - BAR_H - TITLE_BAR_H) / m.cell_h) as usize);
+        assert_eq!(a.grid().cols(), ((1280 - SCROLL_W) / m.cell_w) as usize);
+        assert_eq!(a.grid().rows(), ((752 - BAR_H - TAB_STRIP_H - TITLE_BAR_H) / m.cell_h) as usize);
         // And the cells really do fit: chrome plus grid is no larger than the window.
-        let g = m.pixel_size(a.grid.cols(), a.grid.rows());
-        assert!(g.w + SCROLL_W <= want.w && g.h + BAR_H + TITLE_BAR_H <= want.h);
+        let g = m.pixel_size(a.grid().cols(), a.grid().rows());
+        assert!(g.w + SCROLL_W <= want.w && g.h + BAR_H + TAB_STRIP_H + TITLE_BAR_H <= want.h);
     }
 
     #[test]
@@ -1166,7 +1376,7 @@ mod tests {
         // given, and a client that panicked here would be one a manager could crash.
         let mut a = app();
         assert!(a.resize(Size::new(1, 1)).is_some());
-        assert_eq!((a.grid.cols(), a.grid.rows()), (1, 1));
+        assert_eq!((a.grid().cols(), a.grid().rows()), (1, 1));
         assert_eq!(a.window_size(), Size::new(1, 1));
     }
 
@@ -1183,7 +1393,7 @@ mod tests {
         // and nothing has been evicted: line 4 is where "line2" starts. Anchoring on a
         // *continuation* row would make the assertion below wrong rather than the code — the
         // row that then holds that text is the rejoined line, and the text is in its middle.
-        a.scroll_to_line(a.grid.oldest_line() + 4);
+        a.scroll_to_line(a.grid().oldest_line() + 4);
         let want = line(&a, 0);
         assert!(want.starts_with("line2"), "the anchor is where it is thought to be: {want:?}");
 
@@ -1202,8 +1412,8 @@ mod tests {
     /// asks what the user can see. The two are the same thing while the view follows the
     /// bottom, which is every test written before scrollback existed.
     fn line(a: &App, row: usize) -> alloc::string::String {
-        let s: alloc::string::String = (0..a.grid.cols())
-            .map(|c| a.grid.view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch))
+        let s: alloc::string::String = (0..a.grid().cols())
+            .map(|c| a.grid().view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch))
             .collect();
         s.trim_end().into()
     }
@@ -1254,7 +1464,7 @@ mod tests {
         a.feed(b"hi\r\n\x1b[1mbold\x1b[m");
         assert_eq!(line(&a, 0), "hi");
         assert_eq!(line(&a, 1), "bold");
-        assert!(a.grid.cell(1, 0).unwrap().attrs.flags.contains(libterm::cell::Flags::BOLD));
+        assert!(a.grid().cell(1, 0).unwrap().attrs.flags.contains(libterm::cell::Flags::BOLD));
     }
 
     #[test]
@@ -1264,7 +1474,7 @@ mod tests {
         a.update(Msg::Clear);
         assert_eq!(line(&a, 0), "");
         assert_eq!(line(&a, 1), "");
-        assert_eq!(a.grid.cursor(), (0, 0));
+        assert_eq!(a.grid().cursor(), (0, 0));
     }
 
     #[test]
@@ -1275,13 +1485,13 @@ mod tests {
         for _ in 0..10 {
             a.feed(b"x\r\n");
         }
-        assert!(a.grid.scrollback().len() > 0, "nothing scrolled off");
+        assert!(a.grid().scrollback().len() > 0, "nothing scrolled off");
 
         a.update(Msg::Clear);
-        assert!(a.grid.scrollback().len() > 0, "clear threw away the scrollback");
+        assert!(a.grid().scrollback().len() > 0, "clear threw away the scrollback");
 
         a.update(Msg::Reset);
-        assert_eq!(a.grid.scrollback().len(), 0, "reset kept the scrollback");
+        assert_eq!(a.grid().scrollback().len(), 0, "reset kept the scrollback");
     }
 
     #[test]
@@ -1291,7 +1501,7 @@ mod tests {
         a.feed(b"\x1b[1;31m");
         a.update(Msg::Reset);
         a.feed(b"x");
-        assert_eq!(a.grid.cell(0, 0).unwrap().attrs, libterm::cell::Attributes::default());
+        assert_eq!(a.grid().cell(0, 0).unwrap().attrs, libterm::cell::Attributes::default());
     }
 
     #[test]
@@ -1404,12 +1614,17 @@ mod tests {
         /// Everything about a terminal that any of these rows can move.
         fn digest(a: &mut App) -> alloc::string::String {
             let clip = a.take_clip_request();
+            // **The tab count and the current tab are in here** since M14 Part B: New Tab changes
+            // neither the grid nor the clipboard, so a digest without them would call it a row
+            // that does nothing and the negative control below would fail for the wrong reason.
             alloc::format!(
-                "{clip:?}|{}|{}|{}|{:?}",
+                "{clip:?}|{}|{}|{}|{:?}|{}|{}",
                 line(a, 0),
                 a.closing(),
-                a.grid.has_selection(),
+                a.grid().has_selection(),
                 a.menus.open(),
+                a.tab_labels().len(),
+                a.current_tab(),
             )
         }
         /// A terminal with text on screen and five characters of it swept out, so Copy is live.
@@ -1452,7 +1667,7 @@ mod tests {
                 "{label} changes nothing, so this row proves nothing about routing"
             );
         }
-        assert_eq!(checked, 2, "Copy and Paste are the rows with chords");
+        assert_eq!(checked, 4, "New Tab, Close Tab, Copy and Paste are the rows with chords");
     }
     /// The menu is **never** in the window's tree, open or closed.
     ///
@@ -1553,9 +1768,9 @@ mod tests {
             a.grid_origin(),
             libdraw::geom::Point::new(
                 WINDOW_CONTENT_X as i32,
-                (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H) as i32
+                (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H) as i32
             ),
-            "the grid starts below the bars and inside the frame"
+            "the grid starts below the bars and the tab strip, and inside the frame"
         );
         // The window is the grid plus chrome, and the chrome is *all* of it — a test that added
         // up only the parts it remembered would pass for a frame that took space from the grid.
@@ -1592,7 +1807,7 @@ mod tests {
         }
         let s = a.scroll();
         assert!(s.scrollable(), "ten lines scrolled off and the bar says nothing to scroll");
-        assert_eq!(s.total, a.grid.scrollback().len() as u32 + 6);
+        assert_eq!(s.total, a.grid().scrollback().len() as u32 + 6);
     }
 
     /// A press-and-drag on the scrollbar to `y`, in widget-local coordinates.
@@ -1618,15 +1833,15 @@ mod tests {
     fn dragging_the_scrollbar_moves_the_view_into_the_scrollback() {
         let mut a = app();
         produce(&mut a, 40);
-        assert_eq!(a.view_line(), a.grid.top_line(), "starts at the bottom");
+        assert_eq!(a.view_line(), a.grid().top_line(), "starts at the bottom");
 
         grab(&mut a, 0);
-        assert_eq!(a.view_line(), a.grid.oldest_line(), "the top of the track is the oldest");
+        assert_eq!(a.view_line(), a.grid().oldest_line(), "the top of the track is the oldest");
         assert_eq!(line(&a, 0), "0", "and the oldest line is on show");
 
         let bottom = a.track_h() as i32;
         grab(&mut a, bottom);
-        assert_eq!(a.view_line(), a.grid.top_line(), "the bottom is the live screen again");
+        assert_eq!(a.view_line(), a.grid().top_line(), "the bottom is the live screen again");
     }
 
     #[test]
@@ -1654,10 +1869,10 @@ mod tests {
         let mut a = app();
         produce(&mut a, 40);
         grab(&mut a, 0);
-        assert_ne!(a.view_line(), a.grid.top_line(), "the premise: scrolled away");
+        assert_ne!(a.view_line(), a.grid().top_line(), "the premise: scrolled away");
 
         typed(&mut a, 35); // h
-        assert_eq!(a.view_line(), a.grid.top_line(), "typing did not come back to the bottom");
+        assert_eq!(a.view_line(), a.grid().top_line(), "typing did not come back to the bottom");
 
         // ...and a key that encodes to nothing does not, because it is not typing.
         grab(&mut a, 0);
@@ -1674,11 +1889,11 @@ mod tests {
         produce(&mut a, 40);
         grab(&mut a, 0);
         let showing: alloc::vec::Vec<alloc::string::String> =
-            (0..a.grid.rows()).map(|r| line(&a, r)).collect();
+            (0..a.grid().rows()).map(|r| line(&a, r)).collect();
 
         a.feed(b"more\r\nand more\r\n");
         let after: alloc::vec::Vec<alloc::string::String> =
-            (0..a.grid.rows()).map(|r| line(&a, r)).collect();
+            (0..a.grid().rows()).map(|r| line(&a, r)).collect();
         assert_eq!(showing, after, "the view moved under the reader");
     }
 
@@ -1705,7 +1920,7 @@ mod tests {
         let _ = a.damage_rows();
 
         // Scrolled back by exactly one line: screen row 0 shows at viewport row 1.
-        let back_one = a.grid.top_line() - 1;
+        let back_one = a.grid().top_line() - 1;
         a.scroll_to_line(back_one);
         let _ = a.damage_rows(); // the scroll itself damaged everything
         a.feed(b"\x1b[1;1Hz"); // touch screen row 0
@@ -1730,12 +1945,12 @@ mod tests {
         assert!(a.damage_rows().is_empty(), "the premise: nothing outstanding");
 
         grab(&mut a, 0);
-        assert_eq!(a.damage_rows().len(), a.grid.rows(), "a scroll must repaint the viewport");
+        assert_eq!(a.damage_rows().len(), a.grid().rows(), "a scroll must repaint the viewport");
 
         // ...and snapping back does too.
         let _ = a.damage_rows();
         a.snap_to_bottom();
-        assert_eq!(a.damage_rows().len(), a.grid.rows());
+        assert_eq!(a.damage_rows().len(), a.grid().rows());
 
         // A scroll that lands where the view already is repaints nothing.
         let _ = a.damage_rows();
@@ -1907,6 +2122,100 @@ mod tests {
         check(&mut a, None, &mut tree, "with Edit open and nothing hovered");
         a.update(Msg::MenuBar(1));
         check(&mut a, None, &mut tree, "back to shut");
+    }
+
+    // --- tabs (M14 Part B) --------------------------------------------------
+
+    /// A second tab is a second terminal, sharing nothing with the first.
+    ///
+    /// **The failure this is written against is inheritance, not absence.** Tabs built by adding
+    /// a strip over one grid look right until you type in the second one and the first scrolls;
+    /// the plan names it exactly — "getting it wrong is how a second tab inherits the first's
+    /// scrollback".
+    #[test]
+    fn a_second_tab_shares_nothing_with_the_first() {
+        let mut a = app();
+        a.feed(b"first");
+        let one = a.current_tab();
+
+        a.update(Msg::NewTab);
+        let two = a.current_tab();
+        assert_ne!(two, one, "a new tab is current, and is not the old one");
+        assert_eq!(line(&a, 0), "", "and its grid is empty");
+
+        a.feed(b"second");
+        assert_eq!(line(&a, 0), "second");
+        // …and the first is untouched, which is the half that inheritance breaks.
+        a.update(Msg::SelectTab(one));
+        assert_eq!(line(&a, 0), "first", "the first tab kept its own screen");
+
+        // The outboxes are separate too: what is typed into one tab must not reach the other's
+        // shell. `take_outbox` is drained per tab by the binary, so this checks them by key.
+        a.update(Msg::Key(KeyEvent::new(1, 30, KEY_DOWN as u16, 0))); // `a`
+        let outboxes: alloc::vec::Vec<(u64, usize)> =
+            a.tabs_mut().iter_mut().map(|t| (t.key(), t.take_outbox().len())).collect();
+        assert_eq!(outboxes, alloc::vec![(one, 1), (two, 0)], "only the current tab was typed at");
+    }
+
+    /// Closing the last tab closes the window; closing any other leaves a tab current.
+    #[test]
+    fn closing_the_last_tab_closes_the_window() {
+        let mut a = app();
+        let one = a.current_tab();
+        a.update(Msg::NewTab);
+        let two = a.current_tab();
+
+        a.update(Msg::CloseTab(two));
+        assert!(!a.closing(), "one tab left, so the window stays");
+        assert_eq!(a.current_tab(), one, "and the survivor is current");
+        assert_eq!(a.tab_labels().len(), 1);
+
+        a.update(Msg::CloseTab(one));
+        assert!(a.closing(), "the last tab takes the window with it");
+    }
+
+    /// Closing the current tab picks a neighbour rather than an index that no longer exists.
+    #[test]
+    fn closing_the_current_tab_falls_to_a_neighbour() {
+        let mut a = app();
+        let one = a.current_tab();
+        a.update(Msg::NewTab);
+        let two = a.current_tab();
+        a.update(Msg::NewTab);
+        let three = a.current_tab();
+
+        // The middle one: what takes its place is the one after it.
+        a.update(Msg::SelectTab(two));
+        a.update(Msg::CloseTab(two));
+        assert_eq!(a.current_tab(), three, "the tab that took its place");
+
+        // The last one: there is nothing after it, so the one before.
+        a.update(Msg::SelectTab(three));
+        a.update(Msg::CloseTab(three));
+        assert_eq!(a.current_tab(), one, "the end falls back rather than off");
+        assert!(!a.closing());
+    }
+
+    /// A key names a tab that has gone, and nothing happens to the tab that took its number.
+    ///
+    /// **Why keys are not indices**, asserted rather than asserted-in-a-comment: a message
+    /// naming a position outlives the frame that produced it, and the tab now at that position
+    /// is a different session.
+    #[test]
+    fn a_message_naming_a_closed_tab_does_nothing() {
+        let mut a = app();
+        let one = a.current_tab();
+        a.update(Msg::NewTab);
+        let two = a.current_tab();
+        a.update(Msg::CloseTab(two));
+        assert_eq!(a.current_tab(), one);
+
+        // Both of these named the tab that is gone.
+        a.update(Msg::SelectTab(two));
+        assert_eq!(a.current_tab(), one, "selecting a closed tab changes nothing");
+        a.update(Msg::CloseTab(two));
+        assert!(!a.closing(), "closing a closed tab does not close the window");
+        assert_eq!(a.tab_labels().len(), 1);
     }
 
 }
