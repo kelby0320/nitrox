@@ -23603,3 +23603,122 @@ is the half that has no diff to point at. The reviewer's four negative controls 
 tests all fired, so the tests written were not the problem — the tests *not* written were, and
 each of the three is now pinned by one, including the two the reviewer had proved with throwaway
 probes.
+
+---
+
+## 2026-09-04 — one process, several windows (M14 Part B, New Window and Quit)
+
+All three applications open second top-level windows. The protocol has allowed it since M2 Part A
+and nothing had done it; what stood in the way was the shape of every `main`, and
+`widget-toolkit.md` §11 has carried a trigger for that conversion since M12 Part A — "the next
+part that touches both applications' main loops". This is that part.
+
+**`Child` hosts a top-level now, and the role check it carried was *answered* rather than
+removed.** Its objection was precise: a `Normal` created through `open` "would ignore every resize
+a manager asked of it for the rest of its life — silently, because declining a `Configure` is
+legal". So `open_sized` takes a size instead of measuring one — measuring is a child's rule, since
+a popup is as big as its rows while a top-level contains a `dock`, which measures as whatever it
+is offered — and `resize` is the answer to the objection.
+
+**Two seams came out of doing it rather than planning it.** `present_laid_out` exists because a
+main window needs its own layout: its menu popups' anchors are read from it, and `present`
+computed one internally and threw it away, so a converted window would have laid out twice a
+frame. And `present_custom` exists because `nxterm`'s grid is a `custom` node — `present` painted
+with an empty callback, which no popup or dialog ever minded because they are made of widgets and
+nothing else.
+
+**The first answer to the layout problem was worse and worth recording.** Retaining the layout on
+the `Child` and letting `route` reuse it is arguably more correct — it is the tree/layout
+divergence filed during PR #281's review — but it changes routing for every popup and dialog in
+the tree, which is not a passenger to put on a conversion.
+
+**The conversion itself was the same four steps three times**, each compiling and gated before the
+next: the window becomes a `Child`; the per-window state becomes one value; the loop iterates;
+events dispatch to the window that owns them. The trick that made it tractable was destructuring
+the `Win` at the top of the loop, so six hundred lines of body kept every identifier and the
+compiler found the places that needed a deref.
+
+**Uniform or nothing, and that was decided before starting.** Had the first window stayed the
+loop's own with extras as `Child`s, closing the first would have killed the rest — worse than not
+having New Window at all.
+
+**What a new window *is* differs per application, and each answer is the same shape**: it is a
+second instance, not a second view. A new editor window is empty, a new browser window is at home
+rather than at this window's directory, a new terminal window has one fresh tab with its own
+shell. A window that inherited the first's contents would be a split, which is a different
+feature.
+
+**Quit follows decision 4** — settled by the maintainer while this was being built. Each window is
+asked exactly as its own close button asks, so a window with unsaved work raises its own dialog
+and the quit waits; **cancelling aborts the quit and leaves the rest open**. That is why `nxedit`
+asks one window at a time rather than sending `Close` to all of them, which would put a dialog on
+every window and take the first answer as the verdict for all. `nxfiles` and `nxterm` have nothing
+to refuse with, so their quit is the same rule with nothing in its way.
+
+**One real bug, found by a gate and not by review.** `Child::resize` built a *new* `BufferPool`,
+and the compositor rejected it — it still holds the buffers the old pool attached. The rejection
+was quiet enough that the resize reported success and the window simply stopped committing frames;
+`check-login`'s reflow step caught it three resizes in. The pool is kept now, which is what every
+`main` did before the conversion: `acquire` is handed the size every frame and replaces a buffer
+left at the old shape when it next needs one.
+
+**Both gates assert the shell's account, not the client's.** `check-login` presses `Ctrl+Shift+N`
+and checks that the *manager* placed a window and that its list counts three; `check-terminal`
+checks that the terminal's second window has a **shell**, because a top-level that opened with
+nothing to talk to would look identical from outside. A client can say anything about itself.
+
+**And a coupling that has now bitten twice** is pinned: `check-login` clicks a menu row by index,
+and adding New Window and Quit moved `Rename` from 5 to 8. Both times the failure appeared as a
+rename prompt that never opened, several steps from the menu it was about.
+`the_gate_clicks_the_row_it_means` makes that number wrong in a second instead of in a
+three-minute boot — the same job `the_gate_aims_inside_the_file_word` does for the bar word.
+
+---
+
+## 2026-09-04 — what PR #283's review found: three lines the conversion needed to move
+
+Three blocking findings, and the first two are the same kind of mistake: a line that was correct
+while there was one window, left in place by a change whose whole subject was that there are now
+several. `nxterm` moved both; `nxedit` and `nxfiles` moved neither.
+
+**`exit(0)` stayed inside the per-window loop**, so closing *any* window ended the process and
+discarded whatever every other window held. This is exactly the failure the "uniform or nothing"
+decision existed to prevent, described in this log and in the PR as the reason for that decision —
+and then shipped anyway, in two of the three applications. It survived because **no gate had ever
+closed a second window**: `check-login` reached the removal path only through Quit. It closes one
+now, with `Ctrl+W` on a one-tab window, and reinstating the `exit(0)` makes it fail.
+
+**Cancelling a Quit did not abort it.** `quit_pending` was set and never cleared, so a *Keep
+editing* answer closed the dialog and the next frame asked again — a question that could not be
+dismissed. Worse in the other direction with two windows: the search for the next window to ask
+*skipped* the one that was confirming, so a second dialog went up while the first was open, which
+is precisely the alternative decision 4 rejected. Nothing tested it, and the plan already had
+decision 4 ticked as built. Answering the question now answers the quit, because the quit is what
+asked it; and nothing is asked at all while any window is confirming.
+
+**And an assertion that could not fail.** The new gate step read the number after
+`window list on cli of `, which is `desktops.len()` — not a window count. `check-login` switches
+desktops early, so the comparison was satisfied whatever the taskbar held, and the line printed
+"3 windows" from a number that meant desktops. It counts the bracketed entries now. The
+`placed window` expectation beside it was genuine, so the feature was not unguarded; the half
+described as *the shell's own account of the list* was decoration.
+
+**A `continue` that changed meaning without changing text.** Inside a single-window body it meant
+"round again, do not wait". Inside `for wi in 0..wins.len()` it means "next window", and the wait
+below then blocks with a frame owed — reintroducing the stale-listing bug PR #257's review had
+removed, in the very code whose comment still explains why that bug was worth removing rather than
+reasoning about. A flag carries the old meaning across the new shape.
+
+**The rule these four share** is that the conversion changed what a *scope* means, and every line
+that depended on the old scope kept compiling. A rename would have been caught by the compiler; a
+reshaping of control flow is caught by nothing. The four negative controls the reviewer ran on the
+library-side tests all fired — the tests written were fine, and the ones not written were the
+binaries', where the mistakes were.
+
+Also fixed: eleven warnings across the three binaries (a `buffers` field and a `Session` parameter
+left over from the pool-rebuilding version the reflow gate caught, `compose_buffer` and `draw` now
+dead, unused imports, `nxterm`'s `resized` declared per drain rather than per event — which would
+have made one window's `Configure` repaint another's grid entirely), and the toolkit's own
+documentation, which still said a `Child` is one of the two parented roles with a size fixed at
+creation. That paragraph is rewritten to say what changed *and why the old restriction existed*,
+because the restriction was load-bearing: `open_sized` and `resize` answer it rather than remove it.

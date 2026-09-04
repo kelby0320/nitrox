@@ -17,18 +17,17 @@
 
 extern crate alloc;
 
-use libdraw::format::PixelFormat;
-use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
+
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_ui};
 use libkern::{exit, kprint};
-use librsproto::surface::{CreateWindowRequest, Role};
-use libsurface::buffers::BufferPool;
+use librsproto::surface::{Role};
+
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
-use libui::diff::Tree;
-use libui::layout::{Layout, layout, locate};
-use libui::paint::{FontMetrics, Theme, paint};
-use libui::route::Router;
+
+use libui::layout::{layout, locate};
+use libui::paint::{FontMetrics, Theme};
+
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
 use nxfiles::{
@@ -159,15 +158,6 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
-/// A private framebuffer of `size` to compose a frame into.
-///
-/// Drawn here and copied into whichever buffer is free, for the reason `nxterm` gives: the
-/// toolkit's damage describes what changed since the *last frame*, and the free buffer holds
-/// the frame before that.
-fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
-    let pitch = (size.w as usize).checked_mul(4)?;
-    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
-}
 
 /// Read `path` and hand the listing to `app`.
 ///
@@ -226,19 +216,6 @@ fn ask_shell_to_open(root_ns: u64, path: &str) -> bool {
     ok
 }
 
-/// Paint `damage` of `app` into `fb`.
-fn draw(
-    fb: &mut MemFramebuffer,
-    ui: &libui::element::Element<Msg>,
-    l: &Layout,
-    font: &Font,
-    theme: &Theme,
-    damage: Rect,
-) {
-    // No `custom` nodes: everything this application draws is a widget the toolkit owns, which
-    // is the difference between it and `nxterm` — and the point of building it second.
-    paint(fb, font, theme, ui, l, damage, &mut |_, _, _, _: &mut MemFramebuffer| {});
-}
 
 /// `HOME` from the setup record, or `/` for a process that was told nothing.
 fn home_of(env: &libstream::wire::Record) -> String {
@@ -269,6 +246,19 @@ fn wait_one(h: u64) {
             u64::MAX,
         )
     };
+}
+
+/// Tell the compositor what a newly created window of this browser is.
+///
+/// **Extracted so a second window gets the same treatment** (M14 Part B): it was inline before
+/// the loop, which was fine while a window was created once and would have been the first thing
+/// New Window quietly failed to do.
+fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32) {
+    if let Some(mut w) = win.window(id)
+        && w.set_title(TITLE).is_err()
+    {
+        kprint(b"nxfiles: SetTitle refused\n");
+    }
 }
 
 /// The theme the shell handed this application, or the built-in one.
@@ -317,7 +307,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut app = App::new(&start);
     navigate(&mut app, root_ns, &start);
 
-    let mut size = app.window_size();
+    let size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
         // Boxed for the reason every client here boxes it: ~9 KiB of message buffers has no
@@ -326,78 +316,141 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         Err(_) => fail(b"nxfiles: connect to /dev/draw FAILED\n"),
     };
     let mut win = Session::new(transport);
-    let window_id =
-        match win.create(&CreateWindowRequest::new(size.w, size.h, Role::Normal), BUFFERS) {
-            Ok(w) => w,
-            Err(_) => fail(b"nxfiles: CreateWindow FAILED\n"),
-        };
-    if let Some(mut w) = win.window(window_id)
-        && w.set_title(TITLE).is_err()
-    {
-        kprint(b"nxfiles: SetTitle refused\n");
-    }
-
-    let mut scratch = match compose_buffer(size) {
-        Some(fb) => fb,
-        None => fail(b"nxfiles: impossible window geometry\n"),
-    };
-    let mut pool = {
-        let Some(mut w) = win.window(window_id) else {
-            fail(b"nxfiles: our own window is gone\n");
-        };
-        match BufferPool::new(&mut w, size, BUFFERS) {
-            Some(p) => p,
-            None => fail(b"nxfiles: buffer alloc FAILED\n"),
+    // **The window is a `libui::window::Child`** (M14 Part B), top-level role and all — the same
+    // value the menu and the dialog have always been. Everything a window needs to be drawn and
+    // routed lives in there, so a second window is a second value rather than a second copy of
+    // this loop.
+    let top = {
+        let ui = app.view(&theme, None);
+        match Child::open_sized(
+            &mut win,
+            Role::Normal,
+            (0, 0),
+            size,
+            &ui,
+            &font,
+            &theme,
+            BUFFERS,
+        ) {
+            Some(t) => t,
+            None => fail(b"nxfiles: CreateWindow FAILED\n"),
         }
     };
+    dress(&mut win, top.id());
 
-    let mut bounds = Rect::new(0, 0, size.w, size.h);
-    let mut tree = Tree::new();
-    let mut router = Router::new();
+    let bounds = Rect::new(0, 0, size.w, size.h);
     // The open menu's window, and which menu it is showing — two things because the *same*
     // popup cannot serve both: choosing `Edit` while `File` is open has to replace the window,
     // not redraw it at the other anchor.
-    let mut menu: Option<Child> = None;
-    let mut menu_shown: Option<usize> = None;
-    let mut menu_hovered: Option<u64> = None;
+    let menu: Option<Child> = None;
+    let menu_shown: Option<usize> = None;
+    let menu_hovered: Option<u64> = None;
     // The delete question's window, alive only while one is being asked (M12 Part A's shape).
-    let mut confirm: Option<Child> = None;
-    let mut confirm_hovered: Option<u64> = None;
+    let confirm: Option<Child> = None;
+    let confirm_hovered: Option<u64> = None;
     let ev = win.wait_handle();
     // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
-    let mut reported_prompt = app.prompt_len();
+    let reported_prompt = app.prompt_len();
+
+    /// Everything one window of this browser is.
+    ///
+    /// **A window, not the application** (M14 Part B). Its own panes and tabs, its own surface
+    /// and retained tree, its own menu and its own question, and its own receipt. The `Session`,
+    /// the font and the theme are not here: one connection, one face and one palette serve every
+    /// window this process owns.
+    struct Win {
+        top: Child,
+        app: App,
+        size: Size,
+        bounds: Rect,
+        menu: Option<Child>,
+        menu_shown: Option<usize>,
+        menu_hovered: Option<u64>,
+        confirm: Option<Child>,
+        confirm_hovered: Option<u64>,
+        reported_prompt: Option<usize>,
+    }
+
+    /// Open a window of this browser, dressed and ready to be serviced.
+    ///
+    /// **The same path for the first window and every later one**, so a New Window cannot end up
+    /// subtly different from the original — an untitled bar being the obvious way.
+    fn open_window<T: libsurface::Transport>(
+        win: &mut Session<T>,
+        mut app: App,
+        font: &Font,
+        theme: &Theme,
+    ) -> Option<Win> {
+        let size = app.window_size();
+        let ui = app.view(theme, None);
+        let top = Child::open_sized(win, Role::Normal, (0, 0), size, &ui, font, theme, BUFFERS)?;
+        dress(win, top.id());
+        let reported_prompt = app.prompt_len();
+        Some(Win {
+            top,
+            app,
+            size,
+            bounds: Rect::new(0, 0, size.w, size.h),
+            menu: None,
+            menu_shown: None,
+            menu_hovered: None,
+            confirm: None,
+            confirm_hovered: None,
+            reported_prompt,
+        })
+    }
+
+    let mut quit_pending = false;
+    let mut wins = alloc::vec![Win {
+        top,
+        app,
+        size,
+        bounds,
+        menu,
+        menu_shown,
+        menu_hovered,
+        confirm,
+        confirm_hovered,
+        reported_prompt,
+    }];
 
     loop {
+        // **Every window this process owns, each serviced exactly as one used to be.**
+        //
+        // Destructured rather than dotted through, which is what keeps this loop readable across
+        // the conversion: every name below means what it meant when there was one window.
+        // Set by a window that owes a frame *now* — see the sites that set it.
+        let mut redraw_now = false;
+        for wi in 0..wins.len() {
+        let Win {
+            top,
+            app,
+            // The resize acts on the window whose `Configure` it was, in the dispatch below.
+            size: _,
+            bounds,
+            menu,
+            menu_shown,
+            menu_hovered,
+            confirm,
+            confirm_hovered,
+            reported_prompt,
+        } = &mut wins[wi];
+        let window_id = top.id();
         // ---- render ----
         // The widget under the pointer, from the router that has always known and that nothing
         // had ever asked (M11 Part E batch 3).
-        let ui = app.view(&theme, router.hovered_key(&tree));
-        let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+        let ui = app.view(&theme, top.hovered_key());
+        let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
         // Where each menu drops from, read every frame rather than when one opens: a bar item's
         // position is a fact about the layout, and before the first one there is nowhere to put
         // a popup at all.
         app.menus.set_anchors(
             (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
         );
-        let damage = match tree.update(&ui, &l) {
-            Ok(d) => d,
-            // A malformed tree is a bug in `view`, not a runtime condition.
-            Err(_) => fail(b"nxfiles: the view is not diffable\n"),
-        };
-        if let Some(d) = damage {
-            draw(&mut scratch, &ui, &l, &font, &theme, d);
-            let Some(mut w) = win.window(window_id) else {
-                fail(b"nxfiles: our own window is gone\n");
-            };
-            let Ok(b) = pool.acquire(&mut w, app.window_size()) else {
-                fail(b"nxfiles: no buffer to draw into\n");
-            };
-            if !pool.write(b, scratch.bytes()) {
-                fail(b"nxfiles: the frame did not fit its buffer\n");
-            }
-            if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
-                fail(b"nxfiles: Commit FAILED\n");
-            }
+        // The layout is computed here rather than inside `present` because the menu bar's
+        // anchors are read from it — see `present_laid_out`.
+        if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
+            fail(b"nxfiles: the window could not be drawn\n");
         }
 
         // ---- the requests this frame owes the compositor ----
@@ -434,17 +487,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Opened and destroyed with the menu, because `popup` is a transient role: the
         // compositor takes it with its parent, it holds the keyboard while it is up, and a
         // hidden one would still be a window in the stack.
-        if menu_shown != app.menus.open() {
+        if *menu_shown != app.menus.open() {
             if let Some(m) = menu.take() {
                 m.close(&mut win);
             }
-            menu_hovered = None;
-            menu_shown = app.menus.open();
+            *menu_hovered = None;
+            *menu_shown = app.menus.open();
             if let Some(which) = menu_shown {
                 match app.menus.anchor() {
                     Some(a) => {
-                        let view = app.menu_view(which, &theme, None);
-                        menu = Child::open(
+                        let view = app.menu_view(*which, &theme, None);
+                        *menu = Child::open(
                             &mut win,
                             Role::Popup { parent: window_id },
                             a,
@@ -454,7 +507,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             BUFFERS,
                         );
                     }
-                    None => menu = None,
+                    None => *menu = None,
                 }
                 match menu.as_ref() {
                     // **Where it is and how big, unconditionally.** `check-login` boots the
@@ -485,15 +538,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     None => {
                         kprint(b"nxfiles: could not open the menu\n");
                         app.menus.close();
-                        menu_shown = None;
+                        *menu_shown = None;
                     }
                 }
             }
         }
         if let Some(m) = menu.as_mut() {
             let now = m.hovered_key();
-            if now != menu_hovered {
-                menu_hovered = now;
+            if now != *menu_hovered {
+                *menu_hovered = now;
                 // **Which row the pointer is over, unconditionally** (M14 Part A). `check-login`
                 // boots the release image, so a `test-harness` line would not exist in the binary
                 // it runs — and since the File menu grew a separator, dividing the popup's height
@@ -537,8 +590,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // stronger than before and is not a guarantee — `compositor: focus win=… has=1` would be
         // the real one, and `log_route` caps routed-input lines at eight, long past by here.
         let typed = app.prompt_len();
-        if typed != reported_prompt {
-            reported_prompt = typed;
+        if typed != *reported_prompt {
+            *reported_prompt = typed;
             if let Some(n) = typed {
                 libkern::debug::Line::new()
                     .s(b"nxfiles: name so far ")
@@ -556,7 +609,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // downstream of the shell and racing it to the console (M12 Part A, PR #267).
                 kprint(b"nxfiles: asking before deleting\n");
                 let ask = app.confirm_view(&theme, None);
-                confirm = Child::open(
+                *confirm = Child::open(
                     &mut win,
                     Role::Dialog { parent: window_id },
                     // (0, 0): this client does not know where it is on screen, and a dialog's
@@ -576,13 +629,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if let Some(c) = confirm.take() {
                     c.close(&mut win);
                 }
-                confirm_hovered = None;
+                *confirm_hovered = None;
             }
             _ => {}
         }
         if let Some(c) = confirm.as_mut() {
             let now = c.hovered_key();
-            confirm_hovered = now;
+            *confirm_hovered = now;
             let ask = app.confirm_view(&theme, now);
             if !c.present(&mut win, &ask, &font, &theme) {
                 kprint(b"nxfiles: the confirmation dialog could not be drawn\n");
@@ -602,10 +655,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 .end();
             app.operated(said);
             let here = String::from(app.path());
-            navigate(&mut app, root_ns, &here);
+            navigate(app, root_ns, &here);
             // The notice `navigate` cleared is the answer to what just happened, so it is put
             // back after the listing rather than before it.
             app.operated(said);
+            // **Round again without waiting**, which is what this `continue` meant
+            // when the body serviced one window. Inside the per-window loop it means
+            // "next window", and the wait below would then block with a frame owed —
+            // the stale-listing bug PR #257 removed, reintroduced by the conversion
+            // (PR #283 review, worth fixing 4). The flag is what carries the old
+            // meaning across the new shape.
+            redraw_now = true;
             continue;
         }
         // **The listing is read here, not in `update`.** `update` is a function of values; a
@@ -620,18 +680,85 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             app.opened(&path, ok);
         }
         if let Some(to) = app.take_goto() {
-            navigate(&mut app, root_ns, &to);
+            navigate(app, root_ns, &to);
             // **Round again rather than waiting**, or the listing just installed is not drawn
             // until the *next* event happens to arrive. In practice that is the key's own
             // release a moment later, which is why hand testing and the gate both pass — and
             // why it is worth removing rather than reasoning about (PR #257 review, finding 4).
+            // **Round again without waiting**, which is what this `continue` meant
+            // when the body serviced one window. Inside the per-window loop it means
+            // "next window", and the wait below would then block with a frame owed —
+            // the stale-listing bug PR #257 removed, reintroduced by the conversion
+            // (PR #283 review, worth fixing 4). The flag is what carries the old
+            // meaning across the new shape.
+            redraw_now = true;
             continue;
         }
 
         // **Asked to close, by its own button or by the shell.**
-        if app.closing() {
+
+        }
+
+        // ---- what the windows asked for ----
+        //
+        // **After every window has been serviced**, never inside that loop: creating or
+        // destroying a window while iterating over them is the one thing that shape cannot do.
+        let mut opened = 0usize;
+        for w in wins.iter_mut() {
+            if w.app.take_new_window() {
+                opened += 1;
+            }
+            if w.app.take_quit() {
+                kprint(b"nxfiles: quitting\n");
+                quit_pending = true;
+            }
+        }
+        for _ in 0..opened {
+            // **A new window starts at home**, not at this window's directory: New Window is a
+            // second browser, and one that opened where the first happens to be looking would be
+            // a copy rather than a window.
+            match open_window(&mut win, App::new(&start), &font, &theme) {
+                Some(w) => {
+                    kprint(b"nxfiles: opened another window\n");
+                    wins.push(w);
+                }
+                None => kprint(b"nxfiles: could not open another window\n"),
+            }
+        }
+        // **Quit closes every window.** This browser has nothing unsaved to ask about, so there
+        // is no dialog to cancel and no window that can refuse — the editor is where decision 4's
+        // interesting half lives, and this is the same rule with nothing in its way.
+        if quit_pending {
+            for w in wins.iter_mut() {
+                w.app.update(Msg::Close);
+            }
+        }
+        let mut i = 0;
+        while i < wins.len() {
+            if wins[i].app.closing() {
+                let w = wins.remove(i);
+                if let Some(m) = w.menu {
+                    m.close(&mut win);
+                }
+                if let Some(c) = w.confirm {
+                    c.close(&mut win);
+                }
+                w.top.close(&mut win);
+                kprint(b"nxfiles: closed a window\n");
+            } else {
+                i += 1;
+            }
+        }
+        if wins.is_empty() {
             kprint(b"nxfiles: closing\n");
             exit(0);
+        }
+
+        // **A frame is owed, so do not block for an event.** Without this the window that
+        // asked would not repaint until the next event happened to arrive — in practice the
+        // key's own release, which is why this reads as a lag rather than a hang.
+        if redraw_now {
+            continue;
         }
 
         // ---- events ----
@@ -649,8 +776,35 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
         }
-        let mut resized = false;
         for (from, event) in events {
+            // **Which window is this for?** A record naming none of them is dropped rather than
+            // routed into whichever window happened to be first.
+            let Some(wi) = wins.iter().position(|w| {
+                w.top.id() == from
+                    || w.menu.as_ref().is_some_and(|m| m.id() == from)
+                    || w.confirm.as_ref().is_some_and(|c| c.id() == from)
+            }) else {
+                continue;
+            };
+            let Win {
+                top,
+                app,
+                size,
+                bounds,
+                menu,
+                menu_shown,
+                menu_hovered,
+                confirm,
+                confirm_hovered,
+                ..
+            } = &mut wins[wi];
+            let window_id = top.id();
+            // Rebuilt for *this* window: routing is against this window's tree, and another
+            // window's would report a widget that is not the one under the pointer. **No layout
+            // here** — `Child::route` lays the content out itself, and this browser has no
+            // `drop_at` to hand one to.
+            let ui = app.view(&theme, top.hovered_key());
+            let mut resized = false;
             // **The menu's window routes through the menu's tree.** Same `App`, so a row's `Msg`
             // updates the same state a click in the list does; a different tree and router,
             // because they describe a different window.
@@ -689,9 +843,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         KeyOutcome::Ignored => {}
                     }
                 }
-                let msgs = match (menu_shown, menu.as_mut()) {
+                let msgs = match (*menu_shown, menu.as_mut()) {
                     (Some(which), Some(m)) => {
-                        let view = app.menu_view(which, &theme, menu_hovered);
+                        let view = app.menu_view(which, &theme, *menu_hovered);
                         m.route(&view, &font, &theme, &event)
                     }
                     _ => Vec::new(),
@@ -702,7 +856,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 continue;
             }
             if confirm.as_ref().is_some_and(|c| c.id() == from) {
-                let ask = app.confirm_view(&theme, confirm_hovered);
+                let ask = app.confirm_view(&theme, *confirm_hovered);
                 let mut msgs = confirm
                     .as_mut()
                     .map(|c| c.route(&ask, &font, &theme, &event))
@@ -736,7 +890,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             match event {
                 WindowEvent::Key(k) => {
-                    if let Some(msg) = router.key(&tree, &ui, k) {
+                    if let Some(msg) = top.route_key(&ui, k) {
                         app.update(msg);
                     } else {
                         // Arrow keys and Enter are the browser's own, not any widget's: nothing
@@ -746,7 +900,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Pointer(p) => {
-                    let (msgs, _) = router.pointer(&tree, &ui, &l, p);
+                    let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {
                         app.update(m);
                     }
@@ -788,7 +942,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Focus(f) => {
-                    router.set_window_focused(f);
+                    top.route(&ui, &font, &theme, &WindowEvent::Focus(f));
                     app.focused = f;
                 }
                 WindowEvent::Configure { width, height, .. } => {
@@ -827,17 +981,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 WindowEvent::InputLost => kprint(b"nxfiles: input dropped\n"),
             }
-        }
         if resized {
-            size = app.window_size();
-            match compose_buffer(size) {
-                Some(fb) => scratch = fb,
-                None => fail(b"nxfiles: impossible window geometry\n"),
+            *size = app.window_size();
+            // `Child::resize` reallocates and throws the retained tree away: a tree diffed
+            // against a layout from the old bounds reports damage in the old coordinates, and
+            // starting again reports the whole window, which is what a resize is.
+            if top.resize(*size) == Some(false) {
+                fail(b"nxfiles: impossible window geometry\n");
             }
-            bounds = Rect::new(0, 0, size.w, size.h);
-            // A tree diffed against a layout from the old bounds reports damage in the old
-            // coordinates; starting again reports the whole window, which is what a resize is.
-            tree = Tree::new();
+            *bounds = Rect::new(0, 0, size.w, size.h);
+        }
         }
     }
 }

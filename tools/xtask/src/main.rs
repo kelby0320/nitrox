@@ -3514,6 +3514,74 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     }
     println!("  ok: the editor holds two buffers, and a tab click switched between them");
 
+    // **One process, two top-level windows** (M14 Part B) — the thing the protocol has always
+    // allowed and nothing had done. The shell's window list is where it shows, which is why the
+    // assertion is made there rather than on a receipt the editor prints about itself: a client
+    // can say anything, and what matters is that the *manager* sees two windows it can name.
+    //
+    // `Ctrl+Shift+N`, with Shift because `Ctrl+N` is "new" in the singular everywhere and an
+    // editor's singular is a buffer.
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(&mut qmp, "n")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    // **The shell's line comes first, and that ordering is structural rather than lucky**:
+    // `Child::open_sized` creates the window and `Session::create` waits for its first
+    // `Configure`, which the shell sends after placing it — so the client cannot report a window
+    // it does not yet have.
+    session.expect("desktop-shell: placed window ")?;
+    let placed = session.rest_of_line()?;
+    session.expect("nxedit: opened another window")?;
+    println!("  ok: a second top-level window from one process: {}", placed.trim());
+
+    // **And it is a window in its own right**, not a decoration: the taskbar lists it, which is
+    // the shell's own account of what exists rather than the editor's.
+    let listing = session.transcript();
+    let last = listing
+        .rmatch_indices("window list on cli of ")
+        .next()
+        .map(|(i, m)| listing[i + m.len()..].lines().next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    // **The entries, not the number.** The number after `of ` is `desktops.len()`, which this
+    // gate switched to 2 several steps ago and which is satisfied whatever the taskbar holds — so
+    // reading it made this assertion decoration that could not fail (PR #283 review, blocking 3).
+    // The windows are the bracketed `[id:label]` items.
+    let count = last.matches('[').count();
+    if count < 3 {
+        let _ = session.child.kill();
+        return Err(format!(
+            "after New Window the shell lists {count} window(s) on this desktop — the browser, \
+             the editor and the editor's second window make three. The list read {last:?}"
+        )
+        .into());
+    }
+    println!("  ok: the shell's window list counts it too ({count} windows)");
+
+    // **Closing one window must not take the others with it**, which is the whole of why the
+    // conversion had to be uniform — and was broken anyway until PR #283's review: an `exit(0)`
+    // left inside the per-window loop ran against *each* window's `App`, so closing either one
+    // ended the process and discarded whatever the other held. Nothing caught it because this
+    // gate had never closed a second window.
+    //
+    // `Ctrl+W` on the new window: it has one tab, and closing the last tab closes the window.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "w")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: closed a window")?;
+    // …and the editor is still running, which is the half that would have been lost. The
+    // *first* window answers, so the process did not exit with the second.
+    session.expect("desktop-shell: window list on cli of ")?;
+    println!("  ok: closing one window left the other open");
+
+    // **Give the first window the keyboard back**, because the new one took it — which is right,
+    // and is exactly what makes the rest of this gate's typing land in the wrong place otherwise.
+    // The editor was snapped to the right half earlier and the new window was placed at the
+    // top-left, so they do not overlap and a click in the text area is unambiguous.
+    let back = (ed.0 + 300, ed.1 + 400);
+    click_at(&mut qmp, &mut session, back.0, back.1)?;
+    println!("  ok: and clicking the first window took the keyboard back");
+
     // **`End` first, and that is not tidying.** Step 8b's search left its match *selected* —
     // which is what a find is supposed to do — and typing replaces a selection, so a bare
     // keystroke here would have edited the middle of the file rather than appending to it. It
@@ -3695,8 +3763,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // names the right one. The client says which row the pointer is over, so the gate walks down
     // the popup and stops when the guest agrees it is over `Rename`.
     const MENU_FRAME: i32 = 3;
-    // `Rename` is `MENU_ROW_KEY + 5`: New Tab, Close Tab, a rule, New File, New Folder, Rename.
-    const RENAME_ROW: u64 = 105;
+    // `Rename` is `MENU_ROW_KEY + 8`: New Tab, Close Tab, a rule, New Window, Quit, a rule, New
+    // File, New Folder, Rename. **It has moved twice** — once when the menu gained separators and
+    // again when M14 Part B added the window rows — and each time the gate failed as a *prompt*
+    // that never opened, several steps from the menu it was really about. The walk below at least
+    // says which row it could not find.
+    const RENAME_ROW: u64 = 108;
     let rx = px + 20;
     let mut ry = py + MENU_FRAME;
     let mut rename_at = None;
@@ -4926,6 +4998,28 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     qmp.send_key("ret", false)?;
     session.expect("nxterm: menu chose Paste")?;
     println!("  ok: Down skipped the greyed row and Enter chose the next one");
+
+    // **A second window of the terminal, with a shell of its own** (M14 Part B). The window is
+    // the shell's proof as much as the tab's was: a second top-level that opened with nothing to
+    // talk to would look identical from the outside, and this is the only place that difference
+    // is visible.
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(&mut qmp, "n")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    // **The shell's line comes first, and structurally so**: `open_window` gives the new
+    // window's first tab a tty and a shell before it returns, so the terminal cannot report a
+    // window it has not finished building.
+    // **The shell's line comes first, and structurally so**: `open_window` gives the new window's
+    // first tab a tty and a shell before it returns, so the terminal cannot report a window it has
+    // not finished building. **Nothing between the last two**, because the third comes from a
+    // freshly spawned `nxsh` and its order against this process's own `kprint` is a race — the
+    // rule this gate's own closing comment states (PR #283 review, optional 9).
+    session.expect("nxterm: hosting a shell")?;
+    session.expect("nxterm: opened another window")?;
+    session.expect("nxsh: interactive shell")?;
+    println!("  ok: Ctrl+Shift+N opened a second window with a shell of its own");
 
     // **A second tab is a second terminal**, which is the only part of M14 Part B a host test
     // cannot reach: the split of grids and outboxes is pinned in `nxterm`'s own tests, but that

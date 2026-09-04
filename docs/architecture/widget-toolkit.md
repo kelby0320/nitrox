@@ -1,7 +1,8 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-04), and this document describes what
-exists.** `Router` captures the widget that *carries the handler* rather than the deepest one
+**Status: built (2026-08-11, last checked 2026-09-04), and this document describes what exists.**
+`window::Child` hosts **top-level** windows as of M14 Part B, which is what lets one process own
+several — all three applications do. `Router` captures the widget that *carries the handler* rather than the deepest one
 under the cursor (2026-09-04) — see §8.2, which is the one place a reader will look after losing
 a click. M14 Part A added `menu.rs` — the *whole* of a drop-down menu as a value: a table of
 items with accelerators, separators and per-item availability, the open/anchor/cursor state, the
@@ -867,16 +868,29 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   *and* refuse to apply it while a grab is still held. Deferring alone only moves the bug one drain
   later, because the motion that opened the gesture has already sampled the new hover.
 
-  **A `Child` is one of the two parented roles**, `popup` and `dialog` — the pair the compositor's
-  own `parent_of` matches and the spec calls "transient, parented". Its size is fixed at creation
-  and measured from its tree, so a tree containing a `dock` is refused: `Dock` measures as
-  everything it is offered, deliberately, so it has no natural size. A caller that wants one
-  wraps it in a `sized`.
+  **A `Child` is any window a client owns**, in any role — which is not what it was until M14 Part
+  B, and the change is worth stating precisely because the old restriction was load-bearing rather
+  than fussy. It was the two *parented* roles only, `popup` and `dialog`, the pair the compositor's
+  `parent_of` matches and the spec calls "transient, parented"; its size was fixed at creation and
+  measured from its tree, so a tree containing a `dock` was refused, `Dock` having no natural size.
+  Both restrictions existed for one reason: such a window could never answer a `Configure`, and a
+  `normal` that ignored every resize a manager asked of it — silently, since declining is legal —
+  is worse than one that cannot be created.
 
-  **A main window is still each application's own loop**, and that is a deferral rather than an
-  omission: it owns the `sys_wait`, it must answer `Configure` by reallocating everything a
+  **`open_sized` and `resize` are what answer that**, so the check went rather than the reason for
+  it. A top-level takes the size its application asks for instead of measuring one, and `resize`
+  reallocates the compose buffer and throws the retained tree away. The pool is *kept*:
+  `BufferPool::acquire` is handed the size every frame, and building a second pool is rejected by
+  a compositor still holding the first's buffers.
+
+  **A main window's loop is still each application's own**, and always will be: it owns the
+  `sys_wait`, it must answer `Configure` by reallocating everything a
   `Child` holds, and `nxterm`'s paints a `custom` grid whose damage feeds `libterm`. Trigger: the
-  next part that touches both applications' main loops.
+  next part that touches both applications' main loops. **That happened in M14 Part B**, and all
+  three main windows are `Child`s now: `open_sized` takes a size instead of measuring one,
+  `resize` answers a `Configure`, `present_laid_out` lets a window keep the layout its menu
+  anchors are read from, and `present_custom` reaches the escape hatch — `nxterm`'s grid is a
+  `custom` node whose damage no diff can see.
 
   **This is also the one thing in this crate that is not a function of values.** `libui` gained a
   `libsurface` dependency for it, which the layering in §10 always allowed and nothing had needed.

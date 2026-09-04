@@ -1,4 +1,4 @@
-//! A window an application opens **beside** its main one — a menu, or a dialog.
+//! A window an application owns: its main one, a menu, or a dialog.
 //!
 //! ## Why this is here at all
 //!
@@ -15,19 +15,23 @@
 //!
 //! ## What a `Child` is, and what it is not
 //!
-//! A **child** is one of the two parented roles — [`Role::Popup`] and [`Role::Dialog`] — which
-//! is not a category this module invented: the compositor's own `parent_of` matches exactly
-//! those two, and `rsproto-surface-ops.md` calls both "transient, parented". A child has a size
-//! fixed at creation, no `Configure` to honour, no second event source, and a whole widget tree
-//! with nothing custom in it. That is what makes it a value an application can hold, open and
-//! drop.
+//! A `Child` is **any window a client owns** — its main one included, since M14 Part B. It
+//! bundles the six things a window needs to be drawn and routed: an id, a size, a retained tree,
+//! a router, a compose buffer and a pool. That is what makes it a value an application can hold,
+//! open, resize and drop — and what makes a *second* window a second value rather than a second
+//! copy of a main loop.
 //!
-//! **A main window is not one of these**, and is deliberately still driven by each application's
-//! own loop: it owns the `sys_wait`, it must answer `Configure` by reallocating everything here,
-//! and `nxterm`'s also paints a `custom` grid whose damage feeds `libterm`. Converting those is
-//! a change to the shape of every `main` in the tree with no new behaviour in it, and it does
-//! not belong in the same change as the first dialog. **Trigger: the next part that touches
-//! both applications' main loops** — M12 Part D's tabs is the obvious one.
+//! **It began as the two parented roles only** — [`Role::Popup`] and [`Role::Dialog`], the pair
+//! the compositor's own `parent_of` matches and `rsproto-surface-ops.md` calls "transient,
+//! parented" — and the restriction was load-bearing rather than fussy: such a window has its size
+//! fixed at creation and no `Configure` to honour, and a `normal` created that way would ignore
+//! every resize a manager asked of it for the rest of its life, silently, because declining a
+//! `Configure` is legal. [`Child::open_sized`] and [`Child::resize`] are what *answer* that, so
+//! the check went and the reason for it did not.
+//!
+//! **A main window's loop is still each application's own**, and always will be: it owns the
+//! `sys_wait`, it decides what a `Configure` means to its content, and `nxterm`'s paints a
+//! `custom` grid whose damage feeds `libterm` — which is why [`Child::present_custom`] exists.
 //!
 //! ## Not host-tested, for the reason [`libsurface::buffers`] is not
 //!
@@ -49,13 +53,13 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
-use librsproto::surface::{CreateWindowRequest, Role};
+use librsproto::surface::{CreateWindowRequest, Role, KeyEvent};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, Transport, WindowEvent};
 
 use crate::diff::Tree;
 use crate::element::Element;
-use crate::layout::{Constraints, layout, measure};
+use crate::layout::{Constraints, Layout, layout, measure};
 use crate::paint::{FontMetrics, Theme, paint};
 use crate::route::Router;
 
@@ -79,7 +83,8 @@ const MEASURE_MAX: u32 = u32::MAX / 4;
 pub struct Child {
     /// The compositor's id for this window.
     id: u32,
-    /// Its size, fixed at creation.
+    /// Its size. Fixed at creation for a popup or a dialog, which never answer a `Configure`;
+    /// changed by [`resize`](Self::resize) for a top-level, which must.
     size: Size,
     /// The retained tree this window's frames diff against.
     tree: Tree,
@@ -146,6 +151,7 @@ impl Child {
         if !matches!(role, Role::Popup { .. } | Role::Dialog { .. }) {
             return None;
         }
+        // A measured size is a *child's* rule; a top-level asks for one. See `open_sized`.
         let m = FontMetrics::new(font, theme.font_px);
         let size = measure(content, Constraints::loose(Size::new(MEASURE_MAX, MEASURE_MAX)), &m);
         // **Nothing, and everything, are both refusals.** Zero is a tree that draws nothing.
@@ -184,12 +190,99 @@ impl Child {
         })
     }
 
+    /// Open a window at a size the **caller** chose, in any role.
+    ///
+    /// **The difference from [`open`](Self::open) is where the size comes from**, and that is the
+    /// whole of why a top-level could not go through it (M14 Part B). A popup or a dialog is as
+    /// big as its contents and is created from a `measure`; a top-level is as big as the
+    /// application asked for, contains a `dock` more often than not — which measures as *whatever
+    /// it is offered* — and is then reshaped by a manager for the rest of its life.
+    ///
+    /// **The role check `open` carries is answered rather than removed.** Its reason was that a
+    /// `Normal` created that way "would ignore every resize a manager asked of it for the rest of
+    /// its life — silently, because declining a `Configure` is legal". A window opened here can
+    /// answer one: [`resize`](Self::resize) is what `open` had no equivalent of.
+    pub fn open_sized<T: Transport, Msg>(
+        session: &mut Session<T>,
+        role: Role,
+        at: (i32, i32),
+        size: Size,
+        content: &Element<Msg>,
+        font: &Font,
+        theme: &Theme,
+        buffers: usize,
+    ) -> Option<Self> {
+        if size.w == 0 || size.h == 0 {
+            return None;
+        }
+        let id = session
+            .create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers)
+            .ok()?;
+        let built = (|| {
+            let scratch = compose_buffer(size)?;
+            let pool = BufferPool::new(&mut session.window(id)?, size, buffers)?;
+            Some((pool, scratch))
+        })();
+        let Some((pool, scratch)) = built else {
+            // **Everything after the create destroys the window on the way out**, for `open`'s
+            // reason: `Session::create` waits for the first `Configure`, so an abandoned window
+            // is *configured* and therefore a focus candidate — and having committed nothing it
+            // is never drawn, so it is an invisible window silently eating every keystroke.
+            if let Some(w) = session.window(id) {
+                let _ = w.destroy();
+            }
+            return None;
+        };
+        let mut me = Self {
+            id,
+            size,
+            tree: Tree::new(),
+            router: Router::new(),
+            scratch,
+            pool,
+            hover: None,
+            shown: None,
+        };
+        // Draw once, so a window that has been created is never a window that has never
+        // committed — see the destroy above for what that costs.
+        me.present(session, content, font, theme).then_some(me)
+    }
+
+    /// Take a new size from a `Configure`, reallocating what depends on it.
+    ///
+    /// **`None` if nothing changed**, so a caller can skip the work for a `Configure` that repeats
+    /// a size — which is every `Configure` that follows a move. `Some(false)` means the memory
+    /// could not be had and the window is left at its old size, which is the only answer that
+    /// keeps drawing.
+    ///
+    /// **The retained tree is thrown away, not resized.** A tree diffed against a layout from the
+    /// old bounds reports damage in the old coordinates; starting again reports the whole window,
+    /// which is what a resize is.
+    ///
+    /// **The pool is kept, and there is no `Session` here for that reason.** `BufferPool::acquire`
+    /// is handed the size every frame and replaces a buffer left at the old shape when it next
+    /// needs one. Building a *new* pool here is what the first version did — it took a `Session`
+    /// to do it — and the compositor rejected it, because it still holds the buffers the old pool
+    /// attached. The rejection was silent enough that the resize reported success and the window
+    /// simply stopped committing frames; `check-login`'s reflow step caught it three resizes in.
+    pub fn resize(&mut self, size: Size) -> Option<bool> {
+        if size == self.size {
+            return None;
+        }
+        let Some(scratch) = compose_buffer(size) else { return Some(false) };
+        self.scratch = scratch;
+        self.size = size;
+        self.tree = Tree::new();
+        Some(true)
+    }
+
     /// The compositor's id for this window — what an event names.
     pub fn id(&self) -> u32 {
         self.id
     }
 
-    /// Its size in pixels, which does not change.
+    /// Its size in pixels. Constant for a popup or a dialog; a top-level's changes with
+    /// every `Configure` it answers through [`resize`](Self::resize).
     pub fn size(&self) -> Size {
         self.size
     }
@@ -239,19 +332,73 @@ impl Child {
         // **What this frame is being drawn with**, recorded before it is drawn: the caller built
         // `content` from `hovered_key` a moment ago, so this is the hover the retained tree is
         // about to hold. Under a grab it is already `shown` and this is a no-op.
-        self.shown = self.hovered_key();
         let bounds = Rect::new(0, 0, self.size.w, self.size.h);
         let l = layout(content, bounds, &FontMetrics::new(font, theme.font_px));
-        let damage = match self.tree.update(content, &l) {
-            Ok(None) => return true, // nothing changed; what is on screen is still right
-            Ok(Some(d)) => d,
+        self.present_laid_out(session, content, &l, font, theme)
+    }
+
+    /// [`present`](Self::present), for a caller that has already laid the tree out.
+    ///
+    /// **A main window needs its own layout** — the anchors its menu bar's popups hang from come
+    /// from `locate` against it — and laying out twice a frame to hand one copy to each is work
+    /// with no answer in it. This is the seam that lets a window's owner keep the layout it
+    /// computed (M14 Part B); `present` is this with the layout computed here, which is what a
+    /// popup or a dialog wants.
+    ///
+    /// `l` must be the layout of `content` at this window's size, or the damage this reports
+    /// describes a tree that was never drawn.
+    pub fn present_laid_out<T: Transport, Msg>(
+        &mut self,
+        session: &mut Session<T>,
+        content: &Element<Msg>,
+        l: &Layout,
+        font: &Font,
+        theme: &Theme,
+    ) -> bool {
+        self.present_custom(session, content, l, font, theme, None, &mut |_, _, _, _| {})
+    }
+
+    /// [`present_laid_out`](Self::present_laid_out), for a window with a `custom` node in it.
+    ///
+    /// **The escape hatch has to reach through here too** (M14 Part B). A popup or a dialog is
+    /// made of widgets and nothing else, which is why `present` could paint with an empty
+    /// callback and no caller minded; a *main* window need not be — `nxterm`'s grid is a `custom`
+    /// node whose damage feeds `libterm`, and a window that painted it with nothing would draw
+    /// the chrome around an empty rectangle.
+    pub fn present_custom<T: Transport, Msg>(
+        &mut self,
+        session: &mut Session<T>,
+        content: &Element<Msg>,
+        l: &Layout,
+        font: &Font,
+        theme: &Theme,
+        extra: Option<Rect>,
+        custom: &mut dyn FnMut(u32, Rect, Rect, &mut MemFramebuffer),
+    ) -> bool {
+        // **What this frame is being drawn with**, recorded before it is drawn: the caller built
+        // `content` from `hovered_key` a moment ago, so this is the hover the retained tree is
+        // about to hold. Under a grab it is already `shown` and this is a no-op.
+        self.shown = self.hovered_key();
+        // **Damage the diff cannot see, unioned in.** A `custom` node is fingerprinted by its
+        // kind and size, so a node whose *contents* changed reports nothing — which is right for
+        // a widget and wrong for the escape hatch, whose whole point is that its contents are the
+        // caller's business. `nxterm`'s grid is that case: the rows `libterm` wrote are damage
+        // only the terminal knows about.
+        let damage = match self.tree.update(content, l) {
+            Ok(None) => match extra {
+                // Nothing the tree can see, and nothing the caller added: what is on screen is
+                // still right.
+                None => return true,
+                Some(e) => e,
+            },
+            Ok(Some(d)) => crate::damage::union_opt(Some(d), extra).unwrap_or(d),
             // A malformed tree is a bug in the caller's view, not a runtime condition — but a
             // child window is not worth killing a process over, so it is reported as a frame
             // that could not be drawn. Nothing to clear: a rejected update leaves the tree
             // exactly as it was.
             Err(_) => return false,
         };
-        paint(&mut self.scratch, font, theme, content, &l, damage, &mut |_, _, _, _| {});
+        paint(&mut self.scratch, font, theme, content, l, damage, &mut |k, a, b, fb| custom(k, a, b, fb));
         let mut drawn = false;
         if let Some(mut w) = session.window(self.id)
             && let Ok(b) = self.pool.acquire(&mut w, self.size)
@@ -275,10 +422,11 @@ impl Child {
     /// layout, and a layout of a different tree would report a widget that is not the one under
     /// the pointer.
     ///
-    /// **Three variants and no default action.** A `Configure` is not answered because a child's
-    /// size is fixed; a `Dismissed` means "close me", which is the caller's to act on because
-    /// only the caller knows what the window was *for*; and no child declares a drop acceptor,
-    /// so no `Drop` can arrive here.
+    /// **Three variants and no default action.** A `Configure` is not answered *here* — a popup's
+    /// size is fixed, and a top-level's owner decides what a new size means to its content before
+    /// calling [`resize`](Self::resize); a `Dismissed` means "close me", which is the caller's to
+    /// act on because only the caller knows what the window was *for*; and a `Drop` is routed by
+    /// [`drop_at`](Self::drop_at), against a layout only the owner has.
     pub fn route<Msg: Clone>(
         &mut self,
         content: &Element<Msg>,
@@ -305,6 +453,40 @@ impl Child {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Give the keyboard to the widget carrying `key`, if the tree has one.
+    ///
+    /// **For a window that must not start focused on its first widget.** `focus_next` lands on
+    /// whatever comes first in tree order, which for a terminal is the menu bar — and a terminal
+    /// whose first keystroke opens a menu is not a terminal.
+    pub fn focus_key<Msg>(&mut self, content: &Element<Msg>, key: u64) {
+        if let Some(id) = self.tree.find_by_key(key) {
+            self.router.focus(&self.tree, content, id);
+        }
+    }
+
+    /// Route a key, returning the message it produced.
+    ///
+    /// **Separate from [`route`](Self::route) because a main window needs the `None`**: a key no
+    /// widget claimed is not nothing to an editor, it is a keystroke for the buffer. `route`
+    /// answers with a list because that is what a pointer event produces.
+    pub fn route_key<Msg: Clone>(&self, content: &Element<Msg>, k: KeyEvent) -> Option<Msg> {
+        self.router.key(&self.tree, content, k)
+    }
+
+    /// Whether a drop at `(x, y)` landed on a widget that declared itself an acceptor.
+    ///
+    /// `l` must be the layout `content` was presented with — see
+    /// [`present_laid_out`](Self::present_laid_out) for why a main window has one to hand.
+    pub fn drop_at<Msg: Clone>(
+        &mut self,
+        content: &Element<Msg>,
+        l: &Layout,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        self.router.drop_at(&self.tree, content, l, x, y).is_some()
     }
 
     /// Destroy the window and give this side's pixels back.

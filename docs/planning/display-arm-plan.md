@@ -4492,6 +4492,17 @@ stop discarding `mtime` and `kind` on the way up, which is where the information
 three applications — including what happens to unsaved work, which is the half that makes it a
 decision rather than a loop over windows.
 
+> **Settled 2026-09-04**: Quit closes each window in turn, and a window with unsaved work asks
+> before it closes, exactly as its own close button does — there is not a second question for
+> quitting. **Cancelling that question aborts the quit and leaves every remaining window open.**
+> Windows already closed stay closed, because a close cannot be taken back; that is what every
+> editor does and the alternative — asking every window first and closing none until all agree —
+> needs a dialog per window on screen at once to be honest about what it is asking.
+>
+> **It is not testable before New Window exists.** With one window per application, Quit and
+> Close differ only in a flag nothing can observe, so building it first would be building the
+> half that cannot be checked. It lands with the windows it is about.
+
 **5. A single click selects and a double click opens** (reported 2026-09-03). A double click is a
 toolkit concept — every list wants it — but `route` has no clock. So `libui` gains a small pure
 click tracker the application feeds a position and a time, which answers "first or second". Pure,
@@ -4611,9 +4622,25 @@ the two would have made one review of two unrelated things.
       answer. Gated end to end: `check-terminal` presses the chord and waits for a *second
       shell's* banner, because a strip with two words in it is what a terminal that opened a tab
       and gave it nothing to talk to would draw.
-- [ ] **New Window in all three.** One process, several top-level windows — the protocol allows
-      it and nothing has done it; the taskbar and window list are where that shows.
-- [ ] **Quit**, per decision 4.
+- [x] **New Window in all three** ✅. One process, several top-level windows — the protocol
+      allowed it and nothing had done it; the shell's window list is where it shows, which is
+      where both gates assert it rather than on a receipt a client prints about itself.
+      - [x] **The toolkit half** ✅ — `Child::open_sized` and `Child::resize`, which is what
+            *answers* the role check rather than removing it: `open`'s objection was that a
+            `Normal` created through it "would ignore every resize a manager asked of it for the
+            rest of its life", and a window opened at a caller's size can now answer one.
+            `present_laid_out` is the seam a main window needs, because its menu anchors come
+            from `locate` against a layout `present` otherwise computes and throws away.
+      - [x] **The conversion** ✅, done the same way three times and in four steps each: the
+            window becomes a `Child`, the per-window state becomes one value destructured at the
+            top of the loop, the loop iterates, and events dispatch to the window that owns them.
+            *Uniform or nothing* held: had the first window stayed the loop's own with extras as
+            `Child`s, closing the first would kill the rest.
+            **`nxterm` needed the seam it was predicted to need** — `present_custom`, because its
+            grid is a `custom` node whose damage the diff cannot see.
+- [x] **Quit**, per decision 4 ✅ — each window asked exactly as its own close button asks, and
+      cancelling aborts the quit and leaves the rest open. `nxedit` is where that half is
+      observable; the other two have nothing to refuse with.
 - [x] **A drag that left the window in one motion never asked to be carried** ✅ — not a Part B
       item, found while chasing what looked like a `check-login` flake and reported independently
       from a real session ("click and drag doesn't work"). The hand-off lived in the
