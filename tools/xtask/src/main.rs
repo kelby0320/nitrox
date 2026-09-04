@@ -3479,7 +3479,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
             "pressed on the row and travelled {DRAG_TRIES} times and `nxfiles` never started a \
              drag. The press and its release are in the transcript if they reached the \
              compositor — a pair that arrived means the client did not act on input it was \
-             given, which is what `wip/i8042-efficacy` is chasing"
+             given, which is `TODO(click-not-acted-on)`"
         )
         .into());
     }
@@ -4364,7 +4364,8 @@ fn check_two_sessions(transcript: &str) -> R<()> {
 /// never acted on the pair. Whatever swallows it — the release logging added the same day proves
 /// it is not a lost PS/2 packet, which was the first guess — it is intermittent, and a gate that
 /// treats one delivered-but-ineffective click as a verdict is a gate that fails for a reason
-/// nobody can act on. `wip/i8042-efficacy` is chasing the underlying flakiness.
+/// nobody can act on. Filed as `TODO(click-not-acted-on)`; it is **not** the i8042
+/// lost-interrupt fault, which `drivers/ps2` already fixes with a tick-driven sweep.
 ///
 /// **Only safe where a repeated click is harmless if the first one worked**, which is why the
 /// window is generous: a menu bar word toggles, so a second click on a menu that *did* open would
@@ -4389,7 +4390,10 @@ fn click_until(
         );
     }
     Err(format!(
-        "clicked ({x}, {y}) {ATTEMPTS} times and never saw {receipt:?}. The press and its release          are both in the transcript if they reached the compositor, so check there first: a pair          that arrived means the client did not act on a click it was given, which is the          intermittent fault `wip/i8042-efficacy` is chasing rather than a mis-aimed click"
+        "clicked ({x}, {y}) {ATTEMPTS} times and never saw {receipt:?}. The press and its release \
+         are both in the transcript if they reached the compositor, so check there first: a pair \
+         that arrived means the client did not act on a click it was given, which is \
+         `TODO(click-not-acted-on)` rather than a mis-aimed click"
     )
     .into())
 }
@@ -4420,9 +4424,10 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
             // a bargain. The logging stays, because it makes the next occurrence *legible*;
             // the wait does not, because it makes a different step fail.
             //
-            // **The likely root cause is already known**: an `i8042` losing interrupts, with a
-            // fix in progress on `wip/i8042-efficacy` ("made every input gate flaky"). This
-            // belongs there, not here.
+            // **It is not the i8042 lost-interrupt fault**, which was the obvious suspect and
+            // is already fixed: `drivers/ps2` recovers a byte the controller will not re-raise
+            // for, via a tick-driven sweep. This is something after that, and it is filed as
+            // `TODO(click-not-acted-on)` rather than guessed at here.
             return Ok(session.rest_of_line()?);
         }
         // It did not land where it was aimed, so where it *is* is no longer known.

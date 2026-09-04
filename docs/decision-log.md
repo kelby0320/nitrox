@@ -23378,9 +23378,19 @@ premise: a bar word toggles, so the window is ten seconds, far longer than the r
 the click lands. Two runs since — one TCG, one KVM — hit the fault and recovered, which is the
 only evidence that the retry addresses the real thing rather than the schedule.
 
-**It is a workaround, and the underlying fault is elsewhere.** A compositor that delivered both
-halves of a click to a window whose client did not act on it is a real bug, not a gate problem.
-`wip/i8042-efficacy` is already chasing input-gate flakiness from the interrupt end
-("made every input gate flaky"), and this belongs with it rather than here. What this milestone
-owes it is the evidence: the release line, and a gate that says "landed but produced no receipt"
-instead of timing out forty-five seconds later on an unrelated expectation.
+**It is a workaround, and the underlying fault is filed rather than fixed.** A compositor that
+delivered both halves of a click to a window whose client did not act on it is a real bug, not a
+gate problem: `TODO(click-not-acted-on)`.
+
+**The obvious suspect was checked and is not it.** A dangling `wip/i8042-efficacy` branch carries
+`a58770e`, "Fix the i8042 losing interrupts, which made every input gate flaky", and it is not in
+`main` — which reads like a pending fix for exactly this. It is not: cherry-picking it onto this
+branch *reverts* `drivers/ps2`, because `main` already carries the later and better answer — the
+tick-driven sweep, whose comment records that the earlier claim ("the controller will raise
+because the byte is still there") is false for this device and "cost three investigations". So
+that commit is superseded, the residual fault is something after it, and a stale branch that
+looks like a fix is worth naming as such so the next person does not land it.
+
+What this milestone owes the open item is evidence rather than a guess: the release line, which
+is what rules out lost input, and a gate that says "landed but produced no receipt" instead of
+timing out forty-five seconds later on an unrelated expectation.
