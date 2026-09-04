@@ -9412,6 +9412,15 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
 ///
 /// One list, three consumers (the build, the initramfs, the store package), so a new
 /// coreutil cannot end up built-but-unreachable or packaged-but-unbuilt.
+/// The applications a person launches, and what to call them.
+///
+/// **The display name is the point as much as the filter is.** A modal listing `nxfiles` is
+/// naming a binary; one listing "Files" is naming an application. Both come from the same entry,
+/// so they cannot disagree — and when an icon set exists, it goes here too rather than becoming a
+/// fourth place that has to be kept in step.
+const GRAPHICAL_APPLICATIONS: [(&str, &str); 3] =
+    [("nxterm", "Terminal"), ("nxfiles", "Files"), ("nxedit", "Text Editor")];
+
 fn profile_programs() -> Vec<&'static str> {
     let mut v = COREUTILS.to_vec();
     v.push("nxsh");
@@ -9734,6 +9743,30 @@ fn assemble_image(
     println!(
         "xtask: store package {cu_store}/bin/ ({} programs)",
         programs.len()
+    );
+
+    // **The desktop entries** — one per graphical application, in the same package as the
+    // binaries they name, projected at `/applications` the way `bin/` is projected at `/bin`
+    // (M14 Part H). This is what stops the applications modal listing every program on the
+    // system: `/bin` holds services, servers and CLI tools too, and *"is this graphical?"* is
+    // not a property that can be read off a binary — it is a claim somebody has to make, and
+    // this is where it is made.
+    //
+    // **Beside the binaries rather than in a file of their own**, so that a package carries its
+    // own applications: adding one here is adding a file to a package, not editing a list that
+    // has to be kept in step with three others.
+    let apps_dir = staging.join(cu_store.trim_start_matches('/')).join("applications");
+    fs::create_dir_all(&apps_dir)?;
+    for (exec, name) in GRAPHICAL_APPLICATIONS {
+        fs::write(
+            apps_dir.join(format!("{exec}.toml")),
+            format!("# Desktop entry — see docs/spec/desktop-entry.md\nname = \"{name}\"\nexec = \"{exec}\"\n"),
+        )
+        .map_err(|e| format!("stage the {exec} desktop entry: {e}"))?;
+    }
+    println!(
+        "xtask: store package {cu_store}/applications/ ({} entries)",
+        GRAPHICAL_APPLICATIONS.len()
     );
 
     // The `system` package: the services. Everything init and service-mgr spawn after the

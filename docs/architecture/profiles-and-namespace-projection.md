@@ -10,7 +10,15 @@ Nitrox's distinctive choice: projection is done by a **resource server** resolvi
 lookups, **not** by symlink farms (as Nix does). This is the capability-native form —
 it composes with per-process namespaces and rights.
 
-Status: **implemented, slice 1** (Phase 3). The **system profile** is projected at `/bin`
+Status: **implemented, slice 1** (Phase 3), and **projecting a second directory since
+2026-09-04** (M14 Part H): the same server also projects each package's `applications/` at
+`/applications`, which is where [desktop entries](../spec/desktop-entry.md) live. The two binds
+differ in one thing — `/applications` carries a **subtree base**, so a request arrives as
+`/applications/x` where a `/bin` request arrives as a bare `x`, and one endpoint can tell them
+apart. The projected set is a fixed list in the server, not "whatever a package happens to
+contain": a package is data, and what appears in a namespace is policy.
+
+The **system profile** is projected at `/bin`
 from a manifest over the read-only store by `userspace/profile-server`, which `init`
 spawns and whose endpoint it hands to `service-mgr`. Per-user profile overlays, runtime
 generation switching, and rollback are designed here but **not built**. Verified 2026-08-05.

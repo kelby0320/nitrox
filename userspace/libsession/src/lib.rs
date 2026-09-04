@@ -283,6 +283,39 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         if pr != 0 {
             kprint(b"libsession: /bin bind FAIL (session has no programs)\n");
         }
+        // `/applications` → the *same* profile server, with a subtree base. A resolve of
+        // `/applications/nxterm.toml` reaches it as `applications/nxterm.toml`, and it projects
+        // each package's `applications/` directory the way it projects `bin/` (M14 Part H).
+        //
+        // **Why a second projection rather than a directory of files somewhere.** A desktop entry
+        // says "this program is one a person launches, and here is what to call it" — which is a
+        // fact about a *package*, not about a machine. Projecting it means installing a package
+        // brings its applications with it and removing one takes them away, with no list anywhere
+        // to keep in step. The alternative, a file the image build writes, needs the build to know
+        // every application on the system, which is the coupling the store exists to remove.
+        //
+        // Non-fatal for the same reason `/bin` is: a session that cannot enumerate applications
+        // still runs every one of them by name.
+        let apps = b"/applications";
+        // **Absolute**: `SubtreeBase::from_path` runs `validate_path`, which rejects a bare
+        // component. The forwarded suffix therefore carries the leading slash too, which is what
+        // `profile-server`'s `split_suffix` strips.
+        let base = b"/applications";
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
+        let ar = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                apps.as_ptr() as u64,
+                apps.len() as u64,
+                profile_endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if ar != 0 {
+            kprint(b"libsession: /applications bind FAIL (the modal will be empty)\n");
+        }
         has_bin = pr == 0;
     }
 

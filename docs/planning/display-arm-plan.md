@@ -4522,19 +4522,28 @@ costing showed it crosses the namespace.
 
       See the decision log for the method note: **when a reference exists, measure it.**
 
-### Part H — what an application is
+### Part H — what an application is ✅ complete (2026-09-04)
 
 Split out of Part F, which was chosen to go first *because* it was small. This is not: it reaches
 the namespace, and the box that hid that was one line long.
 
-- [ ] **Desktop entries**, per decision 1: the manifest format, the staged directory, the image
-      build that writes it, and the shell reading it instead of `/bin`.
-- [ ] **And a path the session can resolve**, which is the part the one-line box concealed. `/bin`
-      reaches a session only because the profile server *projects* packages' `bin/` into it — as
-      `desktop-shell`'s own comment says, "`/bin` is a forwarded directory, not a set of
-      bindings" — and `desktop-session-mgr` binds nothing of its own (its only `ns_lookup` is
-      `/svc/auth`). So a directory of desktop entries needs either a second projection or a
-      binding, and deciding which is the real work here.
+- [x] **Desktop entries** ✅, per decision 1: `name` and `exec`, both required, one TOML file per
+      application, specified in [`desktop-entry.md`](../spec/desktop-entry.md).
+- [x] **Projected, not staged** ✅ — which is how the "second projection or a binding" question
+      resolved. Entries sit beside the binaries they name in the same store package, and the
+      profile server projects `applications/` at `/applications` exactly as it projects `bin/` at
+      `/bin`. A package carries its own applications: install one and its entries come with it,
+      with no list anywhere to keep in step. The alternative needs the image build to know every
+      application on the system, which is the coupling the store exists to remove.
+- [x] **One endpoint, two names** ✅. `/bin` is bound unscoped and `/applications` with a subtree
+      base, which is what lets the server tell a request for one from a request for the other.
+      Two things there were found only by booting: a subtree base must be an **absolute** path
+      (`validate_path` rejects a bare component, and the bind failed silently), and splitting the
+      suffix on its first slash is not enough, because opening the directory itself yields a bare
+      `applications` — shape-identical to a program of that name. A fixed list of projection names
+      disambiguates.
+- [x] **The filter matches the program as well as the name** ✅, because somebody who knows the
+      desktop types "editor" and somebody who knows the system types `nxedit`.
 
 ### Part A — the menu bar as a toolkit widget
 

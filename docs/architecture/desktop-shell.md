@@ -2,20 +2,21 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-03** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-04** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
 click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
 Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
 reservation, holding a PNG the theme names and this shell decodes, because the shell holds
 `/home` and a theme where the compositor holds neither; **M13 Part C made the overview a
 translucent `ARGB8888` surface over the live desktop**, replacing the dimmed copy of the wallpaper
-it used to redraw (see [`clipboard.md`](clipboard.md) and
+it used to redraw, and **M14 Part H made the applications modal list desktop entries** rather than
+every program in `/bin` (see [`clipboard.md`](clipboard.md) and
 `display-arm-plan.md` M12 decision 2);
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
 
 **This document outruns its code on purpose, so read it section by section.** What is built:
-the **top bar** (§3), the **applications modal** (§4) — `/bin` listed through the profile
+the **top bar** (§3), the **applications modal** (§4) — `/applications` listed through the profile
 server, filtered as you type — **launching** (§6's spawn half), each application into a
 namespace the shell constructs, and since M10 Part D **launching on somebody else's behalf**
 (§4a): a client names a path over `/dev/desktop` and the shell opens it, **placement and window management** (§8), the shell driving
@@ -193,9 +194,16 @@ compositor. That is the cheap option kept open rather than exercised.
 **One modal, two triggers**: the applications button in the top bar, and the Super key. They open
 the same thing, because they are the same intent.
 
-**Its entries are `/bin` programs**, and this falls out of decisions already made rather than
-being designed here: they are ordinary files in the namespace, so type-to-filter runs over them
-with no special mechanism. (An earlier version also listed `~/Desktop/*.nxg` templates; templates
+**Its entries are desktop entries** (M14 Part H) — one TOML file per graphical application,
+projected at `/applications` the way `/bin` is projected, carrying a display name and the program
+to spawn. See [`desktop-entry.md`](../spec/desktop-entry.md).
+
+Until then they were `/bin` programs, which meant every service, server and command-line tool the
+profile projects, under the name of its binary. Filtering that needs a fact that cannot be read
+off an ELF — "is this graphical?" is a claim somebody has to make — and a name a person recognises
+has to come from somewhere too. Both come from the entry, so they cannot disagree. Type-to-filter
+still runs over them with no special mechanism, and matches the program as well as the name: the
+people using this system are as likely to type `nxedit` as "editor". (An earlier version also listed `~/Desktop/*.nxg` templates; templates
 were cut in composition revision 3.) "Open the code-editor desktop" is a launcher entry, not a
 feature.
 
