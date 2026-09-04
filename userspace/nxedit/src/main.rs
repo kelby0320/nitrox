@@ -395,9 +395,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     }];
 
     loop {
-        // **Destructured rather than dotted through**, which is what keeps this loop readable
-        // after the conversion: every name below means what it meant when there was one window,
-        // and the difference is that they are now borrowed out of a value there can be several of.
+        // **Every window this process owns, each serviced exactly as one used to be.**
+        //
+        // Destructured rather than dotted through, which is what keeps six hundred lines readable
+        // across the conversion: every name below means what it meant when there was one window,
+        // and the difference is that they are borrowed out of one of several.
+        for wi in 0..wins.len() {
         let Win {
             top,
             app,
@@ -412,7 +415,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             reported_name,
             reported_title,
             reported_tab,
-        } = &mut wins[0];
+        } = &mut wins[wi];
         let window_id = top.id();
         // **One line per edit, and it carries a count rather than the text.** A gate driving a
         // release image cannot read this window — the pixels are the only echo an editor has —
@@ -754,6 +757,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             exit(0);
         }
 
+        }
+
         // ---- events ----
         if win.events_pending() == 0 {
             wait_one(ev);
@@ -769,8 +774,36 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
         }
-        let mut resized = false;
         for (from, event) in events {
+            // **Which window is this for?** With one window the answer was "this one, or a stale
+            // record for a child just destroyed". With several it is a lookup, and a record
+            // naming none of them is dropped rather than routed into whichever window happened
+            // to be first — that being the bug this shape exists to prevent.
+            let Some(wi) = wins.iter().position(|w| {
+                w.top.id() == from
+                    || w.menu.as_ref().is_some_and(|m| m.id() == from)
+                    || w.confirm.as_ref().is_some_and(|c| c.id() == from)
+            }) else {
+                continue;
+            };
+            let Win {
+                top,
+                app,
+                size,
+                bounds,
+                confirm,
+                confirm_hovered,
+                menu,
+                menu_shown,
+                menu_hovered,
+                ..
+            } = &mut wins[wi];
+            let window_id = top.id();
+            // Rebuilt for *this* window: routing is against a layout, and a layout of another
+            // window's tree would report a widget that is not the one under the pointer.
+            let ui = app.view(&theme, top.hovered_key());
+            let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
+            let mut resized = false;
             // **The dialog's window routes through the dialog's tree.** Same `App`, so an
             // answer's `Msg` updates the same state the main window's messages do; a different
             // tree and router, because they describe a different window. A record for a window
@@ -931,8 +964,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 WindowEvent::InputLost => kprint(b"nxedit: input dropped\n"),
             }
-        }
-        if resized {
+            if resized {
             *size = app.window_size();
             // **`Child::resize` reallocates and throws the retained tree away**, which is what a
             // resize means: a tree diffed against a layout from the old bounds reports damage in
@@ -942,6 +974,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 fail(b"nxedit: impossible window geometry\n");
             }
             *bounds = Rect::new(0, 0, size.w, size.h);
+            }
         }
     }
 }
