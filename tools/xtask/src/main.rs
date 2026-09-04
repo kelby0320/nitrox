@@ -3443,46 +3443,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // column, so a drop at the extreme edge landed on it anyway. Giving the window a frame moved
     // the content in by four pixels and the drop started landing on the frame — a real gate bug,
     // surfaced by a change that had nothing to do with it.
-    //
-    // **The press-and-travel is retried as a unit**, for the reason `click_until` exists: this
-    // browser intermittently does not act on input the compositor delivered to it, and the drag
-    // is the second step where that shows (PR #280's CI failure was the first). Safe here because
-    // a retry only happens when *no* drag started — the receipt would have arrived otherwise —
-    // so the button is released over the row it was pressed on and nothing has been picked up.
-    const DRAG_TRIES: u32 = 3;
     let mut at = row1;
-    let mut dragging = false;
-    for attempt in 1..=DRAG_TRIES {
-        at = row1;
-        for _ in 0..6 {
-            qmp.send_motion(100, 40)?;
-            at = (at.0 + 100, at.1 + 40);
-        }
-        if session.expect_within(
-            "nxfiles: dragging other.txt",
-            std::time::Duration::from_secs(10),
-        )? {
-            dragging = true;
-            break;
-        }
-        println!("  note: the press on the row did not become a drag (attempt {attempt}/{DRAG_TRIES})");
-        // Let go where we are, walk back to the row, and press again.
-        qmp.send_button("left", false)?;
-        qmp.pointer = Some(at);
-        move_pointer_to(&mut qmp, row1.0, row1.1)?;
-        qmp.pointer = Some(row1);
-        qmp.send_button("left", true)?;
+    for _ in 0..6 {
+        qmp.send_motion(100, 40)?;
+        at = (at.0 + 100, at.1 + 40);
     }
-    if !dragging {
-        let _ = session.child.kill();
-        return Err(format!(
-            "pressed on the row and travelled {DRAG_TRIES} times and `nxfiles` never started a \
-             drag. The press and its release are in the transcript if they reached the \
-             compositor — a pair that arrived means the client did not act on input it was \
-             given, which is `TODO(click-not-acted-on)`"
-        )
-        .into());
-    }
+    // **Asserted directly, not retried.** Like the menu click below, this was flaky for exactly
+    // one reason — a repaint between the press and the release re-identified the row under the
+    // pointer and `libui` dropped the gesture — and the retry that hid it is gone with the bug.
+    session.expect("nxfiles: dragging other.txt")?;
     session.expect("compositor: drag from window ")?;
     // Into the editor's document area — below its title bar and status strip, and well inside
     // the half of the screen it now occupies.
@@ -3709,10 +3678,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     by pointing at it is a menu nobody will find. The item sits at the content's left
     //     edge, one bar below the title.
     let file_menu = (fx + 20, fy + 1 + TITLE_BAR_H + MENU_BAR_H / 2);
-    // **Retried on the popup, not on the press.** `the_gate_aims_inside_the_file_word` pins that
-    // this point is inside the word, and the transcript shows the press *and* its release landing
-    // on this window — and the menu still occasionally does not open. See `click_until`.
-    click_until(&mut qmp, &mut session, file_menu.0, file_menu.1, "nxfiles: menu popup ")?;
+    // **One click, asserted directly.** This was retried for a fortnight of CI runs while a
+    // delivered click intermittently produced nothing; the cause was `libui` losing the gesture
+    // when a repaint between the press and the release re-identified the widget under it, and it
+    // is fixed. The retry is gone deliberately: it would hide the regression it was written for.
+    click_at(&mut qmp, &mut session, file_menu.0, file_menu.1)?;
+    session.expect("nxfiles: menu popup ")?;
     let popup = session.rest_of_line()?;
     let (_, px, py, _pw, ph) = parse_menu_popup(&popup)
         .ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
@@ -4356,48 +4327,6 @@ fn check_two_sessions(transcript: &str) -> R<()> {
 /// guest's input ring. A confirmed press is a position report, so `Qmp::pointer` remembers it
 /// and consecutive clicks walk from there — two motions rather than thirty-four
 /// (PR #243 review, finding 3).
-/// Click at `(x, y)` until the guest says `receipt` — retrying the *click*, not the aim.
-///
-/// **[`click_at`] confirms that the press landed; this confirms that it did something.** They are
-/// different claims, and the gap between them is where PR #280's CI failure lived: the compositor
-/// logged a press *and* a release at the right coordinates on the right window, and the client
-/// never acted on the pair. Whatever swallows it — the release logging added the same day proves
-/// it is not a lost PS/2 packet, which was the first guess — it is intermittent, and a gate that
-/// treats one delivered-but-ineffective click as a verdict is a gate that fails for a reason
-/// nobody can act on. Filed as `TODO(click-not-acted-on)`; it is **not** the i8042
-/// lost-interrupt fault, which `drivers/ps2` already fixes with a tick-driven sweep.
-///
-/// **Only safe where a repeated click is harmless if the first one worked**, which is why the
-/// window is generous: a menu bar word toggles, so a second click on a menu that *did* open would
-/// close it. Ten seconds is far longer than the receipt takes when the click lands.
-fn click_until(
-    qmp: &mut Qmp,
-    session: &mut Session,
-    x: i32,
-    y: i32,
-    receipt: &str,
-) -> R<()> {
-    const ATTEMPTS: u32 = 3;
-    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
-    for attempt in 1..=ATTEMPTS {
-        click_at(qmp, session, x, y)?;
-        if session.expect_within(receipt, PER_ATTEMPT)? {
-            return Ok(());
-        }
-        println!(
-            "  note: the click at ({x}, {y}) landed but produced no {receipt:?} — retrying \
-({attempt}/{ATTEMPTS})"
-        );
-    }
-    Err(format!(
-        "clicked ({x}, {y}) {ATTEMPTS} times and never saw {receipt:?}. The press and its release \
-         are both in the transcript if they reached the compositor, so check there first: a pair \
-         that arrived means the client did not act on a click it was given, which is \
-         `TODO(click-not-acted-on)` rather than a mis-aimed click"
-    )
-    .into())
-}
-
 fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
     const ATTEMPTS: u32 = 3;
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -4424,10 +4353,12 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
             // a bargain. The logging stays, because it makes the next occurrence *legible*;
             // the wait does not, because it makes a different step fail.
             //
-            // **It is not the i8042 lost-interrupt fault**, which was the obvious suspect and
-            // is already fixed: `drivers/ps2` recovers a byte the controller will not re-raise
-            // for, via a tick-driven sweep. This is something after that, and it is filed as
-            // `TODO(click-not-acted-on)` rather than guessed at here.
+            // **It is not lost input, and that took a change to establish.** A click is both
+            // halves and only the press used to be logged, so a dropped release and a client
+            // ignoring the click were indistinguishable. With both logged the answer was that
+            // both arrived — the loss was in `libui`, which dropped the gesture when a repaint
+            // between the halves re-identified the widget under the pointer. Fixed 2026-09-04;
+            // the logging stays, because it is what turned a guess into an answer.
             return Ok(session.rest_of_line()?);
         }
         // It did not land where it was aimed, so where it *is* is no longer known.

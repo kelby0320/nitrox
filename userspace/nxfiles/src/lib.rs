@@ -2502,4 +2502,68 @@ mod tests {
         );
     }
 
+    /// A click on the menu bar opens the menu even when its two halves fall in different frames.
+    ///
+    /// **This is `click-not-acted-on` as the browser experiences it** — the intermittent
+    /// fault that failed PR #280's CI, where the compositor delivered a press *and* a release to
+    /// this window at the File word's coordinates and no menu opened.
+    ///
+    /// The two halves land in different frames whenever the click is the one that *raises* the
+    /// window, because the raise costs a recompose in between; that is why it looked random and
+    /// why it hit KVM more often than TCG. The frame in between is drawn with the word
+    /// **hovered** — the press is what establishes hover — and a hovered `menu_item` has three
+    /// layers where a resting one has one, so every node inside it is re-identified. The fix is
+    /// in `libui`: `Router` captures the node carrying the handler, which is the word itself and
+    /// survives. This is the application-level proof that the path a person clicks is repaired.
+    #[test]
+    fn a_click_split_across_a_repaint_still_opens_the_menu() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let theme = UiTheme::default();
+        let mut tree = libui::diff::Tree::new();
+        let mut router = libui::route::Router::new();
+
+        // Frame 1: nothing hovered, because hover is what the press is about to establish.
+        let rest = a.view(&theme, None);
+        let l = libui::layout::layout(&rest, Rect::new(0, 0, size.w, size.h), &cell);
+        tree.update(&rest, &l).expect("the view is diffable");
+        let word = libui::layout::locate(&rest, &l, MENU_BAR_KEY).expect("the File word is keyed");
+        let at = (word.origin.x + word.size.w as i32 / 2, word.origin.y + word.size.h as i32 / 2);
+
+        let ev = |flags: u16, buttons: u16| librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons,
+            flags,
+            x: at.0,
+            y: at.1,
+            ..Default::default()
+        };
+        let (msgs, _) =
+            router.pointer(&tree, &rest, &l, ev(librsproto::surface::POINTER_PRESSED, 1));
+        assert!(msgs.is_empty(), "a press is not a click");
+
+        // Frame 2: a repaint between the two halves, with the word lit. **Lit explicitly, not
+        // via `hovered_key`** — crossings are suppressed while a capture is in force, so the
+        // press does not itself set `inside`, and a frame built from `hovered_key` here would be
+        // identical to frame 1 and the test would pass against the bug. It did, until the
+        // negative control caught it. What matters is only that *a* repaint between the halves
+        // re-identifies the nodes inside the word, which is what a highlight does.
+        let lit = a.view(&theme, Some(MENU_BAR_KEY));
+        let l2 = libui::layout::layout(&lit, Rect::new(0, 0, size.w, size.h), &cell);
+        tree.update(&lit, &l2).expect("the view is diffable");
+
+        // The release, in that new frame.
+        let (msgs, _) = router.pointer(&tree, &lit, &l2, ev(0, 0));
+        for m in msgs {
+            a.update(m);
+        }
+        assert_eq!(
+            a.menus.open(),
+            Some(0),
+            "the click was dropped because the repaint between its halves re-identified the word"
+        );
+    }
+
 }

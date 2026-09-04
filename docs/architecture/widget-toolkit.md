@@ -1,7 +1,9 @@
 # Nitrox: The Widget Toolkit
 
 **Status: built (2026-08-11, last checked 2026-09-04), and this document describes what
-exists.** M14 Part A added `menu.rs` — the *whole* of a drop-down menu as a value: a table of
+exists.** `Router` captures the widget that *carries the handler* rather than the deepest one
+under the cursor (2026-09-04) — see §8.2, which is the one place a reader will look after losing
+a click. M14 Part A added `menu.rs` — the *whole* of a drop-down menu as a value: a table of
 items with accelerators, separators and per-item availability, the open/anchor/cursor state, the
 keyboard, and the two builders that turn them into a bar and a popup. All three applications had
 been carrying their own copy of the second half. M12 Part A added `window::Child` — the toolkit's first module that is not a function of
@@ -582,6 +584,41 @@ chrome, layout, focus and input plumbing, and gets out of the way where an appli
 knows better.
 
 ---
+
+### 8.2 What a capture is, and why it is not the deepest widget (2026-09-04)
+
+`Router::capture` is the widget a gesture belongs to from its press to its release — it is what
+makes a drag that leaves a button still that button's drag. It stores a **widget id**, and ids
+come from the diff: `reconcile` keeps one when the node's kind matches and mints a fresh one
+otherwise.
+
+**It captures the node carrying a pointer handler**, searched from the hit outwards, so a widget
+that handles its own events (`nxterm`'s grid is a `custom` node with `on_pointer`) captures
+exactly itself.
+
+**It used to capture whatever `hit_test` returned, which is the deepest node** — a button's
+label, not the button — and that lost clicks. A press is also what establishes hover, so the next
+frame draws that control lit; a lit `menu_item` or `button` is a three-layer stack where a resting
+one is a single layer, unkeyed children are matched positionally, and every node inside is
+re-identified. The captured label then names a widget the tree no longer has, `path_to_id`
+returns `None`, and the release dispatches **nothing** — not misrouted, silently gone.
+
+It was intermittent because it needs the press and the release in *different frames*, which is
+exactly what a click on an **unfocused** window guarantees: the raise costs a recompose in
+between. So "the first click on a window you have not touched yet does nothing" — random-looking,
+and much commoner under KVM than TCG. It cost PR #280 a red CI run and two gate workarounds,
+both since removed.
+
+**Click-to-focus does not use the capture**, and that is load-bearing rather than incidental:
+focus is a claim on the keyboard, and walking it up to a composite widget's outer `Stack` moves it
+to something that claims keys and handles none (PR #223). It reads the hit node directly.
+
+**Stale ids are the router's own problem.** `Router` forgets focus, capture and hover naming
+widgets the tree no longer has, from inside `pointer`. That was a `pub fn prune` documented
+"called after every diff" which three applications and a test client never called — a contract
+with no honourers reads like a handled hazard and is worse than none. It is not what keeps a click
+alive: a *re-identified* widget is still on screen, and forgetting the gesture drops the click as
+surely as a stale id does.
 
 ## 9. Three things below the toolkit that Milestone 4 forces
 

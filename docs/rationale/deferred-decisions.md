@@ -63,30 +63,6 @@ be read as the list of what is actually owed.
 
 See `docs/architecture/drivers-and-irps.md` for the framework these defer from.
 
-**A click the compositor delivers that its client never acts on —
-`TODO(click-not-acted-on)`.** Intermittently, and more often under KVM than TCG, a press and its
-release are both routed to a window at the coordinates a gate aimed at, and the client produces
-nothing: no menu opens, no drag starts. It cost PR #280 a red CI run and is the reason
-`click_until` and the drag's retry exist in `xtask` — both retry on the guest's *receipt* rather
-than on where the press landed, so a gate recovers instead of timing out on an unrelated
-expectation forty-five seconds later.
-
-**What it is not.** Not lost PS/2 input: the compositor logs releases as well as presses since
-2026-09-04, and both halves are in the transcript when this happens. Not the i8042 lost-interrupt
-fault either — that one is fixed, by the tick-driven sweep in `kernel/src/drivers/ps2/mod.rs`
-whose own comment records that a byte already sitting in the output buffer raises no further
-edge. A dangling `wip/i8042-efficacy` branch carries a commit with that title that is *not* in
-`main` and looks like a pending fix; it is superseded, and cherry-picking it reverts the better
-answer.
-
-So the loss is somewhere after the compositor decided where the event goes: the IPC delivery, the
-client's event pump, or its router's capture across a focus change — the raise lands *between*
-the press and the release in every captured instance, which is the one correlation there is.
-
-Trigger: the next time an input gate fails with a matched press/release pair in the transcript,
-or anyone reproducing it by hand. Cheap first step: log the event at the client's pump, not only
-at the compositor, so the two ends can be compared.
-
 **Tier 2 (runtime-loadable) drivers.** Phase 2 ships only Tier 1 drivers
 (compiled into the kernel ELF via Cargo features: `pci`, `ahci`, `gpt`). The
 userspace driver manager — matching `DeviceNode`s to loadable modules and
@@ -1962,6 +1938,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A click the compositor delivers that its client never acts on (`click-not-acted-on`) | 2026-09-04 | Filed and fixed the same day, and the filing was wrong about where to look — it guessed the compositor or IPC. The loss was in `libui::route`. `Router::capture` stored the id `hit_test` returns, which is the **deepest** node under the cursor: a button's *label*, not the button. A press is also what establishes hover, so the next frame draws that control lit — and a lit `menu_item` or `button` has three layers where a resting one has one, so positional matching gives every child a fresh id and the captured node stops existing. `path_to_id` then fails and the release dispatches **nothing**: not misrouted, silently gone. Intermittent only because it needs the two halves in different frames, which is exactly what a click on an *unfocused* window guarantees — the raise costs a recompose between them — so it read as random and hit KVM far more than TCG. **The fix is to capture the node carrying the handler**, searched from the hit outwards, which is what dispatch already walked up to find and is the node applications key; it is the same kind of node lit or not, so it survives. Click-to-focus had to stop using `target` in the same change, or it would land on the outer `Stack` that PR #223 exists to keep focus off. Six KVM `check-login` runs went from retrying in three of four to zero. **Two workarounds were removed with it** — a receipt-retried click and a retried drag — because a retry hides the regression it was written for. What stays is the compositor logging *releases* beside presses, which is what turned "we cannot tell whether the click was delivered" into an answer. |
 | `/dev/draw/manage` gates nothing | 2026-08-25 | Closed **by binding**, which is what the entry always said it would be. `desktop-shell` builds a namespace per application and binds `/dev/draw/new` **as its own path** with subtree base `/new`, not the `/dev/draw` subtree: the exact resolve matches and forwards `new`, while `/dev/draw/manage` is not a component-boundary prefix match against it (`match_suffix_offset`) and resolves to nothing. No protocol change and no second endpoint — a first draft specified one, reasoning that the compositor classifies by suffix with no caller identity; both premises are true and the conclusion does not follow, because what a namespace can *reach* is decided by what it **binds**. The shell's own session namespace binds the subtree unscoped and gets both. **Verified rather than asserted**: the shell checks the namespace it built before launching into it and refuses if `manage` is reachable, `check-login` asserts that verdict, and swapping the narrow bind for a subtree one makes the guest print `REACHES /dev/draw/manage -- refusing` and fails the gate. **Two caveats carried forward**: a narrow bind cannot express "the subtree *minus* `manage`", so the first application needing `/dev/draw/<id>/info` for unknown ids forces a subtree bind and `manage` returns — the second endpoint is the fallback and that is its trigger; and anything spawned with `namespace: 0` still inherits root, where `/dev/draw` is bound unscoped, so the selftest path stays ungated whatever session namespaces do. |
 | Window titles: `Surface::SetTitle` and `WindowTitle` | 2026-08-25 | Built in M7 Part A, whose window list is the trigger the entry named. The two ops share the protocol's **first variable-length Surface record**: a 4-byte window id then UTF-8 bytes, with **no length field** — the body's own length gives it, and a second one would only be a way for the two to disagree. Over `MAX_TITLE` (256 bytes) is **truncated on a character boundary, not refused** (decided 2026-08-25): `SetTitle` is silent on success and has no reply a client reads, so refusing would need an error path built for the op specified not to have one. The boundary is the load-bearing part — cutting at 256 *bytes* can land inside a character, so a cap meant to bound memory would leave the title not UTF-8 at all. The compositor logs the first truncation and then stays quiet, for the reason a per-event log cost `check-input` on 2026-08-24. **The 256 was very nearly a lie**: the serve loop copied request bodies into a 64-byte buffer, so the real cap was 60 and a title whose 61st byte began a multi-byte character came back `Malformed` instead of shortened — the exact corruption `truncate_title` exists to prevent, reintroduced one frame up the stack, with `truncate_title`'s walk-back unreachable in the shipped binary. Caught in review because every truncation test called `dispatch` directly with a body no client could deliver; the buffer is now sized from `MAX_TITLE` with a `const` assertion tying them together. Not-UTF-8 or too short is `Malformed`; another connection's window is `NotFound`; an unchanged title produces no manager event, because that queue is bounded. |
 | Thread placement still targets a CPU that has parked | 2026-08-14 | `pick_target_cpu` and `pick_wake_cpu` now require the lock-free `online_mask` bit as well as `cpu_online[]`, so a core that parked forever is never *given* work. **Not applied to the stealing paths**, deliberately: `steal_one`/`steal_available` choose whom to take work *from*, and a parked CPU is exactly the queue you want drained — gating those would strand the threads it already holds. Demonstrated end-to-end by parking a CPU mid-boot: with the fix `test-qemu` passes, without it the boot self-test fails. |

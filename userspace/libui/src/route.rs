@@ -247,10 +247,27 @@ impl Router {
     /// Drop focus, capture and the hovered widget if they name widgets the tree no longer
     /// has.
     ///
-    /// Called after every diff. The router is not on the destroy path, and asking the tree
-    /// cannot go out of date the way a callback can — the same reasoning the compositor's
-    /// `InputRouter` uses for window ids.
-    pub fn prune(&mut self, tree: &Tree) {
+    /// **The router calls this itself**, from the top of every routing entry point, and that is
+    /// the whole of the change (M14): it was `pub` and documented "called after every diff", and
+    /// in three applications and a test client *nothing called it* — a contract with no
+    /// enforcement and no honourers, which is worse than no contract, because it reads like the
+    /// hazard is handled. It is cheap where it sits: routing already hit-tests the tree on every
+    /// event, so this adds a walk of the same order, and only for fields that are set.
+    ///
+    /// The router is not on the destroy path, and asking the tree cannot go out of date the way
+    /// a callback can — the same reasoning the compositor's `InputRouter` uses for window ids.
+    ///
+    /// **From `pointer` only.** `key` takes `&self`, and a stale *focus* is already tolerated
+    /// everywhere it is read: `focus_next` starts from an end rather than refusing to move, and
+    /// routing a key to a widget that is gone finds no handler and returns `None`. Widening
+    /// `key`'s signature to prune there would touch every caller to fix nothing.
+    ///
+    /// **It is not what keeps a click alive.** A widget that was *re-identified* rather than
+    /// destroyed is still on screen under the cursor, and forgetting the gesture would drop the
+    /// click just as surely as a stale id does — `capture_button` goes with `capture`, so the
+    /// release stops being a click either way. Capturing the handler-bearing node is what
+    /// survives that; this is for widgets that genuinely went away.
+    fn forget_stale(&mut self, tree: &Tree) {
         if self.focus.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
             self.focus = None;
         }
@@ -342,12 +359,40 @@ impl Router {
         //
         // Whether *this* press is the one that opened it is read before the assignment, and is
         // what `on_press_down` fires on — see the dispatch below.
+        self.forget_stale(tree);
+        // The innermost node under the cursor, computed once: the capture below is derived from
+        // it, and **click-to-focus is decided by it directly** rather than by `target`, which
+        // since M14 is the handler-bearing ancestor. See the focus branch for why that
+        // distinction is load-bearing.
+        let hit_now = hit_test(tree.root(), layout, at);
         let opens_capture = pressed && self.capture.is_none();
         if opens_capture {
-            self.capture = hit_test(tree.root(), layout, at);
+            // **The widget that handles the gesture, not the deepest one under the cursor.**
+            //
+            // `hit_test` returns the innermost node, which for a composite widget is one of its
+            // *parts* — the label inside a button, not the button. Dispatch has always walked up
+            // from there to find the handler, so capturing the part meant storing the fragile
+            // half of a fact it then recomputed anyway.
+            //
+            // Fragile because a press is also what establishes **hover**: the next frame draws
+            // that control lit, a lit control has more layers than a resting one, positional
+            // matching gives every one of those children a fresh id, and the captured part no
+            // longer exists. `path_to_id` then fails and the release dispatches *nothing* — the
+            // click is not misrouted, it is silently gone. Intermittent in practice because it
+            // needs the press and the release in different frames, which is what a click on an
+            // unfocused window guarantees (the raise costs a recompose between them). It cost
+            // PR #280 a red CI run; `a_gesture_survives_the_widget_under_it_being_re_identified`
+            // is the reproduction.
+            //
+            // The handler-bearing node survives all of that: it is the same kind of node lit or
+            // not, and it is the one applications key. **Searching from the hit itself**, so a
+            // widget that handles its own events — `nxterm`'s grid is a `custom` node with
+            // `on_pointer` — captures exactly what it captured before.
+            self.capture =
+                hit_now.map(|hit| handling_ancestor(tree, element, hit).unwrap_or(hit));
             self.capture_button = Some(event.button);
         }
-        let target = self.capture.or_else(|| hit_test(tree.root(), layout, at));
+        let target = self.capture.or(hit_now);
 
         let mut out = Vec::new();
 
@@ -430,10 +475,14 @@ impl Router {
                     out.push(msg);
                 }
             }
-            let e = match element_at(element, &path) {
-                Some(e) => e,
-                None => return (out, target),
-            };
+            // **The captured element must still exist**, or the click arithmetic below is about
+            // a widget that is not there. Nothing reads it any more — the focus branch used to,
+            // and reads `hit_now` since M14 — but the guard stays: an unresolvable path here
+            // means the tree changed under the gesture, and the arms below would silently
+            // compare against whatever now sits at that index path.
+            if element_at(element, &path).is_none() {
+                return (out, target);
+            }
             // A **click** is a release inside the widget that took the press. Releasing
             // outside is a cancel, which is why this is not simply "on release".
             //
@@ -470,8 +519,18 @@ impl Router {
             // because the label under the cursor is not focusable. That is the behaviour that
             // shipped before this, and making a button take focus needs it to *do* something
             // with the keyboard first.
-            if pressed && e.focusable {
-                self.focus = Some(id);
+            //
+            // **`hit_now`, not `id`** (M14). `id` is `target`, which is the *captured* widget —
+            // and since capture became the handler-bearing ancestor, using it here would walk
+            // focus up to exactly the outer `Stack` this rule exists to keep it off. The gate
+            // for that is `clicking_a_button_does_not_take_the_keyboard_from_the_focused_widget`,
+            // which caught it the moment capture moved.
+            if pressed
+                && let Some(hid) = hit_now
+                && let Some(hpath) = path_to_id(tree.root(), hid)
+                && element_at(element, &hpath).is_some_and(|he| he.focusable)
+            {
+                self.focus = Some(hid);
             }
         }
 
@@ -582,6 +641,34 @@ fn find_by_id(w: Option<&Widget>, id: u64) -> Option<&Widget> {
     w.children.iter().find_map(|c| find_by_id(Some(c), id))
 }
 
+/// The nearest node at or above `hit` that carries a pointer handler, as a widget id.
+///
+/// "Nearest" is from `hit` outwards, so a node that handles its own events is its own answer.
+/// `None` when nothing on the path handles anything — there is no gesture to keep, and the
+/// caller falls back to `hit` so behaviour is unchanged for handler-less widgets.
+///
+/// **All three handlers count.** A title bar carries `on_press_down` and its close button
+/// `on_press`; capturing only for one kind would move the gesture to different nodes depending
+/// on which handler happened to be nearer, which is the sort of rule that is right until somebody
+/// adds a handler.
+fn handling_ancestor<Msg>(tree: &Tree, element: &Element<Msg>, hit: u64) -> Option<u64> {
+    let path = path_to_id(tree.root(), hit)?;
+    (0..=path.len()).rev().find_map(|n| {
+        let e = element_at(element, &path[..n])?;
+        let handles = e.on_press.is_some() || e.on_press_down.is_some() || e.on_pointer.is_some();
+        if handles { widget_at(tree.root(), &path[..n]) } else { None }
+    })
+}
+
+/// The id of the widget at `path`, for the ancestor a handler was actually found on.
+fn widget_at(root: Option<&Widget>, path: &[usize]) -> Option<u64> {
+    let mut cur = root?;
+    for &i in path {
+        cur = cur.children.get(i)?;
+    }
+    Some(cur.id)
+}
+
 /// The index path from the root to `id`.
 fn path_to_id(root: Option<&Widget>, id: u64) -> Option<Path> {
     fn walk(w: &Widget, id: u64, path: &mut Path) -> bool {
@@ -602,7 +689,6 @@ fn path_to_id(root: Option<&Widget>, id: u64) -> Option<Path> {
     walk(root, id, &mut path).then_some(path)
 }
 
-/// The id of the widget at `path`, for the ancestor a handler was actually found on.
 /// The element at `path`, walking [`Element::children`] order.
 fn element_at<'a, Msg>(e: &'a Element<Msg>, path: &[usize]) -> Option<&'a Element<Msg>> {
     let mut cur = e;
@@ -1169,6 +1255,79 @@ mod tests {
         assert_eq!(r.focused(), Some(focusable));
     }
 
+    /// A gesture survives the widget under it being **re-identified** between press and release.
+    ///
+    /// **This is the fault that failed PR #280's CI** (`click-not-acted-on`, resolved
+    /// 2026-09-04):
+    /// a press and its release both delivered to a client at the right coordinates, and no
+    /// message. It needs the two halves to land in different frames, which is exactly what a
+    /// click on an *unfocused* window does — the raise costs a recompose between them — so it
+    /// looked random and hit KVM more often than TCG.
+    ///
+    /// The mechanism is entirely here. A control that highlights under the pointer draws itself
+    /// as one layer at rest and three when lit (`widget::menu_item` and `widget::button` both do
+    /// this). The press is what *establishes* the hover, so the very next frame changes that
+    /// control's child count; unkeyed children are matched positionally, so every one of them is
+    /// a new node with a fresh id. A capture holding the deepest node — the label — then names a
+    /// widget the tree no longer has, `path_to_id` returns `None`, and the release dispatches
+    /// nothing at all.
+    ///
+    /// **The control itself never moved**: it is a `stack` before and after, it keeps its key and
+    /// its id, and it is under the cursor the whole time. Capturing the node that *carries the
+    /// handler* rather than the node that happens to be deepest is what makes the gesture
+    /// survive, and it is also what capture always meant.
+    #[test]
+    fn a_gesture_survives_the_widget_under_it_being_re_identified() {
+        // The shape every hover-highlighting widget in this toolkit has.
+        fn control(lit: bool) -> Element<Msg> {
+            let mut layers = vec![];
+            if lit {
+                layers.push(text("ring"));
+                layers.push(text("bevel"));
+            }
+            layers.push(sized(Size::new(200, 40), text("File")));
+            stack(layers).on_press(Msg::Pressed(1)).key(7)
+        }
+
+        let rest: Element<Msg> = column(vec![control(false)]);
+        let (mut t, l) = build(&rest);
+        let mut r = Router::new();
+
+        // The press lands in the frame drawn *before* anything is hovered, because the press is
+        // what makes it hovered.
+        let before: Vec<u64> = ids(&t);
+        assert!(r.pointer(&t, &rest, &l, press(10, 10)).0.is_empty(), "a press is not a click");
+
+        // The frame the hover produces. Only the highlight changed.
+        let lit: Element<Msg> = column(vec![control(true)]);
+        let l2 = layout(&lit, SCREEN, &CELL);
+        t.update(&lit, &l2).expect("a clean frame");
+        assert_ne!(
+            ids(&t),
+            before,
+            "the highlight did not re-identify anything, so this test proves nothing"
+        );
+
+        // …and the release, in that new frame, is still a click on the control it pressed.
+        let (msgs, _) = r.pointer(&t, &lit, &l2, release(10, 10));
+        assert_eq!(msgs, vec![Msg::Pressed(1)], "the click was dropped by the re-identification");
+    }
+
+    /// Every widget id in the tree, in walk order.
+    fn ids(t: &Tree) -> Vec<u64> {
+        fn walk(w: &Widget, out: &mut Vec<u64>) {
+            out.push(w.id);
+            for c in &w.children {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = t.root() {
+            walk(root, &mut out);
+        }
+        out
+    }
+
     #[test]
     fn focus_and_capture_are_dropped_when_their_widgets_go() {
         // The router is not on the destroy path, so it asks the tree — which cannot go out
@@ -1186,7 +1345,11 @@ mod tests {
         let e2: Element<Msg> = column(vec![text("nothing here")]);
         let l2 = layout(&e2, SCREEN, &CELL);
         t.update(&e2, &l2).expect("ok");
-        r.prune(&t);
+        // **Routing is what notices**, since M14: this used to call a `pub fn prune` that the
+        // doc said was "called after every diff" and that no application in the tree called.
+        // Asserting through a routed event is also the stronger test — it pins the behaviour a
+        // client actually gets rather than the helper it was supposed to remember.
+        r.pointer(&t, &e2, &l2, motion(10, 10));
         assert_eq!(r.focused(), None);
         assert_eq!(r.capture(), None);
     }

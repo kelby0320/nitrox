@@ -23394,3 +23394,80 @@ looks like a fix is worth naming as such so the next person does not land it.
 What this milestone owes the open item is evidence rather than a guess: the release line, which
 is what rules out lost input, and a gate that says "landed but produced no receipt" instead of
 timing out forty-five seconds later on an unrelated expectation.
+
+---
+
+## 2026-09-04 — a capture is the widget that handles the gesture, not the deepest one under it
+
+`click-not-acted-on` is fixed, and it was in `libui::route` rather than anywhere the filing
+guessed. Worth recording in full, because the diagnosis took three wrong turns and each one was
+wrong in a way that is easy to repeat.
+
+**The bug.** `Router::capture` stored the id `hit_test` returns, which is the **deepest** node
+under the cursor — a button's *label*, not the button. Dispatch then walked *up* from it to find
+the handler, so the router was storing the fragile half of a fact it recomputed anyway. Fragile
+because a press is also what establishes hover: the next frame draws that control lit, a lit
+`menu_item` or `button` is a three-layer stack where a resting one is a single layer, unkeyed
+children are matched positionally, and every node inside gets a fresh id. The captured label then
+names a widget the tree no longer has, `path_to_id` returns `None`, the whole dispatch block is
+skipped, and the release produces **nothing** — not a misroute, not an error, silence.
+
+**Why it looked random.** It needs the press and the release in different frames. A click on a
+focused window usually delivers both in one batch and works; a click on an **unfocused** window
+forces a raise between them, and the compositor's own note says a raise costs a ~100 ms recompose.
+So the failing case is "the first click on a window you have not touched yet", which is why it
+read as random and why KVM hit it far more than TCG.
+
+**The three wrong turns, in order.**
+
+*Geometry.* M14 Part A changed a bar word from a `button` to a `menu_item` with different padding,
+and the gate aims at a hardcoded `fx + 20`. Plausible, and wrong — but the test written to rule it
+out stays: `the_gate_aims_inside_the_file_word` pins the gate's own arithmetic against the real
+layout, so the next padding change fails in a second rather than as a QEMU timeout.
+
+*A lost release.* A click is a press **and** a release, `on_press` fires on the release, and the
+compositor logged only presses — so a dropped release and a client ignoring the click were
+indistinguishable in a transcript. Ruling it out required a change: the compositor now logs
+releases beside presses (a button is not a keystroke, so this says no more about a person than the
+press already did), and the answer was immediate — both halves arrive. **That logging stays**; it
+is what turned a guess into an answer.
+
+*A fix built on that guess.* Before the logging proved otherwise, `click_at` was changed to
+confirm the release and re-send a missing one. It made the `nxfiles` drag fail deterministically —
+three runs of three, every release present, no retry ever firing — with the only difference being
+that the gate proceeded one serial line later. Dropped. **A workaround for an unproven cause can
+break something the cause never touched.**
+
+**What found it** was a probe at the *client's* pump, which is what the deferral entry had named
+as the cheap next step. It showed the client receiving both halves at the right coordinates and
+its router producing zero messages, with `capture` unchanged across the pair. That located the
+fault inside `libui` in one run, after which a host test reproduced it in a millisecond.
+
+**The fix.** Capture the nearest handler-bearing node, searched from the hit outwards — so a
+widget handling its own events (`nxterm`'s grid, a `custom` node with `on_pointer`) captures
+exactly what it captured before, and only handler-less leaves move outward. That node is the same
+kind lit or not, and it is the one applications key, so it survives the re-identification.
+
+**One thing had to move with it.** Click-to-focus read `target`, which is now the handler-bearing
+ancestor — so focus would land on the outer `Stack` that PR #223 exists to keep it off ("clicking
+the menu bar killed typing until you clicked the grid again"). It reads the hit node directly now.
+The existing test caught this the moment capture moved, which is the argument for keeping tests
+that pin a rule nobody would think to re-derive.
+
+**`prune` is settled by disappearing.** It was a `pub fn` documented "called after every diff", and
+in three applications and a test client *nothing called it*. A contract with no enforcement and no
+honourers is worse than no contract, because it reads like the hazard is handled. The router calls
+it itself now, from `pointer`, and it is private. Not from `key`, which takes `&self` and where a
+stale focus is already tolerated — widening that signature would touch every caller to fix
+nothing. **It is not what keeps a click alive**, and that is the distinction the old code blurred:
+`prune` answers "the widget was *destroyed*", where this bug is a widget that was *re-identified*
+and is still on screen under the cursor. Forgetting the gesture would drop the click just as
+surely, since `capture_button` goes with `capture`.
+
+**Two gate workarounds were removed with the bug** — a receipt-retried click and a retried drag.
+They were honest while the cause was unknown, and keeping them now would hide the regression they
+were written for. Six `check-login` runs under KVM went from retrying in three of four to zero.
+
+**And both flakes were this one bug.** The menu click and the file drag had been treated as
+separate intermittent faults in separate steps; a drag begins with a press on a list row, which
+highlights under the pointer exactly as a menu word does.
