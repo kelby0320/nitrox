@@ -23107,3 +23107,67 @@ being ignored: the prompt must exist before it can be typed into, and the gate h
 **"It passes more often than it fails" is the reason to fix it, not to leave it.** One failure in
 several runs is a gate that will fail in CI on somebody else's branch, where it reads as their
 bug.
+
+## 2026-09-04 — M14 Part H: an application is a thing that says it is one
+
+The applications modal listed `/bin` — every program the profile projects, services and servers
+and command-line tools included, each under the name of its binary. It lists **desktop entries**
+now: one TOML file per graphical application, carrying a display name and the program to spawn.
+
+**The filter needs a fact that cannot be read off a binary.** "Is this graphical?" is not a
+property of an ELF; it is a claim somebody has to make. Three alternatives were named and rejected
+in the details pass — a `/bin` vs `/apps` split (a program's *location* then encodes policy, and
+there is nowhere to put a display name), an ELF note (invisible, needs tooling, same gap), a list
+inside the shell (a second place to update, and the shell has no business knowing application
+names). The entry is where the claim is made, and the display name rides along so the two cannot
+disagree.
+
+**Entries are projected, not staged.** They sit beside the binaries they name, in the same store
+package, and the profile server projects `applications/` at `/applications` exactly as it projects
+`bin/` at `/bin`. So a package carries its own applications: installing one brings its entries and
+removing one takes them away, with no list anywhere to keep in step. The alternative — a file the
+image build writes — needs the build to know every application on the system, which is the
+coupling the content-addressed store exists to remove.
+
+**One endpoint, two names, and *every bind is scoped*.** The first component of the forwarded
+suffix names the projection: `/bin` bound with base `/bin` forwards `bin` and `bin/list`;
+`/applications` bound with base `/applications` forwards `applications` and
+`applications/nxterm.toml`. No default, no bare form.
+
+Three things had to be got right there, and the third was found by review after the first two were
+found by booting:
+
+- **A subtree base is an absolute path.** `SubtreeBase::from_path` runs `validate_path`, which
+  rejects a bare component, so binding with base `applications` fails with `InvalidArgument` and
+  the session silently has no `/applications`. The bind says so on the console now; a bind that
+  fails quietly is a feature that is simply absent.
+- **Splitting on the first slash is not enough.** Opening the directory *itself* yields a bare
+  `applications`, shape-identical to a program of that name. Matching whole names against a fixed
+  list is what disambiguates.
+- **And leaving `/bin` unscoped left an alias, which the first two fixes hid rather than
+  removed** (PR #279 review). With `/bin` bound whole-tree, a bare suffix meant `bin` — so
+  `/bin/applications` forwarded as `applications` and landed on the applications projection's
+  *root*, putting all of it inside every namespace that binds `/bin`. That is precisely the
+  application namespaces this same change documented as deliberately not having it. The claim was
+  in a current-behaviour architecture doc and in a deferral entry, and was false of the code in the
+  same commit.
+
+  **The mechanism error underneath it** is worth naming separately: the docs said the subtree base
+  was "what lets the server tell one request from the other". It is not — the projection *name*
+  is, which is exactly why an unscoped `/bin` could produce that name. They also said the forwarded
+  suffix carries a leading slash; `join_subtree` takes `base[1..]`, so it never does, and the
+  `strip_prefix('/')` written to handle it was dead code. A mechanism described wrongly will
+  eventually be relied on wrongly, and here it took one commit.
+
+**The projected set is the server's, not the package's.** It is a `const` list, so a package
+either fills a projection the server offers or does not. Deriving it from "whatever directories a
+package contains" would let the contents of a store package decide what appears in a namespace,
+which is data deciding policy.
+
+**And the filter matches the program as well as the name.** Somebody who knows the desktop types
+"editor"; somebody who knows the system types `nxedit`. This system's users are more likely than
+most to be the second kind, and matching only the display name would have made them wrong.
+
+**What an entry is not.** Not a capability. Listing an application does not grant the right to run
+it, and running one does not require an entry — `/bin/nxterm` resolves whether or not
+`nxterm.toml` exists. Authority stays where it always is: in what a namespace contains.

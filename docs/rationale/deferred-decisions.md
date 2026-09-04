@@ -1420,6 +1420,31 @@ the file becomes cumbersome." Its scope and its gate are kept in
 — it belongs to no milestone and has no code to hang a marker on, which is the case that hatch was
 written for.
 
+**An account that can see more than one user's own — `TODO(admin-visibility)`.** A session
+namespace holds `/applications`; an *application* namespace does not, so `nxsh` on the serial
+console can list the installed applications and the same `nxsh` inside `nxterm` cannot. That was
+decided deliberately (M14 Part H): nothing in an application reads it, an application holds no
+authority to spawn — `Desktop::Open` exists because of that — and a binding with no consumer is a
+hole in a sandbox that nobody is watching.
+
+**What it exposes is the larger question rather than the binding.** The default account is
+restricted by design and there is nothing else: no administrator account, no tools that see the
+system rather than one user's corner of it, and no notion of a session with wider visibility. The
+asymmetry above is one small symptom — a person exploring finds that the same shell shows
+different things depending on how they reached it, and the honest answer today is "that is the
+sandbox, and there is no other kind of session to be in".
+
+Deciding it means answering three things that have not been asked: whether an administrator is a
+*user* (a second account) or a *mode* (a session built with a wider spec), what a tool with system
+visibility is allowed to do beyond looking, and how a person moves between the two — because
+"log in as someone else" and "elevate" are different designs with different failure modes. None of
+that is a namespace question; the namespace is where it would show up.
+
+**Trigger: the first tool that needs to see past one user** — a package manager, a service
+inspector, anything that reports on the system rather than on a home directory. Whichever arrives
+first is the thing that makes the shape concrete, and until one does, guessing at the shape is how
+you get an administrator account that fits nothing.
+
 **A cache attribute on a mapped device aperture — `TODO(framebuffer-cache-attr)`.** Userspace maps `/dev/framebuffer` **write-back cached**:
 `protection_to_page_flags` never sets `PageFlags::NO_CACHE`, and nothing carries a cache attribute
 from a `MemoryObject` to a user PTE — `NO_CACHE` is used only by `kvmap`, for kernel MMIO.

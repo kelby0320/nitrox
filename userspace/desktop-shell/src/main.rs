@@ -86,6 +86,7 @@ use libui::element::{
 use libui::diff::Tree;
 use libui::layout::layout;
 use libui::route::Router;
+use desktop_shell::{Application, matches_app, parse_entry};
 use libui::paint::{FontMetrics, Theme, paint, paint_over};
 use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
@@ -624,14 +625,12 @@ fn render_modal(
 ///
 /// Substring rather than prefix: a launcher that only matched from the start would make
 /// "term" fail to find `nxterm`, which is the one thing anybody will type.
-fn filter<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<&'a str> {
-    programs.iter().map(|s| s.as_str()).filter(|name| matches(name, q)).collect()
+fn filter<'a>(apps: &'a [Application], q: &str) -> alloc::vec::Vec<&'a Application> {
+    apps.iter().filter(|a| matches_app(a, q)).collect()
 }
 
-/// Whether `name` is shown for query `q`.
-fn matches(name: &str, q: &str) -> bool {
-    q.is_empty() || name.contains(q)
-}
+
+
 
 /// The modal's rows: what `q` matches, **keyed by index into the unfiltered list**.
 ///
@@ -641,27 +640,31 @@ fn matches(name: &str, q: &str) -> bool {
 /// two produced different keys for the same row as soon as the query was non-empty, which
 /// nothing noticed while a key was only ever used for diffing a modal that is repainted whole.
 /// A click resolves a key back to a program, so it notices now (M11 Part E batch 4).
-fn modal_rows<'a>(programs: &'a [alloc::string::String], q: &str) -> alloc::vec::Vec<ListRow<'a>> {
-    programs
-        .iter()
+fn modal_rows<'a>(apps: &'a [Application], q: &str) -> alloc::vec::Vec<ListRow<'a>> {
+    apps.iter()
         .enumerate()
-        .filter(|(_, name)| matches(name, q))
-        .map(|(i, name)| ListRow { key: i as u64, label: name.as_str() })
+        .filter(|(_, a)| matches_app(a, q))
+        .map(|(i, a)| ListRow { key: i as u64, label: a.name.as_str() })
         .collect()
 }
 
-/// Read the programs `/bin` projects, as the modal's entries.
+/// Read the desktop entries `/applications` projects, as the modal's entries.
 ///
-/// **`/bin` is a forwarded directory, not a set of bindings**, so `SYS_NS_ENUMERATE` does not
-/// see inside it — that walks the namespace's own bindings and `/bin` is one of them. The
-/// entries come from a directory session, the same way `list /bin` gets them.
-fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
+/// **`/applications` is a forwarded directory, not a set of bindings**, so `SYS_NS_ENUMERATE`
+/// does not see inside it — that walks the namespace's own bindings and this is one of them. The
+/// names come from a directory session, the same way `list /bin` gets `/bin`'s; each is then read
+/// and parsed.
+///
+/// **An entry that will not parse is skipped and said so**, rather than failing the modal: one
+/// broken package should lose its own applications, not everybody's — the same rule the profile
+/// server applies to a package whose `bin/` will not open.
+fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
     use librsproto::session::Dir;
     let mut names = alloc::vec::Vec::new();
     let mut buf = [0u8; 4096];
-    let Ok(mut dir) = Dir::open(ns, b"/bin", &mut buf) else {
-        kprint(b"desktop-shell: /bin did not open; the modal will be empty\n");
-        return names;
+    let Ok(mut dir) = Dir::open(ns, b"/applications", &mut buf) else {
+        kprint(b"desktop-shell: /applications did not open; the modal will be empty\n");
+        return alloc::vec::Vec::new();
     };
     let _ = dir.read_dir(|e| {
         if e.name != b"." && e.name != b".." {
@@ -671,8 +674,26 @@ fn read_bin(ns: u64) -> alloc::vec::Vec<alloc::string::String> {
     });
     dir.close();
     names.sort();
-    names
+
+    let mut apps = alloc::vec::Vec::new();
+    for file in &names {
+        let mut path = alloc::string::String::from("/applications/");
+        path.push_str(file);
+        let Ok(bytes) = libfs::read_file(ns, path.as_bytes()) else {
+            Line::new().s(b"desktop-shell: application entry unreadable: ").untrusted(file.as_bytes()).end();
+            continue;
+        };
+        match core::str::from_utf8(&bytes).ok().and_then(parse_entry) {
+            Some(a) => apps.push(a),
+            None => {
+                Line::new().s(b"desktop-shell: application entry malformed: ").untrusted(file.as_bytes()).end();
+            }
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    apps
 }
+
 
 /// `theme`, as the overview's sidebar wears it: the desktop's own ground, darkened, with the
 /// window ground as ink.
@@ -825,6 +846,14 @@ fn build_app_namespace(
         return 0;
     }
 
+    // **No `/applications`, deliberately** — `TODO(admin-visibility)`. The *session* namespace has
+    // it and this one does not, so `nxsh` on the serial console can list the installed
+    // applications and the same `nxsh` inside `nxterm` cannot. Nothing in an application reads it,
+    // and an application holds no authority to spawn in the first place — `Desktop::Open` exists
+    // because of that — so the binding would be a hole in a sandbox with nothing on the other side
+    // of it. The asymmetry is a symptom of a larger gap (there is no account that sees more than
+    // its own corner of the system); see `deferred-decisions.md`.
+    //
     // `/system/fonts`, read-only, so an application can render text. The same subtree bind the
     // session itself gets — an application that could not draw text would be a window of
     // rectangles.
@@ -883,9 +912,21 @@ fn build_app_namespace(
     // before anything asks.
     if profile != 0 {
         let bpath = b"/bin";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
+        // **Scoped**, which is what keeps this bind from also handing over `/applications`
+        // (PR #279 review, blocking 1). Unscoped, `/bin/applications` forwarded as a bare
+        // `applications` and reached the applications projection's root — so the omission
+        // documented four lines up was not an omission at all.
+        // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
         let br = unsafe {
-            syscall4(SYS_NS_BIND, ns, bpath.as_ptr() as u64, bpath.len() as u64, profile)
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                bpath.as_ptr() as u64,
+                bpath.len() as u64,
+                profile,
+                bpath.as_ptr() as u64,
+                bpath.len() as u64,
+            )
         };
         if br != 0 {
             kprint(b"desktop-shell: application /bin bind FAIL\n");
@@ -2041,14 +2082,14 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     }
 
 
-    // The modal's entries, read once. `desktop-shell.md` §4: they are `/bin` programs, and
+    // The modal's entries, read once. `desktop-shell.md` §4: they are desktop entries, and
     // that falls out of decisions already made — they are ordinary files in the namespace, so
     // type-to-filter runs over them with no special mechanism.
-    let programs = read_bin(session_ns);
+    let programs = read_applications(session_ns);
     Line::new()
-        .s(b"desktop-shell: /bin lists ")
+        .s(b"desktop-shell: /applications lists ")
         .u(programs.len() as u64)
-        .s(b" programs")
+        .s(b" application(s)")
         .end();
     let mut modal: Option<u32> = None;
     let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
@@ -2560,7 +2601,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 // misinterpreted as one.
                                 kprint(b"desktop-shell: the name prompt takes typing, not clicks\n");
                             } else {
-                                launcher.launch(name.as_str(), &[]);
+                                // **The entry's `exec`, not its display name.** "Text Editor" is what a person
+                                // reads; `nxedit` is what `/bin` resolves.
+                                launcher.launch(name.exec.as_str(), &[]);
                                 modal_hover = None;
                                 close_modal(
                                     &mut session,
@@ -2654,8 +2697,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // moves it yet, and "the top hit" is what a launcher does with an
                             // untouched list anyway.
                             let filtered = filter(&programs, query.text());
-                            if let Some(name) = filtered.first() {
-                                launcher.launch(name, &[]);
+                            if let Some(app) = filtered.first() {
+                                // The entry's `exec`, not the name on the row — "Terminal" is
+                                // what a person reads and `nxterm` is what `/bin` resolves.
+                                launcher.launch(app.exec.as_str(), &[]);
                                 // **Closed after launching, and this was the bug.** `modal`
                                 // was set once and never cleared, so the popup stayed on top
                                 // of whatever was launched and the top bar's click handler —
@@ -4808,13 +4853,13 @@ fn open_modal(
     parent: u32,
     theme: &Theme,
     font: &Font,
-    programs: &[alloc::string::String],
+    apps: &[Application],
     addrs: &mut [*mut u8; BUFFERS],
     query: &TextFieldState,
     tree: &mut Tree,
     list: &mut ListState,
 ) -> Option<u32> {
-    let rows = modal_rows(programs, query.text());
+    let rows = modal_rows(apps, query.text());
     // Nothing is hovered before the window exists.
     let picture = render_modal(theme, font, query, &rows, list, tree, None);
     let bytes = picture.into_bytes();
@@ -4885,7 +4930,7 @@ fn open_modal(
         .s(b"desktop-shell: applications modal open, window ")
         .u(id as u64)
         .s(b" listing ")
-        .u(programs.len() as u64)
+        .u(apps.len() as u64)
         .end();
     Some(id)
 }

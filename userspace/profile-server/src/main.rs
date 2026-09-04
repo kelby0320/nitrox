@@ -28,6 +28,7 @@ use librsproto::error::error_body;
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, parse_resolve_request, resolve_reply,
 };
+use profile_server::projection::split_suffix;
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use profile_server::manifest::{self, Package};
 
@@ -61,7 +62,7 @@ struct Entry {
 /// change is which packages a profile names — its membership — and this server reads its
 /// manifest exactly once at startup, so it cannot observe that either. See
 /// `TODO(profile-generation-refresh)`.
-static mut INDEX: Option<Vec<Entry>> = None;
+static mut INDEX: Option<Vec<(String, Vec<Entry>)>> = None;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
@@ -76,6 +77,12 @@ static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
 /// Open directory sessions: the kept (server) endpoint per slot, `0` = free.
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
+/// Which projection each session is listing — `bin` unless it was opened on one of
+/// [`PROJECTED`]. A session is bound to a *view*, and there is now more than one.
+static mut SESSION_DIR: [&str; MAX_SESSIONS] = ["bin"; MAX_SESSIONS];
+/// The projection the resolve currently being answered asked for, handed to
+/// [`open_dir_session`] a few lines later in the same loop iteration.
+static mut PENDING_DIR: &str = "bin";
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
     [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
@@ -214,7 +221,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     sr == 0
 }
 
-/// Build the merged `/bin` view by reading each package's `bin/` **through the fs-server**
+/// Build the merged view of one projection by reading each package's `<dir>/` **through the fs-server**
 /// — a real `readdir` of what is on disk, not a recital of the manifest. Packages are read
 /// in manifest order and the first provider of a name wins, which is the same precedence
 /// resolve uses; a listing that disagreed with what a spawn would find would be worse than
@@ -224,19 +231,19 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
 /// broken package should lose that package, not all of `/bin` — the alternative makes every
 /// program on the system unreachable to protect the listing's completeness, which is the
 /// wrong way round.
-fn build_index(root_ns: u64, packages: &[Package]) -> Vec<Entry> {
+fn build_index(root_ns: u64, packages: &[Package], dir: &str) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     for (i, pkg) in packages.iter().enumerate() {
-        let path = format!("{}/bin", pkg.path);
+        let path = format!("{}/{dir}", pkg.path);
         let mut buf = [0u8; 4096]; // >= IPC_MSG_SIZE, what `Dir::open` requires
-        let mut dir = match librsproto::session::Dir::open(root_ns, path.as_bytes(), &mut buf) {
+        let mut listing = match librsproto::session::Dir::open(root_ns, path.as_bytes(), &mut buf) {
             Ok(d) => d,
             Err(_) => {
-                kprint(b"profile-server: package bin/ unreadable (skipped)\n");
+                kprint(b"profile-server: package subdirectory unreadable (skipped)\n");
                 continue;
             }
         };
-        let _ = dir.read_dir(|e| {
+        let _ = listing.read_dir(|e| {
             if e.name != b"." && e.name != b".." {
                 let name = match core::str::from_utf8(e.name) {
                     Ok(n) => String::from(n),
@@ -257,7 +264,7 @@ fn build_index(root_ns: u64, packages: &[Package]) -> Vec<Entry> {
             }
             true
         });
-        dir.close();
+        listing.close();
     }
     out
 }
@@ -266,20 +273,41 @@ fn build_index(root_ns: u64, packages: &[Package]) -> Vec<Entry> {
 ///
 /// **Lazily**, not at startup: eager building costs every boot one directory read per
 /// package over IPC, for a view that a boot with no `/bin` consumer never needs.
-fn index(root_ns: u64, packages: &[Package]) -> &'static [Entry] {
-    // SAFETY: single-threaded server; built once and never mutated after.
+fn index(root_ns: u64, packages: &[Package], dir: &str) -> &'static [Entry] {
+    // SAFETY: single-threaded server; each directory's view is built once and never mutated
+    // after, and entries are only ever appended — so a `&'static [Entry]` handed out earlier
+    // stays valid.
     unsafe {
         if (*(&raw const INDEX)).is_none() {
-            let built = build_index(root_ns, packages);
-            kprint(b"profile-server: /bin index built\n");
-            INDEX = Some(built);
+            INDEX = Some(Vec::new());
         }
-        match &*(&raw const INDEX) {
-            Some(v) => v.as_slice(),
+        let cache = match &mut *(&raw mut INDEX) {
+            Some(c) => c,
+            None => return &[],
+        };
+        if !cache.iter().any(|(d, _)| d == dir) {
+            let built = build_index(root_ns, packages, dir);
+            libkern::debug::Line::new()
+                .s(b"profile-server: /")
+                .s(dir.as_bytes())
+                .s(b" index built, ")
+                .u(built.len() as u64)
+                .s(b" entr(ies)")
+                .end();
+            cache.push((String::from(dir), built));
+        }
+        match cache.iter().find(|(d, _)| d == dir) {
+            Some((_, v)) => {
+                // Reborrow as `'static`: the Vec is never dropped or reallocated in place —
+                // pushing to `cache` moves the *tuple*, not the entries' heap buffer.
+                let p: *const [Entry] = v.as_slice();
+                &*p
+            }
             None => &[],
         }
     }
 }
+
 
 /// Resolve `suffix` (e.g. `heartbeat`) to its store `FileObject` handle (requested rights
 /// + `TRANSFER`, so it can be re-exported). `0` if the profile provides no such program.
@@ -289,15 +317,19 @@ fn index(root_ns: u64, packages: &[Package]) -> &'static [Entry] {
 /// round trip per package per program spawn at fifty. More importantly, two code paths
 /// that must agree about what `/bin` contains is the kind of split that drifts.
 fn resolve_in_store(root_ns: u64, packages: &[Package], suffix: &[u8], rights: u64) -> u64 {
-    let name = match core::str::from_utf8(suffix) {
+    let raw = match core::str::from_utf8(suffix) {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let idx = index(root_ns, packages);
+    let Some((dir, name)) = split_suffix(raw) else { return 0 };
+    if name.is_empty() {
+        return 0;
+    }
+    let idx = index(root_ns, packages, dir);
     let Some(e) = idx.iter().find(|e| e.name == name) else {
         return 0;
     };
-    let path = format!("{}/bin/{}", packages[e.pkg].path, name);
+    let path = format!("{}/{dir}/{name}", packages[e.pkg].path);
     ns_lookup(root_ns, path.as_bytes(), rights | RIGHT_TRANSFER)
 }
 
@@ -314,6 +346,7 @@ fn free_session_at(slot: usize) {
         if SESSION_CH[slot] != 0 {
             syscall1(SYS_HANDLE_CLOSE, SESSION_CH[slot]);
             SESSION_CH[slot] = 0;
+            SESSION_DIR[slot] = "bin";
         }
     }
 }
@@ -360,7 +393,7 @@ fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
 /// The session is bound to the *view*, not to a directory — this server owns a name, not a
 /// place, so there is no inode to remember. Everything it will be asked comes from the
 /// index.
-fn open_dir_session(serve_end: u64, request_id: u64) {
+fn open_dir_session(serve_end: u64, request_id: u64, dir: &'static str) {
     // SAFETY: single-threaded scan of the session table.
     let slot = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) };
     let Some(slot) = slot else {
@@ -375,7 +408,10 @@ fn open_dir_session(serve_end: u64, request_id: u64) {
     // Bind the slot *before* replying, so a fast client's first request cannot arrive
     // before the slot is live.
     // SAFETY: `slot` is free.
-    unsafe { SESSION_CH[slot] = session_end };
+    unsafe {
+        SESSION_CH[slot] = session_end;
+        SESSION_DIR[slot] = dir;
+    };
     if !reply_dir_handle(serve_end, request_id, client_end) {
         free_session_at(slot);
         // SAFETY: closing our own not-yet-transferred handle.
@@ -451,7 +487,9 @@ fn serve_session(root_ns: u64, packages: &[Package], session_ch: u64) {
             reply_error(session_ch, request_id, op, KError::Unsupported.as_i32());
             continue;
         }
-        let entries = index(root_ns, packages);
+        // SAFETY: single-threaded; `slot` is this session's, bound at mint time.
+        let dir = unsafe { SESSION_DIR[slot] };
+        let entries = index(root_ns, packages, dir);
         let mut body = [0u8; MSG_LEN - PAYLOAD_OFF - 64];
         let Some(blen) = pack_read_dir(&mut body, entries, cursor) else {
             reply_error(session_ch, request_id, op, KError::KernelError.as_i32());
@@ -623,12 +661,27 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
             );
             match decode(req) {
                 Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
-                    // An **empty suffix** is `/bin` itself rather than a program in it —
-                    // the projected root, which is what `Dir::open("/bin")` asks for. Any
-                    // other suffix names a program. `0` for the handle marks the session
-                    // case, which is answered below rather than here, because minting a
-                    // channel is a reply of a different shape.
-                    Some(r) if r.suffix.is_empty() => (m.op, m.request_id, 0, true),
+                    // A suffix naming a **projection's root** rather than an entry inside it
+                    // is what `Dir::open` asks for: empty for `/bin`, and the projection's own
+                    // name for the others (their binds carry a subtree base). `0` for the
+                    // handle marks the session case, answered below rather than here, because
+                    // minting a channel is a reply of a different shape.
+                    Some(r)
+                        if core::str::from_utf8(r.suffix)
+                            .ok()
+                            .and_then(split_suffix)
+                            .is_some_and(|(_, name)| name.is_empty()) =>
+                    {
+                        // Remember which view this session will list.
+                        let d = core::str::from_utf8(r.suffix)
+                            .ok()
+                            .and_then(split_suffix)
+                            .map_or("bin", |(d, _)| d);
+                        // Already inside this block's `unsafe`; single-threaded, read back by
+                        // `open_dir_session` a few lines below.
+                        PENDING_DIR = d;
+                        (m.op, m.request_id, 0, true)
+                    }
                     Some(r) => {
                         let h = resolve_in_store(root_ns, packages, r.suffix, r.requested_rights);
                         (m.op, m.request_id, h, h != 0)
@@ -644,7 +697,9 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
             reply_success(serve_end, request_id, handle);
         } else if ok && op == OP_NS_RESOLVE {
             // The projected root: hand back a directory session so `/bin` is listable.
-            open_dir_session(serve_end, request_id);
+            // SAFETY: single-threaded; set by the resolve arm immediately above.
+            let dir = unsafe { PENDING_DIR };
+            open_dir_session(serve_end, request_id, dir);
         } else if op == OP_NS_RESOLVE {
             reply_error(serve_end, request_id, op, KError::NotFound.as_i32());
         } else {

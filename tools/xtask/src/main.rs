@@ -2046,6 +2046,13 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
 /// window. That also makes this the gate that proves the graphical arm exists for a person:
 /// every other display gate boots `--selftest`.
 ///
+/// How many desktop entries the image stages — the number `check-login` asserts the shell read.
+///
+/// **Duplicated from `GRAPHICAL_APPLICATIONS`'s length on purpose.** Deriving it would make the
+/// gate agree with the build by construction and assert nothing; a literal is a second statement
+/// of the same fact, which is what an assertion is for.
+const STAGED_APPLICATIONS: usize = 3;
+
 /// **Paced on the greeter's redraw counter**, because a greeter has no echo. What was typed is
 /// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
 /// `check-terminal` types one character at a time to stay behind. Waiting for the redraw is
@@ -2216,8 +2223,14 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // list click at (90, 788) landing on nothing — which says the bar is not *there* rather
     // than where it is (PR #242 review, optional 9).
     session.expect("desktop-shell: bottom bar placed at 0,776")?;
-    session.expect("desktop-shell: /bin lists ")?;
-    // After `/bin`, because the chord is registered on the loop's first pass and the programs
+    // **The count, not just the prefix** (PR #279 review, finding 7). This is the one line that
+    // distinguishes desktop entries from the `/bin` listing they replaced: a regression to
+    // listing every program would still open a modal, still match `nxterm`, and still launch it,
+    // so every other expectation in this gate holds under both behaviours.
+    session.expect(&format!(
+        "desktop-shell: /applications lists {STAGED_APPLICATIONS} application(s)"
+    ))?;
+    // After it, because the chord is registered on the loop's first pass and the entries
     // are read before the loop. `expect` scans forward, so asserting these out of order times
     // out on a line already behind the cursor.
     session.expect("desktop-shell: Super+H minimizes the focused window")?;
@@ -4223,9 +4236,11 @@ fn check_two_sessions(transcript: &str) -> R<()> {
              `/dev/draw/manage` was taken"
             .into());
     }
-    if transcript.contains("desktop-shell: /bin lists 0 programs") {
-        return Err("the applications modal is empty: /bin projected no programs into the \
-             session namespace. The modal opening is not evidence it has anything in it"
+    if transcript.contains("desktop-shell: /applications lists 0 application(s)") {
+        return Err("the applications modal is empty: no desktop entries reached the session \
+             namespace. Either the `/applications` bind failed (the session log says so), the \
+             directory would not open, or every entry was malformed. The modal opening is not \
+             evidence it has anything in it"
             .into());
     }
     if !transcript.contains("desktop-shell: up (graphical session leader)") {
@@ -9396,6 +9411,18 @@ fn store_hash(bytes: &[u8]) -> String {
 /// coreutils change under a path that claims they did not.
 fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
     let mut bytes = Vec::new();
+    // **The desktop entries are part of the package's contents**, so they are part of its hash
+    // (PR #279 review, finding 3). Without this, changing a display name produces different
+    // package contents at a byte-identical store path — and `profile-server`'s caching rests on
+    // "a store path is content-addressed, so it cannot change contents". Hashed for every package
+    // rather than only the one that has them: an empty contribution costs nothing and a second
+    // package growing entries then needs no second edit here.
+    for (exec, display) in GRAPHICAL_APPLICATIONS {
+        if bins.contains(&exec) {
+            bytes.extend_from_slice(exec.as_bytes());
+            bytes.extend_from_slice(display.as_bytes());
+        }
+    }
     for b in bins {
         bytes.extend_from_slice(
             &fs::read(userspace_bin_path(b))
@@ -9428,6 +9455,20 @@ fn profile_programs() -> Vec<&'static str> {
     v.push("nxedit");
     v
 }
+
+/// The applications a person launches, and what to call them.
+///
+/// **The display name is the point as much as the filter is.** A modal listing `nxfiles` is
+/// naming a binary; one listing "Files" is naming an application. Both come from the same entry,
+/// so they cannot disagree — and when an icon set exists, it goes here too rather than becoming a
+/// fourth place that has to be kept in step.
+///
+/// **Every `exec` must be a program [`profile_programs`] ships**, asserted in `assemble_image`.
+/// This is a fourth list beside that one's three consumers, and without the check an entry can
+/// name a program the package does not contain — which builds clean, lists in the modal, logs a
+/// launch, and opens no window (PR #279 review, finding 5).
+const GRAPHICAL_APPLICATIONS: [(&str, &str); 3] =
+    [("nxterm", "Terminal"), ("nxfiles", "Files"), ("nxedit", "Text Editor")];
 
 /// Pack the initramfs CPIO `newc` archive at `out`: the config manifests, the `init`
 /// ELF (the kernel boot-loads `/sbin/init` from here — retiring the embedded copy),
@@ -9734,6 +9775,42 @@ fn assemble_image(
     println!(
         "xtask: store package {cu_store}/bin/ ({} programs)",
         programs.len()
+    );
+
+    // **The desktop entries** — one per graphical application, in the same package as the
+    // binaries they name, projected at `/applications` the way `bin/` is projected at `/bin`
+    // (M14 Part H). This is what stops the applications modal listing every program on the
+    // system: `/bin` holds services, servers and CLI tools too, and *"is this graphical?"* is
+    // not a property that can be read off a binary — it is a claim somebody has to make, and
+    // this is where it is made.
+    //
+    // **Beside the binaries rather than in a file of their own**, so that a package carries its
+    // own applications: adding one here is adding a file to a package, not editing a list that
+    // has to be kept in step with three others.
+    // **An entry naming a program the package does not ship is a build error**, not a modal row
+    // that launches nothing (PR #279 review, finding 5). `profile_programs` makes the same
+    // guarantee for its own three consumers; this is the fourth list, so it needs the same guard.
+    for (exec, name) in GRAPHICAL_APPLICATIONS {
+        if !programs.contains(&exec) {
+            return Err(format!(
+                "the desktop entry for {name:?} names {exec:?}, which `profile_programs()` does \
+                 not ship — the modal would list it and launching it would open nothing"
+            )
+            .into());
+        }
+    }
+    let apps_dir = staging.join(cu_store.trim_start_matches('/')).join("applications");
+    fs::create_dir_all(&apps_dir)?;
+    for (exec, name) in GRAPHICAL_APPLICATIONS {
+        fs::write(
+            apps_dir.join(format!("{exec}.toml")),
+            format!("# Desktop entry — see docs/spec/desktop-entry.md\nname = \"{name}\"\nexec = \"{exec}\"\n"),
+        )
+        .map_err(|e| format!("stage the {exec} desktop entry: {e}"))?;
+    }
+    println!(
+        "xtask: store package {cu_store}/applications/ ({} entries)",
+        GRAPHICAL_APPLICATIONS.len()
     );
 
     // The `system` package: the services. Everything init and service-mgr spawn after the

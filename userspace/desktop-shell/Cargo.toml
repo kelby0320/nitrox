@@ -37,6 +37,12 @@ libstream = { path = "../libstream", features = ["io"] }
 # every application the result on the environment record it already forwards (M11 Part C).
 libfs = { path = "../libfs" }
 
+# The pure half — the desktop-entry parser and the modal's filter — so it can be host-tested.
+# Same split as `init`, `service-mgr`, `nxterm`, `nxfiles` and `nxedit`.
+[lib]
+name = "desktop_shell"
+path = "src/lib.rs"
+
 [[bin]]
 name = "desktop-shell"
 path = "src/main.rs"

@@ -10,7 +10,26 @@ Nitrox's distinctive choice: projection is done by a **resource server** resolvi
 lookups, **not** by symlink farms (as Nix does). This is the capability-native form —
 it composes with per-process namespaces and rights.
 
-Status: **implemented, slice 1** (Phase 3). The **system profile** is projected at `/bin`
+Status: **implemented, slice 1** (Phase 3), and **projecting a second directory since
+2026-09-04** (M14 Part H): the same server also projects each package's `applications/` at
+`/applications`, which is where [desktop entries](../spec/desktop-entry.md) live.
+
+**Every bind of the endpoint is scoped, and the first component of the suffix names the
+projection.** `/bin` bound with base `/bin` forwards `bin` and `bin/list`; `/applications` bound
+with base `/applications` forwards `applications` and `applications/nxterm.toml`. The kernel joins
+a base *without* its leading slash (`join_subtree` takes `base[1..]`), so the forwarded suffix
+never carries one. There is no default and no bare form.
+
+**`/bin` was unscoped until 2026-09-04, and that was an alias rather than a shortcut.** A bare
+suffix meant `bin`, so `/bin/applications` forwarded as `applications` and landed on the
+applications projection's *root* — putting all of it inside every namespace that binds `/bin`,
+including the application namespaces documented as not having it (PR #279 review). Scoping both
+removes the bare form that made two different things look alike.
+
+The projected set is a fixed list in the server, not "whatever a package happens to contain": a
+package is data, and what appears in a namespace is policy.
+
+The **system profile** is projected at `/bin`
 from a manifest over the read-only store by `userspace/profile-server`, which `init`
 spawns and whose endpoint it hands to `service-mgr`. Per-user profile overlays, runtime
 generation switching, and rollback are designed here but **not built**. Verified 2026-08-05.
