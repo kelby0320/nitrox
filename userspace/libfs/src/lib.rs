@@ -564,6 +564,47 @@ pub fn is_dir(ns: u64, path: &[u8]) -> bool {
     }
 }
 
+/// How a directory listing is ordered.
+///
+/// **Here rather than in each viewer** (M14 decision 3). Two consumers order the same listing —
+/// the browser and the file chooser — and sorting in two places is how two directory views come
+/// to disagree about what "newest" means. An enum rather than a comparator because the set is the
+/// one a person can choose from, not an open extension point.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Order {
+    /// Name, ascending. The default, and the only order stable under everything but a rename.
+    #[default]
+    NameAsc,
+    /// Name, descending.
+    NameDesc,
+    /// Oldest modification first.
+    OldestFirst,
+    /// Newest modification first.
+    NewestFirst,
+}
+
+/// Sort `entries` in place, **directories first** and then by `order`.
+///
+/// **Directories first is not part of the order**, and that is deliberate: it is a fact about
+/// reading a listing rather than something somebody chose, and every file manager does it
+/// whichever sort is selected. Reversing the *name* order does not put files above directories.
+///
+/// **A tie breaks on name, always.** `mtime` is `0` when a server does not report one, and a
+/// directory of zeroes ordered by "newest" would otherwise come back in whatever order the
+/// enumeration produced — not an order anybody chose, and one that would appear to shuffle
+/// between listings of the same directory.
+pub fn sort(entries: &mut [OwnedEntry], order: Order) {
+    entries.sort_by(|a, b| {
+        let dir = |e: &OwnedEntry| e.kind == librsproto::file::DIRENT_KIND_DIR;
+        dir(b).cmp(&dir(a)).then_with(|| match order {
+            Order::NameAsc => a.name().cmp(b.name()),
+            Order::NameDesc => b.name().cmp(a.name()),
+            Order::OldestFirst => a.mtime.cmp(&b.mtime).then_with(|| a.name().cmp(b.name())),
+            Order::NewestFirst => b.mtime.cmp(&a.mtime).then_with(|| a.name().cmp(b.name())),
+        })
+    });
+}
+
 /// Every entry directly under `path`: the filesystem's, plus the namespace bindings mounted
 /// there, with bindings shadowing same-named files.
 ///
@@ -713,6 +754,79 @@ mod tests {
         assert_eq!(join(b"/a", b"b"), "/a/b");
         assert_eq!(join(b"/a/", b"b"), "/a/b");
         assert_eq!(join(b"/", b"system"), "/system");
+    }
+
+    // --- ordering a listing (M14 Part C) ------------------------------------
+
+    /// An entry with a name, a kind and an mtime — everything `sort` reads.
+    fn ent(name: &str, dir: bool, mtime: i64) -> OwnedEntry {
+        let kind = if dir {
+            librsproto::file::DIRENT_KIND_DIR
+        } else {
+            librsproto::file::DIRENT_KIND_FILE
+        };
+        let mut e = OwnedEntry::binding(name.as_bytes(), kind);
+        e.mtime = mtime;
+        e
+    }
+
+    fn names(v: &[OwnedEntry]) -> Vec<String> {
+        v.iter().map(|e| String::from_utf8_lossy(e.name()).into_owned()).collect()
+    }
+
+    /// Directories come first whatever the order, including the reversed one.
+    ///
+    /// **The reversal is the case worth writing.** "Z–A" reverses the *names*; a comparison that
+    /// reversed the whole key would put files above directories, which no file manager does and
+    /// which reads as the listing having changed shape rather than order.
+    #[test]
+    fn directories_lead_every_order() {
+        let mut v = alloc::vec![
+            ent("beta.txt", false, 10),
+            ent("alpha", true, 20),
+            ent("acme.txt", false, 30),
+            ent("zeta", true, 5),
+        ];
+        for order in [Order::NameAsc, Order::NameDesc, Order::OldestFirst, Order::NewestFirst] {
+            sort(&mut v, order);
+            let got = names(&v);
+            assert!(
+                got[..2].iter().all(|n| n == "alpha" || n == "zeta"),
+                "{order:?} put a file above a directory: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_orders_are_the_four_orders() {
+        let mut v = alloc::vec![
+            ent("b.txt", false, 200),
+            ent("a.txt", false, 300),
+            ent("c.txt", false, 100),
+        ];
+        sort(&mut v, Order::NameAsc);
+        assert_eq!(names(&v), ["a.txt", "b.txt", "c.txt"]);
+        sort(&mut v, Order::NameDesc);
+        assert_eq!(names(&v), ["c.txt", "b.txt", "a.txt"]);
+        sort(&mut v, Order::OldestFirst);
+        assert_eq!(names(&v), ["c.txt", "b.txt", "a.txt"]);
+        sort(&mut v, Order::NewestFirst);
+        assert_eq!(names(&v), ["a.txt", "b.txt", "c.txt"]);
+    }
+
+    /// A whole directory with no `mtime` still comes back in a *stable* order.
+    ///
+    /// **`0` is what a server reports when it does not know**, and it is common rather than
+    /// exotic — the namespace half of a listing has no mtime at all. Ordering by date with every
+    /// key equal would otherwise leave the enumeration's own order showing through, which is not
+    /// an order anybody chose and appears to shuffle between listings of the same directory.
+    #[test]
+    fn an_undated_listing_is_still_ordered() {
+        let mut v = alloc::vec![ent("c", false, 0), ent("a", false, 0), ent("b", false, 0)];
+        sort(&mut v, Order::NewestFirst);
+        assert_eq!(names(&v), ["a", "b", "c"], "a tie falls back to the name");
+        sort(&mut v, Order::OldestFirst);
+        assert_eq!(names(&v), ["a", "b", "c"]);
     }
 }
 

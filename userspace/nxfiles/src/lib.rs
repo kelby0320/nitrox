@@ -298,17 +298,26 @@ pub struct Entry {
     pub name: String,
     /// Whether pressing this row descends into it.
     pub is_dir: bool,
+    /// Modification time, seconds since the Unix epoch; `0` when the server does not report one.
+    ///
+    /// **Carried rather than discarded** (M14 decision 3). `OwnedEntry` has had this since the
+    /// directory protocol did, and this struct threw it away on the way up — so a browser that
+    /// wanted to sort by date had nothing to sort by, and the information died here rather than
+    /// anywhere it could be blamed for.
+    pub mtime: i64,
+    /// Byte size; `0` for a directory or when unreported.
+    pub size: u64,
 }
 
 impl Entry {
     /// A directory entry.
     pub fn dir(name: &str) -> Self {
-        Self { name: String::from(name), is_dir: true }
+        Self { name: String::from(name), is_dir: true, mtime: 0, size: 0 }
     }
 
     /// A file entry.
     pub fn file(name: &str) -> Self {
-        Self { name: String::from(name), is_dir: false }
+        Self { name: String::from(name), is_dir: false, mtime: 0, size: 0 }
     }
 
     /// What the row shows: directories carry a trailing separator, which is the whole of the
@@ -625,6 +634,10 @@ impl App {
     /// the old selection refers to, and `list_view` clamping a stale index would silently
     /// select whatever happens to be at that position.
     pub fn show(&mut self, path: &str, mut entries: Vec<Entry>) {
+        // **Directories first, then by name** — and the *rule* is `libfs::sort`'s since M14
+        // Part C, so this browser and the file chooser cannot come to disagree about an order.
+        // What is spelled here is the same comparison over this crate's own `Entry`, which is
+        // `OwnedEntry` with the fields a view needs; the shapes differ, the order does not.
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
         let p = self.pane_mut();
         p.path = String::from(path);
@@ -659,7 +672,12 @@ impl App {
         if name.is_empty() {
             return None;
         }
-        Some(Entry { name, is_dir: e.kind == DIRENT_KIND_DIR })
+        Some(Entry {
+            name,
+            is_dir: e.kind == DIRENT_KIND_DIR,
+            mtime: e.mtime,
+            size: e.size,
+        })
     }
 
     /// The path a row press leads to, or `None` for a row that is not a directory.
