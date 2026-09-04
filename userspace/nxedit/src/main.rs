@@ -378,6 +378,43 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         reported_tab: u64,
     }
 
+    /// Open a window of this editor, dressed and ready to be serviced.
+    ///
+    /// **The same path for the first window and every later one** (M14 Part B). A New Window that
+    /// built its window slightly differently from the original is how the second one ends up
+    /// without a title, or without the drop acceptor — bugs nobody would think to look for.
+    fn open_window<T: libsurface::Transport>(
+        win: &mut Session<T>,
+        mut app: App,
+        font: &Font,
+        theme: &Theme,
+    ) -> Option<Win> {
+        let size = app.window_size();
+        let ui = app.view(theme, None);
+        let top = Child::open_sized(win, Role::Normal, (0, 0), size, &ui, font, theme, BUFFERS)?;
+        dress(win, top.id(), app.path());
+        let reported = app.revision();
+        let reported_name = app.naming_len();
+        let reported_title = String::from(window_title(app.path()));
+        let reported_tab = app.current_tab();
+        Some(Win {
+            top,
+            app,
+            size,
+            bounds: Rect::new(0, 0, size.w, size.h),
+            confirm: None,
+            confirm_hovered: None,
+            menu: None,
+            menu_shown: None,
+            menu_hovered: None,
+            reported,
+            reported_name,
+            reported_title,
+            reported_tab,
+        })
+    }
+
+    let mut quitting = false;
     let mut wins = alloc::vec![Win {
         top,
         app,
@@ -757,6 +794,73 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             exit(0);
         }
 
+        }
+
+        // ---- what the windows asked for ----
+        //
+        // **After every window has been serviced**, not inside that loop: creating or destroying
+        // a window while iterating over them is the one thing that shape cannot do.
+        let mut opened = 0usize;
+        let mut quit_asked = false;
+        for w in wins.iter_mut() {
+            if w.app.take_new_window() {
+                opened += 1;
+            }
+            if w.app.take_quit() {
+                quit_asked = true;
+            }
+        }
+        for _ in 0..opened {
+            // **A new window starts empty**, which is what New Window means everywhere: the
+            // buffers you have open are this window's, and a second window that mirrored them
+            // would be two views of one thing — a split, which is a different feature.
+            match open_window(&mut win, App::new("", &home), &font, &theme) {
+                Some(w) => {
+                    kprint(b"nxedit: opened another window\n");
+                    wins.push(w);
+                }
+                // Not fatal: the editor is still usable, and saying so beats a chord that
+                // silently does nothing.
+                None => kprint(b"nxedit: could not open another window\n"),
+            }
+        }
+        if quit_asked {
+            kprint(b"nxedit: quitting\n");
+            quitting = true;
+        }
+
+        // **Quit asks one window at a time.** Each is asked exactly as its own close button asks
+        // — there is no second question for quitting — so a window with unsaved work raises its
+        // dialog and the quit waits for the answer. **Cancelling aborts the quit** and leaves
+        // every remaining window open (M14 decision 4); that is why this stops at the first
+        // window that is asking rather than sending `Close` to all of them at once, which would
+        // put a dialog on every window and take the first answer as the verdict for all.
+        if quitting
+            && let Some(w) = wins.iter_mut().find(|w| !w.app.confirming() && !w.app.closing())
+        {
+            w.app.update(Msg::Close);
+        }
+
+        // **A window that has finished closing goes**, and the last one takes the process.
+        let mut i = 0;
+        while i < wins.len() {
+            if wins[i].app.closing() {
+                let w = wins.remove(i);
+                if let Some(m) = w.menu {
+                    m.close(&mut win);
+                }
+                if let Some(c) = w.confirm {
+                    c.close(&mut win);
+                }
+                w.top.close(&mut win);
+                kprint(b"nxedit: closed a window\n");
+            } else {
+                i += 1;
+            }
+        }
+        if wins.is_empty() {
+            kprint(b"nxedit: closing\n");
+            exit(0);
         }
 
         // ---- events ----

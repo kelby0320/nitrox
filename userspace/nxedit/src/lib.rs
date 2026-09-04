@@ -166,6 +166,15 @@ pub const BAR_KEY: u64 = 15;
 /// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
 pub const MENU_ROW_KEY: u64 = 100;
 
+/// The key that opens a *window*: `n`, with Ctrl and **Shift**.
+///
+/// Shift because `Ctrl+N` is "new" in the singular everywhere and an editor's singular is a
+/// buffer; the window is the larger thing, and every application that offers both spells it this
+/// way.
+pub const NEW_WINDOW_KEYCODE: u16 = 49;
+/// The key that quits: `q`, with Ctrl. **Quit is not Close** — see [`Msg::Quit`].
+pub const QUIT_KEYCODE: u16 = 16;
+
 /// The key that opens a tab: `t`.
 pub const NEW_TAB_KEYCODE: u16 = 20;
 /// The key that closes one: `w`. Closing the last tab closes the window, which is what the
@@ -261,6 +270,11 @@ pub struct App {
     buffers: Vec<Buffer>,
     /// Which buffer's tab is current, by [`Buffer::key`].
     current: u64,
+    /// Another window has been asked for, and the binary has not made it yet.
+    new_window: bool,
+    /// A quit has been asked for. **The binary owns what that means**, because it is the only
+    /// thing that knows how many windows there are.
+    quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     ///
     /// **New in M14 Part A**: this editor had no menu bar at all, only chords and a save button,
@@ -464,6 +478,20 @@ pub enum Msg {
     NewTab,
     /// A word on the menu bar was pressed: open that menu, or close it if it was already open.
     MenuBar(usize),
+    /// Open another window of this editor — `Ctrl+Shift+N`, or File ▸ New Window.
+    ///
+    /// **Recorded, not done.** A window is a compositor object and this crate makes no syscalls;
+    /// the binary takes the request and creates one, the same seam `nxterm`'s tabs use for their
+    /// ttys.
+    NewWindow,
+    /// Close every window of this application — `Ctrl+Q`, or File ▸ Quit.
+    ///
+    /// **Quit is not Close**, and the difference is only visible once there are several windows:
+    /// Close is this window, Quit is all of them. Each is asked exactly as its own close button
+    /// asks — there is no second question for quitting — and **cancelling one aborts the quit and
+    /// leaves the rest open** (M14 decision 4). Windows already closed stay closed, because a
+    /// close cannot be taken back.
+    Quit,
     /// Undo the last edit — `Ctrl+Z`, or Edit ▸ Undo.
     ///
     /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
@@ -512,6 +540,8 @@ impl App {
         App {
             buffers: alloc::vec![Buffer::new(TAB_KEY_BASE, path)],
             current: TAB_KEY_BASE,
+            new_window: false,
+            quit: false,
             menus: MenuState::new(MENU_COUNT),
             next_key: TAB_KEY_BASE + 1,
             field: None,
@@ -854,6 +884,8 @@ impl App {
         match msg {
             Msg::Key(k) => self.key(k),
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::NewWindow => self.new_window = true,
+            Msg::Quit => self.quit = true,
             Msg::Undo => {
                 let ok = self.buf_mut().text.undo();
                 self.status = String::from(if ok { "undone" } else { "nothing to undo" });
@@ -1126,10 +1158,14 @@ impl App {
                     // visible; this is not.
                     act(Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save)),
                     Item::Separator,
-                    // No Quit: decision 4 settles what quitting means over unsaved work, and
-                    // Part B builds it. This is the window's close button as a menu row, which
-                    // already asks before discarding.
+                    act(Item::new(
+                        "New Window",
+                        Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"),
+                        Msg::NewWindow,
+                    )),
+                    Item::Separator,
                     act(Item::plain("Close Window", Msg::Close)),
+                    act(Item::new("Quit", Accel::ctrl(QUIT_KEYCODE, "Q"), Msg::Quit)),
                 ],
             },
             Menu {
@@ -1159,6 +1195,16 @@ impl App {
                 libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui)
             }
         }
+    }
+
+    /// Whether another window has been asked for. Clears the record.
+    pub fn take_new_window(&mut self) -> bool {
+        core::mem::take(&mut self.new_window)
+    }
+
+    /// Whether a quit has been asked for. Clears the record.
+    pub fn take_quit(&mut self) -> bool {
+        core::mem::take(&mut self.quit)
     }
 
     /// The state a `RequestState` is owed for. Clears the record.
@@ -1996,7 +2042,7 @@ mod tests {
             .flat_map(|m| m.items.iter())
             .filter(|it| matches!(it, Item::Action { enabled: true, .. }))
             .count();
-        assert_eq!(live, 8, "everything but Cut and Copy, which want a selection");
+        assert_eq!(live, 10, "everything but Cut and Copy, which want a selection");
     }
 
     /// The chord a menu row advertises does what choosing that row does.
@@ -2018,13 +2064,17 @@ mod tests {
         fn digest(a: &mut App) -> String {
             let clip = a.take_clip_request();
             let save = a.take_save();
+            // **Every outbox, and this is the third time the control below has said so** — Close
+            // Tab, Save, and now New Window and Quit, each of which changes nothing a digest
+            // watching only the buffer can see.
+            let (nw, q) = (a.take_new_window(), a.take_quit());
             // **`closing` and `save` are in here because the negative control found them
             // missing.** Close Tab on a lone tab closes the *window* — the chord means that
             // everywhere it exists — and Save on a titled buffer records an outbox entry rather
             // than touching the text. A digest that watched only the buffer said both rows
             // changed nothing, which is exactly what that control is for.
             alloc::format!(
-                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}",
+                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}|{nw}{q}",
                 a.status(),
                 a.text(),
                 a.field_kind(),
@@ -2080,7 +2130,7 @@ mod tests {
                 "{label} changes nothing, so this row proves nothing about routing"
             );
         }
-        assert_eq!(checked, 9, "every row but Close Window carries a chord");
+        assert_eq!(checked, 11, "every row but Close Window carries a chord");
     }
 
     #[test]
