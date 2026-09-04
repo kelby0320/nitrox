@@ -3743,8 +3743,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // names the right one. The client says which row the pointer is over, so the gate walks down
     // the popup and stops when the guest agrees it is over `Rename`.
     const MENU_FRAME: i32 = 3;
-    // `Rename` is `MENU_ROW_KEY + 5`: New Tab, Close Tab, a rule, New File, New Folder, Rename.
-    const RENAME_ROW: u64 = 105;
+    // `Rename` is `MENU_ROW_KEY + 8`: New Tab, Close Tab, a rule, New Window, Quit, a rule, New
+    // File, New Folder, Rename. **It has moved twice** — once when the menu gained separators and
+    // again when M14 Part B added the window rows — and each time the gate failed as a *prompt*
+    // that never opened, several steps from the menu it was really about. The walk below at least
+    // says which row it could not find.
+    const RENAME_ROW: u64 = 108;
     let rx = px + 20;
     let mut ry = py + MENU_FRAME;
     let mut rename_at = None;

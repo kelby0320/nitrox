@@ -121,6 +121,14 @@ pub const TAB_STRIP_KEY: u64 = 24;
 /// a tab on the same number for a large enough folder, and hovering one would highlight the other
 /// (PR #270 review, optional 6). A row index cannot reach the high bit.
 pub const TAB_KEY_BASE: u64 = 1 << 63;
+/// The key that opens a *window*: `n`, with Ctrl and **Shift**.
+///
+/// Shift because `Ctrl+N` is "new" in the singular everywhere, and a browser's singular is a tab.
+pub const NEW_WINDOW_KEYCODE: u16 = 49;
+/// The key that quits: `q`, with Ctrl. **Quit is not Close** — it is every window of this
+/// browser, where Close is this one.
+pub const QUIT_KEYCODE: u16 = 16;
+
 /// The key that opens a tab: `t`. Pinned against the keymap by a test, as `nxedit`'s are.
 pub const NEW_TAB_KEYCODE: u16 = 20;
 /// The key that closes one: `w`.
@@ -400,6 +408,11 @@ pub struct App {
     /// A flag rather than an `exit` here: `update` is a function of values and has no way to
     /// tear down a session.
     closing: bool,
+    /// Another window has been asked for, and the binary has not made it yet.
+    new_window: bool,
+    /// A quit has been asked for. **The binary owns what that means**, because it is the only
+    /// thing that knows how many windows there are.
+    quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     ///
     /// The window it drops into is the binary's, opened and destroyed with this — the same
@@ -483,6 +496,14 @@ pub enum Msg {
     Close,
     /// A word on the menu bar was pressed: open that menu, or close it if it was already open.
     MenuBar(usize),
+    /// Open another window of this browser — `Ctrl+Shift+N`, or File ▸ New Window.
+    ///
+    /// **Recorded, not done**: a window is a compositor object and this crate makes no syscalls.
+    NewWindow,
+    /// Close every window of this browser — `Ctrl+Q`, or File ▸ Quit. Nothing here has unsaved
+    /// work to ask about, so no window can refuse; the editor is where decision 4's interesting
+    /// half lives.
+    Quit,
     /// A menu row was chosen.
     Choose(Action),
     /// The delete dialog's *delete* answer.
@@ -523,6 +544,8 @@ impl App {
             move_requested: false,
             resize_requested: None,
             closing: false,
+            new_window: false,
+            quit: false,
             menus: MenuState::new(MENU_COUNT),
             prompt: None,
             confirm: None,
@@ -717,6 +740,8 @@ impl App {
             // opened would leave the menu up until something else dismissed it, and the
             // dismissal a popup gets is a press on *another* window.
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::NewWindow => self.new_window = true,
+            Msg::Quit => self.quit = true,
             Msg::Choose(a) => self.choose(a),
             Msg::SelectTab(k) => {
                 if self.panes.iter().any(|p| p.key == k) {
@@ -1095,6 +1120,16 @@ impl App {
         core::mem::take(&mut self.move_requested)
     }
 
+    /// Whether another window has been asked for. Clears the record.
+    pub fn take_new_window(&mut self) -> bool {
+        core::mem::take(&mut self.new_window)
+    }
+
+    /// Whether a quit has been asked for. Clears the record.
+    pub fn take_quit(&mut self) -> bool {
+        core::mem::take(&mut self.quit)
+    }
+
     /// The edges a `StartResize` is owed for. Clears the record.
     pub fn take_resize_request(&mut self) -> Option<u32> {
         self.resize_requested.take()
@@ -1126,6 +1161,13 @@ impl App {
                     // out loud: `CloseTab` on a lone tab is already a no-op, and a row that
                     // silently did nothing was the half of the affordance that was missing.
                     .enabled(self.panes.len() > 1),
+                    Item::Separator,
+                    Item::new(
+                        "New Window",
+                        Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"),
+                        Msg::NewWindow,
+                    ),
+                    Item::new("Quit", Accel::ctrl(QUIT_KEYCODE, "Q"), Msg::Quit),
                     Item::Separator,
                     act("New File", Action::NewFile),
                     act("New Folder", Action::NewFolder),
@@ -2042,15 +2084,19 @@ mod tests {
         for (i, item) in [
             (0, "New TabCtrl+T"),
             (1, "Close TabCtrl+W"),
-            (3, "New File"),
-            (4, "New Folder"),
-            (5, "Rename"),
-            (6, "Delete"),
+            (3, "New WindowCtrl+Shift+N"),
+            (4, "QuitCtrl+Q"),
+            (6, "New File"),
+            (7, "New Folder"),
+            (8, "Rename"),
+            (9, "Delete"),
         ] {
             assert_eq!(labelled(&file, MENU_ROW_KEY + i), item, "the File menu's row {i}");
         }
         // Row 2 is the separator: it is keyed by nothing, so nothing is found at its index.
-        assert_eq!(labelled(&file, MENU_ROW_KEY + 2), "", "row 2 is a rule, not an item");
+        for rule in [2, 5] {
+            assert_eq!(labelled(&file, MENU_ROW_KEY + rule), "", "row {rule} is a rule, not an item");
+        }
 
         a.update(Msg::MenuBar(1));
         let edit: Element<Msg> = a.menu_view(1, &UiTheme::default(), None);
@@ -2690,6 +2736,28 @@ mod tests {
         // …and it still hands off when it does leave.
         let far = a.window_size().w as i32 + 200;
         assert_eq!(a.pointer_moved(far, row_y(&a, 1), 1), Gesture::HandOff);
+    }
+
+    /// `check-login` clicks a menu row by index, and this is where that index is checked.
+    ///
+    /// **It has moved twice and broken the gate both times** — once when the File menu gained
+    /// separators, again when M14 Part B added New Window and Quit — and both times the failure
+    /// appeared as a *rename prompt that never opened*, several steps away from the menu it was
+    /// really about. A gate cannot link this crate, so it spells the row as a number; this makes
+    /// that number wrong in one second instead of in a three-minute boot.
+    #[test]
+    fn the_gate_clicks_the_row_it_means() {
+        // The constant in `tools/xtask/src/main.rs`, as `MENU_ROW_KEY + n`.
+        const RENAME_ROW: usize = 8;
+        let file = &app().menu_table()[0];
+        assert!(file.title == "File", "the first menu is File");
+        match &file.items[RENAME_ROW] {
+            Item::Action { label, msg, .. } => {
+                assert_eq!(*label, "Rename", "check-login's RENAME_ROW is not Rename any more");
+                assert_eq!(*msg, Msg::Choose(Action::Rename));
+            }
+            Item::Separator => panic!("check-login's RENAME_ROW is a rule, not a row"),
+        }
     }
 
 }
