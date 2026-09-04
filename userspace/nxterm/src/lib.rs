@@ -492,7 +492,7 @@ impl App {
         // because before M14 Part A exactly two of them remembered to do it and the rest were a
         // row away from forgetting. A message that is not a row leaves it alone, which is what
         // keeps `MenuBar` able to open one.
-        if self.menus().iter().flat_map(|m| m.items.iter()).any(
+        if self.menu_table().iter().flat_map(|m| m.items.iter()).any(
             |it| matches!(it, Item::Action { msg: m, .. } if *m == msg),
         ) {
             self.menus.close();
@@ -631,7 +631,7 @@ impl App {
         // decision 2). The pair of constants that used to be tested here are still the source of
         // truth — the table names them — but there is now one statement of "Ctrl+Shift+C copies"
         // instead of a label in the menu and a branch here that could stop agreeing with it.
-        if let Some(msg) = libui::menu::accel_match(&self.menus(), &k) {
+        if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
             self.update(msg);
             return;
         }
@@ -726,7 +726,7 @@ impl App {
     /// is what M14 Part A scopes, and of the two they are edits to what is on screen. GNOME
     /// Terminal puts them under `Terminal`; if a third menu arrives they move there, and the
     /// accelerator table does not care which menu an item is in.
-    pub fn menus(&self) -> Vec<Menu<Msg>> {
+    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
         vec![
             Menu {
                 title: "File",
@@ -742,7 +742,7 @@ impl App {
                     // copy path already declines an empty selection, and a row that looks
                     // available but declines is the thing that reads as a broken menu.
                     Item::new("Copy", Accel::ctrl_shift(COPY_KEYCODE, "C"), Msg::Copy)
-                        .enabled(self.grid.selected_text().is_some()),
+                        .enabled(self.grid.has_selection()),
                     Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
                     Item::Separator,
                     Item::plain("Clear", Msg::Clear),
@@ -762,7 +762,7 @@ impl App {
         // `button` labelled "Terminal"; the word a menu bar carries is not a button, and the
         // popup under it was a second copy of `nxfiles`'s.
         let bar = libui::menu::bar(
-            &self.menus(),
+            &self.menu_table(),
             &self.menus,
             MENU_BAR_KEY,
             hovered,
@@ -866,7 +866,7 @@ impl App {
     /// exists while one is open — but is a shape the type demands and the caller must not have
     /// to think about.
     fn menu(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let menus = self.menus();
+        let menus = self.menu_table();
         match self.menus.open().and_then(|i| menus.get(i)) {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
@@ -1325,7 +1325,7 @@ mod tests {
         // A menu that stayed open after its item was chosen would cover the thing it just
         // acted on. **Every row, not the two that used to remember**: the rule is asked of the
         // table now, so this walks the table.
-        let names = app().menus();
+        let names = app().menu_table();
         let rows: Vec<Msg> = names
             .iter()
             .flat_map(|m| m.items.iter())
@@ -1349,33 +1349,107 @@ mod tests {
         assert_eq!(a.menus.open(), Some(0));
     }
 
-    /// The chord a menu row advertises is the chord the terminal honours.
+    /// Arrowing sideways changes both where the popup hangs and how big it must be.
     ///
-    /// **The point of routing keys through the table** (M14 decision 2): before, the label and
-    /// the `match` on keycodes were two statements, and this test could not have been written
-    /// against one of them. Here the *label* is checked against the key that produces the effect.
+    /// **Why this is a test rather than an observation** (PR #280 review, blocking 2): the binary
+    /// used to rebuild the popup window on `open().is_some()`, so moving from File to Edit left
+    /// the window at File's word and at File's size. `Child::present` lays the new tree into a
+    /// rectangle fixed when the window was created, so Edit's five rows were drawn into a
+    /// one-row window and four of them were clipped away. Nothing in the binary is host-testable;
+    /// what is, is that the two menus genuinely differ in both respects — which is what makes
+    /// rebuilding on a *change* necessary rather than tidy.
+    #[test]
+    fn the_two_menus_hang_from_different_words_and_measure_differently() {
+        let mut a = app();
+        let cell = FixedCell { w: 8, h: 16 };
+        let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
+        let view = a.view(&UiTheme::default(), None);
+        let l = layout(&view, bounds, &cell);
+        a.menus.set_anchors(
+            (0..MENU_COUNT).map(|i| locate(&view, &l, MENU_BAR_KEY + i as u64)).collect(),
+        );
+
+        let measure = |a: &App| {
+            libui::layout::measure(
+                &a.menu_view(&UiTheme::default(), None),
+                libui::layout::Constraints::loose(bounds.size),
+                &cell,
+            )
+        };
+        a.menus.toggle(0);
+        let (file_at, file_size) = (a.menus.anchor(), measure(&a));
+        a.menus.toggle(1);
+        let (edit_at, edit_size) = (a.menus.anchor(), measure(&a));
+
+        assert!(file_at.is_some() && edit_at.is_some(), "both words were laid out");
+        assert_ne!(file_at, edit_at, "the two menus hang from different words");
+        assert!(
+            edit_size.h > file_size.h,
+            "Edit's five rows are taller than File's one — {edit_size:?} vs {file_size:?}"
+        );
+    }
+
+    /// The chord a menu row advertises does what choosing that row does.
+    ///
+    /// **This drives `App::key`**, which is the point and is what the first version did not do
+    /// (PR #280 review, worth fixing 4). It built an event from a row's `Accel` and asked
+    /// `accel_match` about it — both sides of one table, with the terminal never consulted. That
+    /// pins the table against two rows on one chord, which is asserted below; it does not pin
+    /// that anything *routes* through it, and it passed with `App::key`'s `accel_match` deleted.
+    ///
+    /// **Stated as an equivalence rather than per row**, so it does not become a second list of
+    /// what each action does — which is the drift decision 2 exists to prevent.
     #[test]
     fn every_advertised_chord_does_what_its_row_says() {
-        let mut a = app();
-        a.feed(b"hello");
-        // Select something, so Copy is enabled and has something to take.
-        let h = a.metrics.cell_h as i32;
-        a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
-        a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * a.metrics.cell_w as i32, h / 2)));
-
-        let table = a.menus();
+        /// Everything about a terminal that any of these rows can move.
+        fn digest(a: &mut App) -> alloc::string::String {
+            let clip = a.take_clip_request();
+            alloc::format!(
+                "{clip:?}|{}|{}|{}|{:?}",
+                line(a, 0),
+                a.closing(),
+                a.grid.has_selection(),
+                a.menus.open(),
+            )
+        }
+        /// A terminal with text on screen and five characters of it swept out, so Copy is live.
+        fn selected() -> App {
+            let mut a = app();
+            a.feed(b"hello world");
+            let (w, h) = (a.metrics.cell_w as i32, a.metrics.cell_h as i32);
+            a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
+            a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
+            a
+        }
+        let table = selected().menu_table();
         let mut checked = 0;
         for it in table.iter().flat_map(|m| m.items.iter()) {
-            let Item::Action { accel: Some(acc), msg, label, .. } = it else { continue };
+            let Item::Action { accel: Some(acc), msg, label, enabled: true } = it else { continue };
             checked += 1;
-            // The label says Ctrl+Shift+something, and the event built from the row's own
-            // modifiers and keycode is the one `accel_match` claims.
             let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
             assert_eq!(
                 libui::menu::accel_match(&table, &ev).as_ref(),
                 Some(msg),
-                "{label} advertises {} and it reaches something else",
+                "{label} advertises {} and the table hands it to another row",
                 acc.label()
+            );
+            let (mut by_row, mut by_chord) = (selected(), selected());
+            by_row.update(*msg);
+            by_chord.update(Msg::Key(ev));
+            // Each digest exactly once: it drains the clipboard outbox, which is the only way to
+            // see it, so a second call on the same terminal reports its own emptiness.
+            let (by_row, by_chord, untouched) =
+                (digest(&mut by_row), digest(&mut by_chord), digest(&mut selected()));
+            assert_eq!(
+                by_chord, by_row,
+                "{label}: {} does not do what choosing the row does",
+                acc.label()
+            );
+            // **The negative control**: the two agreeing is only evidence if the row moved
+            // something. A terminal that ignored both would pass the assertion above.
+            assert_ne!(
+                by_row, untouched,
+                "{label} changes nothing, so this row proves nothing about routing"
             );
         }
         assert_eq!(checked, 2, "Copy and Paste are the rows with chords");

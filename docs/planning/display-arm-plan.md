@@ -4580,6 +4580,12 @@ the namespace, and the box that hid that was one line long.
       greyed now, as are Close Tab on a lone tab and Cut/Copy in `nxedit` with no selection. The
       old guards stay as second guards, because a caller arriving another way must get the same
       answer.
+- [x] **The keyboard half of an open menu is now driven by a gate** ✅, which it never was: both
+      of PR #280's blocking findings lived there, and the reviewer named the absence as the
+      reason. `check-terminal` reopens the menu, arrows sideways and asserts the popup was rebuilt
+      under the other word at the other size, then arrows down and presses Enter — which also
+      asserts the greyed first row was skipped. `nxterm`'s harness key stopped being a one-shot to
+      allow it; the one-shot was what made the half untestable.
 - [x] **Two gates learned to find a row instead of computing one** ✅. `check-terminal` aimed at
       "the upper quarter" and `check-login` divided the popup's height by a row count; a
       **separator** occupies height without being a row, so neither arithmetic survives. Both now

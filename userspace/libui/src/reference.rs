@@ -251,8 +251,12 @@ fn reference_menu(theme: &Theme) -> Element<Msg> {
     let m: Menu<Msg> = Menu {
         title: "File",
         items: vec![
+            // The keycodes are `t` and `w`, matching their labels. The reference only cares
+            // about pixels, so any pair would draw the same — and a keycode/label pair that
+            // disagreed is the one thing here a reader might take as exemplary (PR #280 review,
+            // optional 9).
             Item::new("New Tab", Accel::ctrl_shift(20, "T"), Msg::File),
-            Item::new("Close", Accel::ctrl(46, "W"), Msg::Edit),
+            Item::new("Close", Accel::ctrl(17, "W"), Msg::Edit),
             Item::Separator,
             Item::plain("Quit", Msg::Run).enabled(false),
         ],

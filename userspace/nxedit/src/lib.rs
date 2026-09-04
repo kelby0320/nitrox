@@ -844,7 +844,7 @@ impl App {
         // so a row added later cannot forget. A message that is not a row leaves it alone, which
         // is what keeps `MenuBar` able to open one.
         if self
-            .menus()
+            .menu_table()
             .iter()
             .flat_map(|m| m.items.iter())
             .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
@@ -1077,7 +1077,7 @@ impl App {
             // 2). The constants above are still the source of truth — the table names them — but
             // there is now one statement of "Ctrl+Z undoes" rather than a label in a menu and a
             // branch here that could stop agreeing with it.
-            if let Some(msg) = libui::menu::accel_match(&self.menus(), &k) {
+            if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
                 self.update(msg);
                 return;
             }
@@ -1097,45 +1097,54 @@ impl App {
     /// Cut and Copy need a selection, and Save is pointless on a buffer that matches the disk.
     /// The chords are the same constants the keyboard used to `match` on — the table is where
     /// they are declared now, and [`libui::menu::accel_match`] is what reads it back.
-    pub fn menus(&self) -> Vec<Menu<Msg>> {
-        let has_selection = self.buf().text.selected_text().is_some();
+    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
+        let has_selection = self.buf().text.has_selection();
+        // **Nothing is available while a field is open** (PR #280 review, worth fixing 3). `key`
+        // has always given every keystroke to an open field — "while a name is being typed the
+        // keys are the field's", chords included — and the menu rows this part added were a way
+        // *around* that rule rather than a second statement of it: Find while naming replaced the
+        // field and silently abandoned the save, and Undo edited the buffer behind an open
+        // prompt. Greying the whole bar says the same thing in the vocabulary this part
+        // introduced, and Esc is one key away from a menu that works again.
+        let free = self.field.is_none();
+        let act = |it: Item<Msg>| it.enabled(free);
         vec![
             Menu {
                 title: "File",
                 items: vec![
-                    Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
-                    Item::new(
+                    act(Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab)),
+                    act(Item::new(
                         "Close Tab",
                         Accel::ctrl(CLOSE_TAB_KEYCODE, "W"),
                         Msg::CloseTab(self.current),
-                    ),
+                    )),
                     Item::Separator,
                     // **Enabled on a clean buffer too.** Saving one is a no-op on disk, but an
                     // untitled buffer is "dirty or not" independently of whether it has a path,
                     // and a Save that greyed out would hide the *name* prompt behind a state a
                     // person cannot see. `nxfiles`'s greying is about a selection, which is
                     // visible; this is not.
-                    Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save),
+                    act(Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save)),
                     Item::Separator,
                     // No Quit: decision 4 settles what quitting means over unsaved work, and
                     // Part B builds it. This is the window's close button as a menu row, which
                     // already asks before discarding.
-                    Item::plain("Close Window", Msg::Close),
+                    act(Item::plain("Close Window", Msg::Close)),
                 ],
             },
             Menu {
                 title: "Edit",
                 items: vec![
-                    Item::new("Undo", Accel::ctrl(UNDO_KEYCODE, "Z"), Msg::Undo),
-                    Item::new("Redo", Accel::ctrl(REDO_KEYCODE, "Y"), Msg::Redo),
+                    act(Item::new("Undo", Accel::ctrl(UNDO_KEYCODE, "Z"), Msg::Undo)),
+                    act(Item::new("Redo", Accel::ctrl(REDO_KEYCODE, "Y"), Msg::Redo)),
                     Item::Separator,
                     Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::Cut)
-                        .enabled(has_selection),
+                        .enabled(free && has_selection),
                     Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy)
-                        .enabled(has_selection),
-                    Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste),
+                        .enabled(free && has_selection),
+                    act(Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste)),
                     Item::Separator,
-                    Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find),
+                    act(Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find)),
                 ],
             },
         ]
@@ -1143,7 +1152,7 @@ impl App {
 
     /// The open menu's popup, framed — the root of a second window, not a layer in this one.
     pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let menus = self.menus();
+        let menus = self.menu_table();
         match menus.get(which) {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             None => {
@@ -1383,7 +1392,7 @@ impl App {
                     docked(
                         Edge::Top,
                         libui::menu::bar(
-                            &self.menus(),
+                            &self.menu_table(),
                             &self.menus,
                             MENU_BAR_KEY,
                             hovered,
@@ -1930,7 +1939,7 @@ mod tests {
         assert_eq!(a.take_clip_request(), None);
         assert_eq!(a.status(), before, "a greyed row's chord does nothing, silently");
         // The row is greyed, which is what makes the silence legible rather than a bug.
-        let edit = a.menus().into_iter().find(|m| m.title == "Edit").expect("an Edit menu");
+        let edit = a.menu_table().into_iter().find(|m| m.title == "Edit").expect("an Edit menu");
         for row in ["Cut", "Copy"] {
             assert!(
                 edit.items.iter().any(|it| matches!(
@@ -1951,28 +1960,124 @@ mod tests {
         assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(String::from("ell"))));
     }
 
-    /// The chord a menu row advertises is the chord the editor honours.
+    /// No menu row acts while a field is open, which is the rule `key` has always followed.
     ///
-    /// **The point of routing keys through the table** (M14 decision 2): before, the label and
-    /// the `match` on keycodes were two statements, and this test could not have been written
-    /// against one of them.
+    /// **The demonstrated failure** (PR #280 review, worth fixing 3): with an untitled buffer's
+    /// naming prompt open and a filename half typed, Edit ▸ Find replaced the field — losing the
+    /// name and silently abandoning the save — and Edit ▸ Undo edited the buffer behind the
+    /// prompt. The menu was a way *around* the "while a name is being typed the keys are the
+    /// field's" invariant rather than a second statement of it.
+    #[test]
+    fn no_menu_row_acts_while_a_field_is_open() {
+        // An untitled buffer, so Save asks for a name.
+        let mut a = App::new("", "/home");
+        a.update(Msg::Save);
+        key(&mut a, 30, 0); // `a`, one character of the filename
+        assert_eq!(a.field_kind(), Some(Field::Naming));
+        assert_eq!(a.naming_len(), Some(1), "a name is half typed");
+
+        // **Every row, not the two that were demonstrated.** A rule asked of the table has to be
+        // checked against the table, or the next row added is the one that forgets.
+        for it in a.menu_table().iter().flat_map(|m| m.items.iter()) {
+            let Item::Action { label, enabled, .. } = it else { continue };
+            assert!(!enabled, "{label} is offered while a name is being typed");
+        }
+        // Nothing reached the field or the buffer: the state is exactly what it was.
+        assert_eq!(a.field_kind(), Some(Field::Naming));
+        assert_eq!(a.naming_len(), Some(1));
+
+        // **The negative control**, and it is the whole test: close the field and the same rows
+        // come back. Without it this would pass for a version that disabled everything always.
+        key(&mut a, libkern::abi::KEY_ESC, 0);
+        assert_eq!(a.field_kind(), None, "Esc closed the prompt");
+        let live = a
+            .menu_table()
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .filter(|it| matches!(it, Item::Action { enabled: true, .. }))
+            .count();
+        assert_eq!(live, 8, "everything but Cut and Copy, which want a selection");
+    }
+
+    /// The chord a menu row advertises does what choosing that row does.
+    ///
+    /// **This drives `App::key`**, which is the whole point and is what the first version of this
+    /// test did not do (PR #280 review, worth fixing 4). It built an event from a row's `Accel`
+    /// and asked `accel_match` about it — both sides of one table, with the application never
+    /// consulted. That pins the table against shadowing chords, which is worth having and is
+    /// asserted below; it does not pin that anything *routes* through it, and the test passed
+    /// with `App::key`'s `accel_match` call deleted.
+    ///
+    /// **The property is stated as an equivalence rather than per row**, which is what keeps it
+    /// from being a second list of what each action does: two identical editors, one sent the
+    /// row's message and one sent the row's chord, must end in the same state. A per-row
+    /// assertion here would be exactly the drift decision 2 exists to prevent.
     #[test]
     fn every_advertised_chord_does_what_its_row_says() {
-        let mut a = app();
-        select(&mut a, "ell");
-        let table = a.menus();
+        /// Everything about an editor that any of these rows can move.
+        fn digest(a: &mut App) -> String {
+            let clip = a.take_clip_request();
+            let save = a.take_save();
+            // **`closing` and `save` are in here because the negative control found them
+            // missing.** Close Tab on a lone tab closes the *window* — the chord means that
+            // everywhere it exists — and Save on a titled buffer records an outbox entry rather
+            // than touching the text. A digest that watched only the buffer said both rows
+            // changed nothing, which is exactly what that control is for.
+            alloc::format!(
+                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}",
+                a.status(),
+                a.text(),
+                a.field_kind(),
+                a.tabs().len(),
+                a.naming_len(),
+                a.closing(),
+                a.confirming(),
+            )
+        }
+        // **With a selection**, so Cut and Copy are live: the loop below skips disabled rows,
+        // and a table built from an untouched editor would quietly check seven of the nine.
+        let mut fixture = app();
+        select(&mut fixture, "ell");
+        let table = fixture.menu_table();
         let mut checked = 0;
         for it in table.iter().flat_map(|m| m.items.iter()) {
-            let Item::Action { accel: Some(acc), msg, label, enabled: true, .. } = it else {
-                continue;
-            };
+            let Item::Action { accel: Some(acc), msg, label, enabled: true } = it else { continue };
             checked += 1;
+            // The table has no two rows on one chord, which is the property the old version of
+            // this test pinned and the only one it pinned.
             let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
             assert_eq!(
                 libui::menu::accel_match(&table, &ev).as_ref(),
                 Some(msg),
-                "{label} advertises {} and it reaches something else",
+                "{label} advertises {} and the table hands it to another row",
                 acc.label()
+            );
+            // …and the application routes through it. Two editors from the same fixture, with a
+            // selection so the rows that need one are live.
+            let (mut by_row, mut by_chord) = (app(), app());
+            for a in [&mut by_row, &mut by_chord] {
+                select(a, "ell");
+            }
+            by_row.update(msg.clone());
+            by_chord.update(Msg::Key(ev));
+            let mut untouched = app();
+            select(&mut untouched, "ell");
+            // **Each digest is taken exactly once**, because it is destructive: it drains the
+            // clipboard and save outboxes, which is the only way to see them. Calling it twice
+            // on one editor reports the second call's emptiness as a difference — which is what
+            // the first version of this test did, and it read as "Save changes nothing".
+            let (by_row, by_chord, untouched) =
+                (digest(&mut by_row), digest(&mut by_chord), digest(&mut untouched));
+            assert_eq!(
+                by_chord, by_row,
+                "{label}: {} does not do what choosing the row does",
+                acc.label()
+            );
+            // **The negative control**: the two agreeing is only evidence if the row moved
+            // something. An editor that ignored both would pass the assertion above.
+            assert_ne!(
+                by_row, untouched,
+                "{label} changes nothing, so this row proves nothing about routing"
             );
         }
         assert_eq!(checked, 9, "every row but Close Window carries a chord");

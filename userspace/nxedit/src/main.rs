@@ -734,11 +734,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // popup holds the keyboard while it is up, so these arrive naming *its* window and
                 // never reach the editor's router below.
                 if let WindowEvent::Key(k) = event {
-                    let table = app.menus();
+                    let table = app.menu_table();
                     match app.menus.key(&k, &table) {
-                        KeyOutcome::Chose(i) => {
-                            if let Some(msg) = menu_shown
-                                .and_then(|w| table.get(w))
+                        KeyOutcome::Chose { menu, item: i } => {
+                            // **From the outcome rather than from `menu_shown`**, which happened
+                            // to be right here and is a second copy of the same fact.
+                            if let Some(msg) = table
+                                .get(menu)
                                 .and_then(|m| m.items.get(i))
                                 .and_then(|it| match it {
                                     Item::Action { msg, enabled: true, .. } => Some(msg.clone()),

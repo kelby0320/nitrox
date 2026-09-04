@@ -4846,6 +4846,57 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     click_at(&mut qmp, &mut session, cx, cy)?;
     session.expect("nxterm: menu chose Clear")?;
 
+    // **The keyboard half of an open menu**, which had no coverage until PR #280's review found
+    // two blocking bugs living in it. Everything above this point is the pointer: a click opens,
+    // a click chooses. Nothing had ever arrowed.
+    //
+    // The popup takes the keyboard while it is up, so these keys reach *it* and never the grid.
+    qmp.send_key("f1", true)?;
+    qmp.send_key("f1", false)?;
+    session.expect("nxterm: menu popup ")?;
+    let reopened = session.rest_of_line()?;
+    let Some((_, ex, _, _, eh)) = parse_popup_line(&reopened) else {
+        let _ = session.child.kill();
+        return Err(format!("could not read the reopened popup's geometry from {reopened:?}").into());
+    };
+
+    // **Left moves to the other menu, and the popup has to be rebuilt for it.** The window is
+    // positioned under a bar word and sized for one menu's rows, both fixed at `Child::open` —
+    // so a client that reconciled on "is a menu open" rather than "which one" would leave this
+    // window where it is and draw the new menu's rows into the old menu's extent. The proof is a
+    // *second* popup line naming a different word and a different height.
+    qmp.send_key("left", true)?;
+    qmp.send_key("left", false)?;
+    session.expect("nxterm: menu popup ")?;
+    let other = session.rest_of_line()?;
+    let Some((_, fx2, _, _, fh)) = parse_popup_line(&other) else {
+        let _ = session.child.kill();
+        return Err(format!("could not read the File popup's geometry from {other:?}").into());
+    };
+    if fx2 == ex || fh == eh {
+        let _ = session.child.kill();
+        return Err(format!(
+            "arrowing to the other menu did not rebuild the popup: Edit was {reopened:?},              File is {other:?} — the window should move to File's word and shrink to its rows"
+        )
+        .into());
+    }
+    println!("  ok: arrowing rebuilt the popup under the other word: {other}");
+
+    // Back to the menu with rows worth choosing, then down one and Enter.
+    qmp.send_key("right", true)?;
+    qmp.send_key("right", false)?;
+    session.expect("nxterm: menu popup ")?;
+    let _ = session.rest_of_line()?;
+    // **One Down lands on Paste, not on Copy.** Copy is the first row and is greyed with nothing
+    // selected, and arrowing skips what Enter could not act on — so this asserts the skip as well
+    // as the movement. A gate that expected `Copy` here would be asserting the bug.
+    qmp.send_key("down", true)?;
+    qmp.send_key("down", false)?;
+    qmp.send_key("ret", true)?;
+    qmp.send_key("ret", false)?;
+    session.expect("nxterm: menu chose Paste")?;
+    println!("  ok: Down skipped the greyed row and Enter chose the next one");
+
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
 
@@ -6916,7 +6967,6 @@ impl Session {
         Ok(())
     }
 
-    /// Kill the guest and hand back the transcript.
     /// Everything the guest has said so far, without consuming any of it.
     ///
     /// For a failure message that has to say *what did* happen rather than only what did not —
@@ -6926,6 +6976,7 @@ impl Session {
         self.out.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// Kill the guest and hand back the transcript.
     fn finish(mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();

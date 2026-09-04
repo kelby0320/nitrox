@@ -23263,3 +23263,74 @@ does not care which menu an item is in.
 menus are in one window should not have to look somewhere else in the next, and a bar *below* a
 tab strip reads as belonging to the tab rather than to the window. It cost the editor's text area
 24 pixels, taken from the window rather than from the document.
+
+---
+
+## 2026-09-04 — what PR #280's review found, and the two shapes underneath it (M14 Part A)
+
+Nine findings, all real. Two were blocking and both were in `nxterm`'s **keyboard** half of an
+open menu — the half no gate drives, and the half the other two applications got right by
+accident rather than by design. That is the interesting part, so it is what this records.
+
+**`KeyOutcome::Chose` now names its menu, and that is an API fix rather than a call-site fix.**
+`MenuState::key` closes the menu *before* returning `Chose`, so a caller asking `open()`
+afterwards gets `None`. `nxterm` did exactly that and dropped every message Enter produced;
+`nxfiles` and `nxedit` were correct because they happened to hold `menu_shown` for the popup
+window's sake. Three call sites each having to remember is a design that will be got wrong again,
+so the outcome carries `{ menu, item }` and the mistake is now unrepresentable. **The rule worth
+keeping**: when a review finds one call site wrong and two right *for unrelated reasons*, the
+thing to fix is the shape that let them differ.
+
+**A discriminator that answers a different question than the one being asked.** `nxterm`
+reconciled its popup on `open().is_some()` — *whether* a menu is open — where the fact that
+matters is *which*. It was correct for a bar with one menu and no arrow keys, and this part gave
+it both. The failure is not a crash: `Child::present` lays a new tree into a rectangle fixed at
+`Child::open`, so switching File→Edit drew five rows into a one-row window and clipped four away.
+Both sibling applications had the right comparison, and `nxedit`'s comment even said why.
+
+**Availability is how an application states a mode.** The editor's menu rows could act while a
+naming prompt was open — Find replaced the field and abandoned a half-typed filename, Undo edited
+the buffer behind the prompt. `key` has always given every keystroke to an open field, chords
+included; the menu was a way *around* that invariant rather than a second statement of it. Every
+row is greyed while a field is open, which says the same thing in the vocabulary this part
+introduced. **This is the general shape** and `widget-toolkit.md` §8.1 now records it.
+
+**A test that names two things from one table tests neither against the code.**
+`every_advertised_chord_does_what_its_row_says` built a `KeyEvent` from a row's `Accel` and asked
+`accel_match` about it — both sides of one table, with the application never called. It passed
+with `App::key`'s `accel_match` deleted. It now drives the event through `App::key` and asserts
+the resulting state equals the state from sending the row's message directly: an **equivalence**
+rather than a per-row list, because a per-row list is the drift decision 2 exists to prevent.
+Each row also carries a negative control against an untouched application, and that control
+immediately earned itself — it found the digest blind to two rows, `Close Tab` on a lone tab
+(which closes the *window*) and `Save` (which fills an outbox, not the buffer). It then found a
+second bug in the test itself: the digest *drains* those outboxes, so calling it twice on one
+application reports its own emptiness as a difference.
+
+**`selected_text().is_some()` is not a cheap question.** Both applications asked whether anything
+was selected by allocating the entire selection as a `String` and discarding it — and `menu_table`
+is on the hot path, because `update` builds the table on every message to decide whether to close
+the menu. A drag-select over 2000 lines of scrollback was quadratic over the gesture. `Grid` and
+`TextAreaState` grew `has_selection`. **They are not the same function**: `TextAreaState::selection`
+is already `None` for a collapsed range, but `Grid::selection` returns the raw field, which is
+`Some` and *empty* after a press with no drag — so the obvious spelling would have offered *Copy*
+for a gesture `selected_text` then declines. A test pins the pair against each other in that
+state, because that is the only state where they could differ.
+
+**The gap the review named is now a gate.** Both blocking findings were in the *keyboard* half
+of an open menu, and the reviewer said plainly why they survived: nothing drives it —
+`check-terminal` opened the menu with F1 and clicked, and never arrowed. `check-terminal` now
+reopens the menu, presses Left and asserts a **second** popup line naming a different bar word and
+a different height (which is blocking 2: a window positioned and sized at `Child::open` cannot
+host another menu's rows), then presses Down and Enter and asserts `menu chose Paste` (blocking
+1, and also that arrowing skipped the greyed *Copy* above it). Reverting either fix makes the gate
+fail, which is the only thing that makes the coverage claim worth anything.
+
+**The harness key stopped being a one-shot to allow it.** `nxterm`'s F1 was guarded by a flag so
+the menu could not open before the gate had finished typing at the shell — but *when* it opens is
+the gate's schedule, not the flag's, and the one-shot is precisely what made the keyboard half
+untestable. It is a plain toggle now.
+
+**The doc-comment orphan, for the seventh time in this repository.** Inserting `transcript` above
+`finish` took `finish`'s `///` block with it. The habit that avoids it is to append below an
+existing item rather than above it.

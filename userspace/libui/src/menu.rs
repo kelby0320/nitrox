@@ -163,8 +163,19 @@ pub enum KeyOutcome {
     Changed,
     /// The menu closed without choosing anything.
     Dismissed,
-    /// The row at this index was chosen; the menu is closed.
-    Chose(usize),
+    /// A row was chosen, and the menu is **already closed**.
+    ///
+    /// **It carries the menu as well as the row**, and that is not redundant: choosing closes,
+    /// so a caller that asked [`MenuState::open`] afterwards would get `None` and lose the
+    /// message. `nxterm` did exactly that (PR #280 review, blocking 1) while the other two
+    /// happened to hold a copy of the open index for their own reasons. Naming both here is what
+    /// makes the mistake unrepresentable rather than something three call sites must remember.
+    Chose {
+        /// Which menu was open, as an index into the slice passed to [`MenuState::key`].
+        menu: usize,
+        /// The row, as an index into that menu's items.
+        item: usize,
+    },
 }
 
 impl MenuState {
@@ -243,7 +254,7 @@ impl MenuState {
             KEY_ENTER => match self.cursor {
                 Some(i) => {
                     self.close();
-                    KeyOutcome::Chose(i)
+                    KeyOutcome::Chose { menu: open, item: i }
                 }
                 // **Enter with nothing selected closes rather than choosing the first row.** A
                 // menu opened by a chord has no cursor yet, and guessing would fire an action
@@ -411,7 +422,7 @@ const ACCEL_PAD: Insets = Insets { top: 0, right: 0, bottom: 0, left: 24 };
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libkern::abi::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
+    use libkern::abi::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
     fn ev(code: u16, mods: u16) -> KeyEvent {
         KeyEvent::new(0, code, 1, mods)
@@ -487,7 +498,7 @@ mod tests {
 
         s.toggle(0);
         s.key(&ev(KEY_DOWN, 0), &menus);
-        assert_eq!(s.key(&ev(KEY_ENTER, 0), &menus), KeyOutcome::Chose(0));
+        assert_eq!(s.key(&ev(KEY_ENTER, 0), &menus), KeyOutcome::Chose { menu: 0, item: 0 });
         assert_eq!(s.open(), None, "choosing closes");
     }
 
@@ -550,6 +561,53 @@ mod tests {
                 "the popup stopped being diffable when the highlight moved to {hover:?}"
             );
         }
+    }
+
+    /// `Chose` names the menu it came from, which is the only way a caller can find the row.
+    ///
+    /// **Choosing closes**, so a caller that asked `open()` afterwards would get `None` — and
+    /// `nxterm` did exactly that until PR #280's review, dropping every message Enter produced.
+    /// Carrying the index in the outcome is what makes that unrepresentable.
+    #[test]
+    fn choosing_names_the_menu_it_chose_from_even_though_it_has_closed() {
+        let menus = alloc::vec![
+            Menu { title: "File", items: alloc::vec![Item::plain("Close", 9u8)] },
+            menu(),
+        ];
+        let mut s = MenuState::new(2);
+        s.toggle(1);
+        s.key(&ev(KEY_DOWN, 0), &menus);
+        let out = s.key(&ev(KEY_ENTER, 0), &menus);
+        assert_eq!(s.open(), None, "choosing closes, which is what makes this necessary");
+        let KeyOutcome::Chose { menu, item } = out else { panic!("Enter chose nothing: {out:?}") };
+        assert_eq!(menu, 1, "the second menu was open, and the outcome still says so");
+        // …and the pair addresses the row a caller means, rather than the first menu's.
+        assert!(
+            matches!(menus[menu].items[item], Item::Action { msg: 1, .. }),
+            "the pair does not address New Tab"
+        );
+    }
+
+    /// Left and Right move between menus, which is what makes a popup rebuild necessary.
+    #[test]
+    fn arrowing_sideways_moves_which_menu_is_open() {
+        let menus = alloc::vec![
+            Menu { title: "File", items: alloc::vec![Item::plain("Close", 9u8)] },
+            menu(),
+        ];
+        let mut s = MenuState::new(2);
+        s.toggle(0);
+        assert_eq!(s.key(&ev(KEY_RIGHT, 0), &menus), KeyOutcome::Changed);
+        assert_eq!(s.open(), Some(1), "Right moved to the next menu");
+        assert_eq!(s.cursor(), None, "…and the cursor does not carry across");
+        assert_eq!(s.key(&ev(KEY_LEFT, 0), &menus), KeyOutcome::Changed);
+        assert_eq!(s.open(), Some(0), "Left wraps back");
+        // **A one-menu bar does not do this**, which is why `nxterm` never hit it before now.
+        let one = alloc::vec![menu()];
+        let mut s = MenuState::new(1);
+        s.toggle(0);
+        assert_eq!(s.key(&ev(KEY_RIGHT, 0), &one), KeyOutcome::Ignored);
+        assert_eq!(s.open(), Some(0));
     }
 
     #[test]

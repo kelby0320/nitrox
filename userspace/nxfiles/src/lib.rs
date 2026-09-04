@@ -140,7 +140,7 @@ pub const CONFIRM_KEEP_KEY: u64 = 23;
 /// on what is selected. It is the division every file browser draws, and it is the reason `copy`
 /// does not sit beside `delete`.
 ///
-/// **They are indices into [`App::menus`] since M14 Part A**, not an enum. The enum existed to
+/// **They are indices into [`App::menu_table`] since M14 Part A**, not an enum. The enum existed to
 /// give each menu a key and a popup tree; both are the toolkit's now, and a `Menu` that only
 /// said "File or Edit" was a second spelling of `0` and `1`.
 pub const MENU_COUNT: usize = 2;
@@ -658,7 +658,7 @@ impl App {
         // Tab arriving from the bar in M14 Part A do not go through `choose`. A message that is
         // not a row leaves it alone, which is what keeps `MenuBar` able to open one.
         if self
-            .menus()
+            .menu_table()
             .iter()
             .flat_map(|m| m.items.iter())
             .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
@@ -917,7 +917,7 @@ impl App {
         // branch here that could stop agreeing with it. The `Ctrl` guard stays around it: every
         // other chord is swallowed rather than folded into a printable character.
         if k.modifiers & MOD_CTRL != 0 {
-            if let Some(msg) = libui::menu::accel_match(&self.menus(), &k) {
+            if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
                 self.update(msg);
             }
             return;
@@ -1083,7 +1083,7 @@ impl App {
     /// the last tab. Before M14 Part A every row looked available and the ones that were not
     /// were refused *after* being chosen — a menu that lets you pick something and then declines
     /// is the shape that reads as broken.
-    pub fn menus(&self) -> Vec<Menu<Msg>> {
+    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
         let selected = self.pane().list.selected.is_some();
         let act = |label: &'static str, a: Action| {
             Item::plain(label, Msg::Choose(a)).enabled(!a.needs_selection() || selected)
@@ -1268,7 +1268,7 @@ impl App {
         // since M14 Part A** — the words were `button`s here, which is not what a menu bar's
         // word is, and the popup under them was a second copy of `nxterm`'s.
         let bar = libui::menu::bar(
-            &self.menus(),
+            &self.menu_table(),
             &self.menus,
             MENU_BAR_KEY,
             hovered,
@@ -1413,7 +1413,7 @@ impl App {
     /// batch would have routed against the File tree. Nothing could be made of it, and a shape
     /// that depends on nobody making anything of it is one to remove rather than to argue about.
     pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let menus = self.menus();
+        let menus = self.menu_table();
         match menus.get(which) {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             // Not reachable while a popup exists — the window is opened and destroyed with the
@@ -2049,7 +2049,7 @@ mod tests {
         let mut a = App::new("/empty");
         a.show("/empty", alloc::vec![]);
         let needs = |a: &App, title: &str| -> Vec<bool> {
-            a.menus()
+            a.menu_table()
                 .into_iter()
                 .find(|m| m.title == title)
                 .expect("the menu exists")
@@ -2071,7 +2071,7 @@ mod tests {
         assert_eq!(needs(&a, "File"), alloc::vec![true, true]);
         assert_eq!(needs(&a, "Edit"), alloc::vec![true]);
         // …and the ones that do not need a selection were never affected either way.
-        let file = a.menus().into_iter().next().expect("File");
+        let file = a.menu_table().into_iter().next().expect("File");
         assert!(
             matches!(file.items[3], Item::Action { enabled: true, .. }),
             "New File does not act on a selection"
@@ -2082,7 +2082,7 @@ mod tests {
     #[test]
     fn close_tab_is_unavailable_on_the_last_tab() {
         let mut a = app();
-        let enabled = |a: &App| match &a.menus()[0].items[1] {
+        let enabled = |a: &App| match &a.menu_table()[0].items[1] {
             Item::Action { label, enabled, .. } => {
                 assert_eq!(*label, "Close Tab");
                 *enabled
@@ -2111,7 +2111,7 @@ mod tests {
         // Choosing anything puts the menu away, or it would sit over the answer. **Every row,
         // not the one this used to check** — the rule is asked of the table now, so this walks it.
         for msg in a
-            .menus()
+            .menu_table()
             .iter()
             .flat_map(|m| m.items.iter())
             .filter_map(|it| match it {

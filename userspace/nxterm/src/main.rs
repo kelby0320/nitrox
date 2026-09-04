@@ -78,7 +78,7 @@ fn fail(msg: &[u8]) -> ! {
 ///
 /// **The keyboard's half of choosing.** A pointer click produces its message through the router,
 /// which reads it off the element the press landed on; the keyboard has no element, so it names a
-/// row and this reads the same table back. Both ends therefore come from `App::menus`, and a
+/// row and this reads the same table back. Both ends therefore come from `App::menu_table`, and a
 /// reordering cannot make Enter and a click do different things.
 fn chosen(table: &[Menu<Msg>], open: Option<usize>, i: usize) -> Option<Msg> {
     match table.get(open?)?.items.get(i)? {
@@ -414,9 +414,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // that reacted to the pointer moving without a button held, so "the path works" needed
     // something to assert (M11 Part E batch 3).
     let mut menu_hovered: Option<u64> = None;
-    // Set once, by the harness click below, to open the menu — see there.
-    #[cfg(feature = "test-harness")]
-    let mut opened_for_harness = false;
+    // Which menu the live popup was opened for, so a *change* — not merely open-versus-shut —
+    // rebuilds the window at the new word and at the new menu's size. The other two applications
+    // have carried this since they grew a second menu.
+    let mut menu_shown: Option<usize> = None;
 
     // **The tty, and the shell on the other end of it.** Part C's whole point: the terminal is
     // obtained like any program's, this process becomes its backend, and the terminal itself is
@@ -469,7 +470,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // hidden one would still be a window in the stack. The anchor has to exist first —
         // before the first layout there is nowhere to put it, which is why this reads the
         // anchor computed just above rather than the one from when the menu was toggled.
-        match (app.menus.open().is_some(), popup.is_some(), app.menus.anchor()) {
+        //
+        // **Which menu, not whether one is open** (PR #280 review, blocking 2). The discriminator
+        // was `open().is_some()`, so switching from File to Edit — which `MenuState::key` does on
+        // Left and Right — left the existing window at the old word and, worse, at the size
+        // measured for the old menu: `Child::present` lays the new tree into a rectangle fixed at
+        // `Child::open`, so the rows a five-row menu grew were simply clipped away. It was
+        // unreachable before this part, because this terminal had one menu and no arrow keys.
+        if menu_shown != app.menus.open() {
+            if let Some(p) = popup.take() {
+                p.close(&mut win);
+            }
+            // The window is gone, so nothing is under the pointer in it. Left set, the next menu
+            // would open believing a row was already highlighted and report no change when one
+            // really was.
+            menu_hovered = None;
+            menu_shown = app.menus.open();
+        }
+        match (menu_shown.is_some(), popup.is_some(), app.menus.anchor()) {
             (true, false, Some(anchor)) => {
                 // **Measured from the menu with no hover**, because the pointer is over the
                 // *bar* item that opened this rather than over the popup — and a highlight does
@@ -505,15 +523,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // beats a window that silently never appears.
                     kprint(b"nxterm: could not open the menu popup\n");
                     app.menus.close();
+                    menu_shown = None;
                 }
             }
             (false, true, _) => {
                 if let Some(p) = popup.take() {
                     p.close(&mut win);
                 }
-                // The window is gone, so nothing is under the pointer in it. Left set, the next
-                // menu would open believing a row was already highlighted and report no change
-                // when one really was.
                 menu_hovered = None;
             }
             _ => {}
@@ -793,13 +809,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // **Arrows, Esc and Enter drive the open menu**, which is possible only here: the
             // popup holds the keyboard while it is up, so these keys arrive naming *its* window
             // and never reach the terminal's router below. `KeyOutcome` says what the press did,
-            // and `Chose` carries the row so the message comes from the same table the popup drew
+            // and `Chose` carries the menu and the row, so the message comes from the same table
             // — not from a second list that could disagree about which row is which.
             if let WindowEvent::Key(k) = event {
-                let table = app.menus();
+                let table = app.menu_table();
                 match app.menus.key(&k, &table) {
-                    KeyOutcome::Chose(i) => {
-                        if let Some(m) = chosen(&table, app.menus.open(), i) {
+                    KeyOutcome::Chose { menu, item } => {
+                        // **The menu comes from the outcome, not from the state**: choosing
+                        // closes, so `app.menus.open()` is already `None` here and asking it
+                        // would drop every message Enter produces (PR #280 review, blocking 1).
+                        if let Some(m) = chosen(&table, Some(menu), item) {
                             chose(m);
                             app.update(m);
                         }
@@ -843,8 +862,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // it on the gate's schedule matters — an open menu is topmost and takes the
                 // keyboard, so opening it earlier would swallow everything typed at the shell.
                 #[cfg(feature = "test-harness")]
-                if k.keycode == 59 && k.pressed != 0 && !opened_for_harness {
-                    opened_for_harness = true;
+                if k.keycode == 59 && k.pressed != 0 {
+                    // **A plain toggle since PR #280's review.** It was a one-shot, guarded so
+                    // the menu could not open before the gate had finished typing at the shell —
+                    // but *when* it opens is the gate's schedule, not this flag's, and the
+                    // one-shot meant the menu could never be reopened. The keyboard half of an
+                    // open menu had no coverage at all as a result, which is where both of that
+                    // review's blocking findings were living.
                     app.update(Msg::MenuBar(nxterm::HARNESS_MENU));
                     continue;
                 }

@@ -460,6 +460,7 @@ the widget set that is a small type system rather than a function:
 | `Item` | An action — label, optional `Accel`, message, `enabled` — or a `Separator` |
 | `Menu` | A title and its items |
 | `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key` |
+| `KeyOutcome::Chose` | **Names the menu as well as the row.** Choosing closes, so a caller that asked `open()` afterwards would get `None` and lose the message |
 | `bar` / `popup` | The two trees: one word per menu, and the open menu's rows |
 | `accel_match` | The message whose item claims a key, from the same table the popup draws |
 
@@ -475,6 +476,12 @@ advertising a chord the handler stopped honouring, and nothing fails. All three 
 route `Ctrl`-chords through `accel_match` against the table the popup draws, so there is one.
 Disabled items do not match, for the reason arrowing skips them: an item that would do nothing
 if clicked should do nothing if typed.
+
+**An open menu is a keyboard mode, and an application says so through `enabled`.** `nxedit`
+greys its whole bar while a text field is open, because `key` has always given every keystroke to
+an open field — chords included — and a menu row that acted anyway was a way *around* that rule
+rather than a second statement of it. This is the general shape: availability is the vocabulary
+an application uses to say what it will refuse, and the refusal stays in place underneath.
 
 **Every row is keyed, separators included.** `diff` rejects a parent whose children are only
 partly keyed, so an unkeyed rule makes the whole popup undiffable — which shows up not as a
