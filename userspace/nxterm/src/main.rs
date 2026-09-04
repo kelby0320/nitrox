@@ -204,6 +204,23 @@ fn wait_any(handles: &[u64]) -> bool {
     n as i64 > 0
 }
 
+/// Tell the compositor what a newly created window of this terminal is.
+///
+/// **A name, because something now shows it.** `SetTitle` shipped in M7 Part A with a compositor
+/// that stores titles and a manager event that reports them, and nothing in the tree ever sent
+/// one — so M8 Part C's window list read `window 6` for every entry, and the shell's title arm
+/// was code no boot could reach (PR #242 review, optional 7).
+///
+/// **Extracted so a second window gets it too** (M14 Part B): it was inline before the loop,
+/// which was fine while a window was created once.
+fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32) {
+    if let Some(mut w) = win.window(id)
+        && w.set_title(nxterm::TITLE).is_err()
+    {
+        kprint(b"nxterm: SetTitle refused\n");
+    }
+}
+
 /// The theme the shell handed this application, or the built-in one.
 ///
 /// **Absent is normal rather than an error**: a client started outside a graphical session — by
@@ -347,50 +364,28 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // client may hold several windows on one connection — which is what the menu becoming a
     // real popup needs (C3 part 3). Today this holds exactly one.
     let mut win = Session::new(transport);
-    let window_id = match win.create(&CreateWindowRequest::new(size.w, size.h, Role::Normal), BUFFERS) {
-        Ok(w) => w,
-        Err(_) => fail(b"nxterm: CreateWindow FAILED\n"),
-    };
-
-    // **A name, because something now shows it.** `SetTitle` shipped in M7 Part A with a
-    // compositor that stores titles and a manager event that reports them, and nothing in the
-    // tree ever sent one — so M8 Part C's window list read `window 6` for every entry, and the
-    // shell's title arm was code no boot could reach (PR #242 review, optional 7).
-    if let Some(mut w) = win.window(window_id)
-        && w.set_title(nxterm::TITLE).is_err()
-    {
-        kprint(b"nxterm: SetTitle refused\n");
-    }
-
-    // Two shared buffers, and a scratch framebuffer to compose into.
-    //
-    // **Drawn once here and copied per frame**, rather than painted directly into whichever
-    // buffer is free: the toolkit's damage describes what changed since the *last frame*, and
-    // the free buffer holds the frame before that. Painting a one-row damage straight into it
-    // would leave the row from two frames ago everywhere else. `libui::damage`'s per-buffer
-    // accumulation is the real answer and it belongs in Part B's successor; a copy is correct
-    // now and is one `memcpy` of a window.
-    let mut scratch = match compose_buffer(size) {
-        Some(fb) => fb,
-        None => fail(b"nxterm: impossible window geometry\n"),
-    };
-    // **The buffers and the resize belong to `libsurface`** since M9 Part D: allocating shared
-    // memory, attaching it, and — the part with an ordering rule in it — replacing it at a new
-    // size without touching what the compositor is reading. This client had its own copy of the
-    // first half and none of the second.
-    let mut pool = {
-        let Some(mut w) = win.window(window_id) else {
-            fail(b"nxterm: our own window is gone\n");
-        };
-        match BufferPool::new(&mut w, size, BUFFERS) {
-            Some(p) => p,
-            None => fail(b"nxterm: buffer alloc FAILED\n"),
+    // **The window is a `libui::window::Child`** (M14 Part B), top-level role and all — the same
+    // value the menu popup has always been. Everything a window needs to be drawn and routed
+    // lives in there, so a second window is a second value rather than a second copy of this loop.
+    let top = {
+        let ui = app.view(&theme, None);
+        match Child::open_sized(
+            &mut win,
+            Role::Normal,
+            (0, 0),
+            size,
+            &ui,
+            &ui_font,
+            &theme,
+            BUFFERS,
+        ) {
+            Some(t) => t,
+            None => fail(b"nxterm: CreateWindow FAILED\n"),
         }
     };
+    dress(&mut win, top.id());
 
-    let mut bounds = Rect::new(0, 0, size.w, size.h);
-    let mut tree = Tree::new();
-    let mut router = Router::new();
+    let bounds = Rect::new(0, 0, size.w, size.h);
     // What the menu's window is, and why it is one.
     //
     // **The arithmetic that used to live here is `MenuState::anchor`'s** (M14 Part A) — "directly
@@ -412,7 +407,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     //
     // The menu's window while it is open, and nothing at all while it is not — a popup is
     // transient by role, so closing the menu destroys it rather than hiding it.
-    let mut popup: Option<Child> = None;
+    let popup: Option<Child> = None;
     // Which item the pointer was over at the last paint of the menu.
     //
     // **Kept so a change can be *reported*, not so the view can be built** — the view reads
@@ -420,11 +415,64 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // a release image sees nothing of a highlight, and hover is the first thing in this system
     // that reacted to the pointer moving without a button held, so "the path works" needed
     // something to assert (M11 Part E batch 3).
-    let mut menu_hovered: Option<u64> = None;
+    let menu_hovered: Option<u64> = None;
     // Which menu the live popup was opened for, so a *change* — not merely open-versus-shut —
     // rebuilds the window at the new word and at the new menu's size. The other two applications
     // have carried this since they grew a second menu.
-    let mut menu_shown: Option<usize> = None;
+    let menu_shown: Option<usize> = None;
+
+    /// Everything one window of this terminal is.
+    ///
+    /// **A window, not the application** (M14 Part B). Its own tabs — and therefore its own ttys
+    /// and its own shells — its own surface and retained tree, its own menu popup. The `Session`,
+    /// the fonts and the theme are not here: one connection and one pair of faces serve every
+    /// window this process owns.
+    struct Win {
+        top: Child,
+        app: App,
+        backends: alloc::vec::Vec<TabBackend>,
+        bounds: Rect,
+        popup: Option<Child>,
+        menu_shown: Option<usize>,
+        menu_hovered: Option<u64>,
+    }
+
+    /// Open a window of this terminal, dressed and with a shell in its first tab.
+    ///
+    /// **The same path for the first window and every later one**, so a New Window cannot end up
+    /// subtly different — an untitled bar being the obvious way, a tab with no shell the worse one.
+    ///
+    /// # Safety
+    ///
+    /// `root_ns` must be this process's live root namespace.
+    unsafe fn open_window<T: libsurface::Transport>(
+        win: &mut Session<T>,
+        mut app: App,
+        ui_font: &Font,
+        theme: &Theme,
+        root_ns: u64,
+        env: &libstream::wire::Record,
+    ) -> Option<Win> {
+        let size = app.window_size();
+        let ui = app.view(theme, None);
+        let top =
+            Child::open_sized(win, Role::Normal, (0, 0), size, &ui, ui_font, theme, BUFFERS)?;
+        dress(win, top.id());
+        let mut backends = alloc::vec::Vec::new();
+        // SAFETY: the caller's contract — `root_ns` is this process's live root namespace.
+        unsafe { reconcile_backends(&mut app, &mut backends, root_ns, env) };
+        Some(Win {
+            top,
+            app,
+            backends,
+            bounds: Rect::new(0, 0, size.w, size.h),
+            popup: None,
+            menu_shown: None,
+            menu_hovered: None,
+        })
+    }
+
+    let mut quitting = false;
 
     // **The tty, and the shell on the other end of it.** Part C's whole point: the terminal is
     // obtained like any program's, this process becomes its backend, and the terminal itself is
@@ -499,14 +547,30 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut backends: alloc::vec::Vec<TabBackend> = alloc::vec::Vec::new();
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     unsafe { reconcile_backends(&mut app, &mut backends, root_ns, &env) };
+    let mut wins = alloc::vec![Win {
+        top,
+        app,
+        backends,
+        bounds,
+        popup,
+        menu_shown,
+        menu_hovered,
+    }];
 
     loop {
+        // **Every window this process owns, each serviced exactly as one used to be.**
+        //
+        // Destructured rather than dotted through, which is what keeps this loop readable across
+        // the conversion: every name below means what it meant when there was one window.
+        for wi in 0..wins.len() {
+        let Win { top, app, backends, bounds, popup, menu_shown, menu_hovered } = &mut wins[wi];
+        let window_id = top.id();
         // ---- render ----
         // **The widget under the pointer, from the router that already knew.** `Router::inside`
         // has reported it since M4; nothing had ever asked, so nothing in this system reacted to
         // the pointer moving over it (M11 Part E batch 3).
-        let ui = app.view(&theme, router.hovered_key(&tree));
-        let l = layout(&ui, bounds, &FontMetrics::new(&ui_font, theme.font_px));
+        let ui = app.view(&theme, top.hovered_key());
+        let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
         // The anchors for the next frame's popup — **one per bar word**. Read every frame rather
         // than only when a menu opens: a word's position is a fact about the layout, not about
         // the menu, and reading it on open means reading it before the first layout exists.
@@ -528,15 +592,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // measured for the old menu: `Child::present` lays the new tree into a rectangle fixed at
         // `Child::open`, so the rows a five-row menu grew were simply clipped away. It was
         // unreachable before this part, because this terminal had one menu and no arrow keys.
-        if menu_shown != app.menus.open() {
+        if *menu_shown != app.menus.open() {
             if let Some(p) = popup.take() {
                 p.close(&mut win);
             }
             // The window is gone, so nothing is under the pointer in it. Left set, the next menu
             // would open believing a row was already highlighted and report no change when one
             // really was.
-            menu_hovered = None;
-            menu_shown = app.menus.open();
+            *menu_hovered = None;
+            *menu_shown = app.menus.open();
         }
         match (menu_shown.is_some(), popup.is_some(), app.menus.anchor()) {
             (true, false, Some(anchor)) => {
@@ -544,7 +608,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // *bar* item that opened this rather than over the popup — and a highlight does
                 // not change what a menu measures.
                 let menu = app.menu_view(&theme, None);
-                popup = Child::open(
+                *popup = Child::open(
                     &mut win,
                     Role::Popup { parent: window_id },
                     anchor,
@@ -574,21 +638,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // beats a window that silently never appears.
                     kprint(b"nxterm: could not open the menu popup\n");
                     app.menus.close();
-                    menu_shown = None;
+                    *menu_shown = None;
                 }
             }
             (false, true, _) => {
                 if let Some(p) = popup.take() {
                     p.close(&mut win);
                 }
-                menu_hovered = None;
+                *menu_hovered = None;
             }
             _ => {}
         }
         if let Some(p) = popup.as_mut() {
             let now = p.hovered_key();
-            if now != menu_hovered {
-                menu_hovered = now;
+            if now != *menu_hovered {
+                *menu_hovered = now;
                 // The item's key, which is a number this program chose — not a label, and not a
                 // position. There is nothing here a person typed.
                 #[cfg(feature = "test-harness")]
@@ -612,55 +676,50 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
-        let ui_damage = match tree.update(&ui, &l) {
-            Ok(d) => d,
-            // A malformed tree is a bug in `view`, not a runtime condition. Refusing loudly
-            // beats painting something that pairs the wrong widgets.
-            Err(_) => fail(b"nxterm: the view is not diffable\n"),
-        };
-
         // **The grid holds the keyboard whenever the menu is not open.** Focus has to start
         // somewhere, and the toolkit will not guess: `focus_next` lands on the menu button,
         // being first in tree order. Re-asserted every frame rather than only on the first,
         // because clicking a button takes focus — and a terminal whose keyboard stays with the
         // menu after you used it is a terminal you have to click back into.
-        if app.menus.open().is_none()
-            && let Some(id) = tree.find_by_key(GRID_KEY)
-        {
-            router.focus(&tree, &ui, id);
+        if app.menus.open().is_none() {
+            top.focus_key(&ui, GRID_KEY);
         }
 
-        let mut damage = ui_damage;
-        // The grid's own rows, in window coordinates, unioned in. **Viewport rows** — the
-        // translation from the grid's screen rows is `App::damage_rows`', because it is the
-        // half that knows where the view is anchored.
+        // The grid's own rows, in window coordinates. **Damage the diff cannot see**: a `custom`
+        // node is fingerprinted by its kind and size, so rows `libterm` wrote report nothing.
+        // **Viewport rows** — the translation from the grid's screen rows is `App::damage_rows`',
+        // because it is the half that knows where the view is anchored.
+        let mut extra = None;
         let origin = app.grid_origin();
         let cols = app.grid().cols();
         for row in app.damage_rows() {
             let r = app.metrics.row_rect(row, cols);
             let r = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
-            damage = union_opt(damage, Some(r));
+            extra = union_opt(extra, Some(r));
         }
 
-        if let Some(d) = damage {
-            draw(&mut scratch, &app, &ui, &l, &ui_font, &mono_font, &theme, d);
-            let Some(mut w) = win.window(window_id) else {
-                fail(b"nxterm: our own window is gone\n");
-            };
-            // **The size is asked for here rather than remembered**, so a buffer left at the
-            // old shape by a resize is replaced at the moment it is next drawn into — which is
-            // the frame after the one that committed the new size, when its release arrives.
-            let Ok(b) = pool.acquire(&mut w, app.window_size()) else {
-                // Two causes since Part D, and the message names both: no buffer came back from
-                // the compositor, or the memory for one at the new size could not be had.
-                fail(b"nxterm: no buffer to draw into\n");
-            };
-            if !pool.write(b, scratch.bytes()) {
-                fail(b"nxterm: the frame did not fit its buffer\n");
-            }
-            if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
-                fail(b"nxterm: Commit FAILED\n");
-            }
+        let ok = {
+            let (m, palette, view_top) = (app.metrics, app.palette, app.view_line());
+            let grid = app.grid();
+            top.present_custom(&mut win, &ui, &l, &ui_font, &theme, extra, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
+                if kind != GRID_KIND {
+                    return;
+                }
+                // **The cells do not always fill the node** (M9 Part D). A maximised window is
+                // exactly the work area and the grid is the whole cells that fit, so up to a
+                // cell's width and height of the node is not covered by any row — and
+                // `render_view` paints cells, nothing else. Left alone that margin holds whatever
+                // the last frame put there, which after a resize is a strip of the old window.
+                let cells = m.pixel_size(grid.cols(), grid.rows());
+                if rect.size.w > cells.w || rect.size.h > cells.h {
+                    fb.fill_rect(clip, palette.background);
+                }
+                let rows = rows_in(clip, origin, &m, grid.rows());
+                libterm::render::render_view(fb, grid, &mono_font, &m, &palette, origin, view_top, &rows);
+            })
+        };
+        if !ok {
+            fail(b"nxterm: the window could not be drawn\n");
         }
 
         // **Asked to close, by its own button or by the shell.** Exiting is the whole of it: the
@@ -826,12 +885,67 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             kprint(b"nxterm: the terminal ended\n");
             app.update(Msg::CloseTab(key));
         }
-        if app.closing() {
+        // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+        unsafe { reconcile_backends(app, backends, root_ns, &env) };
+        }
+
+        // ---- what the windows asked for ----
+        //
+        // **After every window has been serviced**, never inside that loop: creating or
+        // destroying a window while iterating over them is the one thing that shape cannot do.
+        let mut opened = 0usize;
+        for w in wins.iter_mut() {
+            if w.app.take_new_window() {
+                opened += 1;
+            }
+            if w.app.take_quit() {
+                kprint(b"nxterm: quitting\n");
+                quitting = true;
+            }
+        }
+        for _ in 0..opened {
+            // **A new window starts with one fresh tab**, not a copy of this one's: the shells
+            // you have running are this window's, and a second window that inherited them would
+            // be two views of one session.
+            // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+            match unsafe {
+                open_window(&mut win, App::new(COLS, ROWS, metrics), &ui_font, &theme, root_ns, &env)
+            } {
+                Some(w) => {
+                    kprint(b"nxterm: opened another window\n");
+                    wins.push(w);
+                }
+                None => kprint(b"nxterm: could not open another window\n"),
+            }
+        }
+        // **Quit closes every window**, and each closes as its own close button does. A terminal
+        // has nothing unsaved to ask about, so no window can refuse — the editor is where
+        // decision 4's interesting half lives.
+        if quitting {
+            for w in wins.iter_mut() {
+                w.app.update(Msg::Close);
+            }
+        }
+        let mut i = 0;
+        while i < wins.len() {
+            if wins[i].app.closing() {
+                let w = wins.remove(i);
+                if let Some(p) = w.popup {
+                    p.close(&mut win);
+                }
+                // **The backends go with the window**, and their `Drop` closes each channel —
+                // which is how every tty this window held learns its emulator is done, and how
+                // every shell on them ends.
+                w.top.close(&mut win);
+                kprint(b"nxterm: closed a window\n");
+            } else {
+                i += 1;
+            }
+        }
+        if wins.is_empty() {
             kprint(b"nxterm: closing\n");
             exit(0);
         }
-        // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-        unsafe { reconcile_backends(&mut app, &mut backends, root_ns, &env) };
 
         // ---- wait for something to do ----
         //
@@ -842,7 +956,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // keeps the simple path.
         let mut events: alloc::vec::Vec<(u32, WindowEvent)> = alloc::vec::Vec::new();
         let win_handle = win.wait_handle();
-        if !backends.is_empty() && win_handle != 0 {
+        // **Every tab of every window**, which is what one `sys_wait` over the lot means now: a
+        // shell printing in a background tab of a background window must not wait for anything.
+        let any_backend = wins.iter().any(|w| !w.backends.is_empty());
+        if any_backend && win_handle != 0 {
             loop {
                 match win.poll_event() {
                     // **The id is kept.** With the menu open this session holds two windows, and
@@ -856,9 +973,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
             if events.is_empty() {
-                let mut handles = alloc::vec::Vec::with_capacity(backends.len() + 1);
+                let mut handles = alloc::vec::Vec::with_capacity(8);
                 handles.push(win_handle);
-                handles.extend(backends.iter().map(|b| b.backend.channel));
+                for w in wins.iter() {
+                    handles.extend(w.backends.iter().map(|b| b.backend.channel));
+                }
                 if !wait_any(&handles) {
                     // Nothing can make this succeed on a retry — the handle count or the buffer
                     // is wrong — and spinning would be the worse failure.
@@ -879,6 +998,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Set by a `Configure` that actually changed the shape; acted on once, below.
         let mut resized = false;
         for (from, event) in events {
+            // **Which window is this for?** A record naming none of them is dropped rather than
+            // routed into whichever window happened to be first.
+            let Some(wi) = wins.iter().position(|w| {
+                w.top.id() == from || w.popup.as_ref().is_some_and(|p| p.id() == from)
+            }) else {
+                continue;
+            };
+            let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered } =
+                &mut wins[wi];
+            let window_id = top.id();
+            // Rebuilt for *this* window: routing is against a layout, and a layout of another
+            // window's tree would report a widget that is not the one under the pointer.
+            let ui = app.view(&theme, top.hovered_key());
+            let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
         // **The menu's window routes through the menu's tree.** Same `App`, so an item's `Msg`
         // updates the same state; different tree, layout and router, because they describe a
         // different window. A record for a window that is not one of these two is not possible
@@ -963,7 +1096,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     app.update(Msg::MenuBar(nxterm::HARNESS_MENU));
                     continue;
                 }
-                if let Some(msg) = router.key(&tree, &ui, k) {
+                if let Some(msg) = top.route_key(&ui, k) {
                     app.update(msg);
                 }
             }
@@ -979,7 +1112,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 {
                     kprint(b"nxterm: clicked\n");
                 }
-                let (msgs, _hit) = router.pointer(&tree, &ui, &l, p);
+                let msgs = top.route(&ui, &ui_font, &theme, &WindowEvent::Pointer(p));
                 for m in msgs {
                     app.update(m);
                 }
@@ -995,7 +1128,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     .s(b"nxterm: focus=")
                     .u(u64::from(f))
                     .end();
-                router.set_window_focused(f);
+                top.route(&ui, &ui_font, &theme, &WindowEvent::Focus(f));
                 // The title bar shows which window has the keyboard, so this is content as well
                 // as routing state.
                 app.focused = f;
@@ -1064,7 +1197,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
         }
-        }
 
         // **The window changed shape, so everything about the frame does.** The compose buffer
         // is a different size, the layout has a different rect to fill, the diff's record
@@ -1075,17 +1207,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Done at the end of the iteration, so the render at the top of the next one is the
         // first to see the new size — and the buffers themselves are replaced there, by
         // `BufferPool::acquire`, because that is where a *free* one is in hand.
-        if resized {
-            let size = app.window_size();
-            match compose_buffer(size) {
-                Some(fb) => scratch = fb,
-                None => fail(b"nxterm: impossible window geometry\n"),
+            if resized {
+                let size = app.window_size();
+                // `Child::resize` throws the retained tree away: a tree diffed against a layout
+                // from the old bounds reports damage in the old coordinates.
+                if top.resize(&mut win, size) == Some(false) {
+                    fail(b"nxterm: impossible window geometry\n");
+                }
+                *bounds = Rect::new(0, 0, size.w, size.h);
+                app.damage_all();
             }
-            bounds = Rect::new(0, 0, size.w, size.h);
-            // A tree diffed against a layout from the old bounds reports damage in the old
-            // coordinates. Starting again reports the whole window, which is what a resize is.
-            tree = Tree::new();
-            app.damage_all();
         }
     }
 }

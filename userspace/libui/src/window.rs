@@ -258,17 +258,18 @@ impl Child {
     /// **The retained tree is thrown away, not resized.** A tree diffed against a layout from the
     /// old bounds reports damage in the old coordinates; starting again reports the whole window,
     /// which is what a resize is.
+    ///
+    /// **The pool is kept**, and that is not an omission: `BufferPool::acquire` is handed the size
+    /// every frame and replaces a buffer left at the old shape when it next needs one. Building a
+    /// *new* pool here is what the first version did, and the compositor rejected it — it still
+    /// holds the buffers the old pool attached. The rejection was silent enough that the resize
+    /// reported success and the window simply stopped committing frames.
     pub fn resize<T: Transport>(&mut self, session: &mut Session<T>, size: Size) -> Option<bool> {
         if size == self.size {
             return None;
         }
         let Some(scratch) = compose_buffer(size) else { return Some(false) };
-        let Some(mut w) = session.window(self.id) else { return Some(false) };
-        let Some(pool) = BufferPool::new(&mut w, size, self.buffers) else {
-            return Some(false);
-        };
         self.scratch = scratch;
-        self.pool = pool;
         self.size = size;
         self.tree = Tree::new();
         Some(true)
@@ -352,20 +353,50 @@ impl Child {
         font: &Font,
         theme: &Theme,
     ) -> bool {
+        self.present_custom(session, content, l, font, theme, None, &mut |_, _, _, _| {})
+    }
+
+    /// [`present_laid_out`](Self::present_laid_out), for a window with a `custom` node in it.
+    ///
+    /// **The escape hatch has to reach through here too** (M14 Part B). A popup or a dialog is
+    /// made of widgets and nothing else, which is why `present` could paint with an empty
+    /// callback and no caller minded; a *main* window need not be — `nxterm`'s grid is a `custom`
+    /// node whose damage feeds `libterm`, and a window that painted it with nothing would draw
+    /// the chrome around an empty rectangle.
+    pub fn present_custom<T: Transport, Msg>(
+        &mut self,
+        session: &mut Session<T>,
+        content: &Element<Msg>,
+        l: &Layout,
+        font: &Font,
+        theme: &Theme,
+        extra: Option<Rect>,
+        custom: &mut dyn FnMut(u32, Rect, Rect, &mut MemFramebuffer),
+    ) -> bool {
         // **What this frame is being drawn with**, recorded before it is drawn: the caller built
         // `content` from `hovered_key` a moment ago, so this is the hover the retained tree is
         // about to hold. Under a grab it is already `shown` and this is a no-op.
         self.shown = self.hovered_key();
+        // **Damage the diff cannot see, unioned in.** A `custom` node is fingerprinted by its
+        // kind and size, so a node whose *contents* changed reports nothing — which is right for
+        // a widget and wrong for the escape hatch, whose whole point is that its contents are the
+        // caller's business. `nxterm`'s grid is that case: the rows `libterm` wrote are damage
+        // only the terminal knows about.
         let damage = match self.tree.update(content, l) {
-            Ok(None) => return true, // nothing changed; what is on screen is still right
-            Ok(Some(d)) => d,
+            Ok(None) => match extra {
+                // Nothing the tree can see, and nothing the caller added: what is on screen is
+                // still right.
+                None => return true,
+                Some(e) => e,
+            },
+            Ok(Some(d)) => crate::damage::union_opt(Some(d), extra).unwrap_or(d),
             // A malformed tree is a bug in the caller's view, not a runtime condition — but a
             // child window is not worth killing a process over, so it is reported as a frame
             // that could not be drawn. Nothing to clear: a rejected update leaves the tree
             // exactly as it was.
             Err(_) => return false,
         };
-        paint(&mut self.scratch, font, theme, content, l, damage, &mut |_, _, _, _| {});
+        paint(&mut self.scratch, font, theme, content, l, damage, &mut |k, a, b, fb| custom(k, a, b, fb));
         let mut drawn = false;
         if let Some(mut w) = session.window(self.id)
             && let Ok(b) = self.pool.acquire(&mut w, self.size)
@@ -418,6 +449,17 @@ impl Child {
                 Vec::new()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Give the keyboard to the widget carrying `key`, if the tree has one.
+    ///
+    /// **For a window that must not start focused on its first widget.** `focus_next` lands on
+    /// whatever comes first in tree order, which for a terminal is the menu bar — and a terminal
+    /// whose first keystroke opens a menu is not a terminal.
+    pub fn focus_key<Msg>(&mut self, content: &Element<Msg>, key: u64) {
+        if let Some(id) = self.tree.find_by_key(key) {
+            self.router.focus(&self.tree, content, id);
         }
     }
 

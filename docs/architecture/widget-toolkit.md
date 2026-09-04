@@ -1,7 +1,8 @@
 # Nitrox: The Widget Toolkit
 
 **Status: built (2026-08-11, last checked 2026-09-04), and this document describes what
-exists.** `Router` captures the widget that *carries the handler* rather than the deepest one
+exists.** `window::Child` hosts **top-level** windows as of M14 Part B, which is what lets one
+process own several — all three applications do now. `Router` captures the widget that *carries the handler* rather than the deepest one
 under the cursor (2026-09-04) — see §8.2, which is the one place a reader will look after losing
 a click. M14 Part A added `menu.rs` — the *whole* of a drop-down menu as a value: a table of
 items with accelerators, separators and per-item availability, the open/anchor/cursor state, the
@@ -876,7 +877,11 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   **A main window is still each application's own loop**, and that is a deferral rather than an
   omission: it owns the `sys_wait`, it must answer `Configure` by reallocating everything a
   `Child` holds, and `nxterm`'s paints a `custom` grid whose damage feeds `libterm`. Trigger: the
-  next part that touches both applications' main loops.
+  next part that touches both applications' main loops. **That happened in M14 Part B**, and all
+  three main windows are `Child`s now: `open_sized` takes a size instead of measuring one,
+  `resize` answers a `Configure`, `present_laid_out` lets a window keep the layout its menu
+  anchors are read from, and `present_custom` reaches the escape hatch — `nxterm`'s grid is a
+  `custom` node whose damage no diff can see.
 
   **This is also the one thing in this crate that is not a function of values.** `libui` gained a
   `libsurface` dependency for it, which the layering in §10 always allowed and nothing had needed.

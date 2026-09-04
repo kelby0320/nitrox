@@ -4979,6 +4979,23 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     session.expect("nxterm: menu chose Paste")?;
     println!("  ok: Down skipped the greyed row and Enter chose the next one");
 
+    // **A second window of the terminal, with a shell of its own** (M14 Part B). The window is
+    // the shell's proof as much as the tab's was: a second top-level that opened with nothing to
+    // talk to would look identical from the outside, and this is the only place that difference
+    // is visible.
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(&mut qmp, "n")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    // **The shell's line comes first, and structurally so**: `open_window` gives the new
+    // window's first tab a tty and a shell before it returns, so the terminal cannot report a
+    // window it has not finished building.
+    session.expect("nxterm: hosting a shell")?;
+    session.expect("nxterm: opened another window")?;
+    session.expect("nxsh: interactive shell")?;
+    println!("  ok: Ctrl+Shift+N opened a second window with a shell of its own");
+
     // **A second tab is a second terminal**, which is the only part of M14 Part B a host test
     // cannot reach: the split of grids and outboxes is pinned in `nxterm`'s own tests, but that
     // a new tab is given its *own* tty and its *own* shell happens in the binary and needs a

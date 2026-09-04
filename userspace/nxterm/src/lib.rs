@@ -128,6 +128,16 @@ pub const TAB_STRIP_KEY: u64 = 7;
 /// `nxedit::SAVE_KEYCODE` is one, and pinned against `libinput`'s table by a test rather than
 /// by this comment.
 pub const COPY_KEYCODE: u16 = 46;
+/// The key that opens a *window*: `n`, with Ctrl and Shift.
+///
+/// Shift for [`NEW_TAB_KEYCODE`]'s reason — a terminal must not take a bare `Ctrl` chord from the
+/// program it hosts — and because `Ctrl+N` is "new" in the singular, which here is a tab.
+pub const NEW_WINDOW_KEYCODE: u16 = 49;
+/// The key that quits: `q`, with Ctrl and Shift. **Quit is every window of this terminal**, where
+/// Close Window is this one. Shift again, because `Ctrl+Q` is flow control to a terminal's
+/// program and always has been.
+pub const QUIT_KEYCODE: u16 = 16;
+
 /// The key that opens a tab: `t`, with **Ctrl and Shift**.
 ///
 /// **Shift for [`COPY_KEYCODE`]'s reason**, not for symmetry: `Ctrl+T` belongs to whatever is
@@ -147,6 +157,13 @@ pub const PASTE_KEYCODE: u16 = 47;
 pub enum Msg {
     /// A word on the menu bar was clicked: open that menu, or close it if it was the open one.
     MenuBar(usize),
+    /// Open another window of this terminal — `Ctrl+Shift+N`, or File ▸ New Window.
+    ///
+    /// **Recorded, not done**: a window is a compositor object and this crate makes no syscalls,
+    /// the same seam the tabs use for their ttys.
+    NewWindow,
+    /// Close every window of this terminal — `Ctrl+Shift+Q`, or File ▸ Quit.
+    Quit,
     /// Open a tab — `Ctrl+Shift+T`, or File ▸ New Tab.
     ///
     /// **The tty is not this crate's**: opening a tab adds a `Term` with an empty grid, and the
@@ -326,6 +343,11 @@ pub struct App {
     /// The next key to hand out. Monotonic, so a key is never reused and a stale message can
     /// never name a tab that has taken its place.
     next_key: u64,
+    /// Another window has been asked for, and the binary has not made it yet.
+    new_window: bool,
+    /// A quit has been asked for. **The binary owns what that means**, because it is the only
+    /// thing that knows how many windows there are.
+    quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     ///
     /// **The toolkit's, since M14 Part A.** This was a `bool` and a `Rect` here, a two-element
@@ -400,6 +422,8 @@ impl App {
             tabs: alloc::vec![Term::new(TAB_KEY_BASE, cols, rows)],
             current: TAB_KEY_BASE,
             next_key: TAB_KEY_BASE + 1,
+            new_window: false,
+            quit: false,
             menus: MenuState::new(MENU_COUNT),
             focused: true,
             metrics,
@@ -727,6 +751,8 @@ impl App {
         }
         match msg {
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::NewWindow => self.new_window = true,
+            Msg::Quit => self.quit = true,
             Msg::NewTab => {
                 self.open_tab();
             }
@@ -786,6 +812,16 @@ impl App {
             Msg::Key(k) => self.key(k),
             Msg::GridPointer(p) => self.grid_pointer(p),
         }
+    }
+
+    /// Whether another window has been asked for. Clears the record.
+    pub fn take_new_window(&mut self) -> bool {
+        core::mem::take(&mut self.new_window)
+    }
+
+    /// Whether a quit has been asked for. Clears the record.
+    pub fn take_quit(&mut self) -> bool {
+        core::mem::take(&mut self.quit)
     }
 
     /// What the terminal owes the clipboard, taken exactly once.
@@ -981,7 +1017,14 @@ impl App {
                         Msg::CloseTab(self.current),
                     ),
                     Item::Separator,
+                    Item::new(
+                        "New Window",
+                        Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"),
+                        Msg::NewWindow,
+                    ),
+                    Item::Separator,
                     Item::plain("Close Window", Msg::Close),
+                    Item::new("Quit", Accel::ctrl_shift(QUIT_KEYCODE, "Q"), Msg::Quit),
                 ],
             },
             Menu {
@@ -1659,9 +1702,12 @@ mod tests {
 
         assert!(file_at.is_some() && edit_at.is_some(), "both words were laid out");
         assert_ne!(file_at, edit_at, "the two menus hang from different words");
-        assert!(
-            edit_size.h > file_size.h,
-            "Edit's five rows are taller than File's one — {edit_size:?} vs {file_size:?}"
+        // **Different, not ordered.** File was one row when this was written and is five now;
+        // what the popup rebuild depends on is that the two menus measure *differently*, which is
+        // the property, and asserting which is taller made it a fact about today's menus.
+        assert_ne!(
+            edit_size, file_size,
+            "the two menus measure the same, so a rebuild would be undetectable here"
         );
     }
 
@@ -1680,11 +1726,14 @@ mod tests {
         /// Everything about a terminal that any of these rows can move.
         fn digest(a: &mut App) -> alloc::string::String {
             let clip = a.take_clip_request();
+            // **Every outbox**, New Window and Quit included — the negative control below has now
+            // caught three separate additions that changed nothing a narrower digest could see.
+            let (nw, q) = (a.take_new_window(), a.take_quit());
             // **The tab count and the current tab are in here** since M14 Part B: New Tab changes
             // neither the grid nor the clipboard, so a digest without them would call it a row
             // that does nothing and the negative control below would fail for the wrong reason.
             alloc::format!(
-                "{clip:?}|{}|{}|{}|{:?}|{}|{}",
+                "{clip:?}|{}|{}|{}|{:?}|{}|{}|{nw}{q}",
                 line(a, 0),
                 a.closing(),
                 a.grid().has_selection(),
@@ -1733,7 +1782,7 @@ mod tests {
                 "{label} changes nothing, so this row proves nothing about routing"
             );
         }
-        assert_eq!(checked, 4, "New Tab, Close Tab, Copy and Paste are the rows with chords");
+        assert_eq!(checked, 6, "the four tab and clipboard rows, plus New Window and Quit");
     }
     /// The menu is **never** in the window's tree, open or closed.
     ///
