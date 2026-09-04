@@ -244,6 +244,18 @@ pub struct Resized {
 /// How many menus the bar carries. `File` and `Edit`.
 pub const MENU_COUNT: usize = 2;
 
+/// The most tabs one window can hold, **derived rather than chosen**.
+///
+/// `main` waits on the compositor's handle plus one per tab in a single `sys_wait`, which is the
+/// fan-out shape `MAX_WAIT_HANDLES`' own doc describes — and its instruction is that a server
+/// with this shape derives its cap from the constant rather than restating a number. Past the
+/// limit the kernel rejects the wait outright, so the loop would stop blocking and spin at full
+/// tilt (PR #282 review, worth fixing 4).
+///
+/// **Reachable, not theoretical**: `key` admits `KEY_REPEAT` and `accel_match` fires on any press,
+/// so *holding* `Ctrl+Shift+T` opens a tab per repeat.
+pub const MAX_TABS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
+
 /// Where tab keys start. Far from the element keys so a tab and a widget cannot be confused in
 /// a debug line; `nxedit` numbers its buffers the same way and for the same reason.
 pub const TAB_KEY_BASE: u64 = 1 << 62;
@@ -436,12 +448,28 @@ impl App {
         self.window = size;
         let cols = (size.w.saturating_sub(CHROME_W) / self.metrics.cell_w).max(1) as usize;
         let rows = (size.h.saturating_sub(CHROME_H) / self.metrics.cell_h).max(1) as usize;
-        let reflow = self.tab_mut().grid.resize(cols, rows);
-        // **Through the map, not around it.** `view_top` is an absolute line number and the
-        // rewrap changed how many lines exist above it.
-        self.tab_mut().view_top = self.tab_mut().view_top.map(|t| self.tab_mut().grid.clamp_view(reflow.map_line(t)));
-        self.tab_mut().view_moved = true;
-        Some(Resized { evicted: reflow.evicted_lines() })
+        // **Every tab, not the one on screen** (PR #282 review, blocking 2). A window has one
+        // shape and every tab is drawn into it, so a background tab left at the old `cols` is a
+        // grid the next `view()` sizes from stale numbers — a band of ground down the right and
+        // along the bottom, and a shell still wrapping at a column count nothing has any more.
+        // Shrinking is the worse direction, because the stale grid is then *larger* than the area
+        // it is laid into. It compounds too: `open_tab` takes its shape from the current tab.
+        let current = self.current;
+        let mut evicted = 0;
+        for t in &mut self.tabs {
+            let reflow = t.grid.resize(cols, rows);
+            // **Through the map, not around it.** `view_top` is an absolute line number and the
+            // rewrap changed how many lines exist above it.
+            t.view_top = t.view_top.map(|v| t.grid.clamp_view(reflow.map_line(v)));
+            t.view_moved = true;
+            if t.key == current {
+                evicted = reflow.evicted_lines();
+            }
+        }
+        // **The current tab's eviction**, because that is what the caller reports and what a
+        // person could check: a count summed across tabs would name a number nothing on screen
+        // corresponds to.
+        Some(Resized { evicted })
     }
 
     /// Where the grid's top-left sits inside the window.
@@ -563,6 +591,11 @@ impl App {
     }
 
     /// Every tab, for the binary that owns the ttys behind them.
+    pub fn tabs(&self) -> &[Term] {
+        &self.tabs
+    }
+
+    /// Every tab, mutably — for draining outboxes. See [`tabs`](Self::tabs) for reading.
     pub fn tabs_mut(&mut self) -> &mut [Term] {
         &mut self.tabs
     }
@@ -620,12 +653,41 @@ impl App {
     /// this split exists to prevent, and it is a mistake you make by *sharing* rather than by
     /// forgetting to copy — so nothing is copied.
     pub fn open_tab(&mut self) -> u64 {
+        if self.tabs.len() >= MAX_TABS {
+            // **Said rather than silently refused.** A chord that does nothing and explains
+            // nothing is the shape this milestone has spent three parts removing; the grid is
+            // where this application talks to the person using it.
+            self.feed(b"\r\nnxterm: no more tabs in this window\r\n");
+            return self.current;
+        }
         let key = self.next_key;
         self.next_key += 1;
         let (cols, rows) = (self.tab().grid.cols(), self.tab().grid.rows());
         self.tabs.push(Term::new(key, cols, rows));
-        self.current = key;
+        // A fresh `Grid` starts fully dirty, so this repaint is already owed — but going through
+        // the one function that makes a tab current is what keeps it that way.
+        self.show_tab(key);
         key
+    }
+
+    /// Make tab `key` current **and repaint the grid**.
+    ///
+    /// **The repaint is the whole of this function** (PR #282 review, blocking 1). The grid is a
+    /// `custom` node, and `diff` fingerprints one by its kind and size — so switching tabs, which
+    /// changes neither, reports no damage at all, and `paint` draws strictly inside the damage
+    /// rect. The strip would highlight the tab you clicked while the grid below it kept the other
+    /// tab's pixels, until something else happened to damage it: a scroll, a resize, or output
+    /// from this tab's shell, which repaints only the rows it writes and so leaves one fresh line
+    /// over five stale ones.
+    ///
+    /// **`nxedit` has no such problem** because its content is a `text_area` *inside* the diffed
+    /// tree; this grid is outside it, which is what makes the damage this application's to
+    /// declare.
+    fn show_tab(&mut self, key: u64) {
+        self.current = key;
+        // `view_moved` rather than `damage_all`, because it is the flag `damage_rows` already
+        // reads to mean "every row of the viewport" — and the viewport is what changed.
+        self.tab_mut().view_moved = true;
     }
 
     /// Close tab `key`. Returns whether anything was closed.
@@ -643,8 +705,10 @@ impl App {
         self.tabs.remove(i);
         if self.current == key {
             // The one that took its place, or the last if it was the end — never an index that
-            // no longer exists.
-            self.current = self.tabs[i.min(self.tabs.len() - 1)].key;
+            // no longer exists. **Through `show_tab`**, so the grid is repainted: a closed tab
+            // leaves its pixels behind exactly as a switched-away one does.
+            let next = self.tabs[i.min(self.tabs.len() - 1)].key;
+            self.show_tab(next);
         }
         true
     }
@@ -671,7 +735,7 @@ impl App {
             }
             Msg::SelectTab(key) => {
                 if self.tabs.iter().any(|t| t.key == key) {
-                    self.current = key;
+                    self.show_tab(key);
                 }
             }
             // **Nothing selected is not a request.** A copy that pushed an empty entry would move
@@ -1004,10 +1068,9 @@ impl App {
             dock(
                 vec![
                 docked(Edge::Top, bar.key(BAR_KEY)),
-                docked(
-                    Edge::Top,
-                    sized(Size::new(0, TAB_STRIP_H), strip).key(TAB_STRIP_KEY),
-                ),
+                // `tab_strip` already returns itself `sized` to `TAB_STRIP_H`, so this only
+                // needs the key (PR #282 review, optional 9).
+                docked(Edge::Top, strip.key(TAB_STRIP_KEY)),
                 docked(
                     Edge::Right,
                     // **Sized, so the bar ends where the grip begins.** The dock's right slot
@@ -1243,6 +1306,9 @@ mod tests {
         // the same check `nxedit`'s chords get.
         assert_eq!(libinput::keymap::to_char(COPY_KEYCODE, 0), Some(b'c'));
         assert_eq!(libinput::keymap::to_char(PASTE_KEYCODE, 0), Some(b'v'));
+        // The tab chords, added in M14 Part B and claimed in a comment until PR #282's review.
+        assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
+        assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
     }
 
     #[test]
@@ -2216,6 +2282,100 @@ mod tests {
         a.update(Msg::CloseTab(two));
         assert!(!a.closing(), "closing a closed tab does not close the window");
         assert_eq!(a.tab_labels().len(), 1);
+    }
+
+    /// Switching to a tab repaints the grid, which no diff will do for it.
+    ///
+    /// **The grid is outside the diffed tree** — a `custom` node fingerprinted by kind and size —
+    /// so a switch, which changes neither, produces no damage at all and `paint` draws strictly
+    /// inside the damage rect. The strip would highlight the tab you clicked while the grid below
+    /// it kept the other tab's pixels (PR #282 review, blocking 1). `nxedit` has no such problem
+    /// because its content is inside the tree; this damage is the application's to declare.
+    #[test]
+    fn switching_tabs_repaints_the_grid() {
+        let mut a = app();
+        let one = a.current_tab();
+        a.feed(b"first");
+        let _ = a.damage_rows(); // the frame that drew tab one
+
+        a.update(Msg::NewTab);
+        a.feed(b"second");
+        let _ = a.damage_rows(); // …and the frame that drew tab two
+
+        // Nothing has happened to tab one's grid since it was last drawn, so its *own* damage is
+        // empty — which is exactly why the switch has to declare it.
+        a.update(Msg::SelectTab(one));
+        assert_eq!(
+            a.damage_rows().len(),
+            a.grid().rows(),
+            "switching tabs left the other tab's pixels on screen"
+        );
+    }
+
+    /// Closing a tab repaints too: the survivor's pixels are as stale as a switch's.
+    #[test]
+    fn closing_the_current_tab_repaints_the_survivor() {
+        let mut a = app();
+        a.feed(b"first");
+        let _ = a.damage_rows();
+        a.update(Msg::NewTab);
+        let two = a.current_tab();
+        a.feed(b"second");
+        let _ = a.damage_rows();
+
+        a.update(Msg::CloseTab(two));
+        assert_eq!(a.damage_rows().len(), a.grid().rows(), "the survivor was not repainted");
+    }
+
+    /// A `Configure` reshapes **every** tab, not the one on screen.
+    ///
+    /// **A window has one shape and every tab is drawn into it** (PR #282 review, blocking 2). A
+    /// background tab left at the old `cols` is a grid the next `view()` sizes from stale
+    /// numbers — a band of ground down two edges, and a shell wrapping at a column count nothing
+    /// has any more. Shrinking is worse: the stale grid is then larger than the area it is laid
+    /// into. It compounds, because `open_tab` takes its shape from the current tab.
+    #[test]
+    fn a_resize_reshapes_every_tab() {
+        let mut a = app();
+        let one = a.current_tab();
+        a.update(Msg::NewTab);
+        let before = (a.grid().cols(), a.grid().rows());
+
+        let bigger = Size::new(a.window_size().w + 200, a.window_size().h + 200);
+        assert!(a.resize(bigger).is_some(), "a new size is a change");
+        let now = (a.grid().cols(), a.grid().rows());
+        assert_ne!(now, before, "the current tab grew, or this test proves nothing");
+
+        a.update(Msg::SelectTab(one));
+        assert_eq!(
+            (a.grid().cols(), a.grid().rows()),
+            now,
+            "a background tab kept the old shape and would be drawn from stale numbers"
+        );
+        // …and a tab opened afterwards inherits the *current* shape rather than a stale one.
+        a.update(Msg::NewTab);
+        assert_eq!((a.grid().cols(), a.grid().rows()), now);
+    }
+
+    /// A window holds at most `MAX_TABS`, and says so rather than spinning.
+    ///
+    /// **The cap is `MAX_WAIT_HANDLES - 1`** because `main` waits on the compositor plus one
+    /// handle per tab: past the limit the kernel rejects the wait, which returns immediately and
+    /// turns the render loop into a spin (PR #282 review, worth fixing 4). Holding
+    /// `Ctrl+Shift+T` is enough to reach it, since a key repeat opens a tab.
+    #[test]
+    fn a_window_holds_at_most_max_tabs() {
+        let mut a = app();
+        for _ in 0..MAX_TABS * 2 {
+            a.update(Msg::NewTab);
+        }
+        assert_eq!(a.tabs().len(), MAX_TABS, "the cap did not hold");
+        assert!(MAX_TABS < libkern::abi::MAX_WAIT_HANDLES, "…and it leaves room for the window");
+        // The refusal is visible: the last one said so in the grid rather than doing nothing.
+        assert!(
+            (0..a.grid().rows()).any(|r| line(&a, r).contains("no more tabs")),
+            "the refusal was silent"
+        );
     }
 
 }

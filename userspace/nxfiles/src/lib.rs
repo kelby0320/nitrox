@@ -993,7 +993,9 @@ impl App {
         // for a drop target, deliberately, because dropping a thing where it came from is a
         // no-op (`compositor::input::highlight_target`).
         if self.dragging {
-            let name = self.pressed.as_ref().map(|(n, _, _)| n.clone()).unwrap_or_default();
+            // **No sentinel name.** `unwrap_or_default` here would hand `""` to a lookup rather
+            // than saying there is nothing to carry (PR #282 review, optional 7).
+            let Some((name, _, _)) = self.pressed.clone() else { return Gesture::None };
             return self.drag_moved(x, y, &name);
         }
         let Some((name, ox, oy)) = self.pressed.clone() else { return Gesture::None };

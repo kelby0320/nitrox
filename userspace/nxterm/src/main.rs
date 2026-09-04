@@ -184,11 +184,10 @@ fn report_row(app: &App, row: usize) {
 /// mean a keystroke could not be seen while a shell was quiet, or the reverse. With tabs it is
 /// the compositor's handle plus *one per tab* (M14 Part B) — a shell printing in a background tab
 /// must not have to wait for the foreground one to say something.
-fn wait_any(handles: &[u64]) {
-    // 24 bytes per record, which is what the two-handle version sized itself from.
-    let mut results = alloc::vec![0u8; handles.len() * 24];
+fn wait_any(handles: &[u64]) -> bool {
+    let mut results = alloc::vec![0u8; handles.len() * libkern::abi::WAIT_RESULT_SIZE];
     // SAFETY: a valid handle array and a result buffer sized for one record per handle.
-    unsafe {
+    let n = unsafe {
         libkern::syscall4(
             libkern::SYS_WAIT,
             handles.as_ptr() as u64,
@@ -197,6 +196,12 @@ fn wait_any(handles: &[u64]) {
             u64::MAX,
         )
     };
+    // **The answer is checked, not discarded** (PR #282 review, worth fixing 4). The kernel
+    // rejects a `count` above `MAX_WAIT_HANDLES`, and a rejected wait returns *immediately* — so
+    // a caller that ignored it would stop blocking and spin the whole render loop at full tilt.
+    // `nxterm::MAX_TABS` is what keeps the count under the limit; this is what makes a failure
+    // say so instead of burning a core.
+    n as i64 > 0
 }
 
 /// The theme the shell handed this application, or the built-in one.
@@ -455,11 +460,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         root_ns: u64,
         env: &libstream::wire::Record,
     ) {
-        // Tabs that went away take their backend with them: dropping it closes the channel, and
-        // that close is how the tty server learns this emulator is done with that terminal.
-        backends.retain(|b| app.tabs_mut().iter().any(|t| t.key() == b.key));
+        // Tabs that went away take their backend with them: `Backend`'s `Drop` closes the
+        // channel, and that close is how the tty server learns this emulator is done with that
+        // terminal — which ends the `nxsh` on it. That `Drop` exists because of this line: while
+        // there was one backend for the life of the process nothing ever dropped one, and a raw
+        // handle dropped silently would leak a terminal and a shell per closed tab.
+        backends.retain(|b| app.tabs().iter().any(|t| t.key() == b.key));
         let want: alloc::vec::Vec<u64> = app
-            .tabs_mut()
+            .tabs()
             .iter()
             .map(|t| t.key())
             .filter(|k| !backends.iter().any(|b| b.key == *k))
@@ -851,7 +859,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let mut handles = alloc::vec::Vec::with_capacity(backends.len() + 1);
                 handles.push(win_handle);
                 handles.extend(backends.iter().map(|b| b.backend.channel));
-                wait_any(&handles);
+                if !wait_any(&handles) {
+                    // Nothing can make this succeed on a retry — the handle count or the buffer
+                    // is wrong — and spinning would be the worse failure.
+                    fail(b"nxterm: the wait was refused\n");
+                }
                 continue; // round again: drain every source from the top
             }
         } else {

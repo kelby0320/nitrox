@@ -23546,3 +23546,60 @@ is still the browser's own.
 **The rule worth keeping**: when a gate's failure *rate* moves with unrelated changes, that is
 evidence the fault is real and timing-sensitive — not evidence that it is noise. Twice I read it
 the other way round.
+
+---
+
+## 2026-09-04 — what PR #282's review found: three ways one tab was still the assumption
+
+Three blocking findings, and they are the same mistake seen from three sides. The split of *state*
+was done — `Term` holds the grid, `App` holds the window — but three things that had never needed
+to iterate still acted on `self.tab_mut()` alone, because for the whole life of this application
+there was exactly one.
+
+**Switching tabs did not repaint.** The grid is a `custom` node and `diff` fingerprints one by its
+kind and size, so a switch — which changes neither — reports no damage at all, and `paint` draws
+strictly inside the damage rect. The strip highlighted the tab you clicked while the grid below it
+kept the other tab's pixels, until something else happened to damage it: a scroll, a resize, or
+output from that tab's shell, which repaints only the rows it writes and so leaves one fresh line
+over five stale ones. **`nxedit` has no such problem** because its content is a `text_area` inside
+the diffed tree; `nxterm`'s grid is outside it, which is precisely what makes this damage the
+application's to declare. Every change of `current` now goes through one `show_tab`.
+
+**The gates could not see it**, and the reason is worth keeping: opening a *new* tab does repaint,
+because a fresh `Grid` starts fully dirty. `check-terminal` only opens a tab and reads a serial
+receipt — it never switches back, and it never looks at pixels.
+
+**A `Configure` reshaped one grid.** A window has one shape and every tab is drawn into it, so a
+background tab left at the old `cols` is a grid the next `view()` sizes from stale numbers: a band
+of ground down two edges and a shell wrapping at a column count nothing has any more. Shrinking is
+the worse direction, because the stale grid is then *larger* than the area it is laid into. It
+compounded, too — `open_tab` takes its shape from the current tab, so one opened while a stale tab
+was current inherited the staleness.
+
+**Closing a tab leaked its channel and orphaned its shell, and the comment claimed otherwise.** I
+wrote that dropping the backend closes the channel and that the close is how the server learns the
+terminal is done. `Backend` had no `Drop`. Nothing had ever dropped one — there was a single
+backend for the life of the process and the handle went with the exit — so the claim had been true
+of nothing and untested by anything. Ten opened and closed tabs would have left ten shells blocked
+on a read forever. It is a real `Drop` now, on the type rather than at the call site, because a
+handle whose release depends on somebody remembering is one that leaks the first time a second
+caller arrives. **The server records the mirror image of this from its own side**, which is where
+the shape should have been recognised: `attach_backend` returns an orphaned channel to its caller
+precisely because "closing it is not bookkeeping, it is how the *previous* emulator learns its
+terminal has ended".
+
+**And a constant that was safe as a `2` stopped being safe as a length.** `wait_any` passes one
+handle per tab and discarded the syscall's answer; past `MAX_WAIT_HANDLES` the kernel rejects the
+wait, which then returns immediately and turns the render loop into a spin. `MAX_WAIT_HANDLES`'
+own doc says a server with this fan-out derives its cap from the constant rather than restating a
+number — `nxterm` now has that shape, so `MAX_TABS` is derived, the refusal is said in the grid,
+and the wait's result is checked. Reachable rather than theoretical: `key` admits `KEY_REPEAT`, so
+*holding* `Ctrl+Shift+T` opens a tab per repeat.
+
+**The through-line.** Every one of these is code that was correct when a window had one of
+something, left unchanged by a part whose whole subject was that it now has several. Splitting the
+*state* is the visible half of adding tabs; finding the places that quietly assumed the singular
+is the half that has no diff to point at. The reviewer's four negative controls on the batch's own
+tests all fired, so the tests written were not the problem — the tests *not* written were, and
+each of the three is now pinned by one, including the two the reviewer had proved with throwaway
+probes.
