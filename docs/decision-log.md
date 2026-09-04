@@ -23171,3 +23171,226 @@ most to be the second kind, and matching only the display name would have made t
 **What an entry is not.** Not a capability. Listing an application does not grant the right to run
 it, and running one does not require an entry — `/bin/nxterm` resolves whether or not
 `nxterm.toml` exists. Authority stays where it always is: in what a namespace contains.
+
+---
+
+## 2026-09-04 — a menu is a value, and an accelerator is declared once (M14 Part A)
+
+**`userspace/libui/src/menu.rs`.** A drop-down menu is now a table of items — label, optional
+chord, message, availability — plus separators, the open/anchor/cursor state, the keyboard, and
+two builders that turn the table into a bar and into a popup. All three applications took it.
+
+**What was actually duplicated, and it was not the bar.** `menu_bar` and `menu_item` had existed
+since M4 and every application used them. The half each one had written for itself was the *open
+menu*: open/close state, the anchor capture — a `Rect` in `nxterm`, a two-element array in
+`nxfiles` — the row keying, and the dismissal. `menu_bar`'s own doc called that absence
+deliberate on the grounds that "an open menu is a `popup` **window**", which is true and was
+never the question: the window is still each application's, and everything the window *contains*
+is now one thing. `nxedit` had none of it and therefore no menus at all.
+
+**Decision 2 was aspirational until this part.** "An accelerator is declared once" was written
+down in the M14 details pass as a governing decision, and nothing enforced it: a menu that *says*
+`Ctrl+C` and a `match k.keycode` that *implements* it are two statements of one fact, and the
+pair drifts with nothing failing — the menu keeps advertising a chord the handler stopped
+honouring. `accel_match` returns the message whose menu item claims a key, and all three
+applications route their `Ctrl`-chords through it against the same table the popup draws. Each
+gained a test that walks the table and asserts every advertised chord reaches its own row's
+message; none of those tests could have been written before, because there was no single table to
+walk.
+
+**Disabled items do not match a chord**, for the reason arrowing skips them: an item that would
+do nothing if clicked should do nothing if typed. This changed one existing behaviour, and it is
+worth naming because it looks like a regression. `nxedit`'s `Ctrl+C` with nothing selected used
+to put "nothing to copy" in the status strip; it is now silent, because the Edit row is greyed.
+The greying is the feedback, which is how every editor behaves — and the strip's message is still
+there for a caller that reaches `copy` another way.
+
+**Availability is shown rather than discovered on refusal.** `nxfiles` had five operations, three
+of which act on a selection, and choosing one without a selection put "nothing is selected" in
+the strip. That was the honest answer to a question the menu should not have asked. Those rows
+are greyed now, as are Close Tab on a lone tab and Cut/Copy in `nxedit`. **The old guards stay**,
+because a caller arriving by another path must get the same answer — a guard removed on the
+grounds that the UI prevents it is a guard removed on the grounds that the UI is the only caller.
+
+**A disabled row is not dimmed, and that is a gap rather than a decision.** `paint` draws every
+`Text` in `theme.foreground`; there is no per-element ink. So "unavailable" shows as a row that
+does not light under the pointer and that arrowing skips — half the affordance. The colour
+arrives with the ink wrapper Part G adds for syntax highlighting, and `menu_row`'s doc says so
+where somebody would look.
+
+**Every row is keyed, separators included — and this is the part that cost a QEMU round trip.**
+`diff` rejects a parent whose children are only *partly* keyed (`DiffError::MixedKeying`), so an
+unkeyed rule among keyed rows makes the whole popup undiffable. That does not show up as a wrong
+picture: it shows up as `Child::present` returning false every frame, so the menu opens, reports
+its size to the log, and never draws. The same mistake one level out — an unkeyed menu bar docked
+beside two keyed siblings — made `nxedit`'s *whole window* undiffable, which `check-login` caught
+as `nxedit: the view is not diffable`.
+
+**The gates could not see it, and now they can.** `check-display` renders the reference through
+`layout` and `paint` with no diff at all, so adding the menu to `reference.rs` — which was worth
+doing, and pins the right-aligned accelerator column and the stretched separator pixel for pixel
+— proved nothing about diffability. What catches it is a host test per tree:
+`the_popup_diffs_from_one_highlight_to_the_next` in `libui`, and
+`the_window_tree_diffs_across_the_menu_states` in each of the three applications. Both were
+negative-controlled by removing the key and watching them fail.
+
+**Two gates learned to find a row instead of computing one.** `check-terminal` aimed at "the upper
+quarter of the popup" and `check-login` divided the popup's height by a row count. A **separator**
+occupies height without being a row, so neither arithmetic survives — and the failure is silent
+in the worst way, because a click that lands on the wrong row still lands on *a* row. Both gates
+now walk down the popup and stop when the guest's hover receipt names the row they mean, which
+is the rule the position tracking already followed: evidence, not assertion. `nxfiles` grew the
+receipt `nxterm` already had, unconditionally, because `check-login` boots the release image.
+
+**A walk has to record where it went**, which is a deliberate exception to "only a confirmed press
+updates the tracked position". `move_pointer_to` walks a delta from that position and does not
+update it, so the first version of the walk re-walked the whole delta every iteration and ran the
+pointer off the popup. A dropped packet now costs one four-pixel step of drift and the walk takes
+one more; the receipt is what confirms the position, so nothing downstream trusts the estimate.
+
+**What is deliberately not here.** No Select All — nothing in `userspace/` implements one, and
+Part E builds it. No Quit — decision 4 settles what quitting means over unsaved work and Part B
+builds it. A menu item whose action this part invented is how two answers to "what happens to
+unsaved work" get written in two places. `nxterm`'s File menu therefore holds one row, and that
+is the honest shape of a terminal with no tabs until Part B.
+
+**Clear and Reset are under `nxterm`'s Edit menu**, not a Terminal menu of their own, because two
+menus is what this part scopes and of the two they are edits to what is on screen. GNOME Terminal
+puts them under `Terminal`; if a third menu arrives they move there, and the accelerator table
+does not care which menu an item is in.
+
+**`nxedit`'s bar goes above its tab strip**, matching `nxfiles`. A person who learned where the
+menus are in one window should not have to look somewhere else in the next, and a bar *below* a
+tab strip reads as belonging to the tab rather than to the window. It cost the editor's text area
+24 pixels, taken from the window rather than from the document.
+
+---
+
+## 2026-09-04 — what PR #280's review found, and the two shapes underneath it (M14 Part A)
+
+Nine findings, all real. Two were blocking and both were in `nxterm`'s **keyboard** half of an
+open menu — the half no gate drives, and the half the other two applications got right by
+accident rather than by design. That is the interesting part, so it is what this records.
+
+**`KeyOutcome::Chose` now names its menu, and that is an API fix rather than a call-site fix.**
+`MenuState::key` closes the menu *before* returning `Chose`, so a caller asking `open()`
+afterwards gets `None`. `nxterm` did exactly that and dropped every message Enter produced;
+`nxfiles` and `nxedit` were correct because they happened to hold `menu_shown` for the popup
+window's sake. Three call sites each having to remember is a design that will be got wrong again,
+so the outcome carries `{ menu, item }` and the mistake is now unrepresentable. **The rule worth
+keeping**: when a review finds one call site wrong and two right *for unrelated reasons*, the
+thing to fix is the shape that let them differ.
+
+**A discriminator that answers a different question than the one being asked.** `nxterm`
+reconciled its popup on `open().is_some()` — *whether* a menu is open — where the fact that
+matters is *which*. It was correct for a bar with one menu and no arrow keys, and this part gave
+it both. The failure is not a crash: `Child::present` lays a new tree into a rectangle fixed at
+`Child::open`, so switching File→Edit drew five rows into a one-row window and clipped four away.
+Both sibling applications had the right comparison, and `nxedit`'s comment even said why.
+
+**Availability is how an application states a mode.** The editor's menu rows could act while a
+naming prompt was open — Find replaced the field and abandoned a half-typed filename, Undo edited
+the buffer behind the prompt. `key` has always given every keystroke to an open field, chords
+included; the menu was a way *around* that invariant rather than a second statement of it. Every
+row is greyed while a field is open, which says the same thing in the vocabulary this part
+introduced. **This is the general shape** and `widget-toolkit.md` §8.1 now records it.
+
+**A test that names two things from one table tests neither against the code.**
+`every_advertised_chord_does_what_its_row_says` built a `KeyEvent` from a row's `Accel` and asked
+`accel_match` about it — both sides of one table, with the application never called. It passed
+with `App::key`'s `accel_match` deleted. It now drives the event through `App::key` and asserts
+the resulting state equals the state from sending the row's message directly: an **equivalence**
+rather than a per-row list, because a per-row list is the drift decision 2 exists to prevent.
+Each row also carries a negative control against an untouched application, and that control
+immediately earned itself — it found the digest blind to two rows, `Close Tab` on a lone tab
+(which closes the *window*) and `Save` (which fills an outbox, not the buffer). It then found a
+second bug in the test itself: the digest *drains* those outboxes, so calling it twice on one
+application reports its own emptiness as a difference.
+
+**`selected_text().is_some()` is not a cheap question.** Both applications asked whether anything
+was selected by allocating the entire selection as a `String` and discarding it — and `menu_table`
+is on the hot path, because `update` builds the table on every message to decide whether to close
+the menu. A drag-select over 2000 lines of scrollback was quadratic over the gesture. `Grid` and
+`TextAreaState` grew `has_selection`. **They are not the same function**: `TextAreaState::selection`
+is already `None` for a collapsed range, but `Grid::selection` returns the raw field, which is
+`Some` and *empty* after a press with no drag — so the obvious spelling would have offered *Copy*
+for a gesture `selected_text` then declines. A test pins the pair against each other in that
+state, because that is the only state where they could differ.
+
+**The gap the review named is now a gate.** Both blocking findings were in the *keyboard* half
+of an open menu, and the reviewer said plainly why they survived: nothing drives it —
+`check-terminal` opened the menu with F1 and clicked, and never arrowed. `check-terminal` now
+reopens the menu, presses Left and asserts a **second** popup line naming a different bar word and
+a different height (which is blocking 2: a window positioned and sized at `Child::open` cannot
+host another menu's rows), then presses Down and Enter and asserts `menu chose Paste` (blocking
+1, and also that arrowing skipped the greyed *Copy* above it). Reverting either fix makes the gate
+fail, which is the only thing that makes the coverage claim worth anything.
+
+**The harness key stopped being a one-shot to allow it.** `nxterm`'s F1 was guarded by a flag so
+the menu could not open before the gate had finished typing at the shell — but *when* it opens is
+the gate's schedule, not the flag's, and the one-shot is precisely what made the keyboard half
+untestable. It is a plain toggle now.
+
+**The doc-comment orphan, for the seventh time in this repository.** Inserting `transcript` above
+`finish` took `finish`'s `///` block with it. The habit that avoids it is to append below an
+existing item rather than above it.
+
+---
+
+## 2026-09-04 — a click the compositor delivered and the client did not act on (M14 Part A, CI)
+
+`check-login` went red in CI on PR #280's second commit, timing out on `nxfiles: menu popup ` —
+the click that opens the browser's File menu. It passes locally most of the time, which is the
+part that made it worth writing down.
+
+**Three hypotheses, in the order they were tried, and only the third survived.**
+
+**Geometry — ruled out by a test that now stays.** The gate spells the browser's chrome as
+constants and aims at `(fx + 20, …)`, and this part changed what a bar word *is*, from a `button`
+to a `menu_item` with different padding. Nothing connected that hardcoded 20 to the layout, so
+`the_gate_aims_inside_the_file_word` now does: it builds the real tree, locates both bar words,
+and asserts the gate's own arithmetic lands inside *File* and outside *Edit*. It passed, so the
+aim was never the problem — but the next time a bar's padding changes, the failure is a host test
+that names the number rather than a QEMU timeout that names nothing.
+
+**A lost release — ruled out, and ruling it out required a change.** A click is a press *and* a
+release, and `on_press` fires on the release; the compositor logged only presses. So a lost
+release and a client that ignored the click were indistinguishable in the transcript, and QEMU's
+PS/2 queue dropping a whole packet is a documented failure on this path. The compositor now logs
+releases beside presses — a button is not a keystroke, so this says no more about a person than
+the press already did — and the answer came back immediately: **both halves are in the transcript,
+at the right coordinates, on the right window, and the client still did nothing.**
+
+**The wait that was supposed to fix it broke something else.** Before the release logging proved
+otherwise, `click_at` was changed to confirm the release and re-send a missing one. That made the
+`nxfiles` *drag* step fail deterministically — three runs out of three, with every release present
+and no retry ever firing, the only difference being that the gate proceeds one serial line later.
+That is a timing sensitivity in the guest's input path which the wait neither caused nor fixed,
+and trading one red gate for another to chase it is not a bargain. **The wait was dropped; the
+logging was kept**, because the logging is what made the diagnosis possible and costs nothing.
+
+**What shipped is a retry on the effect rather than on the aim.** `click_at` has always retried
+until the *press* landed where it was aimed; `click_until` retries the whole click until the guest
+produces a named receipt. They are different claims — "the pointer was there" and "something
+happened" — and the gap between them is exactly where this failure lived. It is used for the one
+step that flakes, because a repeated click is only safe where the first one doing nothing is the
+premise: a bar word toggles, so the window is ten seconds, far longer than the receipt takes when
+the click lands. Two runs since — one TCG, one KVM — hit the fault and recovered, which is the
+only evidence that the retry addresses the real thing rather than the schedule.
+
+**It is a workaround, and the underlying fault is filed rather than fixed.** A compositor that
+delivered both halves of a click to a window whose client did not act on it is a real bug, not a
+gate problem: `TODO(click-not-acted-on)`.
+
+**The obvious suspect was checked and is not it.** A dangling `wip/i8042-efficacy` branch carries
+`a58770e`, "Fix the i8042 losing interrupts, which made every input gate flaky", and it is not in
+`main` — which reads like a pending fix for exactly this. It is not: cherry-picking it onto this
+branch *reverts* `drivers/ps2`, because `main` already carries the later and better answer — the
+tick-driven sweep, whose comment records that the earlier claim ("the controller will raise
+because the byte is still there") is false for this device and "cost three investigations". So
+that commit is superseded, the residual fault is something after it, and a stale branch that
+looks like a fix is worth naming as such so the next person does not land it.
+
+What this milestone owes the open item is evidence rather than a guess: the release line, which
+is what rules out lost input, and a gate that says "landed but produced no receipt" instead of
+timing out forty-five seconds later on an unrelated expectation.

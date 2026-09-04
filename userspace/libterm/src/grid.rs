@@ -394,6 +394,20 @@ impl Grid {
         self.selection
     }
 
+    /// Whether anything is actually selected — a range that exists **and** covers cells.
+    ///
+    /// **The cheap half of [`selected_text`](Self::selected_text)**, which allocates the whole
+    /// selection as a `String` and is what callers used to ask this question with (PR #280 review,
+    /// worth fixing 6). A menu asks it once per message and a drag asks it once per motion, so
+    /// the allocating version made a long selection quadratic over the gesture.
+    ///
+    /// **Not `selection().is_some()`**, which is true after a bare press: a gesture in progress
+    /// with both ends at one position is `Some` and empty, and offering *Copy* for it would offer
+    /// something `selected_text` then declines.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|s| !s.is_empty())
+    }
+
     /// Begin a selection at absolute `(line, col)` — a press.
     ///
     /// Both ends start here, so a press with no drag selects nothing. [`extend`](Self::extend)
@@ -1803,4 +1817,31 @@ mod tests {
         // Whatever comes back, it came back — the point is that asking did not panic.
         let _ = g.selected_text();
     }
+    /// `has_selection` agrees with `selected_text().is_some()` in every state, including the one
+    /// they could disagree in.
+    ///
+    /// **The empty range is the whole point.** A press with no drag leaves `selection()` as
+    /// `Some` covering nothing, so the obvious cheap spelling — `selection().is_some()` — would
+    /// say a menu row is available for a gesture that yields no text.
+    #[test]
+    fn has_selection_is_the_cheap_half_of_selected_text() {
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "hello world");
+        assert!(!g.has_selection(), "nothing swept out");
+        assert_eq!(g.selected_text(), None);
+        // A press and no drag: a gesture is in progress and covers nothing.
+        g.select_from(0, 3);
+        assert_eq!(g.selected_text(), None, "a press selects no text");
+        assert!(!g.has_selection(), "…and this must agree, which selection().is_some() would not");
+        assert!(g.selection().is_some(), "the range does exist — that is the trap");
+        // A drag: both say yes.
+        g.extend(0, 8);
+        assert!(g.selected_text().is_some());
+        assert!(g.has_selection());
+        // Cleared: both say no again.
+        g.clear_selection();
+        assert_eq!(g.selected_text(), None);
+        assert!(!g.has_selection());
+    }
+
 }

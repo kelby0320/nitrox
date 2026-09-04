@@ -1281,12 +1281,17 @@ fn route_one_batch(
                     }
                     _ => None,
                 };
+                // **Releases as well as presses, since 2026-09-04.** A *click* is both halves,
+                // and only the press was ever logged — so a gate whose click produced no effect
+                // could not tell whether the release had arrived, and a lost one looked exactly
+                // like a client that ignored the click. `check-login` failed that way in CI with
+                // nothing in the transcript to say which it was. A button is not a keystroke, so
+                // this logs no more about a person than the press beside it already did.
                 let diag = meta_change.is_some()
-                    || match *l {
-                        libinput::Logical::Button { pressed: true, .. } => true,
-                        libinput::Logical::Dropped => true,
-                        _ => false,
-                    };
+                    || matches!(
+                        *l,
+                        libinput::Logical::Button { .. } | libinput::Logical::Dropped
+                    );
                 // Already inside the enclosing `unsafe` block, so no inner one: the
                 // justification is that this is a single-threaded server and the counter is
                 // touched only from the serve loop, as `ROUTES_LOGGED` is.
@@ -1306,10 +1311,16 @@ fn route_one_batch(
                         }
                         _ => {
                             let p = srv.router.pointer();
-                            pl.s(b"compositor: press at x=")
-                                .i(p.x as i64)
-                                .s(b" y=")
-                                .i(p.y as i64);
+                            let down =
+                                matches!(*l, libinput::Logical::Button { pressed: true, .. });
+                            pl.s(if down {
+                                b"compositor: press at x=".as_slice()
+                            } else {
+                                b"compositor: release at x=".as_slice()
+                            })
+                            .i(p.x as i64)
+                            .s(b" y=")
+                            .i(p.y as i64);
                             match srv.router.grab() {
                                 Some(w) => {
                                     pl.s(b" win=").u(w as u64);

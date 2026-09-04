@@ -32,11 +32,12 @@ use librsproto::surface::{CreateWindowRequest, Role};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libui::diff::Tree;
-use libui::layout::{Layout, layout};
+use libui::layout::{Layout, layout, locate};
 use libui::paint::{FontMetrics, Theme, paint};
 use libui::route::Router;
 use libui::window::Child;
-use nxedit::{App, Msg, to_bytes};
+use libui::menu::{Item, KeyOutcome};
+use nxedit::{App, MENU_BAR_KEY, MENU_COUNT, Msg, to_bytes};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -320,6 +321,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // and a hidden one would still be a window in the stack. `Role::Dialog` has existed since M2
     // Part A and no program a person runs had ever created one.
     let mut confirm: Option<Child> = None;
+    // **The menu's window** — a third top-level window and this editor's first popup (M14 Part
+    // A). Alive only while a menu is open, for the reason the dialog above is: a `popup` is
+    // transient by role, the compositor takes it with its parent, and it holds the keyboard
+    // while it is up.
+    let mut menu: Option<Child> = None;
+    // Which menu the live popup was opened for, so a *change* — not merely open-versus-shut —
+    // rebuilds the window at the new word. Without it, clicking File then Edit would move the
+    // rows and leave the window under the first word.
+    let mut menu_shown: Option<usize> = None;
+    let mut menu_hovered: Option<u64> = None;
     // Which of the dialog's controls the pointer was over at its last paint — a receipt, the way
     // `nxterm`'s menu hover is. Nothing is built from it; the view reads `hovered_key` directly.
     let mut confirm_hovered: Option<u64> = None;
@@ -394,6 +405,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // had ever asked (M11 Part E batch 3).
         let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
+        // Where each menu drops from, read every frame rather than when one opens: a bar word's
+        // position is a fact about the layout, and before the first one there is nowhere to put a
+        // popup at all — which is exactly what "could not open the menu" means without this.
+        app.menus.set_anchors(
+            (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
+        );
         let damage = match tree.update(&ui, &l) {
             Ok(d) => d,
             // A malformed tree is a bug in `view`, not a runtime condition.
@@ -429,6 +446,56 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
             l.end();
+        }
+
+        // ---- the menu's window ----
+        //
+        // Opened and destroyed with the menu, and rebuilt when *which* menu is open changes.
+        if menu_shown != app.menus.open() {
+            if let Some(m) = menu.take() {
+                m.close(&mut win);
+            }
+            menu_hovered = None;
+            menu_shown = app.menus.open();
+            if let Some(which) = menu_shown {
+                match app.menus.anchor() {
+                    Some(at) => {
+                        // Measured with no hover: the pointer is over the *bar word* that opened
+                        // this rather than over the popup, and a highlight does not change what a
+                        // menu measures.
+                        let view = app.menu_view(which, &theme, None);
+                        menu = Child::open(
+                            &mut win,
+                            Role::Popup { parent: window_id },
+                            at,
+                            &view,
+                            &font,
+                            &theme,
+                            BUFFERS,
+                        );
+                    }
+                    // No anchor yet means no layout yet, which cannot happen after the first
+                    // frame — and if it did, an unplaced menu is better than one at the origin.
+                    None => menu = None,
+                }
+                if menu.is_none() {
+                    // Not fatal: the editor is usable without its menu, and saying so beats a
+                    // window that silently never appears.
+                    kprint(b"nxedit: could not open the menu\n");
+                    app.menus.close();
+                    menu_shown = None;
+                }
+            }
+        }
+        if let Some(m) = menu.as_mut() {
+            let now = m.hovered_key();
+            menu_hovered = now;
+            if let Some(which) = menu_shown {
+                let view = app.menu_view(which, &theme, now);
+                if !m.present(&mut win, &view, &font, &theme) {
+                    kprint(b"nxedit: the menu could not be drawn\n");
+                }
+            }
         }
 
         // ---- the question's window ----
@@ -653,6 +720,53 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // tree and router, because they describe a different window. A record for a window
             // that is neither is not possible — `Session` filtered it — but a stale one for a
             // dialog just destroyed is, and it is dropped rather than routed into the buffer.
+            // **The menu's window routes through the menu's tree.** Same `App`, so a row's
+            // message updates the same state; a different tree, layout and router, because they
+            // describe a different window.
+            if menu.as_ref().is_some_and(|m| m.id() == from) {
+                // A press landed outside the menu, so it goes away — the one thing a popup's
+                // owner cannot work out for itself, because it never sees a press aimed elsewhere.
+                if matches!(event, WindowEvent::Dismissed) {
+                    app.menus.close();
+                    continue;
+                }
+                // **Arrows, Esc and Enter drive the open menu**, which is possible only here: the
+                // popup holds the keyboard while it is up, so these arrive naming *its* window and
+                // never reach the editor's router below.
+                if let WindowEvent::Key(k) = event {
+                    let table = app.menu_table();
+                    match app.menus.key(&k, &table) {
+                        KeyOutcome::Chose { menu, item: i } => {
+                            // **From the outcome rather than from `menu_shown`**, which happened
+                            // to be right here and is a second copy of the same fact.
+                            if let Some(msg) = table
+                                .get(menu)
+                                .and_then(|m| m.items.get(i))
+                                .and_then(|it| match it {
+                                    Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
+                                    _ => None,
+                                })
+                            {
+                                app.update(msg);
+                            }
+                            continue;
+                        }
+                        KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
+                        KeyOutcome::Ignored => {}
+                    }
+                }
+                let msgs = match (menu_shown, menu.as_mut()) {
+                    (Some(which), Some(m)) => {
+                        let view = app.menu_view(which, &theme, menu_hovered);
+                        m.route(&view, &font, &theme, &event)
+                    }
+                    _ => Vec::new(),
+                };
+                for msg in msgs {
+                    app.update(msg);
+                }
+                continue;
+            }
             if confirm.as_ref().is_some_and(|c| c.id() == from) {
                 let ask = app.confirm_view(&theme, confirm_hovered);
                 let mut msgs = confirm

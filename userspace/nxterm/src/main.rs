@@ -37,7 +37,8 @@ use libui::paint::FontMetrics;
 use libui::paint::{Theme, paint};
 use libui::route::Router;
 use libui::window::Child;
-use nxterm::{App, GRID_KEY, GRID_KIND, MENU_ITEM_KEY, Msg, rows_in};
+use libui::menu::{Item, KeyOutcome, Menu};
+use nxterm::{App, GRID_KEY, GRID_KIND, MENU_BAR_KEY, MENU_COUNT, Msg, rows_in};
 
 /// `alloc` backing — the element tree, the grid and the render all allocate.
 #[global_allocator]
@@ -73,24 +74,40 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
-/// Where the menu's window is anchored, and what it is.
+/// The message on row `i` of menu `open`, if that row is an enabled action.
 ///
-/// **A `popup`, not a layer.** `libui`'s `offset` clips at its parent's edge, which is right one
-/// level down and wrong for a menu — "a menu clipped to its window is not a menu"
-/// (`display-substrate.md` §4a). Until M6 C3 the menu was a `Stack` layer hoisted to the whole
-/// window, which worked only because it happened to fit inside the terminal. As a `popup` window
-/// it is parented to the terminal, positioned by *this* client at the anchor the layout gives,
-/// and clipped only by the screen.
+/// **The keyboard's half of choosing.** A pointer click produces its message through the router,
+/// which reads it off the element the press landed on; the keyboard has no element, so it names a
+/// row and this reads the same table back. Both ends therefore come from `App::menu_table`, and a
+/// reordering cannot make Enter and a click do different things.
+fn chosen(table: &[Menu<Msg>], open: Option<usize>, i: usize) -> Option<Msg> {
+    match table.get(open?)?.items.get(i)? {
+        Item::Action { msg, enabled: true, .. } => Some(*msg),
+        _ => None,
+    }
+}
+
+/// Say which item a menu produced, under the harness.
 ///
-/// **The window itself is a [`Child`]** (M12 Part A). This file held a `Popup` struct — an id, a
-/// pool, a scratch framebuffer, a tree and a router, with `open`/`present`/`close` over them —
-/// until an editor's confirmation dialog wanted the same six fields and the same three
-/// operations. Two consumers is when a helper goes down a layer, so it did; nothing about the
-/// menu changed, and the lessons that struct had learned went with it.
-fn menu_at(anchor: Rect) -> (i32, i32) {
-    // Directly under the item it drops from, in the parent's coordinates — which is what the
-    // offset in `CreateWindow` means for a popup.
-    (anchor.origin.x, anchor.bottom() as i32)
+/// **A label, not a keystroke.** `check-terminal` needs to know its click reached a row and which
+/// one; the row's label is a constant this program compiled in, so there is nothing here anybody
+/// typed. Silent in a release image like every other harness receipt.
+#[allow(unused_variables)]
+fn chose(msg: Msg) {
+    #[cfg(feature = "test-harness")]
+    {
+        let name: &[u8] = match msg {
+            Msg::Copy => b"Copy",
+            Msg::Paste => b"Paste",
+            Msg::Clear => b"Clear",
+            Msg::Reset => b"Reset",
+            Msg::Close => b"Close Window",
+            // Not a menu row: the bar's own words toggle, and everything else arrives from the
+            // grid or the title bar. Nothing to report, rather than a line that says "some item".
+            _ => return,
+        };
+        libkern::debug::Line::new().s(b"nxterm: menu chose ").s(name).end();
+    }
 }
 
 /// Paint `damage` of `app` into `fb`.
@@ -367,6 +384,25 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
+    // What the menu's window is, and why it is one.
+    //
+    // **The arithmetic that used to live here is `MenuState::anchor`'s** (M14 Part A) — "directly
+    // under the word it drops from, in the parent's coordinates" is the same sentence in every menu,
+    // and it was written twice. What is left is the reasoning, which is not.
+    //
+    // **A `popup`, not a layer.** `libui`'s `offset` clips at its parent's edge, which is right one
+    // level down and wrong for a menu — "a menu clipped to its window is not a menu"
+    // (`display-substrate.md` §4a). Until M6 C3 the menu was a `Stack` layer hoisted to the whole
+    // window, which worked only because it happened to fit inside the terminal. As a `popup` window
+    // it is parented to the terminal, positioned by *this* client at the anchor the layout gives,
+    // and clipped only by the screen.
+    //
+    // **The window itself is a [`Child`]** (M12 Part A). This file held a `Popup` struct — an id, a
+    // pool, a scratch framebuffer, a tree and a router, with `open`/`present`/`close` over them —
+    // until an editor's confirmation dialog wanted the same six fields and the same three
+    // operations. Two consumers is when a helper goes down a layer, so it did; nothing about the
+    // menu changed, and the lessons that struct had learned went with it.
+    //
     // The menu's window while it is open, and nothing at all while it is not — a popup is
     // transient by role, so closing the menu destroys it rather than hiding it.
     let mut popup: Option<Child> = None;
@@ -378,9 +414,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // that reacted to the pointer moving without a button held, so "the path works" needed
     // something to assert (M11 Part E batch 3).
     let mut menu_hovered: Option<u64> = None;
-    // Set once, by the harness click below, to open the menu — see there.
-    #[cfg(feature = "test-harness")]
-    let mut opened_for_harness = false;
+    // Which menu the live popup was opened for, so a *change* — not merely open-versus-shut —
+    // rebuilds the window at the new word and at the new menu's size. The other two applications
+    // have carried this since they grew a second menu.
+    let mut menu_shown: Option<usize> = None;
 
     // **The tty, and the shell on the other end of it.** Part C's whole point: the terminal is
     // obtained like any program's, this process becomes its backend, and the terminal itself is
@@ -419,9 +456,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // the pointer moving over it (M11 Part E batch 3).
         let ui = app.view(&theme, router.hovered_key(&tree));
         let l = layout(&ui, bounds, &FontMetrics::new(&ui_font, theme.font_px));
-        // The anchor for the next frame's popup. Read every frame rather than only when the
-        // menu opens: the item's position is a fact about the layout, not about the menu.
-        app.menu_anchor = locate(&ui, &l, MENU_ITEM_KEY);
+        // The anchors for the next frame's popup — **one per bar word**. Read every frame rather
+        // than only when a menu opens: a word's position is a fact about the layout, not about
+        // the menu, and reading it on open means reading it before the first layout exists.
+        app.menus.set_anchors(
+            (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
+        );
 
         // ---- the menu's window ----
         //
@@ -430,7 +470,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // hidden one would still be a window in the stack. The anchor has to exist first —
         // before the first layout there is nowhere to put it, which is why this reads the
         // anchor computed just above rather than the one from when the menu was toggled.
-        match (app.menu_open, popup.is_some(), app.menu_anchor) {
+        //
+        // **Which menu, not whether one is open** (PR #280 review, blocking 2). The discriminator
+        // was `open().is_some()`, so switching from File to Edit — which `MenuState::key` does on
+        // Left and Right — left the existing window at the old word and, worse, at the size
+        // measured for the old menu: `Child::present` lays the new tree into a rectangle fixed at
+        // `Child::open`, so the rows a five-row menu grew were simply clipped away. It was
+        // unreachable before this part, because this terminal had one menu and no arrow keys.
+        if menu_shown != app.menus.open() {
+            if let Some(p) = popup.take() {
+                p.close(&mut win);
+            }
+            // The window is gone, so nothing is under the pointer in it. Left set, the next menu
+            // would open believing a row was already highlighted and report no change when one
+            // really was.
+            menu_hovered = None;
+            menu_shown = app.menus.open();
+        }
+        match (menu_shown.is_some(), popup.is_some(), app.menus.anchor()) {
             (true, false, Some(anchor)) => {
                 // **Measured from the menu with no hover**, because the pointer is over the
                 // *bar* item that opened this rather than over the popup — and a highlight does
@@ -439,7 +496,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 popup = Child::open(
                     &mut win,
                     Role::Popup { parent: window_id },
-                    menu_at(anchor),
+                    anchor,
                     &menu,
                     &ui_font,
                     &theme,
@@ -465,16 +522,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // Not fatal: the terminal is still usable without its menu, and saying so
                     // beats a window that silently never appears.
                     kprint(b"nxterm: could not open the menu popup\n");
-                    app.menu_open = false;
+                    app.menus.close();
+                    menu_shown = None;
                 }
             }
             (false, true, _) => {
                 if let Some(p) = popup.take() {
                     p.close(&mut win);
                 }
-                // The window is gone, so nothing is under the pointer in it. Left set, the next
-                // menu would open believing a row was already highlighted and report no change
-                // when one really was.
                 menu_hovered = None;
             }
             _ => {}
@@ -518,7 +573,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // being first in tree order. Re-asserted every frame rather than only on the first,
         // because clicking a button takes focus — and a terminal whose keyboard stays with the
         // menu after you used it is a terminal you have to click back into.
-        if !app.menu_open
+        if app.menus.open().is_none()
             && let Some(id) = tree.find_by_key(GRID_KEY)
         {
             router.focus(&tree, &ui, id);
@@ -748,8 +803,32 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // is the caller's: this menu goes away, where another client's child window might
             // save something first.
             if matches!(event, WindowEvent::Dismissed) {
-                app.menu_open = false;
+                app.menus.close();
                 continue;
+            }
+            // **Arrows, Esc and Enter drive the open menu**, which is possible only here: the
+            // popup holds the keyboard while it is up, so these keys arrive naming *its* window
+            // and never reach the terminal's router below. `KeyOutcome` says what the press did,
+            // and `Chose` carries the menu and the row, so the message comes from the same table
+            // — not from a second list that could disagree about which row is which.
+            if let WindowEvent::Key(k) = event {
+                let table = app.menu_table();
+                match app.menus.key(&k, &table) {
+                    KeyOutcome::Chose { menu, item } => {
+                        // **The menu comes from the outcome, not from the state**: choosing
+                        // closes, so `app.menus.open()` is already `None` here and asking it
+                        // would drop every message Enter produces (PR #280 review, blocking 1).
+                        if let Some(m) = chosen(&table, Some(menu), item) {
+                            chose(m);
+                            app.update(m);
+                        }
+                        continue;
+                    }
+                    // Dismissed already closed it; Changed moved the cursor and the frame above
+                    // will redraw with it. Both are handled, and neither reaches the grid.
+                    KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
+                    KeyOutcome::Ignored => {}
+                }
             }
             let menu = app.menu_view(&theme, popup.as_ref().and_then(|p| p.hovered_key()));
             let msgs = popup
@@ -760,12 +839,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // **The routing proof.** A record arrived naming the popup's window, was routed
                 // through the popup's own tree, and produced a message — three things that were
                 // each impossible before C3's parts 1 and 2.
-                #[cfg(feature = "test-harness")]
-                match msg {
-                    Msg::Clear => kprint(b"nxterm: menu chose Clear\n"),
-                    Msg::Reset => kprint(b"nxterm: menu chose Reset\n"),
-                    _ => {}
-                }
+                chose(msg);
+                // The menu closes itself: `App::update` asks the table whether the message is a
+                // row's, so neither this loop nor any `update` arm has to remember.
                 app.update(msg);
             }
             continue;
@@ -786,9 +862,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // it on the gate's schedule matters — an open menu is topmost and takes the
                 // keyboard, so opening it earlier would swallow everything typed at the shell.
                 #[cfg(feature = "test-harness")]
-                if k.keycode == 59 && k.pressed != 0 && !opened_for_harness {
-                    opened_for_harness = true;
-                    app.update(Msg::ToggleMenu);
+                if k.keycode == 59 && k.pressed != 0 {
+                    // **A plain toggle since PR #280's review.** It was a one-shot, guarded so
+                    // the menu could not open before the gate had finished typing at the shell —
+                    // but *when* it opens is the gate's schedule, not this flag's, and the
+                    // one-shot meant the menu could never be reopened. The keyboard half of an
+                    // open menu had no coverage at all as a result, which is where both of that
+                    // review's blocking findings were living.
+                    app.update(Msg::MenuBar(nxterm::HARNESS_MENU));
                     continue;
                 }
                 if let Some(msg) = router.key(&tree, &ui, k) {

@@ -1060,6 +1060,16 @@ impl TextAreaState {
         Some(if a <= c { (a, c) } else { (c, a) })
     }
 
+    /// Whether anything is selected.
+    ///
+    /// **The cheap half of [`selected_text`](Self::selected_text)**, which allocates the whole
+    /// selection as a `String` — and which callers used to ask this question with (PR #280 review,
+    /// worth fixing 6). Here `selection` is already `None` for a collapsed range, so this is a
+    /// straight delegation; `libterm::Grid::has_selection` is the one that has to say more.
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some()
+    }
+
     /// The selected text, or `None` when nothing is selected.
     pub fn selected_text(&self) -> Option<String> {
         let ((sl, sc), (el, ec)) = self.selection()?;

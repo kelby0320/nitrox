@@ -32,7 +32,7 @@ use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use libkern::abi::BTN_LEFT;
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, POINTER_BUTTON, POINTER_MOTION,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, POINTER_BUTTON, POINTER_MOTION,
     POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED,
     WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
@@ -41,24 +41,32 @@ use libui::widget::{
     GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip,
     title_bar, window_frame,
 };
-use libui::widget::{
-    Theme as UiTheme, ScrollState, WidgetState, button, menu_bar, menu_item, scrollbar,
-};
+use libui::menu::{Accel, Item, Menu, MenuState};
+use libui::widget::{Theme as UiTheme, ScrollState, scrollbar};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
 
-/// The key on the menu bar's one item, so [`libui::layout::locate`] can find where it landed
-/// and the popup can be placed under it.
-pub const MENU_ITEM_KEY: u64 = 1;
+/// Where the menu bar's words are keyed from: `MENU_BAR_KEY + i` for menu `i`.
+///
+/// [`libui::layout::locate`] turns each into the rectangle its popup hangs under. **Ten rather
+/// than one** so the range stays clear of [`GRID_KEY`], which shares this window.
+pub const MENU_BAR_KEY: u64 = 10;
 
-/// The popup's rows, keyed so the router can say which one the cursor is inside.
+/// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
 ///
 /// **Keys are what make hover possible**: `Router::inside` reports the id of the keyed widget
 /// under the pointer, so an unkeyed item is one the router cannot name (M11 Part E batch 3).
-pub const MENU_CLEAR_KEY: u64 = 2;
-/// See [`MENU_CLEAR_KEY`].
-pub const MENU_RESET_KEY: u64 = 3;
+/// A different range from the bar's because a row and a word are different widgets, even though
+/// they live in different windows and could not collide.
+pub const MENU_ROW_KEY: u64 = 100;
+
+/// The menu the harness opens with F1, and the one whose rows `check-terminal` clicks.
+///
+/// Named rather than spelled `1` at the two sites that need it: the gate's expectations are
+/// written against *this* menu's first row, and a reordering that moved it would otherwise
+/// break the gate somewhere that never mentions menus.
+pub const HARNESS_MENU: usize = 1;
 
 /// The key on the grid, so the window can give it the keyboard on its first frame.
 ///
@@ -123,8 +131,17 @@ pub const PASTE_KEYCODE: u16 = 47;
 /// What the chrome can ask the terminal to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Msg {
-    /// The menu bar's item was clicked.
-    ToggleMenu,
+    /// A word on the menu bar was clicked: open that menu, or close it if it was the open one.
+    MenuBar(usize),
+    /// Copy the selection to the clipboard — `Ctrl+Shift+C`, or Edit ▸ Copy.
+    ///
+    /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
+    /// chord and [`libui::menu::accel_match`] routes it, so the label and the binding are one
+    /// statement. Before, they were two and could drift apart silently.
+    Copy,
+    /// Fetch the newest clipboard entry and type it at the shell — `Ctrl+Shift+V`, or Edit ▸
+    /// Paste. See [`Copy`](Msg::Copy) for why it is a message.
+    Paste,
     /// Erase the screen and home the cursor — `Ctrl-L`'s effect, from the menu.
     Clear,
     /// Erase the screen **and** the scrollback, and reset attributes.
@@ -199,6 +216,9 @@ pub struct Resized {
     pub evicted: usize,
 }
 
+/// How many menus the bar carries. `File` and `Edit`.
+pub const MENU_COUNT: usize = 2;
+
 /// Everything the terminal is.
 pub struct App {
     /// The screen, the cursor, and the scrollback.
@@ -206,8 +226,11 @@ pub struct App {
     /// Bytes to grid operations. Held across writes because a sequence can be split across
     /// them — which is the ordinary case once a real backend is delivering in chunks.
     parser: Parser,
-    /// Whether the menu's popup is showing.
-    pub menu_open: bool,
+    /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
+    ///
+    /// **The toolkit's, since M14 Part A.** This was a `bool` and a `Rect` here, a two-element
+    /// array and an enum in `nxfiles`, and the same open/close/anchor/dismiss logic in both.
+    pub menus: MenuState,
     /// Whether this window holds the keyboard, which the title bar shows.
     ///
     /// **The compositor's answer, not a guess.** `FocusEvent` says so on every change; a title
@@ -219,13 +242,6 @@ pub struct App {
     /// of the same state disagreeing for one frame is worse than either answer (PR #248 review,
     /// finding 7).
     pub focused: bool,
-    /// Where the menu item was laid out last frame, so the popup can go under it.
-    ///
-    /// **Last frame's**, which costs one frame of lag the very first time the menu opens and
-    /// is invisible because the item does not move. The alternative is laying the tree out
-    /// twice per frame — once to find the anchor, once with the popup in it — to remove a lag
-    /// nobody can see.
-    pub menu_anchor: Option<Rect>,
     /// Cell metrics, so `view` can size the grid node.
     pub metrics: Metrics,
     /// Colours for the cells.
@@ -312,9 +328,8 @@ impl App {
             maximized: false,
             grid: Grid::new(cols, rows),
             parser: Parser::new(),
-            menu_open: false,
+            menus: MenuState::new(MENU_COUNT),
             focused: true,
-            menu_anchor: None,
             metrics,
             // `libterm`'s ANSI palette — the sixteen colours a program addresses with
             // `ESC[31m` — and deliberately *not* the desktop theme. M11 Part B collapsed
@@ -472,8 +487,28 @@ impl App {
 
     /// Apply a message from the chrome.
     pub fn update(&mut self, msg: Msg) {
+        // **Choosing dismisses the menu, whichever row it was** — a menu that stayed open would
+        // cover the thing it just acted on. Asked of the table rather than repeated in the arms,
+        // because before M14 Part A exactly two of them remembered to do it and the rest were a
+        // row away from forgetting. A message that is not a row leaves it alone, which is what
+        // keeps `MenuBar` able to open one.
+        if self.menu_table().iter().flat_map(|m| m.items.iter()).any(
+            |it| matches!(it, Item::Action { msg: m, .. } if *m == msg),
+        ) {
+            self.menus.close();
+        }
         match msg {
-            Msg::ToggleMenu => self.menu_open = !self.menu_open,
+            Msg::MenuBar(i) => self.menus.toggle(i),
+            // **Nothing selected is not a request.** A copy that pushed an empty entry would move
+            // the ring's serial under every client that was mid-cycle, for a gesture that had
+            // nothing to copy. The Edit row is disabled in that state too, so this is the second
+            // of two guards rather than the only one — the chord reaches here with no menu open.
+            Msg::Copy => {
+                if let Some(text) = self.grid.selected_text() {
+                    self.clip_request = Some(ClipRequest::Copy(text));
+                }
+            }
+            Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
             // The compositor is the one holding the grab this press opened, so all this does is
             // record that the binary owes it a request.
             Msg::DragWindow => self.move_requested = true,
@@ -501,13 +536,11 @@ impl App {
                 // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
                 // one implementation of it rather than a menu-shaped second one.
                 self.feed(b"\x1b[2J\x1b[H");
-                self.menu_open = false;
             }
             Msg::Reset => {
                 let (cols, rows) = (self.grid.cols(), self.grid.rows());
                 self.grid = Grid::new(cols, rows);
                 self.parser = Parser::new();
-                self.menu_open = false;
                 self.view_top = None;
             }
             Msg::Scroll(p) => self.scroll_to(p),
@@ -587,30 +620,20 @@ impl App {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return;
         }
-        // **The clipboard chords are taken before anything is encoded**, which is the whole
-        // reason they carry Shift: `libterm::encode` folds `Ctrl+C` to `0x03`, the interrupt,
-        // and a terminal that copied on it would have taken the one binding a terminal cannot
-        // give away (M12 decision 6). Checked here rather than in `update` for the reason the
-        // two applications settled in Part D: a chord that acts on the *window* is the
-        // window's, and typing is what the grid does with everything else.
-        const CLIP_MODS: u16 = MOD_CTRL | MOD_SHIFT;
-        if k.modifiers & CLIP_MODS == CLIP_MODS {
-            match k.keycode {
-                COPY_KEYCODE => {
-                    // **Nothing selected is not a request.** A copy that pushed an empty entry
-                    // would move the ring's serial under every client that was mid-cycle, for a
-                    // gesture that had nothing to copy.
-                    if let Some(text) = self.grid.selected_text() {
-                        self.clip_request = Some(ClipRequest::Copy(text));
-                    }
-                    return;
-                }
-                PASTE_KEYCODE => {
-                    self.clip_request = Some(ClipRequest::Paste);
-                    return;
-                }
-                _ => {}
-            }
+        // **The menu's chords are taken before anything is encoded**, which is the whole reason
+        // they carry Shift: `libterm::encode` folds `Ctrl+C` to `0x03`, the interrupt, and a
+        // terminal that copied on it would have taken the one binding a terminal cannot give away
+        // (M12 decision 6). Checked here rather than in `update` for the reason the two
+        // applications settled in Part D: a chord that acts on the *window* is the window's, and
+        // typing is what the grid does with everything else.
+        //
+        // **Matched against the menu table rather than against a `match` on keycodes** (M14
+        // decision 2). The pair of constants that used to be tested here are still the source of
+        // truth — the table names them — but there is now one statement of "Ctrl+Shift+C copies"
+        // instead of a label in the menu and a branch here that could stop agreeing with it.
+        if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
+            self.update(msg);
+            return;
         }
         // **Typing clears the selection.** It is the same rule the kill ring's cycle follows —
         // any other action ends the gesture — and without it a highlight stays on screen over
@@ -692,24 +715,60 @@ impl App {
     /// **The theme is the caller's**, because the caller paints this tree — and a tree built from
     /// one theme and painted with another is two themes in one frame, which one type makes easy
     /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
+    /// The bar's menus, in bar order.
+    ///
+    /// **Built rather than stored**, because it is a function of almost nothing: a cached copy
+    /// would be a second place for the same constants, and this is cheap. It takes `&self`
+    /// because Copy is only offered when there is a selection — the one row here whose
+    /// availability is a fact about the terminal rather than about the menu.
+    ///
+    /// **Clear and Reset are under Edit rather than in a Terminal menu of their own.** Two menus
+    /// is what M14 Part A scopes, and of the two they are edits to what is on screen. GNOME
+    /// Terminal puts them under `Terminal`; if a third menu arrives they move there, and the
+    /// accelerator table does not care which menu an item is in.
+    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
+        vec![
+            Menu {
+                title: "File",
+                // No Close Tab: the terminal has no tabs until Part B. No Quit: decision 4
+                // settles what "quit" means to an application with unsaved work, and settling
+                // it here as "the window goes" would be one of two answers in two places.
+                items: vec![Item::plain("Close Window", Msg::Close)],
+            },
+            Menu {
+                title: "Edit",
+                items: vec![
+                    // **Greyed with nothing selected**, which is what `enabled` is for: the
+                    // copy path already declines an empty selection, and a row that looks
+                    // available but declines is the thing that reads as a broken menu.
+                    Item::new("Copy", Accel::ctrl_shift(COPY_KEYCODE, "C"), Msg::Copy)
+                        .enabled(self.grid.has_selection()),
+                    Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
+                    Item::Separator,
+                    Item::plain("Clear", Msg::Clear),
+                    Item::plain("Reset", Msg::Reset),
+                ],
+            },
+        ]
+    }
+
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
     pub fn view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
 
         let grid_px = self.metrics.pixel_size(self.grid.cols(), self.grid.rows());
 
-        let bar = menu_bar(
-            vec![
-                button(
-                    "Terminal",
-                    Msg::ToggleMenu,
-                    WidgetState { hovered: hovered == Some(MENU_ITEM_KEY), ..Default::default() },
-                    &ui,
-                )
-                    .key(MENU_ITEM_KEY),
-            ],
-            BAR_H,
+        // **The bar is `libui::menu`'s, and so is what hangs off it.** It was one hand-rolled
+        // `button` labelled "Terminal"; the word a menu bar carries is not a button, and the
+        // popup under it was a second copy of `nxfiles`'s.
+        let bar = libui::menu::bar(
+            &self.menu_table(),
+            &self.menus,
+            MENU_BAR_KEY,
+            hovered,
+            Msg::MenuBar,
             &ui,
+            BAR_H,
         );
         // **The title bar is the terminal's own chrome** (M9 Part A), and since Part C all three
         // of its buttons do something: minimise and maximise ask the shell, close is this
@@ -801,23 +860,17 @@ impl App {
         self.menu(ui, hovered)
     }
 
-    /// The popup's contents.
+    /// The popup's contents: whichever menu is open, framed.
+    ///
+    /// **An empty frame when none is**, which cannot be drawn because the popup window only
+    /// exists while one is open — but is a shape the type demands and the caller must not have
+    /// to think about.
     fn menu(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        use libui::element::column;
-        // **`menu_item`, not `button`** (M11 Part E batch 3): a menu row highlights the way a
-        // selected list row does, because they are the same thing seen twice — the item that
-        // would happen if you acted now. `hovered` comes from the popup's own router.
-        let items = column(vec![
-            menu_item("Clear", Msg::Clear, hovered == Some(MENU_CLEAR_KEY), ui)
-                .key(MENU_CLEAR_KEY),
-            menu_item("Reset", Msg::Reset, hovered == Some(MENU_RESET_KEY), ui)
-                .key(MENU_RESET_KEY),
-        ]);
-        // A backing fill under the items, so the menu is opaque over whatever it covers — and a
-        // border around it, because on a light theme the face and the window underneath are
-        // within a few units of each other (M11 Part E, batch 2). `popup_frame` supplies both,
-        // and is what the applications modal uses too.
-        libui::widget::popup_frame(padding(Insets::all(2), items), ui)
+        let menus = self.menu_table();
+        match self.menus.open().and_then(|i| menus.get(i)) {
+            Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
+            None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
+        }
     }
 }
 
@@ -843,7 +896,7 @@ pub fn rows_in(clip: Rect, grid_origin: libdraw::geom::Point, m: &Metrics, rows:
 mod tests {
     use super::*;
     use libdraw::text::Font;
-    use librsproto::surface::KEY_UP;
+    use librsproto::surface::{KEY_UP, MOD_CTRL, MOD_SHIFT};
     use libui::layout::{FixedCell, layout, locate};
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
@@ -1255,23 +1308,151 @@ mod tests {
     #[test]
     fn the_menu_opens_and_closes() {
         let mut a = app();
-        assert!(!a.menu_open);
-        a.update(Msg::ToggleMenu);
-        assert!(a.menu_open);
-        a.update(Msg::ToggleMenu);
-        assert!(!a.menu_open);
+        assert_eq!(a.menus.open(), None);
+        a.update(Msg::MenuBar(1));
+        assert_eq!(a.menus.open(), Some(1));
+        a.update(Msg::MenuBar(1));
+        assert_eq!(a.menus.open(), None, "the same word again closes it");
+        // And a *different* word moves the menu rather than closing it, which is the half a
+        // one-menu bar could not have.
+        a.update(Msg::MenuBar(0));
+        a.update(Msg::MenuBar(1));
+        assert_eq!(a.menus.open(), Some(1));
     }
 
     #[test]
     fn choosing_an_item_closes_the_menu() {
         // A menu that stayed open after its item was chosen would cover the thing it just
-        // acted on.
-        for msg in [Msg::Clear, Msg::Reset] {
+        // acted on. **Every row, not the two that used to remember**: the rule is asked of the
+        // table now, so this walks the table.
+        let names = app().menu_table();
+        let rows: Vec<Msg> = names
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .filter_map(|it| match it {
+                Item::Action { msg, .. } => Some(*msg),
+                Item::Separator => None,
+            })
+            .collect();
+        assert!(rows.len() >= 5, "the table is not empty, or this test proves nothing");
+        for msg in rows {
+            // Close would end the process in a real run; here it only sets a flag.
             let mut a = app();
-            a.update(Msg::ToggleMenu);
+            a.update(Msg::MenuBar(1));
             a.update(msg);
-            assert!(!a.menu_open, "{msg:?} left the menu open");
+            assert_eq!(a.menus.open(), None, "{msg:?} left the menu open");
         }
+        // **The negative control**: the bar's own word is not a row, so it must *not* be caught
+        // by the rule above — otherwise no menu could ever be opened.
+        let mut a = app();
+        a.update(Msg::MenuBar(0));
+        assert_eq!(a.menus.open(), Some(0));
+    }
+
+    /// Arrowing sideways changes both where the popup hangs and how big it must be.
+    ///
+    /// **Why this is a test rather than an observation** (PR #280 review, blocking 2): the binary
+    /// used to rebuild the popup window on `open().is_some()`, so moving from File to Edit left
+    /// the window at File's word and at File's size. `Child::present` lays the new tree into a
+    /// rectangle fixed when the window was created, so Edit's five rows were drawn into a
+    /// one-row window and four of them were clipped away. Nothing in the binary is host-testable;
+    /// what is, is that the two menus genuinely differ in both respects — which is what makes
+    /// rebuilding on a *change* necessary rather than tidy.
+    #[test]
+    fn the_two_menus_hang_from_different_words_and_measure_differently() {
+        let mut a = app();
+        let cell = FixedCell { w: 8, h: 16 };
+        let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
+        let view = a.view(&UiTheme::default(), None);
+        let l = layout(&view, bounds, &cell);
+        a.menus.set_anchors(
+            (0..MENU_COUNT).map(|i| locate(&view, &l, MENU_BAR_KEY + i as u64)).collect(),
+        );
+
+        let measure = |a: &App| {
+            libui::layout::measure(
+                &a.menu_view(&UiTheme::default(), None),
+                libui::layout::Constraints::loose(bounds.size),
+                &cell,
+            )
+        };
+        a.menus.toggle(0);
+        let (file_at, file_size) = (a.menus.anchor(), measure(&a));
+        a.menus.toggle(1);
+        let (edit_at, edit_size) = (a.menus.anchor(), measure(&a));
+
+        assert!(file_at.is_some() && edit_at.is_some(), "both words were laid out");
+        assert_ne!(file_at, edit_at, "the two menus hang from different words");
+        assert!(
+            edit_size.h > file_size.h,
+            "Edit's five rows are taller than File's one — {edit_size:?} vs {file_size:?}"
+        );
+    }
+
+    /// The chord a menu row advertises does what choosing that row does.
+    ///
+    /// **This drives `App::key`**, which is the point and is what the first version did not do
+    /// (PR #280 review, worth fixing 4). It built an event from a row's `Accel` and asked
+    /// `accel_match` about it — both sides of one table, with the terminal never consulted. That
+    /// pins the table against two rows on one chord, which is asserted below; it does not pin
+    /// that anything *routes* through it, and it passed with `App::key`'s `accel_match` deleted.
+    ///
+    /// **Stated as an equivalence rather than per row**, so it does not become a second list of
+    /// what each action does — which is the drift decision 2 exists to prevent.
+    #[test]
+    fn every_advertised_chord_does_what_its_row_says() {
+        /// Everything about a terminal that any of these rows can move.
+        fn digest(a: &mut App) -> alloc::string::String {
+            let clip = a.take_clip_request();
+            alloc::format!(
+                "{clip:?}|{}|{}|{}|{:?}",
+                line(a, 0),
+                a.closing(),
+                a.grid.has_selection(),
+                a.menus.open(),
+            )
+        }
+        /// A terminal with text on screen and five characters of it swept out, so Copy is live.
+        fn selected() -> App {
+            let mut a = app();
+            a.feed(b"hello world");
+            let (w, h) = (a.metrics.cell_w as i32, a.metrics.cell_h as i32);
+            a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
+            a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
+            a
+        }
+        let table = selected().menu_table();
+        let mut checked = 0;
+        for it in table.iter().flat_map(|m| m.items.iter()) {
+            let Item::Action { accel: Some(acc), msg, label, enabled: true } = it else { continue };
+            checked += 1;
+            let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
+            assert_eq!(
+                libui::menu::accel_match(&table, &ev).as_ref(),
+                Some(msg),
+                "{label} advertises {} and the table hands it to another row",
+                acc.label()
+            );
+            let (mut by_row, mut by_chord) = (selected(), selected());
+            by_row.update(*msg);
+            by_chord.update(Msg::Key(ev));
+            // Each digest exactly once: it drains the clipboard outbox, which is the only way to
+            // see it, so a second call on the same terminal reports its own emptiness.
+            let (by_row, by_chord, untouched) =
+                (digest(&mut by_row), digest(&mut by_chord), digest(&mut selected()));
+            assert_eq!(
+                by_chord, by_row,
+                "{label}: {} does not do what choosing the row does",
+                acc.label()
+            );
+            // **The negative control**: the two agreeing is only evidence if the row moved
+            // something. A terminal that ignored both would pass the assertion above.
+            assert_ne!(
+                by_row, untouched,
+                "{label} changes nothing, so this row proves nothing about routing"
+            );
+        }
+        assert_eq!(checked, 2, "Copy and Paste are the rows with chords");
     }
     /// The menu is **never** in the window's tree, open or closed.
     ///
@@ -1287,8 +1468,10 @@ mod tests {
             (true, None),
         ] {
             let mut a = app();
-            a.menu_open = open;
-            a.menu_anchor = anchor;
+            if open {
+                a.menus.toggle(0);
+            }
+            a.menus.set_anchors(vec![anchor, None]);
             // **The same shape whether the menu is open or not**, which is the property: the
             // menu is a *window*, so opening it adds nothing here. Since M9 Part E the root is
             // a stack of two — the body and the resize grip over its corner — rather than the
@@ -1318,9 +1501,13 @@ mod tests {
 
         let view = a.view(&UiTheme::default(), None);
         let l = layout(&view, bounds, &cell);
-        let item = locate(&view, &l, MENU_ITEM_KEY).expect("the menu item is keyed");
-        a.menu_anchor = Some(item);
-        a.menu_open = true;
+        let item = locate(&view, &l, MENU_BAR_KEY).expect("the menu's first word is keyed");
+        a.menus.set_anchors(vec![Some(item), None]);
+        a.menus.toggle(0);
+        // The anchor the popup is created at is the word's bottom-left, which is what
+        // `MenuState` computes now — and the assertion below is about the *word*, so this
+        // checks the two agree rather than restating one of them.
+        assert_eq!(a.menus.anchor(), Some((item.origin.x, item.bottom() as i32)));
 
         // The popup hangs from the item's left edge, immediately below it. The menu bar sits
         // *under* the title bar since M9 Part A, so "inside the bar" is measured from there —
@@ -1693,4 +1880,33 @@ mod tests {
         let past = rows_in(Rect::new(0, o.y, 100, m.cell_h * 99), o, m, 6);
         assert_eq!(*past.last().unwrap(), 5);
     }
+    /// The window's own tree survives being diffed frame to frame.
+    ///
+    /// **The class of bug this catches cost a QEMU round trip** (M14 Part A): `diff` rejects a
+    /// parent whose children are *partly* keyed, and adding one unkeyed sibling to a keyed row
+    /// makes the whole window undiffable — so nothing draws at all, in a way no layout or paint
+    /// test can see. The states below are the ones a menu bar introduces: shut, open, and a word
+    /// under the pointer, each of which changes a row's shape.
+    #[test]
+    fn the_window_tree_diffs_across_the_menu_states() {
+        let mut a = app();
+        let theme = UiTheme::default();
+        let mut tree = libui::diff::Tree::new();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let mut check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
+            let size = a.window_size();
+            let e = a.view(&theme, hovered);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            tree.update(&e, &l).unwrap_or_else(|err| panic!("{what}: {err:?}"));
+        };
+        check(&mut a, None, &mut tree, "with the menu shut");
+        check(&mut a, Some(MENU_BAR_KEY), &mut tree, "with a bar word hovered");
+        a.update(Msg::MenuBar(0));
+        check(&mut a, Some(MENU_BAR_KEY), &mut tree, "with File open and hovered");
+        a.update(Msg::MenuBar(1));
+        check(&mut a, None, &mut tree, "with Edit open and nothing hovered");
+        a.update(Msg::MenuBar(1));
+        check(&mut a, None, &mut tree, "back to shut");
+    }
+
 }

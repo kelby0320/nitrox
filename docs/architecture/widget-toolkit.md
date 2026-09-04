@@ -1,7 +1,10 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-02), and this document describes what
-exists.** M12 Part A added `window::Child` — the toolkit's first module that is not a function of
+**Status: built (2026-08-11, last checked 2026-09-04), and this document describes what
+exists.** M14 Part A added `menu.rs` — the *whole* of a drop-down menu as a value: a table of
+items with accelerators, separators and per-item availability, the open/anchor/cursor state, the
+keyboard, and the two builders that turn them into a bar and a popup. All three applications had
+been carrying their own copy of the second half. M12 Part A added `window::Child` — the toolkit's first module that is not a function of
 values, and the one that closes §11's multi-window deferral for the windows an application opens
 beside its main one. M7 Part A added `text_field` and `list_view` to the set — see §8, which records why
 the *text area* arrived in M10 Part C, six milestones after this section reserved a space for
@@ -12,7 +15,8 @@ all of it: the retained tree and the declarative `view` (`userspace/libui/src/el
 measure/arrange layout (`layout.rs`), the keyed diff that damage falls out of (`diff.rs`),
 per-buffer damage accumulation (`damage.rs`), event routing with implicit capture
 (`route.rs`), painting within a damage rectangle (`paint.rs`), and the widget set —
-`button`, `scrollbar`, `menu_bar`, and the `custom` escape hatch (`widget.rs`). Text is real
+`button`, `scrollbar`, `menu_bar`, and the `custom` escape hatch (`widget.rs`) — to which
+`menu.rs` added the drop-down (§8.1). Text is real
 TrueType through `libdraw::text`, rasterised from a font read off the root filesystem at
 runtime — the proportional face the theme names (§11), since M11 Part D. `reference.rs` is
 the fixed picture `cargo xtask check-display` renders on the host and compares against the
@@ -34,9 +38,10 @@ applications** left it in **M12 Part A**, in the half a trigger asked for: an ed
 confirmation is a real `dialog` window, and what a window rather than an application holds is
 `window::Child`. A *main* window is still each application's own loop. The menu's **popup half** left this list in M5 Part B and left the toolkit
 entirely in M6 C3: a menu is a `popup` *window* now, parented to its application's window,
-positioned by the client at the anchor `locate` gives and clipped by the **screen**. `nxterm`
-still uses `locate`; it no longer uses `offset`, which has no consumer outside this crate's own
-tests. A layer can only be clipped to its parent, which is not what a menu needs.
+positioned by the client at the anchor `locate` gives and clipped by the **screen**. A layer can
+only be clipped to its parent, which is not what a menu needs. **It came back in M14 Part A** —
+not the window, which is still the application's, but everything the window *contains* and the
+state that decides whether it exists at all. See §8.1.
 
 Everything else below describes running code. Three sections carry a **banner** marking them as
 the design argument for something now built, rather than a description of a gap — §9.1 the
@@ -414,7 +419,7 @@ Bounded by Milestone 5, as §1 requires:
 |---|---|
 | `text` | Labels in menus and the status line |
 | `button` | Dialogs, and the menu bar's items |
-| `menu` | The terminal's menu bar and its popups |
+| `menu` | The terminal's menu bar and its popups. **The popup half became `menu.rs` in M14 Part A** — see §8.1 |
 | `scrollbar` | The terminal's scrollback |
 | `custom` | The escape hatch: a node with an opaque payload, a paint callback, and raw event delivery |
 
@@ -443,6 +448,51 @@ is:
 | `popup_frame` | A menu or modal's edge. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
 | `menu_item` | A dropdown row that highlights under the pointer, the way a selected list row does — they are the same thing seen twice |
 | `ListState::drag_to` | Converts a pointer's y on a scrollbar into an offset. On the state rather than in each caller, so a list's thumb and `nxterm`'s grid answer the same question the same way |
+
+### 8.1 The drop-down menu (M14 Part A)
+
+`userspace/libui/src/menu.rs` is the whole of a menu **as a value**, and it is the only module in
+the widget set that is a small type system rather than a function:
+
+| Piece | What it is |
+|---|---|
+| `Accel` | A chord and how it reads — `Ctrl+Shift+T`. **Exact on modifiers**, not a subset test, so `Ctrl+V` and `Ctrl+Shift+V` are different chords |
+| `Item` | An action — label, optional `Accel`, message, `enabled` — or a `Separator` |
+| `Menu` | A title and its items |
+| `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key` |
+| `KeyOutcome::Chose` | **Names the menu as well as the row.** Choosing closes, so a caller that asked `open()` afterwards would get `None` and lose the message |
+| `bar` / `popup` | The two trees: one word per menu, and the open menu's rows |
+| `accel_match` | The message whose item claims a key, from the same table the popup draws |
+
+**What it replaced.** `menu_bar` and `menu_item` already existed and every application used them;
+what each one had written for itself was the *other* half — open/close state, the anchor capture
+(a `Rect` in `nxterm`, a two-element array in `nxfiles`), the row keying, and the dismissal. The
+editor had none of it and therefore no menus at all. What none of them had was the part a menu is
+supposed to have: separators, unavailable rows, and arrow keys.
+
+**One statement of a chord.** A menu that *says* `Ctrl+C` and a key handler that separately
+*implements* it are two statements of one fact, and the pair drifts silently — the menu keeps
+advertising a chord the handler stopped honouring, and nothing fails. All three applications now
+route `Ctrl`-chords through `accel_match` against the table the popup draws, so there is one.
+Disabled items do not match, for the reason arrowing skips them: an item that would do nothing
+if clicked should do nothing if typed.
+
+**An open menu is a keyboard mode, and an application says so through `enabled`.** `nxedit`
+greys its whole bar while a text field is open, because `key` has always given every keystroke to
+an open field — chords included — and a menu row that acted anyway was a way *around* that rule
+rather than a second statement of it. This is the general shape: availability is the vocabulary
+an application uses to say what it will refuse, and the refusal stays in place underneath.
+
+**Every row is keyed, separators included.** `diff` rejects a parent whose children are only
+partly keyed, so an unkeyed rule makes the whole popup undiffable — which shows up not as a
+wrong picture but as a menu that opens, reports its size, and never draws a frame.
+`the_popup_diffs_from_one_highlight_to_the_next` is the host test that pins it, and each
+application has the same test for its own window.
+
+**What is still missing, and it is a gap rather than a decision.** A disabled row is not
+*dimmed*: `paint` draws every `Text` in `theme.foreground` and there is no per-element ink, so
+"unavailable" shows only as a row that does not light under the pointer and that arrowing skips.
+The colour arrives with the ink wrapper M14 Part G adds for syntax highlighting.
 
 Two painting primitives arrived with them: `Node::Bevel`, a fill with the theme's gradient — a
 *second* fill rather than a flag on the first, because a flat fill is correct from the clip alone

@@ -63,6 +63,30 @@ be read as the list of what is actually owed.
 
 See `docs/architecture/drivers-and-irps.md` for the framework these defer from.
 
+**A click the compositor delivers that its client never acts on —
+`TODO(click-not-acted-on)`.** Intermittently, and more often under KVM than TCG, a press and its
+release are both routed to a window at the coordinates a gate aimed at, and the client produces
+nothing: no menu opens, no drag starts. It cost PR #280 a red CI run and is the reason
+`click_until` and the drag's retry exist in `xtask` — both retry on the guest's *receipt* rather
+than on where the press landed, so a gate recovers instead of timing out on an unrelated
+expectation forty-five seconds later.
+
+**What it is not.** Not lost PS/2 input: the compositor logs releases as well as presses since
+2026-09-04, and both halves are in the transcript when this happens. Not the i8042 lost-interrupt
+fault either — that one is fixed, by the tick-driven sweep in `kernel/src/drivers/ps2/mod.rs`
+whose own comment records that a byte already sitting in the output buffer raises no further
+edge. A dangling `wip/i8042-efficacy` branch carries a commit with that title that is *not* in
+`main` and looks like a pending fix; it is superseded, and cherry-picking it reverts the better
+answer.
+
+So the loss is somewhere after the compositor decided where the event goes: the IPC delivery, the
+client's event pump, or its router's capture across a focus change — the raise lands *between*
+the press and the release in every captured instance, which is the one correlation there is.
+
+Trigger: the next time an input gate fails with a matched press/release pair in the transcript,
+or anyone reproducing it by hand. Cheap first step: log the event at the client's pump, not only
+at the compositor, so the two ends can be compared.
+
 **Tier 2 (runtime-loadable) drivers.** Phase 2 ships only Tier 1 drivers
 (compiled into the kernel ELF via Cargo features: `pci`, `ahci`, `gpt`). The
 userspace driver manager — matching `DeviceNode`s to loadable modules and

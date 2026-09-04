@@ -202,7 +202,13 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     changed the wrong thing. **Part H is done** (2026-09-04): the applications modal lists desktop entries — a
     package declaring which of its programs are applications and what to call them — projected at
     `/applications` by the profile server the way `bin/` is projected at `/bin`, because "is this
-    graphical?" cannot be read off a binary. **Part G — syntax highlighting — was wanted as a stretch and promoted the
+    graphical?" cannot be read off a binary. **Part A is done** (2026-09-04): a drop-down menu is
+    a value in `libui` — items with chords, separators, per-item availability and the arrow keys —
+    and all three applications took it, the editor gaining a menu bar it had never had, above its
+    tab strip. Decision 2 became true rather than aspirational in the same change: `accel_match`
+    routes a chord through the table the popup draws, so a label and its binding are one
+    statement. The smaller half is that rows which used to be refused *after* being chosen are
+    greyed before. **Part G — syntax highlighting — was wanted as a stretch and promoted the
     same day**: costing it found that reusing `nxsh`'s lexer does not work (it is fallible, and
     parser-mode-driven, while a highlighter must be total over text that is not a program yet), and
     the table-driven scanner that replaces it makes each further language a table rather than code
