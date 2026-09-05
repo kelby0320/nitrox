@@ -653,6 +653,16 @@ choosing is decided above. The keyboard is the application's too, for §7.2's re
 sends a key to a focused widget's handler, and whether a keystroke is an answer, a move or a
 character is not something the toolkit can decide.
 
+**It carries its own size, and `dialog_frame_sized` is why that is possible.** `dialog_frame`
+hard-sizes to 340x132 — a two-line question and two buttons — and the sizing itself cannot be
+dropped, because a `Dock` measures as everything it is offered and `Child::open` refuses a tree
+with no natural size. So the size became a parameter. Built inside the fixed frame, the chooser's
+list was drawn 29px tall against the 220 it was built for and its name field got no pixels at all;
+worse than cramped, because `list_view` computes `visible` from the height it is *told*, so the
+rows past the first two were unreachable and no scrollbar appeared to say so. **`list_view` does
+not size itself** — every caller wraps it in a `sized` of the same height, and this one is no
+exception.
+
 **Every child of a keyed parent must be keyed, and this is where that bit.** `diff` refuses a
 parent whose children are only partly keyed, so an unkeyed path strip beside keyed rows — or a
 keyed button wrapped in an unkeyed `padding` — makes the whole dialog undiffable. That does not

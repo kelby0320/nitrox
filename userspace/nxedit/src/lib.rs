@@ -170,6 +170,15 @@ pub const MENU_ROW_KEY: u64 = 100;
 /// Where the chooser's element keys start — clear of this window's own.
 pub const CHOOSER_KEY: u64 = 200;
 
+/// Where the chooser's *rows* are keyed from.
+///
+/// **A range of its own, not indices from zero.** `libui::chooser` matches `hovered` against its
+/// buttons' keys and `list_view` matches it against the rows', so a row whose key happened to
+/// equal a button's would light that button as the pointer crossed it — row 202 of a long
+/// directory against a Cancel keyed `CHOOSER_KEY + 2` (PR #284 review, finding 6). Far enough
+/// above the widget's own seven that no directory reaches it.
+pub const CHOOSER_ROW_KEY: u64 = 1000;
+
 /// The key that opens the file chooser: `o`, with Ctrl.
 pub const OPEN_KEYCODE: u16 = 24;
 /// The key that opens it to save under a new name: `s`, with Ctrl and **Shift** — the same letter
@@ -933,7 +942,14 @@ impl App {
             Msg::MenuBar(i) => self.menus.toggle(i),
             Msg::OpenFile => self.open_chooser(chooser::Mode::Open),
             Msg::SaveAs => self.open_chooser(chooser::Mode::Save),
-            Msg::ChooserRow(key) => self.chooser_row(key),
+            // **The message carries a key and this takes an index**, converted at the one place
+            // that knows the row numbering — and a key below the base is not a row at all rather
+            // than row zero, which is what a saturating subtraction would have made it.
+            Msg::ChooserRow(key) => {
+                if let Some(row) = key.checked_sub(CHOOSER_ROW_KEY) {
+                    self.chooser_activate(row);
+                }
+            }
             Msg::ChooserAccept => self.chooser_accept(),
             Msg::ChooserCancel => self.chooser = None,
             Msg::NewWindow => self.new_window = true,
@@ -1256,7 +1272,10 @@ impl App {
             .entries
             .iter()
             .enumerate()
-            .map(|(i, (name, _))| libui::widget::ListRow { key: i as u64, label: name })
+            .map(|(i, (name, _))| libui::widget::ListRow {
+                key: CHOOSER_ROW_KEY + i as u64,
+                label: name,
+            })
             .collect();
         let dir = c.dir.clone();
         chooser::view(
@@ -1391,35 +1410,51 @@ impl App {
     }
 
     /// A row was activated: descend into a directory, or take a file as the answer.
-    fn chooser_row(&mut self, key: u64) {
-        let Some(c) = self.chooser.as_mut() else { return };
-        let Some((name, is_dir)) = c.entries.get(key as usize).cloned() else { return };
+    ///
+    /// **One statement of what activating a row means**, reached by the pointer and by `Enter`
+    /// alike. They were two before, and they disagreed: this checked `is_dir` and the accepting
+    /// branch did not, so arrowing onto a directory and pressing `Enter` *answered with the
+    /// directory* — closing the chooser and leaving a new, empty, permanently-blocked tab named
+    /// after a folder, while clicking the same row descended into it. A selection the keyboard
+    /// can make and the keyboard cannot correctly act on (PR #284 review, blocking 2).
+    fn chooser_activate(&mut self, row: u64) {
+        let Some(c) = self.chooser.as_ref() else { return };
+        let Some((name, is_dir)) = c.entries.get(row as usize).cloned() else { return };
+        let path = join(&c.dir, &name);
         if is_dir {
-            let dir = join(&c.dir, &name);
-            self.chooser_list = Some(dir);
+            self.chooser_list = Some(path);
             return;
         }
-        c.state.list.selected = Some(key as usize);
         // **A file is the answer in either mode**, and in Save it becomes the *name* rather than
         // the choice — picking an existing file to overwrite is how a Save dialog is used, and
         // the accepting button is still what commits it.
         match c.mode {
-            chooser::Mode::Open => self.chooser_accept(),
-            chooser::Mode::Save => c.state.name = libui::widget::TextFieldState::with_text(&name),
+            chooser::Mode::Open => {
+                self.chooser = None;
+                self.open_requested = Some(path);
+            }
+            chooser::Mode::Save => {
+                let Some(c) = self.chooser.as_mut() else { return };
+                c.state.list.selected = Some(row as usize);
+                c.state.name = libui::widget::TextFieldState::with_text(&name);
+            }
         }
     }
 
     /// The chooser's answer.
     fn chooser_accept(&mut self) {
         let Some(c) = self.chooser.as_ref() else { return };
-        let path = match c.mode {
+        match c.mode {
+            // **Through the row, not around it.** Accepting a selection *is* activating that row,
+            // so this delegates rather than joining a path of its own — which is what let the two
+            // disagree about directories. There is no recursion here: `chooser_activate` answers
+            // or descends, and never accepts.
             chooser::Mode::Open => {
                 let Some(i) = c.state.list.selected else {
                     self.status = String::from("nothing chosen");
                     return;
                 };
-                let Some((name, _)) = c.entries.get(i) else { return };
-                join(&c.dir, name)
+                self.chooser_activate(i as u64);
             }
             chooser::Mode::Save => {
                 let name = String::from(c.state.name.text());
@@ -1430,14 +1465,10 @@ impl App {
                     self.status = String::from("a name, then Save");
                     return;
                 }
-                join(&c.dir, name)
+                let path = join(&c.dir, name);
+                self.chooser = None;
+                self.adopt_path(&path);
             }
-        };
-        let mode = c.mode;
-        self.chooser = None;
-        match mode {
-            chooser::Mode::Open => self.open_requested = Some(path),
-            chooser::Mode::Save => self.adopt_path(&path),
         }
     }
 
@@ -3018,14 +3049,14 @@ mod tests {
         ]);
 
         // A directory row asks for its listing rather than answering.
-        a.update(Msg::ChooserRow(0));
+        a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
         assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"));
         assert!(a.chooser().is_some(), "descending does not close the chooser");
         assert_eq!(a.take_open(), None, "and it is not an answer");
 
         a.show_chooser("/home/papers", alloc::vec![(String::from("draft.txt"), false)]);
         // A file row is the answer, in Open.
-        a.update(Msg::ChooserRow(0));
+        a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
         assert!(a.chooser().is_none(), "choosing closes it");
         assert_eq!(a.take_open().as_deref(), Some("/home/papers/draft.txt"));
     }
@@ -3051,6 +3082,41 @@ mod tests {
         assert!(a.chooser().is_some(), "left open — the person is mid-answer");
         assert_eq!(a.take_save(), None, "and nothing was written");
         assert_eq!(a.status(), "a name, then Save");
+    }
+
+    /// `Enter` on a selected directory descends, exactly as clicking it does.
+    ///
+    /// **The two paths were separate and disagreed** (PR #284 review, blocking 2). This is the
+    /// keyboard half; `the_chooser_descends_and_then_answers` is the pointer half, and it passed
+    /// throughout — which is why the divergence survived: each path had a test and neither had
+    /// the other's.
+    #[test]
+    fn enter_on_a_directory_descends_rather_than_answering_with_it() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home", alloc::vec![
+            (String::from("papers"), true),
+            (String::from("notes.txt"), false),
+        ]);
+
+        // Arrow onto the directory and press Enter.
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
+        assert_eq!(a.chooser().unwrap().state.list.selected, Some(0), "the directory is selected");
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, 1, 0));
+
+        assert!(a.chooser().is_some(), "descending does not close the chooser");
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"), "it asked to list it");
+        // The failure this pins: the path went out as something to *open*, which `open_into`
+        // then refuses as a directory — a new, empty, blocked tab named after a folder.
+        assert_eq!(a.take_open(), None, "a directory is not an answer");
+
+        // And a file under it still answers, so the descent did not break the accepting half.
+        a.show_chooser("/home/papers", alloc::vec![(String::from("draft.txt"), false)]);
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, 1, 0));
+        assert!(a.chooser().is_none(), "a file closes it");
+        assert_eq!(a.take_open().as_deref(), Some("/home/papers/draft.txt"));
     }
 
     /// The keyboard drives the chooser, and what a key *means* is decided here rather than by the

@@ -22,8 +22,8 @@ use libdraw::geom::Size;
 
 use crate::element::{Element, Insets, column, padding, row, sized, text};
 use crate::widget::{
-    DIALOG_PAD, ListRow, ListState, Theme, button, dialog_frame, list_view, text_field,
-    TextFieldState, WidgetState,
+    DIALOG_BUTTON_H, DIALOG_PAD, ListRow, ListState, Theme, WINDOW_BORDER, WINDOW_FRAME, button,
+    dialog_frame_sized, list_view, text_field, TextFieldState, WidgetState,
 };
 
 /// Which job the chooser is doing.
@@ -84,11 +84,15 @@ impl Default for ChooserState {
     }
 }
 
-/// The element keys this widget uses, from `key_base` upwards.
+/// The element keys this widget uses, from `key_base` upwards: `key_base .. key_base + KEYS`.
 ///
-/// A caller picks a range that does not collide with its own; the chooser is a whole window's
-/// content in practice, so any base clear of the frame's own keys will do.
-pub const KEYS: u64 = 6;
+/// A caller picks a base whose range collides with nothing of its own — including **the keys it
+/// gives the rows**, which are its numbering and not this widget's. `hovered` is matched here
+/// against the buttons' keys and inside `list_view` against the rows', so a row numbered onto a
+/// button lights that button as the pointer passes over it. It was seven keys called six until
+/// PR #284's review, which is the version of this that bites a caller starting its next range at
+/// `key_base + KEYS`.
+pub const KEYS: u64 = 7;
 
 /// The chooser's tree: a path strip, the rows, a name field when saving, and two answers.
 ///
@@ -123,19 +127,23 @@ pub fn view<Msg: Clone>(
     let here =
         padding(Insets { top: 0, right: DIALOG_PAD, bottom: 4, left: DIALOG_PAD }, text(path))
             .key(key_base + 4);
-    let rows = list_view(
-        entries,
-        &mut state.list,
-        ROWS_H,
-        ROW_H,
-        on_row,
-        None,
-        None,
-        hovered,
-        theme,
+    // **Sized to the height it was built for**, which is the rule every other `list_view` caller
+    // follows and this one did not: the widget computes `visible` from the height it is *told*,
+    // so a list drawn shorter than that has rows it will not scroll to and no scrollbar to say so
+    // — `rows.len() > visible` is false, and `ensure_visible` moves nothing (PR #284 review,
+    // blocking 1).
+    let rows = sized(
+        Size::new(0, ROWS_H),
+        list_view(entries, &mut state.list, ROWS_H, ROW_H, on_row, None, None, hovered, theme),
     )
     .key(key_base);
-    let name_field = text_field(&state.name, false, WidgetState::default(), theme);
+    // **Active, because in `Save` this field is the only thing taking characters.** The chooser's
+    // window holds the keyboard and the application routes every key into this state, so a field
+    // drawn at rest — no caret, no focus ring — is a live control that looks disabled. Every other
+    // in-application field passes `active: true`; this one passed the default (PR #284 review,
+    // finding 4).
+    let name_field =
+        text_field(&state.name, false, WidgetState { active: true, ..Default::default() }, theme);
     let mut body: Vec<Element<Msg>> = alloc::vec![here, rows];
     if mode == Mode::Save {
         // **The field is below the list, not above it.** What you type is the answer; the list is
@@ -143,7 +151,7 @@ pub fn view<Msg: Clone>(
         // control this chooser does not have.
         body.push(
             padding(
-                Insets { top: 4, right: DIALOG_PAD, bottom: 0, left: DIALOG_PAD },
+                Insets { top: FIELD_GAP, right: DIALOG_PAD, bottom: 0, left: DIALOG_PAD },
                 sized(Size::new(0, FIELD_H), name_field),
             )
             .key(key_base + 1),
@@ -173,10 +181,45 @@ pub fn view<Msg: Clone>(
         )
         .key(key_base + 3),
     ]);
-    // `dialog_frame` docks the question beside a strip it wraps itself, so the question
+    // `dialog_frame_sized` docks the question beside a strip it wraps itself, so the question
     // carries a key — its own doc says so, and the diff enforces it.
-    dialog_frame(title, column(body).key(key_base + 6), answers, theme)
+    dialog_frame_sized(
+        Size::new(CHOOSER_W, CHOOSER_H),
+        title,
+        column(body).key(key_base + 6),
+        answers,
+        theme,
+    )
 }
+
+/// How wide the chooser's window is.
+///
+/// **Its own size, not a question's.** A confirmation dialog is 340x132, which is a two-line
+/// question and two buttons; a chooser holds a list and a name field, and inside that frame it
+/// drew one and a half rows and a field of zero height.
+pub const CHOOSER_W: u32 = 420;
+
+/// How tall it is, derived from what it contains rather than chosen.
+///
+/// Top border, the title (its own padding either side of one line of text), the body, the button
+/// strip, and the frame and border below — with `TEXT_H_MAX` standing in for the tallest line of
+/// text a theme is expected to ask for, since the title is *measured* rather than fixed and a
+/// frame that fitted at 14px would clip at 20. Slack at smaller sizes sits below the strip, which
+/// is why the list can still be asserted to be exactly [`ROWS_H`] at every one of them.
+pub const CHOOSER_H: u32 = WINDOW_BORDER
+    + (2 * DIALOG_PAD + TEXT_H_MAX)
+    + (FIELD_GAP + TEXT_H_MAX)
+    + ROWS_H
+    + (FIELD_GAP + FIELD_H)
+    + (DIALOG_BUTTON_H + DIALOG_PAD)
+    + WINDOW_FRAME
+    + WINDOW_BORDER;
+
+/// The tallest line of text this frame is sized to survive.
+///
+/// Not a limit the toolkit enforces — a theme asking for more would crowd the list rather than
+/// break it — but the number the height above is honest about depending on.
+const TEXT_H_MAX: u32 = 20;
 
 /// How tall the list is, in pixels — enough rows to recognise a directory without scrolling.
 const ROWS_H: u32 = 220;
@@ -184,6 +227,8 @@ const ROWS_H: u32 = 220;
 const ROW_H: u32 = 20;
 /// The name field's height.
 const FIELD_H: u32 = 24;
+/// The gap between the list and the name field below it.
+const FIELD_GAP: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -203,11 +248,26 @@ mod tests {
         Cancel,
     }
 
+    /// **No row may be named what a `Save` field is seeded with.** The fixture used to list
+    /// `notes.txt` and seed the field with `notes.txt`, so every assertion about the field was
+    /// satisfied by the row label instead — the test passed with the field removed from the tree
+    /// entirely (PR #284 review, blocking 3).
     fn rows() -> Vec<ListRow<'static>> {
         alloc::vec![
             ListRow { key: 1, label: "papers" },
             ListRow { key: 2, label: "notes.txt" },
         ]
+    }
+
+    /// What a `Save` chooser's field is seeded with here — deliberately not any row's label.
+    const SEEDED: &str = "a-name-no-row-has.txt";
+
+    /// The element carrying `key`, if the tree has one.
+    fn find<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+        if e.key == Some(key) {
+            return Some(e);
+        }
+        e.children().find_map(|c| find(c, key))
     }
 
     fn build(mode: Mode, st: &mut ChooserState) -> Element<Msg> {
@@ -231,7 +291,7 @@ mod tests {
     /// it opened.
     #[test]
     fn saving_adds_a_name_field_and_opening_does_not() {
-        let (mut o, mut s) = (ChooserState::new(), ChooserState::saving("notes.txt"));
+        let (mut o, mut s) = (ChooserState::new(), ChooserState::saving(SEEDED));
         let (open, save) = (build(Mode::Open, &mut o), build(Mode::Save, &mut s));
 
         let (mut a, mut b) = (Vec::new(), Vec::new());
@@ -241,10 +301,86 @@ mod tests {
         assert!(b.iter().any(|l| l == "Save As") && b.iter().any(|l| l == "Save"), "{b:?}");
         // Both show where they are, which is what a Save dialog must not be vague about.
         assert!(a.iter().any(|l| l == "/home") && b.iter().any(|l| l == "/home"));
-        // The name the buffer already has is what Save As starts from.
-        assert!(b.iter().any(|l| l.contains("notes.txt")), "the field is not seeded: {b:?}");
-        // …and Open has no field to seed.
-        assert!(!a.iter().any(|l| l.contains("notes.txt") && l != "notes.txt"), "{a:?}");
+
+        // **The field is asserted as a node, not as a string.** A label search cannot tell a
+        // seeded field from a row that happens to read the same, and that is exactly how this
+        // test came to pass for a `Save` tree with no field in it at all. The body column holds
+        // the path strip and the list in both modes, and the field only in `Save`.
+        let body = |e| find(e, 106).expect("the body column is keyed 106").children().count();
+        assert_eq!(body(&open), 2, "Open is the path strip and the list");
+        assert_eq!(body(&save), 3, "Save adds the name field to them");
+        assert!(find(&save, 101).is_some(), "the name field is in the Save tree");
+        assert!(find(&open, 101).is_none(), "and is not in the Open tree");
+
+        // Seeded with what the file is called — and `SEEDED` is a name no row carries, so this
+        // can only be satisfied by the field.
+        assert!(b.iter().any(|l| l == SEEDED), "the field is not seeded: {b:?}");
+    }
+
+    /// **The list and the field get the height they were built for**, which is what the widget
+    /// was drawn at 340x132 for want of.
+    ///
+    /// `list_view` does not size itself — every other caller wraps it, and `nxfiles`'s wrapper
+    /// carries the reason: the widget builds rows for the height it is *told* and is drawn at
+    /// whatever the layout leaves, so a mismatch means rows that exist and cannot be reached
+    /// (`visible` comes from the told height, so `rows.len() > visible` stays false and no
+    /// scrollbar appears) and, in `Save`, a name field with no pixels at all. This chooser was the
+    /// caller that omitted the wrapper *and* sat in a frame hard-sized for a two-line question.
+    ///
+    /// Bracketed across cell heights so it cannot pass by a metric coincidence.
+    #[test]
+    fn the_list_and_the_field_are_drawn_at_the_size_they_were_built_for() {
+        for h in [8u32, 10, 12, 14, 16, 20] {
+            let cell = FixedCell { w: 8, h };
+            let bounds = Rect::new(0, 0, CHOOSER_W, CHOOSER_H);
+            let mut st = ChooserState::saving("notes.txt");
+            let e = build(Mode::Save, &mut st);
+            let l = layout(&e, bounds, &cell);
+            let list = crate::layout::locate(&e, &l, 100).expect("the list is keyed 100");
+            assert_eq!(
+                list.size.h, ROWS_H,
+                "cell height {h}: the list is drawn {}px tall and was built for {ROWS_H}",
+                list.size.h
+            );
+            // The key sits on the *padded* field, which is the gap above it plus the field —
+            // so this is `FIELD_H` seen through the wrapper the tree actually carries a key on.
+            let field = crate::layout::locate(&e, &l, 101).expect("the field is keyed 101");
+            assert_eq!(
+                field.size.h,
+                FIELD_GAP + FIELD_H,
+                "cell height {h}: the name field is {}px tall",
+                field.size.h
+            );
+        }
+    }
+
+    /// The name field is drawn **active**: it has a caret and a focus ring.
+    ///
+    /// **Asserted as a difference rather than as a count**, because the number of nodes a caret
+    /// costs is `text_field`'s business and not this module's. What is this module's business is
+    /// that it asked for the lit version — so the field in the tree is compared against both
+    /// versions built directly, and the inactive one is the negative control.
+    #[test]
+    fn the_name_field_is_drawn_with_a_caret() {
+        fn nodes<M>(e: &Element<M>) -> usize {
+            1 + e.children().map(nodes).sum::<usize>()
+        }
+        let theme = Theme::default();
+        let mut st = ChooserState::saving(SEEDED);
+        let lit = nodes(&text_field::<Msg>(
+            &st.name,
+            false,
+            WidgetState { active: true, ..Default::default() },
+            &theme,
+        ));
+        let rest = nodes(&text_field::<Msg>(&st.name, false, WidgetState::default(), &theme));
+        assert!(lit > rest, "an active field should cost more nodes than a resting one");
+
+        let save = build(Mode::Save, &mut st);
+        let field = find(&save, 101).expect("the name field is keyed 101");
+        // The key is on the padding, which wraps the `sized` that wraps the field itself.
+        assert_eq!(nodes(field), lit + 2, "the chooser's field is not the active one");
+        assert_ne!(nodes(field), rest + 2, "…and is not the resting one");
     }
 
     /// The chooser's tree diffs frame to frame, including across a selection.

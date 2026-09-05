@@ -23805,3 +23805,62 @@ own wait consumed the line, and the gate then hung on output already in the tran
 sources that interleave freely cannot be waited on in a fixed order after the fact: `Session::expect`
 consumes what it scans past. The wait belongs *before* the click, where the window has been placed
 and nothing else is competing to read the stream.
+
+---
+
+## 2026-09-04 — what PR #284's review found: a widget nothing had ever looked at
+
+Three blocking findings and four smaller ones, and the reviewer's own summary is the finding:
+**blocking 1 and 3 are one story.** The chooser was never rendered anywhere a person or a test
+would look at it, and the single test that could have looked was satisfied by a fixture collision.
+
+**The chooser was drawn in a 340x132 window, and neither of its two heights was honoured.**
+`dialog_frame` hard-sizes to `DIALOG_W x DIALOG_H` — the size of a two-line question and two
+buttons — and `Child::open` measures the content to pick the window size, so the chooser's window
+was created at 132 tall and never resized. Inside it the list got 29px of the 220 it was built
+for, and in `Save` the name field got **zero**. Both halves matter and they are different
+mistakes: the frame was the wrong size, *and* `list_view` was not wrapped in the `sized` every
+other caller wraps it in — `nxfiles`'s wrapper carries the reason in a comment. The consequence is
+worse than a cramped dialog: `visible` is computed from the height the widget is *told*, so
+`rows.len() > visible` stayed false, no scrollbar was drawn, and `ensure_visible` scrolled
+nothing. Rows past the first two existed and could not be reached by any means.
+
+**Why nothing caught it.** `check-login` drives the chooser entirely by keyboard and asserts on
+`nxedit`'s receipts, which read `ChooserState` rather than pixels. `preview` and `check-display`
+render `reference.rs`, which has no chooser in it. `shot` never opens one. Every assertion in the
+branch was about state, and the bug was entirely in geometry. `dialog_frame_sized` is the fix —
+the *sizing* is what must not be dropped, since a `Dock` measures as everything it is offered and
+`Child::open` refuses a tree with no natural size; what varies is the number, not whether there is
+one — and the regression test asserts the list and the field are drawn at the heights they were
+built for, bracketed across six cell heights so it cannot pass by a metric coincidence.
+
+**The test that should have caught it was vacuous, and in the way its own subject predicted.** The
+fixture listed a row labelled `notes.txt` and seeded the name field with `notes.txt`, so
+"the field is not seeded" was satisfied by the row label. The reviewer demonstrated it by removing
+the name field from the `Save` tree **entirely** and watching the test pass. It asserts the tree's
+shape now — the body column's child count, and the field's key present in one mode and absent in
+the other — against a seed no row can carry. Both of the reviewer's controls fail against it.
+
+**Two paths to "activate this row", and they disagreed about directories.** The pointer's path
+checked `is_dir` and descended; `Enter` joined whatever was selected and *answered with the
+directory*, closing the chooser and leaving a new, empty, permanently-blocked tab named after a
+folder. Each path had a test and neither had the other's, which is how a divergence between two
+statements of one rule survives review by its author. There is now one `chooser_activate` that
+both reach, and the accepting branch delegates to it rather than joining a path of its own.
+
+**And a rule this project states about its own code, broken in the change that stated it.**
+`libfs::sort`'s doc says sorting in two places is how two directory views come to disagree —
+while `nxfiles::App::show` still spelled the comparison a second time over its own row type, with
+a comment admitting as much. `sort` is generic over a `Listed` trait now, so the browser and the
+chooser share one comparison; the test that pins it sorts a deliberately different shape and
+asserts the same sequence. **A doc comment describing an invariant is not evidence the invariant
+holds**, and the one place it is least likely to be checked is the change that introduces it.
+
+Smaller: the name field was rendered inactive, so the one control taking characters in a Save
+dialog had neither caret nor focus ring; `KEYS` said six where seven are used, and the chooser's
+rows were keyed from zero into the range its own buttons occupy, so row 202 of a long directory
+would light *Cancel*; and the per-character receipt fired on the release as well as the press, so
+"a receipt per character" was two. The row keys now start at a base of their own, and a key below
+it is not row zero — `checked_sub`, not `saturating_sub`, because the saturating version made the
+existing test pass by accident once the base moved.
+

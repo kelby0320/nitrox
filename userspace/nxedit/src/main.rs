@@ -1083,14 +1083,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // keystroke means to a chooser — an answer, a move, or a character — is not
                     // something the toolkit can decide.
                     WindowEvent::Key(k) => {
-                        app.chooser_key(k);
                         // **A receipt per character**, the discipline every typed sequence in this
                         // system's gates follows and the one `nxfiles`'s rename field grew a line
                         // for: an unacknowledged burst is a dropped keystroke discovered as a
                         // wrong filename several steps later. Under KVM the guest is fast enough
                         // that injected keys arrive bunched, which is exactly where that happens.
-                        // Only while saving, because that is the mode with a field to type into.
-                        if let Some(c) = app.chooser()
+                        //
+                        // **Gated on the handler's own answer**, which is what makes it *one* line
+                        // per character: a key is a press and a release, `chooser_key` declines
+                        // the release, and printing beside the call rather than after it emitted
+                        // each count twice (PR #284 review, finding 7). Only while saving, because
+                        // that is the mode with a field to type into.
+                        let handled = app.chooser_key(k);
+                        if handled
+                            && let Some(c) = app.chooser()
                             && c.mode == libui::chooser::Mode::Save
                         {
                             libkern::debug::Line::new()

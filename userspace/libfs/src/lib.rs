@@ -583,6 +583,35 @@ pub enum Order {
     NewestFirst,
 }
 
+/// What [`sort`] needs to know about an entry.
+///
+/// **A trait so that one comparison serves two shapes.** The browser projects `OwnedEntry` down
+/// to a row type of its own with the fields a view needs, so a `sort` that took only `OwnedEntry`
+/// left it to write the comparison a second time — which it did, and which is the exact
+/// divergence this module was introduced to prevent (PR #284 review, finding 5). Three accessors
+/// rather than a conversion, because building a `Vec<OwnedEntry>` to sort a `Vec<Entry>` would
+/// copy every name to answer a question about order.
+pub trait Listed {
+    /// The entry's name, with no path in it.
+    fn sort_name(&self) -> &[u8];
+    /// Whether it is a directory — which decides the *group*, never the order within one.
+    fn sort_is_dir(&self) -> bool;
+    /// Modification time, or `0` where the server reports none.
+    fn sort_mtime(&self) -> i64;
+}
+
+impl Listed for OwnedEntry {
+    fn sort_name(&self) -> &[u8] {
+        self.name()
+    }
+    fn sort_is_dir(&self) -> bool {
+        self.kind == librsproto::file::DIRENT_KIND_DIR
+    }
+    fn sort_mtime(&self) -> i64 {
+        self.mtime
+    }
+}
+
 /// Sort `entries` in place, **directories first** and then by `order`.
 ///
 /// **Directories first is not part of the order**, and that is deliberate: it is a fact about
@@ -593,14 +622,17 @@ pub enum Order {
 /// directory of zeroes ordered by "newest" would otherwise come back in whatever order the
 /// enumeration produced — not an order anybody chose, and one that would appear to shuffle
 /// between listings of the same directory.
-pub fn sort(entries: &mut [OwnedEntry], order: Order) {
+pub fn sort<T: Listed>(entries: &mut [T], order: Order) {
     entries.sort_by(|a, b| {
-        let dir = |e: &OwnedEntry| e.kind == librsproto::file::DIRENT_KIND_DIR;
-        dir(b).cmp(&dir(a)).then_with(|| match order {
-            Order::NameAsc => a.name().cmp(b.name()),
-            Order::NameDesc => b.name().cmp(a.name()),
-            Order::OldestFirst => a.mtime.cmp(&b.mtime).then_with(|| a.name().cmp(b.name())),
-            Order::NewestFirst => b.mtime.cmp(&a.mtime).then_with(|| a.name().cmp(b.name())),
+        b.sort_is_dir().cmp(&a.sort_is_dir()).then_with(|| match order {
+            Order::NameAsc => a.sort_name().cmp(b.sort_name()),
+            Order::NameDesc => b.sort_name().cmp(a.sort_name()),
+            Order::OldestFirst => {
+                a.sort_mtime().cmp(&b.sort_mtime()).then_with(|| a.sort_name().cmp(b.sort_name()))
+            }
+            Order::NewestFirst => {
+                b.sort_mtime().cmp(&a.sort_mtime()).then_with(|| a.sort_name().cmp(b.sort_name()))
+            }
         })
     });
 }
@@ -772,6 +804,48 @@ mod tests {
 
     fn names(v: &[OwnedEntry]) -> Vec<String> {
         v.iter().map(|e| String::from_utf8_lossy(e.name()).into_owned()).collect()
+    }
+
+    /// **A second shape sorts identically**, which is what makes one comparison serve two views.
+    ///
+    /// The browser projects `OwnedEntry` down to rows of its own, and before PR #284's review it
+    /// spelled the comparison again over them. This pins the property that made the copy
+    /// unnecessary: the order comes from [`Listed`], so a type with different fields, a different
+    /// name representation and a different notion of "directory" lands in the same sequence.
+    #[test]
+    fn a_different_shape_takes_the_same_order() {
+        struct Row {
+            label: String,
+            folder: bool,
+            when: i64,
+        }
+        impl Listed for Row {
+            fn sort_name(&self) -> &[u8] {
+                self.label.as_bytes()
+            }
+            fn sort_is_dir(&self) -> bool {
+                self.folder
+            }
+            fn sort_mtime(&self) -> i64 {
+                self.when
+            }
+        }
+
+        let fixture = [("beta.txt", false, 10), ("alpha", true, 20), ("acme.txt", false, 30),
+                       ("zeta", true, 5), ("undated", false, 0)];
+        for order in [Order::NameAsc, Order::NameDesc, Order::OldestFirst, Order::NewestFirst] {
+            let mut wire: Vec<OwnedEntry> =
+                fixture.iter().map(|&(n, d, m)| ent(n, d, m)).collect();
+            let mut rows: Vec<Row> = fixture
+                .iter()
+                .map(|&(n, d, m)| Row { label: String::from(n), folder: d, when: m })
+                .collect();
+            sort(&mut wire, order);
+            sort(&mut rows, order);
+            let a = names(&wire);
+            let b: Vec<String> = rows.iter().map(|r| r.label.clone()).collect();
+            assert_eq!(a, b, "{order:?} ordered the two shapes differently");
+        }
     }
 
     /// Directories come first whatever the order, including the reversed one.

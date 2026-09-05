@@ -221,6 +221,32 @@ pub fn dialog_frame<Msg>(
     buttons: Element<Msg>,
     theme: &Theme,
 ) -> Element<Msg> {
+    dialog_frame_sized(Size::new(DIALOG_W, DIALOG_H), title, question, buttons, theme)
+}
+
+/// The same face at a size the caller picks.
+///
+/// **A dialog that is not a question needs its own size**, and the fixed one above is the reason
+/// this exists: [`DIALOG_W`]×[`DIALOG_H`] is 340×132, which fits a two-line question and two
+/// buttons and nothing else. The file chooser put a list and a name field inside it and got a
+/// list one and a half rows tall and a field with no pixels at all — the widget honoured neither
+/// height it was built for, because the frame had already decided the window was 132 tall
+/// (PR #284 review, blocking 1).
+///
+/// The *sizing* is what must not be dropped: `Node::Dock` measures as everything it is offered,
+/// so a tree containing one has no natural size and `Child::open` refuses it. What varies is the
+/// number, not whether there is one.
+///
+/// The published aim points — [`DIALOG_LEFT_CX`] and friends — describe the fixed size only. A
+/// caller of this owns its own geometry, and the chooser's buttons are right-aligned rather than
+/// two halves, so they would name nothing here.
+pub fn dialog_frame_sized<Msg>(
+    size: Size,
+    title: Element<Msg>,
+    question: Element<Msg>,
+    buttons: Element<Msg>,
+    theme: &Theme,
+) -> Element<Msg> {
     let strip = sized(
         Size::new(0, DIALOG_BUTTON_H + DIALOG_PAD),
         padding(
@@ -234,7 +260,7 @@ pub fn dialog_frame<Msg>(
     // helper built beside it is a `MixedKeying` error on the first frame, which in a client like
     // this means the dialog never appears at all.
     sized(
-        Size::new(DIALOG_W, DIALOG_H),
+        size,
         window_frame(
             title,
             dock(alloc::vec![docked(Edge::Bottom, strip)], padding(Insets::all(0), question)),

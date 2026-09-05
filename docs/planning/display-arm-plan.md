@@ -4679,7 +4679,7 @@ the application that uses both. Each compiled and was tested before the next.
       here that loses work. **Shared with the naming field an untitled buffer already had**, so
       what naming a buffer means is stated once rather than twice.
 
-**Four things came out of building it rather than planning it**, and only the first is about
+**Five things came out of building it rather than planning it**, and only the first two are about
 choosers:
 
 - [x] **A tree whose children are only partly keyed is undiffable, and it does not look like it**
@@ -4700,6 +4700,16 @@ choosers:
       later — which counts that directory to say a rename is not a copy — failed against its
       constant of 2. That is the coupling working rather than a brittleness to route around: the
       number is the directory's, and something wrote to the directory.
+- [x] **A widget nothing had ever looked at** ✅ — PR #284's review, and the finding is the
+      reviewer's own summary of two of them: the chooser was never *rendered* anywhere a person
+      or a test would see it, so a dialog whose list was drawn 29px tall and whose name field had
+      zero height passed every gate. `check-login` drives it by keyboard and asserts on receipts
+      that read state; `preview` and `check-display` render `reference.rs`, which has no chooser
+      in it. The one test that could have looked was satisfied by a fixture that listed a row
+      named what the field was seeded with — it passed with the field removed from the tree
+      entirely. **A doc comment describing an invariant is not evidence the invariant holds**, and
+      the same review found `libfs::sort`'s own comment about sorting in one place while `nxfiles`
+      still sorted in two.
 - [x] **A step with nothing to do with choosers stopped hiding a race** ✅. `check-login`'s
       clipboard step clicked into a freshly launched `nxterm` and typed at it immediately; the
       press receipt is the *compositor's* and says nothing about the client, so the keys went out

@@ -306,7 +306,25 @@ pub struct Entry {
     /// anywhere it could be blamed for.
     pub mtime: i64,
     /// Byte size; `0` for a directory or when unreported.
+    ///
+    /// Carried for the same reason as `mtime`, and read by Part D's Properties.
     pub size: u64,
+}
+
+/// **The browser's rows sort by `libfs`'s comparison, not by one of their own.**
+///
+/// `Entry` is `OwnedEntry` projected down to what a view needs, so the two shapes differ and the
+/// order must not. See [`libfs::Listed`].
+impl libfs::Listed for Entry {
+    fn sort_name(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+    fn sort_is_dir(&self) -> bool {
+        self.is_dir
+    }
+    fn sort_mtime(&self) -> i64 {
+        self.mtime
+    }
 }
 
 impl Entry {
@@ -634,11 +652,12 @@ impl App {
     /// the old selection refers to, and `list_view` clamping a stale index would silently
     /// select whatever happens to be at that position.
     pub fn show(&mut self, path: &str, mut entries: Vec<Entry>) {
-        // **Directories first, then by name** — and the *rule* is `libfs::sort`'s since M14
-        // Part C, so this browser and the file chooser cannot come to disagree about an order.
-        // What is spelled here is the same comparison over this crate's own `Entry`, which is
-        // `OwnedEntry` with the fields a view needs; the shapes differ, the order does not.
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        // **Directories first, then by name — and the comparison is `libfs`'s, not a copy of it.**
+        // It was a copy until PR #284's review: the same rule spelled a second time over this
+        // crate's own `Entry`, with a comment saying so, which is precisely the divergence
+        // `libfs::sort` exists to prevent. Make `NameAsc` case-insensitive and a browser and a
+        // chooser would have shown one directory in two orders.
+        libfs::sort(&mut entries, libfs::Order::NameAsc);
         let p = self.pane_mut();
         p.path = String::from(path);
         p.entries = entries;
