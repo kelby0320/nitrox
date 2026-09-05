@@ -4649,12 +4649,78 @@ the two would have made one review of two unrelated things.
       made the gate's injected motions coalesce — which is how a real bug spent weeks being called
       a flake.
 
-### Part C — the file chooser
+### Part C — the file chooser ✅ complete (2026-09-04)
 
-- [ ] **Open File and Save As**, as one widget used by both, per decision 3.
-- [ ] **`libfs` grows listing and sort**, with `mtime` and kind carried through from `DirEntry`.
-- [ ] **Save As is not Save with a prompt**: it changes what the buffer *is*, which is the tab's
-      title, the unsaved marker and where the next Save goes.
+**Three batches**, in the order the dependencies run: the listing, then the widget over it, then
+the application that uses both. Each compiled and was tested before the next.
+
+- [x] **Open File and Save As, as one widget used by both** ✅, per decision 3 —
+      `userspace/libui/src/chooser.rs` and [`widget-toolkit.md`](../architecture/widget-toolkit.md)
+      §8.3. The two jobs differ in exactly two things: whether there is a name field, and what the
+      accepting button says. A second widget would be one layout maintained twice, and the first
+      divergence would be a chooser that looks different depending on why it opened.
+      **The rule that `libui` makes no syscall was not bent for it**: the module renders and routes
+      over entries it is *given*, and `nxedit`'s `main` does the listing — the same seam the tabs
+      use for their ttys and `nxfiles` uses for its panes.
+- [x] **`libfs` grows listing and sort** ✅, with `mtime` and kind carried through. `libfs::sort`
+      and `libfs::Order`, because two consumers order the same listing and sorting in two places
+      is how two directory views come to disagree about what "newest" means. **Directories first
+      is not part of the order** — it is a fact about reading a listing rather than something
+      somebody chose, so reversing the *name* order does not put files above directories. **A tie
+      always breaks on name**, because `mtime` is `0` whenever a server does not report one, which
+      is every namespace listing; ordering by date with every key equal would leave the
+      enumeration's own order showing through and appear to shuffle between listings of the same
+      directory. `nxfiles::Entry` stopped discarding `mtime` and `size` on the way up, which is
+      where the information actually died.
+- [x] **Save As is not Save with a prompt** ✅ — `App::adopt_path` makes the path what the buffer
+      **is**, and the three things that follow all read it: the tab's label, the title bar's
+      unsaved marker, and where the next `Ctrl+S` writes. A chooser that only picked a destination
+      would write the bytes and leave all three pointing at the old file, which is the one failure
+      here that loses work. **Shared with the naming field an untitled buffer already had**, so
+      what naming a buffer means is stated once rather than twice.
+
+**Five things came out of building it rather than planning it**, and only the first two are about
+choosers:
+
+- [x] **A tree whose children are only partly keyed is undiffable, and it does not look like it**
+      ✅. `diff` refuses such a parent; `Child::present` then returns false every frame, so the
+      dialog opens, reports its size, and never draws — which reads as a compositor or a sizing
+      problem and is neither. Three parents in the chooser's own tree had it, including a keyed
+      button wrapped in an unkeyed `padding`. `the_chooser_diffs_across_a_selection` catches it in
+      a host test now, and the error naming the offending parent's *index path* is what made three
+      of them distinguishable.
+- [x] **The gate counts the rows, because "a dialog opened" is not evidence that a listing
+      arrived** ✅. An unreadable directory opens the chooser over an empty list *deliberately* —
+      the person can back out of it — so a `check-login` step that waited for the window would
+      have passed for exactly the failure decision 3 is about. `nxedit`'s receipt names the
+      directory and counts what is in it, and the gate matches on both.
+
+- [x] **The gate's coupling to the filesystem did its job on the first run** ✅. Save As writes a
+      real file, so `/home/papers` gained a third one and the *rename* step several hundred lines
+      later — which counts that directory to say a rename is not a copy — failed against its
+      constant of 2. That is the coupling working rather than a brittleness to route around: the
+      number is the directory's, and something wrote to the directory.
+- [x] **A widget nothing had ever looked at** ✅ — PR #284's review, and the finding is the
+      reviewer's own summary of two of them: the chooser was never *rendered* anywhere a person
+      or a test would see it, so a dialog whose list was drawn 29px tall and whose name field had
+      zero height passed every gate. `check-login` drives it by keyboard and asserts on receipts
+      that read state; `preview` and `check-display` render `reference.rs`, which has no chooser
+      in it. The one test that could have looked was satisfied by a fixture that listed a row
+      named what the field was seeded with — it passed with the field removed from the tree
+      entirely. **A doc comment describing an invariant is not evidence the invariant holds**, and
+      the same review found `libfs::sort`'s own comment about sorting in one place while `nxfiles`
+      still sorted in two.
+- [x] **A step with nothing to do with choosers stopped hiding a race** ✅. `check-login`'s
+      clipboard step clicked into a freshly launched `nxterm` and typed at it immediately; the
+      press receipt is the *compositor's* and says nothing about the client, so the keys went out
+      while the guest was still opening a tty and drawing a window, and the batch carrying them was
+      dropped. Part C's receipts moved the phase of everything after them and it began failing
+      every run, identically — the same shape as Part B's drag hand-off, and the same lesson: a
+      timing change did not create the bug, it stopped hiding it. The step waits for the shell now.
+      **The first fix was wrong in an instructive way**: waiting *after* the click failed on the
+      next run, because the shell came up before the press receipt and `click_at`'s own wait
+      consumed the line. `Session::expect` consumes what it scans past, so two freely interleaving
+      sources cannot be waited on in a fixed order after the fact.
 
 ### Part D — the browser deepened
 

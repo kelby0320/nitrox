@@ -298,17 +298,44 @@ pub struct Entry {
     pub name: String,
     /// Whether pressing this row descends into it.
     pub is_dir: bool,
+    /// Modification time, seconds since the Unix epoch; `0` when the server does not report one.
+    ///
+    /// **Carried rather than discarded** (M14 decision 3). `OwnedEntry` has had this since the
+    /// directory protocol did, and this struct threw it away on the way up — so a browser that
+    /// wanted to sort by date had nothing to sort by, and the information died here rather than
+    /// anywhere it could be blamed for.
+    pub mtime: i64,
+    /// Byte size; `0` for a directory or when unreported.
+    ///
+    /// Carried for the same reason as `mtime`, and read by Part D's Properties.
+    pub size: u64,
+}
+
+/// **The browser's rows sort by `libfs`'s comparison, not by one of their own.**
+///
+/// `Entry` is `OwnedEntry` projected down to what a view needs, so the two shapes differ and the
+/// order must not. See [`libfs::Listed`].
+impl libfs::Listed for Entry {
+    fn sort_name(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+    fn sort_is_dir(&self) -> bool {
+        self.is_dir
+    }
+    fn sort_mtime(&self) -> i64 {
+        self.mtime
+    }
 }
 
 impl Entry {
     /// A directory entry.
     pub fn dir(name: &str) -> Self {
-        Self { name: String::from(name), is_dir: true }
+        Self { name: String::from(name), is_dir: true, mtime: 0, size: 0 }
     }
 
     /// A file entry.
     pub fn file(name: &str) -> Self {
-        Self { name: String::from(name), is_dir: false }
+        Self { name: String::from(name), is_dir: false, mtime: 0, size: 0 }
     }
 
     /// What the row shows: directories carry a trailing separator, which is the whole of the
@@ -625,7 +652,12 @@ impl App {
     /// the old selection refers to, and `list_view` clamping a stale index would silently
     /// select whatever happens to be at that position.
     pub fn show(&mut self, path: &str, mut entries: Vec<Entry>) {
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        // **Directories first, then by name — and the comparison is `libfs`'s, not a copy of it.**
+        // It was a copy until PR #284's review: the same rule spelled a second time over this
+        // crate's own `Entry`, with a comment saying so, which is precisely the divergence
+        // `libfs::sort` exists to prevent. Make `NameAsc` case-insensitive and a browser and a
+        // chooser would have shown one directory in two orders.
+        libfs::sort(&mut entries, libfs::Order::NameAsc);
         let p = self.pane_mut();
         p.path = String::from(path);
         p.entries = entries;
@@ -659,7 +691,12 @@ impl App {
         if name.is_empty() {
             return None;
         }
-        Some(Entry { name, is_dir: e.kind == DIRENT_KIND_DIR })
+        Some(Entry {
+            name,
+            is_dir: e.kind == DIRENT_KIND_DIR,
+            mtime: e.mtime,
+            size: e.size,
+        })
     }
 
     /// The path a row press leads to, or `None` for a row that is not a directory.

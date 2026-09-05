@@ -2,7 +2,9 @@
 
 **Status: built (2026-08-11, last checked 2026-09-04), and this document describes what exists.**
 `window::Child` hosts **top-level** windows as of M14 Part B, which is what lets one process own
-several — all three applications do. `Router` captures the widget that *carries the handler* rather than the deepest one
+several — all three applications do. M14 Part C added `chooser.rs` — a file chooser as a widget over a
+listing the application supplies, one tree for both Open and Save As; see §8.3.
+`Router` captures the widget that *carries the handler* rather than the deepest one
 under the cursor (2026-09-04) — see §8.2, which is the one place a reader will look after losing
 a click. M14 Part A added `menu.rs` — the *whole* of a drop-down menu as a value: a table of
 items with accelerators, separators and per-item availability, the open/anchor/cursor state, the
@@ -433,7 +435,7 @@ so they exist:
 | Widget | Why it exists |
 |---|---|
 | `text_field` | The greeter's password box and the applications modal's search box. Single-line, optionally masked |
-| `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*" |
+| `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3 |
 
 **And the text area arrived in M10 Part C**, six milestones after this section first reserved a
 space for it:
@@ -623,6 +625,49 @@ widgets the tree no longer has, from inside `pointer`. That was a `pub fn prune`
 with no honourers reads like a handled hazard and is worse than none. It is not what keeps a click
 alive: a *re-identified* widget is still on screen, and forgetting the gesture drops the click as
 surely as a stale id does.
+
+### 8.3 The file chooser (M14 Part C)
+
+`userspace/libui/src/chooser.rs` is a dialog for picking a file to open or naming one to save, and
+it is the toolkit's answer to a question every application eventually asks. **It is a widget over
+a listing, not a browser** (M14 decision 3): `libui` may not make a syscall, and that rule is not
+bent for this one. The module renders and routes over entries it is *given*; the application lists
+the directory with `libfs::list_dir` and orders it with `libfs::sort`.
+
+| Piece | What it is |
+|---|---|
+| `Mode` | `Open` or `Save`. The two jobs differ in exactly two things — whether there is a name field, and what the accepting button says (`verb`) |
+| `ChooserState` | Selection, scroll, and the name being typed. **The listing is deliberately not in here**: it belongs to whoever read it, and a copy would be a second answer to "what is in this directory" that could go stale unnoticed |
+| `view` | The tree: a title, the path strip, the rows, a name field when saving, and Cancel beside the verb |
+
+**One widget for both jobs**, because a second would be this layout maintained twice and the first
+divergence would be a chooser that looks different depending on why it opened.
+
+**The path strip is not decoration.** A chooser that listed only names leaves a person guessing
+which directory they are about to write into, which is the one thing a Save dialog must not be
+vague about — and it is what makes the receipt an application prints about a chooser checkable.
+
+**What the application still owns** is where it is, what is in it, and what a choice *means*: only
+it knows which rows are directories, so `on_row` is sent for any row and descending versus
+choosing is decided above. The keyboard is the application's too, for §7.2's reason — `route`
+sends a key to a focused widget's handler, and whether a keystroke is an answer, a move or a
+character is not something the toolkit can decide.
+
+**It carries its own size, and `dialog_frame_sized` is why that is possible.** `dialog_frame`
+hard-sizes to 340x132 — a two-line question and two buttons — and the sizing itself cannot be
+dropped, because a `Dock` measures as everything it is offered and `Child::open` refuses a tree
+with no natural size. So the size became a parameter. Built inside the fixed frame, the chooser's
+list was drawn 29px tall against the 220 it was built for and its name field got no pixels at all;
+worse than cramped, because `list_view` computes `visible` from the height it is *told*, so the
+rows past the first two were unreachable and no scrollbar appeared to say so. **`list_view` does
+not size itself** — every caller wraps it in a `sized` of the same height, and this one is no
+exception.
+
+**Every child of a keyed parent must be keyed, and this is where that bit.** `diff` refuses a
+parent whose children are only partly keyed, so an unkeyed path strip beside keyed rows — or a
+keyed button wrapped in an unkeyed `padding` — makes the whole dialog undiffable. That does not
+present as a layout problem: `Child::present` returns false every frame and the window opens,
+reports its size, and never draws. Three parents in this one tree had it.
 
 ## 9. Three things below the toolkit that Milestone 4 forces
 

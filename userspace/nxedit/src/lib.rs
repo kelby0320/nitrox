@@ -34,6 +34,7 @@ use librsproto::surface::{
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use alloc::vec;
+use libui::chooser::{self, ChooserState};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
     Edge, Element, Insets, column, dock, docked, offset, padding, row, sized, stack, text,
@@ -166,6 +167,24 @@ pub const BAR_KEY: u64 = 15;
 /// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
 pub const MENU_ROW_KEY: u64 = 100;
 
+/// Where the chooser's element keys start — clear of this window's own.
+pub const CHOOSER_KEY: u64 = 200;
+
+/// Where the chooser's *rows* are keyed from.
+///
+/// **A range of its own, not indices from zero.** `libui::chooser` matches `hovered` against its
+/// buttons' keys and `list_view` matches it against the rows', so a row whose key happened to
+/// equal a button's would light that button as the pointer crossed it — row 202 of a long
+/// directory against a Cancel keyed `CHOOSER_KEY + 2` (PR #284 review, finding 6). Far enough
+/// above the widget's own seven that no directory reaches it.
+pub const CHOOSER_ROW_KEY: u64 = 1000;
+
+/// The key that opens the file chooser: `o`, with Ctrl.
+pub const OPEN_KEYCODE: u16 = 24;
+/// The key that opens it to save under a new name: `s`, with Ctrl and **Shift** — the same letter
+/// as Save, because it is the same verb with a question attached.
+pub const SAVE_AS_KEYCODE: u16 = 31;
+
 /// The key that opens a *window*: `n`, with Ctrl and **Shift**.
 ///
 /// Shift because `Ctrl+N` is "new" in the singular everywhere and an editor's singular is a
@@ -263,6 +282,22 @@ pub struct Buffer {
     differs: bool,
 }
 
+/// A chooser the editor has open: which job, where it is looking, and what is there.
+///
+/// **The entries are here because the application was given them**, not because this crate read
+/// them — `libui::chooser` renders over what it is handed and `main` does the listing, which is
+/// decision 3's rule seen from the other side.
+pub struct Chooser {
+    /// Open a file, or name one to save.
+    pub mode: chooser::Mode,
+    /// The directory being shown.
+    pub dir: String,
+    /// What is in it: a name and whether descending into it makes sense.
+    pub entries: Vec<(String, bool)>,
+    /// Selection, scroll, and the name being typed.
+    pub state: ChooserState,
+}
+
 /// Everything the editor is.
 pub struct App {
     /// The open buffers, in the order their tabs are drawn. **Never empty**: the last one closing
@@ -270,6 +305,12 @@ pub struct App {
     buffers: Vec<Buffer>,
     /// Which buffer's tab is current, by [`Buffer::key`].
     current: u64,
+    /// The chooser this window has open, if any.
+    chooser: Option<Chooser>,
+    /// A directory the binary is being asked to list for the chooser.
+    chooser_list: Option<String>,
+    /// A path the binary is being asked to open into a tab.
+    open_requested: Option<String>,
     /// Another window has been asked for, and the binary has not made it yet.
     new_window: bool,
     /// A quit has been asked for. **The binary owns what that means**, because it is the only
@@ -478,6 +519,18 @@ pub enum Msg {
     NewTab,
     /// A word on the menu bar was pressed: open that menu, or close it if it was already open.
     MenuBar(usize),
+    /// Open the chooser to pick a file — `Ctrl+O`, or File ▸ Open.
+    OpenFile,
+    /// Open the chooser to name this buffer — `Ctrl+Shift+S`, or File ▸ Save As.
+    ///
+    /// **Not Save with a prompt.** See [`App::adopt_path`] for what accepting it changes.
+    SaveAs,
+    /// A row of the chooser was activated: descend into it, or choose it.
+    ChooserRow(u64),
+    /// The chooser's accepting button, or `Enter` in its name field.
+    ChooserAccept,
+    /// The chooser's *Cancel*, its close button, or `Esc`.
+    ChooserCancel,
     /// Open another window of this editor — `Ctrl+Shift+N`, or File ▸ New Window.
     ///
     /// **Recorded, not done.** A window is a compositor object and this crate makes no syscalls;
@@ -540,6 +593,9 @@ impl App {
         App {
             buffers: alloc::vec![Buffer::new(TAB_KEY_BASE, path)],
             current: TAB_KEY_BASE,
+            chooser: None,
+            chooser_list: None,
+            open_requested: None,
             new_window: false,
             quit: false,
             menus: MenuState::new(MENU_COUNT),
@@ -884,6 +940,18 @@ impl App {
         match msg {
             Msg::Key(k) => self.key(k),
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::OpenFile => self.open_chooser(chooser::Mode::Open),
+            Msg::SaveAs => self.open_chooser(chooser::Mode::Save),
+            // **The message carries a key and this takes an index**, converted at the one place
+            // that knows the row numbering — and a key below the base is not a row at all rather
+            // than row zero, which is what a saturating subtraction would have made it.
+            Msg::ChooserRow(key) => {
+                if let Some(row) = key.checked_sub(CHOOSER_ROW_KEY) {
+                    self.chooser_activate(row);
+                }
+            }
+            Msg::ChooserAccept => self.chooser_accept(),
+            Msg::ChooserCancel => self.chooser = None,
             Msg::NewWindow => self.new_window = true,
             Msg::Quit => self.quit = true,
             Msg::Undo => {
@@ -1065,12 +1133,8 @@ impl App {
                                 return;
                             }
                             let path = join(&self.home, &name);
-                            let b = self.buf_mut();
-                            b.path = path;
-                            b.name = name;
-                            let key = b.key;
                             self.field = None;
-                            self.save_requested = Some(key);
+                            self.adopt_path(&path);
                         }
                         // **The field stays open**, which is the whole of what makes Enter walk
                         // through the matches: a find that closed on its first hit would need
@@ -1156,7 +1220,13 @@ impl App {
                     // and a Save that greyed out would hide the *name* prompt behind a state a
                     // person cannot see. `nxfiles`'s greying is about a selection, which is
                     // visible; this is not.
+                    act(Item::new("Open…", Accel::ctrl(OPEN_KEYCODE, "O"), Msg::OpenFile)),
                     act(Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save)),
+                    act(Item::new(
+                        "Save As…",
+                        Accel::ctrl_shift(SAVE_AS_KEYCODE, "S"),
+                        Msg::SaveAs,
+                    )),
                     Item::Separator,
                     act(Item::new(
                         "New Window",
@@ -1186,6 +1256,42 @@ impl App {
         ]
     }
 
+    /// The chooser's tree — the root of a window of its own, like the menu and the question.
+    ///
+    /// **Empty when nothing is being chosen**, which cannot be drawn because the window only
+    /// exists while a chooser does — but the type demands an answer and a caller should not have
+    /// to think about it.
+    pub fn chooser_view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        let Some(c) = self.chooser.as_mut() else {
+            return libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui);
+        };
+        // **The row keys are indices**, which is safe here and nowhere else: a chooser's listing
+        // cannot change under it — nothing lists a directory while one is open — so unlike a tab
+        // or a buffer there is no renumbering for a stale message to fall foul of.
+        let rows: Vec<libui::widget::ListRow<'_>> = c
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| libui::widget::ListRow {
+                key: CHOOSER_ROW_KEY + i as u64,
+                label: name,
+            })
+            .collect();
+        let dir = c.dir.clone();
+        chooser::view(
+            c.mode,
+            &dir,
+            &rows,
+            &mut c.state,
+            CHOOSER_KEY,
+            hovered,
+            Msg::ChooserRow,
+            Msg::ChooserAccept,
+            Msg::ChooserCancel,
+            ui,
+        )
+    }
+
     /// The open menu's popup, framed — the root of a second window, not a layer in this one.
     pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let menus = self.menu_table();
@@ -1205,6 +1311,184 @@ impl App {
     /// Whether a quit has been asked for. Clears the record.
     pub fn take_quit(&mut self) -> bool {
         core::mem::take(&mut self.quit)
+    }
+
+    /// Drive the chooser from the keyboard.
+    ///
+    /// **The application types into the field, not the toolkit** — the same arrangement the
+    /// naming field has had since M12: `text_field` draws a value and a caret, and what a
+    /// keystroke *means* is the application's, because only it knows whether a key is text or an
+    /// answer. `Esc` and `Enter` are the two answers; the arrows move the list; everything else
+    /// is a character, and only when there is a field to put it in.
+    pub fn chooser_key(&mut self, k: KeyEvent) -> bool {
+        // **Fully qualified, as every other keycode in this file is.** `KEY_DOWN` names two
+        // different things one import apart — `librsproto::surface::KEY_DOWN` is a key's *state*
+        // and is what the rest of this file means by it, while `libkern::abi::KEY_DOWN` is the
+        // arrow. Importing the second here would shadow the first inside this one function.
+        if k.pressed == 0 {
+            return false;
+        }
+        if self.chooser.is_none() {
+            return false;
+        }
+        match k.keycode {
+            libkern::abi::KEY_ESC => self.update(Msg::ChooserCancel),
+            libkern::abi::KEY_ENTER => self.update(Msg::ChooserAccept),
+            code => {
+                let Some(c) = self.chooser.as_mut() else { return true };
+                match code {
+                    libkern::abi::KEY_DOWN => {
+                        let n = c.entries.len();
+                        c.state.list.down(n);
+                    }
+                    libkern::abi::KEY_UP => {
+                        c.state.list.up();
+                    }
+                    // **Nothing to type into when opening**, and swallowing the key is the point:
+                    // a dialog holds the keyboard, so a character that fell through would reach
+                    // nothing at all rather than the buffer behind it.
+                    _ if c.mode == chooser::Mode::Save => {
+                        c.state.name.apply(code, k.modifiers);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
+    }
+
+    /// The chooser this window has open, for the binary that owns its window.
+    pub fn chooser(&self) -> Option<&Chooser> {
+        self.chooser.as_ref()
+    }
+
+    /// The chooser, mutably — its list state moves under the pointer.
+    pub fn chooser_mut(&mut self) -> Option<&mut Chooser> {
+        self.chooser.as_mut()
+    }
+
+    /// A directory the binary is asked to list. Clears the record.
+    pub fn take_chooser_list(&mut self) -> Option<String> {
+        self.chooser_list.take()
+    }
+
+    /// A path the binary is asked to open into a tab. Clears the record.
+    pub fn take_open(&mut self) -> Option<String> {
+        self.open_requested.take()
+    }
+
+    /// Hand the chooser what a directory holds.
+    pub fn show_chooser(&mut self, dir: &str, entries: Vec<(String, bool)>) {
+        let Some(c) = self.chooser.as_mut() else { return };
+        c.dir = String::from(dir);
+        c.entries = entries;
+        // **The selection resets**, for `nxfiles::show`'s reason: a listing of a *different*
+        // directory has no row the old selection refers to, and a clamped stale index silently
+        // selects whatever happens to sit at that position.
+        c.state.list = libui::widget::ListState { selected: None, offset: 0 };
+    }
+
+    /// Open the chooser, looking at the current buffer's directory.
+    ///
+    /// **Where the buffer already is**, not `home`: a Save As almost always means "beside this
+    /// file, under another name", and an untitled buffer has no directory of its own to offer.
+    fn open_chooser(&mut self, mode: chooser::Mode) {
+        let path = String::from(self.buf().path.as_str());
+        let dir = match path.rfind('/') {
+            Some(0) | None => String::from("/"),
+            Some(i) => String::from(&path[..i]),
+        };
+        let dir = if path.is_empty() { String::from(&self.home) } else { dir };
+        let state = match mode {
+            chooser::Mode::Open => ChooserState::new(),
+            // Seeded with what the file is called, so Save As starts from the name rather than
+            // from nothing.
+            chooser::Mode::Save => ChooserState::saving(&self.buf().name),
+        };
+        self.chooser_list = Some(dir.clone());
+        self.chooser = Some(Chooser { mode, dir, entries: Vec::new(), state });
+    }
+
+    /// A row was activated: descend into a directory, or take a file as the answer.
+    ///
+    /// **One statement of what activating a row means**, reached by the pointer and by `Enter`
+    /// alike. They were two before, and they disagreed: this checked `is_dir` and the accepting
+    /// branch did not, so arrowing onto a directory and pressing `Enter` *answered with the
+    /// directory* — closing the chooser and leaving a new, empty, permanently-blocked tab named
+    /// after a folder, while clicking the same row descended into it. A selection the keyboard
+    /// can make and the keyboard cannot correctly act on (PR #284 review, blocking 2).
+    fn chooser_activate(&mut self, row: u64) {
+        let Some(c) = self.chooser.as_ref() else { return };
+        let Some((name, is_dir)) = c.entries.get(row as usize).cloned() else { return };
+        let path = join(&c.dir, &name);
+        if is_dir {
+            self.chooser_list = Some(path);
+            return;
+        }
+        // **A file is the answer in either mode**, and in Save it becomes the *name* rather than
+        // the choice — picking an existing file to overwrite is how a Save dialog is used, and
+        // the accepting button is still what commits it.
+        match c.mode {
+            chooser::Mode::Open => {
+                self.chooser = None;
+                self.open_requested = Some(path);
+            }
+            chooser::Mode::Save => {
+                let Some(c) = self.chooser.as_mut() else { return };
+                c.state.list.selected = Some(row as usize);
+                c.state.name = libui::widget::TextFieldState::with_text(&name);
+            }
+        }
+    }
+
+    /// The chooser's answer.
+    fn chooser_accept(&mut self) {
+        let Some(c) = self.chooser.as_ref() else { return };
+        match c.mode {
+            // **Through the row, not around it.** Accepting a selection *is* activating that row,
+            // so this delegates rather than joining a path of its own — which is what let the two
+            // disagree about directories. There is no recursion here: `chooser_activate` answers
+            // or descends, and never accepts.
+            chooser::Mode::Open => {
+                let Some(i) = c.state.list.selected else {
+                    self.status = String::from("nothing chosen");
+                    return;
+                };
+                self.chooser_activate(i as u64);
+            }
+            chooser::Mode::Save => {
+                let name = String::from(c.state.name.text());
+                let name = name.trim();
+                if name.is_empty() {
+                    // Left open rather than cancelled: the person is mid-answer. The same
+                    // decision the naming field makes, for the same reason.
+                    self.status = String::from("a name, then Save");
+                    return;
+                }
+                let path = join(&c.dir, name);
+                self.chooser = None;
+                self.adopt_path(&path);
+            }
+        }
+    }
+
+    /// Make `path` what the current buffer **is**, and save it there.
+    ///
+    /// **This is the whole of "Save As is not Save with a prompt"** (M14 Part C). A prompt that
+    /// only chose a destination would write the bytes and leave the buffer believing it is still
+    /// the file it was opened as — so the tab would keep the old name, the unsaved marker would
+    /// be about the old file, and the *next* `Ctrl+S` would write back to it. Changing what the
+    /// buffer is makes all three follow, because each of them reads the buffer's path.
+    ///
+    /// Shared with the naming field an untitled buffer already had, which does exactly this with
+    /// a name joined to `home` — one statement of what naming a buffer means rather than two.
+    pub fn adopt_path(&mut self, path: &str) {
+        let name = String::from(libfs::basename_str(path));
+        let b = self.buf_mut();
+        b.path = String::from(path);
+        b.name = name;
+        let key = b.key;
+        self.save_requested = Some(key);
     }
 
     /// The state a `RequestState` is owed for. Clears the record.
@@ -2042,7 +2326,7 @@ mod tests {
             .flat_map(|m| m.items.iter())
             .filter(|it| matches!(it, Item::Action { enabled: true, .. }))
             .count();
-        assert_eq!(live, 10, "everything but Cut and Copy, which want a selection");
+        assert_eq!(live, 12, "everything but Cut and Copy, which want a selection");
     }
 
     /// The chord a menu row advertises does what choosing that row does.
@@ -2068,13 +2352,17 @@ mod tests {
             // Tab, Save, and now New Window and Quit, each of which changes nothing a digest
             // watching only the buffer can see.
             let (nw, q) = (a.take_new_window(), a.take_quit());
+            // **And the chooser's**, which is the fourth time this control has caught a digest
+            // that could not see a new outbox: opening a chooser changes no buffer and no tab.
+            let (cl, op) = (a.take_chooser_list(), a.take_open());
+            let choosing = a.chooser().map(|c| c.mode);
             // **`closing` and `save` are in here because the negative control found them
             // missing.** Close Tab on a lone tab closes the *window* — the chord means that
             // everywhere it exists — and Save on a titled buffer records an outbox entry rather
             // than touching the text. A digest that watched only the buffer said both rows
             // changed nothing, which is exactly what that control is for.
             alloc::format!(
-                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}|{nw}{q}",
+                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}|{nw}{q}|{cl:?}{op:?}{choosing:?}",
                 a.status(),
                 a.text(),
                 a.field_kind(),
@@ -2130,7 +2418,7 @@ mod tests {
                 "{label} changes nothing, so this row proves nothing about routing"
             );
         }
-        assert_eq!(checked, 11, "every row but Close Window carries a chord");
+        assert_eq!(checked, 13, "every row but Close Window carries a chord");
     }
 
     #[test]
@@ -2715,4 +3003,179 @@ mod tests {
         check(&mut a, None, &mut tree, "back to shut");
     }
 
+    // --- the file chooser (M14 Part C) --------------------------------------
+
+    /// **Save As is not Save with a prompt**, which is the whole of what this part owes.
+    ///
+    /// A prompt that only chose a destination would write the bytes and leave the buffer
+    /// believing it is still the file it was opened as. Three things read the buffer's path, and
+    /// all three would be wrong: the tab's label, the title bar's unsaved marker, and — the one
+    /// that loses work — where the *next* `Ctrl+S` writes.
+    #[test]
+    fn save_as_changes_what_the_buffer_is() {
+        let mut a = app();
+        assert_eq!(a.path(), "/home/notes.txt");
+
+        a.update(Msg::SaveAs);
+        // The chooser opens on the buffer's own directory, seeded with its name.
+        let c = a.chooser().expect("a chooser is open");
+        assert_eq!(c.dir, "/home");
+        assert_eq!(c.state.name.text(), "notes.txt");
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home"), "and it asked for a listing");
+
+        // Type a different name and accept.
+        let c = a.chooser_mut().expect("a chooser is open");
+        c.state.name = libui::widget::TextFieldState::with_text("other.txt");
+        a.update(Msg::ChooserAccept);
+
+        assert!(a.chooser().is_none(), "accepting closes it");
+        assert_eq!(a.path(), "/home/other.txt", "the buffer *is* the new file");
+        // The tab's label follows, because it reads the buffer's name.
+        assert!(a.tabs().iter().any(|(_, label, _)| label.contains("other.txt")), "{:?}", a.tabs());
+        // And the save that was requested is for the new path, not the old one.
+        let (_, path, _) = a.take_save().expect("a save was requested");
+        assert_eq!(path, "/home/other.txt", "the next write goes to the new file");
+    }
+
+    /// Opening walks into directories and answers with a file.
+    #[test]
+    fn the_chooser_descends_and_then_answers() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home", alloc::vec![
+            (String::from("papers"), true),
+            (String::from("notes.txt"), false),
+        ]);
+
+        // A directory row asks for its listing rather than answering.
+        a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"));
+        assert!(a.chooser().is_some(), "descending does not close the chooser");
+        assert_eq!(a.take_open(), None, "and it is not an answer");
+
+        a.show_chooser("/home/papers", alloc::vec![(String::from("draft.txt"), false)]);
+        // A file row is the answer, in Open.
+        a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
+        assert!(a.chooser().is_none(), "choosing closes it");
+        assert_eq!(a.take_open().as_deref(), Some("/home/papers/draft.txt"));
+    }
+
+    /// A listing resets the selection, and an empty name is not an answer.
+    #[test]
+    fn the_chooser_refuses_the_answers_that_are_not_answers() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        a.show_chooser("/home", alloc::vec![(String::from("notes.txt"), false)]);
+        // Nothing selected: accepting says so rather than choosing the first row.
+        a.update(Msg::ChooserAccept);
+        assert!(a.chooser().is_some(), "it stayed open");
+        assert_eq!(a.take_open(), None);
+        assert_eq!(a.status(), "nothing chosen");
+
+        // Saving with an empty name is the same shape.
+        let mut a = app();
+        a.update(Msg::SaveAs);
+        let c = a.chooser_mut().expect("a chooser is open");
+        c.state.name = libui::widget::TextFieldState::with_text("   ");
+        a.update(Msg::ChooserAccept);
+        assert!(a.chooser().is_some(), "left open — the person is mid-answer");
+        assert_eq!(a.take_save(), None, "and nothing was written");
+        assert_eq!(a.status(), "a name, then Save");
+    }
+
+    /// `Enter` on a selected directory descends, exactly as clicking it does.
+    ///
+    /// **The two paths were separate and disagreed** (PR #284 review, blocking 2). This is the
+    /// keyboard half; `the_chooser_descends_and_then_answers` is the pointer half, and it passed
+    /// throughout — which is why the divergence survived: each path had a test and neither had
+    /// the other's.
+    #[test]
+    fn enter_on_a_directory_descends_rather_than_answering_with_it() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home", alloc::vec![
+            (String::from("papers"), true),
+            (String::from("notes.txt"), false),
+        ]);
+
+        // Arrow onto the directory and press Enter.
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
+        assert_eq!(a.chooser().unwrap().state.list.selected, Some(0), "the directory is selected");
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, 1, 0));
+
+        assert!(a.chooser().is_some(), "descending does not close the chooser");
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"), "it asked to list it");
+        // The failure this pins: the path went out as something to *open*, which `open_into`
+        // then refuses as a directory — a new, empty, blocked tab named after a folder.
+        assert_eq!(a.take_open(), None, "a directory is not an answer");
+
+        // And a file under it still answers, so the descent did not break the accepting half.
+        a.show_chooser("/home/papers", alloc::vec![(String::from("draft.txt"), false)]);
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, 1, 0));
+        assert!(a.chooser().is_none(), "a file closes it");
+        assert_eq!(a.take_open().as_deref(), Some("/home/papers/draft.txt"));
+    }
+
+    /// The keyboard drives the chooser, and what a key *means* is decided here rather than by the
+    /// toolkit.
+    ///
+    /// **A dialog holds the keyboard**, so a key this function declines does not fall through to
+    /// the buffer behind it — it reaches nothing at all. That is why a character in `Open` is
+    /// swallowed rather than ignored, and the assertion that says so is the buffer's text being
+    /// unchanged.
+    #[test]
+    fn the_chooser_reads_the_keyboard_itself() {
+        let ev = |code: u16, pressed: u16| KeyEvent::new(1, code, pressed, 0);
+        let listing =
+            || alloc::vec![(String::from("a.txt"), false), (String::from("b.txt"), false)];
+
+        // Nothing to drive when nothing is being chosen — and *false*, so a caller can tell that
+        // the key is still its own.
+        let mut a = app();
+        assert!(!a.chooser_key(ev(libkern::abi::KEY_ESC, 1)), "no chooser, no claim");
+
+        // The arrows move the selection, and `up` from nothing does not wrap round the bottom.
+        a.update(Msg::OpenFile);
+        a.show_chooser("/home", listing());
+        a.chooser_key(ev(libkern::abi::KEY_UP, 1));
+        assert_eq!(a.chooser().unwrap().state.list.selected, None, "up from nothing selects none");
+        a.chooser_key(ev(libkern::abi::KEY_DOWN, 1));
+        a.chooser_key(ev(libkern::abi::KEY_DOWN, 1));
+        assert_eq!(a.chooser().unwrap().state.list.selected, Some(1));
+        // …and it stops at the end rather than running past the listing it was given.
+        a.chooser_key(ev(libkern::abi::KEY_DOWN, 1));
+        assert_eq!(a.chooser().unwrap().state.list.selected, Some(1), "clamped to the last row");
+
+        // A release is not a keystroke. **The negative control for the whole test**: without it,
+        // every assertion above would pass for a handler that acted on both transitions.
+        assert!(!a.chooser_key(ev(libkern::abi::KEY_UP, 0)), "a release is declined");
+        assert_eq!(a.chooser().unwrap().state.list.selected, Some(1), "and moved nothing");
+
+        // A character in Open has nowhere to go, and is swallowed rather than reaching the buffer.
+        let before = String::from(a.text());
+        assert!(a.chooser_key(ev(KEY_X, 1)), "claimed even though it does nothing");
+        assert_eq!(a.text(), before, "the buffer behind the dialog is untouched");
+
+        // Enter answers with the selected row.
+        a.chooser_key(ev(libkern::abi::KEY_ENTER, 1));
+        assert!(a.chooser().is_none(), "Enter closed it");
+        assert_eq!(a.take_open().as_deref(), Some("/home/b.txt"));
+
+        // Esc closes without answering — and in Save, without writing.
+        a.update(Msg::SaveAs);
+        let _ = a.take_chooser_list();
+        a.chooser_key(ev(libkern::abi::KEY_ESC, 1));
+        assert!(a.chooser().is_none(), "Esc closed it");
+        assert_eq!(a.take_save(), None, "and nothing was saved");
+
+        // A character in Save reaches the field, which is the one mode that has one.
+        a.update(Msg::SaveAs);
+        let seeded = String::from(a.chooser().unwrap().state.name.text());
+        a.chooser_key(ev(KEY_X, 1));
+        let after = String::from(a.chooser().unwrap().state.name.text());
+        assert_ne!(after, seeded, "the name field took the character: {after:?}");
+    }
 }

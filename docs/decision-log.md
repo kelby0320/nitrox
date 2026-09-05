@@ -23722,3 +23722,145 @@ have made one window's `Configure` repaint another's grid entirely), and the too
 documentation, which still said a `Child` is one of the two parented roles with a size fixed at
 creation. That paragraph is rewritten to say what changed *and why the old restriction existed*,
 because the restriction was load-bearing: `open_sized` and `resize` answer it rather than remove it.
+
+---
+
+## 2026-09-04 — the file chooser is a widget over a listing (M14 Part C)
+
+`nxedit` has Open File and Save As, and the chooser they share is `libui::chooser`. Three batches
+in dependency order: the listing (`libfs::sort`), the widget over it, then the application that
+uses both.
+
+**Decision 3 held without an exception.** `libui` may not make a syscall, so the chooser renders
+and routes over entries it is *given*; the application lists the directory and orders it. That is
+the seam `nxedit`'s tabs already use for their ttys and `nxfiles` uses for its panes, and it is
+why this module is a `view` plus a state struct rather than a small browser. **The listing is
+deliberately not in `ChooserState`** — it belongs to whoever read it, and a copy here would be a
+second answer to "what is in this directory" that could go stale with nothing noticing.
+
+**One widget for both jobs**, because Open and Save As differ in exactly two things: whether there
+is a name field, and what the accepting button says. A second widget would be one layout
+maintained twice, and the first divergence would be a chooser that looks different depending on
+why it opened.
+
+**`libfs::sort` exists so two directory views cannot disagree about what "newest" means.** Two
+things about it were decided rather than defaulted. **Directories first is not part of the
+order** — it is a fact about reading a listing, not something somebody chose, so reversing the
+*name* order does not put files above directories; the test is written around that case because a
+comparison that reversed the whole key would look right in the ascending direction. And **a tie
+always breaks on name**, because `mtime` is `0` whenever a server does not report one, which is
+every namespace listing: ordering by date with every key equal would leave the enumeration's own
+order showing through, an order nobody chose that appears to shuffle between listings of the same
+directory.
+
+**Save As is not Save with a prompt, and that is the part's whole content.** A prompt that only
+picked a destination would write the bytes and leave the buffer believing it is still the file it
+was opened as. Three things read the buffer's path and all three would then be wrong: the tab's
+label, the title bar's unsaved marker, and — the one that loses work — where the next `Ctrl+S`
+writes. `adopt_path` changes what the buffer *is*, so all three follow, and it is shared with the
+naming field an untitled buffer already had: what naming a buffer means is stated once.
+
+**A tree whose children are only partly keyed is undiffable, and the symptom is not a layout
+problem.** `diff` refuses such a parent, `Child::present` then returns false every frame, and the
+dialog opens, reports its size and never draws. Three parents in the chooser's own tree had it,
+including a keyed button wrapped in an unkeyed `padding` — the error naming the offending parent's
+index path is what made them distinguishable. It is caught by a host test now
+(`the_chooser_diffs_across_a_selection`) rather than by a boot.
+
+**The gate's first version would have passed for the failure it exists to catch**, and it is the
+silent-probe shape again rather than a new one. An unreadable directory opens the chooser
+over an *empty* list deliberately — the path strip says where it is looking and the person can
+back out — so a `check-login` step that waited for "a chooser opened" proves nothing about the
+listing arriving, which is the whole of decision 3. `nxedit`'s receipt names the directory and
+counts the rows, and the gate matches on both: `choosing a file in /home/papers - 2 entries`.
+
+**And the typed name needed a receipt per character**, the discipline every other typed sequence
+in these gates follows and that `nxfiles`'s rename field grew a line for. The first version fired
+seventeen keys — nine to clear the seeded name and five to type the new one — and waited only for
+the save. That passes under TCG and is exactly the burst that arrives bunched under KVM, where a
+dropped keystroke becomes a wrong filename discovered several steps later. The counts run down
+from nine and back up to five, so a lost key fails on the key rather than on the consequence.
+
+**The gate's coupling to the filesystem did its job on the first run.** Save As writes a real
+file, so `/home/papers` gained a third one and the *rename* step several hundred lines later —
+which counts that directory to say a rename is not a copy — failed against its constant of 2. That
+is the coupling working rather than a brittleness to route around: the number is the directory's,
+and something wrote to the directory. The constant moved and the comment says why.
+
+**And adding those receipts broke a step that had nothing to do with choosers**, which is the
+finding worth keeping. `check-login`'s clipboard step clicked into a freshly launched `nxterm` and
+immediately typed eight characters and a chord at it. The click's receipt is the *compositor's*
+and says nothing about the client, so on a slow enough boot those keys were injected while the
+guest was still opening a tty, attaching a backend and drawing a window — and the batch carrying
+them was dropped (`compositor: input batch DROPPED (SYN_DROPPED)`), so the paste never happened.
+The step had been winning that race for as long as it has existed. Part C's extra receipts moved
+the phase of everything after them, and it began failing on **every** run, identically. That is
+the same shape as Part B's drag hand-off, which the tab strip exposed and which had been dismissed
+as a gate flake twice: *a timing change did not create the bug, it stopped hiding it.*
+
+**The first fix was wrong in a way worth recording, because it is a property of `expect` rather
+than of this gate.** Waiting for `nxterm: hosting a shell` *after* the click reads correctly and
+failed on the next run — the shell came up **before** the press receipt that time, so `click_at`'s
+own wait consumed the line, and the gate then hung on output already in the transcript. Two event
+sources that interleave freely cannot be waited on in a fixed order after the fact: `Session::expect`
+consumes what it scans past. The wait belongs *before* the click, where the window has been placed
+and nothing else is competing to read the stream.
+
+---
+
+## 2026-09-04 — what PR #284's review found: a widget nothing had ever looked at
+
+Three blocking findings and four smaller ones, and the reviewer's own summary is the finding:
+**blocking 1 and 3 are one story.** The chooser was never rendered anywhere a person or a test
+would look at it, and the single test that could have looked was satisfied by a fixture collision.
+
+**The chooser was drawn in a 340x132 window, and neither of its two heights was honoured.**
+`dialog_frame` hard-sizes to `DIALOG_W x DIALOG_H` — the size of a two-line question and two
+buttons — and `Child::open` measures the content to pick the window size, so the chooser's window
+was created at 132 tall and never resized. Inside it the list got 29px of the 220 it was built
+for, and in `Save` the name field got **zero**. Both halves matter and they are different
+mistakes: the frame was the wrong size, *and* `list_view` was not wrapped in the `sized` every
+other caller wraps it in — `nxfiles`'s wrapper carries the reason in a comment. The consequence is
+worse than a cramped dialog: `visible` is computed from the height the widget is *told*, so
+`rows.len() > visible` stayed false, no scrollbar was drawn, and `ensure_visible` scrolled
+nothing. Rows past the first two existed and could not be reached by any means.
+
+**Why nothing caught it.** `check-login` drives the chooser entirely by keyboard and asserts on
+`nxedit`'s receipts, which read `ChooserState` rather than pixels. `preview` and `check-display`
+render `reference.rs`, which has no chooser in it. `shot` never opens one. Every assertion in the
+branch was about state, and the bug was entirely in geometry. `dialog_frame_sized` is the fix —
+the *sizing* is what must not be dropped, since a `Dock` measures as everything it is offered and
+`Child::open` refuses a tree with no natural size; what varies is the number, not whether there is
+one — and the regression test asserts the list and the field are drawn at the heights they were
+built for, bracketed across six cell heights so it cannot pass by a metric coincidence.
+
+**The test that should have caught it was vacuous, and in the way its own subject predicted.** The
+fixture listed a row labelled `notes.txt` and seeded the name field with `notes.txt`, so
+"the field is not seeded" was satisfied by the row label. The reviewer demonstrated it by removing
+the name field from the `Save` tree **entirely** and watching the test pass. It asserts the tree's
+shape now — the body column's child count, and the field's key present in one mode and absent in
+the other — against a seed no row can carry. Both of the reviewer's controls fail against it.
+
+**Two paths to "activate this row", and they disagreed about directories.** The pointer's path
+checked `is_dir` and descended; `Enter` joined whatever was selected and *answered with the
+directory*, closing the chooser and leaving a new, empty, permanently-blocked tab named after a
+folder. Each path had a test and neither had the other's, which is how a divergence between two
+statements of one rule survives review by its author. There is now one `chooser_activate` that
+both reach, and the accepting branch delegates to it rather than joining a path of its own.
+
+**And a rule this project states about its own code, broken in the change that stated it.**
+`libfs::sort`'s doc says sorting in two places is how two directory views come to disagree —
+while `nxfiles::App::show` still spelled the comparison a second time over its own row type, with
+a comment admitting as much. `sort` is generic over a `Listed` trait now, so the browser and the
+chooser share one comparison; the test that pins it sorts a deliberately different shape and
+asserts the same sequence. **A doc comment describing an invariant is not evidence the invariant
+holds**, and the one place it is least likely to be checked is the change that introduces it.
+
+Smaller: the name field was rendered inactive, so the one control taking characters in a Save
+dialog had neither caret nor focus ring; `KEYS` said six where seven are used, and the chooser's
+rows were keyed from zero into the range its own buttons occupy, so row 202 of a long directory
+would light *Cancel*; and the per-character receipt fired on the release as well as the press, so
+"a receipt per character" was two. The row keys now start at a base of their own, and a key below
+it is not row zero — `checked_sub`, not `saturating_sub`, because the saturating version made the
+existing test pass by accident once the base moved.
+

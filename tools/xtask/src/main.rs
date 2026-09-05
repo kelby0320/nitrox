@@ -3606,6 +3606,46 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("/home>")?;
     println!("  ok: and the save reached the current tab's file, read back by the shell");
 
+    // **The file chooser** (M14 Part C). `Ctrl+Shift+S` on a buffer that has a name, then a new
+    // name typed and accepted — and the assertion is that the *save* went to the new path, not
+    // that a dialog appeared.
+    //
+    // **After the ordinary save above, deliberately.** Save As changes what the buffer *is*, so
+    // every later `Ctrl+S` follows it — which is the feature, and which broke the step above when
+    // this ran before it. A gate that had to be reordered by the change is the change being
+    // real. "Save As is not Save with a prompt" is the part's whole content:
+    // a chooser that only picked a destination would write these bytes to `notes.txt` and leave
+    // the tab, the marker and the next `Ctrl+S` all pointing at the old file.
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(&mut qmp, "s")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    // **The receipt counts the rows**, which is the half a "a dialog opened" expectation cannot
+    // see: an unreadable directory opens the chooser over an *empty* list deliberately, so a gate
+    // that only waited for the window would pass for the case decision 3 is about — the
+    // application listing and the widget rendering what it was handed. Two entries here:
+    // `notes.txt` and the `other.txt` the serial side made at step 8.
+    session.expect("nxedit: choosing a file in /home/papers - 2 entries")?;
+    // **A receipt per character**, which is the discipline every typed sequence here follows and
+    // the reason `nxedit` grew the line: an unacknowledged burst is a dropped keystroke found as a
+    // wrong filename several steps later, and under KVM the injected keys arrive bunched enough
+    // for it to happen. The field is seeded with the buffer's own name — `notes.txt`, nine
+    // characters — so this empties it rather than appending to it, and the count runs down.
+    for left in (0..9).rev() {
+        press(&mut qmp, "backspace")?;
+        session.expect(&format!("nxedit: chooser name so far {left} chars"))?;
+    }
+    for (i, c) in "asked".chars().enumerate() {
+        let mut qcode = String::new();
+        qcode.push(c);
+        press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxedit: chooser name so far {} chars", i + 1))?;
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("nxedit: saved /home/papers/asked - ")?;
+    println!("  ok: Save As wrote to the name it was given, not to the file it was opened as");
+
     // 9d. **Copy in the editor, paste in the terminal, and the shell reads what was copied**
     //     (M12 Part E) — one gesture crossing two applications and a server, which is the whole
     //     point of making the clipboard a resource rather than a slot in a widget.
@@ -3668,6 +3708,24 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let (_, tx, ty) = parse_placement(&placed)
         .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // Below the title bar and the terminal's own menu bar, and well inside the frame.
+    // **Wait for the shell before clicking, not after**, and both halves of that are load-bearing.
+    //
+    // *Wait*, because this step used to type into a terminal that was still starting: the press
+    // receipt is the *compositor's* and says nothing about the client, so the eight characters of
+    // `touch ./` and the chord behind them went out while the guest was opening a tty, attaching a
+    // backend and drawing a window. The batch carrying them was dropped —
+    // `compositor: input batch DROPPED (SYN_DROPPED)` — and the paste simply never happened. It
+    // was a race this step had been winning: M14 Part C added receipts to the editor step above,
+    // the phase of everything after it moved, and it began failing every run. Same shape as the
+    // drag hand-off in Part B, which the tab strip exposed and which had been called a flake twice.
+    //
+    // *Before the click*, because `Session::expect` consumes what it scans past and the two event
+    // sources interleave freely: the first attempt put these two lines after `click_at`, and on
+    // the very next run the shell came up *before* the press receipt, so the click's own wait ate
+    // them and the gate hung on a line already in the transcript. The window has been placed by
+    // here, which is all a click needs.
+    session.expect("nxterm: hosting a shell")?;
+    session.expect("nxsh: up")?;
     click_at(&mut qmp, &mut session, tx + 100, ty + TITLE_BAR_H + MENU_BAR_H + 40)?;
 
     // `touch ./` — typed — then the paste, then a suffix. **The suffix is what makes the
@@ -3834,7 +3892,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     }
     press(&mut qmp, "ret")?;
     session.expect("nxfiles: renamed /home/papers/renamed")?;
-    session.expect("nxfiles: listed /home/papers - 2 entries")?;
+    // **Three, because Save As made one.** The count is here to say a rename is not a copy, and
+    // the number it compares against is the directory's — so the step above that wrote
+    // `/home/papers/asked` moved it, and the earlier listing at step 8 still reads 2. A gate whose
+    // constants are the filesystem's state has to change when something writes to it; that is the
+    // coupling working, and it is what caught this on the first run.
+    session.expect("nxfiles: listed /home/papers - 3 entries")?;
     println!("  ok: the browser's File menu renamed a file");
 
     // **And the serial session reads it back**, which is what makes this a rename rather than a
