@@ -24118,3 +24118,40 @@ where it made an existing test pass by coincidence once the base moved.
 a literal. A test naming a bare index is naming a key the tree never produces, which is how a test
 comes to exercise a path no real caller can reach.
 
+---
+
+## 2026-09-08 — a sidebar, and the row that stopped being row zero (M14 Part D, batch 7)
+
+`nxfiles` gets a sidebar of common locations: Home, the three folders under it, and Root.
+
+**One press, not two.** The listing needs a double click because a single one has to be able to
+*select* a file — that is decision 5's whole point. A sidebar row has nothing to select and no
+second verb, so making it wait would be a rule carried past its reason.
+
+**Built from `home`, highlighted from the path.** The places are a function of the home the session
+handed this browser, not of `/home`, which would be wrong for anybody whose home is elsewhere. And
+the highlight is recomputed each frame from where the tab is rather than stored: a remembered
+selection is a second answer to "where am I" and disagrees the moment anything else navigates. The
+test navigates by a route the sidebar knows nothing about and checks the highlight still follows.
+
+**Two spellings, reconciled by a boot.** The folder names live in `nxfiles::DEFAULT_FOLDERS` and in
+the image build's `HOME_FOLDERS`, and `xtask` cannot link the browser — the same reason the gate
+spells a menu row as a number. What keeps them in step is that `check-login` presses *Documents*
+and demands a **listing**: staged under another name, it answers "no such directory" instead.
+
+**The staging is temporary and says so.** First-login creation is the right answer once homes are
+made rather than shipped, and it needs a decision about where the list lives — a profile default, a
+skeleton directory, or the shell's — rather than three lines of `mkdir`. `TODO(home-folders)`,
+triggered by the second home.
+
+**The predicted failure arrived.** A step had pressed Enter on row 0 to descend into `papers`, with
+a comment saying it would fail loudly "if `/home` ever holds a directory sorting before `papers`".
+Three of them now do. Both such steps arrow to `papers` instead, through one `select_papers`
+helper, each arrow acknowledged by the `selected` receipt batch 2 added — which is a per-keystroke
+pace *and* the assertion that the arrow moved where the gate believes.
+
+**The second site was the more interesting one.** It did not press Enter on a fresh listing at all;
+it pressed Enter after a `Backspace` back to `/home`, and a fresh listing selects row 0 — so a step
+that had never mentioned row numbers depended on one. The gate found it three hundred lines from
+the change, as a listing of `/home/Documents` where `/home/papers` was expected.
+

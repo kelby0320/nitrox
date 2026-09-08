@@ -122,6 +122,36 @@ pub const TAB_STRIP_KEY: u64 = 24;
 /// (PR #270 review, optional 6). A row index cannot reach the high bit.
 pub const TAB_KEY_BASE: u64 = 1 << 63;
 
+/// How wide the sidebar of common locations is, in pixels.
+///
+/// **A fixed metric, like every other piece of chrome here** (M11's decision 2): the gates aim at
+/// its rows, and a width that followed the theme's text size would move under a gate that had to
+/// read a theme file to know where to click.
+pub const SIDEBAR_W: u32 = 148;
+
+/// The folders the sidebar offers beneath Home.
+///
+/// **Named here and made by the image build**, which is the arrangement M14 Part D chose while
+/// there is one staged home: first-login creation is the right answer once there are real users,
+/// and is `TODO(home-folders)` rather than built. A row whose directory is absent is not hidden —
+/// pressing it says so, which is the same answer a typed path gets.
+pub const DEFAULT_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
+/// The element key on the sidebar.
+pub const SIDEBAR_KEY: u64 = 26;
+/// Where the sidebar's rows are keyed from — clear of the listing's and of the chrome's, for the
+/// reason [`LIST_ROW_KEY`] gives.
+pub const SIDEBAR_ROW_KEY: u64 = 2000;
+
+/// The place a sidebar key names, or `None` if it is not a sidebar row's.
+fn place_of(key: u64) -> Option<usize> {
+    key.checked_sub(SIDEBAR_ROW_KEY).map(|i| i as usize)
+}
+
+/// `Msg::Place` for the row a key names.
+fn place_row(key: u64) -> Msg {
+    Msg::Place(key)
+}
+
 /// Where the listing's rows are keyed from: `LIST_ROW_KEY + i` for row `i`.
 ///
 /// **A range of their own, because `hovered` is one namespace.** `Router::hovered_key` reports
@@ -436,6 +466,15 @@ pub struct App {
     panes: Vec<Pane>,
     /// Which pane's tab is current, by [`Pane::key`].
     current: u64,
+    /// This session's home, which the sidebar's first row goes to.
+    ///
+    /// **What the browser was started at**, which `main` reads from the environment — the same
+    /// value `desktop-shell` hands every application. A browser that guessed `/home` would be
+    /// wrong for anybody whose home is not there.
+    home: String,
+    /// The sidebar's scroll and highlight. Its *selection* is derived from where the tab is
+    /// rather than remembered, so the two cannot disagree.
+    sidebar: ListState,
     /// The entry whose properties are being shown, and the directory it was in.
     ///
     /// **A snapshot taken when the row was chosen**, for [`Target`]'s reason: the listing and the
@@ -641,6 +680,12 @@ pub enum Msg {
     /// within the run opens. `Activate` is what "open" means, and the keyboard still sends it
     /// directly — `Enter` on a selected row is not a click and has no run to be part of.
     Press(u64),
+    /// A sidebar row was pressed — go to that place.
+    ///
+    /// **One press, not two.** The listing needs a double click because a single one has to be
+    /// able to *select* a file; a sidebar row has nothing to select and no other verb, so making
+    /// it wait for a second click would be a rule copied past its reason.
+    Place(u64),
     /// Close the properties dialog. **The only answer it has**, because it asks nothing.
     CloseProperties,
     /// Open the location bar, seeded with where this tab is — `Ctrl+L`, or the File menu.
@@ -719,6 +764,8 @@ impl App {
                 show_hidden: false,
             }],
             current: TAB_KEY_BASE,
+            home: String::from(path),
+            sidebar: ListState::default(),
             properties: None,
             location: None,
             clicks: libui::click::Clicks::new(),
@@ -1021,6 +1068,11 @@ impl App {
                 self.prompt = None;
                 self.notice = None;
                 self.location = Some(TextFieldState::with_text(&self.pane().path));
+            }
+            Msg::Place(key) => {
+                if let Some(p) = place_of(key).and_then(|i| self.places().into_iter().nth(i)) {
+                    self.goto = Some(p.1);
+                }
             }
             Msg::CloseProperties => self.properties = None,
             Msg::LocationCancel => {
@@ -1327,6 +1379,23 @@ impl App {
     pub fn picked_name(&self) -> Option<String> {
         let p = self.pane();
         p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone())
+    }
+
+    /// The common locations the sidebar offers: a label and where it goes.
+    ///
+    /// **Built rather than stored**, because every one of them is a function of `home` — and a
+    /// list held in a field would be a second answer to "where is home" that could go stale if
+    /// the session's ever moved.
+    ///
+    /// **Root is last and Home is first**, which is the order they are wanted in: the folders
+    /// between them are where a person's own files go, and `/` is the one you take deliberately.
+    pub fn places(&self) -> Vec<(String, String)> {
+        let mut out = alloc::vec![(String::from("Home"), self.home.clone())];
+        for name in DEFAULT_FOLDERS {
+            out.push((String::from(*name), join(&self.home, name)));
+        }
+        out.push((String::from("Root"), String::from("/")));
+        out
     }
 
     /// The listing's rows as the tree keys them.
@@ -1930,6 +1999,32 @@ impl App {
             Some(i) => Some(LIST_ROW_KEY + i as u64),
             None => hovered,
         };
+        // **The sidebar's highlight is derived, not remembered** — whichever place matches where
+        // this tab is, recomputed each frame. A stored selection would be a second answer to
+        // "where am I" and would disagree the moment anything else navigated.
+        let places = self.places();
+        let here = places.iter().position(|(_, path)| *path == self.pane().path);
+        let side_rows: Vec<ListRow<'_>> = places
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _))| ListRow {
+                key: SIDEBAR_ROW_KEY + i as u64,
+                label: label.as_str(),
+            })
+            .collect();
+        self.sidebar.selected = here;
+        let sidebar = list_view(
+            &side_rows,
+            &mut self.sidebar,
+            h,
+            ROW_H,
+            place_row,
+            None,
+            None,
+            hovered,
+            &ui,
+        );
+
         let list = list_view(
             &rows,
             &mut self.pane_mut().list,
@@ -1952,6 +2047,14 @@ impl App {
                         sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
                     ),
                     docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
+                    // **Docked after the three strips, so it starts below them** — a dock takes
+                    // its edges in order, and each one divides what the last left. The path strip
+                    // spans the full width above both panes, which is what makes it read as the
+                    // window's location rather than the listing's.
+                    docked(
+                        Edge::Left,
+                        sized(Size::new(SIDEBAR_W, h), sidebar).key(SIDEBAR_KEY),
+                    ),
                 ],
             // **Sized to the height it was built for.** `list_view` does not size itself, and
             // the dock's flex child otherwise gets everything left over — so the widget would
@@ -3055,6 +3158,90 @@ mod tests {
         let _ = a.view(&ui, None);
     }
 
+    // --- the sidebar (M14 Part D) --------------------------------------------
+
+    /// The places are Home, the default folders under it, and Root — all relative to *this*
+    /// session's home rather than to `/home`.
+    #[test]
+    fn the_places_are_built_from_this_sessions_home() {
+        let a = App::new("/home/someone-else");
+        let places = a.places();
+        assert_eq!(places[0], (String::from("Home"), String::from("/home/someone-else")));
+        assert_eq!(places.last().unwrap().1, "/", "Root is last");
+        for name in DEFAULT_FOLDERS {
+            let want = alloc::format!("/home/someone-else/{name}");
+            assert!(
+                places.iter().any(|(l, p)| l == name && *p == want),
+                "{name} should be under this home, not under /home: {places:?}"
+            );
+        }
+    }
+
+    /// One press on a sidebar row goes there — no second click.
+    ///
+    /// **Not the listing's rule.** A listing row needs a double click because a single one has to
+    /// select; a sidebar row has nothing to select and no other verb.
+    #[test]
+    fn one_press_on_a_place_navigates() {
+        let mut a = app();
+        let root = a.places().len() as u64 - 1;
+        a.update(Msg::Place(SIDEBAR_ROW_KEY + root));
+        assert_eq!(a.take_goto().as_deref(), Some("/"), "one press was enough");
+
+        a.update(Msg::Place(SIDEBAR_ROW_KEY + 1));
+        assert_eq!(a.take_goto().as_deref(), Some("/home/Documents"));
+    }
+
+    /// A key that is not a sidebar row's goes nowhere.
+    ///
+    /// **The control on `checked_sub`.** A saturating conversion would make every stray key mean
+    /// row zero — Home — so a press on anything at all would navigate.
+    #[test]
+    fn a_key_below_the_base_is_not_a_place() {
+        let mut a = app();
+        a.update(Msg::Place(0));
+        assert_eq!(a.take_goto(), None, "key 0 is not Home");
+        a.update(Msg::Place(SIDEBAR_ROW_KEY + 99));
+        assert_eq!(a.take_goto(), None, "and neither is a row that does not exist");
+    }
+
+    /// The sidebar highlights the place the tab is in, and nothing when it is elsewhere.
+    ///
+    /// **Derived rather than remembered**, so it cannot disagree with the listing: this navigates
+    /// by a route the sidebar knows nothing about and the highlight still follows.
+    #[test]
+    fn the_sidebar_follows_where_the_tab_is() {
+        let mut a = app();
+        let ui = UiTheme::default();
+        let _ = a.view(&ui, None);
+        assert_eq!(a.sidebar.selected, Some(0), "the browser starts at home");
+
+        a.show("/home/Pictures", alloc::vec![]);
+        let _ = a.view(&ui, None);
+        let want = a.places().iter().position(|(l, _)| l == "Pictures");
+        assert_eq!(a.sidebar.selected, want, "and follows a navigation it did not cause");
+
+        a.show("/home/papers", alloc::vec![]);
+        let _ = a.view(&ui, None);
+        assert_eq!(a.sidebar.selected, None, "nowhere on the list is nothing highlighted");
+    }
+
+    /// The sidebar's rows share no key with the listing's or with the chrome's.
+    #[test]
+    fn a_place_does_not_light_a_listing_row() {
+        let mut a = app();
+        a.show("/home", (0..8).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect());
+        let listing: Vec<u64> = a.list_rows().iter().map(|r| r.key).collect();
+        let places: Vec<u64> =
+            (0..a.places().len() as u64).map(|i| SIDEBAR_ROW_KEY + i).collect();
+        for p in &places {
+            assert!(!listing.contains(p), "sidebar key {p} is also a listing row");
+            assert_ne!(*p, SIDEBAR_KEY);
+            assert_ne!(*p, LIST_KEY);
+            assert_ne!(*p, UP_KEY);
+        }
+    }
+
     // --- properties (M14 Part D) ---------------------------------------------
 
     /// A size reads exactly below a kibibyte and both ways above it.
@@ -3762,7 +3949,10 @@ mod tests {
                 button: 0x110,
                 buttons: 1,
                 flags: librsproto::surface::POINTER_PRESSED,
-                x: 120,
+                // **Past the sidebar**, which took the left of the window in M14 Part D: `120`
+                // used to be over the listing and is now over *Documents*, so the press produced
+                // a `Place` and no `Grab`. The listing starts at `SIDEBAR_W`.
+                x: SIDEBAR_W as i32 + 120,
                 y: row_y(&a, 1),
                 ..Default::default()
             },

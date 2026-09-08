@@ -4825,9 +4825,31 @@ the sidebar, then the clipboard — the last two build on what the click settles
       keyed `0..n` lit `Up`, the path strip and the notice as the pointer crossed rows 1, 2, 5, 6
       and 7. The same defect PR #284's review found in `nxedit`'s chooser, whose siblings went
       unswept; rows are keyed from `LIST_ROW_KEY` now and the messages carry keys.
-- [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
-      the image build for now; first-login creation is the right answer once there are real
-      users, and is filed rather than built.
+- [x] **A sidebar of common locations** ✅, and the default folders it needs — Home, Documents,
+      Downloads, Pictures, Root. **One press, not two**: a listing row needs a double click
+      because a single one has to be able to *select* a file, and a sidebar row has nothing to
+      select and no second verb, so requiring two would be a rule copied past its reason.
+
+      **The places are built from this session's `home`**, not from `/home`, because that is what
+      `desktop-shell` hands every application and a browser that assumed otherwise would be wrong
+      for anybody whose home is elsewhere. **The highlight is derived each frame** from where the
+      tab is rather than remembered — a stored selection would be a second answer to "where am I"
+      and would disagree the moment anything else navigated, which a test checks by navigating a
+      way the sidebar knows nothing about.
+
+      **Staged by the image build, as the plan said**, and first-login creation is
+      `TODO(home-folders)` with a trigger — the second home, whether a demo user or a real one,
+      since a session-created home would have none of these and the sidebar would offer three dead
+      rows. The names are spelled in `nxfiles::DEFAULT_FOLDERS` and in the image build's
+      `HOME_FOLDERS`, and `xtask` cannot link the browser to compare them — so `check-login`
+      presses the *Documents* row and demands a listing, which is what a folder staged under
+      another name would fail.
+
+      **The gate churn was mostly predicted.** Three directories in `/home` reordered the listing,
+      so the two steps that pressed Enter on row 0 to reach `papers` now arrow to it — the older
+      of them carried a comment saying it would fail loudly the day `/home` held a directory
+      sorting first, and it did. The sidebar also moved every *listing* aim right by `SIDEBAR_W`
+      while the strips above kept the full width; one host test caught that on its own.
 - [ ] **Cut, copy and paste of files** — `TODO(file-clipboard)`, left as a pair in M12 when only
       copy existed. Wants **multi-select**, which is its own interaction.
 - [x] **A delete confirmation** ✅ — **built in M12**, found by checking rather than by building.

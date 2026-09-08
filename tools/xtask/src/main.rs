@@ -87,6 +87,11 @@ const WALLPAPER_W: u32 = 1920;
 /// See [`WALLPAPER_W`]. 16:10, which is the screen's shape.
 const WALLPAPER_H: u32 = 1200;
 
+/// The folders staged under the demo home, which `nxfiles::DEFAULT_FOLDERS` names too.
+///
+/// Kept in step by `check-login` rather than by the compiler — see where they are staged.
+const HOME_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
+
 /// The photograph the wallpaper is cropped from — see `assets/wallpapers/README.md`.
 const WALLPAPER_ASSET: &str = "assets/wallpapers/scuba-divers.png";
 const DEMO_SALT: [u8; 8] = [0x9e, 0x3f, 0xa2, 0x5c, 0x71, 0x0b, 0xd4, 0x86];
@@ -3210,11 +3215,15 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // placement cascade here would be a second copy of a policy that is the shell's to change.
     let files_win = next_geometry(&mut session)?;
 
-    // **Enter descends into the selected row**, which is the directory the serial side just
-    // made: directories sort before files and a fresh listing selects row 0, so this is the
-    // keyboard reaching the same message a row press produces. If `/home` ever holds a
-    // directory sorting before `papers`, this fails naming the path it did open — which is a
-    // loud failure rather than a quiet one.
+    // **Enter descends into the selected row**, which is the keyboard reaching the same message a
+    // row press produces.
+    //
+    // **Arrowed to rather than assumed.** This used to press Enter on row 0 and its comment said
+    // that would fail loudly "if `/home` ever holds a directory sorting before `papers`" — M14
+    // Part D staged three, so it does. Each arrow is acknowledged by the browser's `selected`
+    // receipt, which is both a per-keystroke acknowledgement and the assertion that the arrow
+    // moved where this thinks it did.
+    select_papers(&mut qmp, &mut session)?;
     press(&mut qmp, "ret")?;
     session.expect("nxfiles: listed /home/papers - 0 entries")?;
     println!("  ok: Enter descended, and an empty directory lists nothing");
@@ -3292,6 +3301,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // **Where a listing row is.** Hoisted here from the drag step below, which is the other thing
     // that aims at one — two copies of this sum is how a gate comes to press one row high after
     // a strip changes height. `nxfiles::list_top` is the browser's own version of it.
+    // **The sidebar takes the left of the content** (M14 Part D), so every aim at a *listing* row
+    // starts past it while the strips above still span the full width. `nxfiles::SIDEBAR_W` is
+    // the browser's own version of this number.
+    const SIDEBAR_W: i32 = 148;
     const TITLE_BAR_H: i32 = 26;
     const PATH_H: i32 = 24;
     const ROW_H: i32 = 20;
@@ -3302,6 +3315,23 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let row_y = |row: i32| {
         files_win.2 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + row * ROW_H + ROW_H / 2
     };
+
+    // **The sidebar** (M14 Part D). One press on *Documents* goes there — one, not two: a sidebar
+    // row has nothing to select and no second verb, so the listing's double click would be a rule
+    // copied past its reason.
+    //
+    // **This is also what keeps two spellings of the folder names in step.** `nxfiles` names them
+    // in `DEFAULT_FOLDERS` and the image build stages them from `HOME_FOLDERS`, and this crate
+    // cannot link the browser to compare them — so a folder staged under another name answers
+    // "no such directory" here rather than differing silently.
+    //
+    // Sidebar rows are Home, the three folders, then Root; they start at the same y as the
+    // listing because both sit below the path strip.
+    click_at(&mut qmp, &mut session, files_win.1 + 40, row_y(1))?;
+    session.expect("nxfiles: listed /home/Documents - ")?;
+    println!("  ok: one press on a sidebar row went there");
+    press(&mut qmp, "backspace")?;
+    session.expect("nxfiles: listed /home - ")?;
 
     // **A single click selects, a double click opens** (M14 Part D, decision 5).
     //
@@ -3315,8 +3345,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // and before this part clicking it asked the shell to open it. The receipt is change-driven,
     // which is why the row cannot be row 0: a fresh listing selects that one already, so a click
     // on it changes nothing and reports nothing.
+    // Rows: `Documents`, `Downloads`, `Pictures`, `papers`, then `theme.toml` and
+    // `wallpaper.png` — directories lead, so row 4 is the first file.
     let before = session.transcript().len();
-    let file_row = (files_win.1 + 120, row_y(1));
+    let file_row = (files_win.1 + SIDEBAR_W + 120, row_y(4));
     click_at(&mut qmp, &mut session, file_row.0, file_row.1)?;
     session.expect("nxfiles: selected theme.toml")?;
     println!("  ok: one click on a file selected it");
@@ -3336,7 +3368,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("  ok: and did not ask the shell to open it");
 
     // Two clicks on the directory row descend into it.
-    let dir_row = (files_win.1 + 120, row_y(0));
+    let dir_row = (files_win.1 + SIDEBAR_W + 120, row_y(3));
     click_at(&mut qmp, &mut session, dir_row.0, dir_row.1)?;
     session.expect("nxfiles: selected papers")?;
     click_at(&mut qmp, &mut session, dir_row.0, dir_row.1)?;
@@ -3357,6 +3389,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.send("touch ./papers/notes.txt")?;
     session.expect("/home>")?;
 
+    // **The selection is on `Documents` again**, because the `Backspace` above re-listed `/home`
+    // and a fresh listing selects row 0.
+    select_papers(&mut qmp, &mut session)?;
     press(&mut qmp, "ret")?;
     session.expect("nxfiles: listed /home/papers - 1 entries")?;
 
@@ -3539,6 +3574,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     )?;
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
+    // **The third step to depend on which row a fresh listing selects**, and the one that never
+    // said so: it walks out of `papers` and straight back in, which worked only while `papers`
+    // was row 0. The two before it at least named the row.
+    select_papers(&mut qmp, &mut session)?;
     press(&mut qmp, "ret")?;
     // **The receipt says both numbers, and that is the assertion.** "2 entries" alone cannot tell
     // a filtered listing from a directory that happens to hold two; "(1 hidden)" is the browser
@@ -3574,7 +3613,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
     // and the path strip — plus half a row.
     let row1 =
-        (fx + 120, fy + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
+        (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
@@ -4585,6 +4624,24 @@ fn check_two_sessions(transcript: &str) -> R<()> {
             .into());
     }
     println!("xtask: a graphical and a serial session ran at the same time ✓");
+    Ok(())
+}
+
+/// Move the browser's selection from a fresh `/home` listing down to `papers`.
+///
+/// **Because row 0 stopped being `papers`.** M14 Part D stages `Documents`, `Downloads` and
+/// `Pictures` into the demo home for the sidebar to point at, and directories lead the listing —
+/// so a fresh listing selects `Documents` and the two steps that pressed Enter on it descended
+/// into the wrong directory. The old comment predicted precisely this and said it would fail
+/// loudly, which it did.
+///
+/// Each arrow is acknowledged by the browser's `selected` receipt, which is both a per-keystroke
+/// pace and the assertion that the arrow moved where this thinks it did.
+fn select_papers(qmp: &mut Qmp, session: &mut Session) -> R<()> {
+    for name in ["Downloads", "Pictures", "papers"] {
+        press(qmp, "down")?;
+        session.expect(&format!("nxfiles: selected {name}"))?;
+    }
     Ok(())
 }
 
@@ -10248,6 +10305,20 @@ fn assemble_image(
             "xtask: seeded {WALLPAPER_PATH} ({WALLPAPER_W}x{WALLPAPER_H}, {n} bytes)"
         );
     }
+    // **The folders the browser's sidebar offers** (M14 Part D). Staged here while there is one
+    // demo home; the right answer once there are real users is for the session to make them on
+    // first login, which is `TODO(home-folders)` rather than built.
+    //
+    // **Spelled twice, and checked by a boot rather than by the compiler.** `nxfiles` names the
+    // same three in `DEFAULT_FOLDERS` and this crate cannot link it — that is the same reason the
+    // gate spells a menu row as a number. What keeps them in step is `check-login`: it presses a
+    // sidebar row and demands a *listing*, and a folder staged under another name would answer
+    // "no such directory" instead.
+    for name in HOME_FOLDERS {
+        let path = staging.join(DEMO_HOME.trim_start_matches('/')).join(name);
+        fs::create_dir_all(&path).map_err(|e| format!("stage {}: {e}", path.display()))?;
+    }
+    println!("xtask: seeded {DEMO_HOME}/{{{}}}", HOME_FOLDERS.join(","));
     println!("xtask: seeded /system/users + {DEMO_HOME} (with a theme)");
     // The content-addressed store, pre-built read-only into the ext4 root. Each package
     // lives at /store/<hash>-<name>-<version>/bin/<prog> — a demand-paged file the profile

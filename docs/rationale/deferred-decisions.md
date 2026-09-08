@@ -1488,6 +1488,18 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
+**Making a new user's folders on first login — `TODO(home-folders)`.** M14 Part D gave `nxfiles`
+a sidebar of common locations, and the folders it points at — Documents, Downloads, Pictures — are
+staged into the demo home by the image build. That is right while there is exactly one home
+shipped with the system and wrong the moment there are real users: a home created by
+`session-mgr` would have none of them, and the sidebar would offer three rows that all say the
+directory is not there.
+
+The right answer is for the session to create them when it first builds a user's namespace, which
+needs a decision about *where the list lives* — a profile default, a skeleton directory, or the
+shell's own — rather than the three lines of `mkdir`. **Trigger: the second home**, whether that
+is a second demo user or the first real one.
+
 **A press time on the wire — `TODO(press-time)`.** M14 Part D's click tracker is *given* a time,
 because `libui` makes no syscalls; the application supplies one by reading `CLOCK_MONOTONIC` when
 the press is **delivered**. The kernel already stamps every `InputEvent` with `time_ns` at the
