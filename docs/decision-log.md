@@ -24033,3 +24033,57 @@ the *unmodified* code passing, which is indistinguishable from a control that fi
 from a file, and deleting the guard does fail the test. A control that errors before it patches
 anything proves nothing, and says `ok`.
 
+---
+
+## 2026-09-08 — one dialog slot, and what a browser will not claim (M14 Part D, batches 4 and 5)
+
+**The seam first, on its own.** Hosting a dialog window — open, close, present, route, and
+deciding which window an event belongs to — is about sixty lines of `main.rs`, written for the
+delete question and identical for every dialog after it. `nxedit` carries three copies of it.
+Rather than add a fourth, `nxfiles` got one slot: `Dialog` is a *kind* that carries its own
+console lines so a new variant cannot forget them, and the App answers `dialog_view`,
+`dialog_key`, `dialog_dismissed` and `dialog_failed` — which puts *what a key means* and *what
+dismissal means* with the dialog instead of hard-coded in the event loop.
+
+**Reconciled against the kind, not against "is one open".** A `bool` there would redraw a new
+dialog into a frame sized for the last one; the kind rides with the window, so a different dialog
+replaces it. The refactor's proof is that `check-login`'s existing steps 11 and 12 — which drive
+the confirmation to both answers — passed unchanged, and it was committed on its own so that
+Properties landed on a gated seam rather than inside one.
+
+**Then Properties, which added no plumbing at all** — a variant, a view, its lines, and a chord.
+That is what the seam was for.
+
+**Two things it refuses to state, and both are the same instinct.** A modification time of `0`
+means "this server does not keep one", which is every namespace listing — so Properties reads
+`unknown` rather than formatting the epoch and stating 1970-01-01 as a fact about a file made this
+morning. `fs-server-ext4` carries the identical note at the other end of the wire: "`0` propagates
+as unknown rather than as 1970-with-confidence". And a folder's size is `—` rather than `0 bytes`,
+because the wire carries zero for a directory and "0 bytes" would be a claim about what is inside
+it. **A number a program does not have is not zero.**
+
+**A size shows both numbers.** The exact count is the fact and the rounded one answers "is this
+big"; showing only the round number cannot tell 1.0 KiB from 1.0 KiB, and showing only the exact
+one makes a person count digits. The boundary is what the test pins — 1023 must stay exact and
+1024 must not read as a bare four-digit number, and a comparison written with the wrong `>=` gets
+one of them right and looks correct on the other.
+
+**The gate asserts that it drew.** A dialog whose tree is undiffable opens, reports its size and
+never paints a frame — the failure Part C spent a boot finding — and from outside that is
+indistinguishable from one that opened and closed. So `Dialog` gained a `closed()` receipt,
+symmetric with `opening()`, and the gate checks both ends plus the slice between them for the
+browser's own complaint.
+
+**`Ctrl+I` exists because the gate wanted it and the feature deserved it.** Properties had no
+chord; driving it meant clicking a menu row by index, which this milestone has already had bite
+twice. Decision 2 makes the chord free — the row carries the accelerator and `accel_match` routes
+it — so the convenience and the testability arrived in the same line.
+
+**And I destroyed the seam's own work reverting a control.** `git checkout -- <file>` on a file
+holding a whole uncommitted batch: a new enum, a dispatch layer, a rename across three sites and a
+fresh test. It is the fourth time this project has recorded that mistake and the first where the
+probe *was* a properly scripted one-line mutation — the habit was intact and the revert was still
+reached for, because a one-line probe feels like it deserves a one-line undo. It cost one command
+to recover only because every edit had been applied from a script kept in the scratchpad. When a
+change is scripted, the script is the backup.
+

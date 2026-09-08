@@ -691,8 +691,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // rather than redrawn — which is what a `bool` here would silently get wrong.
         let want = app.dialog();
         if want != dialog.as_ref().map(|(k, _)| *k) {
-            if let Some((_, c)) = dialog.take() {
+            if let Some((kind, c)) = dialog.take() {
                 c.close(&mut win);
+                kprint(kind.closed());
             }
             *dialog_hovered = None;
             if let Some(kind) = want {

@@ -3266,6 +3266,29 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
 
+    // **Properties** (M14 Part D). `Ctrl+I` on the selected row, then `Esc`.
+    //
+    // **What only a boot can say is that it *drew*.** A dialog whose tree is undiffable opens,
+    // reports its size and never paints a frame — the failure M14 Part C spent a boot on — and
+    // from outside that is indistinguishable from one that opened and closed. So both ends are
+    // asserted, and the slice between them is checked for the browser's own complaint.
+    let before_props = session.transcript().len();
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "i")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxfiles: showing properties")?;
+    press(&mut qmp, "esc")?;
+    session.expect("nxfiles: properties closed")?;
+    let props_window = session.transcript()[before_props..].to_string();
+    if props_window.contains("could not be drawn") || props_window.contains("could not open") {
+        let _ = session.child.kill();
+        return Err(format!(
+            "the properties dialog opened and complained: {props_window:?}"
+        )
+        .into());
+    }
+    println!("  ok: Ctrl+I showed the properties dialog, and Esc closed it");
+
     // **Where a listing row is.** Hoisted here from the drag step below, which is the other thing
     // that aims at one — two copies of this sum is how a gate comes to press one row high after
     // a strip changes height. `nxfiles::list_top` is the browser's own version of it.

@@ -4796,7 +4796,30 @@ the sidebar, then the clipboard — the last two build on what the click settles
       them named itself in a second. That is `the_gate_clicks_the_row_it_means` doing the job it
       was built for after this coupling bit twice; the row went *after* the tab pair rather than
       between it, because New Tab and Close Tab are one thought.
-- [ ] **Properties** (size and mtime, both already on the wire).
+- [x] **One dialog slot rather than one per dialog** ✅ — not a box, and done first at the
+      maintainer's direction so the feature that needed it landed on a gated seam. Hosting a
+      dialog window is about sixty lines in `main.rs`, written for the delete question and the
+      same for every dialog after it; `nxedit` has three copies. `Dialog` is a kind carrying its
+      own console lines, the App answers `dialog_view`/`dialog_key`/`dialog_dismissed`, and the
+      slot reconciles on the **kind** — a `bool` there would redraw a new dialog into a frame
+      sized for the last one. Proved by `check-login`'s existing confirmation steps passing
+      unchanged.
+- [x] **Properties** ✅ — size and mtime, both already on the wire and both now read. `Ctrl+I`, or
+      File ▸ Properties. **The entry is snapshotted when the row is chosen**, for `Target`'s
+      reason: the listing and the selection both move while a dialog is up, so one that read them
+      late would describe whatever now sits at that position.
+
+      **Two things it refuses to state.** A modification time of `0` means "the server does not
+      keep one" — which is the whole namespace half of every listing — so it reads `unknown`
+      rather than 1970-01-01, the same trap `fs-server-ext4` names at the other end of the wire.
+      And a folder's size is `—` rather than `0 bytes`, which would be a claim about what is
+      inside it. A size shows **both** numbers once it passes a kibibyte: the exact count is the
+      fact, the rounded one answers "is this big".
+
+      The gate asserts it **drew**, not merely opened: an undiffable tree opens, reports its size
+      and never paints, which from outside is indistinguishable from a dialog that opened and
+      closed. So `Dialog` gained a `closed()` receipt to make both ends observable, and the slice
+      between them is checked for the browser's own complaint.
 - [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
       the image build for now; first-login creation is the right answer once there are real
       users, and is filed rather than built.

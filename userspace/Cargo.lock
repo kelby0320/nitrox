@@ -328,6 +328,7 @@ dependencies = [
  "librsproto",
  "libstream",
  "libsurface",
+ "libtime",
  "libui",
 ]
 

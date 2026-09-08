@@ -140,8 +140,17 @@ pub const CLOSE_TAB_KEYCODE: u16 = 17;
 pub const HIDDEN_KEYCODE: u16 = 35;
 /// The key that opens the location bar: `l`, with Ctrl.
 pub const LOCATION_KEYCODE: u16 = 38;
+/// The key that shows what is known about the selected entry: `i`, with Ctrl.
+pub const PROPERTIES_KEYCODE: u16 = 23;
 /// The element key on the confirmation dialog's title bar.
 pub const CONFIRM_TITLE_KEY: u64 = 20;
+
+/// Where the properties dialog's element keys start.
+pub const PROPS_KEY: u64 = 30;
+/// How wide that dialog is — wider than a question, because it shows paths.
+pub const PROPS_W: u32 = 420;
+/// How tall: a title, five rows of text, and a button strip.
+pub const PROPS_H: u32 = 236;
 /// The element key on its question.
 pub const CONFIRM_TEXT_KEY: u64 = 21;
 /// The element key on its *delete* answer — the left button.
@@ -185,6 +194,8 @@ pub enum Action {
     Copy,
     /// Remove the selected entry, after a confirmation.
     Delete,
+    /// Show what is known about the selected entry: where it is, how big, when it changed.
+    Properties,
 }
 
 impl Action {
@@ -196,13 +207,14 @@ impl Action {
             Action::NewFolder => Some("new folder:"),
             Action::Rename => Some("rename to:"),
             Action::Copy => Some("copy to:"),
-            Action::Delete => None,
+            // Neither of these asks for a name: one asks a question and the other reports.
+            Action::Delete | Action::Properties => None,
         }
     }
 
     /// Whether this acts on the selected entry rather than on the directory.
     pub fn needs_selection(self) -> bool {
-        matches!(self, Action::Rename | Action::Copy | Action::Delete)
+        matches!(self, Action::Rename | Action::Copy | Action::Delete | Action::Properties)
     }
 }
 
@@ -399,6 +411,12 @@ pub struct App {
     panes: Vec<Pane>,
     /// Which pane's tab is current, by [`Pane::key`].
     current: u64,
+    /// The entry whose properties are being shown, and the directory it was in.
+    ///
+    /// **A snapshot taken when the row was chosen**, for [`Target`]'s reason: the listing and the
+    /// selection both move while a dialog is up, so a dialog that read them late would describe
+    /// whatever now sits at that position.
+    properties: Option<(String, Entry)>,
     /// The location bar's field, while it is open.
     ///
     /// **On the window rather than the pane**, because only one can be open at a time and it acts
@@ -542,6 +560,8 @@ pub enum Gesture {
 pub enum Dialog {
     /// "Delete this?" — the one question this browser asks, and the only operation it cannot undo.
     Confirm,
+    /// What is known about one entry. **Not a question**: it has one button and no answer.
+    Properties,
 }
 
 impl Dialog {
@@ -553,6 +573,18 @@ impl Dialog {
     pub fn opening(self) -> &'static [u8] {
         match self {
             Dialog::Confirm => b"nxfiles: asking before deleting\n",
+            Dialog::Properties => b"nxfiles: showing properties\n",
+        }
+    }
+
+    /// The line printed when the window goes away.
+    ///
+    /// **Symmetric with [`Dialog::opening`]**, and not decoration: a dialog that opened and never
+    /// drew looks, from outside, exactly like one that opened and closed. A gate needs both ends.
+    pub fn closed(self) -> &'static [u8] {
+        match self {
+            Dialog::Confirm => b"nxfiles: the question closed\n",
+            Dialog::Properties => b"nxfiles: properties closed\n",
         }
     }
 
@@ -560,6 +592,7 @@ impl Dialog {
     pub fn open_failed(self) -> &'static [u8] {
         match self {
             Dialog::Confirm => b"nxfiles: could not open the confirmation dialog\n",
+            Dialog::Properties => b"nxfiles: could not open the properties dialog\n",
         }
     }
 
@@ -567,6 +600,7 @@ impl Dialog {
     pub fn draw_failed(self) -> &'static [u8] {
         match self {
             Dialog::Confirm => b"nxfiles: the confirmation dialog could not be drawn\n",
+            Dialog::Properties => b"nxfiles: the properties dialog could not be drawn\n",
         }
     }
 }
@@ -582,6 +616,8 @@ pub enum Msg {
     /// within the run opens. `Activate` is what "open" means, and the keyboard still sends it
     /// directly — `Enter` on a selected row is not a click and has no run to be part of.
     Press(u64),
+    /// Close the properties dialog. **The only answer it has**, because it asks nothing.
+    CloseProperties,
     /// Open the location bar, seeded with where this tab is — `Ctrl+L`, or the File menu.
     OpenLocation,
     /// Go to what was typed there.
@@ -658,6 +694,7 @@ impl App {
                 show_hidden: false,
             }],
             current: TAB_KEY_BASE,
+            properties: None,
             location: None,
             clicks: libui::click::Clicks::new(),
             click_run: 1,
@@ -954,6 +991,7 @@ impl App {
                 self.notice = None;
                 self.location = Some(TextFieldState::with_text(&self.pane().path));
             }
+            Msg::CloseProperties => self.properties = None,
             Msg::LocationCancel => {
                 if self.location.take().is_some() {
                     // **Says so**, for the reason the delete question does: a field that vanishes
@@ -1039,6 +1077,11 @@ impl App {
         };
         match a {
             Action::Delete => self.confirm = Some(target),
+            // **The whole entry, not the `Target`.** Size and modification time are what this
+            // dialog is for and `Target` carries neither; it is the path-resolution record.
+            Action::Properties => {
+                self.properties = selected.clone().map(|e| (self.pane().path.clone(), e));
+            }
             // The field starts empty rather than pre-filled with the current name. Pre-filling
             // would need a selection and a caret to be useful — a person would have to clear it
             // before typing — and the field has neither yet.
@@ -1072,8 +1115,9 @@ impl App {
             Action::NewFolder => Some(FileOp::Create { path: to, dir: true }),
             Action::Rename => from.map(|from| FileOp::Rename { from, to }),
             Action::Copy => from.map(|from| FileOp::Copy { from, to, dir: target.is_dir }),
-            // `choose` sends a delete to the dialog and never to a prompt.
-            Action::Delete => None,
+            // `choose` sends these two to a dialog and never to a prompt, so this arm is
+            // unreachable rather than a decision — and saying `None` keeps it that way.
+            Action::Delete | Action::Properties => None,
         };
         self.prompt = None;
     }
@@ -1460,6 +1504,15 @@ impl App {
                     act("New Folder", Action::NewFolder),
                     act("Rename", Action::Rename),
                     act("Delete", Action::Delete),
+                    // **Last, and after the destructive row rather than before it.** Properties
+                    // is the one row here that changes nothing, so it sits where a mis-aimed
+                    // press lands on it instead of on Delete.
+                    Item::new(
+                        "Properties",
+                        Accel::ctrl(PROPERTIES_KEYCODE, "I"),
+                        Msg::Choose(Action::Properties),
+                    )
+                    .enabled(selected),
                 ],
             },
             Menu { title: "Edit", items: vec![act("Copy", Action::Copy)] },
@@ -1523,7 +1576,13 @@ impl App {
     /// another is up replaces it rather than being lost — which is what makes the single slot
     /// safe rather than merely shorter.
     pub fn dialog(&self) -> Option<Dialog> {
-        self.confirm.as_ref().map(|_| Dialog::Confirm)
+        // **The question wins if both are somehow set**, which nothing can currently do: it is
+        // the one that cannot be dismissed by ignoring it.
+        if self.confirm.is_some() {
+            Some(Dialog::Confirm)
+        } else {
+            self.properties.as_ref().map(|_| Dialog::Properties)
+        }
     }
 
     /// The open dialog's tree.
@@ -1534,6 +1593,7 @@ impl App {
     pub fn dialog_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         match self.dialog() {
             Some(Dialog::Confirm) => self.confirm_view(ui, hovered),
+            Some(Dialog::Properties) => self.properties_view(ui, hovered),
             None => libui::widget::popup_frame(text(String::new()), ui),
         }
     }
@@ -1542,6 +1602,15 @@ impl App {
     pub fn dialog_key(&self, k: KeyEvent) -> Option<Msg> {
         match self.dialog() {
             Some(Dialog::Confirm) => self.confirm_key(k),
+            // **`Esc` closes it and so does `Enter`**, because there is nothing to refuse: a
+            // dialog that only reports should close on whichever key a person reaches for.
+            Some(Dialog::Properties) => {
+                if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
+                    return None;
+                }
+                matches!(k.keycode, libkern::abi::KEY_ESC | libkern::abi::KEY_ENTER)
+                    .then_some(Msg::CloseProperties)
+            }
             None => None,
         }
     }
@@ -1553,6 +1622,7 @@ impl App {
     pub fn dialog_dismissed(&self) -> Option<Msg> {
         match self.dialog() {
             Some(Dialog::Confirm) => Some(Msg::KeepIt),
+            Some(Dialog::Properties) => Some(Msg::CloseProperties),
             None => None,
         }
     }
@@ -1561,6 +1631,12 @@ impl App {
     pub fn dialog_failed(&mut self) {
         match self.dialog() {
             Some(Dialog::Confirm) => self.confirm_failed(),
+            // Nothing was going to change, so there is nothing to undo — but the window that
+            // failed must not be left recorded as open, or the slot never reconciles again.
+            Some(Dialog::Properties) => {
+                self.properties = None;
+                self.notice = Some(String::from("could not show the properties"));
+            }
             None => {}
         }
     }
@@ -1921,6 +1997,95 @@ impl App {
         );
         dialog_frame(title, question, buttons, ui)
     }
+
+    /// What is known about one entry: where it is, what it is, how big, when it changed.
+    ///
+    /// **A report, not a question**, so it has one button and closing it means the same as
+    /// pressing that button. Empty when nothing is being shown, for `dialog_view`'s reason.
+    pub fn properties_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        let Some((dir, e)) = self.properties.as_ref() else {
+            return libui::widget::popup_frame(text(String::new()), ui);
+        };
+        let title = title_bar(
+            "Properties",
+            self.dialog_focused,
+            Msg::DragConfirm,
+            TitleButtons { minimise: None, maximise: None, close: Some(Msg::CloseProperties) },
+            ui,
+        )
+        .key(PROPS_KEY);
+
+        // **Every child keyed**, which the diff requires of a parent whose children are keyed at
+        // all — an unkeyed one makes the whole dialog undiffable, and that shows up as a window
+        // that opens, reports its size and never draws (M14 Part C).
+        let mut rows: Vec<Element<Msg>> = Vec::new();
+        let mut line = |i: u64, label: &str, value: String| {
+            rows.push(
+                row(alloc::vec![
+                    sized(Size::new(96, 0), text(String::from(label))).key(PROPS_KEY + 10 + i * 2),
+                    text(value).flex(1).key(PROPS_KEY + 11 + i * 2),
+                ])
+                .key(PROPS_KEY + 2 + i),
+            );
+        };
+        line(0, "Name", e.name.clone());
+        line(1, "Where", dir.clone());
+        line(2, "Kind", String::from(if e.is_dir { "Folder" } else { "File" }));
+        // **A folder's size is not reported rather than reported as zero.** The wire carries `0`
+        // for a directory, and "0 bytes" would be a claim about what is inside it.
+        line(3, "Size", if e.is_dir { String::from("—") } else { size_text(e.size) });
+        line(4, "Modified", modified_text(e.mtime));
+
+        let body = padding(Insets::all(libui::widget::DIALOG_PAD), column(rows))
+            .key(PROPS_KEY + 1);
+        let buttons = row(alloc::vec![
+            text("").flex(1).key(PROPS_KEY + 30),
+            button(
+                "close",
+                Msg::CloseProperties,
+                WidgetState { hovered: hovered == Some(PROPS_KEY + 31), ..Default::default() },
+                ui,
+            )
+            .key(PROPS_KEY + 31),
+        ]);
+        libui::widget::dialog_frame_sized(Size::new(PROPS_W, PROPS_H), title, body, buttons, ui)
+    }
+}
+
+/// A byte count, with a rounded form beside it once the exact one stops being readable.
+///
+/// **Both numbers, not one.** The exact count is the fact and the rounded one is the answer to
+/// "is this big"; a file manager that showed only the round number could not tell 1.0 KiB from
+/// 1.0 KiB, and one that showed only the exact one makes a person count digits.
+pub fn size_text(bytes: u64) -> String {
+    if bytes < 1024 {
+        return alloc::format!("{bytes} bytes");
+    }
+    // Tenths, computed in integers: there is no float formatting here and rounding by hand is
+    // one multiplication.
+    let (unit, name) = match bytes {
+        b if b >= 1024 * 1024 * 1024 => (1024u64 * 1024 * 1024, "GiB"),
+        b if b >= 1024 * 1024 => (1024 * 1024, "MiB"),
+        _ => (1024, "KiB"),
+    };
+    let tenths = (bytes * 10 + unit / 2) / unit;
+    alloc::format!("{}.{} {name} ({bytes} bytes)", tenths / 10, tenths % 10)
+}
+
+/// A modification time as `YYYY-MM-DD HH:MM:SS UTC`, or `unknown`.
+///
+/// **`0` is "unreported", not 1970.** Servers that do not keep a modification time send zero, and
+/// the whole namespace half of every listing does — so a dialog that formatted it would state
+/// 1970-01-01 as a fact about a file created this morning. `fs-server-ext4` carries the same note
+/// at the other end of the wire.
+pub fn modified_text(mtime: i64) -> String {
+    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000))
+    else {
+        return String::from("unknown");
+    };
+    let mut out = libtime::format_civil(&libtime::civil_from_unix(nanos));
+    out.push_str(" UTC");
+    out
 }
 
 /// Join a directory path and an entry name.
@@ -2473,6 +2638,7 @@ mod tests {
             (8, "New Folder"),
             (9, "Rename"),
             (10, "Delete"),
+            (11, "PropertiesCtrl+I"),
         ] {
             assert_eq!(labelled(&file, MENU_ROW_KEY + i), item, "the File menu's row {i}");
         }
@@ -2516,12 +2682,16 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(needs(&a, "File"), alloc::vec![false, false], "Rename and Delete, with nothing selected");
+        assert_eq!(
+            needs(&a, "File"),
+            alloc::vec![false, false, false],
+            "Rename, Delete and Properties, with nothing selected"
+        );
         assert_eq!(needs(&a, "Edit"), alloc::vec![false], "Copy, with nothing selected");
         // **The negative control.** Give it a listing and the same three become available —
         // without it this test would pass for a version that disabled everything unconditionally.
         a.show("/empty", alloc::vec![Entry::file("a"), Entry::file("b")]);
-        assert_eq!(needs(&a, "File"), alloc::vec![true, true]);
+        assert_eq!(needs(&a, "File"), alloc::vec![true, true, true]);
         assert_eq!(needs(&a, "Edit"), alloc::vec![true]);
         // …and the ones that do not need a selection were never affected either way.
         let file = a.menu_table().into_iter().next().expect("File");
@@ -2790,6 +2960,116 @@ mod tests {
         assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
         assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
         assert_eq!(libinput::keymap::to_char(HIDDEN_KEYCODE, 0), Some(b'h'));
+        assert_eq!(libinput::keymap::to_char(LOCATION_KEYCODE, 0), Some(b'l'));
+        assert_eq!(libinput::keymap::to_char(PROPERTIES_KEYCODE, 0), Some(b'i'));
+    }
+
+    // --- properties (M14 Part D) ---------------------------------------------
+
+    /// A size reads exactly below a kibibyte and both ways above it.
+    ///
+    /// **The boundary is the case worth pinning.** 1023 must not round to "1.0 KiB" and 1024 must
+    /// not read as a bare four-digit number; a comparison written with the wrong `>=` gets one of
+    /// them and looks right on the other.
+    #[test]
+    fn a_size_reads_exactly_and_roundly() {
+        assert_eq!(size_text(0), "0 bytes");
+        assert_eq!(size_text(1023), "1023 bytes", "just under a KiB is still exact");
+        assert_eq!(size_text(1024), "1.0 KiB (1024 bytes)");
+        assert_eq!(size_text(1536), "1.5 KiB (1536 bytes)", "and it rounds rather than truncates");
+        assert_eq!(size_text(1024 * 1024), "1.0 MiB (1048576 bytes)");
+        assert_eq!(size_text(1024 * 1024 * 1024), "1.0 GiB (1073741824 bytes)");
+        // The exact count is always there, which is the half a rounded number cannot give back.
+        assert!(size_text(1_234_567).ends_with("(1234567 bytes)"));
+    }
+
+    /// An unreported time says so rather than claiming 1970.
+    ///
+    /// **This is the whole reason the function exists.** `0` means "the server does not keep
+    /// one", which is every namespace listing — and formatting it would state 1970-01-01 as a
+    /// fact about a file made this morning.
+    #[test]
+    fn an_unreported_time_is_unknown_rather_than_1970() {
+        assert_eq!(modified_text(0), "unknown");
+        assert_eq!(modified_text(-1), "unknown", "and so is anything before the epoch");
+        assert_eq!(modified_text(i64::MAX), "unknown", "rather than overflowing into a date");
+        // A real one is the UTC calendar date, which is `libtime`'s to compute.
+        assert_eq!(modified_text(1_000_000_000), "2001-09-09 01:46:40 UTC");
+    }
+
+    /// Properties shows what the entry was when it was chosen, and closes on its one button.
+    #[test]
+    fn properties_reports_the_entry_it_was_opened_on() {
+        let mut a = app();
+        a.show("/home", alloc::vec![
+            Entry { mtime: 1_000_000_000, size: 1536, ..Entry::file("notes.txt") },
+            Entry::dir("work"),
+        ]);
+        // Row 0 is the directory; row 1 is the file.
+        a.update(Msg::Press(1));
+        a.update(Msg::Choose(Action::Properties));
+        assert_eq!(a.dialog(), Some(Dialog::Properties));
+
+        let labels = {
+            let mut out = Vec::new();
+            fn walk<M>(e: &Element<M>, out: &mut Vec<String>) {
+                if let libui::element::Node::Text(t) = &e.node {
+                    out.push(t.clone());
+                }
+                for c in e.children() {
+                    walk(c, out);
+                }
+            }
+            walk(&a.properties_view(&UiTheme::default(), None), &mut out);
+            out
+        };
+        assert!(labels.iter().any(|l| l == "notes.txt"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "/home"), "where it is: {labels:?}");
+        assert!(labels.iter().any(|l| l == "File"), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("1.5 KiB")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("2001-09-09")), "{labels:?}");
+
+        // **The listing may move under it and the dialog must not follow**, which is the reason
+        // the entry is snapshotted rather than read back through the selection.
+        a.show("/elsewhere", alloc::vec![Entry::file("other.txt")]);
+        let after = {
+            let mut out = Vec::new();
+            fn walk<M>(e: &Element<M>, out: &mut Vec<String>) {
+                if let libui::element::Node::Text(t) = &e.node {
+                    out.push(t.clone());
+                }
+                for c in e.children() {
+                    walk(c, out);
+                }
+            }
+            walk(&a.properties_view(&UiTheme::default(), None), &mut out);
+            out
+        };
+        assert!(after.iter().any(|l| l == "notes.txt"), "still the entry it opened on: {after:?}");
+
+        a.update(Msg::CloseProperties);
+        assert_eq!(a.dialog(), None, "its one button closes it");
+    }
+
+    /// A folder reports no size rather than a size of zero.
+    #[test]
+    fn a_folder_does_not_claim_to_be_empty() {
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::dir("work")]);
+        a.update(Msg::Press(0));
+        a.update(Msg::Choose(Action::Properties));
+        let mut out: Vec<String> = Vec::new();
+        fn walk<M>(e: &Element<M>, out: &mut Vec<String>) {
+            if let libui::element::Node::Text(t) = &e.node {
+                out.push(t.clone());
+            }
+            for c in e.children() {
+                walk(c, out);
+            }
+        }
+        walk(&a.properties_view(&UiTheme::default(), None), &mut out);
+        assert!(out.iter().any(|l| l == "Folder"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("0 bytes")), "a folder's size is not zero: {out:?}");
     }
 
     // --- the dialog slot (M14 Part D) ----------------------------------------
