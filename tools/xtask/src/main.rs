@@ -3225,6 +3225,63 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxfiles: listed /home - ")?;
     println!("  ok: Backspace went back up");
 
+    // **Where a listing row is.** Hoisted here from the drag step below, which is the other thing
+    // that aims at one — two copies of this sum is how a gate comes to press one row high after
+    // a strip changes height. `nxfiles::list_top` is the browser's own version of it.
+    const TITLE_BAR_H: i32 = 26;
+    const PATH_H: i32 = 24;
+    const ROW_H: i32 = 20;
+    // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
+    // height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
+    // missed the change would press one row high and drag the wrong file.
+    const MENU_BAR_H: i32 = 24;
+    let row_y = |row: i32| {
+        files_win.2 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + row * ROW_H + ROW_H / 2
+    };
+
+    // **A single click selects, a double click opens** (M14 Part D, decision 5).
+    //
+    // **This is the only place the interaction exists.** The gate navigates with `Enter` and drags
+    // with a press-and-move, so neither touches what a *click* means; the host tests pin the
+    // counting and the select-versus-open split, and what they cannot say is that a real pointer's
+    // two presses arrive close enough together in the guest to be one run.
+    //
+    // **The single click aims at a *file*, and that is the assertion.** `/home` lists `papers`
+    // first because directories lead, then `theme.toml` and `wallpaper.png` — so row 1 is a file,
+    // and before this part clicking it asked the shell to open it. The receipt is change-driven,
+    // which is why the row cannot be row 0: a fresh listing selects that one already, so a click
+    // on it changes nothing and reports nothing.
+    let before = session.transcript().len();
+    let file_row = (files_win.1 + 120, row_y(1));
+    click_at(&mut qmp, &mut session, file_row.0, file_row.1)?;
+    session.expect("nxfiles: selected theme.toml")?;
+    println!("  ok: one click on a file selected it");
+
+    // **And did not open it**, which `expect` cannot say on its own: it scans forward, so the very
+    // line that would prove failure is one it would skip. The transcript since before the click is
+    // checked for the request instead.
+    let window = session.transcript()[before..].to_string();
+    if window.contains("nxfiles: asked to open") {
+        let _ = session.child.kill();
+        return Err(format!(
+            "a single click on a file must select it, not open it — the transcript since the \
+             click holds an open request. {window:?}"
+        )
+        .into());
+    }
+    println!("  ok: and did not ask the shell to open it");
+
+    // Two clicks on the directory row descend into it.
+    let dir_row = (files_win.1 + 120, row_y(0));
+    click_at(&mut qmp, &mut session, dir_row.0, dir_row.1)?;
+    session.expect("nxfiles: selected papers")?;
+    click_at(&mut qmp, &mut session, dir_row.0, dir_row.1)?;
+    session.expect("nxfiles: listed /home/papers - ")?;
+    println!("  ok: and a second click on a directory descended");
+
+    press(&mut qmp, "backspace")?;
+    session.expect("nxfiles: listed /home - ")?;
+
     // 8. **The editor, opened by the browser, and read back by the shell** (M10 Part D). The
     //    same two-session fact as step 7, used the other way round: there the serial side made
     //    something the graphical side had to see; here the graphical side writes something the
@@ -3452,13 +3509,6 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // Row 1 is `other.txt`: the listing sorts directories first and then by name, and `notes`
     // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
     // and the path strip — plus half a row.
-    const TITLE_BAR_H: i32 = 26;
-    const PATH_H: i32 = 24;
-    const ROW_H: i32 = 20;
-    // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
-    // height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
-    // missed the change would press one row high and drag the wrong file.
-    const MENU_BAR_H: i32 = 24;
     let row1 =
         (fx + 120, fy + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + ROW_H + ROW_H / 2);
     move_pointer_to(&mut qmp, row1.0, row1.1)?;

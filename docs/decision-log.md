@@ -23940,3 +23940,60 @@ after the two the 2026-09-03 entry records. The check costs a grep; the plan is 
 rather than built, because the alternative is a plan claiming a thing is absent while the gate
 proving it present runs on every commit.
 
+---
+
+## 2026-09-08 — one click points, two clicks act (M14 Part D, batch 2)
+
+Decision 5, built. `nxfiles` selects on a single click and opens on a second, which is what makes
+the first click useful — before this, clicking a file *opened* it, so there was no way to point at
+one without acting on it. The maintainer reported exactly that while finding the Part B drag bug:
+"clicking a file opens the file rather than selecting it, and I think as a result click and drag
+doesn't work". The second half was the drag bug; this is the first.
+
+**`libui::click` counts a run rather than answering a question.** It returns `1`, `2`, `3`, …
+instead of "is this a double click", because Part E wants a triple click to mean a line in
+`nxterm` — a tracker that stopped at two would have to be replaced or doubled for the third press,
+and the counting is the same three lines either way. Pure, as decision 5 requires: it is *given* a
+position and a time, and `libui` makes no syscall.
+
+**Two guards that are easy to leave out and silent when missing.** A run compares against the
+*previous* press rather than the run's first, so a triple click may drift a couple of pixels
+across its three presses without the third being disowned. And the elapsed time is a
+`saturating_sub`: an unsigned subtraction that wrapped would give an interval of billions, so a
+single bad timestamp would make every later press a first one — a desktop where double click
+stopped working and nothing said why. Both have tests, and the distance and time cases are tested
+*separately*, because either alone passes a comparison that ignores the other.
+
+**`Msg::Press` is the pointer's; `Msg::Activate` means open.** Splitting them is what keeps the
+keyboard honest — `Enter` on a selected row has no position and no run to belong to, and a
+keyboard that had to be pressed twice is an interaction nobody has ever wanted. **A drag abandons
+the run**, which is not tidying: a drag begins with a press the tracker has already counted, so
+without it the click after every drag lands as number two and opens something.
+
+**The time is delivery, not the press, and that is a deferral rather than an oversight.**
+`PointerEvent` has no timestamp; `libinput::Logical` drops the `time_ns` the kernel stamps on every
+`InputEvent` at the interrupt, so the press time does not exist above the compositor's input
+thread. The error is one-directional: a stalled client can read two deliberate clicks as one
+double, but delivery cannot pull events further apart than the stall that bunched them, so a real
+double click never becomes two singles. X11 and Wayland both carry a timestamp for this reason and
+`TODO(press-time)` carries the fix — a wire-format change with a spec doc and forty construction
+sites, which is its own work rather than a passenger on a double click.
+
+**It had no gate coverage, and the shape of the gate is why.** `check-login` navigates with `Enter`
+and drags with a press-and-move — deliberately, both — so nothing in it exercises what a *click*
+means, and this entire change would have passed every gate with nothing touched. That is the
+failure mode worth naming: a green gate set is evidence about what the gates do, and an
+interaction nothing drives is an interaction nothing checks.
+
+**Two things the new step needed.** `nxfiles` grew a `selected` receipt, because a click that only
+selects has no outward sign at all — the window redraws and nothing is logged. And the negative
+half — that a single click did *not* open the file — cannot be an `expect`: it scans forward, so
+the open request that would prove failure is precisely the line it would skip past. The step
+checks the transcript slice since the click instead.
+
+**The receipt is change-driven, and the first version of the step did not account for it.** It
+aimed at row 0 and waited for `selected papers` — but a fresh listing already selects row 0, so
+the receipt had been emitted before the click and consumed before the wait. It aims at a *file*
+row now, which is both a live receipt and the stronger assertion: clicking a file is the case that
+changed.
+

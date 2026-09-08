@@ -241,6 +241,21 @@ fn home_of(env: &libstream::wire::Record) -> String {
         .unwrap_or_else(|| String::from("/"))
 }
 
+/// The monotonic clock in milliseconds.
+///
+/// **Milliseconds because that is the unit a click run is measured in**; nanoseconds would make
+/// `libui::click`'s constants nine-digit numbers for no gain, since nothing here needs to tell two
+/// presses a microsecond apart from each other.
+fn clock_ms() -> u64 {
+    let mut ns: u64 = 0;
+    // SAFETY: `&raw mut ns` is a valid writable `u64` out-parameter, which is what
+    // `sys_clock_read` requires of its second argument.
+    unsafe {
+        libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::CLOCK_MONOTONIC, (&raw mut ns) as u64)
+    };
+    ns / 1_000_000
+}
+
 /// Block until the compositor has something to say.
 ///
 /// One handle, unlike `nxterm`'s two: a browser has no second source of work. It reads a
@@ -363,6 +378,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let ev = win.wait_handle();
     // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
     let reported_prompt = app.prompt_len();
+    let reported_pick: Option<String> = app.picked_name();
 
     /// Everything one window of this browser is.
     ///
@@ -381,6 +397,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         confirm: Option<Child>,
         confirm_hovered: Option<u64>,
         reported_prompt: Option<usize>,
+        /// The selected row's name, reported on change — see the receipt below.
+        reported_pick: Option<String>,
     }
 
     /// Open a window of this browser, dressed and ready to be serviced.
@@ -398,6 +416,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let top = Child::open_sized(win, Role::Normal, (0, 0), size, &ui, font, theme, BUFFERS)?;
         dress(win, top.id());
         let reported_prompt = app.prompt_len();
+        let reported_pick = app.picked_name();
         Some(Win {
             top,
             app,
@@ -409,6 +428,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             confirm: None,
             confirm_hovered: None,
             reported_prompt,
+            reported_pick,
         })
     }
 
@@ -424,6 +444,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         confirm,
         confirm_hovered,
         reported_prompt,
+        reported_pick,
     }];
 
     loop {
@@ -446,6 +467,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             confirm,
             confirm_hovered,
             reported_prompt,
+            reported_pick,
         } = &mut wins[wi];
         let window_id = top.id();
         // ---- render ----
@@ -602,6 +624,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // stronger than before and is not a guarantee — `compositor: focus win=… has=1` would be
         // the real one, and `log_route` caps routed-input lines at eight, long past by here.
         let typed = app.prompt_len();
+        // **What is selected, reported on change** (M14 Part D, decision 5). Since a single click
+        // selects rather than opens, "the click landed and selected the right row" is a fact with
+        // no other outward sign — the window redraws and nothing is logged. On change rather than
+        // per event, like the prompt's receipt below it, so pointing down a listing costs one
+        // line per row rather than one per motion.
+        let picked = app.picked_name();
+        if picked != *reported_pick {
+            *reported_pick = picked.clone();
+            match picked.as_deref() {
+                Some(name) => libkern::debug::Line::new()
+                    .s(b"nxfiles: selected ")
+                    .untrusted(name.as_bytes())
+                    .end(),
+                None => kprint(b"nxfiles: nothing selected\n"),
+            }
+        }
         if typed != *reported_prompt {
             *reported_prompt = typed;
             if let Some(n) = typed {
@@ -912,6 +950,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Pointer(p) => {
+                    // **Counted before the event is routed** (M14 decision 5), so the message the
+                    // press produces can ask what number the click was. The clock is read here
+                    // because `libui` and `nxfiles`'s own library half make no syscalls — see
+                    // `libui::click` for what reading it at *delivery* rather than at the press
+                    // costs, and `TODO(press-time)` for the fix.
+                    if p.kind == librsproto::surface::POINTER_BUTTON
+                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                        && p.button == libkern::abi::BTN_LEFT
+                    {
+                        app.note_press(libdraw::geom::Point::new(p.x, p.y), clock_ms());
+                    }
                     let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {
                         app.update(m);

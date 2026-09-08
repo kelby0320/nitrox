@@ -4762,7 +4762,25 @@ the sidebar, then the clipboard — the last two build on what the click settles
       The chooser hides dotfiles now, because a browser that hides them and a chooser that does not
       are one directory listed two ways by two windows of one desktop; what it has no way to do is
       *show* them, having no menu to hang the toggle on.
-- [ ] **Single click selects, double click opens**, per decision 5.
+- [x] **Single click selects, double click opens** ✅, per decision 5. `libui::click` counts a
+      *run* of presses — `1`, `2`, `3`, … rather than answering "double?" — because Part E wants a
+      triple click to mean a line in `nxterm`, and a tracker that stopped at two would be a second
+      tracker for the third press. Pure, as decision 5 requires: it is given a position and a time
+      and `libui` makes no syscall. `Msg::Press` is the pointer's and `Msg::Activate` is "open", so
+      `Enter` still opens directly — the keyboard has no position and no run to belong to. **A
+      drag abandons the run**, or the click after one opens something nobody asked for.
+
+      **The time is the press's delivery, not the press** — `PointerEvent` carries no timestamp
+      and `libinput::Logical` drops the `time_ns` the kernel stamps on every `InputEvent`. The
+      error runs one way only: a stalled client can read two deliberate clicks as a double, and
+      cannot split a real one. `TODO(press-time)` carries the wire-format fix and its trigger.
+
+      **It had no gate coverage and nearly shipped without any**: `check-login` navigates with
+      `Enter` and drags with a press-and-move, so nothing it did touched what a *click* means and
+      the whole change would have passed untouched. The new step clicks a **file** row — the case
+      that changed — and asserts the transcript holds no open request, which `expect` cannot do
+      because it scans forward past the very line that would prove failure. `nxfiles` grew a
+      `selected` receipt for it, since a click that only selects has no other outward sign.
 - [ ] **A typeable location bar**, and **Properties** (size and mtime, both already on the wire).
 - [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
       the image build for now; first-login creation is the right answer once there are real

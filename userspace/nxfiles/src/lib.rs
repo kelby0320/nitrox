@@ -397,6 +397,13 @@ pub struct App {
     panes: Vec<Pane>,
     /// Which pane's tab is current, by [`Pane::key`].
     current: u64,
+    /// Counts runs of pointer presses, so a second click on a row can mean something else.
+    ///
+    /// **Fed by the binary**, which is the only half that can read a clock — see
+    /// [`App::note_press`] and `libui::click`.
+    clicks: libui::click::Clicks,
+    /// What number the press being routed now is in its run; `1` unless a run is under way.
+    click_run: u32,
     /// The next key to hand out — monotonic, so a stale message can never name a pane that has
     /// taken its place. Numbered from [`TAB_KEY_BASE`] so a tab's key cannot collide with the
     /// chrome's element keys *or with a list row's index*, which `Router::hovered_key` reports in
@@ -520,6 +527,12 @@ pub enum Gesture {
 pub enum Msg {
     /// A listing row was activated — its index into [`App::entries`].
     Activate(u64),
+    /// A row was **pressed** by the pointer — its index into [`App::entries`].
+    ///
+    /// **Not the same as activating it** (M14 decision 5). A single click selects; a second one
+    /// within the run opens. `Activate` is what "open" means, and the keyboard still sends it
+    /// directly — `Enter` on a selected row is not a click and has no run to be part of.
+    Press(u64),
     /// Order this tab's listing that way — a View menu row.
     ///
     /// **Applied to what is already held**, with no listing asked for: the entries are the same
@@ -590,6 +603,8 @@ impl App {
                 show_hidden: false,
             }],
             current: TAB_KEY_BASE,
+            clicks: libui::click::Clicks::new(),
+            click_run: 1,
             next_key: TAB_KEY_BASE + 1,
             window: START_SIZE,
             focused: true,
@@ -765,6 +780,18 @@ impl App {
             self.menus.close();
         }
         match msg {
+            // **A single click selects; the second one opens** (M14 decision 5). Selecting on
+            // every press and opening only on the second is what makes the first click useful —
+            // before this, clicking a file *opened* it, so there was no way to point at one
+            // without acting on it, which is the half the maintainer reported as "clicking a file
+            // opens the file rather than selecting it".
+            Msg::Press(i) => {
+                self.pane_mut().list.selected = Some(i as usize);
+                self.notice = None;
+                if self.click_run >= 2 {
+                    self.update(Msg::Activate(i));
+                }
+            }
             Msg::Activate(i) => {
                 let i = i as usize;
                 self.pane_mut().list.selected = Some(i);
@@ -1085,6 +1112,34 @@ impl App {
         }
     }
 
+    /// Record a pointer press at `at`, `at_ms` milliseconds into the monotonic clock.
+    ///
+    /// **Called before the event is routed**, so the message the press produces can ask what
+    /// number the click was. The binary owns the clock because this crate makes no syscalls, and
+    /// `libui::click` owns the counting because every list wants it — see decision 5.
+    pub fn note_press(&mut self, at: libdraw::geom::Point, at_ms: u64) {
+        self.click_run = self.clicks.press(at, at_ms);
+    }
+
+    /// Abandon the click run — the gesture turned out to be a drag.
+    ///
+    /// **Or the next click after a drag opens something.** A drag begins with a press the tracker
+    /// has already counted; without this the click that follows would be number two of a run the
+    /// person never meant to start.
+    pub fn note_drag(&mut self) {
+        self.clicks.reset();
+        self.click_run = 1;
+    }
+
+    /// The selected row's name, if a row is selected.
+    ///
+    /// **For the binary's receipt**, which reports it on change: a single click now selects rather
+    /// than opens, so what a click did has no outward sign unless something says so.
+    pub fn picked_name(&self) -> Option<String> {
+        let p = self.pane();
+        p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone())
+    }
+
     /// The path the binary owes a listing for, if anything navigated. Clears the record.
     pub fn take_goto(&mut self) -> Option<String> {
         self.goto.take()
@@ -1140,6 +1195,12 @@ impl App {
             return Gesture::None;
         }
         self.dragging = true;
+        // **The click run ends the moment this becomes a drag** (M14 decision 5), and here rather
+        // than in the binary: a drag begins with a press the tracker has already counted, so a
+        // run left open makes the next click number two and opens something nobody asked for.
+        // The binary cannot see this moment — `Gesture::Moved` says the row under an *existing*
+        // drag changed, so a drag that never leaves its own row would report nothing at all.
+        self.note_drag();
         // **The motion that crosses the slop can also be the one that leaves**, and until
         // 2026-09-04 nothing checked that: the hand-off lived in the already-dragging branch,
         // which only a *later* motion reaches — so a gesture that left the window in one step
@@ -1554,7 +1615,7 @@ impl App {
             &mut self.pane_mut().list,
             h,
             ROW_H,
-            Msg::Activate,
+            Msg::Press,
             Some(Msg::Grab),
             Some(Msg::Scroll),
             highlight,
@@ -2532,6 +2593,101 @@ mod tests {
         assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
         assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
         assert_eq!(libinput::keymap::to_char(HIDDEN_KEYCODE, 0), Some(b'h'));
+    }
+
+    // --- single click selects, double click opens (M14 Part D, decision 5) ----
+
+    /// One click points at a file; two open it.
+    ///
+    /// **The first click doing nothing but select is the whole feature.** Before this, clicking a
+    /// file opened it, so there was no way to point at one without acting on it — the maintainer's
+    /// report was "clicking a file opens the file rather than selecting it".
+    #[test]
+    fn a_single_click_selects_and_a_second_one_opens() {
+        let at = libdraw::geom::Point::new(40, 60);
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::file("notes.txt"), Entry::dir("work")]);
+        // **Directories lead, so row 0 is `work` and row 1 is `notes.txt`.** Naming the rows by
+        // the order they were passed in is how the first version of this test asserted against
+        // the wrong file and read as a broken feature.
+        assert_eq!(names(&a), alloc::vec!["work", "notes.txt"]);
+
+        a.note_press(at, 1_000);
+        a.update(Msg::Press(1));
+        assert_eq!(a.pane().list.selected, Some(1), "it selected the row");
+        assert_eq!(a.take_open(), None, "and did not open it");
+        assert_eq!(a.take_goto(), None);
+
+        a.note_press(at, 1_150);
+        a.update(Msg::Press(1));
+        assert_eq!(a.take_open().as_deref(), Some("/home/notes.txt"), "the second click opened it");
+
+        // A directory's second click navigates rather than opening.
+        a.note_press(at, 5_000);
+        a.update(Msg::Press(0));
+        assert_eq!(a.take_goto(), None, "still just a selection");
+        a.note_press(at, 5_150);
+        a.update(Msg::Press(0));
+        assert_eq!(a.take_goto().as_deref(), Some("/home/work"));
+    }
+
+    /// Two clicks too far apart in time are two single clicks.
+    ///
+    /// **The negative control for the run**, and it is the case a person actually produces:
+    /// clicking a file to select it and clicking it again a second later to be sure.
+    #[test]
+    fn two_slow_clicks_do_not_open() {
+        let at = libdraw::geom::Point::new(40, 60);
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::file("notes.txt")]);
+        a.note_press(at, 1_000);
+        a.update(Msg::Press(0));
+        a.note_press(at, 1_000 + libui::click::RUN_MS + 1);
+        a.update(Msg::Press(0));
+        assert_eq!(a.take_open(), None, "two deliberate clicks are not a double click");
+        assert_eq!(a.pane().list.selected, Some(0), "and the row is still selected");
+    }
+
+    /// `Enter` opens the selected row, click run or no click run.
+    ///
+    /// **The keyboard is not a click** — it has no position and no run to be part of, and a
+    /// keyboard that had to be pressed twice would be an interaction nobody has ever wanted.
+    #[test]
+    fn enter_opens_without_a_second_press() {
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::file("notes.txt")]);
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000);
+        a.update(Msg::Press(0));
+        assert_eq!(a.take_open(), None);
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.take_open().as_deref(), Some("/home/notes.txt"));
+    }
+
+    /// A drag abandons the run, so the click after it is a first click.
+    ///
+    /// **Without this the browser opens something after every drag**: a drag starts with a press
+    /// the tracker counted, so the next click lands as number two of a run nobody meant to start.
+    #[test]
+    fn a_drag_abandons_the_run() {
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::file("notes.txt")]);
+
+        // **A real drag, not a call to `note_drag`.** The browser ends the run itself when a
+        // press becomes a drag, and a test that called the helper directly would pass for a
+        // version that never called it — which is what the first one did.
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000);
+        a.update(Msg::Grab(0));
+        a.pointer_moved(40, 60, 1);
+        // Past the slop in one step, which is the motion that arms the drag.
+        assert_eq!(
+            a.pointer_moved(40 + DRAG_SLOP, 60, 1),
+            Gesture::Moved,
+            "travelling past the slop is a drag"
+        );
+        a.pointer_moved(40 + DRAG_SLOP, 60, 0);
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_150);
+        a.update(Msg::Press(0));
+        assert_eq!(a.take_open(), None, "the click after a drag is a first click");
     }
 
     // --- the View menu (M14 Part D) ------------------------------------------

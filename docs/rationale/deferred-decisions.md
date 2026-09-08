@@ -1488,6 +1488,24 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
+**A press time on the wire — `TODO(press-time)`.** M14 Part D's click tracker is *given* a time,
+because `libui` makes no syscalls; the application supplies one by reading `CLOCK_MONOTONIC` when
+the press is **delivered**. The kernel already stamps every `InputEvent` with `time_ns` at the
+interrupt and `libinput::Logical` drops it, so the real press time is unavailable above the
+compositor's input thread.
+
+**The error is one-directional and small**, which is why this is deferred rather than blocking: a
+client stalled between two *deliberate* single clicks receives them closer together than they were
+made and can read them as a double. It cannot turn a real double click into two singles, because
+delivery cannot pull events further apart than the stall that bunched them. Both X11 and Wayland
+carry a timestamp on every input event, and for this reason.
+
+Fixing it means a timestamp through `libinput::Logical`, the compositor, and `PointerEvent` — a
+wire-format change with a spec doc and about forty construction sites, which is its own piece of
+work rather than a passenger on a double click. **Trigger: the first misfire anyone notices, or
+the next change that touches the input path's shape for another reason** — whichever comes first,
+since the plumbing is the cost and it is the same plumbing either way.
+
 **Showing hidden files from `nxedit`'s chooser — `TODO(chooser-hidden)`.** M14 Part D gave
 `nxfiles` a `Ctrl+H`, and the chooser hides dotfiles for the same reason on the same day: a
 browser that hides them and a chooser that does not are one directory listed two ways by two
