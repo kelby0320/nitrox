@@ -2030,6 +2030,32 @@ mod list_view_tests {
         labels.iter().map(|&(key, label)| ListRow { key, label, marked: false }).collect()
     }
 
+    /// A **marked** row is drawn as a selected one, and an unmarked one is not.
+    ///
+    /// **Asserted on the tree, because nothing else can be.** `check-display` renders the guest's
+    /// expected picture with this same code, so a broken highlight is identical on both sides by
+    /// construction; `check-login` presses rows and reads no pixels. Breaking `|| r.marked` left
+    /// the entire host suite green — 309 tests — until this existed (PR #285 review, worth fixing
+    /// 5).
+    #[test]
+    fn a_marked_row_is_drawn_like_a_selected_one() {
+        fn nodes<M>(e: &Element<M>) -> usize {
+            1 + e.children().map(nodes).sum::<usize>()
+        }
+        let label = [(1u64, "alpha"), (2, "beta")];
+        let build = |marked: bool, selected: Option<usize>| {
+            let mut r = rows(&label);
+            r[1].marked = marked;
+            let mut st = ListState { selected, offset: 0 };
+            nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, &Theme::default()))
+        };
+        let plain = build(false, None);
+        let marked = build(true, None);
+        let selected = build(false, Some(1));
+        assert!(marked > plain, "a marked row must cost more layers than a resting one");
+        assert_eq!(marked, selected, "and be drawn as the selected row is");
+    }
+
     /// The whole point of the widget: a hundred rows cost as many elements as fit.
     #[test]
     fn only_the_visible_rows_become_elements() {

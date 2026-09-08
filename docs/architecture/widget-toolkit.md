@@ -1,6 +1,8 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-04), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-08), and this document describes what exists.**
+M14 Part D added `click.rs` — a pure run counter that answers "how many clicks is this", given a
+position and a time, so a double click needs no clock inside a module that may not have one.
 `window::Child` hosts **top-level** windows as of M14 Part B, which is what lets one process own
 several — all three applications do. M14 Part C added `chooser.rs` — a file chooser as a widget over a
 listing the application supplies, one tree for both Open and Save As; see §8.3.
@@ -463,7 +465,7 @@ the widget set that is a small type system rather than a function:
 | Piece | What it is |
 |---|---|
 | `Accel` | A chord and how it reads — `Ctrl+Shift+T`. **Exact on modifiers**, not a subset test, so `Ctrl+V` and `Ctrl+Shift+V` are different chords |
-| `Item` | An action — label, optional `Accel`, message, `enabled` — or a `Separator` |
+| `Item` | An action — label, optional `Accel`, message, `enabled`, and `marked` — or a `Separator`. `marked` draws a bullet in a fixed-width column, so a menu that *sets* something says what it is set to (M14 Part D) |
 | `Menu` | A title and its items |
 | `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key` |
 | `KeyOutcome::Chose` | **Names the menu as well as the row.** Choosing closes, so a caller that asked `open()` afterwards would get `None` and lose the message |
@@ -856,7 +858,8 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 - **Scrolling containers.** The terminal's scrollback is the `custom` grid's own business;
   a general scroll viewport is a different widget with clipping and virtualisation
   questions. Trigger was "the file browser" — **which landed in M10 Part B (2026-08-31) and did
-  not fire it**: `nxfiles`' whole content is one `list_view`, which carries its own scrolling, so
+  not fire it**: `nxfiles`' content is `list_view`s — the listing, and since M14 Part D a sidebar
+  beside it — each carrying its own scrolling, so
   nothing needed a container that scrolls. The trigger stands, narrowed to what would actually
   produce one: **chrome that must stay put while content moves under it** — a path strip beside a
   scrolling pane, or the editor's gutter.

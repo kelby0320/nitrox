@@ -140,7 +140,12 @@ pub const DEFAULT_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
 pub const SIDEBAR_KEY: u64 = 26;
 /// Where the sidebar's rows are keyed from — clear of the listing's and of the chrome's, for the
 /// reason [`LIST_ROW_KEY`] gives.
-pub const SIDEBAR_ROW_KEY: u64 = 2000;
+///
+/// **Unreachable rather than merely distant**, which is the difference `TAB_KEY_BASE` already
+/// knew and this did not: at `2000` it sat exactly `1000` above `LIST_ROW_KEY`, so listing row
+/// 1000 *was* the sidebar's first row and hovering either lit both. A directory with a thousand
+/// entries is ordinary; one with `1 << 62` is not (PR #285 review, worth fixing 4).
+pub const SIDEBAR_ROW_KEY: u64 = 1 << 62;
 
 /// The place a sidebar key names, or `None` if it is not a sidebar row's.
 fn place_of(key: u64) -> Option<usize> {
@@ -926,6 +931,12 @@ impl App {
         // the selection reset above it.
         self.marked.clear();
         self.anchor = None;
+        // **And the click run ends here for the reason a drag ends it** (PR #285 review, optional
+        // 8): the second click of a double click navigates, so a third press moments later would
+        // be run 3 and open whatever is now row 0 — a file in a directory that appeared a tenth
+        // of a second ago. Three fast clicks is a thing people do.
+        self.clicks.reset();
+        self.click_run = 1;
         // A listing supersedes whatever the last row press had to say about itself.
         self.notice = None;
         // **And a question about a directory you have left is not a question worth keeping**
@@ -1203,6 +1214,11 @@ impl App {
                         None => None,
                     };
                     p.list.offset = 0;
+                    // **The anchor follows too** (PR #285 review, optional 7). It is an index
+                    // like the selection, so leaving it behind means a later Shift-click extends
+                    // from wherever that row now sits — a range measured from a file the person
+                    // is not looking at.
+                    self.anchor = self.pane().list.selected;
                 }
             }
             // **A listing, because the hidden ones are not held.** See [`Msg::ToggleHidden`].
@@ -1256,7 +1272,16 @@ impl App {
             // The field starts empty rather than pre-filled with the current name. Pre-filling
             // would need a selection and a caret to be useful — a person would have to clear it
             // before typing — and the field has neither yet.
-            _ => self.prompt = Some((a, target, TextFieldState::new())),
+            //
+            // **And the location bar closes, which is the other half of a rule that was only
+            // half true** (PR #285 review, blocking 1). `key` checks the bar first and `view`
+            // draws the prompt first, so with both open the screen showed one field and the
+            // keyboard fed the other: every character went into a bar nobody could see, and
+            // Enter navigated somewhere instead of creating the file.
+            _ => {
+                self.location = None;
+                self.prompt = Some((a, target, TextFieldState::new()));
+            }
         }
     }
 
@@ -1510,10 +1535,10 @@ impl App {
     /// fail on their own, and reporting them as one would be a single sentence about four
     /// answers. Nothing here reads the filesystem: `main` refuses a destination that is taken,
     /// which is where that promise already lives.
-    pub fn pasted(&mut self, verb: librsproto::clipboard::PathVerb, paths: &[&str]) {
+    pub fn pasted(&mut self, verb: librsproto::clipboard::PathVerb, paths: &[(&str, bool)]) {
         let dir = self.pane().path.clone();
         let mut queued = 0usize;
-        for from in paths {
+        for (from, is_dir) in paths {
             let name = libfs::basename_str(from);
             if name.is_empty() {
                 continue;
@@ -1531,10 +1556,17 @@ impl App {
                 librsproto::clipboard::PathVerb::Cut => {
                     FileOp::MoveInto { from: String::from(*from), to }
                 }
+                // **Whether it is a directory comes from the binary**, which asked the
+                // filesystem — the clipboard carries paths and nothing else, and this crate makes
+                // no syscalls. A copy queued as a file copy for a *folder* reaches
+                // `libfs::copy_file`, whose first act is asking for a size a directory has not
+                // got, so it reported "could not copy it" for an ordinary request. `Duplicate`
+                // has carried `dir` for exactly this reason since M12; the paste path bypassed it
+                // (PR #285 review, worth fixing 3).
                 librsproto::clipboard::PathVerb::Copy => FileOp::Copy {
                     from: String::from(*from),
                     to,
-                    dir: false,
+                    dir: *is_dir,
                 },
             });
         }
@@ -2021,6 +2053,21 @@ impl App {
     /// Whether any filesystem work is queued.
     pub fn has_ops(&self) -> bool {
         !self.ops.is_empty()
+    }
+
+    /// Report what a *batch* of operations did, when one sentence cannot cover them.
+    ///
+    /// **Both numbers when both happened**, because "copied" after three refusals is the browser
+    /// telling somebody their files arrived when they did not — and the "nothing overwrites"
+    /// promise is only worth having if it is visible when it fires.
+    pub fn operated_many(&mut self, done: usize, refused: usize, why: &str) {
+        self.notice = Some(if refused == 0 {
+            alloc::format!("{done} done")
+        } else if done == 0 {
+            alloc::format!("{refused} refused: {why}")
+        } else {
+            alloc::format!("{done} done, {refused} refused: {why}")
+        });
     }
 
     /// Report what an operation did, and say where to look next.
@@ -3360,6 +3407,10 @@ mod tests {
         assert_eq!(libinput::keymap::to_char(HIDDEN_KEYCODE, 0), Some(b'h'));
         assert_eq!(libinput::keymap::to_char(LOCATION_KEYCODE, 0), Some(b'l'));
         assert_eq!(libinput::keymap::to_char(PROPERTIES_KEYCODE, 0), Some(b'i'));
+        // **All six of this part's chords, not three of them** (PR #285 review, optional 10).
+        assert_eq!(libinput::keymap::to_char(CUT_KEYCODE, 0), Some(b'x'));
+        assert_eq!(libinput::keymap::to_char(COPY_KEYCODE, 0), Some(b'c'));
+        assert_eq!(libinput::keymap::to_char(PASTE_KEYCODE, 0), Some(b'v'));
     }
 
     /// Hovering a listing row must not light a piece of chrome.
@@ -3396,6 +3447,51 @@ mod tests {
             }
         }
         let _ = a.view(&ui, None);
+    }
+
+    /// A re-sort moves the anchor with the file, not just the selection.
+    #[test]
+    fn the_anchor_follows_the_file_across_a_re_sort() {
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(0)));
+        assert_eq!(picked(&a), alloc::vec!["f0.txt"]);
+
+        a.update(Msg::SetOrder(libfs::Order::NameDesc));
+        // `f0.txt` is row 4 now. A Shift-click on row 2 must extend from *there*, not from 0.
+        a.note_press(libdraw::geom::Point::new(40, 100), 2_000, MOD_SHIFT);
+        a.update(Msg::Press(row(2)));
+        // Rows 2..=4 under `NameDesc` are `f2`, `f1`, `f0` — and `selection()` reports them in
+        // *listing* order, which is the order they are on screen. **A stale anchor would have
+        // given `f4, f3, f2`**, the range from row 0, which is the distinction this pins.
+        assert_eq!(
+            picked(&a),
+            alloc::vec!["f2.txt", "f1.txt", "f0.txt"],
+            "the range runs from the row the person can see highlighted"
+        );
+    }
+
+    /// A navigation ends the click run, so the click after it is a first click.
+    ///
+    /// **The second click of a double click navigates**, which is what makes this reachable: a
+    /// third press moments later would otherwise open whatever is now row 0.
+    #[test]
+    fn a_navigation_abandons_the_run() {
+        let at = libdraw::geom::Point::new(40, 60);
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::dir("work"), Entry::file("a.txt")]);
+        a.note_press(at, 1_000, 0);
+        a.update(Msg::Press(row(0)));
+        a.note_press(at, 1_120, 0);
+        a.update(Msg::Press(row(0)));
+        assert_eq!(a.take_goto().as_deref(), Some("/home/work"), "the double click descended");
+
+        // The listing arrives, and a third press lands on it.
+        a.show("/home/work", alloc::vec![Entry::file("inside.txt")]);
+        a.note_press(at, 1_240, 0);
+        a.update(Msg::Press(row(0)));
+        assert_eq!(a.take_open(), None, "it selected rather than opening");
     }
 
     // --- cut, copy and paste of files (M14 Part D) ---------------------------
@@ -3459,7 +3555,7 @@ mod tests {
         assert!(a.take_clip_read(), "the binary is asked to read the ring");
         assert!(!a.take_clip_read(), "and asked once");
 
-        a.pasted(PathVerb::Copy, &["/home/a.txt", "/home/b.txt"]);
+        a.pasted(PathVerb::Copy, &[("/home/a.txt", false), ("/home/b.txt", false)]);
         let first = a.take_op().expect("one per path");
         let second = a.take_op().expect("and the second");
         assert_eq!(
@@ -3474,7 +3570,7 @@ mod tests {
         assert_eq!(a.take_op(), None, "and no more than that");
 
         // A cut pastes as a move.
-        a.pasted(PathVerb::Cut, &["/home/a.txt"]);
+        a.pasted(PathVerb::Cut, &[("/home/a.txt", false)]);
         assert!(matches!(a.take_op(), Some(FileOp::MoveInto { .. })));
     }
 
@@ -3486,9 +3582,35 @@ mod tests {
     fn pasting_a_file_into_its_own_directory_does_nothing() {
         let mut a = app();
         a.show("/home", alloc::vec![Entry::file("a.txt")]);
-        a.pasted(PathVerb::Copy, &["/home/a.txt"]);
+        a.pasted(PathVerb::Copy, &[("/home/a.txt", false)]);
         assert_eq!(a.take_op(), None, "no operation was queued");
         assert_eq!(a.notice.as_deref(), Some("nothing to paste here"));
+    }
+
+    /// A pasted **folder** is queued as a tree copy, not a file copy.
+    ///
+    /// **`copy_file` on a directory merely fails**, and reported "could not copy it" for an
+    /// ordinary request — the same hazard `Duplicate` has carried `dir` for since M12, which the
+    /// paste path bypassed (PR #285 review, worth fixing 3). The browser cannot tell a folder
+    /// from a file by its path, so the binary asks the filesystem and hands the answer down.
+    #[test]
+    fn a_pasted_folder_is_a_tree_copy() {
+        let mut a = app();
+        a.show("/home/papers", alloc::vec![]);
+        a.pasted(PathVerb::Copy, &[("/home/work", true)]);
+        assert_eq!(
+            a.take_op(),
+            Some(FileOp::Copy {
+                from: String::from("/home/work"),
+                to: String::from("/home/papers/work"),
+                dir: true
+            })
+        );
+
+        // …and a file is still a file copy, which is the control: a version that always said
+        // `true` would pass the assertion above.
+        a.pasted(PathVerb::Copy, &[("/home/a.txt", false)]);
+        assert!(matches!(a.take_op(), Some(FileOp::Copy { dir: false, .. })));
     }
 
     /// Text on the clipboard is reported rather than pasted as a filename.
@@ -3688,19 +3810,38 @@ mod tests {
     }
 
     /// The sidebar's rows share no key with the listing's or with the chrome's.
+    ///
+    /// **Asserted about the ranges, not about a sample listing.** The first version of this
+    /// listed eight entries and passed while row 1000 *was* the sidebar's first row — a directory
+    /// with a thousand files is ordinary, and a test that cannot reach the collision says nothing
+    /// about it (PR #285 review, worth fixing 4).
     #[test]
     fn a_place_does_not_light_a_listing_row() {
+        // The bases cannot meet however long a directory is: a listing row's key is
+        // `LIST_ROW_KEY + i`, and `i` is bounded by what a filesystem can hold.
+        assert!(
+            SIDEBAR_ROW_KEY - LIST_ROW_KEY > (1u64 << 40),
+            "a listing would have to hold {} entries to reach the sidebar",
+            SIDEBAR_ROW_KEY - LIST_ROW_KEY
+        );
         let mut a = app();
         a.show("/home", (0..8).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect());
         let listing: Vec<u64> = a.list_rows().iter().map(|r| r.key).collect();
-        let places: Vec<u64> =
-            (0..a.places().len() as u64).map(|i| SIDEBAR_ROW_KEY + i).collect();
-        for p in &places {
-            assert!(!listing.contains(p), "sidebar key {p} is also a listing row");
-            assert_ne!(*p, SIDEBAR_KEY);
-            assert_ne!(*p, LIST_KEY);
-            assert_ne!(*p, UP_KEY);
+        for i in 0..a.places().len() as u64 {
+            let p = SIDEBAR_ROW_KEY + i;
+            assert!(!listing.contains(&p), "sidebar key {p} is also a listing row");
+            for (name, chrome) in [
+                ("SIDEBAR_KEY", SIDEBAR_KEY),
+                ("LIST_KEY", LIST_KEY),
+                ("UP_KEY", UP_KEY),
+                ("TAB_STRIP_KEY", TAB_STRIP_KEY),
+                ("PROPS_KEY", PROPS_KEY),
+            ] {
+                assert_ne!(p, chrome, "sidebar key {p} is also {name}");
+            }
         }
+        // And a tab's base is above the sidebar's, which is the third range in this namespace.
+        assert!(TAB_KEY_BASE > SIDEBAR_ROW_KEY, "tabs must stay clear of the sidebar too");
     }
 
     // --- properties (M14 Part D) ---------------------------------------------
@@ -3916,6 +4057,34 @@ mod tests {
         press_key(&mut a, libkern::abi::KEY_BACKSPACE);
         assert_eq!(a.location_text().as_deref(), Some("/hom"), "Backspace edited the field");
         assert_eq!(a.take_goto(), None, "and did not go up a directory");
+    }
+
+    /// The two fields in the path strip cannot both be open.
+    ///
+    /// **One draws and the other takes the keys**, which is what made this worth a test rather
+    /// than a comment: `key` checks the location bar first and `view` draws the prompt first, so
+    /// a state with both set is not a cosmetic muddle — it is a field you cannot see eating every
+    /// keystroke you type (PR #285 review, blocking 1).
+    #[test]
+    fn opening_one_field_closes_the_other() {
+        // The prompt closes the bar.
+        let mut a = app();
+        a.update(Msg::OpenLocation);
+        a.update(Msg::Choose(Action::NewFile));
+        assert_eq!(a.prompt_len(), Some(0), "the prompt is open");
+        assert_eq!(a.location_text(), None, "and the bar is not");
+        // …so typing reaches the prompt and Enter makes a file rather than navigating.
+        press_key(&mut a, KEY_X);
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.take_goto(), None, "nothing navigated");
+        assert!(matches!(a.take_op(), Some(FileOp::Create { .. })), "the file was created");
+
+        // And the bar closes the prompt, which already held.
+        let mut a = app();
+        a.update(Msg::Choose(Action::NewFolder));
+        a.update(Msg::OpenLocation);
+        assert_eq!(a.prompt_len(), None, "the prompt is closed");
+        assert_eq!(a.location_text().as_deref(), Some("/home"));
     }
 
     /// A path that cannot be listed says so rather than doing nothing.

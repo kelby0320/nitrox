@@ -465,6 +465,39 @@ const MARK_W: u32 = 14;
 
 #[cfg(test)]
 mod tests {
+
+    /// A **marked** row draws [`MARK`]; an unmarked one draws nothing in that column.
+    ///
+    /// **The mark is the whole of "a menu says what it is set to"**, and making `popup` never
+    /// emit it left the host suite green until this existed (PR #285 review, worth fixing 5).
+    #[test]
+    fn a_marked_row_draws_the_mark() {
+        fn labels<M>(e: &Element<M>, out: &mut Vec<String>) {
+            if let crate::element::Node::Text(t) = &e.node {
+                out.push(t.clone());
+            }
+            for c in e.children() {
+                labels(c, out);
+            }
+        }
+        let menu = |marked: bool| Menu {
+            title: "View",
+            items: alloc::vec![Item::plain("Newest First", 1u32).marked(marked)],
+        };
+        let theme = Theme::default();
+        let st = MenuState::new(1);
+
+        let mut lit = Vec::new();
+        labels(&popup(&menu(true), &st, 0, None, &theme), &mut lit);
+        assert!(lit.iter().any(|l| l == MARK), "a marked row draws the mark: {lit:?}");
+
+        let mut rest = Vec::new();
+        labels(&popup(&menu(false), &st, 0, None, &theme), &mut rest);
+        assert!(!rest.iter().any(|l| l == MARK), "and an unmarked one does not: {rest:?}");
+        // The label itself is there either way, so this is about the mark and not about the row.
+        assert!(rest.iter().any(|l| l == "Newest First"));
+    }
+
     use super::*;
     use libkern::abi::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP};
 

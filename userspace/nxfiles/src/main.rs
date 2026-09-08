@@ -57,7 +57,7 @@ const BUFFERS: usize = 2;
 ///
 /// The returned string is what the strip shows, so it is written for the person looking at the
 /// window rather than for a log.
-fn perform(ns: u64, op: &FileOp) -> &'static str {
+fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
     // **The destination is tested first, and that is what makes "nothing overwrites" true.**
     // Three of the four refusals this used to claim were unreachable, and one of them was worse
     // than unreachable (PR #268 review, worth fixing 1):
@@ -79,34 +79,34 @@ fn perform(ns: u64, op: &FileOp) -> &'static str {
     match op {
         FileOp::Create { path, dir } => {
             if taken(path) {
-                return "that name is taken";
+                return (false, "that name is taken");
             }
             let made = if *dir {
                 libfs::mkdir(ns, path.as_bytes()).is_ok()
             } else {
                 libfs::create_file(ns, path.as_bytes()).is_ok()
             };
-            if made { "created" } else { "could not create it" }
+            if made { (true, "created") } else { (false, "could not create it") }
         }
         // **Never `replace`**, for rename, copy and move alike: overwriting is a second
         // question, and a browser that answered it silently would be one whose most ordinary
         // mistake — typing a name that is already there — destroys a file.
         FileOp::Rename { from, to } => {
             if taken(to) {
-                return "that name is taken";
+                return (false, "that name is taken");
             }
             match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
-                Ok(()) => "renamed",
-                Err(_) => "could not rename it",
+                Ok(()) => (true, "renamed"),
+                Err(_) => (false, "could not rename it"),
             }
         }
         FileOp::MoveInto { from, to } => {
             if taken(to) {
-                return "there is one there already";
+                return (false, "there is one there already");
             }
             match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
-                Ok(()) => "moved",
-                Err(_) => "could not move it",
+                Ok(()) => (true, "moved"),
+                Err(_) => (false, "could not move it"),
             }
         }
         // **`copy_file`, which maps both sides and copies between the mappings** with no heap at
@@ -115,19 +115,19 @@ fn perform(ns: u64, op: &FileOp) -> &'static str {
         // was always there — `copy_file` on one merely fails.
         FileOp::Copy { from, to, dir } => {
             if taken(to) {
-                return "that name is taken";
+                return (false, "that name is taken");
             }
             if *dir {
                 return match libfs::copy_tree(ns, from.as_bytes(), to.as_bytes(), false, &mut |_, _, _| {})
                 {
-                    Ok(()) => "copied",
-                    Err(_) => "could not copy it",
+                    Ok(()) => (true, "copied"),
+                    Err(_) => (false, "could not copy it"),
                 };
             }
             match libfs::copy_file(ns, from.as_bytes(), to.as_bytes(), false) {
-                Ok(_) => "copied",
-                Err(libfs::FileError::TooLarge) => "too large to copy",
-                Err(_) => "could not copy it",
+                Ok(_) => (true, "copied"),
+                Err(libfs::FileError::TooLarge) => (false, "too large to copy"),
+                Err(_) => (false, "could not copy it"),
             }
         }
         FileOp::Delete { path, dir } => {
@@ -136,7 +136,7 @@ fn perform(ns: u64, op: &FileOp) -> &'static str {
             } else {
                 libfs::unlink_at(ns, path.as_bytes()).is_ok()
             };
-            if r { "deleted" } else { "could not delete it" }
+            if r { (true, "deleted") } else { (false, "could not delete it") }
         }
     }
 }
@@ -795,7 +795,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 Ok(Some((kind, len))) if kind == librsproto::clipboard::CLIP_KIND_PATH => {
                     match librsproto::clipboard::Paths::read(&payload[..len]) {
                         Some(p) => {
-                            let list: Vec<&str> = p.iter().collect();
+                            // **The filesystem is asked what each path is**, because the wire
+                            // carries paths and a copy of a folder is a different operation from
+                            // a copy of a file. `libfs::is_dir` is one resolve per pasted entry,
+                            // at human speed.
+                            let list: Vec<(&str, bool)> = p
+                                .iter()
+                                .map(|path| (path, libfs::is_dir(root_ns, path.as_bytes())))
+                                .collect();
                             app.pasted(p.verb, &list);
                         }
                         // The kind said paths and the bytes are not: a server or a client is
@@ -813,9 +820,25 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // **The whole queue, then one listing.** A paste is several operations and each gets
             // its own line; re-listing between them would read the directory once per file and
             // show it half-done in between.
+            // **Every outcome, not the last one** (PR #285 review, worth fixing 6). The queue
+            // fixed the *op* slot and left the notice with the identical defect: copy four files
+            // into a directory holding three of them and three say "that name is taken" while the
+            // fourth says "copied" — and the strip, which is the person's channel, said *copied*.
+            // The console keeps its line per operation; the strip gets a sentence about all of
+            // them.
             let mut said = "";
+            let mut done = 0usize;
+            let mut refused: Option<&'static str> = None;
+            let mut refusals = 0usize;
             while let Some(op) = app.take_op() {
-                said = perform(root_ns, &op);
+                let (ok, why) = perform(root_ns, &op);
+                said = why;
+                if ok {
+                    done += 1;
+                } else {
+                    refusals += 1;
+                    refused = Some(why);
+                }
                 libkern::debug::Line::new()
                     .s(b"nxfiles: ")
                     .s(said.as_bytes())
@@ -823,7 +846,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     .untrusted(subject(&op).as_bytes())
                     .end();
             }
-            app.operated(said);
+            match (done, refusals, refused) {
+                // One operation keeps the sentence written for it, which is what every other
+                // caller of `operated` produces.
+                (_, 0, _) if done <= 1 => app.operated(said),
+                (_, 0, _) => app.operated_many(done, 0, said),
+                (0, _, Some(why)) if refusals == 1 => app.operated(why),
+                (_, _, Some(why)) => app.operated_many(done, refusals, why),
+                (_, _, None) => app.operated(said),
+            }
             let here = String::from(app.path());
             navigate(app, root_ns, &here);
             // The notice `navigate` cleared is the answer to what just happened, so it is put
