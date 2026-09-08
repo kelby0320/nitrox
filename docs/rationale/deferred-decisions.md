@@ -1488,6 +1488,30 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
+**A press whose release never arrives — `TODO(lost-release)`.** Seen once, in CI, on 2026-09-08:
+`check-login --kvm` timed out on the editor's unsaved-buffer question because the click on its
+close button never completed. The compositor logged the press and **no release**.
+
+**What that rules out, and it is most of the field.** It is not `click-not-acted-on`, whose whole
+signature is *both* halves present and the client doing nothing — releases are logged beside
+presses since PR #280 exactly so these two are different sentences. It is not the diagnostic cap:
+a local run of the same gate reaches that click after 133 of the 256 permitted lines. It is not
+ring overflow: no `SYN_DROPPED` anywhere in the run. So an injected release went missing somewhere
+below the compositor — QEMU's injection, the i8042, the driver ring, or `input-server`.
+
+**Rate: one in six KVM runs of that gate** (one CI failure, one CI re-run pass, four local passes),
+on a branch that added a good deal of injected input earlier in the same gate without touching the
+input path. That is consistent with a pre-existing hazard whose odds rise with the number of
+events, which is the shape the tick-driven sweep in `drivers/ps2` already exists to cover.
+
+**The obvious remedy is known-bad and must not be reached for.** Making `click_at` confirm the
+release and re-send a missing one was tried during PR #280 and made the `nxfiles` drag step fail
+deterministically, three runs out of three — trading one red gate for another. Whatever fixes this
+has to be below the gate.
+
+**Trigger: a second occurrence, or any change to the PS/2 or input-server path** — the second is
+listed because that is where the evidence points and where a fix would land anyway.
+
 **Making a new user's folders on first login — `TODO(home-folders)`.** M14 Part D gave `nxfiles`
 a sidebar of common locations, and the folders it points at — Documents, Downloads, Pictures — are
 staged into the demo home by the image build. That is right while there is exactly one home

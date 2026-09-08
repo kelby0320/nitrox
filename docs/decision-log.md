@@ -24219,3 +24219,47 @@ green suites from a *separate* invocation, which I read as evidence the tree com
 the gate's own build is the check. The same misplacement had already happened once this part, with
 the sidebar step.
 
+---
+
+## 2026-09-08 — a press with no release, and a rule I had and did not use (M14 Part D, CI)
+
+PR #285's first CI run failed the QEMU job: `check-login --kvm` timed out on the editor's
+unsaved-buffer question, because the click on its close button never completed. Every local gate
+had been green.
+
+**The rule was already written down and I did not follow it.** TCG is not a conservative
+approximation of KVM, it is a *slower* one, and the note about that says to run the input gates
+with `--kvm` before pushing anything that touches per-event work. Part D added a great deal of
+injected input across eight batches — a sidebar step, a clipboard step, a click step, arrow
+sequences — and not one local run used `--kvm`. Having the rule and not applying it is worth
+recording separately from the fault, because the fault was found by CI doing what I should have.
+
+**The diagnosis turned on a line that was absent.** The obvious reading was
+`click-not-acted-on` — the intermittent, KVM-favouring click failure this milestone already
+knows. It is not that, and the thing that says so is the *release* line: that fault's whole
+signature is **both** halves in the transcript with the client doing nothing, which is why PR #280
+added release logging in the first place. Here the compositor logged `press at x=571 y=205 win=27`
+and no release at all.
+
+Two other readings were ruled out the same way. The diagnostic cap is 256 lines and a local run
+reaches that click after 133, so the absence is real rather than truncation. And there is no
+`SYN_DROPPED` anywhere in the run, so the ring did not overflow. An injected release went missing
+*below* the compositor.
+
+**Rate: one in six.** One CI failure, one CI re-run pass, four local `--kvm` passes. Filed as
+`TODO(lost-release)` with that evidence rather than left as "a flaky click", because the project
+has twice read a moving failure rate as noise and been wrong both times — the drag hand-off cost
+weeks that way.
+
+**And the remedy that suggests itself is known-bad.** Making `click_at` confirm the release and
+re-send a missing one was tried during PR #280 and made the `nxfiles` drag step fail
+deterministically, three runs out of three. The note there is exact: trading one red gate for
+another is not a bargain. Whatever fixes this belongs below the gate.
+
+**Two smaller process failures in the same stretch, both of the same kind — trusting a signal
+without watching it produce.** A `check-deferrals` I reported as passing had actually failed to
+*build* moments earlier, and I read only the tail of its output. And a "41 suites green" from a
+separate `cargo xtask test` invocation was taken as evidence that the tree a gate was about to
+build would compile; it did not, and that gate never booted. In both cases the check existed, ran,
+and said something I did not read carefully enough.
+
