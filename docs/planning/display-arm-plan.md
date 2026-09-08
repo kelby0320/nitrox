@@ -4722,7 +4722,13 @@ choosers:
       consumed the line. `Session::expect` consumes what it scans past, so two freely interleaving
       sources cannot be waited on in a fixed order after the fact.
 
-### Part D — the browser deepened
+### Part D — the browser deepened ✅ complete (2026-09-08)
+
+**Eight batches.** Two of the boxes below were not on the original list: one was already built and
+found by checking, and one was a bug in shipped code that the sidebar's third set of keyed rows
+would have joined. The one box still open is a *new* deferral this part opened, filed with a
+trigger rather than left implied.
+
 
 **One box was already built**, and it is the third time this milestone's list has been wrong about
 the code — see the 2026-09-03 entry on what an empty grep proves. **A delete confirmation exists**
