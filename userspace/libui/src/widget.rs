@@ -1768,6 +1768,16 @@ pub struct ListRow<'a> {
     pub key: u64,
     /// What the row says.
     pub label: &'a str,
+    /// Whether this row is part of a **multiple** selection, beside `ListState::selected`.
+    ///
+    /// **A property of the row, not a second selection in the state** — the same shape [`Tab`]
+    /// uses. `ListState` is `Copy` and every list in the system builds its rows each frame
+    /// anyway, so a caller that knows a row is picked can just say so; a set inside the state
+    /// would cost every caller a `Vec` for a thing only the file browser has.
+    ///
+    /// Drawn exactly as `selected` is, because to a person they are the same thing: the rows an
+    /// action will act on.
+    pub marked: bool,
 }
 
 /// Which row is selected, and how far the list is scrolled.
@@ -1944,7 +1954,7 @@ pub fn list_view<Msg>(
     let last = (state.offset + visible).min(rows.len());
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
-        let selected = state.selected == Some(i);
+        let selected = state.selected == Some(i) || r.marked;
         // **A selection is blue with a darker edge**, not a lighter grey (M11 Part E, batch 2).
         // The reference draws a one-pixel border in the same blue the focus ring uses and fills
         // the inside with a gradient, and that border is what separates a selected row from the
@@ -2017,7 +2027,7 @@ mod list_view_tests {
     use crate::element::Node;
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
-        labels.iter().map(|&(key, label)| ListRow { key, label }).collect()
+        labels.iter().map(|&(key, label)| ListRow { key, label, marked: false }).collect()
     }
 
     /// The whole point of the widget: a hundred rows cost as many elements as fit.

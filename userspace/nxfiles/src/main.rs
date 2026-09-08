@@ -31,7 +31,7 @@ use libui::paint::{FontMetrics, Theme};
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
 use nxfiles::{
-    App, Entry, FileOp, Gesture, MENU_BAR_KEY, MENU_COUNT, Msg, TITLE,
+    App, Dialog, Entry, FileOp, Gesture, MENU_BAR_KEY, MENU_COUNT, Msg, TITLE,
 };
 
 use alloc::boxed::Box;
@@ -170,16 +170,32 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
     match libfs::list_dir(ns, path.as_bytes()) {
         Ok(entries) => {
             let rows: Vec<Entry> = entries.iter().filter_map(App::entry_of).collect();
-            libkern::debug::Line::new()
-                .s(b"nxfiles: listed ")
-                .untrusted(path.as_bytes())
-                .s(b" - ")
-                .u(rows.len() as u64)
-                .s(b" entries")
-                .end();
+            let read = rows.len();
             app.show(path, rows);
+            // **Counted after `show`, because `show` is what decides which of them the tab
+            // holds.** The count used to be `rows.len()` — what the directory *read* returned —
+            // which was the same number until M14 Part D gave the browser something to hide. A
+            // receipt naming a number nobody can see is worse than none: it is what a gate
+            // counting entries would believe, and it would have gone on agreeing with a hidden
+            // file the browser was quietly still listing.
+            //
+            // Both numbers when they differ, because "two of the three are shown" is the fact,
+            // and a reader who sees only the two has no way to tell a filtered listing from a
+            // small directory.
+            let shown = app.entries().len();
+            let mut l = libkern::debug::Line::new();
+            l.s(b"nxfiles: listed ").untrusted(path.as_bytes()).s(b" - ").u(shown as u64);
+            l.s(b" entries");
+            if read != shown {
+                l.s(b" (").u((read - shown) as u64).s(b" hidden)");
+            }
+            l.end();
         }
         Err(_) => {
+            // **And the window says so too.** The console line has always been here; what was
+            // missing is anything on screen, so a typed path with a typo did nothing visible and
+            // read as a keystroke that had not registered (M14 Part D).
+            app.list_failed(path);
             libkern::debug::Line::new()
                 .s(b"nxfiles: cannot list ")
                 .untrusted(path.as_bytes())
@@ -227,6 +243,53 @@ fn home_of(env: &libstream::wire::Record) -> String {
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_else(|| String::from("/"))
+}
+
+/// Put `bytes` on the clipboard as a list of paths.
+///
+/// **Connects per operation rather than holding a session open**, as `nxedit` and `nxterm` do: a
+/// person copies a handful of times a minute at most, and a held session costs the server a
+/// wait-set slot in a set every application in the window system is in.
+fn clip_put(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf)
+        .map_err(|_| "no /dev/clipboard")?;
+    let r = clip.copy(librsproto::clipboard::CLIP_KIND_PATH, bytes).map(|_| ());
+    clip.close();
+    r.map_err(|_| "the clipboard refused it")
+}
+
+/// Read the newest clipboard entry: its kind, and how many bytes landed in `out`.
+///
+/// `Ok(None)` is an empty ring, which is not a failure — it is what a paste before any copy
+/// finds.
+fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf)
+        .map_err(|_| "no /dev/clipboard")?;
+    let r = clip.paste(0, librsproto::clipboard::CLIP_ANY_SERIAL, out);
+    clip.close();
+    match r {
+        Ok((_, kind, len)) => Ok(Some((kind, len.min(out.len())))),
+        Err(e) if e.is_empty() => Ok(None),
+        Err(e) if e.is_stale() => Err("the clipboard changed"),
+        Err(_) => Err("the clipboard refused"),
+    }
+}
+
+/// The monotonic clock in milliseconds.
+///
+/// **Milliseconds because that is the unit a click run is measured in**; nanoseconds would make
+/// `libui::click`'s constants nine-digit numbers for no gain, since nothing here needs to tell two
+/// presses a microsecond apart from each other.
+fn clock_ms() -> u64 {
+    let mut ns: u64 = 0;
+    // SAFETY: `&raw mut ns` is a valid writable `u64` out-parameter, which is what
+    // `sys_clock_read` requires of its second argument.
+    unsafe {
+        libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::CLOCK_MONOTONIC, (&raw mut ns) as u64)
+    };
+    ns / 1_000_000
 }
 
 /// Block until the compositor has something to say.
@@ -346,11 +409,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let menu_shown: Option<usize> = None;
     let menu_hovered: Option<u64> = None;
     // The delete question's window, alive only while one is being asked (M12 Part A's shape).
-    let confirm: Option<Child> = None;
-    let confirm_hovered: Option<u64> = None;
+    let dialog: Option<(Dialog, Child)> = None;
+    let dialog_hovered: Option<u64> = None;
     let ev = win.wait_handle();
     // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
     let reported_prompt = app.prompt_len();
+    let reported_pick: Option<String> = app.picked_name();
+    let reported_loc: Option<usize> = app.location_text().map(|t| t.chars().count());
 
     /// Everything one window of this browser is.
     ///
@@ -366,9 +431,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         menu: Option<Child>,
         menu_shown: Option<usize>,
         menu_hovered: Option<u64>,
-        confirm: Option<Child>,
-        confirm_hovered: Option<u64>,
+        /// The one dialog window this browser window may have open, and which dialog it is.
+        ///
+        /// **One slot rather than one field per dialog.** The plumbing below — open, close,
+        /// present, route, and deciding which window an event belongs to — was written for the
+        /// delete question and is the same for every dialog after it. The kind rides with the
+        /// window so that a *different* dialog opening replaces it rather than being drawn into
+        /// a frame sized for the last one.
+        dialog: Option<(Dialog, Child)>,
+        dialog_hovered: Option<u64>,
         reported_prompt: Option<usize>,
+        /// The selected row's name, reported on change — see the receipt below.
+        reported_pick: Option<String>,
+        /// How many characters the location bar holds, reported the same way.
+        reported_loc: Option<usize>,
     }
 
     /// Open a window of this browser, dressed and ready to be serviced.
@@ -386,6 +462,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let top = Child::open_sized(win, Role::Normal, (0, 0), size, &ui, font, theme, BUFFERS)?;
         dress(win, top.id());
         let reported_prompt = app.prompt_len();
+        let reported_pick = app.picked_name();
+        let reported_loc = app.location_text().map(|t| t.chars().count());
         Some(Win {
             top,
             app,
@@ -394,9 +472,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             menu: None,
             menu_shown: None,
             menu_hovered: None,
-            confirm: None,
-            confirm_hovered: None,
+            dialog: None,
+            dialog_hovered: None,
             reported_prompt,
+            reported_pick,
+            reported_loc,
         })
     }
 
@@ -409,9 +489,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         menu,
         menu_shown,
         menu_hovered,
-        confirm,
-        confirm_hovered,
+        dialog,
+        dialog_hovered,
         reported_prompt,
+        reported_pick,
+        reported_loc,
     }];
 
     loop {
@@ -431,9 +513,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             menu,
             menu_shown,
             menu_hovered,
-            confirm,
-            confirm_hovered,
+            dialog,
+            dialog_hovered,
             reported_prompt,
+            reported_pick,
+            reported_loc,
         } = &mut wins[wi];
         let window_id = top.id();
         // ---- render ----
@@ -475,7 +559,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
         // window id, so this cannot share the branch above.
         if app.take_confirm_move()
-            && let Some(c) = confirm.as_ref()
+            && let Some((_, c)) = dialog.as_ref()
             && let Some(mut w) = win.window(c.id())
             && w.start_move().is_err()
         {
@@ -590,6 +674,37 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // stronger than before and is not a guarantee — `compositor: focus win=… has=1` would be
         // the real one, and `log_route` caps routed-input lines at eight, long past by here.
         let typed = app.prompt_len();
+        // **What is selected, reported on change** (M14 Part D, decision 5). Since a single click
+        // selects rather than opens, "the click landed and selected the right row" is a fact with
+        // no other outward sign — the window redraws and nothing is logged. On change rather than
+        // per event, like the prompt's receipt below it, so pointing down a listing costs one
+        // line per row rather than one per motion.
+        // **The location bar's length, on change** — the same receipt the name prompt has, and
+        // for the same reason: a gate typing a path needs a per-character acknowledgement, or an
+        // unacknowledged burst becomes a dropped keystroke found later as a wrong path.
+        let loc = app.location_text().map(|t| t.chars().count());
+        if loc != *reported_loc {
+            *reported_loc = loc;
+            match loc {
+                Some(n) => libkern::debug::Line::new()
+                    .s(b"nxfiles: location so far ")
+                    .u(n as u64)
+                    .s(b" chars")
+                    .end(),
+                None => kprint(b"nxfiles: location bar closed\n"),
+            }
+        }
+        let picked = app.picked_name();
+        if picked != *reported_pick {
+            *reported_pick = picked.clone();
+            match picked.as_deref() {
+                Some(name) => libkern::debug::Line::new()
+                    .s(b"nxfiles: selected ")
+                    .untrusted(name.as_bytes())
+                    .end(),
+                None => kprint(b"nxfiles: nothing selected\n"),
+            }
+        }
         if typed != *reported_prompt {
             *reported_prompt = typed;
             if let Some(n) = typed {
@@ -601,58 +716,113 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
-        // ---- the question's window ----
-        match (app.confirming().is_some(), confirm.is_some()) {
-            (true, false) => {
+        // ---- the dialog's window ----
+        //
+        // **Reconciled against the *kind*, not against "is one open".** A dialog replacing another
+        // is a different tree in a differently sized frame, so the window is closed and reopened
+        // rather than redrawn — which is what a `bool` here would silently get wrong.
+        let want = app.dialog();
+        if want != dialog.as_ref().map(|(k, _)| *k) {
+            if let Some((kind, c)) = dialog.take() {
+                c.close(&mut win);
+                kprint(kind.closed());
+            }
+            *dialog_hovered = None;
+            if let Some(kind) = want {
                 // **Said before the window is asked for.** A dialog's first `Configure` is held
                 // for the manager, so a line printed after `Child::open` returned would be
                 // downstream of the shell and racing it to the console (M12 Part A, PR #267).
-                kprint(b"nxfiles: asking before deleting\n");
-                let ask = app.confirm_view(&theme, None);
-                *confirm = Child::open(
+                kprint(kind.opening());
+                let view = app.dialog_view(&theme, None);
+                let opened = Child::open(
                     &mut win,
                     Role::Dialog { parent: window_id },
                     // (0, 0): this client does not know where it is on screen, and a dialog's
                     // offset is a preference the manager overrides anyway.
                     (0, 0),
-                    &ask,
+                    &view,
                     &font,
                     &theme,
                     BUFFERS,
                 );
-                if confirm.is_none() {
-                    kprint(b"nxfiles: could not open the confirmation dialog\n");
-                    app.confirm_failed();
+                match opened {
+                    Some(c) => *dialog = Some((kind, c)),
+                    None => {
+                        kprint(kind.open_failed());
+                        app.dialog_failed();
+                    }
                 }
             }
-            (false, true) => {
-                if let Some(c) = confirm.take() {
-                    c.close(&mut win);
-                }
-                *confirm_hovered = None;
-            }
-            _ => {}
         }
-        if let Some(c) = confirm.as_mut() {
+        if let Some((kind, c)) = dialog.as_mut() {
             let now = c.hovered_key();
-            *confirm_hovered = now;
-            let ask = app.confirm_view(&theme, now);
-            if !c.present(&mut win, &ask, &font, &theme) {
-                kprint(b"nxfiles: the confirmation dialog could not be drawn\n");
+            *dialog_hovered = now;
+            let view = app.dialog_view(&theme, now);
+            if !c.present(&mut win, &view, &font, &theme) {
+                kprint(kind.draw_failed());
             }
         }
 
         // **The filesystem work, here because it is syscalls.** `update` produced a value saying
         // what should happen; this is where it happens, and the listing is read again afterwards
         // so that what the person sees is what is on disk rather than what was asked for.
-        if let Some(op) = app.take_op() {
-            let said = perform(root_ns, &op);
-            libkern::debug::Line::new()
-                .s(b"nxfiles: ")
-                .s(said.as_bytes())
-                .s(b" ")
-                .untrusted(subject(&op).as_bytes())
-                .end();
+        // ---- the clipboard, which is syscalls ----
+        if let Some((verb, paths)) = app.take_clip_push() {
+            let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let mut payload = [0u8; librsproto::clipboard::MAX_CLIP_BYTES];
+            match librsproto::clipboard::encode_paths(verb, &refs, &mut payload) {
+                Some(n) => match clip_put(root_ns, &payload[..n]) {
+                    Ok(()) => libkern::debug::Line::new()
+                        .s(b"nxfiles: clipboard now holds ")
+                        .u(refs.len() as u64)
+                        .s(if verb == librsproto::clipboard::PathVerb::Cut {
+                            b" path(s) to move".as_slice()
+                        } else {
+                            b" path(s) to copy".as_slice()
+                        })
+                        .end(),
+                    Err(e) => app.operated(e),
+                },
+                // **Refused rather than truncated**, and said out loud: half a path is a path to
+                // somewhere else, and this is the one failure here that could act on the wrong
+                // file.
+                None => app.operated("too many paths for one clipboard entry"),
+            }
+        }
+        if app.take_clip_read() {
+            let mut payload = [0u8; librsproto::clipboard::MAX_CLIP_BYTES];
+            match clip_get(root_ns, &mut payload) {
+                Ok(Some((kind, len))) if kind == librsproto::clipboard::CLIP_KIND_PATH => {
+                    match librsproto::clipboard::Paths::read(&payload[..len]) {
+                        Some(p) => {
+                            let list: Vec<&str> = p.iter().collect();
+                            app.pasted(p.verb, &list);
+                        }
+                        // The kind said paths and the bytes are not: a server or a client is
+                        // wrong, and neither is this browser's to fix.
+                        None => app.operated("the clipboard entry is not readable"),
+                    }
+                }
+                Ok(Some(_)) => app.paste_not_paths(),
+                Ok(None) => app.operated("the clipboard is empty"),
+                Err(e) => app.operated(e),
+            }
+        }
+
+        if app.has_ops() {
+            // **The whole queue, then one listing.** A paste is several operations and each gets
+            // its own line; re-listing between them would read the directory once per file and
+            // show it half-done in between.
+            let mut said = "";
+            while let Some(op) = app.take_op() {
+                said = perform(root_ns, &op);
+                libkern::debug::Line::new()
+                    .s(b"nxfiles: ")
+                    .s(said.as_bytes())
+                    .s(b" ")
+                    .untrusted(subject(&op).as_bytes())
+                    .end();
+            }
             app.operated(said);
             let here = String::from(app.path());
             navigate(app, root_ns, &here);
@@ -740,7 +910,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if let Some(m) = w.menu {
                     m.close(&mut win);
                 }
-                if let Some(c) = w.confirm {
+                if let Some((_, c)) = w.dialog {
                     c.close(&mut win);
                 }
                 w.top.close(&mut win);
@@ -782,7 +952,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let Some(wi) = wins.iter().position(|w| {
                 w.top.id() == from
                     || w.menu.as_ref().is_some_and(|m| m.id() == from)
-                    || w.confirm.as_ref().is_some_and(|c| c.id() == from)
+                    || w.dialog.as_ref().is_some_and(|(_, c)| c.id() == from)
             }) else {
                 continue;
             };
@@ -794,8 +964,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 menu,
                 menu_shown,
                 menu_hovered,
-                confirm,
-                confirm_hovered,
+                dialog,
+                dialog_hovered,
                 ..
             } = &mut wins[wi];
             let window_id = top.id();
@@ -855,22 +1025,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 continue;
             }
-            if confirm.as_ref().is_some_and(|c| c.id() == from) {
-                let ask = app.confirm_view(&theme, *confirm_hovered);
-                let mut msgs = confirm
+            if dialog.as_ref().is_some_and(|(_, c)| c.id() == from) {
+                let view = app.dialog_view(&theme, *dialog_hovered);
+                let mut msgs = dialog
                     .as_mut()
-                    .map(|c| c.route(&ask, &font, &theme, &event))
+                    .map(|(_, c)| c.route(&view, &font, &theme, &event))
                     .unwrap_or_default();
                 match event {
-                    // `Esc` is the dialog's, and nothing else is: no key deletes.
-                    WindowEvent::Key(k) => msgs.extend(app.confirm_key(k)),
-                    WindowEvent::Focus(f) => app.confirm_focused = f,
+                    // What a key means is the dialog's own — for the question, `Esc` keeps the
+                    // entry and nothing else answers, because no key may delete.
+                    WindowEvent::Key(k) => msgs.extend(app.dialog_key(k)),
+                    WindowEvent::Focus(f) => app.dialog_focused = f,
                     // A dialog is not dismissed by a press elsewhere — that is a popup's event,
                     // and a question stays until it is answered.
                     WindowEvent::Dismissed => {}
                     // A manager asking the *dialog* to close means the same as its own close
-                    // button: the question goes away and the entry does not.
-                    WindowEvent::CloseRequested => msgs.push(Msg::KeepIt),
+                    // button, and which answer that is belongs to the dialog: for the question it
+                    // is the one that changes nothing.
+                    WindowEvent::CloseRequested => msgs.extend(app.dialog_dismissed()),
                     _ => {}
                 }
                 for msg in msgs {
@@ -900,6 +1072,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Pointer(p) => {
+                    // **Counted before the event is routed** (M14 decision 5), so the message the
+                    // press produces can ask what number the click was. The clock is read here
+                    // because `libui` and `nxfiles`'s own library half make no syscalls — see
+                    // `libui::click` for what reading it at *delivery* rather than at the press
+                    // costs, and `TODO(press-time)` for the fix.
+                    if p.kind == librsproto::surface::POINTER_BUTTON
+                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                        && p.button == libkern::abi::BTN_LEFT
+                    {
+                        app.note_press(libdraw::geom::Point::new(p.x, p.y), clock_ms(), p.modifiers);
+                    }
                     let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {
                         app.update(m);

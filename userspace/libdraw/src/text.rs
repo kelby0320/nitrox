@@ -95,6 +95,17 @@ impl Font {
         libm::ceilf(w.max(0.0)) as u32
     }
 
+    /// Whether the face has a glyph for `c`, rather than the substitute it draws instead.
+    ///
+    /// **A missing glyph is a silent failure**, which is why this is worth being able to ask: a
+    /// character the face does not carry maps to `.notdef` and draws as a blank or a box, with
+    /// nothing reported anywhere. Anything that picks a decorative character — a menu's mark, a
+    /// bullet, an arrow — can pin its choice against the shipped face with a host test instead of
+    /// discovering it in a screenshot.
+    pub fn has_glyph(&self, c: char) -> bool {
+        self.inner.glyph_id(c).0 != 0
+    }
+
     /// The advance of one character — a monospace font's cell width.
     pub fn advance(&self, c: char, px: f32) -> u32 {
         let scaled = self.inner.as_scaled(PxScale::from(px));

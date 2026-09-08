@@ -1275,6 +1275,7 @@ impl App {
             .map(|(i, (name, _))| libui::widget::ListRow {
                 key: CHOOSER_ROW_KEY + i as u64,
                 label: name,
+                marked: false,
             })
             .collect();
         let dir = c.dir.clone();
@@ -2379,7 +2380,9 @@ mod tests {
         let table = fixture.menu_table();
         let mut checked = 0;
         for it in table.iter().flat_map(|m| m.items.iter()) {
-            let Item::Action { accel: Some(acc), msg, label, enabled: true } = it else { continue };
+            let Item::Action { accel: Some(acc), msg, label, enabled: true, .. } = it else {
+                continue;
+            };
             checked += 1;
             // The table has no two rows on one chord, which is the property the old version of
             // this test pinned and the only one it pinned.

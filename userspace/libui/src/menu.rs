@@ -106,6 +106,14 @@ pub enum Item<Msg> {
         msg: Msg,
         /// Whether it can be chosen now.
         enabled: bool,
+        /// Whether the row shows a mark — the state a *setting* row is in.
+        ///
+        /// **A menu that sets something must say what it is set to.** A sort order and a
+        /// "show hidden files" toggle are rows you choose to change a state, and without a mark
+        /// the menu is write-only: you can set the order and never read it back. Availability
+        /// got this treatment in Part A ("shown, not discovered on refusal"); this is the same
+        /// argument for state.
+        marked: bool,
     },
     /// A horizontal rule between groups.
     Separator,
@@ -114,19 +122,29 @@ pub enum Item<Msg> {
 impl<Msg> Item<Msg> {
     /// An enabled row with an accelerator.
     pub fn new(label: &'static str, accel: Accel, msg: Msg) -> Self {
-        Item::Action { label, accel: Some(accel), msg, enabled: true }
+        Item::Action { label, accel: Some(accel), msg, enabled: true, marked: false }
     }
 
     /// An enabled row with no chord.
     pub fn plain(label: &'static str, msg: Msg) -> Self {
-        Item::Action { label, accel: None, msg, enabled: true }
+        Item::Action { label, accel: None, msg, enabled: true, marked: false }
     }
 
     /// The same row, greyed and unpressable.
     pub fn enabled(self, on: bool) -> Self {
         match self {
-            Item::Action { label, accel, msg, .. } => {
-                Item::Action { label, accel, msg, enabled: on }
+            Item::Action { label, accel, msg, marked, .. } => {
+                Item::Action { label, accel, msg, enabled: on, marked }
+            }
+            Item::Separator => Item::Separator,
+        }
+    }
+
+    /// The same row, marked or not — the state a *setting* row is in.
+    pub fn marked(self, on: bool) -> Self {
+        match self {
+            Item::Action { label, accel, msg, enabled, .. } => {
+                Item::Action { label, accel, msg, enabled, marked: on }
             }
             Item::Separator => Item::Separator,
         }
@@ -361,7 +379,7 @@ pub fn popup<Msg: Clone>(
             Item::Separator => rows.push(
                 padding(SEPARATOR_PAD, sized(Size::new(0, 1), fill(theme.border))).key(key),
             ),
-            Item::Action { label, accel, msg, enabled } => {
+            Item::Action { label, accel, msg, enabled, marked } => {
                 let lit = *enabled && (hovered == Some(key) || state.cursor() == Some(i));
                 // **The chord sits in the same row as its label, pushed right by a spacer.** A
                 // menu that only names its actions teaches nothing; the point of the column on
@@ -369,13 +387,24 @@ pub fn popup<Msg: Clone>(
                 // **A flexed empty text is the spacer**, which is what right-aligns the chord
                 // column: `text("")` measures nothing and paints nothing, and `flex(1)` hands it
                 // whatever the widest row leaves over.
+                // **The mark is a fixed-width column, not a prefix on the label.** Prefixing
+                // would move every label sideways as rows changed state, so a menu would appear
+                // to shift under the cursor; a column of its own is what keeps the labels in one
+                // place whether anything is marked or not. Zero width means "as the parent
+                // gives" here, so the size has to be named.
+                // An unmarked row draws *nothing* here rather than a space: the `sized` is what
+                // holds the column open, and a space would put a stray glyph into every label a
+                // caller reads back.
+                let mark: Element<Msg> =
+                    sized(Size::new(MARK_W, 0), text(if *marked { MARK } else { "" }));
                 let body: Element<Msg> = match accel {
                     Some(a) => row(alloc::vec![
+                        mark,
                         text(*label),
                         text("").flex(1),
                         padding(ACCEL_PAD, text(a.label())),
                     ]),
-                    None => row(alloc::vec![text(*label), text("").flex(1)]),
+                    None => row(alloc::vec![mark, text(*label), text("").flex(1)]),
                 };
                 let mut e = menu_row(body, lit, *enabled, theme);
                 if *enabled {
@@ -418,6 +447,21 @@ const SEPARATOR_PAD: Insets = Insets { top: 3, right: 2, bottom: 3, left: 2 };
 
 /// The gap before an accelerator's text, so it never touches its label.
 const ACCEL_PAD: Insets = Insets { top: 0, right: 0, bottom: 0, left: 24 };
+
+/// What a marked row shows in its first column.
+///
+/// **Published so that a test can name it**, which is the point: a character the shipped face does
+/// not carry maps to `.notdef` and draws as a blank or a box with nothing reported, so the choice
+/// is pinned against the real font by `the_menu_mark_exists_in_the_shipped_face` rather than
+/// noticed in a screenshot. A bullet rather than a tick because the same column serves a radio
+/// group (which sort) and a toggle (hidden files), and one glyph for both is one column.
+pub const MARK: &str = "\u{2022}";
+
+/// How wide that column is.
+///
+/// Wide enough for the mark at the sizes a theme asks for, and the same whether a row is marked
+/// or not — see the note in [`popup`] about labels that shift sideways.
+const MARK_W: u32 = 14;
 
 #[cfg(test)]
 mod tests {

@@ -1488,24 +1488,79 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
-**Cut and paste in the file browser — `TODO(file-clipboard)`.** `nxfiles`' *Edit* menu holds
-`copy`, which duplicates the selected entry under a name you type, and nothing else. Cut and
-paste are a **pair**, and a pair that holds something between two gestures is a clipboard however
-it is spelled — so building a private one-slot path buffer in the browser would be a second
-clipboard shipped before the real one. M12 decision 1 makes the clipboard a *resource server*
-precisely so that what you last copied is not readable by everything running, and Part E's own
-scope leaves the door open for this: "the type tag exists so a later image or a typed stream is a
-second kind rather than a second clipboard". A file path is that second kind. **Trigger: Part E's
-ring exists — and since 2026-09-02 it does.**
+**A press whose release never arrives — `TODO(lost-release)`.** Seen once, in CI, on 2026-09-08:
+`check-login --kvm` timed out on the editor's unsaved-buffer question because the click on its
+close button never completed. The compositor logged the press and **no release**.
 
-What the browser needs on top of it is `CLIP_KIND_PATH` beside `CLIP_KIND_TEXT`, an *Edit* menu
-that pushes one and a *paste* that reads one, and a decision about what pasting a path into a
-**text** field should do — the name, or nothing. None of that is Part E's scope, which is why the
-trigger firing moves this from "waiting" to "buildable" rather than closing it.
+**What that rules out, and it is most of the field.** It is not `click-not-acted-on`, whose whole
+signature is *both* halves present and the client doing nothing — releases are logged beside
+presses since PR #280 exactly so these two are different sentences. It is not the diagnostic cap:
+a local run of the same gate reaches that click after 133 of the 256 permitted lines. It is not
+ring overflow: no `SYN_DROPPED` anywhere in the run. So an injected release went missing somewhere
+below the compositor — QEMU's injection, the i8042, the driver ring, or `input-server`.
 
-Nothing is missing meanwhile — moving a file into a folder is a drag, which is the gesture people
-reach for first — and the maintainer asked the question that produced this entry rather than
-assuming an answer (2026-09-02).
+**Rate: one in six KVM runs of that gate** (one CI failure, one CI re-run pass, four local passes),
+on a branch that added a good deal of injected input earlier in the same gate without touching the
+input path. That is consistent with a pre-existing hazard whose odds rise with the number of
+events, which is the shape the tick-driven sweep in `drivers/ps2` already exists to cover.
+
+**The obvious remedy is known-bad and must not be reached for.** Making `click_at` confirm the
+release and re-send a missing one was tried during PR #280 and made the `nxfiles` drag step fail
+deterministically, three runs out of three — trading one red gate for another. Whatever fixes this
+has to be below the gate.
+
+**Trigger: a second occurrence, or any change to the PS/2 or input-server path** — the second is
+listed because that is where the evidence points and where a fix would land anyway.
+
+**Making a new user's folders on first login — `TODO(home-folders)`.** M14 Part D gave `nxfiles`
+a sidebar of common locations, and the folders it points at — Documents, Downloads, Pictures — are
+staged into the demo home by the image build. That is right while there is exactly one home
+shipped with the system and wrong the moment there are real users: a home created by
+`session-mgr` would have none of them, and the sidebar would offer three rows that all say the
+directory is not there.
+
+The right answer is for the session to create them when it first builds a user's namespace, which
+needs a decision about *where the list lives* — a profile default, a skeleton directory, or the
+shell's own — rather than the three lines of `mkdir`. **Trigger: the second home**, whether that
+is a second demo user or the first real one.
+
+**A press time on the wire — `TODO(press-time)`.** M14 Part D's click tracker is *given* a time,
+because `libui` makes no syscalls; the application supplies one by reading `CLOCK_MONOTONIC` when
+the press is **delivered**. The kernel already stamps every `InputEvent` with `time_ns` at the
+interrupt and `libinput::Logical` drops it, so the real press time is unavailable above the
+compositor's input thread.
+
+**The error is one-directional and small**, which is why this is deferred rather than blocking: a
+client stalled between two *deliberate* single clicks receives them closer together than they were
+made and can read them as a double. It cannot turn a real double click into two singles, because
+delivery cannot pull events further apart than the stall that bunched them. Both X11 and Wayland
+carry a timestamp on every input event, and for this reason.
+
+Fixing it means a timestamp through `libinput::Logical`, the compositor, and `PointerEvent` — a
+wire-format change with a spec doc and about forty construction sites, which is its own piece of
+work rather than a passenger on a double click. **Trigger: the first misfire anyone notices, or
+the next change that touches the input path's shape for another reason** — whichever comes first,
+since the plumbing is the cost and it is the same plumbing either way.
+
+**Showing hidden files from `nxedit`'s chooser — `TODO(chooser-hidden)`.** M14 Part D gave
+`nxfiles` a `Ctrl+H`, and the chooser hides dotfiles for the same reason on the same day: a
+browser that hides them and a chooser that does not are one directory listed two ways by two
+windows of one desktop. What the chooser has no way to do is *show* them again. The browser hangs
+its toggle on a View menu and the chooser has no menu — so this needs a chooser-level control,
+which is a decision about the dialog's shape rather than a line of filtering. **Trigger: a person
+who needs to open a dotfile from the editor** — until then the editor still opens one given a
+path, by argument or by a drop, which is how the theme file gets edited today.
+
+**Cut and paste in the file browser — built, M14 Part D (2026-09-08).** `CLIP_KIND_PATH` sits
+beside `CLIP_KIND_TEXT`, the Edit menu holds Cut, Copy and Paste, and a paste reads the ring. The
+third thing this entry asked for — "a decision about what pasting a path into a **text** field
+should do" — was answered by not needing one: the payload is UTF-8 and a text consumer that pastes
+it gets the path as text, which is what a person typing into a field means by pasting a path. The
+kind tag is what lets a *file* consumer treat it as a file instead.
+
+**What the entry did not anticipate is where the verb lives.** A browser that remembered its own
+pending cut would move files for itself and copy them for any other window; the verb is a line in
+the payload, so a cut in one window and a paste in another is the same gesture as within one.
 
 **Tabs run off the end of a window — `TODO(tab-overflow)`.** `libui`'s `tab_strip` gives every
 tab a fixed `TAB_W`, so enough of them are simply not drawn. Sharing the strip out between them

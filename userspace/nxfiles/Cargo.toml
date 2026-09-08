@@ -12,6 +12,7 @@ edition = "2024"
 # check on whether `libui` is usable by somebody who is not extending it at the same time.
 [dependencies]
 libfs = { path = "../libfs" }
+libtime = { path = "../libtime" }
 libui = { path = "../libui" }
 libdraw = { path = "../libdraw", features = ["io"] }
 libsurface = { path = "../libsurface" }

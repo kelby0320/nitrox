@@ -214,7 +214,15 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     every `main`" conversion the toolkit doc has had a trigger for since M12 Part A, done uniformly
     because a first window kept as the loop's own would take the rest with it when closed. Quit
     means every window, asking each exactly as its own close button asks. The same change turned up
-    a real drag bug that had been dismissed as a gate flake twice. **Part C is done** (2026-09-04):
+    a real drag bug that had been dismissed as a gate flake twice. **Part D is done** (2026-09-08) in eight batches: the browser sorts and hides
+    (and `libui`'s menus learned to show what they are set to), a single click selects while a
+    double opens per decision 5, a typeable location bar, one dialog slot in place of a copy of
+    the hosting code per dialog, Properties, a sidebar of common locations, and finally
+    multi-select with cut, copy and paste over a new `CLIP_KIND_PATH` — whose **verb rides on the
+    wire**, because a browser remembering its own pending cut would move files for itself and copy
+    them for every other window. Two of the eight were not on the list: a delete confirmation that
+    turned out to have existed since M12, and a listing row that lit whichever chrome shared its
+    number. **Part C is done** (2026-09-04):
     a file chooser in `libui`, one tree for both Open File and Save As, rendering over a listing the
     application read — decision 3 held without an exception, so `libfs` grew the sort that keeps two
     directory views from disagreeing about what "newest" means. Save As changes what the buffer

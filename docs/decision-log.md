@@ -23864,3 +23864,402 @@ would light *Cancel*; and the per-character receipt fired on the release as well
 it is not row zero — `checked_sub`, not `saturating_sub`, because the saturating version made the
 existing test pass by accident once the base moved.
 
+---
+
+## 2026-09-08 — a menu that sets something says what it is set to (M14 Part D, batch 1)
+
+`nxfiles` grows a **View** menu: four sort orders and a hidden-files toggle. The orders are
+`libfs::Order`'s, which Part C built and nothing had read — three of its four variants had no
+consumer at all until now.
+
+**The toolkit half came first, and it was not on the list.** A menu whose rows *set* something is
+write-only without a mark: you can choose an order and never see which one is in force. Part A
+made availability visible ("shown, not discovered on refusal"); this is the same argument for
+state. `Item::Action` carries a `marked` flag, `popup` draws it in a **fixed-width column** rather
+than as a label prefix — a prefix moves every label sideways as rows change state, so the menu
+appears to shift under the cursor — and an unmarked row draws *nothing* there rather than a space,
+because the `sized` is what holds the column open and a space would put a stray glyph into every
+label a caller reads back. A host test caught exactly that.
+
+**The mark is a bullet, and that is a claim about a font file.** A character the shipped face does
+not carry maps to `.notdef` and draws as a blank or a box with nothing reported anywhere — a
+silent failure of the kind this project keeps writing memos about. So `libdraw::text::Font` grew
+`has_glyph`, and an `xtask` host test asserts the shipped UI face carries `MARK`, with a
+private-use codepoint as the control that proves the check can fail. `xtask` is the only place the
+glyph `libui` picked and the font file the image stages are both in scope.
+
+**Sorting asks for no listing; hiding does.** The asymmetry is the design. An order rearranges the
+entries a tab already holds, so a syscall to reorder a `Vec` this process owns would be a round
+trip for nothing. Hiding *drops* entries — because a row's key is its index into what the tab
+holds, and filtering a view built from a longer list gives one row two numberings, which is how a
+selection comes to name the wrong file — so the ones hidden are not held anywhere and showing them
+again is a fresh listing.
+
+**The selection follows the file, not the row.** `selected` is an index, so leaving it alone
+across a re-sort silently selects whatever lands on that line, and a person watching the name they
+picked jump elsewhere would reasonably conclude the browser had selected something else. The
+negative control for that assertion is one of three run against this batch; all three fail without
+their fix.
+
+**Per tab, not per window.** An order is a property of *this view of this directory*, beside
+`path` and the selection. Navigation keeps the pane, so an order chosen once follows you down a
+tree; a new tab starts at the default, which is the rule Part B settled for a new window — a
+second instance rather than a second view of the first.
+
+**The gate asserts what no host test can.** `check-login` makes a third file in `/home/papers`
+with a leading dot and checks the browser lists **two**, then presses `Ctrl+H` for three and again
+for two. The host tests pin the filtering, the listing request and the mark; what none of them can
+say is that a real directory read through a real server comes back with the entry in it. Both
+directions, and the second is not tidying: a toggle that worked once and not back would leave
+every later count in the gate one too high, discovered several hundred lines away as a rename that
+appeared to add a file.
+
+**The gate found that the browser's receipt counted the wrong thing, on its first run.** The
+`nxfiles: listed … - N entries` line reported what `libfs::list_dir` returned, not what the tab
+holds — the same number for as long as the browser showed everything it read, and wrong the moment
+it hid anything. The step expecting two got three. A receipt naming a number nobody can see is
+worse than no receipt: it is what a gate counting entries believes, and it would have gone on
+agreeing while the browser quietly listed a hidden file. It counts after `show` now, and names
+both numbers when they differ — `2 entries (1 hidden)` — because "two of the three are shown" is
+the fact, and a reader given only the two cannot tell a filtered listing from a small directory.
+That suffix is what the gate asserts; `2 entries` alone would have passed for a browser that never
+filtered.
+
+**One dotfile in one directory found a disagreement between two applications.** `nxedit`'s file
+chooser lists a directory with the same `libfs` calls the browser uses, and its comment already
+said the two "cannot come to disagree about one" — meaning the *order*. They disagreed about the
+*set* the moment the browser learned to hide: one directory listed two ways by two windows of one
+desktop. The chooser hides dotfiles now. What it cannot do is show them — the browser hangs its
+toggle on a View menu and a dialog has no menu — so that is `TODO(chooser-hidden)`, filed rather
+than bodged, and the editor still opens a dotfile given a path.
+
+**And one box was already built.** "A delete confirmation" has existed since M12 — `Action::Delete`
+sets `self.confirm`, `check-login` step 11 drives both answers, four host tests cover it. That is
+the **third** time M14's list has been wrong about the code in the direction of "this is missing",
+after the two the 2026-09-03 entry records. The check costs a grep; the plan is ticked as found
+rather than built, because the alternative is a plan claiming a thing is absent while the gate
+proving it present runs on every commit.
+
+---
+
+## 2026-09-08 — one click points, two clicks act (M14 Part D, batch 2)
+
+Decision 5, built. `nxfiles` selects on a single click and opens on a second, which is what makes
+the first click useful — before this, clicking a file *opened* it, so there was no way to point at
+one without acting on it. The maintainer reported exactly that while finding the Part B drag bug:
+"clicking a file opens the file rather than selecting it, and I think as a result click and drag
+doesn't work". The second half was the drag bug; this is the first.
+
+**`libui::click` counts a run rather than answering a question.** It returns `1`, `2`, `3`, …
+instead of "is this a double click", because Part E wants a triple click to mean a line in
+`nxterm` — a tracker that stopped at two would have to be replaced or doubled for the third press,
+and the counting is the same three lines either way. Pure, as decision 5 requires: it is *given* a
+position and a time, and `libui` makes no syscall.
+
+**Two guards that are easy to leave out and silent when missing.** A run compares against the
+*previous* press rather than the run's first, so a triple click may drift a couple of pixels
+across its three presses without the third being disowned. And the elapsed time is a
+`saturating_sub`: an unsigned subtraction that wrapped would give an interval of billions, so a
+single bad timestamp would make every later press a first one — a desktop where double click
+stopped working and nothing said why. Both have tests, and the distance and time cases are tested
+*separately*, because either alone passes a comparison that ignores the other.
+
+**`Msg::Press` is the pointer's; `Msg::Activate` means open.** Splitting them is what keeps the
+keyboard honest — `Enter` on a selected row has no position and no run to belong to, and a
+keyboard that had to be pressed twice is an interaction nobody has ever wanted. **A drag abandons
+the run**, which is not tidying: a drag begins with a press the tracker has already counted, so
+without it the click after every drag lands as number two and opens something.
+
+**The time is delivery, not the press, and that is a deferral rather than an oversight.**
+`PointerEvent` has no timestamp; `libinput::Logical` drops the `time_ns` the kernel stamps on every
+`InputEvent` at the interrupt, so the press time does not exist above the compositor's input
+thread. The error is one-directional: a stalled client can read two deliberate clicks as one
+double, but delivery cannot pull events further apart than the stall that bunched them, so a real
+double click never becomes two singles. X11 and Wayland both carry a timestamp for this reason and
+`TODO(press-time)` carries the fix — a wire-format change with a spec doc and forty construction
+sites, which is its own work rather than a passenger on a double click.
+
+**It had no gate coverage, and the shape of the gate is why.** `check-login` navigates with `Enter`
+and drags with a press-and-move — deliberately, both — so nothing in it exercises what a *click*
+means, and this entire change would have passed every gate with nothing touched. That is the
+failure mode worth naming: a green gate set is evidence about what the gates do, and an
+interaction nothing drives is an interaction nothing checks.
+
+**Two things the new step needed.** `nxfiles` grew a `selected` receipt, because a click that only
+selects has no outward sign at all — the window redraws and nothing is logged. And the negative
+half — that a single click did *not* open the file — cannot be an `expect`: it scans forward, so
+the open request that would prove failure is precisely the line it would skip past. The step
+checks the transcript slice since the click instead.
+
+**The receipt is change-driven, and the first version of the step did not account for it.** It
+aimed at row 0 and waited for `selected papers` — but a fresh listing already selects row 0, so
+the receipt had been emitted before the click and consumed before the wait. It aims at a *file*
+row now, which is both a live receipt and the stronger assertion: clicking a file is the case that
+changed.
+
+---
+
+## 2026-09-08 — a location bar, and one key doing two things (M14 Part D, batch 3)
+
+`nxfiles` grows a typeable location bar: `Ctrl+L`, seeded with where the tab is.
+
+**Seeded rather than blank**, because the common edit is to the tail of a path — and somebody who
+opened it by accident sees where they are instead of an empty field. **A relative path is joined
+to the current directory**, which is what typing `papers` from `/home` means everywhere else a
+path is typed; an absolute one replaces it.
+
+**While it is open the keyboard is the bar's**, checked before the name prompt's branch and for
+the identical reason: `Backspace` correcting a typo must not also go up a directory. One key doing
+two things is the failure, and this browser now has two fields that would each have made it.
+
+**A failed listing was invisible on screen and is not any more.** `nxfiles: cannot list …` has
+always gone to the console, but the window showed nothing at all — the pane simply stayed where it
+was. That was survivable while every navigation came from a row press or `Backspace`, both of
+which name something that exists; a location bar makes a typo the ordinary case, and "nothing
+happened" is indistinguishable from a keystroke that never arrived.
+
+**One menu row moved four host assertions and a gate constant.** Adding *Go to Location…* to the
+File menu shifted every row after it, including the `Rename` index `check-login` clicks by number.
+All five failures named themselves in a second — which is `the_gate_clicks_the_row_it_means` doing
+exactly what it was built for after this coupling bit twice, both times appearing as a rename
+prompt that never opened, several steps from the menu it was about. The row went *after* the tab
+pair rather than between it: New Tab and Close Tab are one thought, and a row wedged between them
+reads as part of neither.
+
+**Two mistakes of my own, both the same shape.** A doc comment was orphaned again by inserting a
+method *above* an existing one — the fifth occurrence this project has recorded, and the reason
+the rule is "append below". And a scripted negative control failed to apply its patch and reported
+the *unmodified* code passing, which is indistinguishable from a control that fired; it was rerun
+from a file, and deleting the guard does fail the test. A control that errors before it patches
+anything proves nothing, and says `ok`.
+
+---
+
+## 2026-09-08 — one dialog slot, and what a browser will not claim (M14 Part D, batches 4 and 5)
+
+**The seam first, on its own.** Hosting a dialog window — open, close, present, route, and
+deciding which window an event belongs to — is about sixty lines of `main.rs`, written for the
+delete question and identical for every dialog after it. `nxedit` carries three copies of it.
+Rather than add a fourth, `nxfiles` got one slot: `Dialog` is a *kind* that carries its own
+console lines so a new variant cannot forget them, and the App answers `dialog_view`,
+`dialog_key`, `dialog_dismissed` and `dialog_failed` — which puts *what a key means* and *what
+dismissal means* with the dialog instead of hard-coded in the event loop.
+
+**Reconciled against the kind, not against "is one open".** A `bool` there would redraw a new
+dialog into a frame sized for the last one; the kind rides with the window, so a different dialog
+replaces it. The refactor's proof is that `check-login`'s existing steps 11 and 12 — which drive
+the confirmation to both answers — passed unchanged, and it was committed on its own so that
+Properties landed on a gated seam rather than inside one.
+
+**Then Properties, which added no plumbing at all** — a variant, a view, its lines, and a chord.
+That is what the seam was for.
+
+**Two things it refuses to state, and both are the same instinct.** A modification time of `0`
+means "this server does not keep one", which is every namespace listing — so Properties reads
+`unknown` rather than formatting the epoch and stating 1970-01-01 as a fact about a file made this
+morning. `fs-server-ext4` carries the identical note at the other end of the wire: "`0` propagates
+as unknown rather than as 1970-with-confidence". And a folder's size is `—` rather than `0 bytes`,
+because the wire carries zero for a directory and "0 bytes" would be a claim about what is inside
+it. **A number a program does not have is not zero.**
+
+**A size shows both numbers.** The exact count is the fact and the rounded one answers "is this
+big"; showing only the round number cannot tell 1.0 KiB from 1.0 KiB, and showing only the exact
+one makes a person count digits. The boundary is what the test pins — 1023 must stay exact and
+1024 must not read as a bare four-digit number, and a comparison written with the wrong `>=` gets
+one of them right and looks correct on the other.
+
+**The gate asserts that it drew.** A dialog whose tree is undiffable opens, reports its size and
+never paints a frame — the failure Part C spent a boot finding — and from outside that is
+indistinguishable from one that opened and closed. So `Dialog` gained a `closed()` receipt,
+symmetric with `opening()`, and the gate checks both ends plus the slice between them for the
+browser's own complaint.
+
+**`Ctrl+I` exists because the gate wanted it and the feature deserved it.** Properties had no
+chord; driving it meant clicking a menu row by index, which this milestone has already had bite
+twice. Decision 2 makes the chord free — the row carries the accelerator and `accel_match` routes
+it — so the convenience and the testability arrived in the same line.
+
+**And I destroyed the seam's own work reverting a control.** `git checkout -- <file>` on a file
+holding a whole uncommitted batch: a new enum, a dispatch layer, a rename across three sites and a
+fresh test. It is the fourth time this project has recorded that mistake and the first where the
+probe *was* a properly scripted one-line mutation — the habit was intact and the revert was still
+reached for, because a one-line probe feels like it deserves a one-line undo. It cost one command
+to recover only because every edit had been applied from a script kept in the scratchpad. When a
+change is scripted, the script is the backup.
+
+---
+
+## 2026-09-08 — hovering the third file lit the Up button (M14 Part D, batch 6)
+
+`nxfiles` keyed its listing rows by their bare index, and `Router::hovered_key` reports **one
+namespace**: the key of whatever is under the pointer. The chrome compares that against its own
+constants, so a row lit whichever button shared its number. Rows 1, 2, 5, 6 and 7 aliased
+`LIST_KEY`, `UP_KEY`, `STRIP_KEY`, `PATH_KEY` and `NOTICE_KEY` — hovering the third file in any
+directory lit **Up**.
+
+**This is the sibling of a finding already made and already fixed once.** PR #284's review found
+the same defect in `nxedit`'s chooser: rows keyed from zero into the range the dialog's own buttons
+occupied, so row 202 of a long directory lit *Cancel*. That instance was fixed and its siblings
+were not swept — which is exactly what this project's own note about fixing the class rather than
+the instance exists to prevent. `TAB_KEY_BASE`'s doc had worked the hazard out for *tabs* and
+stopped there, so the chrome kept it.
+
+**Found by writing the sidebar**, which wanted a third set of keyed rows and would have aliased
+too. The test was written first and watched fail (`row key 1 is also LIST_KEY`) before anything
+moved — red, then green, which for a bug in shipped code is the only order that proves the test
+is about the bug.
+
+**Rows are keyed from `LIST_ROW_KEY` now, and the messages carry the key rather than the index.**
+`update` converts once, in the one place that knows the numbering, with `checked_sub` — a key below
+the base is *not* row zero. That is the accident the saturating version caused in the chooser,
+where it made an existing test pass by coincidence once the base moved.
+
+**Twenty-four test call sites moved to a `row(i)` helper** that names the base rather than spelling
+a literal. A test naming a bare index is naming a key the tree never produces, which is how a test
+comes to exercise a path no real caller can reach.
+
+---
+
+## 2026-09-08 — a sidebar, and the row that stopped being row zero (M14 Part D, batch 7)
+
+`nxfiles` gets a sidebar of common locations: Home, the three folders under it, and Root.
+
+**One press, not two.** The listing needs a double click because a single one has to be able to
+*select* a file — that is decision 5's whole point. A sidebar row has nothing to select and no
+second verb, so making it wait would be a rule carried past its reason.
+
+**Built from `home`, highlighted from the path.** The places are a function of the home the session
+handed this browser, not of `/home`, which would be wrong for anybody whose home is elsewhere. And
+the highlight is recomputed each frame from where the tab is rather than stored: a remembered
+selection is a second answer to "where am I" and disagrees the moment anything else navigates. The
+test navigates by a route the sidebar knows nothing about and checks the highlight still follows.
+
+**Two spellings, reconciled by a boot.** The folder names live in `nxfiles::DEFAULT_FOLDERS` and in
+the image build's `HOME_FOLDERS`, and `xtask` cannot link the browser — the same reason the gate
+spells a menu row as a number. What keeps them in step is that `check-login` presses *Documents*
+and demands a **listing**: staged under another name, it answers "no such directory" instead.
+
+**The staging is temporary and says so.** First-login creation is the right answer once homes are
+made rather than shipped, and it needs a decision about where the list lives — a profile default, a
+skeleton directory, or the shell's — rather than three lines of `mkdir`. `TODO(home-folders)`,
+triggered by the second home.
+
+**The predicted failure arrived.** A step had pressed Enter on row 0 to descend into `papers`, with
+a comment saying it would fail loudly "if `/home` ever holds a directory sorting before `papers`".
+Three of them now do. Both such steps arrow to `papers` instead, through one `select_papers`
+helper, each arrow acknowledged by the `selected` receipt batch 2 added — which is a per-keystroke
+pace *and* the assertion that the arrow moved where the gate believes.
+
+**The second site was the more interesting one.** It did not press Enter on a fresh listing at all;
+it pressed Enter after a `Backspace` back to `/home`, and a fresh listing selects row 0 — so a step
+that had never mentioned row numbers depended on one. The gate found it three hundred lines from
+the change, as a listing of `/home/Documents` where `/home/papers` was expected.
+
+---
+
+## 2026-09-08 — the verb goes on the wire (M14 Part D, batch 8)
+
+Multi-select, then cut, copy and paste of files — `TODO(file-clipboard)` built, which closes the
+last box of Part D.
+
+**Multi-select came first because the clipboard acts on whatever is picked.** `Ctrl`-click toggles,
+`Shift`-click extends a range in both directions, a plain press replaces. **Picks are names rather
+than indices**: the View menu can reorder a listing under a live selection, and a set of positions
+would afterwards name different files. And **a Ctrl-click never opens**, however fast it repeats —
+somebody building a selection is not asking for anything to happen, which is decision 5's argument
+one step further on.
+
+**`ListRow` gained `marked`; `ListState` did not gain a set.** The state is `Copy` with sixteen
+literal construction sites, so a `Vec` inside it would cost every list in the system an allocation
+for a thing only the browser has. `Tab` already carried a `marked` field, so this is the shape that
+existed rather than a new one. To a person a marked row and a selected row are the same thing —
+the rows an action will act on — so `list_view` draws them identically.
+
+**The verb is on the wire, and that is the decision this batch turns on.** `CLIP_KIND_PATH`'s
+payload is a `cut` or `copy` line followed by one absolute path per line. The cheaper design — the
+browser remembering that it just cut — would **move files for the window that cut them and copy
+them for every other window**, which is a difference nobody can see until it has happened to their
+files. Putting it in the payload makes a cut in one window and a paste in another the same gesture
+as within one.
+
+**Three refusals, each with a test.** An unknown verb is not a copy, or a future third verb — a
+link — would silently duplicate files on every browser that predates it. A payload that does not
+fit is refused rather than truncated, because half a path is a path to somewhere else, and that is
+the one failure here that could act on the wrong file. And pasting a file into the directory it is
+already in does nothing: for a copy, `from == to` opens a file for reading and truncates it for
+writing at the same path.
+
+**The codec's tests do not only round-trip.** A round trip tests the encoder against itself; the
+reader is pinned by handing it bytes a correct writer would never produce — an unknown verb, a
+verb that is a prefix of a real one, an empty verb, blank lines, and payload that is not UTF-8.
+
+**`self.op` became a queue.** A paste of four files is four operations that can each fail on their
+own, and a single slot would have let the last silently replace the three before it. `main` drains
+the queue and re-lists **once**, because a listing between operations reads the directory per file
+and shows it half-done in between.
+
+**`Action::Copy` became `Action::Duplicate`.** It prompts for a name and writes a second file
+beside the first; the new Copy puts a path on the clipboard and does nothing until a paste. Two
+verbs sharing a word is how a menu comes to mean two things.
+
+**The old test that asserted the Edit menu held only Copy carried the reason cut and paste were
+absent** — they are a pair that holds something between two gestures, which is a clipboard however
+it is spelled, so adding them before M12 Part E built the real one would have shipped a second
+clipboard. The replacement says the reason is now satisfied rather than dropping it.
+
+**And the third open question in the deferral answered itself.** It asked "what should pasting a
+path into a *text* field do — the name, or nothing". Neither: the payload is UTF-8, so a text
+consumer pastes the path *as text*, which is what a person means by pasting a path into a field.
+The kind tag is what lets a file consumer treat it as a file instead. A question that needs no
+mechanism is worth recording as answered rather than left open.
+
+**A method note, because it cost a gate run.** A step was added above the closure it uses, so
+`check-login` never booted — and the `cargo xtask test` I had run in the same breath reported 41
+green suites from a *separate* invocation, which I read as evidence the tree compiled. It was not:
+the gate's own build is the check. The same misplacement had already happened once this part, with
+the sidebar step.
+
+---
+
+## 2026-09-08 — a press with no release, and a rule I had and did not use (M14 Part D, CI)
+
+PR #285's first CI run failed the QEMU job: `check-login --kvm` timed out on the editor's
+unsaved-buffer question, because the click on its close button never completed. Every local gate
+had been green.
+
+**The rule was already written down and I did not follow it.** TCG is not a conservative
+approximation of KVM, it is a *slower* one, and the note about that says to run the input gates
+with `--kvm` before pushing anything that touches per-event work. Part D added a great deal of
+injected input across eight batches — a sidebar step, a clipboard step, a click step, arrow
+sequences — and not one local run used `--kvm`. Having the rule and not applying it is worth
+recording separately from the fault, because the fault was found by CI doing what I should have.
+
+**The diagnosis turned on a line that was absent.** The obvious reading was
+`click-not-acted-on` — the intermittent, KVM-favouring click failure this milestone already
+knows. It is not that, and the thing that says so is the *release* line: that fault's whole
+signature is **both** halves in the transcript with the client doing nothing, which is why PR #280
+added release logging in the first place. Here the compositor logged `press at x=571 y=205 win=27`
+and no release at all.
+
+Two other readings were ruled out the same way. The diagnostic cap is 256 lines and a local run
+reaches that click after 133, so the absence is real rather than truncation. And there is no
+`SYN_DROPPED` anywhere in the run, so the ring did not overflow. An injected release went missing
+*below* the compositor.
+
+**Rate: one in six.** One CI failure, one CI re-run pass, four local `--kvm` passes. Filed as
+`TODO(lost-release)` with that evidence rather than left as "a flaky click", because the project
+has twice read a moving failure rate as noise and been wrong both times — the drag hand-off cost
+weeks that way.
+
+**And the remedy that suggests itself is known-bad.** Making `click_at` confirm the release and
+re-send a missing one was tried during PR #280 and made the `nxfiles` drag step fail
+deterministically, three runs out of three. The note there is exact: trading one red gate for
+another is not a bargain. Whatever fixes this belongs below the gate.
+
+**Two smaller process failures in the same stretch, both of the same kind — trusting a signal
+without watching it produce.** A `check-deferrals` I reported as passing had actually failed to
+*build* moments earlier, and I read only the tail of its output. And a "41 suites green" from a
+separate `cargo xtask test` invocation was taken as evidence that the tree a gate was about to
+build would compile; it did not, and that gate never booted. In both cases the check existed, ran,
+and said something I did not read carefully enough.
+

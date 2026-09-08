@@ -4722,18 +4722,169 @@ choosers:
       consumed the line. `Session::expect` consumes what it scans past, so two freely interleaving
       sources cannot be waited on in a fixed order after the fact.
 
-### Part D — the browser deepened
+### Part D — the browser deepened ✅ complete (2026-09-08)
 
-- [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
-      the image build for now; first-login creation is the right answer once there are real
-      users, and is filed rather than built.
-- [ ] **Sort: A–Z, Z–A, oldest first, newest first** — through `libfs`, per decision 3.
-- [ ] **Cut, copy and paste of files** — `TODO(file-clipboard)`, left as a pair in M12 when only
-      copy existed. Wants **multi-select**, which is its own interaction.
-- [ ] **Single click selects, double click opens**, per decision 5.
-- [ ] **Show hidden files**, a **typeable location bar**, and **Properties** (size and mtime,
-      both already on the wire).
-- [ ] **A delete confirmation.**
+**Eight batches.** Two of the boxes below were not on the original list: one was already built and
+found by checking, and one was a bug in shipped code that the sidebar's third set of keyed rows
+would have joined. The one box still open is a *new* deferral this part opened, filed with a
+trigger rather than left implied.
+
+
+**One box was already built**, and it is the third time this milestone's list has been wrong about
+the code — see the 2026-09-03 entry on what an empty grep proves. **A delete confirmation exists**
+and has since M12: `Action::Delete` sets `self.confirm`, `Msg::ConfirmDelete` and `Msg::KeepIt` are
+its two answers, `check-login` step 11 drives both, and four host tests cover it. Ticked below as
+found rather than built, because the alternative is a plan that says a thing is missing while the
+gate that proves it exists runs on every commit.
+
+**Batches**, in dependency order: the View menu, then decision 5's click, then the chrome, then
+the sidebar, then the clipboard — the last two build on what the click settles.
+
+- [x] **Sort: A–Z, Z–A, oldest first, newest first** ✅ — through `libfs`, per decision 3, which is
+      the first reader `Order`'s other three variants have had. **Per tab**, beside `path` and the
+      selection, because it is a property of this view of this directory: navigation keeps the
+      pane, so an order chosen once follows you down a tree, and a new tab starts at the default.
+      Re-ordering asks for **no listing** — the entries are the same entries — and **the selection
+      follows the file rather than the row**, which is the half that is easy to get wrong:
+      `selected` is an index, so leaving it alone silently selects whatever lands on that line.
+- [x] **Show hidden files** ✅ — `Ctrl+H` or the View menu. Off by default: a dot means "not part
+      of what this directory is for", and a browser ignoring it puts a person's configuration in
+      front of them every time they open their home. **Hidden entries are dropped rather than
+      skipped at draw time**, because a row's key is its index into what the tab holds and a view
+      built from a longer list would give one row two numberings. That is why the toggle asks for
+      a *listing* where the sort does not — the asymmetry is the design, not an oversight.
+- [x] **A menu that sets something says what it is set to** ✅, which was not a box and is what
+      made the two above readable. `libui::menu::Item` carries a `marked` flag and `popup` draws it
+      in a fixed-width column — a column rather than a prefix, or labels shift sideways as rows
+      change state. The mark is a bullet, and **`Font::has_glyph` exists so that choice is pinned
+      against the shipped face by a host test**: a character a font does not carry maps to
+      `.notdef` and draws as a blank with nothing reported anywhere.
+- [x] **A receipt that counted what was read rather than what is shown** ✅ — not a box, found by
+      the gate on its first run. `nxfiles: listed … - N entries` reported `libfs::list_dir`'s count,
+      which was the same number until the browser had something to hide. It counts what the tab
+      holds now and names both when they differ (`2 entries (1 hidden)`), which is what the gate
+      asserts — `2 entries` alone would pass for a browser that never filtered.
+- [ ] **`nxedit`'s chooser needs its own `Ctrl+H`** — `TODO(chooser-hidden)`, opened by batch 1.
+      The chooser hides dotfiles now, because a browser that hides them and a chooser that does not
+      are one directory listed two ways by two windows of one desktop; what it has no way to do is
+      *show* them, having no menu to hang the toggle on.
+- [x] **Single click selects, double click opens** ✅, per decision 5. `libui::click` counts a
+      *run* of presses — `1`, `2`, `3`, … rather than answering "double?" — because Part E wants a
+      triple click to mean a line in `nxterm`, and a tracker that stopped at two would be a second
+      tracker for the third press. Pure, as decision 5 requires: it is given a position and a time
+      and `libui` makes no syscall. `Msg::Press` is the pointer's and `Msg::Activate` is "open", so
+      `Enter` still opens directly — the keyboard has no position and no run to belong to. **A
+      drag abandons the run**, or the click after one opens something nobody asked for.
+
+      **The time is the press's delivery, not the press** — `PointerEvent` carries no timestamp
+      and `libinput::Logical` drops the `time_ns` the kernel stamps on every `InputEvent`. The
+      error runs one way only: a stalled client can read two deliberate clicks as a double, and
+      cannot split a real one. `TODO(press-time)` carries the wire-format fix and its trigger.
+
+      **It had no gate coverage and nearly shipped without any**: `check-login` navigates with
+      `Enter` and drags with a press-and-move, so nothing it did touched what a *click* means and
+      the whole change would have passed untouched. The new step clicks a **file** row — the case
+      that changed — and asserts the transcript holds no open request, which `expect` cannot do
+      because it scans forward past the very line that would prove failure. `nxfiles` grew a
+      `selected` receipt for it, since a click that only selects has no other outward sign.
+- [x] **A typeable location bar** ✅ — `Ctrl+L`, or File ▸ Go to Location…, seeded with where
+      the tab is so the common edit is to the tail of a path rather than to a blank. An absolute
+      path replaces where you are; a **relative one is joined to it**, which is what typing
+      `papers` from `/home` should mean. While it is open the keys are its own — `Backspace`
+      corrects a typo rather than going up a directory, which is the rule the name prompt already
+      follows and the same failure it exists to prevent: one key doing two things.
+
+      **A path that cannot be listed now says so.** The console line has always existed; nothing
+      appeared *on screen*, so a typo did nothing visible and read as a keystroke that had not
+      registered — which a location bar makes an everyday case rather than a rare one.
+
+      **Adding one menu row moved four host assertions and one gate constant**, and every one of
+      them named itself in a second. That is `the_gate_clicks_the_row_it_means` doing the job it
+      was built for after this coupling bit twice; the row went *after* the tab pair rather than
+      between it, because New Tab and Close Tab are one thought.
+- [x] **One dialog slot rather than one per dialog** ✅ — not a box, and done first at the
+      maintainer's direction so the feature that needed it landed on a gated seam. Hosting a
+      dialog window is about sixty lines in `main.rs`, written for the delete question and the
+      same for every dialog after it; `nxedit` has three copies. `Dialog` is a kind carrying its
+      own console lines, the App answers `dialog_view`/`dialog_key`/`dialog_dismissed`, and the
+      slot reconciles on the **kind** — a `bool` there would redraw a new dialog into a frame
+      sized for the last one. Proved by `check-login`'s existing confirmation steps passing
+      unchanged.
+- [x] **Properties** ✅ — size and mtime, both already on the wire and both now read. `Ctrl+I`, or
+      File ▸ Properties. **The entry is snapshotted when the row is chosen**, for `Target`'s
+      reason: the listing and the selection both move while a dialog is up, so one that read them
+      late would describe whatever now sits at that position.
+
+      **Two things it refuses to state.** A modification time of `0` means "the server does not
+      keep one" — which is the whole namespace half of every listing — so it reads `unknown`
+      rather than 1970-01-01, the same trap `fs-server-ext4` names at the other end of the wire.
+      And a folder's size is `—` rather than `0 bytes`, which would be a claim about what is
+      inside it. A size shows **both** numbers once it passes a kibibyte: the exact count is the
+      fact, the rounded one answers "is this big".
+
+      The gate asserts it **drew**, not merely opened: an undiffable tree opens, reports its size
+      and never paints, which from outside is indistinguishable from a dialog that opened and
+      closed. So `Dialog` gained a `closed()` receipt to make both ends observable, and the slice
+      between them is checked for the browser's own complaint.
+- [x] **A listing row lit the chrome it shared a number with** ✅ — not a box, found while building
+      the sidebar and fixed as a class rather than an instance. `hovered` is one namespace, so rows
+      keyed `0..n` lit `Up`, the path strip and the notice as the pointer crossed rows 1, 2, 5, 6
+      and 7. The same defect PR #284's review found in `nxedit`'s chooser, whose siblings went
+      unswept; rows are keyed from `LIST_ROW_KEY` now and the messages carry keys.
+- [x] **A sidebar of common locations** ✅, and the default folders it needs — Home, Documents,
+      Downloads, Pictures, Root. **One press, not two**: a listing row needs a double click
+      because a single one has to be able to *select* a file, and a sidebar row has nothing to
+      select and no second verb, so requiring two would be a rule copied past its reason.
+
+      **The places are built from this session's `home`**, not from `/home`, because that is what
+      `desktop-shell` hands every application and a browser that assumed otherwise would be wrong
+      for anybody whose home is elsewhere. **The highlight is derived each frame** from where the
+      tab is rather than remembered — a stored selection would be a second answer to "where am I"
+      and would disagree the moment anything else navigated, which a test checks by navigating a
+      way the sidebar knows nothing about.
+
+      **Staged by the image build, as the plan said**, and first-login creation is
+      `TODO(home-folders)` with a trigger — the second home, whether a demo user or a real one,
+      since a session-created home would have none of these and the sidebar would offer three dead
+      rows. The names are spelled in `nxfiles::DEFAULT_FOLDERS` and in the image build's
+      `HOME_FOLDERS`, and `xtask` cannot link the browser to compare them — so `check-login`
+      presses the *Documents* row and demands a listing, which is what a folder staged under
+      another name would fail.
+
+      **The gate churn was mostly predicted.** Three directories in `/home` reordered the listing,
+      so the two steps that pressed Enter on row 0 to reach `papers` now arrow to it — the older
+      of them carried a comment saying it would fail loudly the day `/home` held a directory
+      sorting first, and it did. The sidebar also moved every *listing* aim right by `SIDEBAR_W`
+      while the strips above kept the full width; one host test caught that on its own.
+- [x] **Multi-select** ✅, which is its own interaction and came first because the clipboard acts
+      on whatever is picked. `Ctrl`-click toggles, `Shift`-click extends a range **both ways
+      round**, a plain press replaces. **Picks are names, not indices**, because the View menu can
+      reorder the listing under a live selection and a set of positions would then name different
+      files. `ListRow` gained a `marked` field rather than `ListState` gaining a set: the state is
+      `Copy` with sixteen literal construction sites, and a `Vec` inside it would cost every list
+      in the system an allocation for a thing only the browser has — `Tab` already carries
+      `marked`, so this is the shape that existed. **A Ctrl-click never opens**, however fast it
+      repeats: somebody building a selection is not asking for anything to happen.
+- [x] **Cut, copy and paste of files** ✅ — `TODO(file-clipboard)` built, with `CLIP_KIND_PATH`
+      beside `CLIP_KIND_TEXT`. **The verb is on the wire**: the payload is a `cut` or `copy` line
+      and then one absolute path per line, because a browser remembering its own pending cut would
+      move files for itself and copy them for any other window — a difference nobody can see until
+      it has happened. Paths are resolved to absolute *before* pushing, since a path is read by
+      whoever reads it.
+
+      Three refusals, each with a test: **an unknown verb is not a copy** (a future third verb — a
+      link — would otherwise silently duplicate files on every browser predating it); **a payload
+      that does not fit is refused rather than truncated**, since half a path is a path to
+      somewhere else; and **pasting a file into the directory it is already in does nothing**,
+      because `from == to` for a copy opens a file for reading and truncates it for writing at the
+      same path.
+
+      `self.op` became a **queue**: a paste of four files is four operations that can each fail on
+      their own, and a single slot would have let the last silently replace the three before it.
+      `Action::Copy` — which prompts for a name — became `Action::Duplicate`, because it and the
+      new Copy are different verbs. The gate carries a path across `/dev/clipboard` between two
+      directories and reads the result back from the **serial** side.
+- [x] **A delete confirmation** ✅ — **built in M12**, found by checking rather than by building.
 
 ### Part E — the terminal and editor deepened
 
