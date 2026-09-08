@@ -121,6 +121,31 @@ pub const TAB_STRIP_KEY: u64 = 24;
 /// a tab on the same number for a large enough folder, and hovering one would highlight the other
 /// (PR #270 review, optional 6). A row index cannot reach the high bit.
 pub const TAB_KEY_BASE: u64 = 1 << 63;
+
+/// Where the listing's rows are keyed from: `LIST_ROW_KEY + i` for row `i`.
+///
+/// **A range of their own, because `hovered` is one namespace.** `Router::hovered_key` reports
+/// whatever is under the pointer and the chrome compares that against its own constants — so rows
+/// keyed by their bare index lit whichever button shared the number, and rows 1, 2, 5, 6 and 7 all
+/// did (`LIST_KEY`, `UP_KEY`, `STRIP_KEY`, `PATH_KEY`, `NOTICE_KEY`). `TAB_KEY_BASE` worked this
+/// out for tabs and the chrome was left with the same hazard; `a_listing_row_does_not_light_the_
+/// chrome` now holds the two apart. The same defect the chooser had, found in PR #284's review.
+pub const LIST_ROW_KEY: u64 = 1000;
+
+/// The row a listing key names, or `None` if it is not a listing row's.
+fn list_row_of(key: u64) -> Option<usize> {
+    key.checked_sub(LIST_ROW_KEY).map(|i| i as usize)
+}
+
+/// `Msg::Press` for the row a key names — `list_view` hands back the key it was given.
+fn press_row(key: u64) -> Msg {
+    Msg::Press(key)
+}
+
+/// `Msg::Grab` likewise.
+fn grab_row(key: u64) -> Msg {
+    Msg::Grab(key)
+}
 /// The key that opens a *window*: `n`, with Ctrl and **Shift**.
 ///
 /// Shift because `Ctrl+N` is "new" in the singular everywhere, and a browser's singular is a tab.
@@ -878,11 +903,16 @@ impl App {
             // before this, clicking a file *opened* it, so there was no way to point at one
             // without acting on it, which is the half the maintainer reported as "clicking a file
             // opens the file rather than selecting it".
-            Msg::Press(i) => {
-                self.pane_mut().list.selected = Some(i as usize);
+            // **The message carries the row's *key*** and this is the one place that knows the
+            // numbering. A key below the base is not row zero — `checked_sub`, not saturating,
+            // for the reason `nxedit`'s chooser learned: the saturating version makes a stray key
+            // act on the first row and makes a test pass by accident.
+            Msg::Press(key) => {
+                let Some(i) = list_row_of(key) else { return };
+                self.pane_mut().list.selected = Some(i);
                 self.notice = None;
                 if self.click_run >= 2 {
-                    self.update(Msg::Activate(i));
+                    self.update(Msg::Activate(i as u64));
                 }
             }
             Msg::Activate(i) => {
@@ -904,10 +934,11 @@ impl App {
             }
             // **Remembered, not acted on.** What a press becomes is decided by what happens
             // next: a release makes it a click, and enough movement makes it a drag.
-            Msg::Grab(i) => {
-                // Resolved here, while the listing this index came from is still the listing.
-                self.pressed =
-                    self.pane().entries.get(i as usize).map(|e| (e.name.clone(), 0, 0));
+            Msg::Grab(key) => {
+                // Resolved here, while the listing this key came from is still the listing.
+                self.pressed = list_row_of(key)
+                    .and_then(|i| self.pane().entries.get(i))
+                    .map(|e| (e.name.clone(), 0, 0));
             }
             // **The drag converts through the widget's own arithmetic** — `ListState::drag_to`,
             // the same `ScrollState::offset_at` `nxterm` uses for its grid — so a list and a
@@ -1296,6 +1327,22 @@ impl App {
     pub fn picked_name(&self) -> Option<String> {
         let p = self.pane();
         p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone())
+    }
+
+    /// The listing's rows as the tree keys them.
+    ///
+    /// **For the test that pins the keys apart from the chrome's.** Building the whole view to
+    /// read them back would work and would also depend on every other thing the view does.
+    pub fn list_rows(&self) -> Vec<libui::widget::ListRow<'_>> {
+        self.pane()
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| libui::widget::ListRow {
+                key: LIST_ROW_KEY + i as u64,
+                label: e.name.as_str(),
+            })
+            .collect()
     }
 
     /// The path the binary owes a listing for, if anything navigated. Clears the record.
@@ -1866,7 +1913,7 @@ impl App {
         let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
         for (i, l) in labels.iter().enumerate() {
-            rows.push(ListRow { key: i as u64, label: l });
+            rows.push(ListRow { key: LIST_ROW_KEY + i as u64, label: l });
         }
         let h = self.list_h();
         // **`Grab` on the press, `Activate` on the click.** A drag is decided when the button
@@ -1880,7 +1927,7 @@ impl App {
         // pointer is holding something and the only thing under it that matters is where it
         // lands.
         let highlight = match self.over {
-            Some(i) => Some(i as u64),
+            Some(i) => Some(LIST_ROW_KEY + i as u64),
             None => hovered,
         };
         let list = list_view(
@@ -1888,8 +1935,8 @@ impl App {
             &mut self.pane_mut().list,
             h,
             ROW_H,
-            Msg::Press,
-            Some(Msg::Grab),
+            press_row,
+            Some(grab_row),
             Some(Msg::Scroll),
             highlight,
             &ui,
@@ -2146,6 +2193,14 @@ mod tests {
         out
     }
 
+    /// A listing row's element key, which is what `Msg::Press` and `Msg::Grab` carry.
+    ///
+    /// **Rows are keyed from `LIST_ROW_KEY`, not from zero** — see its doc for the aliasing that
+    /// forced it. A test naming a bare index is naming a key the tree never produces.
+    fn row(i: u64) -> u64 {
+        LIST_ROW_KEY + i
+    }
+
     fn app() -> App {
         let mut a = App::new("/home");
         a.show(
@@ -2295,7 +2350,7 @@ mod tests {
         // it, so a browser that started a drag on the first pixel would make opening a file by
         // clicking it a matter of luck.
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt
+        a.update(Msg::Grab(row(2))); // a.txt
         assert_eq!(a.pointer_moved(100, 100, 1), Gesture::None, "the first motion fixes the origin");
         assert_eq!(
             a.pointer_moved(100 + DRAG_SLOP - 1, 100, 1),
@@ -2321,7 +2376,7 @@ mod tests {
         // The record has to be cleared by the button coming up, or the *next* press-free motion
         // would start a drag for a row nobody is holding.
         let mut a = app();
-        a.update(Msg::Grab(0));
+        a.update(Msg::Grab(row(0)));
         assert_eq!(a.pointer_moved(10, 10, 1), Gesture::None);
         assert_eq!(a.pointer_moved(10, 10, 0), Gesture::None, "the button came up");
         assert_eq!(a.pointer_moved(400, 400, 1), Gesture::None, "a later motion carries nothing");
@@ -2334,7 +2389,7 @@ mod tests {
         // the keyboard is here — Backspace between the press and the move is one keystroke away.
         // An index remembered across that names a different row; a name names none.
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt, in /home
+        a.update(Msg::Grab(row(2))); // a.txt, in /home
         assert_eq!(a.pointer_moved(10, 10, 1), Gesture::None, "the press is recorded");
 
         a.show("/", alloc::vec![Entry::dir("bin"), Entry::dir("dev"), Entry::file("zzz")]);
@@ -2348,7 +2403,7 @@ mod tests {
 
         // And a listing that still holds the row drags *that* row, whatever moved around it.
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt
+        a.update(Msg::Grab(row(2))); // a.txt
         a.pointer_moved(10, 10, 1);
         a.show("/home", alloc::vec![Entry::file("a.txt"), Entry::dir("new"), Entry::dir("work")]);
         assert_eq!(a.pointer_moved(10 + DRAG_SLOP, 10, 1), Gesture::Moved);
@@ -2363,7 +2418,7 @@ mod tests {
         // The kind is the entry's, not the gesture's: an editor that takes files only must not
         // be highlighted for a folder, and the compositor decides that from what this says.
         let mut a = app();
-        a.update(Msg::Grab(0)); // archive/
+        a.update(Msg::Grab(row(0))); // archive/
         a.pointer_moved(10, 10, 1);
         a.pointer_moved(10 + DRAG_SLOP, 10, 1);
         a.pointer_moved(OUTSIDE.0, OUTSIDE.1, 1);
@@ -2558,7 +2613,7 @@ mod tests {
         // be: it skips the source window when it looks for a drop target, so a drag that came
         // out of this list can never be delivered back to it.
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt
+        a.update(Msg::Grab(row(2))); // a.txt
         a.pointer_moved(100, row_y(&a, 2), 1);
         assert_eq!(a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 2), 1), Gesture::Moved);
         // Over `work/`, which is a directory and therefore a target.
@@ -2576,7 +2631,7 @@ mod tests {
         // A file row is not a destination, and a directory dropped on itself is a rename to a
         // path underneath the thing being moved.
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt
+        a.update(Msg::Grab(row(2))); // a.txt
         a.pointer_moved(100, row_y(&a, 2), 1);
         a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 2), 1);
         // Row 3 is `notes.txt` — a file.
@@ -2585,7 +2640,7 @@ mod tests {
         assert!(a.take_op().is_none(), "a file row is not a folder");
 
         let mut a = app();
-        a.update(Msg::Grab(1)); // work/
+        a.update(Msg::Grab(row(1))); // work/
         a.pointer_moved(100, row_y(&a, 1), 1);
         a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 1), 1);
         assert_eq!(a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 1), 0), Gesture::Dropped);
@@ -2598,7 +2653,7 @@ mod tests {
         // drop target and a pointer highlight cannot come to look different — and the widget
         // needs no state for it.
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt
+        a.update(Msg::Grab(row(2))); // a.txt
         a.pointer_moved(100, row_y(&a, 2), 1);
         a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 2), 1);
         assert_eq!(a.drop_target(), None, "over the file it came from");
@@ -2772,7 +2827,7 @@ mod tests {
             "there is a band below the rows and inside the window, which is the whole hazard"
         );
 
-        a.update(Msg::Grab(1)); // d02
+        a.update(Msg::Grab(row(1))); // d02
         a.pointer_moved(100, row_y(&a, 1), 1);
         a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 1), 1);
         assert_eq!(a.drop_target(), Some(1), "over a real row to start with");
@@ -2964,6 +3019,42 @@ mod tests {
         assert_eq!(libinput::keymap::to_char(PROPERTIES_KEYCODE, 0), Some(b'i'));
     }
 
+    /// Hovering a listing row must not light a piece of chrome.
+    ///
+    /// **`hovered` is one namespace.** `Router::hovered_key` reports the key of whatever is under
+    /// the pointer, and the chrome compares it against its own constants — so a listing row keyed
+    /// by its bare index lights the button that happens to share that number. `TAB_KEY_BASE`'s
+    /// doc already worked this out for tabs; the chrome is the same hazard and was not covered.
+    #[test]
+    fn a_listing_row_does_not_light_the_chrome() {
+        let mut a = app();
+        a.show(
+            "/home",
+            (0..8).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect(),
+        );
+        let ui = UiTheme::default();
+        // Every row's key, as the tree carries it.
+        let keys: Vec<u64> = a.list_rows().iter().map(|r| r.key).collect();
+        for k in &keys {
+            for (name, chrome) in [
+                ("LIST_KEY", LIST_KEY),
+                ("UP_KEY", UP_KEY),
+                ("STRIP_KEY", STRIP_KEY),
+                ("PATH_KEY", PATH_KEY),
+                ("NOTICE_KEY", NOTICE_KEY),
+                ("PROMPT_KEY", PROMPT_KEY),
+                ("BAR_KEY", BAR_KEY),
+                ("STRIP_INNER_KEY", STRIP_INNER_KEY),
+                ("TAB_STRIP_KEY", TAB_STRIP_KEY),
+                ("CONFIRM_TITLE_KEY", CONFIRM_TITLE_KEY),
+                ("PROPS_KEY", PROPS_KEY),
+            ] {
+                assert_ne!(*k, chrome, "row key {k} is also {name}");
+            }
+        }
+        let _ = a.view(&ui, None);
+    }
+
     // --- properties (M14 Part D) ---------------------------------------------
 
     /// A size reads exactly below a kibibyte and both ways above it.
@@ -3006,7 +3097,7 @@ mod tests {
             Entry::dir("work"),
         ]);
         // Row 0 is the directory; row 1 is the file.
-        a.update(Msg::Press(1));
+        a.update(Msg::Press(row(1)));
         a.update(Msg::Choose(Action::Properties));
         assert_eq!(a.dialog(), Some(Dialog::Properties));
 
@@ -3056,7 +3147,7 @@ mod tests {
     fn a_folder_does_not_claim_to_be_empty() {
         let mut a = app();
         a.show("/home", alloc::vec![Entry::dir("work")]);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         a.update(Msg::Choose(Action::Properties));
         let mut out: Vec<String> = Vec::new();
         fn walk<M>(e: &Element<M>, out: &mut Vec<String>) {
@@ -3087,7 +3178,7 @@ mod tests {
         assert_eq!(a.dialog(), None, "nothing is open to begin with");
         assert_eq!(a.dialog_dismissed(), None, "and nothing to dismiss");
 
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         a.update(Msg::Choose(Action::Delete));
         assert_eq!(a.dialog(), Some(Dialog::Confirm), "the question is up");
 
@@ -3210,21 +3301,21 @@ mod tests {
         assert_eq!(names(&a), alloc::vec!["work", "notes.txt"]);
 
         a.note_press(at, 1_000);
-        a.update(Msg::Press(1));
+        a.update(Msg::Press(row(1)));
         assert_eq!(a.pane().list.selected, Some(1), "it selected the row");
         assert_eq!(a.take_open(), None, "and did not open it");
         assert_eq!(a.take_goto(), None);
 
         a.note_press(at, 1_150);
-        a.update(Msg::Press(1));
+        a.update(Msg::Press(row(1)));
         assert_eq!(a.take_open().as_deref(), Some("/home/notes.txt"), "the second click opened it");
 
         // A directory's second click navigates rather than opening.
         a.note_press(at, 5_000);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         assert_eq!(a.take_goto(), None, "still just a selection");
         a.note_press(at, 5_150);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         assert_eq!(a.take_goto().as_deref(), Some("/home/work"));
     }
 
@@ -3238,9 +3329,9 @@ mod tests {
         let mut a = app();
         a.show("/home", alloc::vec![Entry::file("notes.txt")]);
         a.note_press(at, 1_000);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         a.note_press(at, 1_000 + libui::click::RUN_MS + 1);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         assert_eq!(a.take_open(), None, "two deliberate clicks are not a double click");
         assert_eq!(a.pane().list.selected, Some(0), "and the row is still selected");
     }
@@ -3254,7 +3345,7 @@ mod tests {
         let mut a = app();
         a.show("/home", alloc::vec![Entry::file("notes.txt")]);
         a.note_press(libdraw::geom::Point::new(40, 60), 1_000);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         assert_eq!(a.take_open(), None);
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(a.take_open().as_deref(), Some("/home/notes.txt"));
@@ -3273,7 +3364,7 @@ mod tests {
         // press becomes a drag, and a test that called the helper directly would pass for a
         // version that never called it — which is what the first one did.
         a.note_press(libdraw::geom::Point::new(40, 60), 1_000);
-        a.update(Msg::Grab(0));
+        a.update(Msg::Grab(row(0)));
         a.pointer_moved(40, 60, 1);
         // Past the slop in one step, which is the motion that arms the drag.
         assert_eq!(
@@ -3283,7 +3374,7 @@ mod tests {
         );
         a.pointer_moved(40 + DRAG_SLOP, 60, 0);
         a.note_press(libdraw::geom::Point::new(40, 60), 1_150);
-        a.update(Msg::Press(0));
+        a.update(Msg::Press(row(0)));
         assert_eq!(a.take_open(), None, "the click after a drag is a first click");
     }
 
@@ -3693,7 +3784,7 @@ mod tests {
     #[test]
     fn a_drag_that_leaves_in_one_motion_still_hands_off() {
         let mut a = app();
-        a.update(Msg::Grab(2)); // a.txt, a file
+        a.update(Msg::Grab(row(2))); // a.txt, a file
         // The first motion only records the origin — that much was never in doubt.
         assert_eq!(a.pointer_moved(120, row_y(&a, 2), 1), Gesture::None);
         // **One motion, past the slop and past the window's right edge.**
@@ -3713,7 +3804,7 @@ mod tests {
     #[test]
     fn a_drag_that_stays_inside_does_not_hand_off() {
         let mut a = app();
-        a.update(Msg::Grab(2));
+        a.update(Msg::Grab(row(2)));
         assert_eq!(a.pointer_moved(120, row_y(&a, 2), 1), Gesture::None);
         let inside = a.pointer_moved(120, row_y(&a, 1), 1);
         assert!(

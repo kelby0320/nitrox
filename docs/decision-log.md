@@ -24087,3 +24087,34 @@ reached for, because a one-line probe feels like it deserves a one-line undo. It
 to recover only because every edit had been applied from a script kept in the scratchpad. When a
 change is scripted, the script is the backup.
 
+---
+
+## 2026-09-08 — hovering the third file lit the Up button (M14 Part D, batch 6)
+
+`nxfiles` keyed its listing rows by their bare index, and `Router::hovered_key` reports **one
+namespace**: the key of whatever is under the pointer. The chrome compares that against its own
+constants, so a row lit whichever button shared its number. Rows 1, 2, 5, 6 and 7 aliased
+`LIST_KEY`, `UP_KEY`, `STRIP_KEY`, `PATH_KEY` and `NOTICE_KEY` — hovering the third file in any
+directory lit **Up**.
+
+**This is the sibling of a finding already made and already fixed once.** PR #284's review found
+the same defect in `nxedit`'s chooser: rows keyed from zero into the range the dialog's own buttons
+occupied, so row 202 of a long directory lit *Cancel*. That instance was fixed and its siblings
+were not swept — which is exactly what this project's own note about fixing the class rather than
+the instance exists to prevent. `TAB_KEY_BASE`'s doc had worked the hazard out for *tabs* and
+stopped there, so the chrome kept it.
+
+**Found by writing the sidebar**, which wanted a third set of keyed rows and would have aliased
+too. The test was written first and watched fail (`row key 1 is also LIST_KEY`) before anything
+moved — red, then green, which for a bug in shipped code is the only order that proves the test
+is about the bug.
+
+**Rows are keyed from `LIST_ROW_KEY` now, and the messages carry the key rather than the index.**
+`update` converts once, in the one place that knows the numbering, with `checked_sub` — a key below
+the base is *not* row zero. That is the accident the saturating version caused in the chooser,
+where it made an existing test pass by coincidence once the base moved.
+
+**Twenty-four test call sites moved to a `row(i)` helper** that names the base rather than spelling
+a literal. A test naming a bare index is naming a key the tree never produces, which is how a test
+comes to exercise a path no real caller can reach.
+

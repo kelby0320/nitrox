@@ -4820,6 +4820,11 @@ the sidebar, then the clipboard — the last two build on what the click settles
       and never paints, which from outside is indistinguishable from a dialog that opened and
       closed. So `Dialog` gained a `closed()` receipt to make both ends observable, and the slice
       between them is checked for the browser's own complaint.
+- [x] **A listing row lit the chrome it shared a number with** ✅ — not a box, found while building
+      the sidebar and fixed as a class rather than an instance. `hovered` is one namespace, so rows
+      keyed `0..n` lit `Up`, the path strip and the notice as the pointer crossed rows 1, 2, 5, 6
+      and 7. The same defect PR #284's review found in `nxedit`'s chooser, whose siblings went
+      unswept; rows are keyed from `LIST_ROW_KEY` now and the messages carry keys.
 - [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
       the image build for now; first-login creation is the right answer once there are real
       users, and is filed rather than built.
