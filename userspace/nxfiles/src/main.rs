@@ -31,7 +31,7 @@ use libui::paint::{FontMetrics, Theme};
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
 use nxfiles::{
-    App, Entry, FileOp, Gesture, MENU_BAR_KEY, MENU_COUNT, Msg, TITLE,
+    App, Dialog, Entry, FileOp, Gesture, MENU_BAR_KEY, MENU_COUNT, Msg, TITLE,
 };
 
 use alloc::boxed::Box;
@@ -377,8 +377,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let menu_shown: Option<usize> = None;
     let menu_hovered: Option<u64> = None;
     // The delete question's window, alive only while one is being asked (M12 Part A's shape).
-    let confirm: Option<Child> = None;
-    let confirm_hovered: Option<u64> = None;
+    let dialog: Option<(Dialog, Child)> = None;
+    let dialog_hovered: Option<u64> = None;
     let ev = win.wait_handle();
     // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
     let reported_prompt = app.prompt_len();
@@ -399,8 +399,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         menu: Option<Child>,
         menu_shown: Option<usize>,
         menu_hovered: Option<u64>,
-        confirm: Option<Child>,
-        confirm_hovered: Option<u64>,
+        /// The one dialog window this browser window may have open, and which dialog it is.
+        ///
+        /// **One slot rather than one field per dialog.** The plumbing below — open, close,
+        /// present, route, and deciding which window an event belongs to — was written for the
+        /// delete question and is the same for every dialog after it. The kind rides with the
+        /// window so that a *different* dialog opening replaces it rather than being drawn into
+        /// a frame sized for the last one.
+        dialog: Option<(Dialog, Child)>,
+        dialog_hovered: Option<u64>,
         reported_prompt: Option<usize>,
         /// The selected row's name, reported on change — see the receipt below.
         reported_pick: Option<String>,
@@ -433,8 +440,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             menu: None,
             menu_shown: None,
             menu_hovered: None,
-            confirm: None,
-            confirm_hovered: None,
+            dialog: None,
+            dialog_hovered: None,
             reported_prompt,
             reported_pick,
             reported_loc,
@@ -450,8 +457,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         menu,
         menu_shown,
         menu_hovered,
-        confirm,
-        confirm_hovered,
+        dialog,
+        dialog_hovered,
         reported_prompt,
         reported_pick,
         reported_loc,
@@ -474,8 +481,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             menu,
             menu_shown,
             menu_hovered,
-            confirm,
-            confirm_hovered,
+            dialog,
+            dialog_hovered,
             reported_prompt,
             reported_pick,
             reported_loc,
@@ -520,7 +527,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
         // window id, so this cannot share the branch above.
         if app.take_confirm_move()
-            && let Some(c) = confirm.as_ref()
+            && let Some((_, c)) = dialog.as_ref()
             && let Some(mut w) = win.window(c.id())
             && w.start_move().is_err()
         {
@@ -677,44 +684,49 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
 
-        // ---- the question's window ----
-        match (app.confirming().is_some(), confirm.is_some()) {
-            (true, false) => {
+        // ---- the dialog's window ----
+        //
+        // **Reconciled against the *kind*, not against "is one open".** A dialog replacing another
+        // is a different tree in a differently sized frame, so the window is closed and reopened
+        // rather than redrawn — which is what a `bool` here would silently get wrong.
+        let want = app.dialog();
+        if want != dialog.as_ref().map(|(k, _)| *k) {
+            if let Some((_, c)) = dialog.take() {
+                c.close(&mut win);
+            }
+            *dialog_hovered = None;
+            if let Some(kind) = want {
                 // **Said before the window is asked for.** A dialog's first `Configure` is held
                 // for the manager, so a line printed after `Child::open` returned would be
                 // downstream of the shell and racing it to the console (M12 Part A, PR #267).
-                kprint(b"nxfiles: asking before deleting\n");
-                let ask = app.confirm_view(&theme, None);
-                *confirm = Child::open(
+                kprint(kind.opening());
+                let view = app.dialog_view(&theme, None);
+                let opened = Child::open(
                     &mut win,
                     Role::Dialog { parent: window_id },
                     // (0, 0): this client does not know where it is on screen, and a dialog's
                     // offset is a preference the manager overrides anyway.
                     (0, 0),
-                    &ask,
+                    &view,
                     &font,
                     &theme,
                     BUFFERS,
                 );
-                if confirm.is_none() {
-                    kprint(b"nxfiles: could not open the confirmation dialog\n");
-                    app.confirm_failed();
+                match opened {
+                    Some(c) => *dialog = Some((kind, c)),
+                    None => {
+                        kprint(kind.open_failed());
+                        app.dialog_failed();
+                    }
                 }
             }
-            (false, true) => {
-                if let Some(c) = confirm.take() {
-                    c.close(&mut win);
-                }
-                *confirm_hovered = None;
-            }
-            _ => {}
         }
-        if let Some(c) = confirm.as_mut() {
+        if let Some((kind, c)) = dialog.as_mut() {
             let now = c.hovered_key();
-            *confirm_hovered = now;
-            let ask = app.confirm_view(&theme, now);
-            if !c.present(&mut win, &ask, &font, &theme) {
-                kprint(b"nxfiles: the confirmation dialog could not be drawn\n");
+            *dialog_hovered = now;
+            let view = app.dialog_view(&theme, now);
+            if !c.present(&mut win, &view, &font, &theme) {
+                kprint(kind.draw_failed());
             }
         }
 
@@ -816,7 +828,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if let Some(m) = w.menu {
                     m.close(&mut win);
                 }
-                if let Some(c) = w.confirm {
+                if let Some((_, c)) = w.dialog {
                     c.close(&mut win);
                 }
                 w.top.close(&mut win);
@@ -858,7 +870,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let Some(wi) = wins.iter().position(|w| {
                 w.top.id() == from
                     || w.menu.as_ref().is_some_and(|m| m.id() == from)
-                    || w.confirm.as_ref().is_some_and(|c| c.id() == from)
+                    || w.dialog.as_ref().is_some_and(|(_, c)| c.id() == from)
             }) else {
                 continue;
             };
@@ -870,8 +882,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 menu,
                 menu_shown,
                 menu_hovered,
-                confirm,
-                confirm_hovered,
+                dialog,
+                dialog_hovered,
                 ..
             } = &mut wins[wi];
             let window_id = top.id();
@@ -931,22 +943,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 continue;
             }
-            if confirm.as_ref().is_some_and(|c| c.id() == from) {
-                let ask = app.confirm_view(&theme, *confirm_hovered);
-                let mut msgs = confirm
+            if dialog.as_ref().is_some_and(|(_, c)| c.id() == from) {
+                let view = app.dialog_view(&theme, *dialog_hovered);
+                let mut msgs = dialog
                     .as_mut()
-                    .map(|c| c.route(&ask, &font, &theme, &event))
+                    .map(|(_, c)| c.route(&view, &font, &theme, &event))
                     .unwrap_or_default();
                 match event {
-                    // `Esc` is the dialog's, and nothing else is: no key deletes.
-                    WindowEvent::Key(k) => msgs.extend(app.confirm_key(k)),
-                    WindowEvent::Focus(f) => app.confirm_focused = f,
+                    // What a key means is the dialog's own — for the question, `Esc` keeps the
+                    // entry and nothing else answers, because no key may delete.
+                    WindowEvent::Key(k) => msgs.extend(app.dialog_key(k)),
+                    WindowEvent::Focus(f) => app.dialog_focused = f,
                     // A dialog is not dismissed by a press elsewhere — that is a popup's event,
                     // and a question stays until it is answered.
                     WindowEvent::Dismissed => {}
                     // A manager asking the *dialog* to close means the same as its own close
-                    // button: the question goes away and the entry does not.
-                    WindowEvent::CloseRequested => msgs.push(Msg::KeepIt),
+                    // button, and which answer that is belongs to the dialog: for the question it
+                    // is the one that changes nothing.
+                    WindowEvent::CloseRequested => msgs.extend(app.dialog_dismissed()),
                     _ => {}
                 }
                 for msg in msgs {

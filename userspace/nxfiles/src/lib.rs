@@ -496,7 +496,7 @@ pub struct App {
     /// `Role::Dialog` window, which is what M12 Part A built.
     confirm: Option<Target>,
     /// Whether the *dialog* holds the keyboard, which its own title bar shows.
-    pub confirm_focused: bool,
+    pub dialog_focused: bool,
     /// The dialog's title bar was dragged, and the binary owes a `StartMove` **on its window**.
     confirm_move_requested: bool,
     /// A filesystem operation the binary owes.
@@ -527,6 +527,48 @@ pub enum Gesture {
     Dropped,
     /// The row an internal drag is over has changed, so the frame is stale.
     Moved,
+}
+
+/// Which dialog a browser window has open.
+///
+/// **One slot, not one per dialog** (M14 Part D). A window shows at most one of these at a time,
+/// and the binary's plumbing for hosting one — open, close, present, route, and deciding which
+/// window an event belongs to — is about sixty lines that were written for the delete question
+/// and would otherwise be copied for the next one. `nxedit` has three such copies; this is the
+/// seam that keeps `nxfiles` at zero.
+///
+/// A variant carries the console lines its dialog needs, so adding one cannot forget them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialog {
+    /// "Delete this?" — the one question this browser asks, and the only operation it cannot undo.
+    Confirm,
+}
+
+impl Dialog {
+    /// The line printed **before** the window is asked for.
+    ///
+    /// Before, because a dialog's first `Configure` is held for the manager: a line printed after
+    /// `Child::open` returned would be downstream of the shell and racing it to the console
+    /// (M12 Part A, PR #267).
+    pub fn opening(self) -> &'static [u8] {
+        match self {
+            Dialog::Confirm => b"nxfiles: asking before deleting\n",
+        }
+    }
+
+    /// The line printed when the window could not be created.
+    pub fn open_failed(self) -> &'static [u8] {
+        match self {
+            Dialog::Confirm => b"nxfiles: could not open the confirmation dialog\n",
+        }
+    }
+
+    /// The line printed when a frame could not be drawn.
+    pub fn draw_failed(self) -> &'static [u8] {
+        match self {
+            Dialog::Confirm => b"nxfiles: the confirmation dialog could not be drawn\n",
+        }
+    }
 }
 
 /// What can happen to the browser.
@@ -637,7 +679,7 @@ impl App {
             menus: MenuState::new(MENU_COUNT),
             prompt: None,
             confirm: None,
-            confirm_focused: true,
+            dialog_focused: true,
             confirm_move_requested: false,
             op: None,
             over: None,
@@ -1475,6 +1517,54 @@ impl App {
         core::mem::take(&mut self.confirm_move_requested)
     }
 
+    /// Which dialog this window has open, if any.
+    ///
+    /// **The binary reconciles its one window against this**, so a dialog that opens while
+    /// another is up replaces it rather than being lost — which is what makes the single slot
+    /// safe rather than merely shorter.
+    pub fn dialog(&self) -> Option<Dialog> {
+        self.confirm.as_ref().map(|_| Dialog::Confirm)
+    }
+
+    /// The open dialog's tree.
+    ///
+    /// **Empty when nothing is open**, which cannot be drawn because the window only exists while
+    /// a dialog does — but the type demands an answer and a caller should not have to think about
+    /// it. The same shape `nxedit::App::chooser_view` settled on.
+    pub fn dialog_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+        match self.dialog() {
+            Some(Dialog::Confirm) => self.confirm_view(ui, hovered),
+            None => libui::widget::popup_frame(text(String::new()), ui),
+        }
+    }
+
+    /// What the open dialog does with a key.
+    pub fn dialog_key(&self, k: KeyEvent) -> Option<Msg> {
+        match self.dialog() {
+            Some(Dialog::Confirm) => self.confirm_key(k),
+            None => None,
+        }
+    }
+
+    /// What a manager asking the *dialog's window* to close means.
+    ///
+    /// **The cautious answer, per dialog.** For a question that is the one that changes nothing:
+    /// closing a question must not perform it.
+    pub fn dialog_dismissed(&self) -> Option<Msg> {
+        match self.dialog() {
+            Some(Dialog::Confirm) => Some(Msg::KeepIt),
+            None => None,
+        }
+    }
+
+    /// The dialog's window could not be created, so it cannot be shown.
+    pub fn dialog_failed(&mut self) {
+        match self.dialog() {
+            Some(Dialog::Confirm) => self.confirm_failed(),
+            None => {}
+        }
+    }
+
     /// How many characters have been typed into the name prompt, or `None` when none is open.
     ///
     /// **The receipt for the one thing typed here that is not a navigation key.** A gate driving
@@ -1800,7 +1890,7 @@ impl App {
         };
         let title = title_bar(
             "Delete",
-            self.confirm_focused,
+            self.dialog_focused,
             Msg::DragConfirm,
             // One button, and it is the cautious answer: closing a question must not perform it.
             TitleButtons { minimise: None, maximise: None, close: Some(Msg::KeepIt) },
@@ -2700,6 +2790,44 @@ mod tests {
         assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
         assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
         assert_eq!(libinput::keymap::to_char(HIDDEN_KEYCODE, 0), Some(b'h'));
+    }
+
+    // --- the dialog slot (M14 Part D) ----------------------------------------
+
+    /// The slot reports which dialog is open, and its dismissal is the cautious answer.
+    ///
+    /// **The seam a second dialog will be added through.** The binary hosts one window against
+    /// `dialog()` and reconciles on the *kind*, so what this pins is that the kind tracks the
+    /// state — a `dialog()` stuck on `Some` would leave a window on screen with nothing behind
+    /// it, and one stuck on `None` would close a question mid-answer.
+    #[test]
+    fn the_dialog_slot_tracks_what_is_open() {
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::file("notes.txt")]);
+        assert_eq!(a.dialog(), None, "nothing is open to begin with");
+        assert_eq!(a.dialog_dismissed(), None, "and nothing to dismiss");
+
+        a.update(Msg::Press(0));
+        a.update(Msg::Choose(Action::Delete));
+        assert_eq!(a.dialog(), Some(Dialog::Confirm), "the question is up");
+
+        // **Closing the window must not perform it**, which is what a dialog's own close button
+        // already means and what the manager's request has to mean too.
+        assert_eq!(a.dialog_dismissed(), Some(Msg::KeepIt));
+        // `Esc` is the only key that answers, and it answers the same way.
+        assert_eq!(
+            a.dialog_key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0)),
+            Some(Msg::KeepIt)
+        );
+        assert_eq!(
+            a.dialog_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN, 0)),
+            None,
+            "no key deletes — Enter is the obvious candidate and the obvious accident"
+        );
+
+        a.update(Msg::KeepIt);
+        assert_eq!(a.dialog(), None, "answering closes the slot");
+        assert_eq!(a.take_op(), None, "and nothing was removed");
     }
 
     // --- the location bar (M14 Part D) ---------------------------------------
