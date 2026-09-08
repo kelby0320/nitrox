@@ -170,14 +170,26 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
     match libfs::list_dir(ns, path.as_bytes()) {
         Ok(entries) => {
             let rows: Vec<Entry> = entries.iter().filter_map(App::entry_of).collect();
-            libkern::debug::Line::new()
-                .s(b"nxfiles: listed ")
-                .untrusted(path.as_bytes())
-                .s(b" - ")
-                .u(rows.len() as u64)
-                .s(b" entries")
-                .end();
+            let read = rows.len();
             app.show(path, rows);
+            // **Counted after `show`, because `show` is what decides which of them the tab
+            // holds.** The count used to be `rows.len()` — what the directory *read* returned —
+            // which was the same number until M14 Part D gave the browser something to hide. A
+            // receipt naming a number nobody can see is worse than none: it is what a gate
+            // counting entries would believe, and it would have gone on agreeing with a hidden
+            // file the browser was quietly still listing.
+            //
+            // Both numbers when they differ, because "two of the three are shown" is the fact,
+            // and a reader who sees only the two has no way to tell a filtered listing from a
+            // small directory.
+            let shown = app.entries().len();
+            let mut l = libkern::debug::Line::new();
+            l.s(b"nxfiles: listed ").untrusted(path.as_bytes()).s(b" - ").u(shown as u64);
+            l.s(b" entries");
+            if read != shown {
+                l.s(b" (").u((read - shown) as u64).s(b" hidden)");
+            }
+            l.end();
         }
         Err(_) => {
             libkern::debug::Line::new()

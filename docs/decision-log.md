@@ -23864,3 +23864,79 @@ would light *Cancel*; and the per-character receipt fired on the release as well
 it is not row zero — `checked_sub`, not `saturating_sub`, because the saturating version made the
 existing test pass by accident once the base moved.
 
+---
+
+## 2026-09-08 — a menu that sets something says what it is set to (M14 Part D, batch 1)
+
+`nxfiles` grows a **View** menu: four sort orders and a hidden-files toggle. The orders are
+`libfs::Order`'s, which Part C built and nothing had read — three of its four variants had no
+consumer at all until now.
+
+**The toolkit half came first, and it was not on the list.** A menu whose rows *set* something is
+write-only without a mark: you can choose an order and never see which one is in force. Part A
+made availability visible ("shown, not discovered on refusal"); this is the same argument for
+state. `Item::Action` carries a `marked` flag, `popup` draws it in a **fixed-width column** rather
+than as a label prefix — a prefix moves every label sideways as rows change state, so the menu
+appears to shift under the cursor — and an unmarked row draws *nothing* there rather than a space,
+because the `sized` is what holds the column open and a space would put a stray glyph into every
+label a caller reads back. A host test caught exactly that.
+
+**The mark is a bullet, and that is a claim about a font file.** A character the shipped face does
+not carry maps to `.notdef` and draws as a blank or a box with nothing reported anywhere — a
+silent failure of the kind this project keeps writing memos about. So `libdraw::text::Font` grew
+`has_glyph`, and an `xtask` host test asserts the shipped UI face carries `MARK`, with a
+private-use codepoint as the control that proves the check can fail. `xtask` is the only place the
+glyph `libui` picked and the font file the image stages are both in scope.
+
+**Sorting asks for no listing; hiding does.** The asymmetry is the design. An order rearranges the
+entries a tab already holds, so a syscall to reorder a `Vec` this process owns would be a round
+trip for nothing. Hiding *drops* entries — because a row's key is its index into what the tab
+holds, and filtering a view built from a longer list gives one row two numberings, which is how a
+selection comes to name the wrong file — so the ones hidden are not held anywhere and showing them
+again is a fresh listing.
+
+**The selection follows the file, not the row.** `selected` is an index, so leaving it alone
+across a re-sort silently selects whatever lands on that line, and a person watching the name they
+picked jump elsewhere would reasonably conclude the browser had selected something else. The
+negative control for that assertion is one of three run against this batch; all three fail without
+their fix.
+
+**Per tab, not per window.** An order is a property of *this view of this directory*, beside
+`path` and the selection. Navigation keeps the pane, so an order chosen once follows you down a
+tree; a new tab starts at the default, which is the rule Part B settled for a new window — a
+second instance rather than a second view of the first.
+
+**The gate asserts what no host test can.** `check-login` makes a third file in `/home/papers`
+with a leading dot and checks the browser lists **two**, then presses `Ctrl+H` for three and again
+for two. The host tests pin the filtering, the listing request and the mark; what none of them can
+say is that a real directory read through a real server comes back with the entry in it. Both
+directions, and the second is not tidying: a toggle that worked once and not back would leave
+every later count in the gate one too high, discovered several hundred lines away as a rename that
+appeared to add a file.
+
+**The gate found that the browser's receipt counted the wrong thing, on its first run.** The
+`nxfiles: listed … - N entries` line reported what `libfs::list_dir` returned, not what the tab
+holds — the same number for as long as the browser showed everything it read, and wrong the moment
+it hid anything. The step expecting two got three. A receipt naming a number nobody can see is
+worse than no receipt: it is what a gate counting entries believes, and it would have gone on
+agreeing while the browser quietly listed a hidden file. It counts after `show` now, and names
+both numbers when they differ — `2 entries (1 hidden)` — because "two of the three are shown" is
+the fact, and a reader given only the two cannot tell a filtered listing from a small directory.
+That suffix is what the gate asserts; `2 entries` alone would have passed for a browser that never
+filtered.
+
+**One dotfile in one directory found a disagreement between two applications.** `nxedit`'s file
+chooser lists a directory with the same `libfs` calls the browser uses, and its comment already
+said the two "cannot come to disagree about one" — meaning the *order*. They disagreed about the
+*set* the moment the browser learned to hide: one directory listed two ways by two windows of one
+desktop. The chooser hides dotfiles now. What it cannot do is show them — the browser hangs its
+toggle on a View menu and a dialog has no menu — so that is `TODO(chooser-hidden)`, filed rather
+than bodged, and the editor still opens a dotfile given a path.
+
+**And one box was already built.** "A delete confirmation" has existed since M12 — `Action::Delete`
+sets `self.confirm`, `check-login` step 11 drives both answers, four host tests cover it. That is
+the **third** time M14's list has been wrong about the code in the direction of "this is missing",
+after the two the 2026-09-03 entry records. The check costs a grep; the plan is ticked as found
+rather than built, because the alternative is a plan claiming a thing is absent while the gate
+proving it present runs on every commit.
+

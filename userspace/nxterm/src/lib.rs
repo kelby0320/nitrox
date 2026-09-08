@@ -1754,7 +1754,9 @@ mod tests {
         let table = selected().menu_table();
         let mut checked = 0;
         for it in table.iter().flat_map(|m| m.items.iter()) {
-            let Item::Action { accel: Some(acc), msg, label, enabled: true } = it else { continue };
+            let Item::Action { accel: Some(acc), msg, label, enabled: true, .. } = it else {
+                continue;
+            };
             checked += 1;
             let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
             assert_eq!(

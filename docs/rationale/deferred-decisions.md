@@ -1488,6 +1488,15 @@ and explicitly refuses to scale up. Filling needs an upscaler and a decision abo
 **Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
 both as options eventually, so the theme key is designed with room for a mode beside the path.
 
+**Showing hidden files from `nxedit`'s chooser — `TODO(chooser-hidden)`.** M14 Part D gave
+`nxfiles` a `Ctrl+H`, and the chooser hides dotfiles for the same reason on the same day: a
+browser that hides them and a chooser that does not are one directory listed two ways by two
+windows of one desktop. What the chooser has no way to do is *show* them again. The browser hangs
+its toggle on a View menu and the chooser has no menu — so this needs a chooser-level control,
+which is a decision about the dialog's shape rather than a line of filtering. **Trigger: a person
+who needs to open a dotfile from the editor** — until then the editor still opens one given a
+path, by argument or by a drop, which is how the theme file gets edited today.
+
 **Cut and paste in the file browser — `TODO(file-clipboard)`.** `nxfiles`' *Edit* menu holds
 `copy`, which duplicates the selected entry under a name you type, and nothing else. Cut and
 paste are a **pair**, and a pair that holds something between two gestures is a clipboard however

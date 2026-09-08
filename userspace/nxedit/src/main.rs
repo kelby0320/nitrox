@@ -610,7 +610,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         .iter()
                         .filter_map(|e| {
                             let name = String::from_utf8_lossy(e.name()).into_owned();
-                            (!name.is_empty()).then_some((
+                            // **A leading dot is not shown here either** (M14 Part D). The
+                            // comment above says this chooser and the browser cannot disagree
+                            // about an *order*; they must not disagree about the *set* either,
+                            // and they did the moment `nxfiles` learned to hide — one directory
+                            // listed two ways by two windows of one desktop.
+                            //
+                            // TODO(chooser-hidden): no way to reach one from here. The browser
+                            // has `Ctrl+H`; this has no menu to hang it on and needs its own
+                            // chooser-level toggle. Tracked in the Part D list.
+                            let hidden = name.starts_with('.');
+                            (!name.is_empty() && !hidden).then_some((
                                 name,
                                 e.kind == librsproto::file::DIRENT_KIND_DIR,
                             ))

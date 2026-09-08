@@ -133,6 +133,11 @@ pub const QUIT_KEYCODE: u16 = 16;
 pub const NEW_TAB_KEYCODE: u16 = 20;
 /// The key that closes one: `w`.
 pub const CLOSE_TAB_KEYCODE: u16 = 17;
+/// The key that shows and hides the entries a leading dot marks: `h`, with Ctrl.
+///
+/// **`Ctrl+H` rather than a `Super` chord**, which the compositor owns: every one of those is the
+/// shell's, and a browser binding one would be a keystroke the guest never sees.
+pub const HIDDEN_KEYCODE: u16 = 35;
 /// The element key on the confirmation dialog's title bar.
 pub const CONFIRM_TITLE_KEY: u64 = 20;
 /// The element key on its question.
@@ -370,6 +375,19 @@ pub struct Pane {
     entries: Vec<Entry>,
     /// Which row is selected and how far the list is scrolled.
     list: ListState,
+    /// How this tab's listing is ordered.
+    ///
+    /// **Per tab, beside `path` and `list`**, because it is a property of *this view of this
+    /// directory* rather than of the browser. Navigation keeps the pane, so an order chosen once
+    /// follows you down a tree; a new tab starts at the default, which is the same rule Part B
+    /// settled for a new window — a second instance, not a second view of the first.
+    order: libfs::Order,
+    /// Whether the entries a leading dot marks are listed.
+    ///
+    /// Per tab for the reason `order` is, and **off by default**: a dot is a convention meaning
+    /// "not part of what this directory is for", and a browser that ignored it would put a
+    /// person's configuration in front of them every time they opened their home.
+    show_hidden: bool,
 }
 
 /// Everything the browser is.
@@ -502,6 +520,18 @@ pub enum Gesture {
 pub enum Msg {
     /// A listing row was activated — its index into [`App::entries`].
     Activate(u64),
+    /// Order this tab's listing that way — a View menu row.
+    ///
+    /// **Applied to what is already held**, with no listing asked for: the entries are the same
+    /// entries, and a syscall to put them in a different order would be a round trip to sort a
+    /// `Vec` this process owns.
+    SetOrder(libfs::Order),
+    /// Show or stop showing the entries a leading dot marks — `Ctrl+H`, or the View menu.
+    ///
+    /// **This one does ask for a listing**, and the asymmetry with [`Msg::SetOrder`] is the
+    /// point: an order rearranges what the tab holds, while hiding *drops* entries — so the ones
+    /// that were dropped are not there to bring back, and the directory has to be read again.
+    ToggleHidden,
     /// A press landed on a row: the gesture that *may* become a drag (M10 Part E).
     Grab(u64),
     /// The "up" control was pressed.
@@ -556,6 +586,8 @@ impl App {
                 path: String::from(path),
                 entries: Vec::new(),
                 list: ListState::default(),
+                order: libfs::Order::default(),
+                show_hidden: false,
             }],
             current: TAB_KEY_BASE,
             next_key: TAB_KEY_BASE + 1,
@@ -657,8 +689,15 @@ impl App {
         // crate's own `Entry`, with a comment saying so, which is precisely the divergence
         // `libfs::sort` exists to prevent. Make `NameAsc` case-insensitive and a browser and a
         // chooser would have shown one directory in two orders.
-        libfs::sort(&mut entries, libfs::Order::NameAsc);
         let p = self.pane_mut();
+        // **Hidden entries are dropped here, not at draw time.** A row's key is its index into
+        // `entries`, and so is `ListState::selected` — so filtering a view built from a longer
+        // list would mean two numberings for one row, which is how a selection comes to name the
+        // wrong file. What the tab holds is what the tab shows.
+        if !p.show_hidden {
+            entries.retain(|e| !e.name.starts_with('.'));
+        }
+        libfs::sort(&mut entries, p.order);
         p.path = String::from(path);
         p.entries = entries;
         p.list = ListState { selected: (!p.entries.is_empty()).then_some(0), offset: 0 };
@@ -797,6 +836,8 @@ impl App {
                     path: here.clone(),
                     entries: Vec::new(),
                     list: ListState::default(),
+                    order: libfs::Order::default(),
+                    show_hidden: false,
                 });
                 self.current = key;
                 // The listing is a syscall, so the new pane starts empty and asks for one.
@@ -821,6 +862,29 @@ impl App {
                 if self.confirm.take().is_some() {
                     self.notice = Some(String::from("not deleted"));
                 }
+            }
+            // **Re-sorted in place**, and the selection follows the *file* rather than the row:
+            // a person watching a name they picked jump to another line as the order changes
+            // would reasonably think the browser had selected something else.
+            Msg::SetOrder(order) => {
+                let p = self.pane_mut();
+                if p.order != order {
+                    p.order = order;
+                    let picked =
+                        p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone());
+                    libfs::sort(&mut p.entries, order);
+                    p.list.selected = match picked {
+                        Some(name) => p.entries.iter().position(|e| e.name == name),
+                        None => None,
+                    };
+                    p.list.offset = 0;
+                }
+            }
+            // **A listing, because the hidden ones are not held.** See [`Msg::ToggleHidden`].
+            Msg::ToggleHidden => {
+                let p = self.pane_mut();
+                p.show_hidden = !p.show_hidden;
+                self.goto = Some(self.pane().path.clone());
             }
             Msg::RequestState(s) => {
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
@@ -1184,6 +1248,10 @@ impl App {
         let act = |label: &'static str, a: Action| {
             Item::plain(label, Msg::Choose(a)).enabled(!a.needs_selection() || selected)
         };
+        let here = self.pane().order;
+        let order_row = |label: &'static str, o: libfs::Order| {
+            Item::plain(label, Msg::SetOrder(o)).marked(o == here)
+        };
         vec![
             Menu {
                 title: "File",
@@ -1213,6 +1281,26 @@ impl App {
                 ],
             },
             Menu { title: "Edit", items: vec![act("Copy", Action::Copy)] },
+            // **A menu that sets something says what it is set to** — the four orders are a radio
+            // group and the last row is a toggle, and both read their mark from the tab whose
+            // menu this is. Without the marks the menu would be write-only: you could choose an
+            // order and never see which one is in force.
+            Menu {
+                title: "View",
+                items: vec![
+                    order_row("Name (A\u{2013}Z)", libfs::Order::NameAsc),
+                    order_row("Name (Z\u{2013}A)", libfs::Order::NameDesc),
+                    order_row("Oldest First", libfs::Order::OldestFirst),
+                    order_row("Newest First", libfs::Order::NewestFirst),
+                    Item::Separator,
+                    Item::new(
+                        "Show Hidden Files",
+                        Accel::ctrl(HIDDEN_KEYCODE, "H"),
+                        Msg::ToggleHidden,
+                    )
+                    .marked(self.pane().show_hidden),
+                ],
+            },
         ]
     }
 
@@ -2443,6 +2531,116 @@ mod tests {
     fn the_tab_chords_are_the_ones_the_keymap_names() {
         assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
         assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
+        assert_eq!(libinput::keymap::to_char(HIDDEN_KEYCODE, 0), Some(b'h'));
+    }
+
+    // --- the View menu (M14 Part D) ------------------------------------------
+
+    /// A listing with something to hide in it, and something to order by.
+    fn dated() -> Vec<Entry> {
+        let at = |name: &str, mtime: i64| Entry { mtime, ..Entry::file(name) };
+        alloc::vec![at("beta.txt", 300), at(".hidden", 100), at("alpha.txt", 200)]
+    }
+
+    fn names(a: &App) -> Vec<&str> {
+        a.entries().iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// A dot hides an entry, `Ctrl+H` shows it, and showing it costs a listing.
+    ///
+    /// **The listing is the half worth asserting.** Hiding *drops* entries rather than skipping
+    /// them at draw time, so the ones hidden are not held anywhere — a toggle that only flipped
+    /// the flag would show the same rows it was already showing, which looks exactly like a
+    /// binding that did not fire.
+    #[test]
+    fn a_dot_hides_an_entry_until_the_toggle_asks_for_it() {
+        let mut a = app();
+        a.show("/home", dated());
+        assert_eq!(names(&a), alloc::vec!["alpha.txt", "beta.txt"], "the dot is not listed");
+
+        a.update(Msg::Key(KeyEvent::new(1, HIDDEN_KEYCODE, KEY_DOWN, MOD_CTRL)));
+        assert_eq!(a.take_goto().as_deref(), Some("/home"), "the toggle asks for a listing");
+        // …and the browser is the thing that filters, so the same entries come back different.
+        a.show("/home", dated());
+        assert_eq!(names(&a), alloc::vec![".hidden", "alpha.txt", "beta.txt"]);
+
+        // Off again, by the menu row this time rather than the chord.
+        a.update(Msg::ToggleHidden);
+        let _ = a.take_goto();
+        a.show("/home", dated());
+        assert_eq!(names(&a), alloc::vec!["alpha.txt", "beta.txt"]);
+    }
+
+    /// Ordering rearranges what the tab holds — no listing — and the selection follows the file.
+    ///
+    /// **The selection is the part that is easy to get wrong.** `selected` is an index, so
+    /// leaving it alone across a re-sort silently selects whatever lands on that line; a person
+    /// watching the name they picked jump elsewhere would reasonably think the browser had
+    /// selected something else.
+    #[test]
+    fn an_order_rearranges_without_a_listing_and_keeps_the_file_selected() {
+        let mut a = app();
+        a.show("/home", dated());
+        assert_eq!(names(&a), alloc::vec!["alpha.txt", "beta.txt"]);
+        a.update(Msg::Activate(0));
+        let _ = a.take_goto();
+        let picked = |a: &App| -> String {
+            let i = a.pane().list.selected.expect("a row is selected");
+            a.entries()[i].name.clone()
+        };
+        assert_eq!(picked(&a), "alpha.txt");
+
+        a.update(Msg::SetOrder(libfs::Order::NewestFirst));
+        assert_eq!(a.take_goto(), None, "a re-order is not a navigation");
+        assert_eq!(names(&a), alloc::vec!["beta.txt", "alpha.txt"], "newest first");
+        assert_eq!(
+            picked(&a),
+            "alpha.txt",
+            "the selection followed the file rather than staying on row 0"
+        );
+
+        // And the same order chosen twice is not a change.
+        a.update(Msg::SetOrder(libfs::Order::NewestFirst));
+        assert_eq!(names(&a), alloc::vec!["beta.txt", "alpha.txt"]);
+    }
+
+    /// The View menu shows which order is in force and whether hidden files are shown.
+    ///
+    /// **Exactly one order is marked at a time**, which is what makes it a radio group rather
+    /// than four independent rows, and the toggle's mark tracks the flag both ways.
+    #[test]
+    fn the_view_menu_says_what_it_is_set_to() {
+        let marked = |a: &App| -> Vec<String> {
+            a.menu_table()
+                .into_iter()
+                .find(|m| m.title == "View")
+                .expect("a View menu")
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Action { label, marked: true, .. } => Some(String::from(*label)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut a = app();
+        assert_eq!(marked(&a), alloc::vec![String::from("Name (A\u{2013}Z)")], "the default");
+
+        a.update(Msg::SetOrder(libfs::Order::OldestFirst));
+        assert_eq!(
+            marked(&a),
+            alloc::vec![String::from("Oldest First")],
+            "one order at a time — the old mark moved rather than a second appearing"
+        );
+
+        a.update(Msg::ToggleHidden);
+        assert_eq!(
+            marked(&a),
+            alloc::vec![String::from("Oldest First"), String::from("Show Hidden Files")]
+        );
+        a.update(Msg::ToggleHidden);
+        assert_eq!(marked(&a), alloc::vec![String::from("Oldest First")], "and back off again");
     }
 
     #[test]

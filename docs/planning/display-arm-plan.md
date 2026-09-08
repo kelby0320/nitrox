@@ -4724,16 +4724,52 @@ choosers:
 
 ### Part D — the browser deepened
 
+**One box was already built**, and it is the third time this milestone's list has been wrong about
+the code — see the 2026-09-03 entry on what an empty grep proves. **A delete confirmation exists**
+and has since M12: `Action::Delete` sets `self.confirm`, `Msg::ConfirmDelete` and `Msg::KeepIt` are
+its two answers, `check-login` step 11 drives both, and four host tests cover it. Ticked below as
+found rather than built, because the alternative is a plan that says a thing is missing while the
+gate that proves it exists runs on every commit.
+
+**Batches**, in dependency order: the View menu, then decision 5's click, then the chrome, then
+the sidebar, then the clipboard — the last two build on what the click settles.
+
+- [x] **Sort: A–Z, Z–A, oldest first, newest first** ✅ — through `libfs`, per decision 3, which is
+      the first reader `Order`'s other three variants have had. **Per tab**, beside `path` and the
+      selection, because it is a property of this view of this directory: navigation keeps the
+      pane, so an order chosen once follows you down a tree, and a new tab starts at the default.
+      Re-ordering asks for **no listing** — the entries are the same entries — and **the selection
+      follows the file rather than the row**, which is the half that is easy to get wrong:
+      `selected` is an index, so leaving it alone silently selects whatever lands on that line.
+- [x] **Show hidden files** ✅ — `Ctrl+H` or the View menu. Off by default: a dot means "not part
+      of what this directory is for", and a browser ignoring it puts a person's configuration in
+      front of them every time they open their home. **Hidden entries are dropped rather than
+      skipped at draw time**, because a row's key is its index into what the tab holds and a view
+      built from a longer list would give one row two numberings. That is why the toggle asks for
+      a *listing* where the sort does not — the asymmetry is the design, not an oversight.
+- [x] **A menu that sets something says what it is set to** ✅, which was not a box and is what
+      made the two above readable. `libui::menu::Item` carries a `marked` flag and `popup` draws it
+      in a fixed-width column — a column rather than a prefix, or labels shift sideways as rows
+      change state. The mark is a bullet, and **`Font::has_glyph` exists so that choice is pinned
+      against the shipped face by a host test**: a character a font does not carry maps to
+      `.notdef` and draws as a blank with nothing reported anywhere.
+- [x] **A receipt that counted what was read rather than what is shown** ✅ — not a box, found by
+      the gate on its first run. `nxfiles: listed … - N entries` reported `libfs::list_dir`'s count,
+      which was the same number until the browser had something to hide. It counts what the tab
+      holds now and names both when they differ (`2 entries (1 hidden)`), which is what the gate
+      asserts — `2 entries` alone would pass for a browser that never filtered.
+- [ ] **`nxedit`'s chooser needs its own `Ctrl+H`** — `TODO(chooser-hidden)`, opened by batch 1.
+      The chooser hides dotfiles now, because a browser that hides them and a chooser that does not
+      are one directory listed two ways by two windows of one desktop; what it has no way to do is
+      *show* them, having no menu to hang the toggle on.
+- [ ] **Single click selects, double click opens**, per decision 5.
+- [ ] **A typeable location bar**, and **Properties** (size and mtime, both already on the wire).
 - [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
       the image build for now; first-login creation is the right answer once there are real
       users, and is filed rather than built.
-- [ ] **Sort: A–Z, Z–A, oldest first, newest first** — through `libfs`, per decision 3.
 - [ ] **Cut, copy and paste of files** — `TODO(file-clipboard)`, left as a pair in M12 when only
       copy existed. Wants **multi-select**, which is its own interaction.
-- [ ] **Single click selects, double click opens**, per decision 5.
-- [ ] **Show hidden files**, a **typeable location bar**, and **Properties** (size and mtime,
-      both already on the wire).
-- [ ] **A delete confirmation.**
+- [x] **A delete confirmation** ✅ — **built in M12**, found by checking rather than by building.
 
 ### Part E — the terminal and editor deepened
 

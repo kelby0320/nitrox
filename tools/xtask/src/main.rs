@@ -3391,6 +3391,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // the open file is deliberately a no-op, and a gate that did it would assert nothing.
     session.send("touch ./papers/other.txt")?;
     session.expect("/home>")?;
+    // **A third file the browser must not show** (M14 Part D). A dot is a convention meaning
+    // "not part of what this directory is for", and the assertion below is that `/home/papers`
+    // holds three entries while the browser lists two — which is the only way to tell hiding
+    // from a directory that happens to have two files in it.
+    session.send("touch ./papers/.quiet.txt")?;
+    session.expect("/home>")?;
 
     // **Click the browser to give it the keyboard**, then walk it out and back in so it lists
     // the file the serial side just made. A listing is read when something navigates; nothing
@@ -3413,7 +3419,35 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
     press(&mut qmp, "ret")?;
-    session.expect("nxfiles: listed /home/papers - 2 entries")?;
+    // **The receipt says both numbers, and that is the assertion.** "2 entries" alone cannot tell
+    // a filtered listing from a directory that happens to hold two; "(1 hidden)" is the browser
+    // stating that it read three and is showing two.
+    session.expect("nxfiles: listed /home/papers - 2 entries (1 hidden)")?;
+    println!("  ok: three files in the directory, two of them listed");
+
+    // **`Ctrl+H` shows them, and again hides them** (M14 Part D). The count is the assertion and
+    // the *guest's* count is the only one that can fail here: the host tests already pin that a
+    // dot is filtered, that the toggle asks for a listing and that the View menu's mark tracks
+    // the flag — what none of them can say is that a real directory read through a real server
+    // comes back with the entry in it.
+    //
+    // **Both directions, and the second is not tidying.** Hiding drops entries rather than
+    // skipping them, so showing them again is a *listing* rather than a flag; a toggle that
+    // worked once and not back would leave every later count in this gate one too high, which is
+    // how it would be discovered — several hundred lines away, as a rename that seemed to add a
+    // file.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "h")?;
+    qmp.send_key("ctrl", false)?;
+    // No suffix here: with nothing hidden, what was read and what is shown are the same number,
+    // and the receipt says so by not mentioning a difference.
+    session.expect("nxfiles: listed /home/papers - 3 entries")?;
+    println!("  ok: Ctrl+H showed the hidden one");
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "h")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxfiles: listed /home/papers - 2 entries (1 hidden)")?;
+    println!("  ok: and hid it again, leaving the directory as the rest of this gate expects");
 
     // Row 1 is `other.txt`: the listing sorts directories first and then by name, and `notes`
     // sorts before `other`. The row's y is the window's origin plus its chrome — the title bar
@@ -10427,6 +10461,23 @@ fn format_cmd(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped UI face carries the glyph a marked menu row draws.
+    ///
+    /// **A missing glyph is a silent failure** — `.notdef`, drawn as a blank or a box, reported
+    /// nowhere — so a decorative character picked in `libui` is a claim about a font file staged
+    /// by this crate, and this is the only place both are in scope. The control is the second
+    /// assertion: a private-use codepoint no face carries, which proves the check can fail.
+    #[test]
+    fn the_menu_mark_exists_in_the_shipped_face() {
+        let (ui, _) = host_faces().expect("the built-in theme's faces load on the host");
+        let mark = libui::menu::MARK.chars().next().expect("MARK is not empty");
+        assert!(
+            ui.has_glyph(mark),
+            "the UI face has no glyph for {mark:?} — a marked menu row would draw a blank"
+        );
+        assert!(!ui.has_glyph('\u{E000}'), "a private-use codepoint should be absent");
+    }
 
     /// A preview is the same picture the display gate demands of the guest.
     ///
