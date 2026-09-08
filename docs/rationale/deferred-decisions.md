@@ -1527,24 +1527,16 @@ which is a decision about the dialog's shape rather than a line of filtering. **
 who needs to open a dotfile from the editor** — until then the editor still opens one given a
 path, by argument or by a drop, which is how the theme file gets edited today.
 
-**Cut and paste in the file browser — `TODO(file-clipboard)`.** `nxfiles`' *Edit* menu holds
-`copy`, which duplicates the selected entry under a name you type, and nothing else. Cut and
-paste are a **pair**, and a pair that holds something between two gestures is a clipboard however
-it is spelled — so building a private one-slot path buffer in the browser would be a second
-clipboard shipped before the real one. M12 decision 1 makes the clipboard a *resource server*
-precisely so that what you last copied is not readable by everything running, and Part E's own
-scope leaves the door open for this: "the type tag exists so a later image or a typed stream is a
-second kind rather than a second clipboard". A file path is that second kind. **Trigger: Part E's
-ring exists — and since 2026-09-02 it does.**
+**Cut and paste in the file browser — built, M14 Part D (2026-09-08).** `CLIP_KIND_PATH` sits
+beside `CLIP_KIND_TEXT`, the Edit menu holds Cut, Copy and Paste, and a paste reads the ring. The
+third thing this entry asked for — "a decision about what pasting a path into a **text** field
+should do" — was answered by not needing one: the payload is UTF-8 and a text consumer that pastes
+it gets the path as text, which is what a person typing into a field means by pasting a path. The
+kind tag is what lets a *file* consumer treat it as a file instead.
 
-What the browser needs on top of it is `CLIP_KIND_PATH` beside `CLIP_KIND_TEXT`, an *Edit* menu
-that pushes one and a *paste* that reads one, and a decision about what pasting a path into a
-**text** field should do — the name, or nothing. None of that is Part E's scope, which is why the
-trigger firing moves this from "waiting" to "buildable" rather than closing it.
-
-Nothing is missing meanwhile — moving a file into a folder is a drag, which is the gesture people
-reach for first — and the maintainer asked the question that produced this entry rather than
-assuming an answer (2026-09-02).
+**What the entry did not anticipate is where the verb lives.** A browser that remembered its own
+pending cut would move files for itself and copy them for any other window; the verb is a line in
+the payload, so a cut in one window and a paste in another is the same gesture as within one.
 
 **Tabs run off the end of a window — `TODO(tab-overflow)`.** `libui`'s `tab_strip` gives every
 tab a fixed `TAB_W`, so enough of them are simply not drawn. Sharing the strip out between them

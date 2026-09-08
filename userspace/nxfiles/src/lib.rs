@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use alloc::vec;
@@ -197,6 +197,12 @@ pub const HIDDEN_KEYCODE: u16 = 35;
 pub const LOCATION_KEYCODE: u16 = 38;
 /// The key that shows what is known about the selected entry: `i`, with Ctrl.
 pub const PROPERTIES_KEYCODE: u16 = 23;
+/// The key that cuts the selection: `x`, with Ctrl.
+pub const CUT_KEYCODE: u16 = 45;
+/// The key that copies it: `c`, with Ctrl.
+pub const COPY_KEYCODE: u16 = 46;
+/// The key that pastes: `v`, with Ctrl.
+pub const PASTE_KEYCODE: u16 = 47;
 /// The element key on the confirmation dialog's title bar.
 pub const CONFIRM_TITLE_KEY: u64 = 20;
 
@@ -233,7 +239,6 @@ pub const MENU_COUNT: usize = 2;
 /// copied is not readable by everything running, and Part E's own words leave the door open for
 /// this: "the type tag exists so a later image or a typed stream is a second kind rather than a
 /// second clipboard". A file path is that second kind. **Trigger: Part E's ring exists** —
-/// `TODO(file-clipboard)`.
 ///
 /// Nothing is lost meanwhile: moving a file into a folder is a drag, which is the gesture people
 /// reach for first anyway.
@@ -246,7 +251,11 @@ pub enum Action {
     /// Give the selected entry a new name, from a prompt.
     Rename,
     /// Duplicate the selected entry under a name from a prompt.
-    Copy,
+    ///
+    /// **Named `Duplicate` since M14 Part D**, when the Edit menu gained a real Copy. They are
+    /// different things: this asks for a name and writes a second file beside the first, while
+    /// Copy puts a path on the clipboard and does nothing until a Paste.
+    Duplicate,
     /// Remove the selected entry, after a confirmation.
     Delete,
     /// Show what is known about the selected entry: where it is, how big, when it changed.
@@ -261,7 +270,7 @@ impl Action {
             Action::NewFile => Some("new file:"),
             Action::NewFolder => Some("new folder:"),
             Action::Rename => Some("rename to:"),
-            Action::Copy => Some("copy to:"),
+            Action::Duplicate => Some("duplicate as:"),
             // Neither of these asks for a name: one asks a question and the other reports.
             Action::Delete | Action::Properties => None,
         }
@@ -269,7 +278,7 @@ impl Action {
 
     /// Whether this acts on the selected entry rather than on the directory.
     pub fn needs_selection(self) -> bool {
-        matches!(self, Action::Rename | Action::Copy | Action::Delete | Action::Properties)
+        matches!(self, Action::Rename | Action::Duplicate | Action::Delete | Action::Properties)
     }
 }
 
@@ -466,6 +475,21 @@ pub struct App {
     panes: Vec<Pane>,
     /// Which pane's tab is current, by [`Pane::key`].
     current: u64,
+    /// Paths the binary is asked to push onto the clipboard, and what should happen to them.
+    ///
+    /// **Recorded rather than done**, like every other syscall this crate cannot make.
+    clip_push: Option<(librsproto::clipboard::PathVerb, Vec<String>)>,
+    /// The binary is asked to read the clipboard and hand back what is on it.
+    clip_read: bool,
+    /// The entries picked *besides* the one the list state holds, by name.
+    ///
+    /// **Names rather than indices**, because indices do not survive a re-sort: the View menu can
+    /// reorder the listing under a selection, and a set of positions would then name different
+    /// files. Names are what the selection means to a person, and `show` clears them anyway when
+    /// the listing changes directory.
+    marked: Vec<String>,
+    /// Where a range selection counts from — the last row picked without Shift.
+    anchor: Option<usize>,
     /// This session's home, which the sidebar's first row goes to.
     ///
     /// **What the browser was started at**, which `main` reads from the environment — the same
@@ -493,6 +517,8 @@ pub struct App {
     clicks: libui::click::Clicks,
     /// What number the press being routed now is in its run; `1` unless a run is under way.
     click_run: u32,
+    /// The modifiers held at that press — what makes Ctrl-click and Shift-click expressible.
+    click_mods: u16,
     /// The next key to hand out — monotonic, so a stale message can never name a pane that has
     /// taken its place. Numbered from [`TAB_KEY_BASE`] so a tab's key cannot collide with the
     /// chrome's element keys *or with a list row's index*, which `Router::hovered_key` reports in
@@ -581,8 +607,12 @@ pub struct App {
     pub dialog_focused: bool,
     /// The dialog's title bar was dragged, and the binary owes a `StartMove` **on its window**.
     confirm_move_requested: bool,
-    /// A filesystem operation the binary owes.
-    op: Option<FileOp>,
+    /// Filesystem work the binary owes, in the order it was asked for.
+    ///
+    /// **A queue since M14 Part D**, because a paste of four files is four operations that can
+    /// each fail on their own — a single slot would have made the last one silently replace the
+    /// three before it.
+    ops: Vec<FileOp>,
     /// The row an internal drag is over, while one is running.
     ///
     /// **Internal**: a drag that has passed the slop but has not left this window. The payload
@@ -680,6 +710,12 @@ pub enum Msg {
     /// within the run opens. `Activate` is what "open" means, and the keyboard still sends it
     /// directly — `Enter` on a selected row is not a click and has no run to be part of.
     Press(u64),
+    /// Put the selection on the clipboard to be **moved**.
+    CutFiles,
+    /// Put it there to be **copied**.
+    CopyFiles,
+    /// Act on whatever paths are on the clipboard, here.
+    PasteFiles,
     /// A sidebar row was pressed — go to that place.
     ///
     /// **One press, not two.** The listing needs a double click because a single one has to be
@@ -764,12 +800,17 @@ impl App {
                 show_hidden: false,
             }],
             current: TAB_KEY_BASE,
+            clip_push: None,
+            clip_read: false,
+            marked: Vec::new(),
+            anchor: None,
             home: String::from(path),
             sidebar: ListState::default(),
             properties: None,
             location: None,
             clicks: libui::click::Clicks::new(),
             click_run: 1,
+            click_mods: 0,
             next_key: TAB_KEY_BASE + 1,
             window: START_SIZE,
             focused: true,
@@ -790,7 +831,7 @@ impl App {
             confirm: None,
             dialog_focused: true,
             confirm_move_requested: false,
-            op: None,
+            ops: Vec::new(),
             over: None,
             dragging: false,
         }
@@ -881,6 +922,10 @@ impl App {
         p.path = String::from(path);
         p.entries = entries;
         p.list = ListState { selected: (!p.entries.is_empty()).then_some(0), offset: 0 };
+        // **A listing of another directory has nothing the old picks refer to.** Same argument as
+        // the selection reset above it.
+        self.marked.clear();
+        self.anchor = None;
         // A listing supersedes whatever the last row press had to say about itself.
         self.notice = None;
         // **And a question about a directory you have left is not a question worth keeping**
@@ -956,10 +1001,28 @@ impl App {
             // act on the first row and makes a test pass by accident.
             Msg::Press(key) => {
                 let Some(i) = list_row_of(key) else { return };
-                self.pane_mut().list.selected = Some(i);
+                if i >= self.pane().entries.len() {
+                    return;
+                }
                 self.notice = None;
-                if self.click_run >= 2 {
-                    self.update(Msg::Activate(i as u64));
+                let mods = self.click_mods;
+                // **Ctrl adds one, Shift adds a run, and a plain press replaces everything** —
+                // the three every file manager has, and the reason the modifiers ride on the
+                // press record rather than being tracked from the keyboard.
+                if mods & MOD_CTRL != 0 {
+                    self.toggle_mark(i);
+                } else if mods & MOD_SHIFT != 0 {
+                    self.mark_range_to(i);
+                } else {
+                    self.marked.clear();
+                    self.anchor = Some(i);
+                    self.pane_mut().list.selected = Some(i);
+                    // **Only a plain press opens.** A second Ctrl-click is somebody building a
+                    // selection, not asking for anything to happen — and opening a file
+                    // mid-selection is exactly the accident decision 5 exists to prevent.
+                    if self.click_run >= 2 {
+                        self.update(Msg::Activate(i as u64));
+                    }
                 }
             }
             Msg::Activate(i) => {
@@ -1051,7 +1114,7 @@ impl App {
                 if let Some(t) = self.confirm.take()
                     && let Some(path) = t.from
                 {
-                    self.op = Some(FileOp::Delete { path, dir: t.is_dir });
+                    self.ops.push(FileOp::Delete { path, dir: t.is_dir });
                 }
             }
             // **Says so**, because a dialog that vanishes with nothing changed is
@@ -1074,6 +1137,31 @@ impl App {
                     self.goto = Some(p.1);
                 }
             }
+            Msg::CutFiles | Msg::CopyFiles => {
+                let verb = if msg == Msg::CutFiles {
+                    librsproto::clipboard::PathVerb::Cut
+                } else {
+                    librsproto::clipboard::PathVerb::Copy
+                };
+                // **Resolved to absolute paths now**, while this listing is still this listing —
+                // the same rule `Target` follows. A path pasted later is read by whoever reads
+                // it, and a relative one would name a file in *their* directory.
+                let dir = self.pane().path.clone();
+                let paths: Vec<String> =
+                    self.selection().iter().map(|e| join(&dir, &e.name)).collect();
+                if paths.is_empty() {
+                    self.notice = Some(String::from("nothing is selected"));
+                    return;
+                }
+                let n = paths.len();
+                self.clip_push = Some((verb, paths));
+                self.notice = Some(alloc::format!(
+                    "{} {n} {}",
+                    if verb == librsproto::clipboard::PathVerb::Cut { "cut" } else { "copied" },
+                    if n == 1 { "entry" } else { "entries" }
+                ));
+            }
+            Msg::PasteFiles => self.clip_read = true,
             Msg::CloseProperties => self.properties = None,
             Msg::LocationCancel => {
                 if self.location.take().is_some() {
@@ -1193,15 +1281,16 @@ impl App {
         // sit at row 0 after a navigation the prompt gave no sign of (PR #268 review, blocking 3).
         let to = join(&target.dir, &name);
         let from = target.from.clone();
-        self.op = match a {
+        let queued = match a {
             Action::NewFile => Some(FileOp::Create { path: to, dir: false }),
             Action::NewFolder => Some(FileOp::Create { path: to, dir: true }),
             Action::Rename => from.map(|from| FileOp::Rename { from, to }),
-            Action::Copy => from.map(|from| FileOp::Copy { from, to, dir: target.is_dir }),
+            Action::Duplicate => from.map(|from| FileOp::Copy { from, to, dir: target.is_dir }),
             // `choose` sends these two to a dialog and never to a prompt, so this arm is
             // unreachable rather than a decision — and saying `None` keeps it that way.
             Action::Delete | Action::Properties => None,
         };
+        self.ops.extend(queued);
         self.prompt = None;
     }
 
@@ -1223,7 +1312,7 @@ impl App {
         }
         let from = join(&self.pane().path, carried);
         let dir = join(&self.pane().path, &target.name);
-        self.op = Some(FileOp::MoveInto { from, to: join(&dir, carried) });
+        self.ops.push(FileOp::MoveInto { from, to: join(&dir, carried) });
     }
 
     /// Where the list's first row starts, in window coordinates.
@@ -1349,8 +1438,13 @@ impl App {
     /// **Called before the event is routed**, so the message the press produces can ask what
     /// number the click was. The binary owns the clock because this crate makes no syscalls, and
     /// `libui::click` owns the counting because every list wants it — see decision 5.
-    pub fn note_press(&mut self, at: libdraw::geom::Point, at_ms: u64) {
+    pub fn note_press(&mut self, at: libdraw::geom::Point, at_ms: u64, modifiers: u16) {
         self.click_run = self.clicks.press(at, at_ms);
+        // **Held at the press, and carried rather than re-derived.** `PointerEvent` reports them
+        // on every record precisely so a client does not track them from `KeyEvent`s — which it
+        // could only get right while it also held keyboard focus, so a Ctrl-click on an unfocused
+        // window would behave as a plain one (the note on `PointerEvent::modifiers`).
+        self.click_mods = modifiers;
     }
 
     /// Abandon the click run — the gesture turned out to be a drag.
@@ -1398,6 +1492,114 @@ impl App {
         out
     }
 
+    /// Paths the binary owes a clipboard push for. Clears the record.
+    pub fn take_clip_push(
+        &mut self,
+    ) -> Option<(librsproto::clipboard::PathVerb, Vec<String>)> {
+        self.clip_push.take()
+    }
+
+    /// Whether the binary owes a clipboard *read*. Clears the record.
+    pub fn take_clip_read(&mut self) -> bool {
+        core::mem::take(&mut self.clip_read)
+    }
+
+    /// What was on the clipboard, handed back by the binary.
+    ///
+    /// **One operation per path, queued** — a paste of four files is four things that can each
+    /// fail on their own, and reporting them as one would be a single sentence about four
+    /// answers. Nothing here reads the filesystem: `main` refuses a destination that is taken,
+    /// which is where that promise already lives.
+    pub fn pasted(&mut self, verb: librsproto::clipboard::PathVerb, paths: &[&str]) {
+        let dir = self.pane().path.clone();
+        let mut queued = 0usize;
+        for from in paths {
+            let name = libfs::basename_str(from);
+            if name.is_empty() {
+                continue;
+            }
+            let to = join(&dir, name);
+            // **A paste into the directory a file is already in is refused**, rather than
+            // silently doing nothing or overwriting it: `from == to` is a rename onto itself for
+            // a cut and a copy onto itself for a copy, and the second would truncate the file it
+            // was reading.
+            if *from == to {
+                continue;
+            }
+            queued += 1;
+            self.ops.push(match verb {
+                librsproto::clipboard::PathVerb::Cut => {
+                    FileOp::MoveInto { from: String::from(*from), to }
+                }
+                librsproto::clipboard::PathVerb::Copy => FileOp::Copy {
+                    from: String::from(*from),
+                    to,
+                    dir: false,
+                },
+            });
+        }
+        if queued == 0 {
+            self.notice = Some(String::from("nothing to paste here"));
+        }
+    }
+
+    /// The clipboard held something that is not a list of paths.
+    pub fn paste_not_paths(&mut self) {
+        self.notice = Some(String::from("the clipboard holds text, not files"));
+    }
+
+    /// Add or remove one row from the picks.
+    ///
+    /// **The row the list state holds is part of the selection**, so toggling it off has to move
+    /// it somewhere: the state keeps a single `selected` and the picks are everything *besides*
+    /// it, which would otherwise make the anchor impossible to unpick.
+    fn toggle_mark(&mut self, i: usize) {
+        let Some(name) = self.pane().entries.get(i).map(|e| e.name.clone()) else { return };
+        if self.pane().list.selected == Some(i) {
+            // **Unpicking the state's own row empties it rather than the picks**, which is the
+            // half a set-only model would miss: `selected` is part of the selection, so
+            // Ctrl-clicking it has to be able to take it out.
+            self.pane_mut().list.selected = None;
+        } else if let Some(at) = self.marked.iter().position(|n| *n == name) {
+            self.marked.remove(at);
+        } else {
+            self.marked.push(name);
+        }
+        self.anchor = Some(i);
+    }
+
+    /// Pick every row between the anchor and `i`, inclusive.
+    fn mark_range_to(&mut self, i: usize) {
+        let from = self.anchor.or(self.pane().list.selected).unwrap_or(i);
+        let (lo, hi) = if from <= i { (from, i) } else { (i, from) };
+        let names: Vec<String> = self.pane().entries[lo..=hi.min(self.pane().entries.len() - 1)]
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        self.pane_mut().list.selected = Some(from);
+        self.marked = names.into_iter().filter(|n| Some(n.as_str()) != self.selected_name()).collect();
+    }
+
+    /// The name of the row the list state holds, if any.
+    fn selected_name(&self) -> Option<&str> {
+        let p = self.pane();
+        p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.as_str())
+    }
+
+    /// Every entry picked right now, in listing order.
+    ///
+    /// **One answer for every caller**, because "the selection" is what the Edit menu acts on and
+    /// a second derivation of it is how a cut and a paste come to disagree about what was picked.
+    pub fn selection(&self) -> Vec<&Entry> {
+        self.pane()
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| self.pane().list.selected == Some(*i) || self.marked.contains(&e.name))
+            .map(|(_, e)| e)
+            .collect()
+    }
+
     /// The listing's rows as the tree keys them.
     ///
     /// **For the test that pins the keys apart from the chrome's.** Building the whole view to
@@ -1410,6 +1612,7 @@ impl App {
             .map(|(i, e)| libui::widget::ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: e.name.as_str(),
+                marked: self.marked.contains(&e.name),
             })
             .collect()
     }
@@ -1631,7 +1834,25 @@ impl App {
                     .enabled(selected),
                 ],
             },
-            Menu { title: "Edit", items: vec![act("Copy", Action::Copy)] },
+            // **Cut, Copy and Paste are the clipboard's**, and Duplicate is the older row that
+            // used to be called Copy — a different thing, which is why it moved rather than being
+            // renamed in place: this one asks for a name and writes a file, those three move a
+            // path through `/dev/clipboard` and act on a Paste.
+            Menu {
+                title: "Edit",
+                items: vec![
+                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::CutFiles)
+                        .enabled(selected),
+                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::CopyFiles)
+                        .enabled(selected),
+                    // **Paste is offered whatever is on the ring**, because a browser cannot know
+                    // what is there without reading it, and reading it is a syscall this crate
+                    // does not make. A paste of text says so instead.
+                    Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::PasteFiles),
+                    Item::Separator,
+                    act("Duplicate\u{2026}", Action::Duplicate),
+                ],
+            },
             // **A menu that sets something says what it is set to** — the four orders are a radio
             // group and the last row is a toggle, and both read their mark from the tab whose
             // menu this is. Without the marks the menu would be write-only: you could choose an
@@ -1794,7 +2015,12 @@ impl App {
 
     /// The filesystem operation the binary owes, if any. Clears the record.
     pub fn take_op(&mut self) -> Option<FileOp> {
-        self.op.take()
+        if self.ops.is_empty() { None } else { Some(self.ops.remove(0)) }
+    }
+
+    /// Whether any filesystem work is queued.
+    pub fn has_ops(&self) -> bool {
+        !self.ops.is_empty()
     }
 
     /// Report what an operation did, and say where to look next.
@@ -1982,7 +2208,11 @@ impl App {
         let labels: Vec<String> = self.pane().entries.iter().map(|e| e.label()).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
         for (i, l) in labels.iter().enumerate() {
-            rows.push(ListRow { key: LIST_ROW_KEY + i as u64, label: l });
+            rows.push(ListRow {
+                key: LIST_ROW_KEY + i as u64,
+                label: l,
+                marked: self.marked.contains(&self.pane().entries[i].name),
+            });
         }
         let h = self.list_h();
         // **`Grab` on the press, `Activate` on the click.** A drag is decided when the button
@@ -2010,6 +2240,7 @@ impl App {
             .map(|(i, (label, _))| ListRow {
                 key: SIDEBAR_ROW_KEY + i as u64,
                 label: label.as_str(),
+                marked: false,
             })
             .collect();
         self.sidebar.selected = here;
@@ -2575,7 +2806,7 @@ mod tests {
         // three on a row, and the three have to say so when there is no row.
         let mut a = App::new("/home");
         a.show("/home", alloc::vec![]);
-        for action in [Action::Rename, Action::Copy, Action::Delete] {
+        for action in [Action::Rename, Action::Duplicate, Action::Delete] {
             a.update(Msg::Choose(action));
             assert!(a.take_op().is_none(), "{action:?} did something with nothing selected");
             assert!(a.confirming().is_none(), "{action:?} asked about nothing");
@@ -2610,7 +2841,7 @@ mod tests {
 
         // Copy is the same shape and a different operation — the one that reaches `copy_file`.
         select(&mut a, 2);
-        a.update(Msg::Choose(Action::Copy));
+        a.update(Msg::Choose(Action::Duplicate));
         press_key(&mut a, KEY_X);
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(
@@ -2807,11 +3038,20 @@ mod tests {
 
         a.update(Msg::MenuBar(1));
         let edit: Element<Msg> = a.menu_view(1, &UiTheme::default(), None);
-        assert_eq!(labelled(&edit, MENU_ROW_KEY), "Copy");
-        // **And nothing else is here**: cut and paste are a pair that holds something between
-        // two gestures, which is a clipboard however it is spelled, and M12 Part E builds the
-        // real one. An `Edit` menu that grew them now would be a second clipboard.
-        assert_eq!(labelled(&edit, MENU_ROW_KEY + 1), "", "the Edit menu holds one thing");
+        // **Cut and paste live here now**, and the note this replaces said why they could not:
+        // they are a pair that holds something between two gestures, which is a clipboard however
+        // it is spelled, so an Edit menu that grew them before M12 Part E built the real one would
+        // have shipped a second clipboard. Part E built it and M14 Part D gave it a path kind.
+        for (i, item) in [
+            (0, "CutCtrl+X"),
+            (1, "CopyCtrl+C"),
+            (2, "PasteCtrl+V"),
+            (4, "Duplicate\u{2026}"),
+        ] {
+            assert_eq!(labelled(&edit, MENU_ROW_KEY + i), item, "the Edit menu's row {i}");
+        }
+        assert_eq!(labelled(&edit, MENU_ROW_KEY + 3), "", "row 3 is a rule");
+        assert_eq!(labelled(&edit, MENU_ROW_KEY + 5), "", "and there is no row after Duplicate");
     }
 
     /// A row that would be refused is drawn unavailable rather than offered.
@@ -3024,11 +3264,11 @@ mod tests {
 
     #[test]
     fn copying_a_folder_is_a_tree_copy() {
-        // `copy_file` on a directory merely fails, and `Action::Copy` does not exclude one —
+        // `copy_file` on a directory merely fails, and `Action::Duplicate` does not exclude one —
         // so the operation has to carry which it is (PR #268 review, optional 3).
         let mut a = app();
         select(&mut a, 0); // archive/
-        a.update(Msg::Choose(Action::Copy));
+        a.update(Msg::Choose(Action::Duplicate));
         press_key(&mut a, KEY_X);
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(
@@ -3156,6 +3396,227 @@ mod tests {
             }
         }
         let _ = a.view(&ui, None);
+    }
+
+    // --- cut, copy and paste of files (M14 Part D) ---------------------------
+
+    use librsproto::clipboard::PathVerb;
+
+    /// Copy puts every picked entry on the clipboard, as absolute paths.
+    ///
+    /// **Resolved before pushing**, because a path is read by whoever reads it — a relative one
+    /// would name a file in *their* directory.
+    #[test]
+    fn copy_pushes_the_whole_selection_as_absolute_paths() {
+        let mut a = app();
+        a.show("/home/papers", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(0)));
+        a.note_press(libdraw::geom::Point::new(40, 100), 2_000, MOD_CTRL);
+        a.update(Msg::Press(row(2)));
+
+        a.update(Msg::CopyFiles);
+        let (verb, paths) = a.take_clip_push().expect("a push was recorded");
+        assert_eq!(verb, PathVerb::Copy);
+        assert_eq!(paths, alloc::vec!["/home/papers/f0.txt", "/home/papers/f2.txt"]);
+        assert_eq!(a.notice.as_deref(), Some("copied 2 entries"));
+        assert_eq!(a.take_clip_push(), None, "and the record is cleared");
+    }
+
+    /// Cut says so on the wire rather than being remembered here.
+    ///
+    /// **A browser that remembered its own pending cut** would move files for itself and copy
+    /// them for any other window, which is a difference nobody can see until it has happened.
+    #[test]
+    fn cut_is_the_verb_on_the_wire() {
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(1)));
+        a.update(Msg::CutFiles);
+        let (verb, paths) = a.take_clip_push().expect("a push");
+        assert_eq!(verb, PathVerb::Cut);
+        assert_eq!(paths, alloc::vec!["/home/f1.txt"]);
+        assert_eq!(a.notice.as_deref(), Some("cut 1 entry"));
+    }
+
+    /// Copying nothing says so and pushes nothing.
+    #[test]
+    fn copying_an_empty_selection_pushes_nothing() {
+        let mut a = app();
+        a.show("/empty", alloc::vec![]);
+        a.update(Msg::CopyFiles);
+        assert_eq!(a.take_clip_push(), None);
+        assert_eq!(a.notice.as_deref(), Some("nothing is selected"));
+    }
+
+    /// A paste queues one operation per path, and the verb decides which.
+    #[test]
+    fn a_paste_queues_one_operation_per_path() {
+        let mut a = app();
+        a.show("/home/papers", alloc::vec![Entry::file("kept.txt")]);
+        a.update(Msg::PasteFiles);
+        assert!(a.take_clip_read(), "the binary is asked to read the ring");
+        assert!(!a.take_clip_read(), "and asked once");
+
+        a.pasted(PathVerb::Copy, &["/home/a.txt", "/home/b.txt"]);
+        let first = a.take_op().expect("one per path");
+        let second = a.take_op().expect("and the second");
+        assert_eq!(
+            first,
+            FileOp::Copy {
+                from: String::from("/home/a.txt"),
+                to: String::from("/home/papers/a.txt"),
+                dir: false
+            }
+        );
+        assert!(matches!(second, FileOp::Copy { .. }));
+        assert_eq!(a.take_op(), None, "and no more than that");
+
+        // A cut pastes as a move.
+        a.pasted(PathVerb::Cut, &["/home/a.txt"]);
+        assert!(matches!(a.take_op(), Some(FileOp::MoveInto { .. })));
+    }
+
+    /// A paste into the directory the file is already in is refused.
+    ///
+    /// **The copy is the dangerous half**: `from == to` would open the file for reading and
+    /// truncate it for writing at the same path.
+    #[test]
+    fn pasting_a_file_into_its_own_directory_does_nothing() {
+        let mut a = app();
+        a.show("/home", alloc::vec![Entry::file("a.txt")]);
+        a.pasted(PathVerb::Copy, &["/home/a.txt"]);
+        assert_eq!(a.take_op(), None, "no operation was queued");
+        assert_eq!(a.notice.as_deref(), Some("nothing to paste here"));
+    }
+
+    /// Text on the clipboard is reported rather than pasted as a filename.
+    #[test]
+    fn pasting_text_says_what_it_found() {
+        let mut a = app();
+        a.paste_not_paths();
+        assert_eq!(a.notice.as_deref(), Some("the clipboard holds text, not files"));
+        assert_eq!(a.take_op(), None);
+    }
+
+    // --- multi-select (M14 Part D) -------------------------------------------
+
+    /// A listing with enough rows to pick a range out of.
+    fn five() -> Vec<Entry> {
+        (0..5).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect()
+    }
+
+    fn picked(a: &App) -> Vec<String> {
+        a.selection().iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// Ctrl-click adds a row and takes it away again, including the anchor.
+    ///
+    /// **Unpicking the anchor is the case a set-only model misses.** The list state holds one
+    /// `selected` and the picks are everything besides it, so Ctrl-clicking the selected row has
+    /// to empty the state rather than the set.
+    #[test]
+    fn ctrl_click_adds_and_removes_one_row() {
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(1)));
+        assert_eq!(picked(&a), alloc::vec!["f1.txt"]);
+
+        a.note_press(libdraw::geom::Point::new(40, 100), 2_000, MOD_CTRL);
+        a.update(Msg::Press(row(3)));
+        assert_eq!(picked(&a), alloc::vec!["f1.txt", "f3.txt"], "in listing order");
+
+        // Again on the same row takes it out.
+        a.note_press(libdraw::geom::Point::new(40, 100), 3_000, MOD_CTRL);
+        a.update(Msg::Press(row(3)));
+        assert_eq!(picked(&a), alloc::vec!["f1.txt"]);
+
+        // And on the anchor, which lives in the list state rather than in the picks.
+        a.note_press(libdraw::geom::Point::new(40, 60), 4_000, MOD_CTRL);
+        a.update(Msg::Press(row(1)));
+        assert!(picked(&a).is_empty(), "the anchor can be unpicked too: {:?}", picked(&a));
+    }
+
+    /// Shift-click picks everything between the anchor and the row, both ways round.
+    #[test]
+    fn shift_click_picks_a_range() {
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(1)));
+        a.note_press(libdraw::geom::Point::new(40, 140), 2_000, MOD_SHIFT);
+        a.update(Msg::Press(row(3)));
+        assert_eq!(picked(&a), alloc::vec!["f1.txt", "f2.txt", "f3.txt"]);
+
+        // **Upwards too**, which a range written as `from..=to` gets wrong.
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 140), 1_000, 0);
+        a.update(Msg::Press(row(3)));
+        a.note_press(libdraw::geom::Point::new(40, 60), 2_000, MOD_SHIFT);
+        a.update(Msg::Press(row(1)));
+        assert_eq!(picked(&a), alloc::vec!["f1.txt", "f2.txt", "f3.txt"]);
+    }
+
+    /// A plain press replaces the whole selection.
+    #[test]
+    fn a_plain_press_replaces_the_picks() {
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(0)));
+        a.note_press(libdraw::geom::Point::new(40, 100), 2_000, MOD_CTRL);
+        a.update(Msg::Press(row(2)));
+        assert_eq!(picked(&a).len(), 2);
+
+        a.note_press(libdraw::geom::Point::new(40, 180), 3_000, 0);
+        a.update(Msg::Press(row(4)));
+        assert_eq!(picked(&a), alloc::vec!["f4.txt"], "one press, one row");
+    }
+
+    /// **A Ctrl-click never opens**, however fast it repeats.
+    ///
+    /// Somebody building a selection is not asking for anything to happen, and opening a file
+    /// mid-selection is the accident decision 5 exists to prevent.
+    #[test]
+    fn building_a_selection_does_not_open_anything() {
+        let mut a = app();
+        a.show("/home", five());
+        let at = libdraw::geom::Point::new(40, 60);
+        a.note_press(at, 1_000, MOD_CTRL);
+        a.update(Msg::Press(row(1)));
+        a.note_press(at, 1_100, MOD_CTRL);
+        a.update(Msg::Press(row(1)));
+        assert_eq!(a.take_open(), None, "two fast Ctrl-clicks are not a double click");
+    }
+
+    /// The picks survive a re-sort and do not survive a navigation.
+    ///
+    /// **Names, not indices.** The View menu reorders the listing under a selection, and a set of
+    /// positions would name different files afterwards.
+    #[test]
+    fn picks_follow_the_files_across_a_re_sort() {
+        let mut a = app();
+        a.show("/home", five());
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
+        a.update(Msg::Press(row(0)));
+        a.note_press(libdraw::geom::Point::new(40, 100), 2_000, MOD_CTRL);
+        a.update(Msg::Press(row(1)));
+        assert_eq!(picked(&a), alloc::vec!["f0.txt", "f1.txt"]);
+
+        a.update(Msg::SetOrder(libfs::Order::NameDesc));
+        assert_eq!(picked(&a), alloc::vec!["f1.txt", "f0.txt"], "the same two files, reordered");
+
+        // **And the order is still the tab's**, which is why row 0 here is `f4.txt` rather than
+        // `f0.txt`: an order chosen once follows you down a tree, by design.
+        a.show("/elsewhere", five());
+        assert_eq!(
+            picked(&a),
+            alloc::vec!["f4.txt"],
+            "a new listing keeps only its own row 0, under the order this tab is in"
+        );
     }
 
     // --- the sidebar (M14 Part D) --------------------------------------------
@@ -3487,21 +3948,21 @@ mod tests {
         // the wrong file and read as a broken feature.
         assert_eq!(names(&a), alloc::vec!["work", "notes.txt"]);
 
-        a.note_press(at, 1_000);
+        a.note_press(at, 1_000, 0);
         a.update(Msg::Press(row(1)));
         assert_eq!(a.pane().list.selected, Some(1), "it selected the row");
         assert_eq!(a.take_open(), None, "and did not open it");
         assert_eq!(a.take_goto(), None);
 
-        a.note_press(at, 1_150);
+        a.note_press(at, 1_150, 0);
         a.update(Msg::Press(row(1)));
         assert_eq!(a.take_open().as_deref(), Some("/home/notes.txt"), "the second click opened it");
 
         // A directory's second click navigates rather than opening.
-        a.note_press(at, 5_000);
+        a.note_press(at, 5_000, 0);
         a.update(Msg::Press(row(0)));
         assert_eq!(a.take_goto(), None, "still just a selection");
-        a.note_press(at, 5_150);
+        a.note_press(at, 5_150, 0);
         a.update(Msg::Press(row(0)));
         assert_eq!(a.take_goto().as_deref(), Some("/home/work"));
     }
@@ -3515,9 +3976,9 @@ mod tests {
         let at = libdraw::geom::Point::new(40, 60);
         let mut a = app();
         a.show("/home", alloc::vec![Entry::file("notes.txt")]);
-        a.note_press(at, 1_000);
+        a.note_press(at, 1_000, 0);
         a.update(Msg::Press(row(0)));
-        a.note_press(at, 1_000 + libui::click::RUN_MS + 1);
+        a.note_press(at, 1_000 + libui::click::RUN_MS + 1, 0);
         a.update(Msg::Press(row(0)));
         assert_eq!(a.take_open(), None, "two deliberate clicks are not a double click");
         assert_eq!(a.pane().list.selected, Some(0), "and the row is still selected");
@@ -3531,7 +3992,7 @@ mod tests {
     fn enter_opens_without_a_second_press() {
         let mut a = app();
         a.show("/home", alloc::vec![Entry::file("notes.txt")]);
-        a.note_press(libdraw::geom::Point::new(40, 60), 1_000);
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
         a.update(Msg::Press(row(0)));
         assert_eq!(a.take_open(), None);
         press_key(&mut a, libkern::abi::KEY_ENTER);
@@ -3550,7 +4011,7 @@ mod tests {
         // **A real drag, not a call to `note_drag`.** The browser ends the run itself when a
         // press becomes a drag, and a test that called the helper directly would pass for a
         // version that never called it — which is what the first one did.
-        a.note_press(libdraw::geom::Point::new(40, 60), 1_000);
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_000, 0);
         a.update(Msg::Grab(row(0)));
         a.pointer_moved(40, 60, 1);
         // Past the slop in one step, which is the motion that arms the drag.
@@ -3560,7 +4021,7 @@ mod tests {
             "travelling past the slop is a drag"
         );
         a.pointer_moved(40 + DRAG_SLOP, 60, 0);
-        a.note_press(libdraw::geom::Point::new(40, 60), 1_150);
+        a.note_press(libdraw::geom::Point::new(40, 60), 1_150, 0);
         a.update(Msg::Press(row(0)));
         assert_eq!(a.take_open(), None, "the click after a drag is a first click");
     }

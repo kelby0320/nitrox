@@ -4850,8 +4850,34 @@ the sidebar, then the clipboard — the last two build on what the click settles
       of them carried a comment saying it would fail loudly the day `/home` held a directory
       sorting first, and it did. The sidebar also moved every *listing* aim right by `SIDEBAR_W`
       while the strips above kept the full width; one host test caught that on its own.
-- [ ] **Cut, copy and paste of files** — `TODO(file-clipboard)`, left as a pair in M12 when only
-      copy existed. Wants **multi-select**, which is its own interaction.
+- [x] **Multi-select** ✅, which is its own interaction and came first because the clipboard acts
+      on whatever is picked. `Ctrl`-click toggles, `Shift`-click extends a range **both ways
+      round**, a plain press replaces. **Picks are names, not indices**, because the View menu can
+      reorder the listing under a live selection and a set of positions would then name different
+      files. `ListRow` gained a `marked` field rather than `ListState` gaining a set: the state is
+      `Copy` with sixteen literal construction sites, and a `Vec` inside it would cost every list
+      in the system an allocation for a thing only the browser has — `Tab` already carries
+      `marked`, so this is the shape that existed. **A Ctrl-click never opens**, however fast it
+      repeats: somebody building a selection is not asking for anything to happen.
+- [x] **Cut, copy and paste of files** ✅ — `TODO(file-clipboard)` built, with `CLIP_KIND_PATH`
+      beside `CLIP_KIND_TEXT`. **The verb is on the wire**: the payload is a `cut` or `copy` line
+      and then one absolute path per line, because a browser remembering its own pending cut would
+      move files for itself and copy them for any other window — a difference nobody can see until
+      it has happened. Paths are resolved to absolute *before* pushing, since a path is read by
+      whoever reads it.
+
+      Three refusals, each with a test: **an unknown verb is not a copy** (a future third verb — a
+      link — would otherwise silently duplicate files on every browser predating it); **a payload
+      that does not fit is refused rather than truncated**, since half a path is a path to
+      somewhere else; and **pasting a file into the directory it is already in does nothing**,
+      because `from == to` for a copy opens a file for reading and truncates it for writing at the
+      same path.
+
+      `self.op` became a **queue**: a paste of four files is four operations that can each fail on
+      their own, and a single slot would have let the last silently replace the three before it.
+      `Action::Copy` — which prompts for a name — became `Action::Duplicate`, because it and the
+      new Copy are different verbs. The gate carries a path across `/dev/clipboard` between two
+      directories and reads the result back from the **serial** side.
 - [x] **A delete confirmation** ✅ — **built in M12**, found by checking rather than by building.
 
 ### Part E — the terminal and editor deepened

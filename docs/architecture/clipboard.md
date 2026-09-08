@@ -142,9 +142,13 @@ here without a second thought about it.
 - **Focus-gated reads** — `TODO(clipboard-focus)`. Trigger: an application inside a session that the
   person does not trust.
 - **Chunked transfers** — `TODO(clipboard-chunking)`. Trigger: the first thing somebody cannot copy.
-- **A file-path kind for the browser's cut and paste** — `TODO(file-clipboard)`, whose trigger *has*
-  fired: the ring exists. What it still needs is a second `CLIP_KIND_*`, the menu items, and a
-  decision about pasting a path into a text field.
+- **A file-path kind for the browser's cut and paste** — **built, M14 Part D**.
+  `CLIP_KIND_PATH` is a `cut` or `copy` verb line followed by one absolute path per line, and
+  `nxfiles`'s Edit menu pushes and reads it. **The verb is on the wire and not in the browser**,
+  or a cut in one window and a paste in another would move files for the window that cut them and
+  copy them for everyone else. Pasting one into a *text* field needed no decision after all: the
+  payload is UTF-8, so a text consumer gets the path as text, which is what pasting a path into a
+  field means; the kind is what lets a file consumer treat it as a file.
 
 All three are in [`deferred-decisions.md`](../rationale/deferred-decisions.md).
 

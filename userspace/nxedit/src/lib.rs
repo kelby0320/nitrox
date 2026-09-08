@@ -1275,6 +1275,7 @@ impl App {
             .map(|(i, (name, _))| libui::widget::ListRow {
                 key: CHOOSER_ROW_KEY + i as u64,
                 label: name,
+                marked: false,
             })
             .collect();
         let dir = c.dir.clone();

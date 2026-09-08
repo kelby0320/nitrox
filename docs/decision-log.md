@@ -24155,3 +24155,67 @@ it pressed Enter after a `Backspace` back to `/home`, and a fresh listing select
 that had never mentioned row numbers depended on one. The gate found it three hundred lines from
 the change, as a listing of `/home/Documents` where `/home/papers` was expected.
 
+---
+
+## 2026-09-08 — the verb goes on the wire (M14 Part D, batch 8)
+
+Multi-select, then cut, copy and paste of files — `TODO(file-clipboard)` built, which closes the
+last box of Part D.
+
+**Multi-select came first because the clipboard acts on whatever is picked.** `Ctrl`-click toggles,
+`Shift`-click extends a range in both directions, a plain press replaces. **Picks are names rather
+than indices**: the View menu can reorder a listing under a live selection, and a set of positions
+would afterwards name different files. And **a Ctrl-click never opens**, however fast it repeats —
+somebody building a selection is not asking for anything to happen, which is decision 5's argument
+one step further on.
+
+**`ListRow` gained `marked`; `ListState` did not gain a set.** The state is `Copy` with sixteen
+literal construction sites, so a `Vec` inside it would cost every list in the system an allocation
+for a thing only the browser has. `Tab` already carried a `marked` field, so this is the shape that
+existed rather than a new one. To a person a marked row and a selected row are the same thing —
+the rows an action will act on — so `list_view` draws them identically.
+
+**The verb is on the wire, and that is the decision this batch turns on.** `CLIP_KIND_PATH`'s
+payload is a `cut` or `copy` line followed by one absolute path per line. The cheaper design — the
+browser remembering that it just cut — would **move files for the window that cut them and copy
+them for every other window**, which is a difference nobody can see until it has happened to their
+files. Putting it in the payload makes a cut in one window and a paste in another the same gesture
+as within one.
+
+**Three refusals, each with a test.** An unknown verb is not a copy, or a future third verb — a
+link — would silently duplicate files on every browser that predates it. A payload that does not
+fit is refused rather than truncated, because half a path is a path to somewhere else, and that is
+the one failure here that could act on the wrong file. And pasting a file into the directory it is
+already in does nothing: for a copy, `from == to` opens a file for reading and truncates it for
+writing at the same path.
+
+**The codec's tests do not only round-trip.** A round trip tests the encoder against itself; the
+reader is pinned by handing it bytes a correct writer would never produce — an unknown verb, a
+verb that is a prefix of a real one, an empty verb, blank lines, and payload that is not UTF-8.
+
+**`self.op` became a queue.** A paste of four files is four operations that can each fail on their
+own, and a single slot would have let the last silently replace the three before it. `main` drains
+the queue and re-lists **once**, because a listing between operations reads the directory per file
+and shows it half-done in between.
+
+**`Action::Copy` became `Action::Duplicate`.** It prompts for a name and writes a second file
+beside the first; the new Copy puts a path on the clipboard and does nothing until a paste. Two
+verbs sharing a word is how a menu comes to mean two things.
+
+**The old test that asserted the Edit menu held only Copy carried the reason cut and paste were
+absent** — they are a pair that holds something between two gestures, which is a clipboard however
+it is spelled, so adding them before M12 Part E built the real one would have shipped a second
+clipboard. The replacement says the reason is now satisfied rather than dropping it.
+
+**And the third open question in the deferral answered itself.** It asked "what should pasting a
+path into a *text* field do — the name, or nothing". Neither: the payload is UTF-8, so a text
+consumer pastes the path *as text*, which is what a person means by pasting a path into a field.
+The kind tag is what lets a file consumer treat it as a file instead. A question that needs no
+mechanism is worth recording as answered rather than left open.
+
+**A method note, because it cost a gate run.** A step was added above the closure it uses, so
+`check-login` never booted — and the `cargo xtask test` I had run in the same breath reported 41
+green suites from a *separate* invocation, which I read as evidence the tree compiled. It was not:
+the gate's own build is the check. The same misplacement had already happened once this part, with
+the sidebar step.
+

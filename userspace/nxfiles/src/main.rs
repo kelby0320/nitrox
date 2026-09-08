@@ -245,6 +245,38 @@ fn home_of(env: &libstream::wire::Record) -> String {
         .unwrap_or_else(|| String::from("/"))
 }
 
+/// Put `bytes` on the clipboard as a list of paths.
+///
+/// **Connects per operation rather than holding a session open**, as `nxedit` and `nxterm` do: a
+/// person copies a handful of times a minute at most, and a held session costs the server a
+/// wait-set slot in a set every application in the window system is in.
+fn clip_put(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf)
+        .map_err(|_| "no /dev/clipboard")?;
+    let r = clip.copy(librsproto::clipboard::CLIP_KIND_PATH, bytes).map(|_| ());
+    clip.close();
+    r.map_err(|_| "the clipboard refused it")
+}
+
+/// Read the newest clipboard entry: its kind, and how many bytes landed in `out`.
+///
+/// `Ok(None)` is an empty ring, which is not a failure — it is what a paste before any copy
+/// finds.
+fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static str> {
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf)
+        .map_err(|_| "no /dev/clipboard")?;
+    let r = clip.paste(0, librsproto::clipboard::CLIP_ANY_SERIAL, out);
+    clip.close();
+    match r {
+        Ok((_, kind, len)) => Ok(Some((kind, len.min(out.len())))),
+        Err(e) if e.is_empty() => Ok(None),
+        Err(e) if e.is_stale() => Err("the clipboard changed"),
+        Err(_) => Err("the clipboard refused"),
+    }
+}
+
 /// The monotonic clock in milliseconds.
 ///
 /// **Milliseconds because that is the unit a click run is measured in**; nanoseconds would make
@@ -734,14 +766,63 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // **The filesystem work, here because it is syscalls.** `update` produced a value saying
         // what should happen; this is where it happens, and the listing is read again afterwards
         // so that what the person sees is what is on disk rather than what was asked for.
-        if let Some(op) = app.take_op() {
-            let said = perform(root_ns, &op);
-            libkern::debug::Line::new()
-                .s(b"nxfiles: ")
-                .s(said.as_bytes())
-                .s(b" ")
-                .untrusted(subject(&op).as_bytes())
-                .end();
+        // ---- the clipboard, which is syscalls ----
+        if let Some((verb, paths)) = app.take_clip_push() {
+            let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let mut payload = [0u8; librsproto::clipboard::MAX_CLIP_BYTES];
+            match librsproto::clipboard::encode_paths(verb, &refs, &mut payload) {
+                Some(n) => match clip_put(root_ns, &payload[..n]) {
+                    Ok(()) => libkern::debug::Line::new()
+                        .s(b"nxfiles: clipboard now holds ")
+                        .u(refs.len() as u64)
+                        .s(if verb == librsproto::clipboard::PathVerb::Cut {
+                            b" path(s) to move".as_slice()
+                        } else {
+                            b" path(s) to copy".as_slice()
+                        })
+                        .end(),
+                    Err(e) => app.operated(e),
+                },
+                // **Refused rather than truncated**, and said out loud: half a path is a path to
+                // somewhere else, and this is the one failure here that could act on the wrong
+                // file.
+                None => app.operated("too many paths for one clipboard entry"),
+            }
+        }
+        if app.take_clip_read() {
+            let mut payload = [0u8; librsproto::clipboard::MAX_CLIP_BYTES];
+            match clip_get(root_ns, &mut payload) {
+                Ok(Some((kind, len))) if kind == librsproto::clipboard::CLIP_KIND_PATH => {
+                    match librsproto::clipboard::Paths::read(&payload[..len]) {
+                        Some(p) => {
+                            let list: Vec<&str> = p.iter().collect();
+                            app.pasted(p.verb, &list);
+                        }
+                        // The kind said paths and the bytes are not: a server or a client is
+                        // wrong, and neither is this browser's to fix.
+                        None => app.operated("the clipboard entry is not readable"),
+                    }
+                }
+                Ok(Some(_)) => app.paste_not_paths(),
+                Ok(None) => app.operated("the clipboard is empty"),
+                Err(e) => app.operated(e),
+            }
+        }
+
+        if app.has_ops() {
+            // **The whole queue, then one listing.** A paste is several operations and each gets
+            // its own line; re-listing between them would read the directory once per file and
+            // show it half-done in between.
+            let mut said = "";
+            while let Some(op) = app.take_op() {
+                said = perform(root_ns, &op);
+                libkern::debug::Line::new()
+                    .s(b"nxfiles: ")
+                    .s(said.as_bytes())
+                    .s(b" ")
+                    .untrusted(subject(&op).as_bytes())
+                    .end();
+            }
             app.operated(said);
             let here = String::from(app.path());
             navigate(app, root_ns, &here);
@@ -1000,7 +1081,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         && p.flags & librsproto::surface::POINTER_PRESSED != 0
                         && p.button == libkern::abi::BTN_LEFT
                     {
-                        app.note_press(libdraw::geom::Point::new(p.x, p.y), clock_ms());
+                        app.note_press(libdraw::geom::Point::new(p.x, p.y), clock_ms(), p.modifiers);
                     }
                     let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {

@@ -98,6 +98,101 @@ pub const CLIP_RING: usize = 16;
 /// No other value is defined here, because a constant nothing sends is scaffolding.
 pub const CLIP_KIND_TEXT: u16 = 0;
 
+/// A list of absolute paths, and what was meant to happen to them.
+///
+/// **A second kind rather than a second clipboard**, which is what the tag above exists for: the
+/// browser's cut and paste share one ring and one authority with text. The file-clipboard
+/// deferral named the three things this needed — the kind, the menu, and a paste that reads one —
+/// and M14 Part D built all three, which is what closed it.
+///
+/// The bytes are UTF-8 and newline-separated: a **verb** line, then one absolute path per line.
+/// The verb is `cut` or `copy`. See [`encode_paths`] and [`Paths`].
+///
+/// **The verb is on the wire and not in the browser**, because a cut in one window and a paste in
+/// another is the same gesture as within one — a browser remembering its own pending cut would
+/// move files for itself and copy them for anybody else, which is the kind of difference nobody
+/// can see until it has happened.
+pub const CLIP_KIND_PATH: u16 = 1;
+
+/// What a [`CLIP_KIND_PATH`] entry says should happen to its paths.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathVerb {
+    /// The paths are to be copied, and stay where they are.
+    Copy,
+    /// The paths are to be moved, and the originals go.
+    Cut,
+}
+
+impl PathVerb {
+    /// The word this verb is spelled with on the wire.
+    pub fn word(self) -> &'static str {
+        match self {
+            PathVerb::Copy => "copy",
+            PathVerb::Cut => "cut",
+        }
+    }
+}
+
+/// Write `paths` into `out` as a [`CLIP_KIND_PATH`] payload; returns how many bytes were used.
+///
+/// **Into a caller's buffer, because this crate has no allocator** — the same shape every other
+/// codec here takes. `None` if the payload would not fit, rather than a truncated list: half a
+/// path is a path to somewhere else.
+///
+/// **Absolute paths are a caller's rule, not this codec's** — a relative one would be read against
+/// whatever directory the *reader* is in, which is a different file. The browser resolves before
+/// pushing; this does not validate, for the reason the text codec does not validate UTF-8.
+pub fn encode_paths(verb: PathVerb, paths: &[&str], out: &mut [u8]) -> Option<usize> {
+    let word = verb.word().as_bytes();
+    let mut n = word.len() + paths.iter().map(|p| 1 + p.len()).sum::<usize>();
+    if n > out.len() || n > MAX_CLIP_BYTES {
+        return None;
+    }
+    out[..word.len()].copy_from_slice(word);
+    n = word.len();
+    for p in paths {
+        out[n] = b'\n';
+        n += 1;
+        out[n..n + p.len()].copy_from_slice(p.as_bytes());
+        n += p.len();
+    }
+    Some(n)
+}
+
+/// A decoded [`CLIP_KIND_PATH`] payload: the verb, and the paths after it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Paths<'a> {
+    /// What should happen to them.
+    pub verb: PathVerb,
+    /// The rest of the payload, still newline-separated — walk it with [`Paths::iter`].
+    rest: &'a str,
+}
+
+impl<'a> Paths<'a> {
+    /// Read a payload, or `None` if the verb is not one of the two.
+    ///
+    /// **An unknown verb is not a copy.** Guessing would make a future third verb — a link, say —
+    /// silently duplicate files on every browser that predates it.
+    pub fn read(bytes: &'a [u8]) -> Option<Paths<'a>> {
+        let text = core::str::from_utf8(bytes).ok()?;
+        let (head, rest) = match text.split_once('\n') {
+            Some((h, r)) => (h, r),
+            None => (text, ""),
+        };
+        let verb = match head {
+            "copy" => PathVerb::Copy,
+            "cut" => PathVerb::Cut,
+            _ => return None,
+        };
+        Some(Paths { verb, rest })
+    }
+
+    /// The paths, in the order they were pushed. Empty lines are skipped.
+    pub fn iter(&self) -> impl Iterator<Item = &'a str> {
+        self.rest.split('\n').filter(|p| !p.is_empty())
+    }
+}
+
 /// Wire size of an entry's fixed head: `serial` (8), `kind` (2), `len` (4), and two bytes of
 /// padding so the bytes start 8-aligned.
 pub const CLIP_ENTRY_HEAD: usize = 16;
@@ -491,6 +586,55 @@ impl<'a> Clipboard<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    // --- the path kind (M14 Part D) ------------------------------------------
+
+    /// A list of paths survives the round trip, verb and all.
+    #[test]
+    fn paths_round_trip() {
+        let mut buf = [0u8; 256];
+        let n = encode_paths(PathVerb::Cut, &["/home/a.txt", "/home/b"], &mut buf)
+            .expect("it fits");
+        let got = Paths::read(&buf[..n]).expect("it reads");
+        assert_eq!(got.verb, PathVerb::Cut);
+        let mut seen = got.iter();
+        assert_eq!(seen.next(), Some("/home/a.txt"));
+        assert_eq!(seen.next(), Some("/home/b"));
+        assert_eq!(seen.next(), None, "and nothing after them");
+    }
+
+    /// **Bytes a correct writer would never produce**, which is the half a round trip cannot
+    /// reach: it only ever tests the encoder's own output.
+    #[test]
+    fn a_reader_refuses_what_it_should() {
+        // An unknown verb is not a copy. Guessing would make a future third verb — a link, say —
+        // silently duplicate files on every browser that predates it.
+        assert!(Paths::read(b"link\n/home/a").is_none());
+        assert!(Paths::read(b"\n/home/a").is_none(), "an empty verb is not one either");
+        assert!(Paths::read(b"copied\n/home/a").is_none(), "nor a prefix of one");
+        // A verb with no paths is legal and empty — pushing nothing is not a malformed entry.
+        let only = Paths::read(b"copy").expect("a bare verb reads");
+        assert_eq!(only.iter().count(), 0);
+        // Blank lines are skipped rather than yielded as an empty path, which would name the
+        // reader's own directory.
+        let padded = Paths::read(b"copy\n/home/a\n\n/home/b\n").expect("reads");
+        assert_eq!(padded.iter().count(), 2);
+        // Not UTF-8 at all.
+        assert!(Paths::read(&[b'c', b'o', b'p', b'y', b'\n', 0xff, 0xfe]).is_none());
+    }
+
+    /// A payload that will not fit is refused rather than truncated.
+    ///
+    /// **Half a path is a path to somewhere else**, which is the one failure here that could
+    /// delete the wrong file.
+    #[test]
+    fn a_payload_that_does_not_fit_is_refused() {
+        let mut small = [0u8; 8];
+        assert!(encode_paths(PathVerb::Copy, &["/home/a-long-name"], &mut small).is_none());
+        let mut buf = [0u8; 64];
+        assert!(encode_paths(PathVerb::Copy, &["/a"], &mut buf).is_some(), "and fits when it does");
+    }
+
     use super::*;
 
     #[test]

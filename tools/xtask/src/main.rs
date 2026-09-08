@@ -3333,6 +3333,41 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
 
+    // **Cut, copy and paste of files** (M14 Part D), which is the file-clipboard deferral built: a
+    // path crosses `/dev/clipboard` between two directories and the **serial** side reads the
+    // result back. Asserted through the filesystem rather than through a log line, for step 9d's
+    // reason — a paste that acted on the wrong path makes a differently-named file rather than a
+    // matching count.
+    //
+    // Row 4 is `theme.toml`, the first file after the three directories.
+    click_at(&mut qmp, &mut session, files_win.1 + SIDEBAR_W + 120, row_y(4))?;
+    session.expect("nxfiles: selected theme.toml")?;
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "c")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxfiles: clipboard now holds 1 path(s) to copy")?;
+    println!("  ok: Ctrl+C put a path on the clipboard");
+
+    // Into an empty directory, by the sidebar, and paste there.
+    click_at(&mut qmp, &mut session, files_win.1 + 40, row_y(1))?;
+    session.expect("nxfiles: listed /home/Documents - 0 entries")?;
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "v")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxfiles: copied /home/Documents/theme.toml")?;
+    session.expect("nxfiles: listed /home/Documents - 1 entries")?;
+    println!("  ok: and Ctrl+V copied it into another directory");
+
+    // **The serial column is what says it happened**, because asking the browser would be asking
+    // the program that claims to have done it.
+    session.send("list ./Documents")?;
+    session.expect("theme.toml")?;
+    session.expect("/home>")?;
+    println!("  ok: and the shell sees the file the paste made");
+
+    press(&mut qmp, "backspace")?;
+    session.expect("nxfiles: listed /home - ")?;
+
     // **A single click selects, a double click opens** (M14 Part D, decision 5).
     //
     // **This is the only place the interaction exists.** The gate navigates with `Enter` and drags

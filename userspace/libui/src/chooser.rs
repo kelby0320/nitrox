@@ -254,8 +254,8 @@ mod tests {
     /// entirely (PR #284 review, blocking 3).
     fn rows() -> Vec<ListRow<'static>> {
         alloc::vec![
-            ListRow { key: 1, label: "papers" },
-            ListRow { key: 2, label: "notes.txt" },
+            ListRow { key: 1, label: "papers", marked: false },
+            ListRow { key: 2, label: "notes.txt", marked: false },
         ]
     }
 

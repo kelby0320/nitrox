@@ -644,7 +644,7 @@ fn modal_rows<'a>(apps: &'a [Application], q: &str) -> alloc::vec::Vec<ListRow<'
     apps.iter()
         .enumerate()
         .filter(|(_, a)| matches_app(a, q))
-        .map(|(i, a)| ListRow { key: i as u64, label: a.name.as_str() })
+        .map(|(i, a)| ListRow { key: i as u64, label: a.name.as_str(), marked: false })
         .collect()
 }
 
