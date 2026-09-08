@@ -192,6 +192,10 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
             l.end();
         }
         Err(_) => {
+            // **And the window says so too.** The console line has always been here; what was
+            // missing is anything on screen, so a typed path with a typo did nothing visible and
+            // read as a keystroke that had not registered (M14 Part D).
+            app.list_failed(path);
             libkern::debug::Line::new()
                 .s(b"nxfiles: cannot list ")
                 .untrusted(path.as_bytes())
@@ -379,6 +383,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
     let reported_prompt = app.prompt_len();
     let reported_pick: Option<String> = app.picked_name();
+    let reported_loc: Option<usize> = app.location_text().map(|t| t.chars().count());
 
     /// Everything one window of this browser is.
     ///
@@ -399,6 +404,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         reported_prompt: Option<usize>,
         /// The selected row's name, reported on change — see the receipt below.
         reported_pick: Option<String>,
+        /// How many characters the location bar holds, reported the same way.
+        reported_loc: Option<usize>,
     }
 
     /// Open a window of this browser, dressed and ready to be serviced.
@@ -417,6 +424,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         dress(win, top.id());
         let reported_prompt = app.prompt_len();
         let reported_pick = app.picked_name();
+        let reported_loc = app.location_text().map(|t| t.chars().count());
         Some(Win {
             top,
             app,
@@ -429,6 +437,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             confirm_hovered: None,
             reported_prompt,
             reported_pick,
+            reported_loc,
         })
     }
 
@@ -445,6 +454,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         confirm_hovered,
         reported_prompt,
         reported_pick,
+        reported_loc,
     }];
 
     loop {
@@ -468,6 +478,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             confirm_hovered,
             reported_prompt,
             reported_pick,
+            reported_loc,
         } = &mut wins[wi];
         let window_id = top.id();
         // ---- render ----
@@ -629,6 +640,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // no other outward sign — the window redraws and nothing is logged. On change rather than
         // per event, like the prompt's receipt below it, so pointing down a listing costs one
         // line per row rather than one per motion.
+        // **The location bar's length, on change** — the same receipt the name prompt has, and
+        // for the same reason: a gate typing a path needs a per-character acknowledgement, or an
+        // unacknowledged burst becomes a dropped keystroke found later as a wrong path.
+        let loc = app.location_text().map(|t| t.chars().count());
+        if loc != *reported_loc {
+            *reported_loc = loc;
+            match loc {
+                Some(n) => libkern::debug::Line::new()
+                    .s(b"nxfiles: location so far ")
+                    .u(n as u64)
+                    .s(b" chars")
+                    .end(),
+                None => kprint(b"nxfiles: location bar closed\n"),
+            }
+        }
         let picked = app.picked_name();
         if picked != *reported_pick {
             *reported_pick = picked.clone();

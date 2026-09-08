@@ -3225,6 +3225,47 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxfiles: listed /home - ")?;
     println!("  ok: Backspace went back up");
 
+    // **The location bar** (M14 Part D). `Ctrl+L` opens it on where the tab is, the path is
+    // retyped, and `Enter` goes there — which is the whole chain: the chord reached the browser,
+    // the keys went to the *field* rather than to the listing behind it, and what was typed became
+    // a navigation.
+    //
+    // **A receipt per character**, the discipline every typed sequence in this gate follows.
+    qmp.send_key("ctrl", true)?;
+    press(&mut qmp, "l")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxfiles: location so far 5 chars")?;
+    println!("  ok: Ctrl+L opened the bar seeded with /home");
+
+    // Clear the five it was seeded with. **Backspace here must not go up a directory**, which is
+    // the property the emptying itself proves: a browser whose listing still had the keyboard
+    // would navigate rather than edit, and the counts below would never arrive.
+    for left in (0..5).rev() {
+        press(&mut qmp, "backspace")?;
+        session.expect(&format!("nxfiles: location so far {left} chars"))?;
+    }
+    for (i, c) in "/home/papers".chars().enumerate() {
+        let qcode = match c {
+            '/' => String::from("slash"),
+            other => other.to_string(),
+        };
+        press(&mut qmp, &qcode)?;
+        session.expect(&format!("nxfiles: location so far {} chars", i + 1))?;
+    }
+    press(&mut qmp, "ret")?;
+    // **The bar closes before the listing arrives, and the order is not a choice.** The receipt
+    // is emitted from the render pass, which runs a full turn of the loop before the pending
+    // navigation is taken — so `closed` is on the wire first. `Session::expect` consumes what it
+    // scans past, so waiting for the listing first eats the close and then hangs on it; the first
+    // version of this step did exactly that.
+    session.expect("nxfiles: location bar closed")?;
+    session.expect("nxfiles: listed /home/papers - ")?;
+    println!("  ok: and what was typed into it became a navigation");
+
+    // Back to `/home`, which is where the steps below expect to be.
+    press(&mut qmp, "backspace")?;
+    session.expect("nxfiles: listed /home - ")?;
+
     // **Where a listing row is.** Hoisted here from the drag step below, which is the other thing
     // that aims at one — two copies of this sum is how a gate comes to press one row high after
     // a strip changes height. `nxfiles::list_top` is the browser's own version of it.
@@ -3910,7 +3951,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // again when M14 Part B added the window rows — and each time the gate failed as a *prompt*
     // that never opened, several steps from the menu it was really about. The walk below at least
     // says which row it could not find.
-    const RENAME_ROW: u64 = 108;
+    const RENAME_ROW: u64 = 109;
     let rx = px + 20;
     let mut ry = py + MENU_FRAME;
     let mut rename_at = None;

@@ -138,6 +138,8 @@ pub const CLOSE_TAB_KEYCODE: u16 = 17;
 /// **`Ctrl+H` rather than a `Super` chord**, which the compositor owns: every one of those is the
 /// shell's, and a browser binding one would be a keystroke the guest never sees.
 pub const HIDDEN_KEYCODE: u16 = 35;
+/// The key that opens the location bar: `l`, with Ctrl.
+pub const LOCATION_KEYCODE: u16 = 38;
 /// The element key on the confirmation dialog's title bar.
 pub const CONFIRM_TITLE_KEY: u64 = 20;
 /// The element key on its question.
@@ -397,6 +399,11 @@ pub struct App {
     panes: Vec<Pane>,
     /// Which pane's tab is current, by [`Pane::key`].
     current: u64,
+    /// The location bar's field, while it is open.
+    ///
+    /// **On the window rather than the pane**, because only one can be open at a time and it acts
+    /// on whichever tab is current — the same reason the name prompt is not per pane.
+    location: Option<TextFieldState>,
     /// Counts runs of pointer presses, so a second click on a row can mean something else.
     ///
     /// **Fed by the binary**, which is the only half that can read a clock — see
@@ -533,6 +540,12 @@ pub enum Msg {
     /// within the run opens. `Activate` is what "open" means, and the keyboard still sends it
     /// directly — `Enter` on a selected row is not a click and has no run to be part of.
     Press(u64),
+    /// Open the location bar, seeded with where this tab is — `Ctrl+L`, or the File menu.
+    OpenLocation,
+    /// Go to what was typed there.
+    LocationGo,
+    /// Close it without going anywhere.
+    LocationCancel,
     /// Order this tab's listing that way — a View menu row.
     ///
     /// **Applied to what is already held**, with no listing asked for: the entries are the same
@@ -603,6 +616,7 @@ impl App {
                 show_hidden: false,
             }],
             current: TAB_KEY_BASE,
+            location: None,
             clicks: libui::click::Clicks::new(),
             click_run: 1,
             next_key: TAB_KEY_BASE + 1,
@@ -890,6 +904,39 @@ impl App {
                     self.notice = Some(String::from("not deleted"));
                 }
             }
+            // **Seeded with where the tab is**, so the common edit is to the tail of a path
+            // rather than to an empty field — and a person who opened it by accident sees where
+            // they are rather than a blank.
+            Msg::OpenLocation => {
+                self.prompt = None;
+                self.notice = None;
+                self.location = Some(TextFieldState::with_text(&self.pane().path));
+            }
+            Msg::LocationCancel => {
+                if self.location.take().is_some() {
+                    // **Says so**, for the reason the delete question does: a field that vanishes
+                    // with nothing changed is indistinguishable from one that acted.
+                    self.notice = Some(String::from("cancelled"));
+                }
+            }
+            Msg::LocationGo => {
+                let Some(f) = self.location.as_ref() else { return };
+                let typed = f.text().trim().to_string();
+                if typed.is_empty() {
+                    self.notice = Some(String::from("a path, then Enter"));
+                    return;
+                }
+                // **A relative path is joined to where the tab is**, which is what a location bar
+                // is for — typing `papers` from `/home` should go where typing it into a shell
+                // would. An absolute one replaces it outright.
+                let to = if typed.starts_with('/') {
+                    typed
+                } else {
+                    join(&self.pane().path, &typed)
+                };
+                self.location = None;
+                self.goto = Some(to);
+            }
             // **Re-sorted in place**, and the selection follows the *file* rather than the row:
             // a person watching a name they picked jump to another line as the order changes
             // would reasonably think the browser had selected something else.
@@ -1075,6 +1122,22 @@ impl App {
             }
             return;
         }
+        // **And while a path is being typed they are the location bar's**, for exactly the
+        // reason below: `Backspace` correcting a typo must not also go up a directory. Before the
+        // prompt check because the two are mutually exclusive — opening either closes the other —
+        // so the order between them only decides which branch answers when neither is open.
+        if self.location.is_some() {
+            match k.keycode {
+                libkern::abi::KEY_ESC => self.update(Msg::LocationCancel),
+                libkern::abi::KEY_ENTER => self.update(Msg::LocationGo),
+                code => {
+                    if let Some(f) = self.location.as_mut() {
+                        f.apply(code, k.modifiers);
+                    }
+                }
+            }
+            return;
+        }
         // **While a name is being typed the keys are the field's**, arrows and Backspace
         // included — the same rule `nxedit`'s naming field follows, and for the same reason: a
         // Backspace that went up a directory while somebody was correcting a typo would be one
@@ -1129,6 +1192,15 @@ impl App {
     pub fn note_drag(&mut self) {
         self.clicks.reset();
         self.click_run = 1;
+    }
+
+    /// The listing the binary was asked for could not be read.
+    ///
+    /// **Said out loud, because a typed path that does not exist is the ordinary mistake.** The
+    /// browser used to leave the pane exactly as it was, so a location bar entry with a typo did
+    /// nothing at all and looked like a key that had not registered.
+    pub fn list_failed(&mut self, path: &str) {
+        self.notice = Some(alloc::format!("no such directory: {path}"));
     }
 
     /// The selected row's name, if a row is selected.
@@ -1327,6 +1399,13 @@ impl App {
                     // out loud: `CloseTab` on a lone tab is already a no-op, and a row that
                     // silently did nothing was the half of the affordance that was missing.
                     .enabled(self.panes.len() > 1),
+                    // **After the tab pair, not between it.** New Tab and Close Tab are one
+                    // thought, and a row wedged between them reads as part of neither.
+                    Item::new(
+                        "Go to Location\u{2026}",
+                        Accel::ctrl(LOCATION_KEYCODE, "L"),
+                        Msg::OpenLocation,
+                    ),
                     Item::Separator,
                     Item::new(
                         "New Window",
@@ -1405,6 +1484,15 @@ impl App {
     /// added for the same reason it was: a count, not the text.
     pub fn prompt_len(&self) -> Option<usize> {
         self.prompt.as_ref().map(|(_, _, f)| f.text().chars().count())
+    }
+
+    /// What the location bar holds, if it is open.
+    ///
+    /// **For the binary's receipt**, which reports it on change the way the name prompt's length
+    /// is reported: a bar that is open and a bar that is not look different on screen and
+    /// identical in a transcript.
+    pub fn location_text(&self) -> Option<String> {
+        self.location.as_ref().map(|f| String::from(f.text()))
     }
 
     /// The row an internal drag is over, which the view draws a highlight on.
@@ -1559,6 +1647,25 @@ impl App {
                 )
                 .key(NOTICE_KEY),
             ]),
+            // **The location bar replaces the path with a field showing the same text**, which
+            // is what makes it read as editing where you are rather than as a second prompt about
+            // something else.
+            None if self.location.is_some() => {
+                let f = self.location.as_ref().expect("checked by the guard");
+                row(alloc::vec![
+                    padding(
+                        Insets { top: 2, right: 6, bottom: 2, left: 6 },
+                        text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                    )
+                    .key(PATH_KEY)
+                    .flex(1),
+                    padding(
+                        Insets { top: 4, right: 6, bottom: 4, left: 0 },
+                        text(self.notice.clone().unwrap_or_default()),
+                    )
+                    .key(NOTICE_KEY),
+                ])
+            }
             None => row(alloc::vec![
                 padding(Insets { top: 4, right: 4, bottom: 4, left: 6 }, text(self.pane().path.clone()))
                     .key(PATH_KEY),
@@ -2270,17 +2377,17 @@ mod tests {
         for (i, item) in [
             (0, "New TabCtrl+T"),
             (1, "Close TabCtrl+W"),
-            (3, "New WindowCtrl+Shift+N"),
-            (4, "QuitCtrl+Q"),
-            (6, "New File"),
-            (7, "New Folder"),
-            (8, "Rename"),
-            (9, "Delete"),
+            (4, "New WindowCtrl+Shift+N"),
+            (5, "QuitCtrl+Q"),
+            (7, "New File"),
+            (8, "New Folder"),
+            (9, "Rename"),
+            (10, "Delete"),
         ] {
             assert_eq!(labelled(&file, MENU_ROW_KEY + i), item, "the File menu's row {i}");
         }
-        // Row 2 is the separator: it is keyed by nothing, so nothing is found at its index.
-        for rule in [2, 5] {
+        // Row 3 is the separator: it is keyed by nothing, so nothing is found at its index.
+        for rule in [3, 6] {
             assert_eq!(labelled(&file, MENU_ROW_KEY + rule), "", "row {rule} is a rule, not an item");
         }
 
@@ -2329,7 +2436,7 @@ mod tests {
         // …and the ones that do not need a selection were never affected either way.
         let file = a.menu_table().into_iter().next().expect("File");
         assert!(
-            matches!(file.items[3], Item::Action { enabled: true, .. }),
+            matches!(file.items[7], Item::Action { enabled: true, .. }),
             "New File does not act on a selection"
         );
     }
@@ -2593,6 +2700,88 @@ mod tests {
         assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
         assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
         assert_eq!(libinput::keymap::to_char(HIDDEN_KEYCODE, 0), Some(b'h'));
+    }
+
+    // --- the location bar (M14 Part D) ---------------------------------------
+
+    /// `Ctrl+L` opens the bar on where the tab is, and Enter goes where it says.
+    #[test]
+    fn the_location_bar_opens_seeded_and_navigates() {
+        let mut a = app();
+        assert!(a.location_text().is_none(), "closed to begin with");
+
+        a.update(Msg::Key(KeyEvent::new(1, LOCATION_KEYCODE, KEY_DOWN, MOD_CTRL)));
+        assert_eq!(
+            a.location_text().as_deref(),
+            Some("/home"),
+            "seeded with where the tab is, not left blank"
+        );
+
+        // Replace it with somewhere else and go.
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0)));
+        a.update(Msg::OpenLocation);
+        *a.location.as_mut().expect("open") = TextFieldState::with_text("/system/fonts");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.take_goto().as_deref(), Some("/system/fonts"));
+        assert!(a.location_text().is_none(), "and it closed");
+    }
+
+    /// A relative path is joined to where the tab is, as it would be in a shell.
+    #[test]
+    fn a_relative_path_is_joined_to_the_current_directory() {
+        let mut a = app();
+        a.update(Msg::OpenLocation);
+        *a.location.as_mut().expect("open") = TextFieldState::with_text("papers");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.take_goto().as_deref(), Some("/home/papers"));
+    }
+
+    /// Esc closes it and says so; an empty path is refused and it stays open.
+    ///
+    /// **"Cancelled" is not decoration**: a field that vanishes with nothing changed is
+    /// indistinguishable from one that acted, which is the same argument the delete question
+    /// already makes.
+    #[test]
+    fn the_location_bar_refuses_the_answers_that_are_not_answers() {
+        let mut a = app();
+        a.update(Msg::OpenLocation);
+        *a.location.as_mut().expect("open") = TextFieldState::with_text("   ");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert!(a.location_text().is_some(), "left open — the person is mid-answer");
+        assert_eq!(a.take_goto(), None, "and went nowhere");
+        assert_eq!(a.notice.as_deref(), Some("a path, then Enter"));
+
+        press_key(&mut a, libkern::abi::KEY_ESC);
+        assert!(a.location_text().is_none(), "Esc closed it");
+        assert_eq!(a.take_goto(), None);
+        assert_eq!(a.notice.as_deref(), Some("cancelled"));
+    }
+
+    /// While the bar is open the keys are its own — Backspace edits, it does not go up.
+    ///
+    /// **One key doing two things is the failure**, and it is the rule the name prompt already
+    /// follows: correcting a typo must not also navigate.
+    #[test]
+    fn the_location_bar_holds_the_keyboard_while_it_is_open() {
+        let mut a = app();
+        a.update(Msg::OpenLocation);
+        assert_eq!(a.location_text().as_deref(), Some("/home"));
+        press_key(&mut a, libkern::abi::KEY_BACKSPACE);
+        assert_eq!(a.location_text().as_deref(), Some("/hom"), "Backspace edited the field");
+        assert_eq!(a.take_goto(), None, "and did not go up a directory");
+    }
+
+    /// A path that cannot be listed says so rather than doing nothing.
+    #[test]
+    fn a_directory_that_is_not_there_is_reported() {
+        let mut a = app();
+        a.update(Msg::OpenLocation);
+        *a.location.as_mut().expect("open") = TextFieldState::with_text("/nowhere");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        let to = a.take_goto().expect("it tried");
+        // The binary comes back with the bad news, as it does for any listing.
+        a.list_failed(&to);
+        assert_eq!(a.notice.as_deref(), Some("no such directory: /nowhere"));
     }
 
     // --- single click selects, double click opens (M14 Part D, decision 5) ----
@@ -3139,7 +3328,7 @@ mod tests {
     #[test]
     fn the_gate_clicks_the_row_it_means() {
         // The constant in `tools/xtask/src/main.rs`, as `MENU_ROW_KEY + n`.
-        const RENAME_ROW: usize = 8;
+        const RENAME_ROW: usize = 9;
         let file = &app().menu_table()[0];
         assert!(file.title == "File", "the first menu is File");
         match &file.items[RENAME_ROW] {

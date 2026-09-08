@@ -23997,3 +23997,39 @@ the receipt had been emitted before the click and consumed before the wait. It a
 row now, which is both a live receipt and the stronger assertion: clicking a file is the case that
 changed.
 
+---
+
+## 2026-09-08 — a location bar, and one key doing two things (M14 Part D, batch 3)
+
+`nxfiles` grows a typeable location bar: `Ctrl+L`, seeded with where the tab is.
+
+**Seeded rather than blank**, because the common edit is to the tail of a path — and somebody who
+opened it by accident sees where they are instead of an empty field. **A relative path is joined
+to the current directory**, which is what typing `papers` from `/home` means everywhere else a
+path is typed; an absolute one replaces it.
+
+**While it is open the keyboard is the bar's**, checked before the name prompt's branch and for
+the identical reason: `Backspace` correcting a typo must not also go up a directory. One key doing
+two things is the failure, and this browser now has two fields that would each have made it.
+
+**A failed listing was invisible on screen and is not any more.** `nxfiles: cannot list …` has
+always gone to the console, but the window showed nothing at all — the pane simply stayed where it
+was. That was survivable while every navigation came from a row press or `Backspace`, both of
+which name something that exists; a location bar makes a typo the ordinary case, and "nothing
+happened" is indistinguishable from a keystroke that never arrived.
+
+**One menu row moved four host assertions and a gate constant.** Adding *Go to Location…* to the
+File menu shifted every row after it, including the `Rename` index `check-login` clicks by number.
+All five failures named themselves in a second — which is `the_gate_clicks_the_row_it_means` doing
+exactly what it was built for after this coupling bit twice, both times appearing as a rename
+prompt that never opened, several steps from the menu it was about. The row went *after* the tab
+pair rather than between it: New Tab and Close Tab are one thought, and a row wedged between them
+reads as part of neither.
+
+**Two mistakes of my own, both the same shape.** A doc comment was orphaned again by inserting a
+method *above* an existing one — the fifth occurrence this project has recorded, and the reason
+the rule is "append below". And a scripted negative control failed to apply its patch and reported
+the *unmodified* code passing, which is indistinguishable from a control that fired; it was rerun
+from a file, and deleting the guard does fail the test. A control that errors before it patches
+anything proves nothing, and says `ok`.
+

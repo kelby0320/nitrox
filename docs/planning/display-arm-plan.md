@@ -4781,7 +4781,22 @@ the sidebar, then the clipboard — the last two build on what the click settles
       that changed — and asserts the transcript holds no open request, which `expect` cannot do
       because it scans forward past the very line that would prove failure. `nxfiles` grew a
       `selected` receipt for it, since a click that only selects has no other outward sign.
-- [ ] **A typeable location bar**, and **Properties** (size and mtime, both already on the wire).
+- [x] **A typeable location bar** ✅ — `Ctrl+L`, or File ▸ Go to Location…, seeded with where
+      the tab is so the common edit is to the tail of a path rather than to a blank. An absolute
+      path replaces where you are; a **relative one is joined to it**, which is what typing
+      `papers` from `/home` should mean. While it is open the keys are its own — `Backspace`
+      corrects a typo rather than going up a directory, which is the rule the name prompt already
+      follows and the same failure it exists to prevent: one key doing two things.
+
+      **A path that cannot be listed now says so.** The console line has always existed; nothing
+      appeared *on screen*, so a typo did nothing visible and read as a keystroke that had not
+      registered — which a location bar makes an everyday case rather than a rare one.
+
+      **Adding one menu row moved four host assertions and one gate constant**, and every one of
+      them named itself in a second. That is `the_gate_clicks_the_row_it_means` doing the job it
+      was built for after this coupling bit twice; the row went *after* the tab pair rather than
+      between it, because New Tab and Close Tab are one thought.
+- [ ] **Properties** (size and mtime, both already on the wire).
 - [ ] **A sidebar of common locations**, and the default folders in `/home` it needs. Staged by
       the image build for now; first-login creation is the right answer once there are real
       users, and is filed rather than built.
