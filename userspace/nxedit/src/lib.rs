@@ -1049,12 +1049,16 @@ impl App {
             // the buffer — so an empty buffer selects nothing rather than a zero-width range the
             // copy path would then treat as a selection.
             Msg::SelectAll => {
+                // **A byte offset, because `select_range` takes one** — it clamps with
+                // `lines[line].len()` and walks back to a char boundary, exactly as `cursor()`
+                // documents. `chars().count()` is short by one per multi-byte character, so
+                // Select All quietly dropped the last character of a line ending in one
+                // (PR #287 review, blocking 4). The *display* conversion is `position_text`'s,
+                // and it is the other direction.
                 let text = &self.buf().text;
                 let last = text.lines().len().saturating_sub(1);
-                let end = text.lines().get(last).map_or(0, |l| l.chars().count());
-                if last > 0 || end > 0 {
-                    self.buf_mut().text.select_range((0, 0), (last, end));
-                }
+                let end = text.lines().get(last).map_or(0, |l| l.len());
+                self.buf_mut().text.select_range((0, 0), (last, end));
             }
             Msg::Copy => self.copy(false),
             Msg::Cut => self.copy(true),
@@ -1240,14 +1244,19 @@ impl App {
                                 self.status = String::from("nothing to replace");
                                 return;
                             }
-                            let hit = self.buf_mut().text.find(&typed);
+                            // **A needle that is not there does not move to stage two.** `find`
+                            // leaves the anchor alone when it misses, so a selection made *before*
+                            // Replace was opened is still sitting there — and stage two's guard
+                            // was "is anything selected", not "is the match selected". Typing a
+                            // replacement then destroyed that selection and reported replacing a
+                            // needle the buffer does not contain (PR #287 review, blocking 3).
+                            if !self.buf_mut().text.find(&typed) {
+                                self.status = alloc::format!("no {typed}");
+                                return;
+                            }
                             self.replacing = Some(typed.clone());
                             self.field = Some((Field::ReplaceWith, TextFieldState::new()));
-                            self.status = if hit {
-                                alloc::format!("replace {typed} with, then Enter")
-                            } else {
-                                alloc::format!("no {typed}")
-                            };
+                            self.status = alloc::format!("replace {typed} with, then Enter");
                         }
                         // **Each Enter replaces the match that is showing and finds the next**,
                         // which is the shape Find already has: the field stays open so Enter
@@ -1275,8 +1284,10 @@ impl App {
                                 self.field = None;
                                 return;
                             };
-                            // The match is selected by `find`, so this replaces exactly it.
-                            if self.buf().text.selection().is_some() {
+                            // **The selection must be the match**, not merely present: `find`
+                            // selects what it hit, and anything else selected is somebody's own
+                            // selection that this has no business replacing.
+                            if self.buf().text.selected_text().as_deref() == Some(needle.as_str()) {
                                 self.buf_mut().text.insert_text(&typed);
                                 self.replaced += 1;
                             }
@@ -1392,7 +1403,11 @@ impl App {
                     // **Offered whenever the buffer holds anything**, which is not the same as
                     // "there is a selection": making one is what this row is for.
                     Item::new("Select All", Accel::ctrl(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
-                        .enabled(free && !self.buf().text.text().is_empty()),
+                        // **Never `text()`**, which is `lines.join("\n")` — a fresh copy of the
+                        // whole file, and `menu_table` is rebuilt on every keystroke for
+                        // `accel_match`. This is the defect `has_selection` was added to remove
+                        // one milestone ago, with a larger object (PR #287 review, worth fixing 9).
+                        .enabled(free && self.buf().text.lines().iter().any(|l| !l.is_empty())),
                     Item::Separator,
                     act(Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find)),
                     act(Item::new(
@@ -2340,6 +2355,10 @@ mod tests {
 
     #[test]
     fn the_chord_keycodes_are_the_ones_the_keymap_names() {
+        // **The three this part added, pinned like the rest** (PR #287 review, optional 11).
+        assert_eq!(libinput::keymap::to_char(SELECT_ALL_KEYCODE, 0), Some(b'a'));
+        assert_eq!(libinput::keymap::to_char(REPLACE_KEYCODE, 0), Some(b'h'));
+        assert_eq!(libinput::keymap::to_char(GO_TO_KEYCODE, 0), Some(b'g'));
         // Pinned against the table they have to agree with rather than against the comments
         // beside them, the way the save chord already is.
         assert_eq!(libinput::keymap::to_char(UNDO_KEYCODE, 0), Some(b'z'));
@@ -2531,12 +2550,28 @@ mod tests {
             "every line, including the last"
         );
 
-        // **An empty buffer selects nothing**, rather than a zero-width range the copy path would
-        // treat as a selection and push an empty entry for.
+        // **An empty buffer selects nothing** — and this holds without a guard in `SelectAll`,
+        // because `TextAreaState::selection` returns `None` for a collapsed range. The guard that
+        // used to be here claimed to prevent "a zero-width range the copy path would treat as a
+        // selection", a hazard that cannot occur since `has_selection` delegates to `selection`;
+        // it is gone, and this asserts the property rather than the guard (PR #287 review, worth
+        // fixing 7).
         let mut b = app();
         b.loaded("", b"");
         b.update(Msg::SelectAll);
         assert!(b.buf().text.selection().is_none(), "nothing to select");
+        assert!(!b.buf().text.has_selection(), "and nothing for Copy to find");
+
+        // **A last line ending in a multi-byte character** — `select_range` takes a *byte* offset,
+        // and a character count is short by one per such character.
+        let mut c = app();
+        c.loaded("one\néxy", "one\néxy".as_bytes());
+        c.update(Msg::SelectAll);
+        assert_eq!(
+            c.buf().text.selected_text().as_deref(),
+            Some("one\néxy"),
+            "the last character is not dropped"
+        );
     }
 
     /// Replace asks what, then with what, and each Enter takes the next match.
@@ -2564,6 +2599,59 @@ mod tests {
         assert_eq!(a.text(), "a dog and a dog", "and the second");
         assert_eq!(a.status(), "replaced 2");
         assert_eq!(a.field_kind(), Some(Field::ReplaceWith), "still open");
+    }
+
+    /// A needle that is not in the buffer does not consume somebody's selection.
+    ///
+    /// **`find` leaves the anchor alone when it misses**, so a selection made *before* Replace was
+    /// opened is still there — and stage two's guard used to be "is anything selected" rather than
+    /// "is the match selected". Typing a replacement then destroyed that selection and reported a
+    /// replacement of a needle the buffer does not contain (PR #287 review, blocking 3).
+    #[test]
+    fn replacing_an_absent_needle_leaves_the_selection_alone() {
+        let mut a = app();
+        a.loaded("hello world", b"hello world");
+        // A selection the person made themselves.
+        a.buf_mut().text.select_range((0, 6), (0, 11));
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("world"));
+
+        a.update(Msg::Replace);
+        type_into(&mut a, "zzz");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.status(), "no zzz");
+        assert_eq!(
+            a.field_kind(),
+            Some(Field::ReplaceFind),
+            "it stays on the first stage rather than asking what to replace it with"
+        );
+
+        // …and even if the person types on, nothing is replaced.
+        type_into(&mut a, "qq");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.text(), "hello world", "the buffer is untouched");
+    }
+
+    /// A selection made *between* the two stages is not what gets replaced.
+    ///
+    /// **The second guard, and it is reachable**: stage one refusing a miss keeps a *stale*
+    /// selection out, but nothing stops somebody clicking elsewhere while the "replace with"
+    /// field is open. The guard is "the selection is the match", not "something is selected".
+    #[test]
+    fn a_selection_made_between_the_stages_is_not_replaced() {
+        let mut a = app();
+        a.loaded("cat and dog", b"cat and dog");
+        a.update(Msg::Replace);
+        type_into(&mut a, "cat");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.field_kind(), Some(Field::ReplaceWith), "the match was found");
+
+        // The person selects something else before answering.
+        a.buf_mut().text.select_range((0, 8), (0, 11));
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("dog"));
+
+        type_into(&mut a, "zzz");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.text(), "cat and dog", "`dog` was not replaced");
     }
 
     /// An empty needle ends the replace rather than matching everything.
@@ -2618,6 +2706,11 @@ mod tests {
         type_into(&mut a, "900");
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(a.buf().text.cursor().0, 2, "clamped to the last line");
+        // **The cursor alone cannot see this**: `TextAreaState::place` clamps too, so line 900
+        // lands on the last line with or without the clamp here. What differs is what the strip
+        // *says* and what the binary is told to scroll to (PR #287 review, worth fixing 8).
+        assert_eq!(a.status(), "line 3", "and says where it actually went");
+        assert_eq!(a.take_find_report(), Some(Some(2)), "the scroll target is the real line");
 
         // **A typo is refused**, because that is not an unambiguous intent.
         a.update(Msg::GoTo);

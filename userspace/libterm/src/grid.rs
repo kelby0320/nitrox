@@ -454,16 +454,29 @@ impl Grid {
     /// Returns whether anything was selected — an empty grid has nothing to select, and saying so
     /// is what lets a caller decline to redraw.
     pub fn select_all(&mut self) -> bool {
-        let last = self.top_line() + self.rows() as u64 - 1;
         let oldest = self.oldest_line();
-        if last < oldest {
-            return false;
+        let last = self.top_line() + self.rows() as u64 - 1;
+        // **"Nothing to select" means every line is blank**, not a line-number comparison. The
+        // guard here was `last < oldest`, which cannot happen — `last` is at least `scrolled`,
+        // which is at least `oldest_line()` — so this never returned `false`, and Select All then
+        // Copy in a fresh terminal put a run of empty lines on the clipboard (PR #287 review,
+        // worth fixing 10).
+        let mut end = None;
+        let mut at = oldest;
+        while at <= last {
+            if let Some(text) = self.line_text(at)
+                && !text.is_empty()
+            {
+                end = Some((at, text.chars().count()));
+            }
+            at += 1;
         }
+        let Some((last_line, last_col)) = end else { return false };
         self.select_from(oldest, 0);
-        // **The end of the last line, not the last column of the grid.** `extend` clamps into the
-        // line it is given, and a column past the text is where a trailing-space run would be
-        // picked up by `selected_text` — the same reason the copy path trims.
-        self.extend(last, self.cols());
+        // **To the end of the last line that has text, not the grid's width.** `extend` does no
+        // clamping — it assigns — so a column past the text highlights empty cells out to the
+        // window's edge, which is the thing `select_line_at` one screen away exists to avoid.
+        self.extend(last_line, last_col);
         true
     }
 
@@ -505,9 +518,15 @@ impl Grid {
         let mut at = line.max(self.oldest_line());
         while at <= last {
             if let Some(text) = self.line_text(at) {
-                let from = if at == line { col.min(text.len()) } else { 0 };
+                // **Cells in, cells out.** `str::find` works in bytes and a grid column is a
+                // character — `é` is one cell and two bytes — so a byte offset handed to
+                // `select_from` names the wrong span, and a start offset landing inside a
+                // multi-byte character makes `str::get` yield `None`, silently skipping the rest
+                // of the line (PR #287 review, blocking 5).
+                let skip = if at == line { col } else { 0 };
+                let from: usize = text.char_indices().nth(skip).map_or(text.len(), |(b, _)| b);
                 if let Some(hit) = text.get(from..).and_then(|tail| tail.find(needle)) {
-                    return Some((at, from + hit));
+                    return Some((at, text[..from + hit].chars().count()));
                 }
             }
             at += 1;
@@ -1156,6 +1175,55 @@ mod tests {
         for line in ["one", "two", "three", "four", "five"] {
             assert!(text.contains(line), "{line:?} is missing from {text:?}");
         }
+    }
+
+    /// `find_from` reports **cell** columns, which is what a caller selects with.
+    ///
+    /// **`str::find` works in bytes and a grid column is a character.** `é` is one cell and two
+    /// bytes, so a byte offset handed to `select_from` selects the wrong span — and a start
+    /// offset landing inside a multi-byte character makes `str::get` yield `None`, silently
+    /// skipping the rest of the line (PR #287 review, blocking 5).
+    #[test]
+    fn find_from_reports_cells_not_bytes() {
+        let mut g = Grid::new(30, 2);
+        feed(&mut g, "ééxtarget");
+        let line = g.top_line();
+        assert_eq!(
+            g.find_from("target", line, 0),
+            Some((line, 3)),
+            "two accents and an x are three cells, not five bytes"
+        );
+        // And selecting with that column takes the word it named.
+        g.select_from(line, 3);
+        g.extend(line, 3 + "target".chars().count());
+        assert_eq!(g.selected_text().as_deref(), Some("target"));
+
+        // A search starting mid-line, from a column inside the accented run.
+        assert_eq!(g.find_from("x", line, 1), Some((line, 2)), "the rest of the line is searched");
+    }
+
+    /// Select All on a grid with nothing on it selects nothing.
+    ///
+    /// **The old guard could not fire**: `last` is at least `scrolled`, which is at least
+    /// `oldest_line()`, so `select_all` always returned `true` — and a fresh terminal's Select
+    /// All then Copy put a run of blank lines on the clipboard.
+    #[test]
+    fn select_all_on_a_blank_grid_selects_nothing() {
+        let mut g = Grid::new(20, 3);
+        assert!(!g.select_all(), "an empty grid has nothing to select");
+        assert!(!g.has_selection());
+        assert_eq!(g.selected_text(), None, "and nothing to copy");
+    }
+
+    /// Select All stops at the end of the last line with text, not at the grid's width.
+    #[test]
+    fn select_all_stops_at_the_text() {
+        let mut g = Grid::new(30, 3);
+        feed(&mut g, "one\r\ntwo\r\nshort");
+        assert!(g.select_all());
+        let sel = g.selection().expect("a selection");
+        assert_eq!(sel.head.1, 5, "`short` is five cells, and the grid is thirty wide");
+        assert_eq!(g.selected_text().as_deref(), Some("one\ntwo\nshort"));
     }
 
     /// A find walks forward through the history and reports character columns.

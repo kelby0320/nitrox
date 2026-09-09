@@ -816,17 +816,32 @@ impl App {
             // it, and a Select All that took only the visible rows would copy a different thing
             // depending on where you had scrolled to.
             Msg::SelectAll => {
-                self.tab_mut().grid.select_all();
+                if self.tab_mut().grid.select_all() {
+                    // The rows it just highlighted are mostly *scrollback* rows, which
+                    // `damage_all` does not reach — see `find_next`.
+                    self.tab_mut().view_moved = true;
+                }
             }
+            // **Reopening keeps what was typed.** `Ctrl+Shift+F` is a plausible thing to press
+            // twice, and a fresh field would silently discard a needle mid-search — the chord's
+            // own doc said it "can reopen it", which was only true in the sense that it emptied
+            // it (PR #287 review, optional 13).
             Msg::Find => {
-                self.find = Some(TextFieldState::new());
+                if self.find.is_none() {
+                    self.find = Some(TextFieldState::new());
+                }
             }
             // **The screen stays; the history goes.** `Ctrl+L` clears the screen and belongs to
             // the shell — this is the other thing, and the two are worth not confusing.
             Msg::ClearScrollback => {
+                // **Snapped *before* the history goes, and the order is the whole fix.**
+                // `snap_to_bottom` decides whether to repaint by comparing the clamped view
+                // against the screen — and once the scrollback is gone there is nothing above the
+                // screen to clamp to, so afterwards it always compares equal and repaints
+                // nothing. Assigning `view_top = None` directly had the same effect for a
+                // different reason (PR #287 review, blocking 2).
+                self.snap_to_bottom();
                 self.tab_mut().grid.clear_scrollback();
-                // A view scrolled into what was just dropped has nowhere to be.
-                self.tab_mut().view_top = None;
             }
             Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
             // The compositor is the one holding the grab this press opened, so all this does is
@@ -1070,7 +1085,13 @@ impl App {
         t.grid.extend(line, col + n);
         // **Scrolled to, because a match nobody can see is not a find.** Clamped by the grid, so
         // a hit on the screen leaves the view where it is.
-        t.view_top = Some(t.grid.clamp_view(line));
+        // **Through `scroll_to_line`, which the file calls "the one place the view changes"** —
+        // it clamps and sets `view_moved` when the anchor actually moves. Assigning `view_top`
+        // here left the repaint out: `select_from` damages *screen* rows and `damage_rows` drops
+        // every row whose viewport position is off the bottom, so a view scrolled back by a whole
+        // screen reported no damage and the match was selected on a screen nobody redrew — the
+        // one case Find exists for (PR #287 review, blocking 1).
+        self.scroll_to_line(line);
     }
 
     /// Move the view to where a scrollbar interaction points.
@@ -1192,7 +1213,10 @@ impl App {
                         Accel::ctrl_shift(SELECT_ALL_KEYCODE, "A"),
                         Msg::SelectAll,
                     )
-                    .enabled(self.tab().grid.oldest_line() <= self.tab().grid.top_line()),
+                    // **Offered when there is anything to select.** The old test here compared
+                    // `oldest_line() <= top_line()`, which is true by construction — `select_all`
+                    // is the one that knows, and it says so by returning `false`.
+                    .enabled(self.tab().grid.line_text(self.tab().grid.top_line()).is_some()),
                     Item::new("Find", Accel::ctrl_shift(FIND_KEYCODE, "F"), Msg::Find),
                     // **Offered only when there is history to drop**, which is what `enabled` is
                     // for: a row that looks available and does nothing reads as a broken menu.
@@ -1526,6 +1550,12 @@ mod tests {
 
     #[test]
     fn the_copy_and_paste_keycodes_are_the_letters_they_claim() {
+        // **All five of this terminal's chords, not two** — a constant naming the wrong letter
+        // would make the menu advertise a chord nothing types, and the digests prove routing from
+        // that same table so nothing else would notice (PR #287 review, optional 11).
+        assert_eq!(libinput::keymap::to_char(SELECT_ALL_KEYCODE, 0), Some(b'a'));
+        assert_eq!(libinput::keymap::to_char(FIND_KEYCODE, 0), Some(b'f'));
+        assert_eq!(libinput::keymap::to_char(CLEAR_KEYCODE, 0), Some(b'k'));
         // Pinned against `libinput`'s table rather than against the constants' own comments —
         // the same check `nxedit`'s chords get.
         assert_eq!(libinput::keymap::to_char(COPY_KEYCODE, 0), Some(b'c'));
@@ -2013,6 +2043,40 @@ mod tests {
         assert!(a.find.is_none(), "Esc closed it");
     }
 
+    /// A find that scrolls to a match in the scrollback **repaints**.
+    ///
+    /// **The case Find exists for is the one that was broken.** `Grid::select_from` damages
+    /// *screen* rows, and `damage_rows` drops every row whose viewport position is off the
+    /// bottom — so a view scrolled back by a whole screen reported no damage at all and the match
+    /// was selected on a screen nobody redrew (PR #287 review, blocking 1).
+    #[test]
+    fn a_find_that_scrolls_back_repaints_the_viewport() {
+        let mut a = app();
+        a.feed(b"needle\r\n");
+        for _ in 0..10 {
+            a.feed(b"filler\r\n");
+        }
+        assert!(a.grid().oldest_line() < a.grid().top_line(), "the needle is in the history");
+        let _ = a.damage_rows();
+
+        a.update(Msg::Find);
+        for c in "needle".bytes() {
+            let code = (1u16..=90)
+                .find(|k| libinput::keymap::to_char(*k, 0) == Some(c))
+                .expect("a keycode");
+            a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN as u16, 0)));
+        }
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN as u16, 0)));
+
+        assert_eq!(a.grid().selected_text().as_deref(), Some("needle"), "it found the match");
+        assert_ne!(a.view_line(), a.grid().top_line(), "and scrolled back to show it");
+        assert_eq!(
+            a.damage_rows().len(),
+            a.grid().rows(),
+            "a viewport that moved repaints all of itself"
+        );
+    }
+
     /// A second press takes a word and a third takes the line; a fourth starts again.
     ///
     /// **Past three there is no larger unit**, and leaving a fourth click as "still a line" would
@@ -2064,9 +2128,30 @@ mod tests {
         for _ in 0..8 {
             a.feed(b"line\r\n");
         }
-        assert!(a.grid().oldest_line() < a.grid().top_line(), "there is history");
+        let top = a.grid().top_line();
+        assert!(a.grid().oldest_line() < top, "there is history");
+
+        // **Scrolled back first, which the first version of this test never did** — so it
+        // asserted only what `Grid::clear_scrollback` provides and passed with the view handling
+        // deleted (PR #287 review, worth fixing 6).
+        a.tab_mut().view_top = Some(a.grid().oldest_line());
+        assert_ne!(a.view_line(), top, "the view is in the history");
+
+        // Drain the frame's damage, as `main` does, so what follows is this action's alone.
+        let _ = a.damage_rows();
+
         a.update(Msg::ClearScrollback);
-        assert_eq!(a.grid().oldest_line(), a.grid().top_line(), "the history is gone");
+        assert_eq!(a.grid().oldest_line(), top, "the history is gone");
+        assert_eq!(a.view_line(), top, "and the view came back to the screen");
+        // **The repaint is the assertion.** `view_line` clamps on read, so it reports the screen
+        // whether or not the view was reset — the difference a person sees is whether anything is
+        // *redrawn*, and a viewport that moved from history to the screen without damage leaves
+        // every pixel stale (PR #287 review, worth fixing 6, second attempt).
+        assert_eq!(
+            a.damage_rows().len(),
+            a.grid().rows(),
+            "moving the viewport repaints all of it"
+        );
     }
 
     /// `check-terminal` clicks the Edit menu's `Clear` by number; this is that number.
