@@ -236,9 +236,24 @@ fn reference_area(theme: &Theme) -> Element<Msg> {
         a.apply(libkern::abi::KEY_RIGHT, librsproto::surface::MOD_SHIFT);
     }
     a.apply(libkern::abi::KEY_DOWN, librsproto::surface::MOD_SHIFT);
+    // **One coloured run, so the picture contains ink that is not the theme's foreground**
+    // (M14 Part G). `check-display` compares this render against the guest's own, so a guest
+    // that dropped `Node::Ink` — compiled it out, took the wrong branch, read a different theme
+    // — paints those glyphs in the wrong colour and the gate says so. It is the only check on
+    // the ink path that looks at pixels rather than at a tree.
+    //
+    // **On `me`, which the selection also covers**, because a run under a highlight is the case
+    // worth having in a picture: it is where the two colours have to compose rather than one
+    // replacing the other.
+    let ink = [crate::widget::InkRun {
+        line: 0,
+        start: 7,
+        end: 9,
+        colour: theme.syntax_keyword,
+    }];
     crate::element::sized(
         Size::new(0, AREA_H),
-        text_area(&mut a, AREA_H, ROW_H, true, &[], theme),
+        text_area(&mut a, AREA_H, ROW_H, true, &ink, theme),
     )
 }
 

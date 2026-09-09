@@ -99,6 +99,12 @@ pub struct StringRule {
 /// A language, as data. See the module docs.
 #[derive(Clone, Copy)]
 pub struct Language {
+    /// What to call it — for a receipt, and for a test that wants to say which table it got.
+    ///
+    /// **A field rather than an identity derived from the table.** Comparing two `Language`
+    /// values by the addresses of their slices is the clever alternative, and it rests on the
+    /// compiler not merging two identical empty ones — a thing it is free to do.
+    pub name: &'static str,
     /// Sequences that start a comment running to the end of the line.
     pub line_comments: &'static [&'static str],
     /// A block comment's opener and closer.
@@ -126,6 +132,7 @@ pub struct Language {
 
 /// The empty language: everything is plain. What a file with no known extension gets.
 pub const PLAIN: Language = Language {
+    name: "plain",
     line_comments: &[],
     block_comment: None,
     strings: &[],
@@ -139,6 +146,7 @@ pub const PLAIN: Language = Language {
 
 /// `nxsh`, this system's shell — see `docs/spec/shell-language.md`.
 pub const NXSH: Language = Language {
+    name: "nxsh",
     line_comments: &["#"],
     block_comment: None,
     strings: &[
@@ -158,6 +166,7 @@ pub const NXSH: Language = Language {
 
 /// TOML, which every configuration file in this system is written in.
 pub const TOML: Language = Language {
+    name: "toml",
     line_comments: &["#"],
     block_comment: None,
     strings: &[
@@ -179,6 +188,7 @@ pub const TOML: Language = Language {
 /// line. Telling the two apart needs a grammar, and a highlighter that coloured half of every
 /// generic function is worse than one that leaves `'x'` plain.
 pub const RUST: Language = Language {
+    name: "rust",
     line_comments: &["//"],
     block_comment: Some(("/*", "*/")),
     strings: &[StringRule { delim: '"', escape: true, multiline: true }],
@@ -204,6 +214,7 @@ pub const RUST: Language = Language {
 /// already needed, and an inline code span is a delimiter. Emphasis is **not** coloured — `*`
 /// pairs across a line are a grammar, and this is where the table would have started bending.
 pub const MARKDOWN: Language = Language {
+    name: "markdown",
     line_comments: &[],
     block_comment: None,
     strings: &[],
@@ -231,6 +242,11 @@ pub fn for_name(name: &str) -> Option<Language> {
         "md" => Some(MARKDOWN),
         _ => None,
     }
+}
+
+/// What to call a language in a receipt. `None` — a file with no known extension — is `"plain"`.
+pub fn name_of(lang: Option<Language>) -> &'static str {
+    lang.map_or(PLAIN.name, |l| l.name)
 }
 
 /// Scan one line, given what was open at its start. Returns its runs and what is open after it.
@@ -637,10 +653,14 @@ mod tests {
 
     #[test]
     fn a_language_comes_from_the_extension_and_nothing_else_is_an_error() {
-        assert!(for_name("build.nx").is_some());
-        assert!(for_name("init.toml").is_some());
-        assert!(for_name("lib.rs").is_some());
-        assert!(for_name("README.md").is_some());
+        // **Which language, not merely that there is one.** A `.toml` read as Markdown colours
+        // nothing and looks exactly like a scanner that never ran, so the mapping is what the
+        // assertion is about.
+        for (file, want) in
+            [("build.nx", "nxsh"), ("init.toml", "toml"), ("lib.rs", "rust"), ("README.md", "markdown")]
+        {
+            assert_eq!(name_of(for_name(file)), want, "{file}");
+        }
         // **`None` is a supported answer**, not a gap: a file this system does not know is
         // plain text, drawn in one colour.
         assert!(for_name("notes").is_none(), "no extension is plain text");

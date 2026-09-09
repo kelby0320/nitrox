@@ -3481,7 +3481,12 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // its request was taken when the shell's reply arrives, and the editor reads the file when
     // the kernel gets round to running it.
     let asked = String::from("nxfiles: asked to open /home/papers/notes.txt");
-    let opened = String::from("nxedit: opened /home/papers/notes.txt - 0 bytes");
+    // **The language is on this line since M14 Part G**, and asserting it is what says the
+    // shipped binary ran `syntax::for_name` at all. `.txt` is plain text, which is a supported
+    // answer rather than a gap — the four languages this system contains are host-tested, and
+    // what only a boot can add is that the dispatch happens in the binary that ships.
+    let opened =
+        String::from("nxedit: opened /home/papers/notes.txt - 0 bytes, highlighted as plain");
     session.expect_all(&[&asked, &opened])?;
     // After the open, for the reason the browser's is read after its listing: the editor reads
     // its file before it has a window to place.
