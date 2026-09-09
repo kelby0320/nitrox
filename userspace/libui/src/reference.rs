@@ -238,7 +238,7 @@ fn reference_area(theme: &Theme) -> Element<Msg> {
     a.apply(libkern::abi::KEY_DOWN, librsproto::surface::MOD_SHIFT);
     crate::element::sized(
         Size::new(0, AREA_H),
-        text_area(&mut a, AREA_H, ROW_H, true, theme),
+        text_area(&mut a, AREA_H, ROW_H, true, &[], theme),
     )
 }
 

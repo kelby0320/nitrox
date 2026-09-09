@@ -1909,7 +1909,7 @@ impl App {
         // the honest answer: the title bar is not where a document goes.
         let focused = self.focused;
         let area =
-            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ui).on_drop(Msg::Dropped);
+            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &[], &ui).on_drop(Msg::Dropped);
 
         let body = window_frame(
             title,

@@ -19,6 +19,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use libdraw::format::Rgb;
 use libdraw::geom::Size;
 // **Re-exported, because every widget here takes one.** A caller importing `button` and
 // `list_view` from this module should not have to reach into `libdraw` for the third argument
@@ -1744,6 +1745,27 @@ impl TextAreaState {
     }
 }
 
+/// A stretch of one line of a [`text_area`], drawn in a colour of its own.
+///
+/// **Colours rather than token kinds**, which is what keeps this toolkit out of the business of
+/// knowing what a language is: the application scans its own text and looks the colour up in the
+/// theme, and the widget merely draws what it is handed. `nxedit::syntax` is the first producer.
+///
+/// **Byte offsets, and the widget clamps them.** A cache of these is computed from the buffer as
+/// it was a moment ago, so an edit can leave one naming bytes past the end of a shortened line —
+/// which must be a wrong colour for one frame rather than a panic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InkRun {
+    /// Which line, as an index into the state's lines.
+    pub line: usize,
+    /// First byte within that line, inclusive.
+    pub start: usize,
+    /// Last byte, exclusive.
+    pub end: usize,
+    /// What to draw it in.
+    pub colour: Rgb,
+}
+
 /// A multi-line editable text view over a [`TextAreaState`].
 ///
 /// **Takes the state by `&mut`, and scrolls it.** `list_view` takes its state by value and
@@ -1755,14 +1777,20 @@ impl TextAreaState {
 /// `height` is what the caller will lay it out at; wrap the result in `sized` to keep the two in
 /// step, for the reason [`list_view`] gives.
 ///
-/// **What it draws:** the visible lines, the selection behind the text on each, and the caret
-/// when `active`. What it does *not* draw is a scrollbar — that is `scrollbar`'s, composed
-/// beside it by an application that wants one, the way the terminal composes its own.
+/// **What it draws:** the visible lines, the selection behind the text on each, the caret when
+/// `active`, and each line in the colours `ink` gives it. What it does *not* draw is a scrollbar
+/// — that is `scrollbar`'s, composed beside it by an application that wants one, the way the
+/// terminal composes its own.
+///
+/// `ink` may be empty, which is a text area in one colour and what every caller had before
+/// M14 Part G. Runs for lines that are not on screen are ignored, so a caller may hand over
+/// whatever it has cached.
 pub fn text_area<Msg>(
     state: &mut TextAreaState,
     height: u32,
     row_height: u32,
     active: bool,
+    ink: &[InkRun],
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -1791,55 +1819,63 @@ pub fn text_area<Msg>(
             (from < to).then_some((from, to))
         });
 
-        let mut pieces: Vec<Element<Msg>> = Vec::with_capacity(5);
-        let mut at = 0usize;
-        let push_text = |pieces: &mut Vec<Element<Msg>>, from: usize, to: usize| {
-            if from < to {
-                pieces.push(text(String::from(&l[from..to])));
-            }
-        };
-        // Where the caret goes on this line, if it is on this line at all. The pieces are built
-        // left to right, so *when* it is emitted decides where it appears — and a selection's
-        // cursor is at its **start** as often as at its end: every `Shift+Left`, `Shift+Up` and
-        // backwards drag makes one. The first version emitted it only after the highlight, under
-        // a `cur_col >= at` guard that a backwards selection cannot satisfy, so the cursor
-        // vanished from the screen for exactly those (PR #258 review, blocking 2).
-        let caret = (active && i == cur_line).then_some(cur_col);
-        let mut caret_drawn = false;
-        let push_caret = |pieces: &mut Vec<Element<Msg>>, at: &mut usize, to: usize| {
-            push_text(pieces, *at, to);
-            pieces.push(sized(Size::new(CARET, 0), fill(theme.focus_ring)));
-            *at = to;
-        };
-        if let Some(cc) = caret {
-            if span.map(|(from, _)| cc <= from).unwrap_or(true) {
-                push_caret(&mut pieces, &mut at, cc);
-                caret_drawn = true;
-            }
-        }
+        // Where the caret goes on this line, if it is on this line at all.
+        //
+        // **Clamped into the line**, because it is drawn at a *cut* below and a cut outside the
+        // line would be dropped — taking the caret with it. A cursor column past the end is not
+        // supposed to happen; a caret nobody can find is the failure that follows if it does
+        // (PR #258 review, blocking 2, which this rewrite subsumes).
+        let caret = (active && i == cur_line).then_some(cur_col.min(l.len()));
+
+        // **Every boundary on this line, in one sorted list**, and then one pass over it. The
+        // selection, the caret and the syntax runs each split the line, and the version that
+        // handled them in sequence had to decide *when* to emit the caret relative to the
+        // highlight — a question with two right answers, since a selection's cursor is at its
+        // start as often as at its end. As cuts there is no ordering left to get wrong: the
+        // caret is a boundary like any other and comes out where it sits (M14 Part G).
+        let mut cuts: Vec<usize> = Vec::with_capacity(8);
+        cuts.push(0);
+        cuts.push(l.len());
         if let Some((from, to)) = span {
-            push_text(&mut pieces, at, from);
-            // The highlight is a `fill` *under* the run: `fill` measures as zero, so the stack
-            // takes the text's size and the colour covers exactly the glyphs' box.
-            pieces.push(stack(alloc::vec![
-                fill(theme.selection),
-                text(String::from(&l[from..to])),
-            ]));
-            at = to;
+            cuts.push(from);
+            cuts.push(to);
         }
         if let Some(cc) = caret {
-            if !caret_drawn {
-                // **`max`, not a guard, and that is the fix's whole shape.** The cursor is one
-                // end of the selection, so on its own line it sits at the highlight's start —
-                // drawn above — or at its end, and `cc` is then already past `at`. Should some
-                // future arrangement put it inside the run, this draws a caret in the wrong
-                // column rather than none at all: a caret nobody can find is the failure this
-                // replaces, and it is worse than one a pixel out of place.
-                let to = cc.max(at);
-                push_caret(&mut pieces, &mut at, to);
+            cuts.push(cc);
+        }
+        // **Clamped, not trusted.** These come from a scan of the buffer as it was, so an edit
+        // that shortened this line leaves runs naming bytes past its end — and a cut that split
+        // a character would panic on the slice below.
+        let runs = ink.iter().filter(|r| r.line == i);
+        for r in runs.clone() {
+            for b in [r.start, r.end] {
+                let b = b.min(l.len());
+                if l.is_char_boundary(b) {
+                    cuts.push(b);
+                }
             }
         }
-        push_text(&mut pieces, at, l.len());
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let mut pieces: Vec<Element<Msg>> = Vec::with_capacity(cuts.len());
+        for (k, &from) in cuts.iter().enumerate() {
+            if caret == Some(from) {
+                pieces.push(sized(Size::new(CARET, 0), fill(theme.focus_ring)));
+            }
+            let Some(&to) = cuts.get(k + 1) else { break };
+            let mut piece = text(String::from(&l[from..to]));
+            // The innermost wrapper wins, so a selected keyword keeps its own colour.
+            if let Some(r) = runs.clone().find(|r| r.start <= from && from < r.end) {
+                piece = crate::element::ink(r.colour, piece);
+            }
+            if span.is_some_and(|(f, t)| from >= f && to <= t) {
+                // The highlight is a `fill` *under* the run: `fill` measures as zero, so the
+                // stack takes the text's size and the colour covers exactly the glyphs' box.
+                piece = stack(alloc::vec![fill(theme.selection), piece]);
+            }
+            pieces.push(piece);
+        }
         if pieces.is_empty() {
             // An empty line still needs a row, or the lines below it move up by one.
             pieces.push(text(""));
@@ -3731,19 +3767,19 @@ two");
         // the widget takes `&mut` precisely so it cannot be forgotten (PR #257 review).
         let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7");
         let p = Theme::default();
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
         assert_eq!(a.offset(), 0);
 
         for _ in 0..5 {
             a.apply(KEY_DOWN, 0);
         }
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
         assert_eq!(a.offset(), 3, "line 5 is visible in a three-line window");
 
         for _ in 0..5 {
             a.apply(KEY_UP, 0);
         }
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
         assert_eq!(a.offset(), 0, "and it scrolls back the other way");
     }
 
@@ -3872,7 +3908,7 @@ two");
         // never does. Both directions here, counted in the tree (PR #258 review, blocking 2).
         let p = Theme::default();
         let draw = |a: &mut TextAreaState| -> usize {
-            let e: Element<()> = text_area(a, 3 * 16, 16, true, &p);
+            let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], &p);
             fills(&e, p.focus_ring)
         };
 
@@ -3900,8 +3936,131 @@ two");
 
         let mut a = area();
         a.apply(KEY_END, 0);
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], &p);
         assert_eq!(fills(&e, p.focus_ring), 0, "and none at all when the widget is not active");
+    }
+
+    /// Every `(text, ink)` pair in a tree, in order — an ink node's text, or `None` for plain.
+    fn inked<M>(e: &Element<M>) -> Vec<(String, Option<Rgb>)> {
+        fn walk<M>(e: &Element<M>, under: Option<Rgb>, out: &mut Vec<(String, Option<Rgb>)>) {
+            match &e.node {
+                crate::element::Node::Text(t) if !t.is_empty() => {
+                    out.push((t.clone(), under));
+                }
+                crate::element::Node::Ink { colour, child } => walk(child, Some(*colour), out),
+                _ => {
+                    for c in e.children() {
+                        walk(c, under, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(e, None, &mut out);
+        out
+    }
+
+    const KEYWORD: Rgb = Rgb::new(0x11, 0x22, 0x33);
+
+    /// A run splits its line and colours exactly its own bytes.
+    #[test]
+    fn an_ink_run_splits_a_line_and_colours_only_itself() {
+        let p = Theme::default();
+        let mut a = TextAreaState::with_text("let x = 1");
+        let e: Element<()> = text_area(
+            &mut a,
+            16,
+            16,
+            false,
+            &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
+            &p,
+        );
+        assert_eq!(
+            inked(&e),
+            alloc::vec![
+                (String::from("let"), Some(KEYWORD)),
+                (String::from(" x = 1"), None),
+            ],
+            "the line was not split at the run's edge"
+        );
+    }
+
+    /// A coloured run under a selection keeps its colour.
+    ///
+    /// **The reason ink is a wrapper rather than a property of the text node.** The selection is
+    /// a `fill` beneath the glyphs, so a selected keyword is a stack of a fill and an inked text
+    /// — and a version that dropped the ink when the piece was selected would make selecting a
+    /// line turn all of it black, which is the moment a person is most likely to be reading it.
+    #[test]
+    fn a_selected_run_keeps_its_ink() {
+        let p = Theme::default();
+        let mut a = TextAreaState::with_text("let x = 1");
+        for _ in 0..3 {
+            a.apply(KEY_RIGHT, MOD_SHIFT);
+        }
+        let e: Element<()> = text_area(
+            &mut a,
+            16,
+            16,
+            true,
+            &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
+            &p,
+        );
+        assert_eq!(fills(&e, p.selection), 1, "precondition: the keyword is selected");
+        assert!(
+            inked(&e).contains(&(String::from("let"), Some(KEYWORD))),
+            "the selection took the colour with it: {:?}",
+            inked(&e)
+        );
+    }
+
+    /// A stale run past the end of a line is clamped, not indexed with.
+    ///
+    /// **Reachable on every keystroke.** The runs are scanned from the buffer as it was a moment
+    /// ago, so deleting the end of a line leaves one naming bytes that are gone — and a run whose
+    /// bounds landed inside a multi-byte character would panic on the slice. A wrong colour for
+    /// one frame is the right failure; a crashed editor is not.
+    #[test]
+    fn a_stale_or_misaligned_run_neither_panics_nor_colours_past_the_end() {
+        let p = Theme::default();
+        let mut a = TextAreaState::with_text("ab");
+        let e: Element<()> = text_area(
+            &mut a,
+            16,
+            16,
+            false,
+            &[InkRun { line: 0, start: 1, end: 99, colour: KEYWORD }],
+            &p,
+        );
+        assert_eq!(
+            inked(&e),
+            alloc::vec![(String::from("a"), None), (String::from("b"), Some(KEYWORD))],
+            "a run past the end was not clamped to it"
+        );
+
+        // A boundary inside a character is dropped rather than split on.
+        let mut a = TextAreaState::with_text("\u{4e2d}\u{6587}");
+        let e: Element<()> = text_area(
+            &mut a,
+            16,
+            16,
+            false,
+            &[InkRun { line: 0, start: 1, end: 2, colour: KEYWORD }],
+            &p,
+        );
+        assert_eq!(inked(&e).len(), 1, "the line was split inside a character: {:?}", inked(&e));
+
+        // And a run naming a line that is not on screen colours nothing.
+        let mut a = TextAreaState::with_text("only");
+        let e: Element<()> = text_area(
+            &mut a,
+            16,
+            16,
+            false,
+            &[InkRun { line: 40, start: 0, end: 2, colour: KEYWORD }],
+            &p,
+        );
+        assert!(inked(&e).iter().all(|(_, c)| c.is_none()));
     }
 
     #[test]
@@ -3912,11 +4071,11 @@ two");
         let mut a = area();
         a.apply(KEY_RIGHT, 0);
         a.apply(KEY_DOWN, MOD_SHIFT);
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
         assert_eq!(fills(&e, p.selection), 2, "the tail of line 0 and the head of line 1");
 
         let mut a = area();
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
         assert_eq!(fills(&e, p.selection), 0, "and nothing when nothing is selected");
     }
 
@@ -3934,7 +4093,7 @@ two");
         assert_eq!(a.text(), "ab\nde\nfghi");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Theme::default());
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &Theme::default());
         assert_eq!(fills(&e, Theme::default().selection), 0, "nothing is selected, so nothing \
             is highlighted");
 
@@ -3953,7 +4112,7 @@ two");
         a.extend_to(0, 3);
         assert!(a.apply(KEY_BACKSPACE, 0));
         assert_eq!(a.text(), "ab\nde\nfghi");
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &Theme::default());
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &Theme::default());
     }
 
     #[test]
