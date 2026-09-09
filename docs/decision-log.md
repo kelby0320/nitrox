@@ -24390,11 +24390,19 @@ arguments and `chooser::view` ten, and adding an eleventh to each was the obviou
 the handler on the outside instead is both smaller and more correct, because the widget's
 outermost node is exactly the region a person means by "over the list".
 
-**A wheel is the one pointer kind that must not coalesce**, and the reason is the difference
-between two fields: `x` is a *position*, so the newest answer is the whole truth and the older
-ones are redundant, while `wheel` is a *delta* and the newest is only the last part of it. A
-client scrolling steadily against a coalescing outbox would find its page creeping at one detent
-per drain.
+**A wheel coalesces by *summing*, which is neither of the two obvious rules** — and the first
+version of this shipped the wrong one of them. `x` is a *position*, so motion's replace rule
+keeps the whole truth; `wheel` is a *delta*, so replacing loses every detent but the last and a
+client scrolling steadily would find its page creeping. That argument is right and its conclusion
+— leave the wheel uncoalesced — was not: it made the wheel the first pointer kind to take a queue
+slot per event, in a queue whose depth is justified by there not being one, so a fast scroll
+against a client that had fallen behind could push a `Release` off the front and hang it
+permanently. Summing is bounded *and* lossless, and it follows motion's remove-and-append so the
+total arrives at the later record's position. **Only across turns that agree about `modifiers`
+and `buttons`**, because those decide what a scroll *means*: three scrolled lines added to two
+Ctrl-scrolled ones would be five zoom steps. Found in review (PR #288, 3), which also noted the
+thing this does *not* fix — a held key repeats, so `Outbound::Key` has always streamed through
+this queue.
 
 **`scroll-grab` was closed by answering where the state lives.** The entry had been open since M4
 and its own framing was "a question of where it lives rather than whether it is allowed":
@@ -24416,6 +24424,24 @@ to catch. Both copies use 20 000 now, and both fail without the widening. Runnin
 the habit that found it; what it says is narrower and worth keeping: **the largest input is not
 automatically the most revealing one**, and a boundary test has to be built from a value whose
 failure is visible.
+
+**A grab belongs to the button that took it, which the first version did not say.** The router
+hands a captured widget *every* button's events and drops its own capture only when all of them
+come up, so tapping the right button mid-drag arrived at `ScrollGrab` as a press and a release of
+a gesture it was not part of: the press re-took the grab from wherever the cursor was — a jump,
+if that was off the thumb — and the release ended a drag the person was still making, stranding
+the bar while the router went on delivering to it. The code this replaced (`if p.buttons != 0`)
+kept following. `ScrollGrab` records the button now, exactly as the compositor's `grab_button`
+does one layer down and for the same reason (PR #248 review). Found in review, PR #288, 1.
+
+**"Answer `false` on any failure" was safe for the knock's first half and not its second.** A
+mouse that recognises the sample-rate sequence switches to four-byte packets when the *third rate*
+lands, not when its id is read — so a timeout at the id query would have returned `false`, left
+`enable_wheel` uncalled, and framed a three-byte decoder against a four-byte stream for ever,
+which is the exact failure the cautious answer was chosen to avoid. Anything but a confirmed
+`0x03` now resets the device, which unambiguously puts it back to three bytes whatever it had
+decided. Reasoned from the control flow rather than demonstrated: it needs an i8042 that
+acknowledges three commands and then times out, which nothing here can inject (PR #288 review, 2).
 
 **What the gate can see and the host cannot.** `check-input` injects a real wheel over QMP and
 asserts it twice: at the device layer, where the sign and the four-byte framing are claims about

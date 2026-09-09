@@ -299,25 +299,54 @@ pub unsafe fn init() -> Present {
 /// **must** pass on to the packet decoder, since nothing in the stream distinguishes a
 /// four-byte packet from a three-byte one.
 ///
-/// Any step failing is answered `false`, which is the safe direction: a mouse assumed to have
-/// no wheel loses a wheel, while one wrongly assumed to have one loses its framing and wanders
-/// the screen pressing buttons.
+/// ## `false` is only safe until the knock lands
+///
+/// **Returning `false` is not free after the third rate has been acknowledged.** A device that
+/// recognises the sequence switches to four-byte packets *there*, not when its id is read — so a
+/// failure at the id query would leave a four-byte mouse behind a three-byte decoder, which
+/// frames every packet at an offset for ever and is exactly the "wanders the screen pressing
+/// buttons" failure a cautious `false` is supposed to avoid. Before the loop finishes, `false`
+/// really is free: the sequence is recognised only when all three land.
+///
+/// So **anything but a confirmed [`ID_WHEEL`] resets the device**, which unambiguously puts it
+/// back to three-byte packets whatever it had decided — a failed ack, a timed-out read, or an id
+/// this code does not know. A reset also restores the default sample rate, which is why only the
+/// `true` path has to put the rate back.
+///
+/// Reasoned from the control flow rather than demonstrated: it needs an i8042 that acknowledges
+/// three commands and then times out, which nothing here can inject (PR #288 review, 2).
 fn knock_for_wheel() -> bool {
     for rate in WHEEL_KNOCK {
         if aux_command(DEV_SET_SAMPLE_RATE) != Some(0xFA) || aux_command(rate) != Some(0xFA) {
+            // Nothing has changed shape yet, so there is nothing to put back.
             return false;
         }
     }
-    if aux_command(DEV_GET_DEVICE_ID) != Some(0xFA) {
-        return false;
+    if aux_command(DEV_GET_DEVICE_ID) != Some(0xFA) || read_data() != Some(ID_WHEEL) {
+        return reset_to_three_bytes();
     }
-    let wheel = read_data() == Some(ID_WHEEL);
-    // Undo the knock's parting gift of 80 Hz. Attempted whatever the answer was, because a
-    // mouse that did *not* recognise the sequence still obeyed all three rate commands.
+    // Undo the knock's parting gift of 80 Hz — the wheel path is the only one that has to,
+    // since the reset above restores the default rate for every other outcome.
     if aux_command(DEV_SET_SAMPLE_RATE) == Some(0xFA) {
         let _ = aux_command(SAMPLE_RATE);
     }
-    wheel
+    true
+}
+
+/// Reset the mouse and consume its replies. Always answers `false` — "no wheel".
+///
+/// **The only way to be sure of the packet length after the knock has landed.** `0xFF` returns
+/// the device to its power-on state: three-byte packets, default sample rate, reporting off —
+/// and [`init`] enables reporting immediately afterwards, which it does for every mouse anyway.
+fn reset_to_three_bytes() -> bool {
+    if aux_command(DEV_RESET) == Some(0xFA) {
+        // The self-test byte and the device id, in that order. Consumed here for the reason the
+        // whole bring-up is polled: a `0xAA` that reached the scancode decoder would be a
+        // phantom Left Shift release.
+        let _ = read_data();
+        let _ = read_data();
+    }
+    false
 }
 
 /// Route the keyboard and aux interrupts to `kbd`/`aux` and enable them in the controller.

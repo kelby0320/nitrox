@@ -27,9 +27,10 @@ as of M3 Part D (2026-08-10): `libsurface` delivers both records into a per-wind
 window.
 
 Delivery is **queued and retried, not best-effort**. The compositor holds a bounded per-session
-outbox, coalesces pointer motion to at most one pending record per window, and re-sends the
-head until the client takes it, so a burst of motion delays a keystroke rather than displacing
-it. A client that stalls long enough to overrun that queue loses the oldest records and
+outbox, coalesces pointer records to at most one pending record per window — motion by
+**replacement**, since a position supersedes, and a wheel by **summing its detents**, since a
+delta does not — and re-sends the head until the client takes it, so a burst of input delays a
+keystroke rather than displacing it. A client that stalls long enough to overrun that queue loses the oldest records and
 **is not told** — the protocol has no loss marker, which is a filed gap
 (`../rationale/deferred-decisions.md`).
 

@@ -391,7 +391,15 @@ mod tests {
         assert_eq!(out[0], InputEvent::rel(REL_WHEEL, -1, 5));
     }
 
-    /// A mouse with no wheel reports none — the fourth byte is not read from the next packet.
+    /// A mouse with no wheel reports none.
+    ///
+    /// **What this can and cannot see** (PR #288 review, 5). It pins the *behaviour* — a
+    /// three-byte decoder emits no `REL_WHEEL` — and that behaviour holds for two independent
+    /// reasons: `events` reads `dz` only when it is non-zero, and `feed` never writes `buf[3]`
+    /// at this length so `dz` cannot be anything else. Deleting the `len == 4` check in `feed`
+    /// therefore leaves this green. The check stays as a statement of intent rather than as a
+    /// guard this test defends, and there is no state to reach it from: nothing turns a
+    /// four-byte decoder back into a three-byte one.
     #[test]
     fn a_three_byte_mouse_never_reports_a_wheel() {
         let mut d = Decoder::new();

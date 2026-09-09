@@ -516,12 +516,19 @@ impl ScrollState {
 pub struct ScrollGrab {
     /// Pixels between the thumb's top and where the press landed, while a drag is running.
     within: Option<i32>,
+    /// Which button took the grab — the only one whose events this drag answers.
+    ///
+    /// **The router hands a captured widget every button's events**, and drops its own capture
+    /// only when *all* of them come up, so a second button tapped mid-drag arrives here as a
+    /// press and a release belonging to a gesture this grab is not part of. The compositor keeps
+    /// `grab_button` for the identical reason one layer down (PR #248 review, blocking 1).
+    button: u16,
 }
 
 impl ScrollGrab {
     /// A tracker holding nothing.
     pub const fn new() -> Self {
-        Self { within: None }
+        Self { within: None, button: 0 }
     }
 
     /// Whether a drag is in progress.
@@ -539,6 +546,14 @@ impl ScrollGrab {
     /// geometry from the one drawn puts the thumb where the pointer is not.
     pub fn apply(&mut self, state: ScrollState, track: u32, ev: PointerEvent) -> Option<u32> {
         let is_button = ev.kind == POINTER_BUTTON;
+        // **Only the button that took the grab is answered.** Pressing a second one mid-drag
+        // would otherwise re-take the grab from wherever the cursor happens to be — a jump, if
+        // that is off the thumb — and its *release* would end a gesture the person is still
+        // making, leaving the bar stranded while the router goes on delivering to it. The old
+        // `if p.buttons != 0` test in each application kept following (PR #288 review, 1).
+        if is_button && self.within.is_some() && ev.button != self.button {
+            return None;
+        }
         if is_button && ev.flags & POINTER_PRESSED == 0 {
             // The release, which the router delivers to the captured widget wherever the
             // cursor has got to. Nothing moves; the grab ends.
@@ -554,10 +569,12 @@ impl ScrollGrab {
                 // rather than one recomputed from the thumb's position — keeps a grab exact
                 // where the position arithmetic truncates.
                 self.within = Some(ev.y - top);
+                self.button = ev.button;
                 return Some(state.offset);
             }
             // On the track: jump, then hold the thumb centred for the rest of the drag.
             self.within = Some(len as i32 / 2);
+            self.button = ev.button;
             return Some(state.offset_at(track, ev.y));
         }
         let within = self.within?;
@@ -2480,6 +2497,44 @@ mod list_view_tests {
             let expected = st.offset_for_thumb_top(track, pos as i32 + 10);
             assert_eq!(moved, expected, "{what}: the thumb did not follow by the distance moved");
         }
+    }
+
+    /// A second button tapped mid-drag neither ends the drag nor re-takes it.
+    ///
+    /// **The router delivers every button's events to the captured widget**, and clears its own
+    /// capture only when *all* of them come up (`released && event.buttons == 0`) — so pressing
+    /// the right button without letting go of the left arrives here as a press and a release of
+    /// a button this grab knows nothing about. Answering either of them would strand the bar:
+    /// the router still believes the gesture is live, so the person goes on dragging and
+    /// nothing follows. The code this replaced (`if p.buttons != 0` in each application) kept
+    /// following, so this is a regression the review caught (PR #288, finding 1).
+    #[test]
+    fn a_second_buttons_press_and_release_do_not_disturb_the_drag() {
+        const RIGHT: u16 = 0x111;
+        let track = 200;
+        let st = ScrollState { offset: 400, visible: 20, total: 1000 };
+        let (pos, _) = st.thumb(track);
+        let mut g = ScrollGrab::new();
+        press_bar(&mut g, st, track, pos as i32);
+        assert!(g.dragging(), "precondition: the left button took the thumb");
+
+        // The right button goes down while the left is still held: two buttons in the mask.
+        let other = |flags: u16, buttons: u16| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: RIGHT,
+            buttons,
+            flags,
+            // Far from the thumb, so re-taking the grab here would visibly jump the bar.
+            y: track as i32 - 1,
+            ..Default::default()
+        };
+        assert_eq!(g.apply(st, track, other(POINTER_PRESSED, 0b011)), None, "the press answered");
+        assert_eq!(g.apply(st, track, other(0, 0b001)), None, "the release answered");
+        assert!(g.dragging(), "a button this grab never took ended it");
+
+        // And the drag still tracks the pointer, from the offset it was taken at.
+        let moved = drag_bar(&mut g, st, track, pos as i32 + 10).expect("still dragging");
+        assert_eq!(moved, st.offset_for_thumb_top(track, pos as i32 + 10));
     }
 
     /// A press on the track still jumps, and holds the thumb centred afterwards.

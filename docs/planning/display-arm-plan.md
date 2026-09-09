@@ -4776,10 +4776,12 @@ the sidebar, then the clipboard — the last two build on what the click settles
       `Enter` still opens directly — the keyboard has no position and no run to belong to. **A
       drag abandons the run**, or the click after one opens something nobody asked for.
 
-      **The time is the press's delivery, not the press** — `PointerEvent` carries no timestamp
-      and `libinput::Logical` drops the `time_ns` the kernel stamps on every `InputEvent`. The
-      error runs one way only: a stalled client can read two deliberate clicks as a double, and
-      cannot split a real one. `TODO(press-time)` carries the wire-format fix and its trigger.
+      ~~**The time is the press's delivery, not the press**~~ — **fixed in Part I** (2026-09-09).
+      It was true as written: `PointerEvent` carried no timestamp and `libinput::Logical` dropped
+      the `time_ns` the kernel stamps on every `InputEvent`, so the error ran one way — a stalled
+      client could read two deliberate clicks as a double, and could not split a real one. The
+      record carries `time_ms` now and this application reads it. Struck rather than deleted,
+      because the deferral it justified is part of this part's record.
 
       **It had no gate coverage and nearly shipped without any**: `check-login` navigates with
       `Enter` and drags with a press-and-move, so nothing it did touched what a *click* means and
@@ -4969,9 +4971,12 @@ different kind of work from anything else in Part E and does not belong inside i
       **A wheel raises nothing, focuses nothing and crosses nothing.** Raising would reorder the
       screen — and move the keyboard with it, since focus *is* topmost-focusable — for a gesture
       people make without looking; and the cursor did not move, so no enter or leave is derived.
-      It is also the one pointer kind that must **not** coalesce in the outbox: `x` is a
-      position, so the newest answer is the whole truth, while `wheel` is a delta and the newest
-      is only the last part of it.
+      In the outbox it coalesces by **summing**, which is neither of the two obvious rules:
+      replacing (motion's rule) loses every detent but the last, because `wheel` is a delta
+      rather than a position, and not coalescing at all would make it the first pointer kind to
+      take a queue slot per event — in a queue whose depth is justified by that not happening.
+      Summing is bounded *and* lossless. Only across turns that agree about `modifiers` and
+      `buttons`, since those decide what a scroll means (PR #288 review, 3).
 - [x] **A press time on the wire — `TODO(press-time)`** ✅, folded in here at the maintainer's
       direction (2026-09-09) and paid off in the same widening. `PointerEvent` went 24 → 32
       bytes: the two reserved bytes became `wheel`, and `time_ms` was appended.
