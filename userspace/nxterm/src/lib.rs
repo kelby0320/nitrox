@@ -218,6 +218,8 @@ pub enum Msg {
     /// a scroll: the router delivers motion whether or not a button is held, and a bar that
     /// moved on hover would be unusable.
     Scroll(PointerEvent),
+    /// The wheel turned over the terminal — see [`App::wheel`].
+    Wheel(PointerEvent),
     /// The title bar was pressed somewhere that moves the window.
     ///
     /// The answer is one request and no arithmetic: the compositor already holds the grab this
@@ -879,6 +881,7 @@ impl App {
                 self.tab_mut().view_top = None;
             }
             Msg::Scroll(p) => self.scroll_to(p),
+            Msg::Wheel(p) => self.wheel(p),
             Msg::Key(k) => self.key(k),
             Msg::GridPointer(p) => self.grid_pointer(p),
         }
@@ -1106,6 +1109,37 @@ impl App {
         let s = self.scroll();
         let line = self.tab().grid.oldest_line() + s.offset_at(self.track_h(), p.y) as u64;
         self.scroll_to_line(line);
+    }
+
+    /// Scroll the viewport by a turn of the wheel.
+    ///
+    /// **[`WHEEL_UNITS`](libui::click::WHEEL_UNITS) lines a detent**, which is the toolkit's
+    /// number rather than this application's: a wheel that moved three lines here and five rows
+    /// in the file browser is a desktop that feels wrong without anyone being able to say why.
+    ///
+    /// **Through [`scroll_to_line`](Self::scroll_to_line)**, so the wheel and the scrollbar
+    /// have one implementation of what a viewport position means — including the clamp at both
+    /// ends and the repaint, which is the half that goes missing when a second path is written.
+    /// It follows that a wheel down to the bottom *parks* there rather than resuming the
+    /// bottom-follow, exactly as dragging the thumb to the end does: a program printing
+    /// afterwards must not pull the view along with it. Typing resumes following.
+    fn wheel(&mut self, p: PointerEvent) {
+        if p.wheel == 0 {
+            return;
+        }
+        // **Widened before multiplying.** `wheel` is `i16` and saturates at the compositor,
+        // so a long stall delivers 32767 detents; in `i16` arithmetic times three that is a
+        // scroll in the wrong direction.
+        let lines = i64::from(p.wheel) * i64::from(libui::click::WHEEL_UNITS);
+        let top = self.view_line();
+        // Positive is down, so it moves the viewport's first line forward. `scroll_to_line`
+        // clamps, which is what makes running off either end stop rather than wrap.
+        let want = if lines < 0 {
+            top.saturating_sub(lines.unsigned_abs())
+        } else {
+            top.saturating_add(lines as u64)
+        };
+        self.scroll_to_line(want);
     }
 
     /// Anchor the viewport at absolute line `top`, clamped, repainting if that moved it.
@@ -1341,7 +1375,12 @@ impl App {
                     // **The grid takes the pointer since M12 Part E.** It had none: nothing in
                     // the terminal reacted to the pointer except the scrollbar and the chrome.
                     .on_pointer(Msg::GridPointer),
-            ),
+            )
+            // **The wheel is the whole body's, not the grid's** (M14 Part I). A wheel walks up
+            // from whatever it landed on, so hanging it here means turning it over the
+            // scrollbar or the tab strip scrolls the terminal too — which is what a person
+            // expects, and what putting it on the grid alone would have made a dead zone of.
+            .on_wheel(Msg::Wheel),
             &ui,
         );
 
@@ -2372,6 +2411,96 @@ mod tests {
         assert_eq!(a.view_line(), parked, "a hover moved the view");
     }
 
+    /// One turn of the wheel, `dz` detents.
+    fn turn(a: &mut App, dz: i16) {
+        a.update(Msg::Wheel(PointerEvent {
+            kind: librsproto::surface::POINTER_WHEEL,
+            wheel: dz,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_three_lines_a_detent_in_the_direction_it_turned() {
+        let mut a = app();
+        produce(&mut a, 40);
+        let bottom = a.view_line();
+
+        turn(&mut a, -1);
+        assert_eq!(a.view_line(), bottom - 3, "up one detent is three lines back");
+        turn(&mut a, -2);
+        assert_eq!(a.view_line(), bottom - 9, "and detents multiply");
+        turn(&mut a, 1);
+        assert_eq!(a.view_line(), bottom - 6, "positive is down, back toward the live screen");
+    }
+
+    /// The wheel repaints the viewport, which is not the same as changing the grid.
+    ///
+    /// **The bug this exists for is silent**: the view moves and nothing redraws, so the
+    /// terminal shows the old rows until something else happens to damage them. `Grid`'s own
+    /// damage is about *cells that changed*, and scrolling changes none — it changes which
+    /// ones are on show. PR #287's review found exactly this omission twice in one part.
+    #[test]
+    fn scrolling_by_wheel_repaints_the_viewport() {
+        let mut a = app();
+        produce(&mut a, 40);
+        let _ = a.damage_rows(); // start from a clean frame
+
+        turn(&mut a, -1);
+        assert_eq!(
+            a.damage_rows().len(),
+            a.grid().rows(),
+            "the viewport moved and nothing was repainted"
+        );
+    }
+
+    #[test]
+    fn the_wheel_stops_at_both_ends_rather_than_running_past_them() {
+        let mut a = app();
+        produce(&mut a, 40);
+
+        turn(&mut a, -1000);
+        assert_eq!(a.view_line(), a.grid().oldest_line(), "scrolled past the top of history");
+        turn(&mut a, 1000);
+        assert_eq!(a.view_line(), a.grid().top_line(), "and past the live screen");
+    }
+
+    /// A wheel of zero detents is not a scroll.
+    ///
+    /// Cheap, and it is the guard that keeps the handler honest about *why* it acts: every
+    /// other pointer kind reaching this message would carry `wheel == 0`.
+    #[test]
+    fn a_wheel_record_with_no_detents_does_not_move_the_view() {
+        let mut a = app();
+        produce(&mut a, 40);
+        turn(&mut a, -2);
+        let parked = a.view_line();
+        turn(&mut a, 0);
+        assert_eq!(a.view_line(), parked);
+    }
+
+    /// A huge delta scrolls a very long way in the right direction.
+    ///
+    /// **The arithmetic is the point**: `wheel` is `i16` and the compositor saturates it, so a
+    /// consumer that stalled while somebody scrolled receives thousands of detents. Multiplied
+    /// by three in `i16` that overflows, and the terminal jumps to the *top* of its history
+    /// when the person scrolled down.
+    ///
+    /// **20 000 rather than `i16::MAX`, and the difference is the whole test.** `32767 * 3`
+    /// wraps back round to `32765` — still positive, still downward — so a version of this
+    /// written with the largest value passes against the broken arithmetic it exists to
+    /// catch. Found by running that control: the value has to be one whose wrap is *visible*.
+    #[test]
+    fn a_huge_wheel_delta_scrolls_down_rather_than_wrapping_upward() {
+        let mut a = app();
+        produce(&mut a, 40);
+        turn(&mut a, -20); // somewhere in the middle of the history
+        assert_ne!(a.view_line(), a.grid().top_line(), "the premise: scrolled back");
+
+        turn(&mut a, 20_000);
+        assert_eq!(a.view_line(), a.grid().top_line(), "20 000 detents down is the live screen");
+    }
+
     #[test]
     fn typing_snaps_the_view_back_to_the_bottom() {
         // What makes scrollback usable rather than a trap: the alternative is a prompt that
@@ -2517,6 +2646,49 @@ mod tests {
         assert!(!msgs.is_empty(), "nothing under the maximise button at ({x}, {y})");
         for m in msgs {
             a.update(m);
+        }
+    }
+
+    /// A wheel turned over the window scrolls it — **through the real tree and router**.
+    ///
+    /// **The half the direct-`update` tests above cannot reach.** They prove `App::wheel` does
+    /// the arithmetic; nothing in them says the view *carries* an `on_wheel`, so deleting it
+    /// leaves every one of them green and the terminal silently unable to scroll. Handlers get
+    /// dropped by exactly this kind of edit — the wheel hangs on the body's `dock`, which is a
+    /// node somebody restructuring the chrome would rebuild.
+    ///
+    /// **Over the grid and over the scrollbar**, because hanging it on the body is what makes
+    /// the second one work, and a version that put it on the grid alone would pass the first.
+    #[test]
+    fn a_wheel_over_the_window_scrolls_it_through_the_router() {
+        for (what, x) in [
+            ("over the grid", 40),
+            ("over the scrollbar", -(SCROLL_W as i32) / 2), // measured from the right edge
+        ] {
+            let mut a = app();
+            produce(&mut a, 40);
+            let bottom = a.view_line();
+            let (t, l, mut r) = window(&a);
+            let e = a.view(&UiTheme::default(), None);
+            let x = if x < 0 { a.window_size().w as i32 + x } else { x };
+            let p = PointerEvent {
+                window: 1,
+                kind: librsproto::surface::POINTER_WHEEL,
+                wheel: -1,
+                x,
+                y: (a.window_size().h / 2) as i32,
+                ..Default::default()
+            };
+            let msgs = r.pointer(&t, &e, &l, p).0;
+            assert!(!msgs.is_empty(), "{what}: nothing took the wheel at x={x}");
+            for m in msgs {
+                a.update(m);
+            }
+            assert_eq!(
+                a.view_line(),
+                bottom - u64::from(libui::click::WHEEL_UNITS),
+                "{what}: the wheel did not reach the viewport"
+            );
         }
     }
 

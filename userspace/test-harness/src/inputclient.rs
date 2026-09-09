@@ -120,6 +120,8 @@ const GRID: u32 = 1;
 enum Msg {
     Key(KeyEvent),
     Ptr(PointerEvent),
+    /// The wheel, which reaches a *different* handler — see `Element::on_wheel`.
+    Wheel(PointerEvent),
 }
 
 /// Bytes per record, from the shared ABI rather than a local literal — an earlier version
@@ -506,6 +508,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let view: Element<Msg> = custom(GRID, libdraw::geom::Size::new(WIN_W, WIN_H))
         .on_key(|k| Some(Msg::Key(k)))
         .on_pointer(Msg::Ptr)
+        // **A separate handler, which is the thing worth proving here.** `on_pointer` never
+        // receives a wheel, so a widget reporting one through this handler is evidence that
+        // `libui` routed it as a wheel rather than as an ordinary pointer record.
+        .on_wheel(Msg::Wheel)
         .focusable();
     let bounds = libdraw::geom::Rect::new(0, 0, WIN_W, WIN_H);
     let cells = FixedCell { w: 8, h: 16 };
@@ -627,21 +633,32 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     .u(pe.button as u64)
                     .s(b" buttons=")
                     .u(pe.buttons as u64)
+                    .s(b" wheel=")
+                    .i(pe.wheel as i64)
                     .s(b" x=")
                     .i(pe.x as i64)
                     .s(b" y=")
                     .i(pe.y as i64)
                     .end();
                 for m in router.pointer(&tree, &view, &laid, pe).0 {
-                    if let Msg::Ptr(rp) = m {
-                        Line::new()
-                            .s(b"input-testclient: widget ptr kind=")
-                            .u(rp.kind as u64)
-                            .s(b" x=")
-                            .i(rp.x as i64)
-                            .s(b" y=")
-                            .i(rp.y as i64)
-                            .end();
+                    match m {
+                        Msg::Ptr(rp) => {
+                            Line::new()
+                                .s(b"input-testclient: widget ptr kind=")
+                                .u(rp.kind as u64)
+                                .s(b" x=")
+                                .i(rp.x as i64)
+                                .s(b" y=")
+                                .i(rp.y as i64)
+                                .end();
+                        }
+                        Msg::Wheel(rp) => {
+                            Line::new()
+                                .s(b"input-testclient: widget wheel dz=")
+                                .i(rp.wheel as i64)
+                                .end();
+                        }
+                        Msg::Key(_) => {}
                     }
                 }
                 if pe.kind == librsproto::surface::POINTER_BUTTON

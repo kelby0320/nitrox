@@ -316,6 +316,29 @@ mod tests {
         assert_eq!(o.len(), 7);
     }
 
+    /// Two turns of the wheel are two scrolls, and coalescing them would lose one.
+    ///
+    /// **The one pointer kind where collapsing is actively wrong**, and the reason is the
+    /// difference between the two fields: `x` is a *position*, so the newest answer is the
+    /// whole truth and the older ones are redundant; `wheel` is a *delta*, so the newest is
+    /// only the last part of the truth. A client scrolling steadily would find its page
+    /// creeping at one detent per drain.
+    #[test]
+    fn wheel_records_are_never_coalesced_because_a_detent_is_a_delta() {
+        let mut o = Outbox::new();
+        for _ in 0..5 {
+            o.push(Outbound::Pointer {
+                event: PointerEvent {
+                    window: 1,
+                    kind: librsproto::surface::POINTER_WHEEL,
+                    wheel: 1,
+                    ..Default::default()
+                },
+            });
+        }
+        assert_eq!(o.len(), 5, "five detents are five records");
+    }
+
     #[test]
     fn a_focus_change_is_never_coalesced_away_by_input() {
         // Same reasoning as `Release`: input is continuous and a focus change is not, so on

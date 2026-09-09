@@ -25,8 +25,8 @@ use libdraw::geom::{Point, Rect};
 use libinput::Logical;
 use librsproto::surface::{
     KeyEvent, MAX_HOTKEYS, MAX_SNAP_ZONES, MgrHotkey, MgrSnapZone, POINTER_BUTTON, POINTER_ENTER,
-    POINTER_LEAVE, POINTER_MOTION, POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM, RESIZE_LEFT,
-    RESIZE_RIGHT, RESIZE_TOP, StartResize,
+    POINTER_LEAVE, POINTER_MOTION, POINTER_PRESSED, POINTER_WHEEL, PointerEvent, RESIZE_BOTTOM,
+    RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP, StartResize,
 };
 
 use crate::{Damage, StackError, WindowStack};
@@ -406,7 +406,8 @@ impl InputRouter {
                 self.time_ns = time_ns;
             }
             Logical::Motion { buttons, modifiers, time_ns, .. }
-            | Logical::Button { buttons, modifiers, time_ns, .. } => {
+            | Logical::Button { buttons, modifiers, time_ns, .. }
+            | Logical::Wheel { buttons, modifiers, time_ns, .. } => {
                 self.buttons = buttons;
                 self.modifiers = modifiers;
                 self.time_ns = time_ns;
@@ -620,6 +621,22 @@ impl InputRouter {
                     dismissed,
                     ..Routed::default()
                 }
+            }
+
+            // **The wheel goes where the pointer is**, like every other pointer record and
+            // unlike a key: scrolling acts on what is under the cursor, which is what every
+            // desktop does and what makes a wheel usable over an unfocused window. `target`
+            // is the same answer motion and buttons get, so a wheel turned mid-drag reaches
+            // the window holding the grab rather than whatever the cursor has wandered over.
+            //
+            // **No crossing pass and no restack.** The cursor did not move, so nothing was
+            // entered or left, and scrolling a window is not a reason to raise it — a wheel
+            // that raised would reorder the screen for a gesture people make without looking.
+            Logical::Wheel { dz, .. } => {
+                if let Some(window) = self.target(stack) {
+                    self.emit_wheel(window, dz, stack, out);
+                }
+                Routed { resized: ended, outline: outline_gone, ..Routed::default() }
             }
 
             Logical::Dropped { .. } => {
@@ -1343,11 +1360,40 @@ impl InputRouter {
         stack: &WindowStack,
         out: &mut Vec<Outbound>,
     ) {
-        let Some(w) = stack.window(window) else {
-            return;
-        };
+        if let Some(event) = self.record(window, kind, button, flags, stack) {
+            out.push(Outbound::Pointer { event });
+        }
+    }
+
+    /// Emit a `POINTER_WHEEL` record carrying `dz` detents.
+    ///
+    /// Built from the same [`record`](Self::record) as every other kind, so the window-local
+    /// coordinates a client scrolls *at* cannot come from a second piece of arithmetic.
+    ///
+    /// **Saturating into `i16`.** The wire field is 16 bits and the accumulator is 32: a
+    /// consumer that stopped reading has its deltas summed and carried forward by
+    /// `input-server`, so an arbitrarily long stall is an arbitrarily large number. Saturating
+    /// scrolls a very long way, which is what the person did; wrapping would scroll the other
+    /// way.
+    fn emit_wheel(&self, window: u32, dz: i32, stack: &WindowStack, out: &mut Vec<Outbound>) {
+        if let Some(event) = self.record(window, POINTER_WHEEL, 0, 0, stack) {
+            let dz = dz.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            out.push(Outbound::Pointer { event: event.with_wheel(dz) });
+        }
+    }
+
+    /// One pointer record for `window`, or `None` if the window is not in the stack.
+    fn record(
+        &self,
+        window: u32,
+        kind: u16,
+        button: u16,
+        flags: u16,
+        stack: &WindowStack,
+    ) -> Option<PointerEvent> {
+        let w = stack.window(window)?;
         let origin = w.bounds().origin;
-        let event = PointerEvent::new(
+        Some(PointerEvent::new(
             window,
             kind,
             button,
@@ -1364,8 +1410,7 @@ impl InputRouter {
             // anything queued in between — the error the `press-time` deferral recorded, paid off in
             // M14 Part I.
             self.time_ns / 1_000_000,
-        );
-        out.push(Outbound::Pointer { event });
+        ))
     }
 }
 
@@ -3301,6 +3346,110 @@ mod tests {
         let out = go(&mut r, &mut s, button(true));
         assert!(out.iter().all(|o| o.window() == lower));
         assert_eq!(r.grab(), Some(lower));
+    }
+
+    /// A wheel with nothing held.
+    fn wheel(dz: i32) -> Logical {
+        Logical::Wheel { dz, buttons: 0, modifiers: 0, time_ns: T }
+    }
+
+    /// The wheel goes to the window under the cursor, carrying its detents.
+    #[test]
+    fn a_wheel_reaches_the_window_under_the_pointer() {
+        let mut s = WindowStack::new();
+        let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
+        let b = win(&mut s, Role::Normal, 300, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 350, 50);
+
+        let out = go(&mut r, &mut s, wheel(2));
+        assert_eq!(out.len(), 1, "a wheel moves no cursor, so it crosses nothing");
+        let Outbound::Pointer { event } = &out[0] else { panic!("a pointer record") };
+        assert_eq!(event.window, b, "the window under the cursor, not {a}");
+        assert_eq!(event.kind, POINTER_WHEEL);
+        assert_eq!(event.wheel, 2);
+        assert_eq!((event.x, event.y), (50, 50), "and window-local, like every other record");
+    }
+
+    /// Scrolling does not raise, and does not reorder the stack.
+    ///
+    /// **A gesture people make without looking.** A wheel that raised would bring a window
+    /// forward — and take focus with it, since focus *is* topmost-focusable — for a scroll
+    /// aimed at whatever the cursor happened to rest on.
+    #[test]
+    fn a_wheel_neither_raises_nor_focuses() {
+        let mut s = WindowStack::new();
+        let lower = win(&mut s, Role::Normal, 0, 0, 640, 480);
+        let upper = win(&mut s, Role::Normal, 300, 300, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        assert_eq!(s.focus_candidate(), Some(upper), "precondition: the small one is on top");
+
+        let routed = go_routed(&mut r, &mut s, wheel(1));
+        assert_eq!(routed.restacked, None, "scrolling reordered the screen");
+        assert_eq!(s.focus_candidate(), Some(upper), "…and moved the keyboard with it");
+        assert_eq!(r.grab(), None, "a wheel is not a press and opens no grab");
+        let _ = lower;
+    }
+
+    /// Mid-drag the wheel follows the grab, not the cursor.
+    #[test]
+    fn a_wheel_during_a_drag_goes_to_the_grab_holder() {
+        let mut s = WindowStack::new();
+        let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
+        win(&mut s, Role::Normal, 300, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        go(&mut r, &mut s, button(true));
+        go(&mut r, &mut s, drag(300, 0));
+        assert_eq!(r.grab(), Some(a), "precondition: the press grabbed the first window");
+
+        let out = go(&mut r, &mut s, wheel(-1));
+        assert!(out.iter().all(|o| o.window() == a), "the sequence belongs to the grab holder");
+    }
+
+    /// A wheel carries the buttons and modifiers held while it turned.
+    ///
+    /// Ctrl-scroll is a gesture — zoom, in most applications — and it is expressible only
+    /// because the modifier travels on the record, exactly as it does for a click.
+    #[test]
+    fn a_wheel_carries_the_state_held_while_it_turned() {
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, Logical::Wheel {
+            dz: 1,
+            buttons: 0,
+            modifiers: MOD_SHIFT,
+            time_ns: T,
+        });
+        let Outbound::Pointer { event } = &out[0] else { panic!("a pointer record") };
+        assert_eq!(event.modifiers, MOD_SHIFT);
+        assert_eq!(event.time_ms, T_MS);
+    }
+
+    /// A delta too large for the wire saturates rather than wrapping.
+    ///
+    /// **Reachable rather than theoretical**: `input-server` sums the relative axes of every
+    /// batch a stalled consumer could not be sent and re-emits the total, so the number arriving
+    /// here is bounded by how long somebody scrolled, not by one packet. Wrapping would scroll
+    /// the other way at the moment the stall ended.
+    #[test]
+    fn a_wheel_delta_too_large_for_the_wire_saturates() {
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 200, 200);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, wheel(i32::from(i16::MAX) + 10));
+        let Outbound::Pointer { event } = &out[0] else { panic!("a pointer record") };
+        assert_eq!(event.wheel, i16::MAX, "saturated, still downward");
+
+        let out = go(&mut r, &mut s, wheel(i32::MIN));
+        let Outbound::Pointer { event } = &out[0] else { panic!("a pointer record") };
+        assert_eq!(event.wheel, i16::MIN);
     }
 
     /// Every record of a batch carries the interrupt's time, synthesised crossings included.

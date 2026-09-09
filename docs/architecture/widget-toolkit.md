@@ -388,7 +388,19 @@ it is still being dragged forever. Coordinates are widget-local and **signed**, 
 mid-capture they are routinely negative.
 
 Enter and leave are synthesised at widget boundaries the same way the compositor synthesises
-them at window boundaries, and suppressed during a capture for the same reason.
+them at window boundaries, and suppressed during a capture for the same reason — **and for a
+wheel**, which moved no cursor and so crossed nothing.
+
+**The wheel has a handler of its own** (`on_wheel`, M14 Part I), and never arrives at
+`on_pointer`. It bubbles like everything else, and that is exactly why it cannot share: the
+thing that scrolls is rarely the thing under the cursor — a row in a list, a cell in a grid —
+so a wheel delivered to `on_pointer` would stop at the first widget tracking the cursor for
+*any* reason, hover included, and be silently dropped there. Claiming it is a statement a widget
+makes ("I scroll"), not one it is assumed into by having an opinion about the pointer.
+
+A wheel opens no capture, fires no `on_press` and moves no focus. Nothing about it is a press,
+and each of those is a separate branch that would otherwise fire on a record whose `flags` and
+`buttons` happen to be zero.
 
 ### 7.2 Keyboard, and the second focus
 

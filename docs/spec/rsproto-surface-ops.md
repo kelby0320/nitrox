@@ -585,6 +585,12 @@ made that additive rather than another record.
 - **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus
   and regardless of role — a panel that cannot take a keystroke can still be clicked. A window
   that is not focused still sees the click that is about to focus it.
+- **A `POINTER_WHEEL` record goes to the window under the pointer too**, and **does not raise
+  it**. Scrolling acts on what is under the cursor, which is what makes a wheel usable over an
+  unfocused window; raising would reorder the screen — and move the keyboard with it, since
+  focus *is* topmost-focusable — for a gesture people make without looking. Mid-drag it follows
+  the grab like every other pointer record. No enter or leave is derived from one: the cursor
+  did not move.
 - **A press grabs, until its release.** Every pointer event from a press to the release of the
   last held button goes to the window the press landed on, **even after the cursor leaves it**.
   Without this a drag ending outside the window delivers a press with no release, and the

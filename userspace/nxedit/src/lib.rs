@@ -30,8 +30,8 @@ use alloc::vec::Vec;
 
 use libdraw::geom::{Rect, Size};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, RESIZE_BOTTOM, RESIZE_RIGHT,
-    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, PointerEvent, RESIZE_BOTTOM,
+    RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use alloc::vec;
 use libui::chooser::{self, ChooserState};
@@ -564,6 +564,8 @@ pub enum Msg {
     ChooserAccept,
     /// The chooser's *Cancel*, its close button, or `Esc`.
     ChooserCancel,
+    /// The wheel turned over the chooser — see [`ListState::wheel`](libui::widget::ListState::wheel).
+    ChooserWheel(PointerEvent),
     /// Open another window of this editor — `Ctrl+Shift+N`, or File ▸ New Window.
     ///
     /// **Recorded, not done.** A window is a compositor object and this crate makes no syscalls;
@@ -1013,6 +1015,14 @@ impl App {
             }
             Msg::ChooserAccept => self.chooser_accept(),
             Msg::ChooserCancel => self.chooser = None,
+            // **Declined when no chooser is open**, which is not defensive: the dialog is a
+            // second window and its records arrive on the same session, so one in flight when
+            // the dialog closes reaches this.
+            Msg::ChooserWheel(p) => {
+                if let Some(c) = self.chooser.as_mut() {
+                    c.state.list.wheel(p.wheel);
+                }
+            }
             Msg::NewWindow => self.new_window = true,
             Msg::Quit => self.quit = true,
             Msg::Undo => {
@@ -1460,6 +1470,12 @@ impl App {
             Msg::ChooserCancel,
             ui,
         )
+        // **The whole dialog takes the wheel** (M14 Part I), from outside the widget rather than
+        // through an eleventh parameter to it: a wheel bubbles to the nearest handler, so hanging
+        // it here catches one turned over the rows, the path strip or the buttons — and a chooser
+        // that could not be scrolled while the browser beside it could is one listing behaving
+        // two ways, which is what `chooser-hidden` was filed about.
+        .on_wheel(Msg::ChooserWheel)
     }
 
     /// The open menu's popup, framed — the root of a second window, not a layer in this one.
@@ -3433,6 +3449,49 @@ mod tests {
         // And the save that was requested is for the new path, not the old one.
         let (_, path, _) = a.take_save().expect("a save was requested");
         assert_eq!(path, "/home/other.txt", "the next write goes to the new file");
+    }
+
+    /// The wheel scrolls the chooser's list, **through the real dialog tree and router**.
+    ///
+    /// **A dialog is a window, so it has its own tree**, and the wheel is hung on the element
+    /// `chooser::view` returns rather than passed into it. Nothing but a routed event can say
+    /// that line is there — every other chooser test drives `update` directly.
+    #[test]
+    fn the_wheel_scrolls_the_choosers_list() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        let _ = a.take_chooser_list();
+        // More rows than the dialog shows, or the offset clamps straight back to zero.
+        a.show_chooser(
+            "/home",
+            (0..60).map(|i| (alloc::format!("f{i}.txt"), false)).collect(),
+        );
+
+        let ui = a.chooser_view(&UiTheme::default(), None);
+        let l = libui::layout::layout(
+            &ui,
+            Rect::new(0, 0, libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H),
+            &CELL,
+        );
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&ui, &l).expect("the chooser is diffable");
+        let mut router = libui::route::Router::new();
+        let ev = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_WHEEL,
+            wheel: 1,
+            x: (libui::chooser::CHOOSER_W / 2) as i32,
+            y: (libui::chooser::CHOOSER_H / 2) as i32,
+            ..Default::default()
+        };
+        let msgs = router.pointer(&tree, &ui, &l, ev).0;
+        assert!(!msgs.is_empty(), "nothing over the chooser took the wheel");
+        for m in msgs {
+            a.update(m);
+        }
+        assert_eq!(
+            a.chooser().expect("still open").state.list.offset,
+            libui::click::WHEEL_UNITS as usize,
+        );
     }
 
     /// Opening walks into directories and answers with a file.

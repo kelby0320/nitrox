@@ -27,6 +27,18 @@ use libdraw::geom::Point;
 /// two, slow enough that a double click is not a dexterity test.
 pub const RUN_MS: u64 = 400;
 
+/// How many units of content one detent of the wheel moves.
+///
+/// **Three, which is what every desktop settled on**: one is a wheel that feels broken, and a
+/// whole screen is a page-up key people turn by accident. A *unit* is whatever the thing being
+/// scrolled counts in — lines in a terminal, rows in a list — because that is the granularity a
+/// person is aiming at, and it is the only reading that makes a wheel behave the same in both.
+///
+/// Here rather than in each application for [`RUN_MS`]'s reason: two copies of a feel constant
+/// drift, and a wheel that moves three lines in one window and five in the next is a desktop
+/// that feels broken without anyone being able to say why.
+pub const WHEEL_UNITS: u16 = 3;
+
 /// How far the pointer may move between two presses of one run, in pixels.
 ///
 /// **Not zero**, because a mouse moves a pixel or two under a finger pressing a button, and a

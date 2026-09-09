@@ -1865,6 +1865,25 @@ impl ListState {
 const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 
 impl ListState {
+    /// Scroll by a turn of the wheel, `dz` detents, positive **down**.
+    ///
+    /// **No upper clamp here**, deliberately: [`list_view`] already clamps the offset against
+    /// the rows it is given every time it builds, and it is the one that knows how many fit.
+    /// A second clamp would need the caller to pass a count it has no other reason to have,
+    /// and two clamps disagreeing is how a list ends up unable to reach its last row.
+    ///
+    /// **Widened before multiplying**, because `dz` saturates at the compositor: a consumer
+    /// that stalled while somebody scrolled receives thousands of detents, and `i16`
+    /// arithmetic on that scrolls the other way.
+    pub fn wheel(&mut self, dz: i16) {
+        let rows = i64::from(dz) * i64::from(crate::click::WHEEL_UNITS);
+        self.offset = if rows < 0 {
+            self.offset.saturating_sub(rows.unsigned_abs() as usize)
+        } else {
+            self.offset.saturating_add(rows as usize)
+        };
+    }
+
     /// Move the offset to where a drag on the scrollbar's track points.
     ///
     /// **The conversion belongs here, not in each caller**, because the widget already knows the
@@ -2028,6 +2047,36 @@ mod list_view_tests {
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
         labels.iter().map(|&(key, label)| ListRow { key, label, marked: false }).collect()
+    }
+
+    /// The wheel moves the offset by whole rows, and stops at the top.
+    ///
+    /// **The bottom is not clamped here and that is deliberate** — `list_view` does it against
+    /// the rows it is handed, which is the only place the count is known. This checks the half
+    /// that *is* here: the direction, the multiplier, and that scrolling up past the first row
+    /// stops rather than wrapping to an enormous offset (`offset` is unsigned, so the failure
+    /// would be a list showing nothing at all).
+    #[test]
+    fn the_wheel_moves_whole_rows_and_stops_at_the_top() {
+        let mut st = ListState { selected: None, offset: 0 };
+        st.wheel(2);
+        assert_eq!(st.offset, 2 * crate::click::WHEEL_UNITS as usize, "positive is down");
+        st.wheel(-1);
+        assert_eq!(st.offset, crate::click::WHEEL_UNITS as usize);
+        st.wheel(-100);
+        assert_eq!(st.offset, 0, "a scroll off the top stops there");
+    }
+
+    /// A saturated delta scrolls a long way down rather than wrapping upward.
+    ///
+    /// **20 000 rather than `i16::MAX`**: `32767 * 3` wraps back round to a *positive* `i16`, so
+    /// the largest value passes against the broken arithmetic this exists to catch. The value
+    /// has to be one whose overflow is visible — the same trap `nxterm`'s copy of this test hit.
+    #[test]
+    fn a_huge_wheel_delta_does_not_wrap_upward() {
+        let mut st = ListState { selected: None, offset: 100 };
+        st.wheel(20_000);
+        assert!(st.offset > 100, "scrolled down, not back to the top: {}", st.offset);
     }
 
     /// A **marked** row is drawn as a selected one, and an unmarked one is not.

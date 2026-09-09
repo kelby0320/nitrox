@@ -1592,10 +1592,29 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     // an expect placed after them scans forward past a line already emitted and times out. The
     // click assertions below are what depend on the window being back, and they say so.
 
+    // ---- The wheel, through a window and into a widget (M14 Part I) ----
+    //
+    // The device-layer half above proves the driver frames and signs it. This proves the rest
+    // of the path: `libinput` turned the axis into a `Logical::Wheel`, the compositor routed it
+    // to the window **under the cursor** (never the focused one — a wheel is a pointer event)
+    // and stamped a `POINTER_WHEEL` record, and `libui` dispatched it to `on_wheel`.
+    //
+    // **The widget line is the one that could not be faked.** `on_pointer` never receives a
+    // wheel, so a `widget wheel` line means the toolkit routed it *as* a wheel — a change that
+    // delivered wheels to `on_pointer` "so nothing is lost" would print `widget ptr kind=4`
+    // here instead and this would fail.
+    //
+    // Before the click, because the click's press is what ends the client's window phase.
+    qmp.send_wheel(true)?;
+    session.expect("input-testclient: win ptr kind=4 btn=0 buttons=0 wheel=1")?;
+    session.expect("input-testclient: widget wheel dz=1")?;
+    qmp.send_wheel(false)?;
+    session.expect("input-testclient: widget wheel dz=-1")?;
+
     // And a click, which is routed by hit-testing instead of focus. `buttons=1` is the mask
     // the record carries on every kind — the field that used to read zero here.
     qmp.send_button("left", true)?;
-    session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
+    session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1 wheel=0")?;
     // Kind 1 is `POINTER_BUTTON`, and the coordinates are **widget-local**: the grid fills
     // the window and sits at its origin, so they match — which is exactly why the host tests
     // place a widget away from the origin as well.
