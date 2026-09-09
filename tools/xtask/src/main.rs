@@ -1467,6 +1467,29 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     // PS/2 wire to be wrong about. This assertion is the only thing standing between an
     // inverted mouse and a green build.
     session.expect("input-testclient: ev kind=2 code=1 value=3")?;
+
+    // ---- The wheel (M14 Part I) ----
+    //
+    // **This is the only check on the sign, and on the packet length.** A mouse that answered
+    // the IntelliMouse knock sends *four*-byte packets, and a decoder still framing three
+    // reads every packet after the first at an offset — so the motion assertions above would
+    // have started failing rather than this one. That the knock happened at all is only
+    // observable here: it is a conversation with the emulated device, and no host test has one.
+    //
+    // `REL_WHEEL` is `0x08`, and it is **positive-down** in this system — the sign convention
+    // is the screen's rather than Linux's (`rsproto-input-ops.md`). A turn toward the user
+    // must therefore arrive as `value=1`. Getting this backwards is one character in the
+    // driver and inverts scrolling everywhere; nothing on the host can catch it, because the
+    // host has no PS/2 wire to be wrong about — exactly the argument the `REL_Y` assertion
+    // above makes for itself.
+    //
+    // **Before the click, not after it.** `BTN_LEFT`'s press is the sentinel that ends the
+    // client's raw-stream phase, so anything injected after it is never printed.
+    qmp.send_wheel(true)?;
+    session.expect("input-testclient: ev kind=2 code=8 value=1")?;
+    qmp.send_wheel(false)?;
+    session.expect("input-testclient: ev kind=2 code=8 value=-1")?;
+
     qmp.send_button("left", true)?;
     session.expect("input-testclient: ev kind=1 code=272 value=1")?;
     // Release it: phase 2 asserts on the button mask, and a press left held from here would
@@ -6791,6 +6814,18 @@ impl Qmp {
                "data":{{"down":{down},"button":"{button}"}}}}]}}}}"#
         ))?;
         Ok(())
+    }
+
+    /// Turn the wheel one detent, up or down.
+    ///
+    /// **A button, not an axis**, which is QEMU's model rather than this one's: `wheel-up` and
+    /// `wheel-down` are `InputButton` values, and the PS/2 backend turns a press of one into a
+    /// signed `Z` in the packet it sends. The release is sent for symmetry and produces
+    /// nothing — QEMU decrements or increments its accumulator on the *down* edge only.
+    fn send_wheel(&mut self, down: bool) -> R<()> {
+        let button = if down { "wheel-down" } else { "wheel-up" };
+        self.send_button(button, true)?;
+        self.send_button(button, false)
     }
 
     /// Inject relative pointer motion.

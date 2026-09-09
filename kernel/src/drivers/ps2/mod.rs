@@ -392,6 +392,17 @@ pub fn init() {
         crate::kprintln!("ps2: no i8042 devices answered (no /dev/input/raw/*)");
         return;
     }
+    if present.wheel {
+        // **The decoder cannot work this out for itself**, and it is not a feature flag: a
+        // mouse that answered the knock sends four-byte packets from now on, so a decoder
+        // still framing three would read every one of them at an offset. Done here rather
+        // than inside `arch::ps2::init` because the packet layout is this module's — the arch
+        // layer owns ports and interrupts, not what the bytes mean.
+        //
+        // Safe without ordering care: `PRESENT` is still false and the interrupts are not
+        // armed, so nothing can be feeding the decoder yet.
+        PS2.lock().mouse.enable_wheel();
+    }
 
     for (index, present) in [(DEV_KEYBOARD, present.keyboard), (DEV_MOUSE, present.mouse)] {
         if !present {
@@ -423,9 +434,12 @@ pub fn init() {
     // merely harmless; storing last is what keeps it unreachable if that ever changes.
     PRESENT.store(true, Ordering::Release);
     crate::kprintln!(
-        "ps2: {}{}armed (kbd vec{:#x}, aux vec{:#x})",
+        "ps2: {}{}{}armed (kbd vec{:#x}, aux vec{:#x})",
         if present.keyboard { "keyboard " } else { "" },
         if present.mouse { "mouse " } else { "" },
+        // Logged because it changes how every mouse packet is *framed*, so a boot where the
+        // knock silently failed and one where it worked must not look the same in a transcript.
+        if present.wheel { "wheel " } else { "" },
         kbd_vec,
         aux_vec
     );
