@@ -147,6 +147,8 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
                 if size.h == 0 { inner.h } else { size.h },
             )
         }
+        // Ink changes no geometry, so it measures as its child does.
+        Node::Ink { child, .. } => measure(child, c, m),
         Node::Padding { insets, child } => {
             let inner = measure(child, c.shrink(insets.horizontal(), insets.vertical()), m);
             Size::new(
@@ -252,6 +254,8 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
 
         // `rect` is already the constrained one, computed above.
         Node::Sized { child, .. } => alloc::vec![arrange(child, rect, m)],
+        // The child takes the whole rect: an ink wrapper is transparent to layout.
+        Node::Ink { child, .. } => alloc::vec![arrange(child, rect, m)],
 
         // `rect` is already the offset one, computed above.
         Node::Offset { child, .. } => alloc::vec![arrange(child, rect, m)],

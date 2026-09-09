@@ -94,6 +94,34 @@ pub struct Theme {
     /// black text stays legible on it — the one constraint a selection colour actually has.
     pub selection: Rgb,
 
+    // ---- syntax highlighting ----
+    //
+    // **The one place M11's "not a colour of its own" rule does not apply.** Every other colour
+    // in this file is a surface or its ink, and a widget that wanted a third was told to derive
+    // it — a keyword and a comment cannot be derived from a window's ground and its foreground,
+    // because what they encode is *meaning* rather than depth. Six, because six is what a
+    // tolerant table-driven scanner can actually tell apart (M14 Part G).
+    //
+    // Chosen for contrast against a white ground rather than measured off the reference
+    // desktop, which is the honest description: MATE's editor ships several schemes and no
+    // single one of them is "the" reference the rest of this palette was sampled from.
+    /// A language's reserved words — `if`, `fn`, `let`, and TOML's `true`/`false`.
+    pub syntax_keyword: Rgb,
+    /// String literals, Markdown code spans and the inside of a fenced block.
+    pub syntax_string: Rgb,
+    /// Comments, and Markdown block quotes — the two things a reader skips.
+    pub syntax_comment: Rgb,
+    /// Numeric literals.
+    pub syntax_number: Rgb,
+    /// Structural markers at line level: a Markdown heading, a TOML `[table]` header.
+    pub syntax_heading: Rgb,
+    /// A shell variable — `$name` and `${name}`.
+    ///
+    /// **One language uses it and it earns its field there.** What a person reads a script for
+    /// is mostly which values flow where, so `$PATH` standing out is the single most useful
+    /// colour in an `nxsh` file; a kind shared by every language would not have caught it.
+    pub syntax_variable: Rgb,
+
     // ---- window chrome ----
     /// A title bar's face while its window holds the keyboard.
     pub title_active: Rgb,
@@ -246,6 +274,16 @@ impl Theme {
             thumb: Rgb::new(0x8E, 0xB1, 0xDD),
             selection: Rgb::new(0x93, 0xB5, 0xE0),
 
+            // Dark enough to read on white, and far enough apart in hue to be told apart at a
+            // glance, which is the whole job: a scheme whose keyword and number differ by a
+            // shade is a scheme that colours text for no benefit.
+            syntax_keyword: Rgb::new(0x7A, 0x3E, 0x9D),
+            syntax_string: Rgb::new(0xA0, 0x30, 0x00),
+            syntax_comment: Rgb::new(0x5E, 0x7A, 0x5E),
+            syntax_number: Rgb::new(0x1E, 0x6F, 0xA8),
+            syntax_heading: Rgb::new(0x1A, 0x4C, 0x8B),
+            syntax_variable: Rgb::new(0x8A, 0x5A, 0x00),
+
             title_active: Rgb::new(0xE0, 0xDE, 0xDC),
             title_inactive: Rgb::new(0xD4, 0xD2, 0xD0),
 
@@ -357,6 +395,12 @@ impl Theme {
                 "track" => set(&mut t.track, value),
                 "thumb" => set(&mut t.thumb, value),
                 "selection" => set(&mut t.selection, value),
+                "syntax_keyword" => set(&mut t.syntax_keyword, value),
+                "syntax_string" => set(&mut t.syntax_string, value),
+                "syntax_comment" => set(&mut t.syntax_comment, value),
+                "syntax_number" => set(&mut t.syntax_number, value),
+                "syntax_heading" => set(&mut t.syntax_heading, value),
+                "syntax_variable" => set(&mut t.syntax_variable, value),
                 "title_active" => set(&mut t.title_active, value),
                 "title_inactive" => set(&mut t.title_inactive, value),
                 "cursor_body" => set(&mut t.cursor_body, value),
@@ -467,6 +511,12 @@ impl Theme {
             track,
             thumb,
             selection,
+            syntax_keyword,
+            syntax_string,
+            syntax_comment,
+            syntax_number,
+            syntax_heading,
+            syntax_variable,
             title_active,
             title_inactive,
             cursor_body,
@@ -492,6 +542,12 @@ impl Theme {
             ("track", track),
             ("thumb", thumb),
             ("selection", selection),
+            ("syntax_keyword", syntax_keyword),
+            ("syntax_string", syntax_string),
+            ("syntax_comment", syntax_comment),
+            ("syntax_number", syntax_number),
+            ("syntax_heading", syntax_heading),
+            ("syntax_variable", syntax_variable),
             ("title_active", title_active),
             ("title_inactive", title_inactive),
             ("cursor_body", cursor_body),
@@ -835,12 +891,20 @@ mod tests {
         let text = t.to_config();
         assert_eq!(
             text.lines().count(),
-            22,
-            "sixteen colours, a size, a bevel, two fonts, a wallpaper and its mode"
+            28,
+            "sixteen colours, six syntax colours, a size, a bevel, two fonts, a wallpaper and \
+             its mode"
         );
         let (back, issues) = Theme::from_config(&text);
         assert_eq!(back, t);
         assert!(issues.is_empty(), "{issues:?}");
+        // **A named key as well as the count**, because a count passes for a field written under
+        // the wrong name — and `from_config` would then leave it at its default while `back == t`
+        // still held, since the default is what `t` carries for a field the test never changed.
+        assert!(
+            text.contains("syntax_comment = \"#5E7A5E\""),
+            "the syntax colours are not written under the names the reader accepts:\n{text}"
+        );
 
         // And it says so about a theme it did *not* come from: reading this on top of a
         // different starting point still lands on `t`, because every field is named.
