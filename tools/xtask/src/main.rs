@@ -2889,7 +2889,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     routes it, `nxterm` decides it landed on the bar, and only then does the request go
     //     out. A compositor that took its drag offset from the pointer *at the request* would
     //     lose whatever the pointer did in between — the window jumps by that much and then
-    //     tracks correctly, which is exactly the defect `TODO(scroll-grab)` describes. Every
+    //     tracks correctly, which is exactly the defect the `scroll-grab` deferral described. Every
     //     other step here waits for the guest between injections; this one deliberately does not,
     //     because a stationary pointer across that round trip measures zero drift where a person
     //     sees forty pixels (PR #247 review, finding 4).

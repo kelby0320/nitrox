@@ -208,7 +208,9 @@ pub struct InputRouter {
     /// which time the pointer has moved, and by which time coalescing may have handed that
     /// client a position older still. A drag whose offset is measured at the request jumps by
     /// however far the pointer travelled in between, which is the same defect
-    /// `TODO(scroll-grab)` describes for a scrollbar thumb (PR #247 review, finding 4).
+    /// the `scroll-grab` deferral described for a scrollbar thumb (PR #247 review, finding 4).
+    /// Both are now solved the same way, a layer apart: this records the pointer at the press,
+    /// and `libui::widget::ScrollGrab` records where within the thumb it landed.
     grab_at: Point,
     /// The interactive move in progress, if any.
     drag: Option<Drag>,
@@ -2320,7 +2322,7 @@ mod tests {
         // after the press — the client has to receive it, route it through its own toolkit and
         // decide it landed on a title bar — and the pointer keeps moving meanwhile. A drag that
         // takes its origin from the pointer *at the request* jumps by that distance and then
-        // tracks correctly, which is the defect `TODO(scroll-grab)` describes for a scrollbar.
+        // tracks correctly, which is the defect the `scroll-grab` deferral described for a scrollbar.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);

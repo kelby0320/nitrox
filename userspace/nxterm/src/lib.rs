@@ -365,6 +365,11 @@ pub struct App {
     /// `nxfiles` uses, and the reason `libui::click` counts a *run* rather than answering
     /// "double?": this is the caller that wanted three.
     clicks: libui::click::Clicks,
+    /// Where within the thumb the scrollbar was taken hold of — see [`ScrollGrab`].
+    ///
+    /// **Held here for `clicks`' reason**: it is interaction state that outlives one event, and
+    /// the widgets it belongs to are rebuilt every frame.
+    scroll_grab: libui::widget::ScrollGrab,
     /// What number the press being routed now is in its run.
     click_run: u32,
     /// The find field, while one is open.
@@ -454,6 +459,7 @@ impl App {
         let g = metrics.pixel_size(cols, rows);
         App {
             clicks: libui::click::Clicks::new(),
+            scroll_grab: libui::widget::ScrollGrab::new(),
             click_run: 1,
             find: None,
             // The same two sums `resize` subtracts, so the window this opens at is a window
@@ -1103,11 +1109,14 @@ impl App {
     /// and a bar that tracked the cursor on hover would scroll whenever the pointer passed over
     /// it on its way somewhere else.
     fn scroll_to(&mut self, p: PointerEvent) {
-        if p.buttons == 0 {
-            return;
-        }
         let s = self.scroll();
-        let line = self.tab().grid.oldest_line() + s.offset_at(self.track_h(), p.y) as u64;
+        // **The grab decides whether this event is part of a drag at all**, which is what the
+        // old `buttons == 0` test was standing in for: a press takes hold, a motion follows,
+        // a release lets go, and anything else answers `None` (M14 Part I).
+        let Some(offset) = self.scroll_grab.apply(s, self.track_h(), p) else {
+            return;
+        };
+        let line = self.tab().grid.oldest_line() + offset as u64;
         self.scroll_to_line(line);
     }
 
@@ -2391,6 +2400,41 @@ mod tests {
         let bottom = a.track_h() as i32;
         grab(&mut a, bottom);
         assert_eq!(a.view_line(), a.grid().top_line(), "the bottom is the live screen again");
+    }
+
+    /// Taking hold of the thumb does not move the view — the `scroll-grab` deferral, closed.
+    ///
+    /// **The application-level half.** `ScrollGrab`'s own tests pin the arithmetic; what this
+    /// says is that the terminal *uses* it — the wiring is one call, and the version before it
+    /// re-centred the thumb on every press, so aiming at the thumb threw away the screen you
+    /// were reading before the drag began.
+    #[test]
+    fn taking_hold_of_the_thumb_does_not_move_the_view() {
+        let mut a = app();
+        produce(&mut a, 200);
+        // Somewhere in the middle, so the thumb has track on both sides of it.
+        let mid = a.track_h() as i32 / 2;
+        grab(&mut a, mid);
+        let parked = a.view_line();
+        assert_ne!(parked, a.grid().top_line(), "premise: scrolled back");
+        assert_ne!(parked, a.grid().oldest_line(), "premise: not at the top either");
+
+        let (pos, len) = a.scroll().thumb(a.track_h());
+        for (what, y) in [("its top", pos as i32), ("its bottom", pos as i32 + len as i32 - 1)] {
+            // A fresh press each time: two presses in a row, as a person aiming twice would.
+            grab(&mut a, y);
+            assert_eq!(a.view_line(), parked, "the press on {what} moved the view");
+        }
+
+        // …and from there it follows the pointer.
+        let before = a.view_line();
+        a.update(Msg::Scroll(PointerEvent {
+            kind: librsproto::surface::POINTER_MOTION,
+            buttons: 1,
+            y: pos as i32 + len as i32 - 1 + 20,
+            ..Default::default()
+        }));
+        assert!(a.view_line() > before, "the drag did not follow the pointer down");
     }
 
     #[test]

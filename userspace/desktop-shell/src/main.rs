@@ -2766,7 +2766,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     let pressed = p.flags & librsproto::surface::POINTER_PRESSED != 0;
                     if pressed {
                         // **Picked up by which thumbnail, not by where inside it.** The
-                        // press-relative offset `TODO(scroll-grab)` is about matters when the
+                        // press-relative offset the `scroll-grab` deferral was about matters when the
                         // thing being dragged is *drawn* following the cursor; here the
                         // thumbnail stays put and only the drop target is read, so the offset
                         // has nothing to be wrong about. That deferral named this as its second

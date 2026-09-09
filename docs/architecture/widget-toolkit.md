@@ -536,6 +536,15 @@ M7's `text_field` was and remains the narrow thing: a password box and a search 
 wrapping, no selection and no multi-line cursor. A single-line field is not a text area, which
 is what §1's contradiction turned on.
 
+**Interaction state that outlives one event lives in a value the application holds.** There are
+two, both small and both pure: `click::Clicks`, which counts a run of presses so a second click
+can mean a word (M14 Part D), and `widget::ScrollGrab`, which remembers where within a scrollbar
+thumb a press landed so that taking hold of one does not move it (M14 Part I). Neither can live
+in a widget — the tree is rebuilt every frame — and neither belongs in each application, which
+is how two implementations of "is this a double click" come to disagree. §3 reserves retained
+widget state for things the application has no opinion about, and nobody has an opinion about
+where inside a thumb a button landed.
+
 **What these widgets are, at the toolkit's seam.** Each ships a *state* type
 (`TextFieldState`, `ListState`, `TextAreaState`) carrying the logic their callers would
 otherwise each reimplement: key dispatch for the field, selection-follows-scroll for the list,

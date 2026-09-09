@@ -520,6 +520,11 @@ pub struct App {
     /// **Fed by the binary**, which is the only half that can read a clock — see
     /// [`App::note_press`] and `libui::click`.
     clicks: libui::click::Clicks,
+    /// Where within the thumb the scrollbar was taken hold of — see
+    /// [`ScrollGrab`](libui::widget::ScrollGrab).
+    ///
+    /// **One per window rather than one per pane**, because a grab is: one button, one drag.
+    scroll_grab: libui::widget::ScrollGrab,
     /// What number the press being routed now is in its run; `1` unless a run is under way.
     click_run: u32,
     /// The modifiers held at that press — what makes Ctrl-click and Shift-click expressible.
@@ -816,6 +821,7 @@ impl App {
             properties: None,
             location: None,
             clicks: libui::click::Clicks::new(),
+            scroll_grab: libui::widget::ScrollGrab::new(),
             click_run: 1,
             click_mods: 0,
             next_key: TAB_KEY_BASE + 1,
@@ -1063,13 +1069,15 @@ impl App {
                     .and_then(|i| self.pane().entries.get(i))
                     .map(|e| (e.name.clone(), 0, 0));
             }
-            // **The drag converts through the widget's own arithmetic** — `ListState::drag_to`,
-            // the same `ScrollState::offset_at` `nxterm` uses for its grid — so a list and a
-            // terminal cannot disagree about where a thumb points (M11 Part E batch 6).
+            // **The drag converts through the widget's own arithmetic** — `ListState::bar` and
+            // `ScrollGrab`, the same pair `nxterm` uses for its grid — so a list and a terminal
+            // cannot disagree about where a thumb points (M11 Part E batch 6), nor about what
+            // taking hold of one means (M14 Part I).
             Msg::Scroll(p) => {
-                if p.buttons != 0 {
-                    let (h, total) = (self.list_h(), self.pane().entries.len());
-                    self.pane_mut().list.drag_to(h, ROW_H, total, p.y);
+                let (h, total) = (self.list_h(), self.pane().entries.len());
+                let bar = self.pane().list.bar(h, ROW_H, total);
+                if let Some(offset) = self.scroll_grab.apply(bar, h, p) {
+                    self.pane_mut().list.offset = offset as usize;
                 }
             }
             // **The same conversion the terminal does, from the widget that owns it**
