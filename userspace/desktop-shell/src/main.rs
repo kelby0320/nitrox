@@ -531,10 +531,10 @@ enum ModalMsg {
 /// The height the modal's list is laid out at — the space left after the filter field.
 ///
 /// **One place, because two things have to agree about it** (PR #265 review, optional 10): the
-/// view lays the list out at this height, and `ListState::drag_to` converts a pointer's y against
-/// it. Open-coded at both, changing one would leave the thumb tracking a track that is not the
-/// one drawn — which is the failure `drag_to`'s own doc names. `nxfiles` routes both through
-/// `App::list_h`, and this is that shape.
+/// view lays the list out at this height, and the `ScrollState` a drag is converted against is
+/// built from it. Open-coded at both, changing one would leave the thumb tracking a track that is
+/// not the one drawn — which is the failure `ListState::bar`'s own doc names. `nxfiles` routes
+/// both through `App::list_h`, and this is that shape.
 fn modal_list_h() -> u32 {
     MODAL_H.saturating_sub(40)
 }
@@ -2106,6 +2106,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // that the launcher keeps no selection — which was true and also meant the scroll offset
     // reset every frame, so `/bin`'s 26 entries were ten reachable rows and a filter.
     let mut modal_list = ListState::default();
+    // Where within the thumb the modal's scrollbar was taken hold of (M14 Part I), so that
+    // grabbing it does not move the list before the drag begins.
+    let mut modal_grab = libui::widget::ScrollGrab::new();
     let mut query = TextFieldState::new();
     // **The modal serves two purposes and has to know which.** It is the applications launcher
     // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
@@ -2581,13 +2584,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                     for msg in msgs {
                         // The drag converts through the widget's own arithmetic, which is what
-                        // keeps a list's thumb and a terminal's agreeing about where a y points.
+                        // keeps a list's thumb and a terminal's agreeing about where a y points —
+                        // and, since M14 Part I, about what taking hold of one means.
                         let ModalMsg::Launch(key) = msg else {
-                            if let ModalMsg::Scroll(p) = msg
-                                && p.buttons != 0
-                            {
-                                modal_list.drag_to(modal_list_h(), ROW_H, rows.len(), p.y);
-                                modal_dirty = true;
+                            if let ModalMsg::Scroll(p) = msg {
+                                let h = modal_list_h();
+                                let bar = modal_list.bar(h, ROW_H, rows.len());
+                                if let Some(offset) = modal_grab.apply(bar, h, p) {
+                                    modal_list.offset = offset as usize;
+                                    modal_dirty = true;
+                                }
                             }
                             continue;
                         };

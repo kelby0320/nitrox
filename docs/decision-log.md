@@ -24325,3 +24325,100 @@ first clicks and somebody who clicked four times needed two more to get a word b
 re-seeds now. **A control that passes is not "the fix is fine" — it is "nothing covers this", and
 covering it is what finds the defect.**
 
+
+---
+
+## 2026-09-09 — the input path grows an axis and a clock (M14 Part I)
+
+The scroll wheel, end to end, and two deferrals that were the same plumbing: `press-time` and
+`scroll-grab`. Four batches.
+
+**One widening of the wire, not two.** `PointerEvent` went from 24 bytes to 32 — the two
+reserved bytes became `wheel`, and `time_ms` was appended. The wheel needed an *axis* on that
+record and the double-click tracker needed a *timestamp* on it; doing them separately would have
+meant two passes over the same struct, its spec doc and every construction site. That the wheel
+had a place to go at all is the reserved bytes working as intended, which is the first time this
+project has spent a reservation.
+
+**The time rides on the event rather than beside it.** `libinput::Logical` carries the kernel's
+`time_ns` on **every** variant, `Dropped` included: a loss is a moment too, and the compositor
+synthesises crossings on one that have to be stamped with something. The alternative — `feed`
+tells the caller nothing and the caller passes the record's time alongside each `Logical` it
+routes — costs no field and hands the next edit the `now` already in scope, which is exactly the
+bug being closed. **A number that can be swapped for the wrong number silently will be.** The
+router then mirrors it beside `buttons` and `modifiers`, for the reason those are mirrored: enter
+and leave are *generated* rather than received, so they have no event of their own to read.
+
+**Milliseconds on the wire, divided once.** The kernel stamps nanoseconds; `emit` divides. A
+client that has to divide is a client that can forget to, and nanoseconds handed to an interval
+expressed in milliseconds fails *silently* — as a desktop where double click stopped working.
+X11 and Wayland both carry milliseconds for this reason and both carry 32 bits of them, which
+wraps every 49 days and makes every toolkit special-case it; this carries 64. `nxterm` and
+`nxfiles` both lost their `clock_ms()`.
+
+**`REL_WHEEL` is positive-down, and that parts company with Linux.** This table takes Linux's
+*codes*; the sign convention is the screen's, the one `REL_Y` already follows, so that nothing
+above the driver needs a sign of its own to add a delta to a scroll offset. Linux's `REL_WHEEL`
+is positive-up and its driver negates the wire; ours does not, because the PS/2 wire is already
+positive-down. The constant had sat defined and unconsumed for a month, documented with Linux's
+convention and never exercised — a good illustration of why an unused constant's documentation
+is a guess.
+
+**The IntelliMouse knock changes the packet *length*, which is why the answer has to be passed
+on.** A mouse that recognises the sample-rate sequence 200/100/80 changes its id to `0x03` and
+sends four-byte packets from then on. Nothing in the byte stream distinguishes them from
+three-byte ones — there is no flag in byte 0 and no framing byte to count from — so the decoder
+is *told*, once, by whoever performed the knock. Told wrongly in either direction it reads every
+packet at an offset for ever: the same framing failure the resynchronisation machinery exists
+for, reached by configuration rather than by a lost byte. The knock also leaves the mouse
+sampling at 80 Hz, so the rate is set back afterwards; a visibly coarser cursor is not something
+to inherit from a probe.
+
+**`libui` gained `on_wheel`, and a wheel never arrives at `on_pointer`.** The reason is what
+happens to the widgets that do not want it. A wheel bubbles, and the thing that scrolls is rarely
+the thing under the cursor — a row in a list, a cell in a grid — so delivered through
+`on_pointer` it would stop at the first widget tracking the cursor for *any* reason, hover
+included, and be dropped there with nothing to say why. A separate handler makes "I scroll" a
+claim a widget states rather than one it is assumed into by having an opinion about the pointer.
+A wheel opens no capture, fires no click, moves no focus, and derives no crossing: the cursor did
+not move.
+
+**Three consumers, and none of them needed a widget parameter.** The handler goes on the
+`Element` a widget *returns* — `nxterm`'s whole window body, so the scrollbar and the tab strip
+are not dead zones; `nxfiles`' listing; `nxedit`'s chooser. `list_view` already takes nine
+arguments and `chooser::view` ten, and adding an eleventh to each was the obvious shape; hanging
+the handler on the outside instead is both smaller and more correct, because the widget's
+outermost node is exactly the region a person means by "over the list".
+
+**A wheel is the one pointer kind that must not coalesce**, and the reason is the difference
+between two fields: `x` is a *position*, so the newest answer is the whole truth and the older
+ones are redundant, while `wheel` is a *delta* and the newest is only the last part of it. A
+client scrolling steadily against a coalescing outbox would find its page creeping at one detent
+per drain.
+
+**`scroll-grab` was closed by answering where the state lives.** The entry had been open since M4
+and its own framing was "a question of where it lives rather than whether it is allowed":
+`libui::widget::ScrollGrab`, a value the **application** holds, the same shape as
+`libui::click::Clicks`. The toolkit's widgets are rebuilt every frame and have nowhere to keep
+state that outlives an event, and nobody has an opinion about where inside a thumb a button
+landed. `ScrollState` gained `offset_for_thumb_top` — the inverse `offset_at` should always have
+been expressed in terms of — and `offset_at` stays, because centring is exactly right for a press
+on the **track**. A press on the thumb returns the offset *unchanged* rather than one recomputed
+from the thumb's position, which keeps a grab exact where the position arithmetic truncates.
+**M9's drag-to-move had already solved its own half separately**: the compositor's `grab_at`
+records the pointer at the press for precisely this reason (PR #247 review, finding 4). Same
+idea, one layer down, and both sites now say so.
+
+**A control caught a vacuous test, and the lesson is about the *value* rather than the control.**
+"A saturated wheel delta must not wrap" was written with `i16::MAX` — and `32767 * 3` wraps round
+to `32765`, still positive, still downward, so it passed against the broken arithmetic it existed
+to catch. Both copies use 20 000 now, and both fail without the widening. Running the control is
+the habit that found it; what it says is narrower and worth keeping: **the largest input is not
+automatically the most revealing one**, and a boundary test has to be built from a value whose
+failure is visible.
+
+**What the gate can see and the host cannot.** `check-input` injects a real wheel over QMP and
+asserts it twice: at the device layer, where the sign and the four-byte framing are claims about
+a wire the host does not have, and through a window into a **widget**, where `widget wheel dz=`
+is a line only correct routing can produce — a change that delivered wheels to `on_pointer` "so
+nothing is lost" would print `widget ptr kind=4` there instead.

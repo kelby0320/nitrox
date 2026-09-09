@@ -756,7 +756,7 @@ pub enum Msg {
     Grab(u64),
     /// The "up" control was pressed.
     Up,
-    /// The scrollbar is being dragged — see [`ListState::drag_to`].
+    /// A pointer event over the scrollbar — see [`ScrollGrab`](libui::widget::ScrollGrab).
     Scroll(PointerEvent),
     /// The wheel turned over the listing — see [`ListState::wheel`].
     Wheel(PointerEvent),
