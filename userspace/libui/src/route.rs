@@ -593,13 +593,20 @@ impl Router {
         // The state that was true when the cursor crossed, from the event that moved it —
         // a crossing has no buttons or modifiers of its own, and inventing zeroes would tell
         // a widget the button it is about to be dragged with is not held.
+        //
+        // **The wheel is zeroed with `button` and `flags`**, and for the same reason: those are
+        // about the *transition*, and a crossing is not the transition that caused it. Carried
+        // through, a crossing provoked by a wheel event would arrive at a widget claiming
+        // detents of its own, and the widget would scroll twice for one turn. The time is
+        // carried, because "when did the cursor enter" has the same answer as "when did the
+        // event that moved it happen".
         let ev = PointerEvent {
             kind,
             button: 0,
             buttons: cause.buttons,
             flags: 0,
             modifiers: cause.modifiers,
-            _pad: 0,
+            wheel: 0,
             ..localise(cause, l.rect)
         };
         out.push(f(ev));

@@ -508,19 +508,42 @@ focus within its window and the window has the keyboard; those are two facts fro
 and they must not share a field. Losing window focus does **not** clear widget focus —
 returning to a window has to put the caret back where it was.
 
-`PointerEvent`, 24 bytes:
+`PointerEvent`, 32 bytes:
 
 | Offset | Size | Type | Field |
 |---|---|---|---|
 | 0 | 4 | `u32` | `window` |
-| 4 | 2 | `u16` | `kind` — `0` motion, `1` button, `2` enter, `3` leave |
+| 4 | 2 | `u16` | `kind` — `0` motion, `1` button, `2` enter, `3` leave, `4` wheel |
 | 6 | 2 | `u16` | `button` — a `BTN_*` code on a button event, else zero |
 | 8 | 2 | `u16` | `buttons` — every button held: `BTN_LEFT`→bit 0, `RIGHT`→1, `MIDDLE`→2 |
 | 10 | 2 | `u16` | `flags` — `POINTER_PRESSED` (bit 0) on a press |
 | 12 | 2 | `u16` | `modifiers` — `MOD_SHIFT` and friends, as on `KeyEvent` |
-| 14 | 2 | | reserved, zero |
+| 14 | 2 | **`i16`** | `wheel` — detents on `POINTER_WHEEL`, else zero; **positive is down** |
 | 16 | 4 | **`i32`** | `x` — window-local, **signed** |
 | 20 | 4 | **`i32`** | `y` — window-local, signed |
+| 24 | 8 | `u64` | `time_ms` — monotonic milliseconds **at the interrupt**, not at delivery |
+
+**The record grew from 24 bytes to 32 on 2026-09-09** (M14 Part I), taking the two reserved
+bytes for `wheel` and appending `time_ms`. One widening rather than two: the wheel wanted an
+axis and the double-click tracker wanted a clock, and both are the same plumbing through
+`libinput`, the compositor and every construction site.
+
+**`wheel` is a count of detents, not a distance**, and a client decides what a detent is worth —
+three lines in a terminal, a row in a list. More than one can arrive in a record when the device
+reported faster than the compositor sent. **Positive is down**, matching `y`, `REL_WHEEL` at the
+device layer, and Wayland's `wl_pointer.axis`: a client adding it to a scroll offset needs no
+sign of its own. (Linux's `REL_WHEEL` is positive-*up*; this system takes Linux's codes and not
+that convention — see [`rsproto-input-ops.md`](rsproto-input-ops.md).)
+
+**`time_ms` is when the input happened, not when the client got it.** The kernel stamps every
+device record at the interrupt; the compositor divides that to milliseconds once and puts it
+here. A client that instead read its own clock on delivery measured the queue: stalled between
+two *deliberate* single clicks it would see them closer together than they were made and read
+them as a double. The error runs one way only — delivery cannot pull events further apart than
+a stall bunched them — which is why the field was deferred rather than blocking, and why the
+clients that wanted it (`nxterm`, `nxfiles`) read a clock until this landed. X11 and Wayland
+both carry a timestamp per input event; both carry 32 bits of milliseconds, which wraps every
+49 days and makes every toolkit special-case it. This carries 64.
 
 A pointer record needs its `window` more than a key record does, not less: a key goes to the
 focused window, which a client could track from `FocusEvent`, but a pointer record goes to the
@@ -539,8 +562,11 @@ screen and they stay correct when the window moves — which a client is not tol
 should not have to be. They are **signed** because a drag can leave a window: a client reading
 them unsigned sees the pointer teleport.
 
-**New interaction kinds are new `kind` values**, not new ops — scroll and touch fit without a
-wire change, which is the same reason the device layer's extensibility lives in its enums.
+**New interaction kinds are new `kind` values**, not new ops — touch fits without a new op,
+which is the same reason the device layer's extensibility lives in its enums. Scroll was the
+first to arrive and proved the *op* half of that claim and not the layout half: `POINTER_WHEEL`
+is a `kind`, but it needed somewhere to put a magnitude, and the two reserved bytes are what
+made that additive rather than another record.
 
 ### Which window receives them
 

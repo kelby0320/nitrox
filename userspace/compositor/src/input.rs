@@ -262,6 +262,17 @@ pub struct InputRouter {
     /// Modifiers held, mirrored the same way — what makes shift-click and shift-drag
     /// expressible on the wire rather than only in `libinput`.
     modifiers: u16,
+    /// When the event being routed happened, mirrored the same way and for the same reason.
+    ///
+    /// **Mirrored rather than passed down**, because the records this router emits are not all
+    /// caused by an event that has one: enter and leave are *generated here*, and a leave
+    /// synthesised because a window was minimized mid-drag still has to be stamped. Taking the
+    /// time from whatever event provoked it is what lets every record of one batch agree —
+    /// exactly the argument `buttons` and `modifiers` are mirrored on.
+    ///
+    /// **Nanoseconds here, milliseconds on the wire.** The kernel's stamp is `time_ns` and the
+    /// division happens once, at [`emit`](Self::emit) — dividing earlier would round twice.
+    time_ns: u64,
     /// Keycodes whose press this router **delivered**, awaiting their release.
     ///
     /// **The other half of `consumed`, and it is what keeps presses and releases balanced.**
@@ -329,6 +340,7 @@ impl InputRouter {
             grab_broken: false,
             buttons: 0,
             modifiers: 0,
+            time_ns: 0,
             hotkeys: Vec::new(),
             zones: Vec::new(),
             in_zone: None,
@@ -389,15 +401,24 @@ impl InputRouter {
         // their own to read; taking it from the event that provoked them is what lets every
         // record carry the same answer.
         match *ev {
-            Logical::Key { modifiers, .. } => self.modifiers = modifiers,
-            Logical::Motion { buttons, modifiers, .. }
-            | Logical::Button { buttons, modifiers, .. } => {
+            Logical::Key { modifiers, time_ns, .. } => {
+                self.modifiers = modifiers;
+                self.time_ns = time_ns;
+            }
+            Logical::Motion { buttons, modifiers, time_ns, .. }
+            | Logical::Button { buttons, modifiers, time_ns, .. } => {
                 self.buttons = buttons;
                 self.modifiers = modifiers;
+                self.time_ns = time_ns;
             }
-            Logical::Dropped => {
+            // **The time is kept, where the state is thrown away.** A loss says nothing about
+            // *when* it happened being wrong — it is the one thing about a `Dropped` that is
+            // still known — and the crossings this arm synthesises need a stamp like any other
+            // record. Zeroing it here would date them to the beginning of the clock.
+            Logical::Dropped { time_ns } => {
                 self.buttons = 0;
                 self.modifiers = 0;
+                self.time_ns = time_ns;
             }
         }
 
@@ -443,7 +464,7 @@ impl InputRouter {
         }
 
         match *ev {
-            Logical::Key { keycode, pressed, modifiers } => {
+            Logical::Key { keycode, pressed, modifiers, .. } => {
                 // **Before focus routing, and consuming rather than copying.** A chord that
                 // also reached the focused window would type into it — `Super+2` would switch
                 // desktops *and* put a `2` in the terminal.
@@ -601,7 +622,7 @@ impl InputRouter {
                 }
             }
 
-            Logical::Dropped => {
+            Logical::Dropped { .. } => {
                 // Buttons are no longer trustworthy — a release may be the event that was
                 // lost, and a grab that outlives its button never ends. `libinput` has
                 // already reset what it accumulated; this is the same reset one layer up.
@@ -1338,6 +1359,11 @@ impl InputRouter {
             // stopped at the border.
             self.pointer.x.saturating_sub(origin.x),
             self.pointer.y.saturating_sub(origin.y),
+            // **The interrupt's time, divided once.** A client reading its own clock instead
+            // measures when *it* got round to the event, which is a different number whenever
+            // anything queued in between — the error the `press-time` deferral recorded, paid off in
+            // M14 Part I.
+            self.time_ns / 1_000_000,
         );
         out.push(Outbound::Pointer { event });
     }
@@ -1404,23 +1430,32 @@ mod tests {
         go(r, s, motion(x - p.x, y - p.y));
     }
 
+    /// The interrupt time every helper below stamps, in nanoseconds.
+    ///
+    /// Chosen so its milliseconds are not zero and not round: a record stamped from
+    /// somewhere other than the event carries a visibly different number rather than one
+    /// that could be either.
+    const T: u64 = 7_123_456_789;
+    /// What `T` becomes on the wire.
+    const T_MS: u64 = T / 1_000_000;
+
     /// Motion with nothing held.
     fn motion(dx: i32, dy: i32) -> Logical {
-        Logical::Motion { dx, dy, buttons: 0, modifiers: 0 }
+        Logical::Motion { dx, dy, buttons: 0, modifiers: 0, time_ns: T }
     }
 
     /// Motion with the left button held — what `libinput` emits mid-drag.
     fn drag(dx: i32, dy: i32) -> Logical {
-        Logical::Motion { dx, dy, buttons: 1, modifiers: 0 }
+        Logical::Motion { dx, dy, buttons: 1, modifiers: 0, time_ns: T }
     }
 
     fn key(keycode: u16, pressed: bool) -> Logical {
-        Logical::Key { keycode, pressed, modifiers: 0 }
+        Logical::Key { keycode, pressed, modifiers: 0, time_ns: T }
     }
 
     /// A key transition with modifiers held — what a chord looks like on the wire.
     fn chord(keycode: u16, pressed: bool, modifiers: u16) -> Logical {
-        Logical::Key { keycode, pressed, modifiers }
+        Logical::Key { keycode, pressed, modifiers, time_ns: T }
     }
 
     /// The "Super" key is `MOD_SUPER` on the wire — the name the modifier bitmask uses.
@@ -1556,7 +1591,7 @@ mod tests {
             assert!(r.outline().is_some(), "precondition: the target is highlighted");
 
             let out = if lost_input {
-                go(&mut r, &mut s, Logical::Dropped)
+                go(&mut r, &mut s, Logical::Dropped { time_ns: T })
             } else {
                 // The source window goes away mid-gesture: `reconcile_with` breaks the grab,
                 // and the invariant at the top of `route` tears the drag down with it.
@@ -1778,7 +1813,7 @@ mod tests {
         r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
 
         go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
-        go(&mut r, &mut s, Logical::Dropped);
+        go(&mut r, &mut s, Logical::Dropped { time_ns: T });
         // The release the chord was owed never arrives; the drop is what stands in for it.
         assert_eq!(go(&mut r, &mut s, key(KEY_2, true)).len(), 1, "an ordinary press after");
         assert_eq!(
@@ -1841,6 +1876,7 @@ mod tests {
             pressed,
             buttons: if pressed { 1 } else { 0 },
             modifiers: 0,
+            time_ns: T,
         }
     }
 
@@ -2111,7 +2147,13 @@ mod tests {
         go(
             &mut r,
             &mut s,
-            Logical::Button { button: BTN_LEFT, pressed: true, buttons: 1, modifiers: MOD_SHIFT },
+            Logical::Button {
+                button: BTN_LEFT,
+                pressed: true,
+                buttons: 1,
+                modifiers: MOD_SHIFT,
+                time_ns: T,
+            },
         );
 
         s.set_minimized(w, true).unwrap();
@@ -2119,7 +2161,13 @@ mod tests {
         let out = go(
             &mut r,
             &mut s,
-            Logical::Button { button: BTN_LEFT, pressed: false, buttons: 0, modifiers: 0 },
+            Logical::Button {
+                button: BTN_LEFT,
+                pressed: false,
+                buttons: 0,
+                modifiers: 0,
+                time_ns: T,
+            },
         );
         for o in &out {
             let Outbound::Pointer { event } = o else { continue };
@@ -2285,7 +2333,7 @@ mod tests {
         go(&mut r, &mut s, button(true));
         r.start_move(w, &mut s).expect("grabbed");
 
-        go(&mut r, &mut s, Logical::Dropped);
+        go(&mut r, &mut s, Logical::Dropped { time_ns: T });
         let at = s.window(w).expect("there").origin;
         assert_eq!(s.dragging(), None, "the drag went with the grab");
         go(&mut r, &mut s, motion(30, 30));
@@ -2553,7 +2601,7 @@ mod tests {
             go(&mut r, &mut s, drag(-230, 0));
 
             let routed = if interrupted_by_loss {
-                go_routed(&mut r, &mut s, Logical::Dropped)
+                go_routed(&mut r, &mut s, Logical::Dropped { time_ns: T })
             } else {
                 // The window leaves the screen under the pointer; `reconcile_with` breaks the
                 // grab on the next event and the invariant tears the gesture down.
@@ -2827,7 +2875,7 @@ mod tests {
         assert_eq!(s.place(w, Point::new(0, 0)), Err(StackError::Dragging));
         go(&mut r, &mut s, drag(40, 30));
 
-        let routed = go_routed(&mut r, &mut s, Logical::Dropped);
+        let routed = go_routed(&mut r, &mut s, Logical::Dropped { time_ns: T });
         assert_eq!(routed.resized, None, "a gesture the user did not finish asks for nothing");
         assert_eq!(routed.outline.expect("taken down").now, None);
         assert!(s.place(w, Point::new(0, 0)).is_ok(), "and the window is a manager's again");
@@ -2998,6 +3046,7 @@ mod tests {
             pressed: true,
             buttons: 1,
             modifiers: MOD_SHIFT,
+            time_ns: T,
         });
         for o in &out {
             let Outbound::Pointer { event, .. } = o else { unreachable!() };
@@ -3009,6 +3058,7 @@ mod tests {
             dy: 0,
             buttons: 1,
             modifiers: MOD_SHIFT,
+            time_ns: T,
         });
         let Outbound::Pointer { event, .. } = out
             .iter()
@@ -3030,6 +3080,7 @@ mod tests {
             pressed: false,
             buttons: 0,
             modifiers: MOD_SHIFT,
+            time_ns: T,
         });
         let entered = out
             .iter()
@@ -3174,7 +3225,7 @@ mod tests {
         go(&mut r, &mut s, drag(200, 0));
         assert_eq!(r.grab(), Some(a));
 
-        go(&mut r, &mut s, Logical::Dropped);
+        go(&mut r, &mut s, Logical::Dropped { time_ns: T });
         assert_eq!(r.grab(), None);
         let out = go(&mut r, &mut s, motion(1, 0));
         assert!(out.iter().all(|o| o.window() == b), "later events follow the cursor again");
@@ -3250,5 +3301,48 @@ mod tests {
         let out = go(&mut r, &mut s, button(true));
         assert!(out.iter().all(|o| o.window() == lower));
         assert_eq!(r.grab(), Some(lower));
+    }
+
+    /// Every record of a batch carries the interrupt's time, synthesised crossings included.
+    ///
+    /// **The crossing is the half worth testing.** A press produces two records — the enter the
+    /// router *generates* and the button itself — and only the second has an event of its own
+    /// to take a time from. A version that stamped `emit` from a clock, or left the generated
+    /// one at zero, would still pass an assertion that only looked at the button.
+    #[test]
+    fn every_record_carries_the_time_of_the_event_that_caused_it() {
+        let mut s = WindowStack::new();
+        let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
+        let b = win(&mut s, Role::Normal, 300, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+
+        let at = r.pointer();
+        let out = go(&mut r, &mut s, motion(50 - at.x, 50 - at.y));
+        let times: Vec<(u16, u64)> = out
+            .iter()
+            .filter_map(|o| match o {
+                Outbound::Pointer { event } => Some((event.kind, event.time_ms)),
+                _ => None,
+            })
+            .collect();
+        assert!(times.iter().any(|(k, _)| *k == POINTER_ENTER), "the cursor entered {a}");
+        assert!(
+            times.iter().all(|&(_, t)| t == T_MS),
+            "a record was stamped from somewhere other than the event: {times:?}"
+        );
+
+        // The leave into the other window is generated too, and by an event that is not a
+        // crossing — so it can only be stamped from the mirror.
+        let out = go(&mut r, &mut s, motion(300, 0));
+        let leave = out
+            .iter()
+            .find_map(|o| match o {
+                Outbound::Pointer { event } if event.kind == POINTER_LEAVE => Some(*event),
+                _ => None,
+            })
+            .expect("left the first window");
+        assert_eq!(leave.window, a);
+        assert_eq!(leave.time_ms, T_MS);
+        assert!(out.iter().any(|o| o.window() == b), "and entered the second");
     }
 }
