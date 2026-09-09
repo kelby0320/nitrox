@@ -24448,3 +24448,88 @@ asserts it twice: at the device layer, where the sign and the four-byte framing 
 a wire the host does not have, and through a window into a **widget**, where `widget wheel dz=`
 is a line only correct routing can produce — a change that delivered wheels to `on_pointer` "so
 nothing is lost" would print `widget ptr kind=4` there instead.
+
+
+---
+
+## 2026-09-09 — syntax highlighting, and a toolkit that can draw a second colour (M14 Part G)
+
+The last part of Milestone 14. Four batches: an ink node and six theme colours, a tolerant
+scanner and four languages, coloured runs in the text area, and the editor's cache.
+
+**A lexer answers "what does this program mean". A highlighter answers "what does this text look
+like", over text that is not a program yet.** That is why `nxsh`'s own lexer is not reused, and
+the argument for reusing it — that the two could then never disagree — does not survive reading
+it: `peek` and `bump` return `Result`, and while a person is typing an unterminated string is the
+*normal* state of the buffer, so a highlighter built on it stops colouring at the first quote and
+starts again when the pair closes. It is also parser-mode-driven, and a standalone highlighter has
+no parser to pick the mode with. The scanner here is total by construction instead: every byte
+lands in a run, an unterminated string runs to the end of its line, and there is no input it can
+refuse.
+
+**A language is a table, and the cost that matters is that it is paid once.** Line-comment
+markers, a block-comment pair, string rules, a keyword list, a numbers flag, a variable sigil,
+line prefixes and a fence. nxsh, TOML, Rust and Markdown are data; the scanner is the code.
+**Markdown was named in the plan as the drop candidate** if it bent the table into a grammar, and
+it did not — a line prefix and a fence were rules the table already needed for headings, quotes
+and fenced blocks. What it does not get is emphasis, because `*` pairs across a line *are* a
+grammar. Rust does not get character literals, for the same reason one language over: the same
+quote opens a lifetime, and `&'static str` would open a string running to the end of the line.
+
+**`Node::Ink` is a wrapper, not a colour on the text node.** Before this every glyph `libui` drew
+was `theme.foreground`. Ink is inherited — a coloured run is usually several nodes, and a
+highlighted keyword under a selection is a `stack` of a fill and a text — so a leaf carrying its
+own colour would need its parent to remember to set it. The wrapper changes no geometry, which is
+what lets it go round anything; measuring as zero (which `Fill` and `Icon` do) would collapse
+every run in a text area and the line would draw on top of itself.
+
+**Six `syntax_*` colours in `Theme`, and this is the one place M11's "not a colour of its own"
+rule does not apply.** Every other colour in that file is a surface or its ink, and a widget
+wanting a third was told to derive one; a keyword and a comment cannot be derived from a window's
+ground, because what they encode is meaning rather than depth. Six is what a table-driven scanner
+can tell apart. `to_config`'s destructure — added in PR #263's review so that a new field fails to
+compile until it is serialised — did exactly its job.
+
+**The widget is handed colours, never token kinds.** A toolkit that took kinds would have to know
+what a keyword is, and `Theme` would carry a table indexed by an enum belonging to one
+application. The application scans its own text and looks the colour up.
+
+**The text area's piece loop became one pass over a sorted cut list**, which is smaller than what
+it replaced and has one fewer thing to get wrong. The selection, the caret and the syntax runs
+each split a line; handled in sequence, the code had to decide when to emit the caret relative to
+the highlight — a question with two right answers, since a selection's cursor is at its start as
+often as at its end, and getting it wrong cost PR #258 a blocking finding. As cuts there is no
+ordering left. Every existing caret and selection test passed unchanged, which is the evidence
+that it is the same widget.
+
+**Runs are clamped rather than trusted**, because they are computed from the buffer as it was a
+moment ago: an edit that shortens a line leaves one naming bytes that are gone, and a bound
+landing inside a multi-byte character would panic on the slice. A wrong colour for one frame is
+the right failure; a crashed editor is not.
+
+**Only the start states are cached.** A run is derived from the line's text as it is *now*, so a
+stale colour is impossible — the worst a stale cache can do is start a line in the wrong state,
+and that is the one thing the rescan maintains. Caching runs instead would mean a `Vec` per line
+of the file to save scanning the forty on screen. Two things the rescan had to get right, each
+with a control that fails without it: it **starts at or above the edit** (the minimum of the
+cursor's line before and after, which brackets every edit this editor can make, undo included),
+and its **early exit is off when the line count changed**, since `starts` is indexed by line and
+inserting one shifts every entry below it — so "the state here already matches" compares against
+a different line's state, exits on the first line, and leaves a block comment's `*/` outside the
+comment.
+
+**`.nx` is settled**, in `shell-language.md`, where it had been "a placeholder, not a real
+decision" since that document was written. Not `.sh`, because this does not accept one's scripts;
+not `.nxsh`, because that names the interpreter rather than the language. **And the extension is
+for tools rather than for the loader**: nothing about running a script depends on it, or a naming
+convention would be pretending to be a type system.
+
+**Two things caught by writing the test first.** The ink tests never assert an exact colour —
+glyphs are antialiased, and at 16 px a stem is a pixel and a half wide, so a letter may contain no
+fully-covered pixel and an exact match can fail on a correct implementation; what survives
+blending is the hue. And the plan's own "a rescan from the cursor's line" would have been wrong
+for every Enter, which the failing version of that test said out loud.
+
+**Milestone 14 is complete**: nine parts in six days, three deferrals closed (`press-time`,
+`scroll-grab`, and the wheel), one left open with a trigger (`chooser-hidden`), and a list that
+was wrong about the code five times — always by claiming something missing that already existed.

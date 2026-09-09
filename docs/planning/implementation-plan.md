@@ -239,11 +239,16 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     that merely tracks the cursor cannot swallow a scroll it has no opinion about. Two deferrals
     closed with it: `press-time` (the kernel's interrupt stamp now reaches a client, so nobody
     reads a clock at delivery) and `scroll-grab` (taking hold of a scrollbar thumb no longer moves
-    it). **Part G — syntax highlighting — was wanted as a stretch and promoted the
-    same day**: costing it found that reusing `nxsh`'s lexer does not work (it is fallible, and
-    parser-mode-driven, while a highlighter must be total over text that is not a program yet), and
-    the table-driven scanner that replaces it makes each further language a table rather than code
-    — so it covers nxsh, TOML, Markdown and Rust instead of one. **The control panel is trigger-gated**
+    it). **Part G is done** (2026-09-09), and with it **M14 is complete**: syntax
+    highlighting, wanted as a stretch and promoted the same day it was costed, because reusing
+    `nxsh`'s lexer does not work (it is fallible, and parser-mode-driven, while a highlighter must
+    be total over text that is not a program yet) and the table-driven scanner that replaces it
+    makes each further language a table rather than code — nxsh, TOML, Markdown and Rust. Its
+    enabling half was worth having alone: `libui` could draw text in exactly one colour before
+    this, so `Node::Ink` is a wrapper that colours a whole subtree, and `Theme` grew six
+    `syntax_*` entries — the one place M11's "not a colour of its own" rule does not apply, since
+    a keyword and a comment cannot be derived from a window's ground. It also settled `.nx`, which
+    `shell-language.md` had called "a placeholder, not a real decision" since it was written. **The control panel is trigger-gated**
     rather than scheduled: when settings outgrow a hand-edited file. (Desktops and the applications milestone — M8, and what is now M10 — were
     rescoped 2026-08-21 when durable window-to-window wiring was cut; the milestone numbered 9 on
     that date is today's M10. See the decision log.)
