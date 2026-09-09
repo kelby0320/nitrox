@@ -4,8 +4,10 @@
 bound into the root namespace and into both session columns' namespaces, and `desktop-shell` binds
 it into every application namespace it constructs. `nxedit` copies, cuts, pastes and cycles;
 `nxterm` selects with the pointer and copies and pastes; `clip` reads and writes the ring from a
-pipeline. Text only — `CLIP_KIND_TEXT` is the only kind defined. Focus-gated reads and chunked
-transfers are deferred with triggers written down.
+pipeline; and `nxfiles` cuts, copies and pastes **files** as of M14 Part D (2026-09-08). **Two
+kinds are defined**: `CLIP_KIND_TEXT` and `CLIP_KIND_PATH`, the latter a `cut` or `copy` verb line
+followed by one absolute path per line. Focus-gated reads and chunked transfers are deferred with
+triggers written down.
 
 The wire contract is [`librsproto::clipboard`](../../userspace/librsproto/src/clipboard.rs); the
 ring is [`clipboard_server::Ring`](../../userspace/clipboard-server/src/lib.rs). This document is
