@@ -4508,7 +4508,7 @@ toolkit concept — every list wants it — but `route` has no clock. So `libui`
 click tracker the application feeds a position and a time, which answers "first or second". Pure,
 testable, and no syscall in a module that forbids them.
 
-**Build order: F, H, A, B, C, D, E, G.** The letters are the order they were *named* in; this is
+**Build order: F, H, A, B, C, D, E, I, G.** The letters are the order they were *named* in; this is
 the order they are built in, and the two are not the same because Part H split out of F once
 costing showed it crosses the namespace.
 
@@ -4886,17 +4886,77 @@ the sidebar, then the clipboard — the last two build on what the click settles
       directories and reads the result back from the **serial** side.
 - [x] **A delete confirmation** ✅ — **built in M12**, found by checking rather than by building.
 
-### Part E — the terminal and editor deepened
+### Part E — the terminal and editor deepened ✅ complete (2026-09-09)
 
-- [ ] **`nxterm`: Find, and Clear Scrollback.**
-- [ ] **`nxterm`: the scroll wheel and a scrollbar** — `TODO(scroll-grab)`.
-- [ ] **`nxterm`: double click selects a word, triple selects a line.**
-- [ ] **Select All, in the terminal and the editor** — which nothing in `userspace/` implements
-      today, so it is built here and only *wired* by Part A's menus.
-- [ ] **`nxedit`: Replace**, beside the Find that M12 Part C built.
-- [ ] **`nxedit`: a status bar with line and column**, and **go to line**.
-- [ ] **`nxedit`: an unsaved-changes dot on the tab, and a prompt on close** —
-      `TODO(dialog-save-answer)` is half of this already.
+**Three batches**, and the wheel left with Part I. Two of the seven boxes were not what they read
+as: one was already built, and one was a vertical slice through the input path wearing a terminal
+feature's clothes.
+
+- [x] **`nxterm`: Find, and Clear Scrollback** ✅. **The find field takes the tab strip's row
+      rather than adding one** — a strip of its own is where a find bar conventionally goes and
+      would have changed the grid's height, which is the number every gate measuring this terminal
+      asserts and which a person would see as the window reflowing when they pressed the chord.
+      **While it is open the keys are the field's**, which is a stronger claim here than in an
+      editor: what a terminal normally does with a keystroke is send it to a program, so a field
+      that let characters through would type them into the shell while the person believed they
+      were searching. `Ctrl+Shift+K` clears the scrollback rather than `Ctrl+L`, which is
+      clear-the-*screen* in every shell and belongs to the tenant. **The numbering does not
+      rewind**: `scrolled` counts lines *produced*, so a view anchored to line 900 goes on meaning
+      line 900 and the history shortens exactly as eviction shortens it.
+- [x] **`nxterm`: double click selects a word, triple selects a line** ✅, through
+      `libui::click` — the caller its run counting was built for in Part D. **A word is a run of
+      non-blanks**, not a language's idea of one: what is under the pointer in a terminal is
+      usually a path or a flag, and splitting `--colour=auto` into three would defeat the gesture.
+      **A fourth click re-seeds the run** rather than forgetting it, or the fourth press *and the
+      fifth* are both first clicks and somebody who clicked once too often needs two more to get
+      a word back.
+- [x] **Select All, in the terminal and the editor** ✅. The terminal's takes the **scrollback**,
+      because the screen is a window onto it and a Select All that took the visible rows would
+      copy a different thing depending on where you had scrolled.
+- [x] **`nxedit`: Replace** ✅ — two staged fields, "replace what" then "replace with", and each
+      Enter takes the next match with the field left open, which is the shape Find already had.
+      Replace-all would be a different row, and one whose undo is a single step over a whole file.
+- [x] **`nxedit`: a status bar with line and column**, and **go to line** ✅. The readout went into
+      the strip the window already has rather than a second bar along the bottom, which would have
+      shrunk the text area and moved every gate coordinate inside it for a number. **Counted from
+      one**, and **columns count characters rather than bytes** — `col` is a byte offset, which is
+      right for indexing and wrong to show anybody. Go to Line **clamps past the end**, because
+      that intent is unambiguous, and **refuses a non-number**, because that is a typo.
+- [x] **`nxedit`: an unsaved-changes dot on the tab, and a prompt on close** ✅ — **already
+      built**, found by checking rather than by building. `nxedit` passes `marked: b.modified()`
+      into `libui::widget::Tab`, and the close prompt has been gated by `check-login` since M12.
+      `TODO(dialog-save-answer)` is a *third* answer — save and close — which is its own deferral
+      rather than half of this. **Fourth time this milestone's list has claimed something missing
+      that exists**, which is why all seven boxes were checked against the code before Part E
+      started.
+
+### Part I — the input path grows an axis and a clock
+
+**Split out of Part E on 2026-09-09**, because "the scroll wheel" reads like a terminal feature and
+is not one. `REL_WHEEL` is a constant in `kernel/src/libkern/input.rs` that **nothing consumes**:
+there is no wheel in `libinput::Logical`, no field for one on `PointerEvent`, and so nothing for a
+client to receive. `nxterm`'s scrollbar and its `Msg::Scroll` already exist — that message comes
+from dragging the bar, not from a wheel.
+
+So this is a vertical slice through the input path and a **wire-format change**, which is a
+different kind of work from anything else in Part E and does not belong inside it.
+
+- [ ] **A wheel axis, end to end** — PS/2 wheel bytes in the driver, an axis on
+      `libinput::Logical`, delivery through the compositor, a field on `PointerEvent`, and
+      `nxterm` scrolling by it.
+- [ ] **A press time on the wire — `TODO(press-time)`, folded in here** at the maintainer's
+      direction (2026-09-09). It wants a timestamp on `PointerEvent`; the wheel wants an axis on
+      the same struct. **One change to the wire format, its spec doc and its construction sites
+      rather than two** — and the double-click tracker stops measuring *delivery* time, which is
+      the error that entry documents.
+- [ ] **The scrollbar thumb — `TODO(scroll-grab)`**, if the same pass can reach it: it is the
+      interaction state the toolkit does not keep, and it is the other half of "the scroll wheel
+      and a scrollbar" as Part E originally worded it.
+
+**Not in scope**: `TODO(lost-release)`. It is a *loss* in the same path and this part will be
+touching that path, so the evidence should be re-read while here — but chasing an intermittent one
+in six is not a deliverable, and the entry's trigger already says a change to this path is when to
+look.
 
 ### Part G — syntax highlighting
 

@@ -42,7 +42,9 @@ use libui::widget::{
     title_bar, window_frame,
 };
 use libui::menu::{Accel, Item, Menu, MenuState};
-use libui::widget::{TAB_STRIP_H, Theme as UiTheme, ScrollState, scrollbar};
+use libui::widget::{
+    TAB_STRIP_H, TextFieldState, Theme as UiTheme, ScrollState, WidgetState, scrollbar, text_field,
+};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -120,6 +122,20 @@ const CHROME_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_
 /// The element key on the tab strip.
 pub const TAB_STRIP_KEY: u64 = 7;
 
+/// The key that selects everything, with **Ctrl and Shift** held: `a`.
+///
+/// **Shift for the reason Copy has it**: `Ctrl+A` belongs to whatever is running in the terminal —
+/// it is start-of-line in every shell built on readline — and a terminal that swallowed it would
+/// take a key away from the program the person is actually using.
+pub const SELECT_ALL_KEYCODE: u16 = 30;
+/// The key that opens Find, with **Ctrl and Shift**: `f`.
+pub const FIND_KEYCODE: u16 = 33;
+/// The key that clears the scrollback, with **Ctrl and Shift**: `k`.
+///
+/// **`k` rather than `l`.** `Ctrl+L` is clear-the-screen in every shell and belongs to the tenant;
+/// this drops the *history*, which is a different thing and the shell has no opinion about.
+pub const CLEAR_KEYCODE: u16 = 37;
+
 /// The key that copies the selection, with **Ctrl and Shift** held: `c`.
 ///
 /// **Shift is not decoration here** — M12 decision 6. `Ctrl+C` means *interrupt* in a terminal
@@ -175,6 +191,12 @@ pub enum Msg {
     CloseTab(u64),
     /// Make the tab with this key current — a click on the strip.
     SelectTab(u64),
+    /// Select every line the grid holds — `Ctrl+Shift+A`, or Edit ▸ Select All.
+    SelectAll,
+    /// Open the find field — `Ctrl+Shift+F`, or Edit ▸ Find.
+    Find,
+    /// Drop the scrollback, keeping the screen — `Ctrl+Shift+K`, or Edit ▸ Clear Scrollback.
+    ClearScrollback,
     /// Copy the selection to the clipboard — `Ctrl+Shift+C`, or Edit ▸ Copy.
     ///
     /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
@@ -335,6 +357,20 @@ impl Term {
 
 /// Everything the terminal is.
 pub struct App {
+    /// Counts runs of presses, so a second click means a word and a third means a line.
+    ///
+    /// **Fed by the binary**, which is the only half that can read a clock — the same arrangement
+    /// `nxfiles` uses, and the reason `libui::click` counts a *run* rather than answering
+    /// "double?": this is the caller that wanted three.
+    clicks: libui::click::Clicks,
+    /// What number the press being routed now is in its run.
+    click_run: u32,
+    /// The find field, while one is open.
+    ///
+    /// **On the window rather than the tab**, because it replaces the tab strip while it is up —
+    /// there is nowhere to show a per-tab one, and a find that survived a tab switch would be
+    /// searching a grid the person is no longer looking at.
+    find: Option<TextFieldState>,
     /// The open tabs, in the order the strip draws them. **Never empty**: closing the last one
     /// closes the window, so every method below can assume there is a current tab.
     tabs: Vec<Term>,
@@ -415,6 +451,9 @@ impl App {
     pub fn new(cols: usize, rows: usize, metrics: Metrics) -> App {
         let g = metrics.pixel_size(cols, rows);
         App {
+            clicks: libui::click::Clicks::new(),
+            click_run: 1,
+            find: None,
             // The same two sums `resize` subtracts, so the window this opens at is a window
             // whose grid is exactly `cols` x `rows` — and stays so after the first `Configure`.
             window: Size::new(g.w + CHROME_W, g.h + CHROME_H),
@@ -773,6 +812,22 @@ impl App {
                     self.clip_request = Some(ClipRequest::Copy(text));
                 }
             }
+            // **Everything the grid holds, scrollback included** — the screen is a window onto
+            // it, and a Select All that took only the visible rows would copy a different thing
+            // depending on where you had scrolled to.
+            Msg::SelectAll => {
+                self.tab_mut().grid.select_all();
+            }
+            Msg::Find => {
+                self.find = Some(TextFieldState::new());
+            }
+            // **The screen stays; the history goes.** `Ctrl+L` clears the screen and belongs to
+            // the shell — this is the other thing, and the two are worth not confusing.
+            Msg::ClearScrollback => {
+                self.tab_mut().grid.clear_scrollback();
+                // A view scrolled into what was just dropped has nowhere to be.
+                self.tab_mut().view_top = None;
+            }
             Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
             // The compositor is the one holding the grab this press opened, so all this does is
             // record that the binary owes it a request.
@@ -851,9 +906,24 @@ impl App {
         let Some((line, col)) = self.cell_at(p.x, p.y) else { return };
         if p.kind == POINTER_BUTTON && p.button == BTN_LEFT {
             if p.flags & POINTER_PRESSED != 0 {
-                // A press with no drag selects nothing and *clears* what was selected — which
-                // is what a click anywhere else in the window means too.
-                self.tab_mut().grid.select_from(line, col);
+                // **One press starts a sweep, two take a word, three take a line** — the run
+                // `libui::click` counts, which was built counting past two for this caller.
+                //
+                // **Past three wraps back to a sweep** rather than counting on, because a fourth
+                // click has no larger unit to select and leaving it as "still a line" would make
+                // a person who clicked once too often unable to start a new selection without
+                // pausing.
+                match self.click_run {
+                    2 => {
+                        self.tab_mut().grid.select_word_at(line, col);
+                    }
+                    3 => {
+                        self.tab_mut().grid.select_line_at(line);
+                    }
+                    // A press with no drag selects nothing and *clears* what was selected — which
+                    // is what a click anywhere else in the window means too.
+                    _ => self.tab_mut().grid.select_from(line, col),
+                }
                 // **The viewport, not the screen** — see [`view_moved`](Self::view_moved).
                 self.tab_mut().view_moved = true;
             }
@@ -863,6 +933,28 @@ impl App {
             self.tab_mut().grid.extend(line, col);
             self.tab_mut().view_moved = true;
         }
+    }
+
+    /// Record a pointer press at `at`, `at_ms` milliseconds into the monotonic clock.
+    ///
+    /// **Called before the event is routed**, so the press it produces can ask what number the
+    /// click was — the same seam `nxfiles::App::note_press` describes, and the same reason: this
+    /// crate makes no syscalls.
+    ///
+    /// **A run past three restarts**, because there is no unit larger than a line to select.
+    pub fn note_press(&mut self, at: libdraw::geom::Point, at_ms: u64) {
+        let n = self.clicks.press(at, at_ms);
+        self.click_run = if n > 3 {
+            // **Re-seeded, not merely forgotten.** A bare `reset` would make this press a first
+            // click *and the next one too*, because the run it would have continued no longer
+            // exists — so a person who clicked four times would have to click twice more to get
+            // a word. Pressing again after the reset makes this press the first of a new run, so
+            // the one after it is the second.
+            self.clicks.reset();
+            self.clicks.press(at, at_ms)
+        } else {
+            n
+        };
     }
 
     /// The absolute `(line, column)` a grid-local pixel falls in, or `None` outside it.
@@ -910,6 +1002,28 @@ impl App {
             self.update(msg);
             return;
         }
+        // **While a find is open the keys are the field's, not the tenant's** — which is a
+        // stronger claim here than in an editor, because what a terminal normally does with a
+        // keystroke is *send it to a program*. A find field that let characters through would
+        // type them into the shell while the person believed they were searching.
+        //
+        // After the chord check, so `Ctrl+Shift+F` can reopen it and the copy and paste chords
+        // still work with a find up; before the encoder, which is what the field is protecting
+        // the person from.
+        if self.find.is_some() {
+            match k.keycode {
+                libkern::abi::KEY_ESC => {
+                    self.find = None;
+                }
+                libkern::abi::KEY_ENTER => self.find_next(),
+                code => {
+                    if let Some(f) = self.find.as_mut() {
+                        f.apply(code, k.modifiers);
+                    }
+                }
+            }
+            return;
+        }
         // **Typing clears the selection.** It is the same rule the kill ring's cycle follows —
         // any other action ends the gesture — and without it a highlight stays on screen over
         // text that has since scrolled away under it.
@@ -922,6 +1036,41 @@ impl App {
         let mut out = [0u8; libterm::encode::MAX_ENCODED];
         let n = libterm::encode::encode(k.keycode, k.modifiers, &mut out);
         self.send(&out[..n]);
+    }
+
+    /// Find the next match and show it, or say there is none.
+    ///
+    /// **Walks from just after the current match**, so pressing Enter repeatedly steps through
+    /// them — the same shape `nxedit`'s find has, and the reason the field stays open. Wraps to
+    /// the oldest line when it runs out, because a terminal's history is a loop a person scrolls
+    /// rather than a document with an end.
+    fn find_next(&mut self) {
+        let Some(needle) = self.find.as_ref().map(|f| alloc::string::String::from(f.text()))
+        else {
+            return;
+        };
+        if needle.is_empty() {
+            return;
+        }
+        let g = &self.tab().grid;
+        let (from_line, from_col) = match g.selection() {
+            Some(sel) => {
+                let (_, head) = sel.ordered();
+                (head.0, head.1)
+            }
+            None => (g.oldest_line(), 0),
+        };
+        let hit = g
+            .find_from(&needle, from_line, from_col)
+            .or_else(|| g.find_from(&needle, g.oldest_line(), 0));
+        let Some((line, col)) = hit else { return };
+        let n = needle.chars().count();
+        let t = self.tab_mut();
+        t.grid.select_from(line, col);
+        t.grid.extend(line, col + n);
+        // **Scrolled to, because a match nobody can see is not a find.** Clamped by the grid, so
+        // a hit on the screen leaves the view where it is.
+        t.view_top = Some(t.grid.clamp_view(line));
     }
 
     /// Move the view to where a scrollbar interaction points.
@@ -1036,6 +1185,23 @@ impl App {
                     Item::new("Copy", Accel::ctrl_shift(COPY_KEYCODE, "C"), Msg::Copy)
                         .enabled(self.tab().grid.has_selection()),
                     Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
+                    // **Offered whenever there is anything to select**, which is not the same as
+                    // "there is a selection": Select All's whole job is to make one.
+                    Item::new(
+                        "Select All",
+                        Accel::ctrl_shift(SELECT_ALL_KEYCODE, "A"),
+                        Msg::SelectAll,
+                    )
+                    .enabled(self.tab().grid.oldest_line() <= self.tab().grid.top_line()),
+                    Item::new("Find", Accel::ctrl_shift(FIND_KEYCODE, "F"), Msg::Find),
+                    // **Offered only when there is history to drop**, which is what `enabled` is
+                    // for: a row that looks available and does nothing reads as a broken menu.
+                    Item::new(
+                        "Clear Scrollback",
+                        Accel::ctrl_shift(CLEAR_KEYCODE, "K"),
+                        Msg::ClearScrollback,
+                    )
+                    .enabled(self.tab().grid.oldest_line() < self.tab().grid.top_line()),
                     Item::Separator,
                     Item::plain("Clear", Msg::Clear),
                     Item::plain("Reset", Msg::Reset),
@@ -1074,14 +1240,29 @@ impl App {
             .iter()
             .map(|(key, label)| libui::widget::Tab { key: *key, label, marked: false })
             .collect();
-        let strip = libui::widget::tab_strip(
-            &tabs,
-            self.current,
-            hovered,
-            Msg::SelectTab,
-            Msg::CloseTab,
-            &ui,
-        );
+        // **The find field takes the tab strip's row rather than adding one** (M14 Part E). A
+        // strip of its own is where a find bar conventionally goes and would have changed the
+        // grid's height — which is the number every gate that measures this terminal asserts, and
+        // which a person would see as the window reflowing when they pressed `Ctrl+Shift+F`. The
+        // strip is one row of chrome and a find *is* what the window is doing, which is the same
+        // argument `nxedit`'s strip makes for replacing its status with a field.
+        let strip = match self.find.as_ref() {
+            Some(f) => libui::element::sized(
+                Size::new(0, TAB_STRIP_H),
+                libui::element::padding(
+                    libui::element::Insets { top: 2, right: 6, bottom: 2, left: 6 },
+                    text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                ),
+            ),
+            None => libui::widget::tab_strip(
+                &tabs,
+                self.current,
+                hovered,
+                Msg::SelectTab,
+                Msg::CloseTab,
+                &ui,
+            ),
+        };
 
         // **The title bar is the terminal's own chrome** (M9 Part A), and since Part C all three
         // of its buttons do something: minimise and maximise ask the shell, close is this
@@ -1732,11 +1913,19 @@ mod tests {
             // **The tab count and the current tab are in here** since M14 Part B: New Tab changes
             // neither the grid nor the clipboard, so a digest without them would call it a row
             // that does nothing and the negative control below would fail for the wrong reason.
+            // **The selection's extent, not merely whether there is one** — the fixture starts
+            // with a selection, so a bool cannot see Select All widening it, and the negative
+            // control below rejected the row for changing "nothing" (M14 Part E). That is the
+            // fourth addition this control has caught, each one an outbox or a field the digest
+            // could not observe.
+            // **And whether a find is open** — the sixth thing this control has caught the digest
+            // unable to see. Opening one changes no grid, no clipboard and no tab.
+            let finding = a.find.as_ref().map(|f| alloc::string::String::from(f.text()));
             alloc::format!(
-                "{clip:?}|{}|{}|{}|{:?}|{}|{}|{nw}{q}",
+                "{clip:?}|{}|{}|{:?}|{:?}|{}|{}|{nw}{q}|{finding:?}",
                 line(a, 0),
                 a.closing(),
-                a.grid().has_selection(),
+                a.grid().selection(),
                 a.menus.open(),
                 a.tab_labels().len(),
                 a.current_tab(),
@@ -1784,8 +1973,127 @@ mod tests {
                 "{label} changes nothing, so this row proves nothing about routing"
             );
         }
-        assert_eq!(checked, 6, "the four tab and clipboard rows, plus New Window and Quit");
+        assert_eq!(
+            checked,
+            8,
+            "the four tab and clipboard rows, Select All and Find, plus New Window and Quit"
+        );
     }
+    // --- Find, Clear Scrollback and the click runs (M14 Part E) --------------
+
+    /// A find takes the keys, walks the matches, and `Esc` gives them back.
+    ///
+    /// **The keys are the field's while it is open**, which matters more here than in an editor:
+    /// what a terminal normally does with a keystroke is send it to a program, so a field that
+    /// let characters through would type them into the shell while the person believed they were
+    /// searching.
+    #[test]
+    fn a_find_takes_the_keys_and_walks_the_matches() {
+        let mut a = app();
+        a.feed(b"hello world");
+        a.update(Msg::Find);
+        assert!(a.find.is_some(), "the field is open");
+
+        for c in "hello".bytes() {
+            let code = (1u16..=90)
+                .find(|k| libinput::keymap::to_char(*k, 0) == Some(c))
+                .expect("a keycode");
+            a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN as u16, 0)));
+        }
+        assert_eq!(a.find.as_ref().map(|f| f.text()), Some("hello"), "the keys went to the field");
+
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN as u16, 0)));
+        assert_eq!(
+            a.grid().selected_text().as_deref(),
+            Some("hello"),
+            "Enter selected the match"
+        );
+
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN as u16, 0)));
+        assert!(a.find.is_none(), "Esc closed it");
+    }
+
+    /// A second press takes a word and a third takes the line; a fourth starts again.
+    ///
+    /// **Past three there is no larger unit**, and leaving a fourth click as "still a line" would
+    /// strand somebody who clicked once too often.
+    #[test]
+    fn click_runs_take_a_word_then_a_line() {
+        let mut a = app();
+        a.feed(b"hello world");
+        let at = libdraw::geom::Point::new(4, 4);
+        // The first cell of the first row: inside `hello`.
+        let press = |a: &mut App| {
+            let h = a.metrics.cell_h as i32;
+            a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
+        };
+
+        a.note_press(at, 1_000);
+        press(&mut a);
+        assert_eq!(a.grid().selected_text(), None, "one press starts a sweep and selects nothing");
+
+        a.note_press(at, 1_100);
+        press(&mut a);
+        assert_eq!(a.grid().selected_text().as_deref(), Some("hello"), "two take the word");
+
+        a.note_press(at, 1_200);
+        press(&mut a);
+        assert_eq!(a.grid().selected_text().as_deref(), Some("hello world"), "three take the line");
+
+        // **A fourth is a first**, not a fourth — and the *fifth* is what proves it. A fourth
+        // click selects nothing whether the run restarted or merely ran off the end of the
+        // match, so asserting on it distinguishes nothing; the difference shows on the next
+        // press, which is a word again only if the run went back to one.
+        a.note_press(at, 1_300);
+        press(&mut a);
+        assert_eq!(a.grid().selected_text(), None, "a fourth selects nothing either way");
+
+        a.note_press(at, 1_400);
+        press(&mut a);
+        assert_eq!(
+            a.grid().selected_text().as_deref(),
+            Some("hello"),
+            "the fifth is the second of a new run, so it takes a word"
+        );
+    }
+
+    /// Clearing the scrollback keeps the screen and forgets a scrolled-back view.
+    #[test]
+    fn clearing_the_scrollback_returns_the_view() {
+        let mut a = app();
+        for _ in 0..8 {
+            a.feed(b"line\r\n");
+        }
+        assert!(a.grid().oldest_line() < a.grid().top_line(), "there is history");
+        a.update(Msg::ClearScrollback);
+        assert_eq!(a.grid().oldest_line(), a.grid().top_line(), "the history is gone");
+    }
+
+    /// `check-terminal` clicks the Edit menu's `Clear` by number; this is that number.
+    ///
+    /// **The same guard `nxfiles` has, added after the same failure.** A gate cannot link this
+    /// crate, so it spells the row as a constant — and M14 Part E's three new rows moved `Clear`
+    /// from 3 to 6, which the gate discovered as "never saw `menu chose Clear`" after clicking
+    /// `Find` instead. This makes it wrong in a second rather than in a boot.
+    #[test]
+    fn the_gate_clicks_the_row_it_means() {
+        // The constant in `tools/xtask/src/main.rs`, as `MENU_ROW_KEY + n`.
+        const CLEAR_ROW: usize = 6;
+        let a = app();
+        let edit = a
+            .menu_table()
+            .into_iter()
+            .find(|m| m.title == "Edit")
+            .expect("an Edit menu");
+        match &edit.items[CLEAR_ROW] {
+            Item::Action { label, msg, .. } => {
+                assert_eq!(*label, "Clear", "check-terminal's CLEAR_ROW is not Clear any more");
+                assert_eq!(*msg, Msg::Clear);
+            }
+            Item::Separator => panic!("check-terminal's CLEAR_ROW is a rule, not a row"),
+        }
+    }
+
     /// The menu is **never** in the window's tree, open or closed.
     ///
     /// It was a `Stack` layer over the whole window until M6 C3 — hoisted there because a layer

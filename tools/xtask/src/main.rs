@@ -5187,10 +5187,17 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // size. The hover receipt already says *which* row the pointer is over, so this walks down
     // the popup and stops when the guest says it is over the one it means to click.
     //
-    // **`Clear`, which is `MENU_ROW_KEY + 3`.** Copy and Paste are above it: Copy is disabled
-    // with nothing selected and would produce no message when clicked, which is correct
-    // behaviour and useless as a proof that a click reached a row.
-    const CLEAR_ROW: u64 = 103;
+    // **`Clear`, which is `MENU_ROW_KEY + 6`.** Copy and Paste are above it — Copy is disabled
+    // with nothing selected and would produce no message when clicked, which is correct behaviour
+    // and useless as a proof that a click reached a row — and so are Select All, Find and Clear
+    // Scrollback since M14 Part E, plus the separator.
+    //
+    // **It was `+ 3` and that row is now `Find`**, so the walk still found a row to hover and the
+    // click chose the wrong one; the failure appeared as "never saw `menu chose Clear`" three
+    // steps from the menu it was about. `nxterm::tests::the_gate_clicks_the_row_it_means` makes
+    // this number wrong in a second instead of in a three-minute boot, which is the job the same
+    // test has done twice for `nxfiles`.
+    const CLEAR_ROW: u64 = 106;
     //
     // **Each step records where it went**, which is a deliberate exception to the rule that only
     // a *confirmed* press updates the tracked position. `move_pointer_to` walks a delta from that

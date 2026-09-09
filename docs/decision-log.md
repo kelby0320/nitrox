@@ -24263,3 +24263,65 @@ separate `cargo xtask test` invocation was taken as evidence that the tree a gat
 build would compile; it did not, and that gate never booted. In both cases the check existed, ran,
 and said something I did not read carefully enough.
 
+---
+
+## 2026-09-09 — the terminal and editor deepened, and a control that found a real bug (M14 Part E)
+
+Select All in both applications, Replace and Go to Line in the editor, Find and Clear Scrollback in
+the terminal, and double- and triple-click selection. Three batches.
+
+**Two of the seven boxes were not what they read as**, which is the fourth and fifth time this
+milestone's list has been wrong about the code. "An unsaved-changes dot on the tab, and a prompt on
+close" **was already built** — `nxedit` passes `marked: b.modified()` into the tab strip and the
+close prompt has been gated since M12. And "the scroll wheel and a scrollbar" is **not a terminal
+feature**: the scrollbar exists, `Msg::Scroll` comes from dragging it, and the wheel does not exist
+anywhere above a lone kernel constant. `REL_WHEEL` is defined in `kernel/src/libkern/input.rs` and
+nothing consumes it — no axis on `libinput::Logical`, no field on `PointerEvent`. That is a
+vertical slice through the input path and a wire-format change, so it left Part E as **Part I**,
+with `TODO(press-time)` folded into it at the maintainer's direction: the wheel wants an axis on
+`PointerEvent` and press-time wants a timestamp on it, which is one change to the format, its spec
+doc and its construction sites rather than two.
+
+**Where chrome goes, twice, and both times the answer was "the row that is already there".** The
+terminal's find field takes the tab strip's row and the editor's line-and-column readout takes the
+status strip's, because a strip of its own would have changed the grid's height in one case and
+the text area's in the other — and those numbers are what every gate that measures these windows
+asserts. In a terminal it is worse than gate churn: a person pressing the find chord would watch
+the window reflow.
+
+**A find field in a terminal has to hold the keyboard harder than one in an editor.** What a
+terminal does with an unclaimed keystroke is *send it to a program*, so a field that let characters
+through would type them into the shell while the person believed they were searching. Placed after
+the chord check, so copy and paste still work with a find up, and before the encoder, which is what
+it is protecting them from.
+
+**A word is a run of non-blanks.** Not a language's idea of one: what is under the pointer in a
+terminal is usually a path, a flag or an identifier, and splitting `--colour=auto` into three
+selections would make double click useless for what it is mostly used for.
+
+**Clearing the scrollback does not rewind the numbering.** `scrolled` counts lines *produced*, so a
+view or a selection anchored to line 900 must go on meaning line 900; this shortens the history
+exactly as eviction does, and `oldest_line` moves up to meet the screen.
+
+**The chord digests could not see six different things, and caught every one.** Each application's
+"every advertised chord does what its row says" test refuses a row whose effect the digest cannot
+observe. Select All was invisible because both fixtures start *with* a selection so Cut and Copy
+are live, and the digests recorded only *whether* one existed — not its extent. Opening a find
+field was invisible because it changes no grid, no clipboard and no tab. That control has now
+found six gaps of this shape across three parts, and it is the single most productive test in this
+repository.
+
+**And a passing control found a bug in the code rather than in the test.** Three controls this
+part did not fire. Two were tests asserting the wrong thing: the terminal's Select All was pinned
+only by "the row changed something", and a line selection was asserted through `selected_text`,
+which trims trailing blanks and so reads identically whether the selection stops at the text or
+runs to the row's width — that one is asserted on the *range* now, because the difference is what
+is highlighted.
+
+The third was different. "A fourth click starts a new run" could not be seen through
+`selected_text` at all, because a fourth click selects nothing either way; asserting the **fifth**
+click exposed that `reset()` clears the run entirely, so the fourth press *and the fifth* were both
+first clicks and somebody who clicked four times needed two more to get a word back. The tracker
+re-seeds now. **A control that passes is not "the fix is fine" — it is "nothing covers this", and
+covering it is what finds the defect.**
+

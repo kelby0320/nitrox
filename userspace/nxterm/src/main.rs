@@ -54,6 +54,19 @@ const ROWS: usize = 24;
 
 
 
+/// The monotonic clock in milliseconds.
+///
+/// **Milliseconds because that is the unit a click run is measured in**, as `nxfiles` spells it.
+fn clock_ms() -> u64 {
+    let mut ns: u64 = 0;
+    // SAFETY: `&raw mut ns` is a valid writable `u64` out-parameter, which is what
+    // `sys_clock_read` requires of its second argument.
+    unsafe {
+        libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::CLOCK_MONOTONIC, (&raw mut ns) as u64)
+    };
+    ns / 1_000_000
+}
+
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
@@ -1062,6 +1075,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     && p.flags & librsproto::surface::POINTER_PRESSED != 0
                 {
                     kprint(b"nxterm: clicked\n");
+                }
+                // **Counted before the event is routed** (M14 Part E), so the press it produces
+                // can ask what number the click was. The clock is read here because neither
+                // `libui` nor this crate's library half makes a syscall — see `libui::click` for
+                // what reading it at *delivery* rather than at the press costs, and Part I for
+                // the fix.
+                if p.kind == librsproto::surface::POINTER_BUTTON
+                    && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                    && p.button == libkern::abi::BTN_LEFT
+                {
+                    app.note_press(libdraw::geom::Point::new(p.x, p.y), clock_ms());
                 }
                 let msgs = top.route(&ui, &ui_font, &theme, &WindowEvent::Pointer(p));
                 for m in msgs {

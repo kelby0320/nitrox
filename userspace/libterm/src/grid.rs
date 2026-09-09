@@ -445,6 +445,134 @@ impl Grid {
         }
     }
 
+    /// Select every line the grid holds, scrollback included.
+    ///
+    /// **From the oldest line to the end of the newest**, which is what "all" means in a terminal:
+    /// the screen is a window onto the scrollback, and a Select All that took only the visible
+    /// rows would copy a different thing depending on where you had scrolled to.
+    ///
+    /// Returns whether anything was selected — an empty grid has nothing to select, and saying so
+    /// is what lets a caller decline to redraw.
+    pub fn select_all(&mut self) -> bool {
+        let last = self.top_line() + self.rows() as u64 - 1;
+        let oldest = self.oldest_line();
+        if last < oldest {
+            return false;
+        }
+        self.select_from(oldest, 0);
+        // **The end of the last line, not the last column of the grid.** `extend` clamps into the
+        // line it is given, and a column past the text is where a trailing-space run would be
+        // picked up by `selected_text` — the same reason the copy path trims.
+        self.extend(last, self.cols());
+        true
+    }
+
+    /// The text of one absolute line, trailing blanks trimmed.
+    ///
+    /// `None` past either end of the history — the ring evicts, so a line number that was valid
+    /// a moment ago may name nothing now.
+    pub fn line_text(&self, line: u64) -> Option<String> {
+        if line < self.oldest_line() || line > self.top_line() + self.rows as u64 - 1 {
+            return None;
+        }
+        let mut out = String::new();
+        for col in 0..self.cols {
+            match self.view_cell(line, 0, col) {
+                Some(c) => out.push(c.ch),
+                None => return None,
+            }
+        }
+        while out.ends_with(' ') {
+            out.pop();
+        }
+        Some(out)
+    }
+
+    /// The first `needle` at or after `(line, col)`, searching towards the newest line.
+    ///
+    /// **Never spans a line break**, the same limit `TextAreaState::search_from` states and for
+    /// the same reason: lines are separate here, and a needle containing one would have to be
+    /// matched piecewise. Nothing can type a newline into a find field.
+    ///
+    /// **Columns are character offsets into the line's text**, which is what a caller wanting to
+    /// select the match needs — the grid's own columns are cells, and the two agree for every
+    /// character this terminal can print.
+    pub fn find_from(&self, needle: &str, line: u64, col: usize) -> Option<(u64, usize)> {
+        if needle.is_empty() {
+            return None;
+        }
+        let last = self.top_line() + self.rows as u64 - 1;
+        let mut at = line.max(self.oldest_line());
+        while at <= last {
+            if let Some(text) = self.line_text(at) {
+                let from = if at == line { col.min(text.len()) } else { 0 };
+                if let Some(hit) = text.get(from..).and_then(|tail| tail.find(needle)) {
+                    return Some((at, from + hit));
+                }
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// Drop the lines that have scrolled off, keeping the screen.
+    ///
+    /// **The absolute numbering does not rewind.** `scrolled` counts lines *produced*, and a
+    /// view or a selection anchored to line 900 must keep meaning line 900 — so this shortens the
+    /// history rather than renumbering it, exactly as eviction does. `oldest_line` moves up to
+    /// meet the screen; nothing above it exists any more.
+    ///
+    /// Returns whether anything was dropped, so a caller can decline to redraw.
+    pub fn clear_scrollback(&mut self) -> bool {
+        if self.scrollback.is_empty() {
+            return false;
+        }
+        self.scrollback.clear();
+        // A selection reaching into what was just dropped names lines that are gone.
+        if let Some(sel) = self.selection
+            && sel.ordered().0.0 < self.top_line()
+        {
+            self.selection = None;
+        }
+        true
+    }
+
+    /// Select the word under `(line, col)`; `false` if there is no word there.
+    ///
+    /// **A word is a run of anything that is not a space**, which is the rule a terminal wants
+    /// rather than a language's: what is under the pointer is usually a path, a flag or an
+    /// identifier, and splitting `--colour=auto` into three selections would make double click
+    /// useless for the thing it is mostly used for. Selecting on a blank does nothing rather than
+    /// selecting the run of blanks.
+    pub fn select_word_at(&mut self, line: u64, col: usize) -> bool {
+        let Some(text) = self.line_text(line) else { return false };
+        let chars: Vec<char> = text.chars().collect();
+        if col >= chars.len() || chars[col] == ' ' {
+            return false;
+        }
+        let mut from = col;
+        while from > 0 && chars[from - 1] != ' ' {
+            from -= 1;
+        }
+        let mut to = col;
+        while to + 1 < chars.len() && chars[to + 1] != ' ' {
+            to += 1;
+        }
+        self.select_from(line, from);
+        self.extend(line, to + 1);
+        true
+    }
+
+    /// Select the whole of `line`; `false` if that line is not there.
+    pub fn select_line_at(&mut self, line: u64) -> bool {
+        let Some(text) = self.line_text(line) else { return false };
+        self.select_from(line, 0);
+        // **To the end of the text, not the end of the row.** A line's trailing cells are blanks
+        // the terminal never wrote, and taking them would put a run of spaces on the clipboard.
+        self.extend(line, text.chars().count());
+        true
+    }
+
     /// The selected text, or `None` when nothing is selected.
     ///
     /// **Trailing blanks are dropped per line**, exactly as [`resize`](Self::resize) drops them
@@ -1008,6 +1136,95 @@ mod tests {
             let n = p.feed(b, &mut out);
             g.apply_all(&out[..n]);
         }
+    }
+
+    /// `select_all` takes every line the grid holds, scrollback included.
+    ///
+    /// **The scrollback is the point.** The screen is a window onto it, so a Select All that took
+    /// only the visible rows would copy a different thing depending on where the view was
+    /// scrolled to — and `nxterm`'s chord test cannot see the difference, because it only asks
+    /// whether the row changed *something* (M14 Part E).
+    #[test]
+    fn select_all_takes_the_scrollback_too() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        // Three rows on screen and two scrolled off, so a visible-only selection would miss them.
+        assert!(g.oldest_line() < g.top_line(), "there is scrollback to miss");
+
+        assert!(g.select_all(), "something was selected");
+        let text = g.selected_text().expect("a selection has text");
+        for line in ["one", "two", "three", "four", "five"] {
+            assert!(text.contains(line), "{line:?} is missing from {text:?}");
+        }
+    }
+
+    /// A find walks forward through the history and reports character columns.
+    #[test]
+    fn find_from_walks_the_history() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "alpha\r\nbeta\r\ngamma\r\nbeta again");
+        let first = g.find_from("beta", g.oldest_line(), 0).expect("the first beta");
+        // Searching on from just after it finds the second, not the same one again.
+        let next = g.find_from("beta", first.0, first.1 + 1).expect("the second beta");
+        assert!(next.0 > first.0, "the second is on a later line: {first:?} then {next:?}");
+        assert_eq!(g.find_from("zeta", g.oldest_line(), 0), None, "and what is absent is absent");
+    }
+
+    /// Clearing the scrollback keeps the screen and does **not** rewind the numbering.
+    ///
+    /// **`scrolled` counts lines produced**, so a view or a selection anchored to line 900 must
+    /// go on meaning line 900 — this shortens the history exactly as eviction does.
+    #[test]
+    fn clearing_the_scrollback_keeps_the_screen_and_the_numbering() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let top = g.top_line();
+        assert!(g.oldest_line() < top, "there is scrollback to clear");
+
+        assert!(g.clear_scrollback(), "something was dropped");
+        assert_eq!(g.top_line(), top, "the screen's absolute number did not move");
+        assert_eq!(g.oldest_line(), top, "and the history now starts at the screen");
+        assert_eq!(g.line_text(top).as_deref(), Some("three"), "the screen is untouched");
+        assert!(!g.clear_scrollback(), "and a second clear has nothing to do");
+    }
+
+    /// Double click takes a word, and a word is a run of non-blanks.
+    ///
+    /// **Not a language's idea of a word.** What is under the pointer in a terminal is usually a
+    /// path or a flag, and splitting `--colour=auto` into three would make the gesture useless
+    /// for what it is mostly used for.
+    #[test]
+    fn a_word_is_a_run_of_non_blanks() {
+        let mut g = Grid::new(30, 2);
+        feed(&mut g, "ls --colour=auto /home");
+        let line = g.top_line();
+
+        assert!(g.select_word_at(line, 4), "inside the flag");
+        assert_eq!(g.selected_text().as_deref(), Some("--colour=auto"));
+
+        assert!(g.select_word_at(line, 0), "the first word");
+        assert_eq!(g.selected_text().as_deref(), Some("ls"));
+
+        // A blank is not a word, and selecting on one does nothing.
+        assert!(!g.select_word_at(line, 2), "the space between them");
+    }
+
+    /// Triple click takes the line, and stops at the text rather than the row's width.
+    ///
+    /// **Asserted on the range, not on the text.** `selected_text` trims trailing blanks itself,
+    /// so a selection running to the row's full width copies the same string — the difference is
+    /// what is *highlighted*, which is a run of empty cells to the right of the text. The first
+    /// version of this test asserted the text and passed with the wrong implementation.
+    #[test]
+    fn a_line_selection_stops_at_the_text() {
+        let mut g = Grid::new(30, 2);
+        feed(&mut g, "short");
+        let line = g.top_line();
+        assert!(g.select_line_at(line));
+        let sel = g.selection().expect("a selection");
+        assert_eq!(sel.anchor, (line, 0));
+        assert_eq!(sel.head, (line, 5), "to the end of `short`, not to column 30");
+        assert_eq!(g.selected_text().as_deref(), Some("short"));
     }
 
     /// A row's characters, trailing blanks trimmed.
