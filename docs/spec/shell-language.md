@@ -1059,10 +1059,31 @@ keyword is justified on principle rather than convenience (contrast the `def`-no
 not implicit — is the same recurring rule as env vars crossing a process boundary or data crossing
 IPC, not a branding echo.
 
+**The file extension is `.nx`** — settled 2026-09-09, having been a placeholder since this
+document was written. M14 Part G forced it: a syntax highlighter picks a language from a file's
+extension, and it cannot dispatch on a placeholder. Decided deliberately here rather than by
+whatever string the first `match` arm happened to contain.
+
+Why this one:
+
+- **Not `.sh`.** This is not a POSIX shell and does not accept one's scripts. A file that says
+  `.sh` and is not is a file another system will run with the wrong interpreter.
+- **Not `.nxsh`.** It names the interpreter rather than the language, and every script would
+  carry the program's name in its own filename. `nxsh` is what *runs* `.nx`, the way `bash` is
+  not `.bash`.
+- **`.nx` is what this document's examples already say**, so settling on it makes them correct
+  rather than starting a rename.
+
+**The extension is for tools, not for the loader.** Nothing about running a script depends on it:
+a file is executable because of how it is invoked, not because of what it is called, and a script
+with no extension runs exactly as one with it. What an extension buys is that a *program looking
+at a file it did not open* — a highlighter, a listing, a future `file` — can guess what is in it
+without reading it. Making it load-bearing would be a naming convention pretending to be a type
+system.
+
 **Deliberately left open, not decided here:**
 - Circular imports — needs a rule, but it's closer to an interpreter/loader implementation concern
   than a grammar one.
-- The `.nx` file extension used above is a placeholder, not a real decision.
 - This is deliberately the small, file-level answer only. A real package system (versioned,
   shared, content-addressed) would naturally build on the NixOS/Guix-store influence already
   referenced elsewhere in the OS design — but that's a system-level concern bigger than shell
