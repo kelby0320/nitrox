@@ -1538,9 +1538,10 @@ carry a timestamp on every input event, and for this reason.
 
 Fixing it means a timestamp through `libinput::Logical`, the compositor, and `PointerEvent` — a
 wire-format change with a spec doc and about forty construction sites, which is its own piece of
-work rather than a passenger on a double click. **Trigger: the first misfire anyone notices, or
-the next change that touches the input path's shape for another reason** — whichever comes first,
-since the plumbing is the cost and it is the same plumbing either way.
+work rather than a passenger on a double click. **Trigger: fired.** M14 **Part I** folds this in at the maintainer's direction (2026-09-09): the
+scroll wheel needs an *axis* on `PointerEvent` and this needs a *timestamp* on it, which is one
+change to the wire format, its spec doc and its construction sites rather than two. The plumbing
+was always the cost, and it is the same plumbing.
 
 **Showing hidden files from `nxedit`'s chooser — `TODO(chooser-hidden)`.** M14 Part D gave
 `nxfiles` a `Ctrl+H`, and the chooser hides dotfiles for the same reason on the same day: a

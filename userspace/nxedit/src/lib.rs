@@ -49,6 +49,9 @@ use libui::widget::{
 /// The status strip's height in pixels — one row of chrome under the title bar.
 pub const STATUS_H: u32 = 24;
 
+/// The element key on the strip's line-and-column readout.
+pub const POSITION_KEY: u64 = 16;
+
 /// A text line's height in pixels, matching the toolkit's default theme.
 pub const ROW_H: u32 = 20;
 
@@ -209,6 +212,16 @@ pub const CLOSE_TAB_KEYCODE: u16 = 17;
 pub const COPY_KEYCODE: u16 = 46;
 /// The key that cuts: `x`.
 pub const CUT_KEYCODE: u16 = 45;
+/// The key that selects the whole buffer: `a`, with Ctrl.
+///
+/// **No Shift here, unlike `nxterm`'s.** The terminal needs it because `Ctrl+A` belongs to
+/// whatever is running inside it; an editor has no such tenant, and `Ctrl+A` is Select All
+/// everywhere an editor exists.
+pub const SELECT_ALL_KEYCODE: u16 = 30;
+/// The key that opens Replace: `h`, with Ctrl — where every editor puts it.
+pub const REPLACE_KEYCODE: u16 = 35;
+/// The key that jumps to a line: `g`, with Ctrl.
+pub const GO_TO_KEYCODE: u16 = 34;
 /// The key that pastes: `v`. With **Shift** as well it cycles — see [`App::cycling`].
 pub const PASTE_KEYCODE: u16 = 47;
 
@@ -311,6 +324,13 @@ pub struct App {
     chooser_list: Option<String>,
     /// A path the binary is being asked to open into a tab.
     open_requested: Option<String>,
+    /// What a replace is looking for, captured when the first stage was answered.
+    ///
+    /// **Beside the field rather than inside it**, because `Field` is a plain marker the strip
+    /// reads for a label and giving it a payload would make every match on it carry one.
+    replacing: Option<String>,
+    /// How many replacements the running replace has made, for the strip to report.
+    replaced: usize,
     /// Another window has been asked for, and the binary has not made it yet.
     new_window: bool,
     /// A quit has been asked for. **The binary owns what that means**, because it is the only
@@ -431,6 +451,16 @@ pub enum Field {
     Naming,
     /// Text to look for in the buffer.
     Finding,
+    /// Text to look for, on the way to replacing it.
+    ///
+    /// **A stage of its own rather than a flag on `Finding`**, because the strip's label is what
+    /// tells a person which of the two they are in — and "find" over a field whose Enter is about
+    /// to start replacing things would be the label lying.
+    ReplaceFind,
+    /// What to put in its place.
+    ReplaceWith,
+    /// A line number to jump to.
+    GoingTo,
 }
 
 /// What the editor owes the clipboard, which only `main` can do.
@@ -479,6 +509,9 @@ impl Field {
         match self {
             Field::Naming => "name",
             Field::Finding => "find",
+            Field::ReplaceFind => "replace what",
+            Field::ReplaceWith => "replace with",
+            Field::GoingTo => "go to line",
         }
     }
 }
@@ -555,6 +588,12 @@ pub enum Msg {
     Redo,
     /// Open the find field — `Ctrl+F`. See [`Undo`](Msg::Undo).
     Find,
+    /// Select the whole buffer — `Ctrl+A`, or Edit ▸ Select All.
+    SelectAll,
+    /// Start a replace — `Ctrl+H`, or Edit ▸ Replace.
+    Replace,
+    /// Jump to a line — `Ctrl+G`, or Edit ▸ Go to Line.
+    GoTo,
     /// Copy the selection — `Ctrl+C`. See [`Undo`](Msg::Undo).
     Copy,
     /// Cut the selection — `Ctrl+X`. See [`Undo`](Msg::Undo).
@@ -596,6 +635,8 @@ impl App {
             chooser: None,
             chooser_list: None,
             open_requested: None,
+            replacing: None,
+            replaced: 0,
             new_window: false,
             quit: false,
             menus: MenuState::new(MENU_COUNT),
@@ -780,6 +821,26 @@ impl App {
     /// What the status strip is saying.
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    /// Where the cursor is, as a person counts: `line 3, col 12`.
+    ///
+    /// **One-based, and converted here rather than in the buffer.** The text area counts from
+    /// zero because it indexes with these numbers; a person comparing against a compiler's error
+    /// message needs them from one, and the single place they are displayed is the right place
+    /// for the conversion.
+    ///
+    /// **Column counts characters, not bytes.** A cursor after `é` is in column 2, not column 3 —
+    /// the buffer's `col` is a byte offset, which is the right thing for indexing and the wrong
+    /// thing to show anybody.
+    pub fn position_text(&self) -> String {
+        let t = &self.buf().text;
+        let (line, col) = t.cursor();
+        let chars = t
+            .lines()
+            .get(line)
+            .map_or(0, |l| l.get(..col).map_or(0, |head| head.chars().count()));
+        alloc::format!("line {}, col {}", line + 1, chars + 1)
     }
 
     /// Whether this buffer refuses to be written, and why.
@@ -974,6 +1035,31 @@ impl App {
                 self.field = Some((Field::Finding, TextFieldState::new()));
                 self.status = String::from("find, then Enter");
             }
+            Msg::Replace => {
+                self.replacing = None;
+                self.replaced = 0;
+                self.field = Some((Field::ReplaceFind, TextFieldState::new()));
+                self.status = String::from("replace what, then Enter");
+            }
+            Msg::GoTo => {
+                self.field = Some((Field::GoingTo, TextFieldState::new()));
+                self.status = String::from("line number, then Enter");
+            }
+            // **From the start to the end of the last line**, which `select_range` clamps into
+            // the buffer — so an empty buffer selects nothing rather than a zero-width range the
+            // copy path would then treat as a selection.
+            Msg::SelectAll => {
+                // **A byte offset, because `select_range` takes one** — it clamps with
+                // `lines[line].len()` and walks back to a char boundary, exactly as `cursor()`
+                // documents. `chars().count()` is short by one per multi-byte character, so
+                // Select All quietly dropped the last character of a line ending in one
+                // (PR #287 review, blocking 4). The *display* conversion is `position_text`'s,
+                // and it is the other direction.
+                let text = &self.buf().text;
+                let last = text.lines().len().saturating_sub(1);
+                let end = text.lines().get(last).map_or(0, |l| l.len());
+                self.buf_mut().text.select_range((0, 0), (last, end));
+            }
             Msg::Copy => self.copy(false),
             Msg::Cut => self.copy(true),
             Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
@@ -1149,6 +1235,71 @@ impl App {
                             };
                             self.find_report = Some(hit.then_some(line));
                         }
+                        // **The first stage answers with a needle and finds it**, so the person
+                        // can see what is about to be replaced before typing what to put there.
+                        // An empty needle ends the replace rather than matching everything.
+                        Field::ReplaceFind => {
+                            if typed.is_empty() {
+                                self.field = None;
+                                self.status = String::from("nothing to replace");
+                                return;
+                            }
+                            // **A needle that is not there does not move to stage two.** `find`
+                            // leaves the anchor alone when it misses, so a selection made *before*
+                            // Replace was opened is still sitting there — and stage two's guard
+                            // was "is anything selected", not "is the match selected". Typing a
+                            // replacement then destroyed that selection and reported replacing a
+                            // needle the buffer does not contain (PR #287 review, blocking 3).
+                            if !self.buf_mut().text.find(&typed) {
+                                self.status = alloc::format!("no {typed}");
+                                return;
+                            }
+                            self.replacing = Some(typed.clone());
+                            self.field = Some((Field::ReplaceWith, TextFieldState::new()));
+                            self.status = alloc::format!("replace {typed} with, then Enter");
+                        }
+                        // **Each Enter replaces the match that is showing and finds the next**,
+                        // which is the shape Find already has: the field stays open so Enter
+                        // walks, and `Esc` ends it. Replacing everything at once would be a
+                        // different row, and one whose undo is a single step over a whole file.
+                        // **Clamped to the buffer rather than refused**, which is what every
+                        // editor's go-to-line does: asking for line 900 of a 40-line file means
+                        // the end, and an error message there would be pedantry about a request
+                        // whose intent is unambiguous. A number that is not one *is* refused,
+                        // because that is a typo rather than an intent.
+                        Field::GoingTo => {
+                            let Ok(want) = typed.parse::<usize>() else {
+                                self.status = alloc::format!("{typed} is not a line number");
+                                return;
+                            };
+                            let lines = self.buf().text.lines().len();
+                            let line = want.max(1).min(lines.max(1)) - 1;
+                            self.buf_mut().text.place(line, 0);
+                            self.field = None;
+                            self.status = alloc::format!("line {}", line + 1);
+                            self.find_report = Some(Some(line));
+                        }
+                        Field::ReplaceWith => {
+                            let Some(needle) = self.replacing.clone() else {
+                                self.field = None;
+                                return;
+                            };
+                            // **The selection must be the match**, not merely present: `find`
+                            // selects what it hit, and anything else selected is somebody's own
+                            // selection that this has no business replacing.
+                            if self.buf().text.selected_text().as_deref() == Some(needle.as_str()) {
+                                self.buf_mut().text.insert_text(&typed);
+                                self.replaced += 1;
+                            }
+                            let more = self.buf_mut().text.find(&needle);
+                            let line = self.buf().text.cursor().0;
+                            self.find_report = Some(more.then_some(line));
+                            self.status = if more {
+                                alloc::format!("replaced {}, Enter for the next", self.replaced)
+                            } else {
+                                alloc::format!("replaced {}", self.replaced)
+                            };
+                        }
                     }
                 }
                 code => {
@@ -1249,8 +1400,26 @@ impl App {
                     Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy)
                         .enabled(free && has_selection),
                     act(Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste)),
+                    // **Offered whenever the buffer holds anything**, which is not the same as
+                    // "there is a selection": making one is what this row is for.
+                    Item::new("Select All", Accel::ctrl(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
+                        // **Never `text()`**, which is `lines.join("\n")` — a fresh copy of the
+                        // whole file, and `menu_table` is rebuilt on every keystroke for
+                        // `accel_match`. This is the defect `has_selection` was added to remove
+                        // one milestone ago, with a larger object (PR #287 review, worth fixing 9).
+                        .enabled(free && self.buf().text.lines().iter().any(|l| !l.is_empty())),
                     Item::Separator,
                     act(Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find)),
+                    act(Item::new(
+                        "Replace\u{2026}",
+                        Accel::ctrl(REPLACE_KEYCODE, "H"),
+                        Msg::Replace,
+                    )),
+                    act(Item::new(
+                        "Go to Line\u{2026}",
+                        Accel::ctrl(GO_TO_KEYCODE, "G"),
+                        Msg::GoTo,
+                    )),
                 ],
             },
         ]
@@ -1675,8 +1844,22 @@ impl App {
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
                     text(self.status.clone()),
                 )
-                .key(STATUS_KEY),
+                .key(STATUS_KEY)
+                .flex(1),
             },
+            // **Line and column, at the right of the strip this window already has** (M14 Part E).
+            // A second bar along the bottom is where a status bar conventionally goes and would
+            // have moved every gate coordinate in the text area for a number; the strip is
+            // already the status bar, and the position a person is at is status.
+            //
+            // **Counted from one**, because that is what every editor's "line 3" means and what a
+            // person comparing against a compiler's error message needs it to mean; the buffer
+            // counts from zero and the conversion belongs at the one place it is displayed.
+            padding(
+                Insets { top: 4, right: 8, bottom: 4, left: 4 },
+                text(self.position_text()),
+            )
+            .key(POSITION_KEY),
         ]);
 
         // **The tab strip, drawn whatever the count.** A strip that appeared with the second
@@ -1880,6 +2063,25 @@ mod tests {
     /// A key press, as the compositor delivers one.
     fn key(a: &mut App, keycode: u16, modifiers: u16) {
         a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN as u16, modifiers)));
+    }
+
+    /// Type `text` one keystroke at a time, as a person would.
+    ///
+    /// **Through the keymap rather than a hand-written table**, so a test that types `cat` is
+    /// pressing the keys the guest would press — the same reason the chord constants are pinned
+    /// against `libinput::keymap` rather than against their comments.
+    fn type_into(a: &mut App, text: &str) {
+        for want in text.bytes() {
+            let code = (1u16..=90)
+                .find(|c| libinput::keymap::to_char(*c, 0) == Some(want))
+                .unwrap_or_else(|| panic!("no keycode types {:?}", want as char));
+            key(a, code, 0);
+        }
+    }
+
+    /// A bare key press, spelled as the other tests spell it.
+    fn press_key(a: &mut App, keycode: u16) {
+        key(a, keycode, 0);
     }
 
     /// `x`, the one letter these tests type.
@@ -2153,6 +2355,10 @@ mod tests {
 
     #[test]
     fn the_chord_keycodes_are_the_ones_the_keymap_names() {
+        // **The three this part added, pinned like the rest** (PR #287 review, optional 11).
+        assert_eq!(libinput::keymap::to_char(SELECT_ALL_KEYCODE, 0), Some(b'a'));
+        assert_eq!(libinput::keymap::to_char(REPLACE_KEYCODE, 0), Some(b'h'));
+        assert_eq!(libinput::keymap::to_char(GO_TO_KEYCODE, 0), Some(b'g'));
         // Pinned against the table they have to agree with rather than against the comments
         // beside them, the way the save chord already is.
         assert_eq!(libinput::keymap::to_char(UNDO_KEYCODE, 0), Some(b'z'));
@@ -2327,7 +2533,191 @@ mod tests {
             .flat_map(|m| m.items.iter())
             .filter(|it| matches!(it, Item::Action { enabled: true, .. }))
             .count();
-        assert_eq!(live, 12, "everything but Cut and Copy, which want a selection");
+        assert_eq!(live, 14, "everything but Cut and Copy, which want a selection");
+    }
+
+    // --- Select All and Replace (M14 Part E) ---------------------------------
+
+    /// Select All takes the whole buffer, and an empty one has nothing to take.
+    #[test]
+    fn select_all_takes_the_buffer_and_an_empty_one_stays_empty() {
+        let mut a = app();
+        a.loaded("one\ntwo\nthree", b"one\ntwo\nthree");
+        a.update(Msg::SelectAll);
+        assert_eq!(
+            a.buf().text.selected_text().as_deref(),
+            Some("one\ntwo\nthree"),
+            "every line, including the last"
+        );
+
+        // **An empty buffer selects nothing** — and this holds without a guard in `SelectAll`,
+        // because `TextAreaState::selection` returns `None` for a collapsed range. The guard that
+        // used to be here claimed to prevent "a zero-width range the copy path would treat as a
+        // selection", a hazard that cannot occur since `has_selection` delegates to `selection`;
+        // it is gone, and this asserts the property rather than the guard (PR #287 review, worth
+        // fixing 7).
+        let mut b = app();
+        b.loaded("", b"");
+        b.update(Msg::SelectAll);
+        assert!(b.buf().text.selection().is_none(), "nothing to select");
+        assert!(!b.buf().text.has_selection(), "and nothing for Copy to find");
+
+        // **A last line ending in a multi-byte character** — `select_range` takes a *byte* offset,
+        // and a character count is short by one per such character.
+        let mut c = app();
+        c.loaded("one\néxy", "one\néxy".as_bytes());
+        c.update(Msg::SelectAll);
+        assert_eq!(
+            c.buf().text.selected_text().as_deref(),
+            Some("one\néxy"),
+            "the last character is not dropped"
+        );
+    }
+
+    /// Replace asks what, then with what, and each Enter takes the next match.
+    ///
+    /// **The field stays open so Enter walks**, which is the shape Find already has — a replace
+    /// that closed on the first hit would need re-opening for the second.
+    #[test]
+    fn replace_walks_the_matches_one_enter_at_a_time() {
+        let mut a = app();
+        a.loaded("a cat and a cat", b"a cat and a cat");
+        a.update(Msg::Replace);
+        assert_eq!(a.field_kind(), Some(Field::ReplaceFind));
+
+        type_into(&mut a, "cat");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.field_kind(), Some(Field::ReplaceWith), "the second stage");
+        assert_eq!(a.status(), "replace cat with, then Enter");
+
+        type_into(&mut a, "dog");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.text(), "a dog and a cat", "the first match only");
+        assert_eq!(a.status(), "replaced 1, Enter for the next");
+
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.text(), "a dog and a dog", "and the second");
+        assert_eq!(a.status(), "replaced 2");
+        assert_eq!(a.field_kind(), Some(Field::ReplaceWith), "still open");
+    }
+
+    /// A needle that is not in the buffer does not consume somebody's selection.
+    ///
+    /// **`find` leaves the anchor alone when it misses**, so a selection made *before* Replace was
+    /// opened is still there — and stage two's guard used to be "is anything selected" rather than
+    /// "is the match selected". Typing a replacement then destroyed that selection and reported a
+    /// replacement of a needle the buffer does not contain (PR #287 review, blocking 3).
+    #[test]
+    fn replacing_an_absent_needle_leaves_the_selection_alone() {
+        let mut a = app();
+        a.loaded("hello world", b"hello world");
+        // A selection the person made themselves.
+        a.buf_mut().text.select_range((0, 6), (0, 11));
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("world"));
+
+        a.update(Msg::Replace);
+        type_into(&mut a, "zzz");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.status(), "no zzz");
+        assert_eq!(
+            a.field_kind(),
+            Some(Field::ReplaceFind),
+            "it stays on the first stage rather than asking what to replace it with"
+        );
+
+        // …and even if the person types on, nothing is replaced.
+        type_into(&mut a, "qq");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.text(), "hello world", "the buffer is untouched");
+    }
+
+    /// A selection made *between* the two stages is not what gets replaced.
+    ///
+    /// **The second guard, and it is reachable**: stage one refusing a miss keeps a *stale*
+    /// selection out, but nothing stops somebody clicking elsewhere while the "replace with"
+    /// field is open. The guard is "the selection is the match", not "something is selected".
+    #[test]
+    fn a_selection_made_between_the_stages_is_not_replaced() {
+        let mut a = app();
+        a.loaded("cat and dog", b"cat and dog");
+        a.update(Msg::Replace);
+        type_into(&mut a, "cat");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.field_kind(), Some(Field::ReplaceWith), "the match was found");
+
+        // The person selects something else before answering.
+        a.buf_mut().text.select_range((0, 8), (0, 11));
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("dog"));
+
+        type_into(&mut a, "zzz");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.text(), "cat and dog", "`dog` was not replaced");
+    }
+
+    /// An empty needle ends the replace rather than matching everything.
+    #[test]
+    fn replacing_nothing_is_refused() {
+        let mut a = app();
+        a.loaded("hello", b"hello");
+        a.update(Msg::Replace);
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.field_kind(), None, "the field closed");
+        assert_eq!(a.status(), "nothing to replace");
+        assert_eq!(a.text(), "hello", "and the buffer is untouched");
+    }
+
+    /// The strip reports the cursor from one, and counts characters rather than bytes.
+    ///
+    /// **Bytes would be the easy answer and the wrong one**: `col` is a byte offset because that
+    /// is what indexes a `String`, so a cursor after a two-byte character would read column 3
+    /// where a person sees column 2.
+    #[test]
+    fn the_strip_reports_the_position_a_person_counts() {
+        let mut a = app();
+        a.loaded("one\ntwo", b"one\ntwo");
+        assert_eq!(a.position_text(), "line 1, col 1", "counted from one, not zero");
+
+        a.buf_mut().text.place(1, 3);
+        assert_eq!(a.position_text(), "line 2, col 4");
+
+        // A multi-byte character: the cursor sits after `é`, which is one character and two bytes.
+        let mut b = app();
+        b.loaded("é!", "é!".as_bytes());
+        b.buf_mut().text.place(0, 2);
+        assert_eq!(b.position_text(), "line 1, col 2", "characters, not bytes");
+    }
+
+    /// Go to Line jumps, clamps past the end, and refuses what is not a number.
+    #[test]
+    fn go_to_line_clamps_and_refuses() {
+        let mut a = app();
+        a.loaded("one\ntwo\nthree", b"one\ntwo\nthree");
+
+        a.update(Msg::GoTo);
+        assert_eq!(a.field_kind(), Some(Field::GoingTo));
+        type_into(&mut a, "2");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.buf().text.cursor().0, 1, "line 2 is index 1");
+        assert_eq!(a.field_kind(), None, "and the field closed");
+
+        // **Past the end means the end**, which is what every editor does: the intent is
+        // unambiguous and an error there would be pedantry.
+        a.update(Msg::GoTo);
+        type_into(&mut a, "900");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.buf().text.cursor().0, 2, "clamped to the last line");
+        // **The cursor alone cannot see this**: `TextAreaState::place` clamps too, so line 900
+        // lands on the last line with or without the clamp here. What differs is what the strip
+        // *says* and what the binary is told to scroll to (PR #287 review, worth fixing 8).
+        assert_eq!(a.status(), "line 3", "and says where it actually went");
+        assert_eq!(a.take_find_report(), Some(Some(2)), "the scroll target is the real line");
+
+        // **A typo is refused**, because that is not an unambiguous intent.
+        a.update(Msg::GoTo);
+        type_into(&mut a, "x");
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.status(), "x is not a line number");
+        assert_eq!(a.field_kind(), Some(Field::GoingTo), "and the field stays open");
     }
 
     /// The chord a menu row advertises does what choosing that row does.
@@ -2362,8 +2752,13 @@ mod tests {
             // everywhere it exists — and Save on a titled buffer records an outbox entry rather
             // than touching the text. A digest that watched only the buffer said both rows
             // changed nothing, which is exactly what that control is for.
+            // **And the selection's extent** — the fifth time. The fixture starts *with* a
+            // selection so that Cut and Copy are live, so a digest that watched only whether one
+            // exists cannot see Select All widening it, and the control below rejected the row
+            // for changing nothing (M14 Part E).
+            let sel = a.buf().text.selection();
             alloc::format!(
-                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}|{nw}{q}|{cl:?}{op:?}{choosing:?}",
+                "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}|{nw}{q}|{cl:?}{op:?}{choosing:?}|{sel:?}",
                 a.status(),
                 a.text(),
                 a.field_kind(),
@@ -2421,7 +2816,7 @@ mod tests {
                 "{label} changes nothing, so this row proves nothing about routing"
             );
         }
-        assert_eq!(checked, 13, "every row but Close Window carries a chord");
+        assert_eq!(checked, 16, "every row but Close Window carries a chord");
     }
 
     #[test]
