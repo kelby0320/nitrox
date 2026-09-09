@@ -277,21 +277,6 @@ fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static st
     }
 }
 
-/// The monotonic clock in milliseconds.
-///
-/// **Milliseconds because that is the unit a click run is measured in**; nanoseconds would make
-/// `libui::click`'s constants nine-digit numbers for no gain, since nothing here needs to tell two
-/// presses a microsecond apart from each other.
-fn clock_ms() -> u64 {
-    let mut ns: u64 = 0;
-    // SAFETY: `&raw mut ns` is a valid writable `u64` out-parameter, which is what
-    // `sys_clock_read` requires of its second argument.
-    unsafe {
-        libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::CLOCK_MONOTONIC, (&raw mut ns) as u64)
-    };
-    ns / 1_000_000
-}
-
 /// Block until the compositor has something to say.
 ///
 /// One handle, unlike `nxterm`'s two: a browser has no second source of work. It reads a
@@ -1104,15 +1089,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 WindowEvent::Pointer(p) => {
                     // **Counted before the event is routed** (M14 decision 5), so the message the
-                    // press produces can ask what number the click was. The clock is read here
-                    // because `libui` and `nxfiles`'s own library half make no syscalls — see
-                    // `libui::click` for what reading it at *delivery* rather than at the press
-                    // costs, and `TODO(press-time)` for the fix.
+                    // press produces can ask what number the click was.
+                    //
+                    // **The record's own time, since Part I.** `libui` and this crate's library
+                    // half make no syscalls, so the clock used to be read *here* — at delivery,
+                    // which is when this loop got round to the press rather than when the press
+                    // happened. `press-time` was the deferral that recorded the difference.
                     if p.kind == librsproto::surface::POINTER_BUTTON
                         && p.flags & librsproto::surface::POINTER_PRESSED != 0
                         && p.button == libkern::abi::BTN_LEFT
                     {
-                        app.note_press(libdraw::geom::Point::new(p.x, p.y), clock_ms(), p.modifiers);
+                        app.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms, p.modifiers);
                     }
                     let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {

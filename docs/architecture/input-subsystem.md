@@ -16,8 +16,10 @@ arriving in a widget runs on every boot:
 | Focus, hit-testing, implicit grab, key repeat | `userspace/compositor/src/input.rs` |
 | Delivery to a widget | `userspace/libui/src/route.rs` |
 
-`cargo xtask check-input` injects a keystroke and a click over QMP and asserts both reach a
-widget, so the path is gated end to end rather than assumed. `cargo xtask check-login` adds the
+`cargo xtask check-input` injects a keystroke, a click and a **wheel** over QMP and asserts each
+reaches a widget, so the path is gated end to end rather than assumed. (The wheel arrived with
+M14 Part I, 2026-09-09: the mouse is asked at bring-up whether it has one — the IntelliMouse
+knock — and answers by sending four-byte packets from then on.) `cargo xtask check-login` adds the
 property that paced injection cannot test: a burst of motion delivered *while* the compositor is
 recomposing the whole screen must still put the cursor exactly where the arithmetic says (§7).
 

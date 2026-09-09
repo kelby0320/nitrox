@@ -5,17 +5,19 @@
 //! may make a syscall, so this is *given* a position and a time and answers with a number. Pure,
 //! testable, and no clock in a module that forbids one.
 //!
-//! ## Where the time comes from, and what that costs
+//! ## Where the time comes from
 //!
-//! The application reads the clock when the press is *delivered*, because a `PointerEvent` carries
-//! no timestamp — `libinput::Logical` drops the `time_ns` the kernel puts on every `InputEvent`,
-//! so the press time is not available anywhere above the compositor's input thread.
+//! **The record's own `time_ms`**, which is the kernel's stamp taken at the interrupt and carried
+//! down through `libinput::Logical` and the compositor. An application passes it in; it does not
+//! read a clock.
 //!
-//! The difference matters in one direction only: a client stalled between two *deliberate* single
-//! clicks receives them closer together than they were made, and can read them as a double. It
-//! cannot turn a real double click into two singles, because delivery cannot pull events further
-//! apart than the stall that bunched them. `TODO(press-time)` carries the fix — a timestamp on the
-//! wire, which is what X11 and Wayland both learned to do — and its trigger.
+//! It did read one until M14 Part I, because `PointerEvent` carried no timestamp — and the error
+//! that introduced ran in one direction: a client stalled between two *deliberate* single clicks
+//! received them closer together than they were made and could read them as a double. It could
+//! not turn a real double click into two singles, because delivery cannot pull events further
+//! apart than the stall that bunched them. X11 and Wayland both carry a timestamp on every input
+//! event, and for this reason. `press-time` was the deferral; the wheel wanting the same record
+//! widened is what paid it off.
 
 use libdraw::geom::Point;
 
@@ -24,6 +26,18 @@ use libdraw::geom::Point;
 /// **The interval every desktop uses**, near enough: fast enough that two deliberate clicks are
 /// two, slow enough that a double click is not a dexterity test.
 pub const RUN_MS: u64 = 400;
+
+/// How many units of content one detent of the wheel moves.
+///
+/// **Three, which is what every desktop settled on**: one is a wheel that feels broken, and a
+/// whole screen is a page-up key people turn by accident. A *unit* is whatever the thing being
+/// scrolled counts in — lines in a terminal, rows in a list — because that is the granularity a
+/// person is aiming at, and it is the only reading that makes a wheel behave the same in both.
+///
+/// Here rather than in each application for [`RUN_MS`]'s reason: two copies of a feel constant
+/// drift, and a wheel that moves three lines in one window and five in the next is a desktop
+/// that feels broken without anyone being able to say why.
+pub const WHEEL_UNITS: u16 = 3;
 
 /// How far the pointer may move between two presses of one run, in pixels.
 ///

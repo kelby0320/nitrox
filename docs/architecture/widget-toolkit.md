@@ -388,7 +388,19 @@ it is still being dragged forever. Coordinates are widget-local and **signed**, 
 mid-capture they are routinely negative.
 
 Enter and leave are synthesised at widget boundaries the same way the compositor synthesises
-them at window boundaries, and suppressed during a capture for the same reason.
+them at window boundaries, and suppressed during a capture for the same reason — **and for a
+wheel**, which moved no cursor and so crossed nothing.
+
+**The wheel has a handler of its own** (`on_wheel`, M14 Part I), and never arrives at
+`on_pointer`. It bubbles like everything else, and that is exactly why it cannot share: the
+thing that scrolls is rarely the thing under the cursor — a row in a list, a cell in a grid —
+so a wheel delivered to `on_pointer` would stop at the first widget tracking the cursor for
+*any* reason, hover included, and be silently dropped there. Claiming it is a statement a widget
+makes ("I scroll"), not one it is assumed into by having an opinion about the pointer.
+
+A wheel opens no capture, fires no `on_press` and moves no focus. Nothing about it is a press,
+and each of those is a separate branch that would otherwise fire on a record whose `flags` and
+`buttons` happen to be zero.
 
 ### 7.2 Keyboard, and the second focus
 
@@ -523,6 +535,15 @@ never wraps. A later "these could be merged" now has something to argue against.
 M7's `text_field` was and remains the narrow thing: a password box and a search box, with no
 wrapping, no selection and no multi-line cursor. A single-line field is not a text area, which
 is what §1's contradiction turned on.
+
+**Interaction state that outlives one event lives in a value the application holds.** There are
+two, both small and both pure: `click::Clicks`, which counts a run of presses so a second click
+can mean a word (M14 Part D), and `widget::ScrollGrab`, which remembers where within a scrollbar
+thumb a press landed so that taking hold of one does not move it (M14 Part I). Neither can live
+in a widget — the tree is rebuilt every frame — and neither belongs in each application, which
+is how two implementations of "is this a double click" come to disagree. §3 reserves retained
+widget state for things the application has no opinion about, and nobody has an opinion about
+where inside a thumb a button landed.
 
 **What these widgets are, at the toolkit's seam.** Each ships a *state* type
 (`TextFieldState`, `ListState`, `TextAreaState`) carrying the logic their callers would

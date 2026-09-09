@@ -188,9 +188,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     **M14 — the applications, and what a menu is** — detail-passed 2026-09-03 from the
     maintainer's list after living with the desktop, with the north star stated as a comparison:
     the three applications should be about equivalent to the versions of GNOME Terminal, Text
-    Editor and Files that ship, which is a bar anyone can check against a machine they own. Eight
-    parts, built F, H, A, B, C, D, E, G — H split out of F when costing showed desktop entries
-    cross the namespace, and F is what is left, which is genuinely small. Five governing decisions — an
+    Editor and Files that ship, which is a bar anyone can check against a machine they own. **Nine**
+    parts, built F, H, A, B, C, D, E, I, G — H split out of F when costing showed desktop entries
+    cross the namespace, and I split out of E on 2026-09-09 because "the scroll wheel" reads like
+    a terminal feature and is a vertical slice through the input path. Five governing decisions — an
     application is a thing that *says* it is one (desktop entries, because "is this graphical?"
     cannot be read off a binary), an accelerator is declared once so its label and its binding
     cannot drift, the file chooser is a widget over a listing rather than a browser inside a
@@ -227,7 +228,18 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     application read — decision 3 held without an exception, so `libfs` grew the sort that keeps two
     directory views from disagreeing about what "newest" means. Save As changes what the buffer
     *is* rather than prompting for a destination, which is what makes the tab's label, the unsaved
-    marker and the next `Ctrl+S` follow it. **Part G — syntax highlighting — was wanted as a stretch and promoted the
+    marker and the next `Ctrl+S` follow it. **Part E is done** (2026-09-09): Find and Clear Scrollback in the terminal,
+    Select All in both, Replace and Go to Line in the editor, and double- and triple-click
+    selection through the click tracker Part D built. Two of its seven boxes were not what they
+    read as — an unsaved-changes prompt that had existed since M12, and "the scroll wheel", which
+    turned out to be a wire-format change and left as Part I. **Part I is done** (2026-09-09): the
+    input path grew an axis and a clock in one widening of `PointerEvent` — the IntelliMouse knock
+    in the PS/2 driver, a `Logical::Wheel`, `POINTER_WHEEL` records routed to the window under the
+    pointer, and `libui::Element::on_wheel`, which is a handler of its own precisely so a widget
+    that merely tracks the cursor cannot swallow a scroll it has no opinion about. Two deferrals
+    closed with it: `press-time` (the kernel's interrupt stamp now reaches a client, so nobody
+    reads a clock at delivery) and `scroll-grab` (taking hold of a scrollbar thumb no longer moves
+    it). **Part G — syntax highlighting — was wanted as a stretch and promoted the
     same day**: costing it found that reusing `nxsh`'s lexer does not work (it is fallible, and
     parser-mode-driven, while a highlighter must be total over text that is not a program yet), and
     the table-driven scanner that replaces it makes each further language a table rather than code

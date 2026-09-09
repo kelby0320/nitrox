@@ -74,6 +74,14 @@ All fields little-endian. The numbering is Linux's `evdev`, deliberately:
 **`REL_Y` is positive-down**, matching screen coordinates — the PS/2 wire reports positive-up
 and the driver negates, so exactly one place knows.
 
+**`REL_WHEEL` is positive-down too**, toward the user, and this is where the numbering stops
+following Linux: Linux's `REL_WHEEL` is positive-*up*. The **codes** are Linux's and stay
+Linux's; the sign is the screen's, for the same reason `REL_Y`'s is — one place knows, and
+nothing above the driver needs a sign of its own to add a wheel delta to a scroll offset. The
+PS/2 wire is already positive-down here, so unlike `REL_Y` nothing negates it. Landed with the
+wheel itself (M14 Part I, 2026-09-09); the constant was defined and unconsumed for a month
+before that, documented with Linux's convention and never exercised.
+
 **Buttons are keys.** `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` (`0x110`–`0x112`) are `EV_KEY`
 codes, because a button has the same down/up/held state machine as a key and a separate class
 would duplicate it.

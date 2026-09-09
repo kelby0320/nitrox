@@ -4776,10 +4776,12 @@ the sidebar, then the clipboard — the last two build on what the click settles
       `Enter` still opens directly — the keyboard has no position and no run to belong to. **A
       drag abandons the run**, or the click after one opens something nobody asked for.
 
-      **The time is the press's delivery, not the press** — `PointerEvent` carries no timestamp
-      and `libinput::Logical` drops the `time_ns` the kernel stamps on every `InputEvent`. The
-      error runs one way only: a stalled client can read two deliberate clicks as a double, and
-      cannot split a real one. `TODO(press-time)` carries the wire-format fix and its trigger.
+      ~~**The time is the press's delivery, not the press**~~ — **fixed in Part I** (2026-09-09).
+      It was true as written: `PointerEvent` carried no timestamp and `libinput::Logical` dropped
+      the `time_ns` the kernel stamps on every `InputEvent`, so the error ran one way — a stalled
+      client could read two deliberate clicks as a double, and could not split a real one. The
+      record carries `time_ms` now and this application reads it. Struck rather than deleted,
+      because the deferral it justified is part of this part's record.
 
       **It had no gate coverage and nearly shipped without any**: `check-login` navigates with
       `Enter` and drags with a press-and-move, so nothing it did touched what a *click* means and
@@ -4930,7 +4932,7 @@ feature's clothes.
       that exists**, which is why all seven boxes were checked against the code before Part E
       started.
 
-### Part I — the input path grows an axis and a clock
+### Part I — the input path grows an axis and a clock ✅ complete (2026-09-09)
 
 **Split out of Part E on 2026-09-09**, because "the scroll wheel" reads like a terminal feature and
 is not one. `REL_WHEEL` is a constant in `kernel/src/libkern/input.rs` that **nothing consumes**:
@@ -4941,22 +4943,76 @@ from dragging the bar, not from a wheel.
 So this is a vertical slice through the input path and a **wire-format change**, which is a
 different kind of work from anything else in Part E and does not belong inside it.
 
-- [ ] **A wheel axis, end to end** — PS/2 wheel bytes in the driver, an axis on
-      `libinput::Logical`, delivery through the compositor, a field on `PointerEvent`, and
-      `nxterm` scrolling by it.
-- [ ] **A press time on the wire — `TODO(press-time)`, folded in here** at the maintainer's
-      direction (2026-09-09). It wants a timestamp on `PointerEvent`; the wheel wants an axis on
-      the same struct. **One change to the wire format, its spec doc and its construction sites
-      rather than two** — and the double-click tracker stops measuring *delivery* time, which is
-      the error that entry documents.
-- [ ] **The scrollbar thumb — `TODO(scroll-grab)`**, if the same pass can reach it: it is the
-      interaction state the toolkit does not keep, and it is the other half of "the scroll wheel
-      and a scrollbar" as Part E originally worded it.
+- [x] **A wheel axis, end to end** ✅ — four batches, and the wire was widened **once**.
 
-**Not in scope**: `TODO(lost-release)`. It is a *loss* in the same path and this part will be
-touching that path, so the evidence should be re-read while here — but chasing an intermittent one
-in six is not a deliverable, and the entry's trigger already says a change to this path is when to
-look.
+      **The knock changes the packet length, which is why the decoder has to be told.** A PS/2
+      mouse answers the IntelliMouse sample-rate sequence by changing its id to `0x03` and
+      sending **four**-byte packets from then on; nothing in the byte stream distinguishes them
+      from three-byte ones, so a decoder told the wrong length reads every packet at an offset
+      for ever. That is the framing failure `mouse.rs`'s resynchronisation machinery exists for,
+      reached by configuration rather than by a lost byte.
+
+      **`REL_WHEEL` is positive-down, which parts company with Linux** — whose `REL_WHEEL` is
+      positive-*up* — while keeping Linux's codes. The sign convention here is the screen's, the
+      one `REL_Y` already follows, so nothing above the driver needs a sign of its own to add a
+      delta to a scroll offset. The PS/2 wire is already positive-down, so unlike `REL_Y` nothing
+      negates it. `check-input` injects a real wheel and asserts the direction: it is the only
+      thing in the tree that can, because the host has no PS/2 wire to be wrong about.
+
+      **`libui` gained `on_wheel`, and a wheel never reaches `on_pointer`.** The reason is what
+      happens to the widgets that do not want it: a wheel bubbles, the thing that scrolls is
+      rarely the thing under the cursor, and delivered through `on_pointer` it would stop at the
+      first widget tracking the cursor for *any* reason — hover included — and be dropped
+      silently. Three consumers hang the handler on the element the widget returns rather than
+      taking a parameter, which is what let the terminal, the browser's listing and the editor's
+      chooser all take it without an API change: `nxterm`'s whole window body (so the scrollbar
+      and the tab strip are not dead zones), `nxfiles`' listing, `nxedit`'s chooser.
+
+      **A wheel raises nothing, focuses nothing and crosses nothing.** Raising would reorder the
+      screen — and move the keyboard with it, since focus *is* topmost-focusable — for a gesture
+      people make without looking; and the cursor did not move, so no enter or leave is derived.
+      In the outbox it coalesces by **summing**, which is neither of the two obvious rules:
+      replacing (motion's rule) loses every detent but the last, because `wheel` is a delta
+      rather than a position, and not coalescing at all would make it the first pointer kind to
+      take a queue slot per event — in a queue whose depth is justified by that not happening.
+      Summing is bounded *and* lossless. Only across turns that agree about `modifiers` and
+      `buttons`, since those decide what a scroll means (PR #288 review, 3).
+- [x] **A press time on the wire — `TODO(press-time)`** ✅, folded in here at the maintainer's
+      direction (2026-09-09) and paid off in the same widening. `PointerEvent` went 24 → 32
+      bytes: the two reserved bytes became `wheel`, and `time_ms` was appended.
+
+      **The time rides on the event, not beside it.** `libinput::Logical` carries the kernel's
+      `time_ns` on every variant, `Dropped` included — a loss is a moment too, and the
+      compositor synthesises crossings on one that have to be stamped. The alternative
+      considered was passing the record's time alongside each `Logical` the compositor routes:
+      it costs no field and hands the next edit the `now` already in scope, which is exactly the
+      bug being closed. **Milliseconds on the wire**, divided once at `emit`, because a client
+      that has to divide can forget to — and nanoseconds fed to an interval expressed in
+      milliseconds fails *silently*, as a desktop where double click stopped working.
+- [x] **The scrollbar thumb — `TODO(scroll-grab)`** ✅, and the same pass did reach it. The
+      entry's framing was "a question of where it lives rather than whether it is allowed", and
+      the answer is `libui::widget::ScrollGrab`, a value the **application** holds — the same
+      shape as `libui::click::Clicks`, because the toolkit's widgets are rebuilt every frame and
+      have nowhere to keep state that outlives an event.
+
+      `ScrollState` gained `offset_for_thumb_top`; `offset_at` stays, because centring is
+      exactly right for a press on the **track**, and the grab is what tells the two presses
+      apart. **M9's drag-to-move had already solved its own half separately** — the compositor's
+      `grab_at` records the pointer at the press for this reason (PR #247 review) — so the two
+      now sit a layer apart and say so.
+
+**A control caught a vacuous test, twice in one shape.** "A saturated delta must not wrap" was
+written with `i16::MAX` — and `32767 * 3` wraps round to `32765`, still positive, still
+downward, so it passed against the broken arithmetic it existed to catch. Both copies use
+20 000 now, and both fail without the widening. The lesson is narrower than "run the control":
+the *value* has to be one whose failure is visible, and the largest input is not automatically
+the most revealing one.
+
+**Not in scope, and it stayed out**: `TODO(lost-release)`. It is a *loss* in the same path and
+this part touched that path, so the evidence was re-read while here — nothing in this work
+plausibly bears on it, and the change that would (a compositor that re-sends a missing release)
+is known-bad: PR #280 tried it and broke the drag step three runs out of three. The entry's
+trigger stands.
 
 ### Part G — syntax highlighting
 

@@ -287,7 +287,23 @@ pub struct Element<Msg> {
     /// costs nothing.
     pub on_key: Option<fn(KeyEvent) -> Option<Msg>>,
     /// Raw pointer events routed to this element.
+    ///
+    /// **Never a wheel** — those go to [`on_wheel`](Self::on_wheel) instead, so a widget that
+    /// tracks the cursor does not have to filter out an event it has no opinion about.
     pub on_pointer: Option<fn(PointerEvent) -> Msg>,
+    /// The wheel turned over this element — a `POINTER_WHEEL` record.
+    ///
+    /// **Its own handler rather than a kind arriving at [`on_pointer`](Self::on_pointer)**, and
+    /// the reason is what happens to the widgets that do not want it. A wheel bubbles: the
+    /// thing that scrolls is rarely the thing under the cursor — a row in a list, a cell in a
+    /// grid — so it has to walk up until something takes it. Sent through `on_pointer` it would
+    /// stop at the first widget tracking the cursor for *any* reason, hover included, and be
+    /// silently dropped there. A separate handler makes "I scroll" a claim a widget states
+    /// rather than one it is assumed into.
+    ///
+    /// The record still carries `x`/`y` (widget-local, like every other), `modifiers` for
+    /// Ctrl-scroll, and `buttons` for a wheel turned mid-drag.
+    pub on_wheel: Option<fn(PointerEvent) -> Msg>,
     /// Whether this element accepts keyboard focus.
     ///
     /// Opt-in, not derived from having an `on_key`: a scrollbar has neither and must still
@@ -307,6 +323,7 @@ impl<Msg> Element<Msg> {
             on_drop: None,
             on_key: None,
             on_pointer: None,
+            on_wheel: None,
             focusable: false,
         }
     }
@@ -354,9 +371,19 @@ impl<Msg> Element<Msg> {
         self
     }
 
-    /// Take raw pointer events routed to this element.
+    /// Take raw pointer events routed to this element — everything but the wheel.
     pub fn on_pointer(mut self, f: fn(PointerEvent) -> Msg) -> Self {
         self.on_pointer = Some(f);
+        self
+    }
+
+    /// Take the wheel when it turns over this element or anything inside it.
+    ///
+    /// **Claiming it stops it**: the nearest ancestor with a handler is the one that gets it,
+    /// so a scrolling pane inside another scrolling pane takes its own wheel — see
+    /// [`on_wheel`](Self::on_wheel) for why this is not `on_pointer` with a `kind` check.
+    pub fn on_wheel(mut self, f: fn(PointerEvent) -> Msg) -> Self {
+        self.on_wheel = Some(f);
         self
     }
 

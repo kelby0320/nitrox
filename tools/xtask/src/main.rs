@@ -1467,6 +1467,29 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     // PS/2 wire to be wrong about. This assertion is the only thing standing between an
     // inverted mouse and a green build.
     session.expect("input-testclient: ev kind=2 code=1 value=3")?;
+
+    // ---- The wheel (M14 Part I) ----
+    //
+    // **This is the only check on the sign, and on the packet length.** A mouse that answered
+    // the IntelliMouse knock sends *four*-byte packets, and a decoder still framing three
+    // reads every packet after the first at an offset — so the motion assertions above would
+    // have started failing rather than this one. That the knock happened at all is only
+    // observable here: it is a conversation with the emulated device, and no host test has one.
+    //
+    // `REL_WHEEL` is `0x08`, and it is **positive-down** in this system — the sign convention
+    // is the screen's rather than Linux's (`rsproto-input-ops.md`). A turn toward the user
+    // must therefore arrive as `value=1`. Getting this backwards is one character in the
+    // driver and inverts scrolling everywhere; nothing on the host can catch it, because the
+    // host has no PS/2 wire to be wrong about — exactly the argument the `REL_Y` assertion
+    // above makes for itself.
+    //
+    // **Before the click, not after it.** `BTN_LEFT`'s press is the sentinel that ends the
+    // client's raw-stream phase, so anything injected after it is never printed.
+    qmp.send_wheel(true)?;
+    session.expect("input-testclient: ev kind=2 code=8 value=1")?;
+    qmp.send_wheel(false)?;
+    session.expect("input-testclient: ev kind=2 code=8 value=-1")?;
+
     qmp.send_button("left", true)?;
     session.expect("input-testclient: ev kind=1 code=272 value=1")?;
     // Release it: phase 2 asserts on the button mask, and a press left held from here would
@@ -1569,10 +1592,29 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     // an expect placed after them scans forward past a line already emitted and times out. The
     // click assertions below are what depend on the window being back, and they say so.
 
+    // ---- The wheel, through a window and into a widget (M14 Part I) ----
+    //
+    // The device-layer half above proves the driver frames and signs it. This proves the rest
+    // of the path: `libinput` turned the axis into a `Logical::Wheel`, the compositor routed it
+    // to the window **under the cursor** (never the focused one — a wheel is a pointer event)
+    // and stamped a `POINTER_WHEEL` record, and `libui` dispatched it to `on_wheel`.
+    //
+    // **The widget line is the one that could not be faked.** `on_pointer` never receives a
+    // wheel, so a `widget wheel` line means the toolkit routed it *as* a wheel — a change that
+    // delivered wheels to `on_pointer` "so nothing is lost" would print `widget ptr kind=4`
+    // here instead and this would fail.
+    //
+    // Before the click, because the click's press is what ends the client's window phase.
+    qmp.send_wheel(true)?;
+    session.expect("input-testclient: win ptr kind=4 btn=0 buttons=0 wheel=1")?;
+    session.expect("input-testclient: widget wheel dz=1")?;
+    qmp.send_wheel(false)?;
+    session.expect("input-testclient: widget wheel dz=-1")?;
+
     // And a click, which is routed by hit-testing instead of focus. `buttons=1` is the mask
     // the record carries on every kind — the field that used to read zero here.
     qmp.send_button("left", true)?;
-    session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
+    session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1 wheel=0")?;
     // Kind 1 is `POINTER_BUTTON`, and the coordinates are **widget-local**: the grid fills
     // the window and sits at its origin, so they match — which is exactly why the host tests
     // place a widget away from the origin as well.
@@ -2847,7 +2889,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     routes it, `nxterm` decides it landed on the bar, and only then does the request go
     //     out. A compositor that took its drag offset from the pointer *at the request* would
     //     lose whatever the pointer did in between — the window jumps by that much and then
-    //     tracks correctly, which is exactly the defect `TODO(scroll-grab)` describes. Every
+    //     tracks correctly, which is exactly the defect the `scroll-grab` deferral described. Every
     //     other step here waits for the guest between injections; this one deliberately does not,
     //     because a stationary pointer across that round trip measures zero drift where a person
     //     sees forty pixels (PR #247 review, finding 4).
@@ -6791,6 +6833,18 @@ impl Qmp {
                "data":{{"down":{down},"button":"{button}"}}}}]}}}}"#
         ))?;
         Ok(())
+    }
+
+    /// Turn the wheel one detent, up or down.
+    ///
+    /// **A button, not an axis**, which is QEMU's model rather than this one's: `wheel-up` and
+    /// `wheel-down` are `InputButton` values, and the PS/2 backend turns a press of one into a
+    /// signed `Z` in the packet it sends. The release is sent for symmetry and produces
+    /// nothing — QEMU decrements or increments its accumulator on the *down* edge only.
+    fn send_wheel(&mut self, down: bool) -> R<()> {
+        let button = if down { "wheel-down" } else { "wheel-up" };
+        self.send_button(button, true)?;
+        self.send_button(button, false)
     }
 
     /// Inject relative pointer motion.

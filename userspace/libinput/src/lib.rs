@@ -28,7 +28,7 @@
 use libkern::abi::{
     BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, EV_SYN, InputEvent, KEY_LEFTALT, KEY_LEFTCTRL,
     KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT,
-    REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
+    REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
 };
 use librsproto::surface::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
 
@@ -41,16 +41,33 @@ pub mod keymap;
 /// growing a buffer on its say-so.
 pub const MAX_LOGICAL: usize = 5;
 
-/// How large an `out` slice [`Interpreter::feed`] needs to lose nothing: **one more than
+/// How large an `out` slice [`Interpreter::feed`] needs to lose nothing: **two more than
 /// [`MAX_LOGICAL`]**.
 ///
-/// The accumulated motion is appended at flush time rather than queued, so a full group of
-/// transitions plus a motion is `MAX_LOGICAL + 1` events. A caller sizing its buffer to
-/// `MAX_LOGICAL` — as this crate's own tests did — silently loses the motion in exactly
-/// that case, which reads as a cursor that stops while keys are held.
-pub const MAX_PER_GROUP: usize = MAX_LOGICAL + 1;
+/// The accumulated motion and the accumulated wheel are appended at flush time rather than
+/// queued, so a full group of transitions plus both is `MAX_LOGICAL + 2` events. A caller
+/// sizing its buffer to `MAX_LOGICAL` — as this crate's own tests did — silently loses them in
+/// exactly that case, which reads as a cursor that stops while keys are held.
+///
+/// **It was `+ 1` until the wheel existed**, and that is the shape of mistake this constant is
+/// for: a mouse reports movement, buttons and the wheel in *one* packet, so the worst case grew
+/// the moment a fourth packet byte started producing events.
+pub const MAX_PER_GROUP: usize = MAX_LOGICAL + 2;
 
-/// One interpreted event — what happened, with the state that was true when it happened.
+/// One interpreted event — what happened, when, and the state that was true then.
+///
+/// ## Every variant carries `time_ns`, and it is the *interrupt's* time
+///
+/// The kernel stamps every [`InputEvent`] at the interrupt and this crate used to drop it, so
+/// the moment a button went down was unavailable anywhere above the compositor's input thread —
+/// and a client wanting one (a double click is two presses close in time) had to read its own
+/// clock when the press was *delivered*. That is a different number whenever anything queued in
+/// between, which the `press-time` deferral recorded until M14 Part I paid it off.
+///
+/// **On the event rather than beside it.** The obvious alternative — `feed` tells the caller
+/// nothing and the caller passes the record's time alongside each `Logical` it routes — costs
+/// no field and reintroduces the whole bug on the first edit that reaches for the `now` already
+/// in scope. A number that can be swapped for the wrong number silently will be.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Logical {
     /// A key or button transition, with the modifiers held at that moment.
@@ -61,6 +78,8 @@ pub enum Logical {
         pressed: bool,
         /// Modifiers held **at this transition**.
         modifiers: u16,
+        /// Kernel monotonic time at the interrupt. See the type's own docs.
+        time_ns: u64,
     },
     /// Pointer motion, as a **delta**. See the module docs on why it is not a position.
     Motion {
@@ -78,6 +97,12 @@ pub enum Logical {
         buttons: u16,
         /// Modifiers held during this motion — what makes a shift-drag expressible.
         modifiers: u16,
+        /// When the group this motion accumulated over was closed — its `SYN_REPORT`'s stamp.
+        ///
+        /// **The group's, because the motion is the group's**: a diagonal move is two records
+        /// summed into one event, and neither record's own time is more the answer than the
+        /// other's. They are microseconds apart in any case — one packet, one interrupt.
+        time_ns: u64,
     },
     /// A pointer button transition.
     Button {
@@ -89,13 +114,41 @@ pub enum Logical {
         buttons: u16,
         /// Modifiers held at this transition — what makes shift-click expressible.
         modifiers: u16,
+        /// Kernel monotonic time at the interrupt — **the press time a double click needs**.
+        time_ns: u64,
+    },
+    /// The wheel turned, as a **delta in detents**.
+    ///
+    /// **Its own variant rather than a third axis on [`Motion`](Self::Motion)**: a consumer
+    /// acts on the two completely differently — motion moves a cursor, a wheel scrolls
+    /// whatever is under it — and folding them together would make every motion handler test
+    /// a field it does not care about, with the failure being a window that scrolls whenever
+    /// the mouse is moved.
+    Wheel {
+        /// Detents, positive **down**. See `REL_WHEEL` for why that is the screen's sign
+        /// rather than Linux's.
+        dz: i32,
+        /// Buttons held while it turned, carried for [`Motion`](Self::Motion)'s reason.
+        buttons: u16,
+        /// Modifiers held while it turned — what makes Ctrl-scroll expressible.
+        modifiers: u16,
+        /// When the group this accumulated over was closed, as for [`Motion`](Self::Motion).
+        time_ns: u64,
     },
     /// Events were lost upstream; **accumulated state has been reset**.
     ///
     /// The consumer must discard whatever it believed about held keys and buttons. A
     /// consumer that ignores this carries a phantom held modifier for the rest of a session,
     /// which is exactly the failure `SYN_DROPPED` exists to prevent.
-    Dropped,
+    Dropped {
+        /// When the loss was reported.
+        ///
+        /// **A loss is a moment too**, and this one is load-bearing rather than decorative: a
+        /// consumer that synthesises anything on a drop — the compositor synthesises the
+        /// crossings a broken grab implies — has to stamp it with something, and the only
+        /// alternative is the clock it happens to read next.
+        time_ns: u64,
+    },
 }
 
 /// Every modifier key, and the mask bit it contributes to. Order fixes each key's slot in
@@ -160,6 +213,8 @@ pub struct Interpreter {
     /// Motion accumulated within the current group.
     dx: i32,
     dy: i32,
+    /// Wheel detents accumulated within the current group.
+    dz: i32,
     /// Key/button transitions seen in the current group, awaiting its `SYN`.
     pending: [Option<Logical>; MAX_LOGICAL],
     pending_n: usize,
@@ -173,6 +228,7 @@ impl Interpreter {
             buttons: 0,
             dx: 0,
             dy: 0,
+            dz: 0,
             pending: [None; MAX_LOGICAL],
             pending_n: 0,
         }
@@ -228,9 +284,15 @@ impl Interpreter {
                         pressed,
                         buttons: self.buttons,
                         modifiers,
+                        time_ns: e.time_ns,
                     });
                 } else {
-                    self.push(Logical::Key { keycode: e.code, pressed, modifiers });
+                    self.push(Logical::Key {
+                        keycode: e.code,
+                        pressed,
+                        modifiers,
+                        time_ns: e.time_ns,
+                    });
                 }
                 0
             }
@@ -238,7 +300,8 @@ impl Interpreter {
                 match e.code {
                     REL_X => self.dx += e.value,
                     REL_Y => self.dy += e.value,
-                    _ => {} // wheel and future axes: not interpreted yet
+                    REL_WHEEL => self.dz += e.value,
+                    _ => {} // future axes — a horizontal wheel, a dial
                 }
                 0
             }
@@ -249,14 +312,15 @@ impl Interpreter {
                 self.buttons = 0;
                 self.dx = 0;
                 self.dy = 0;
+                self.dz = 0;
                 self.pending_n = 0;
                 if out.is_empty() {
                     return 0;
                 }
-                out[0] = Logical::Dropped;
+                out[0] = Logical::Dropped { time_ns: e.time_ns };
                 1
             }
-            EV_SYN if e.code == SYN_REPORT => self.flush(out),
+            EV_SYN if e.code == SYN_REPORT => self.flush(e.time_ns, out),
             _ => 0,
         }
     }
@@ -270,8 +334,11 @@ impl Interpreter {
         }
     }
 
-    /// Emit the current group and reset it.
-    fn flush(&mut self, out: &mut [Logical]) -> usize {
+    /// Emit the current group and reset it, stamping what it accumulated with `time_ns`.
+    ///
+    /// The transitions were stamped when they arrived; only the accumulated motion is stamped
+    /// here, because only it was assembled from several records.
+    fn flush(&mut self, time_ns: u64, out: &mut [Logical]) -> usize {
         let mut n = 0;
         for slot in self.pending.iter_mut().take(self.pending_n) {
             if let Some(l) = slot.take()
@@ -288,11 +355,25 @@ impl Interpreter {
                 dy: self.dy,
                 buttons: self.buttons,
                 modifiers: self.modifiers(),
+                time_ns,
+            };
+            n += 1;
+        }
+        // **After the motion, and a separate event from it.** One packet can carry both — a
+        // hand resting on a mouse moves it while turning the wheel — and a consumer wants the
+        // cursor moved before it decides what the wheel turned *over*.
+        if self.dz != 0 && n < out.len() {
+            out[n] = Logical::Wheel {
+                dz: self.dz,
+                buttons: self.buttons,
+                modifiers: self.modifiers(),
+                time_ns,
             };
             n += 1;
         }
         self.dx = 0;
         self.dy = 0;
+        self.dz = 0;
         n
     }
 }
@@ -302,27 +383,36 @@ mod tests {
     use super::*;
     use libkern::abi::{KEY_ESC, KEY_PRESS, KEY_RELEASE};
 
+    /// The time every helper below stamps.
+    ///
+    /// **Nonzero deliberately.** With the helpers stamping zero, every assertion in this
+    /// module would read `time_ns: 0` and hold just as well for an interpreter that dropped
+    /// the field and defaulted it — the assertion would be decoration. One shared constant
+    /// makes each of them a check; `the_interrupts_own_time_reaches_each_event` is the one
+    /// that pins *which* record's time each event gets.
+    const T: u64 = 9_000_000_000;
+
     fn key(code: u16, down: bool) -> InputEvent {
         InputEvent {
             kind: EV_KEY,
             code,
             value: if down { KEY_PRESS } else { KEY_RELEASE },
-            time_ns: 0,
+            time_ns: T,
         }
     }
     fn rel(code: u16, v: i32) -> InputEvent {
-        InputEvent { kind: EV_REL, code, value: v, time_ns: 0 }
+        InputEvent { kind: EV_REL, code, value: v, time_ns: T }
     }
     fn syn() -> InputEvent {
-        InputEvent { kind: EV_SYN, code: SYN_REPORT, value: 0, time_ns: 0 }
+        InputEvent { kind: EV_SYN, code: SYN_REPORT, value: 0, time_ns: T }
     }
     fn dropped() -> InputEvent {
-        InputEvent { kind: EV_SYN, code: SYN_DROPPED, value: 7, time_ns: 0 }
+        InputEvent { kind: EV_SYN, code: SYN_DROPPED, value: 7, time_ns: T }
     }
 
     /// Feed a whole group and collect what it produced.
     fn group(i: &mut Interpreter, events: &[InputEvent]) -> ([Logical; MAX_PER_GROUP], usize) {
-        let mut out = [Logical::Dropped; MAX_PER_GROUP];
+        let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
         let mut n = 0;
         for &e in events {
             n = i.feed(e, &mut out);
@@ -335,7 +425,7 @@ mod tests {
         // The property the whole accumulator exists for: a `SYN` is what completes a logical
         // event, so acting on each record would double-report a diagonal move.
         let mut i = Interpreter::new();
-        let mut out = [Logical::Dropped; MAX_PER_GROUP];
+        let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
         assert_eq!(i.feed(key(KEY_ESC, true), &mut out), 0, "the key alone completes nothing");
         assert_eq!(i.feed(syn(), &mut out), 1, "the SYN does");
     }
@@ -349,13 +439,13 @@ mod tests {
         group(&mut i, &[key(BTN_LEFT, true), syn()]);
         let (out, n) = group(&mut i, &[rel(REL_X, 4), syn()]);
         assert_eq!(n, 1);
-        assert_eq!(out[0], Logical::Motion { dx: 4, dy: 0, buttons: 1, modifiers: 0 });
+        assert_eq!(out[0], Logical::Motion { dx: 4, dy: 0, buttons: 1, modifiers: 0, time_ns: T });
 
         let (out, _) = group(&mut i, &[key(KEY_LEFTSHIFT, true), rel(REL_X, 2), syn()]);
         let motion = out.iter().find(|l| matches!(l, Logical::Motion { .. })).expect("motion");
         assert_eq!(
             *motion,
-            Logical::Motion { dx: 2, dy: 0, buttons: 1, modifiers: MOD_SHIFT },
+            Logical::Motion { dx: 2, dy: 0, buttons: 1, modifiers: MOD_SHIFT, time_ns: T },
             "a shift-drag is expressible without the consumer tracking either"
         );
     }
@@ -365,7 +455,7 @@ mod tests {
         let mut i = Interpreter::new();
         let (out, n) = group(&mut i, &[rel(REL_X, 5), rel(REL_Y, -3), syn()]);
         assert_eq!(n, 1);
-        assert_eq!(out[0], Logical::Motion { dx: 5, dy: -3, buttons: 0, modifiers: 0 });
+        assert_eq!(out[0], Logical::Motion { dx: 5, dy: -3, buttons: 0, modifiers: 0, time_ns: T });
     }
 
     #[test]
@@ -376,7 +466,7 @@ mod tests {
         group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         let (out, n) = group(&mut i, &[key(30, true), syn()]);
         assert_eq!(n, 1);
-        assert_eq!(out[0], Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT });
+        assert_eq!(out[0], Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT, time_ns: T });
     }
 
     #[test]
@@ -387,7 +477,7 @@ mod tests {
         let (out, _) = group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         assert_eq!(
             out[0],
-            Logical::Key { keycode: KEY_LEFTSHIFT, pressed: true, modifiers: MOD_SHIFT }
+            Logical::Key { keycode: KEY_LEFTSHIFT, pressed: true, modifiers: MOD_SHIFT, time_ns: T }
         );
     }
 
@@ -397,7 +487,7 @@ mod tests {
         group(&mut i, &[key(KEY_LEFTCTRL, true), syn()]);
         assert_eq!(i.modifiers(), MOD_CTRL);
         let (out, _) = group(&mut i, &[key(KEY_LEFTCTRL, false), syn()]);
-        assert_eq!(out[0], Logical::Key { keycode: KEY_LEFTCTRL, pressed: false, modifiers: 0 });
+        assert_eq!(out[0], Logical::Key { keycode: KEY_LEFTCTRL, pressed: false, modifiers: 0, time_ns: T });
         assert_eq!(i.modifiers(), 0);
     }
 
@@ -418,7 +508,7 @@ mod tests {
         let (out, _) = group(&mut i, &[key(30, true), syn()]);
         assert_eq!(
             out[0],
-            Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT },
+            Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT, time_ns: T },
             "so a key typed now is still shifted"
         );
 
@@ -458,6 +548,7 @@ mod tests {
                 pressed: true,
                 buttons: 1,
                 modifiers: MOD_SHIFT,
+                time_ns: T,
             },
             "shift-click is expressible only because both travel together"
         );
@@ -492,64 +583,107 @@ mod tests {
         assert_eq!(i.buttons(), 1);
 
         let mut out =
-            [Logical::Key { keycode: 0, pressed: false, modifiers: 0 }; MAX_PER_GROUP];
+            [Logical::Key { keycode: 0, pressed: false, modifiers: 0, time_ns: T }; MAX_PER_GROUP];
         assert_eq!(i.feed(dropped(), &mut out), 1);
-        assert_eq!(out[0], Logical::Dropped);
+        assert_eq!(out[0], Logical::Dropped { time_ns: T });
         assert_eq!(i.modifiers(), 0, "held keys across a gap are a guess");
         assert_eq!(i.buttons(), 0);
     }
 
+    /// Everything one packet can carry at once — five transitions, a motion and a wheel.
+    ///
+    /// The two accumulated events are appended at flush rather than queued, so they do not
+    /// compete with the transitions for `MAX_LOGICAL` slots and need the two extra ones.
+    /// Sized short, they are what falls off the end — and a cursor that freezes while three
+    /// buttons are held is a maddening bug to find from the symptom.
     #[test]
-    fn a_full_group_plus_motion_needs_the_whole_max_per_group() {
-        // Motion is appended at flush rather than queued, so it does not compete with the
-        // transitions for `MAX_LOGICAL` slots — it needs the extra one. Sized at
-        // `MAX_LOGICAL` this loses the motion, and a cursor that freezes while three
-        // buttons are held is a maddening bug to find from the symptom.
+    fn a_full_group_plus_motion_and_a_wheel_needs_the_whole_max_per_group() {
+        const GROUP: [fn() -> InputEvent; 7] = [
+            || key(BTN_LEFT, true),
+            || key(BTN_RIGHT, true),
+            || key(BTN_MIDDLE, true),
+            || key(KEY_LEFTSHIFT, true),
+            || key(KEY_LEFTCTRL, true),
+            || rel(REL_X, 7),
+            || rel(REL_WHEEL, -2),
+        ];
         let mut i = Interpreter::new();
-        let mut out = [Logical::Dropped; MAX_PER_GROUP];
-        for e in [
-            key(BTN_LEFT, true),
-            key(BTN_RIGHT, true),
-            key(BTN_MIDDLE, true),
-            key(KEY_LEFTSHIFT, true),
-            key(KEY_LEFTCTRL, true),
-            rel(REL_X, 7),
-        ] {
-            i.feed(e, &mut out);
+        let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
+        for e in GROUP {
+            i.feed(e(), &mut out);
         }
         let n = i.feed(syn(), &mut out);
-        assert_eq!(n, MAX_PER_GROUP, "five transitions and the motion");
+        assert_eq!(n, MAX_PER_GROUP, "five transitions, the motion and the wheel");
         assert_eq!(
-            out[MAX_PER_GROUP - 1],
-            Logical::Motion { dx: 7, dy: 0, buttons: 7, modifiers: MOD_SHIFT | MOD_CTRL },
+            out[MAX_PER_GROUP - 2],
+            Logical::Motion { dx: 7, dy: 0, buttons: 7, modifiers: MOD_SHIFT | MOD_CTRL, time_ns: T },
             "and it carries the state the same group established"
         );
+        assert_eq!(
+            out[MAX_PER_GROUP - 1],
+            Logical::Wheel { dz: -2, buttons: 7, modifiers: MOD_SHIFT | MOD_CTRL, time_ns: T },
+            "the wheel carries it too — Ctrl-scroll is a gesture, and it is one event"
+        );
 
-        let mut small = [Logical::Dropped; MAX_LOGICAL];
-        for e in [
-            key(BTN_LEFT, true),
-            key(BTN_RIGHT, true),
-            key(BTN_MIDDLE, true),
-            key(KEY_LEFTSHIFT, true),
-            key(KEY_LEFTCTRL, true),
-            rel(REL_X, 7),
-        ] {
-            i.feed(e, &mut small);
+        let mut small = [Logical::Dropped { time_ns: T }; MAX_LOGICAL];
+        for e in GROUP {
+            i.feed(e(), &mut small);
         }
         let n = i.feed(syn(), &mut small);
-        assert_eq!(n, MAX_LOGICAL, "and one short, the motion is what falls off the end");
-        assert!(!small.iter().any(|l| matches!(l, Logical::Motion { .. })));
+        assert_eq!(n, MAX_LOGICAL, "and two short, the accumulated events fall off the end");
+        assert!(!small.iter().any(|l| matches!(l, Logical::Motion { .. } | Logical::Wheel { .. })));
+    }
+
+    /// A wheel is its own event, not a third axis on the motion.
+    ///
+    /// **Both in one group, which is what a real packet looks like**: a hand resting on a
+    /// mouse moves it while turning the wheel, and an implementation that folded the two
+    /// together would make every motion handler scroll.
+    #[test]
+    fn a_wheel_is_a_separate_event_from_the_motion_in_the_same_group() {
+        let mut i = Interpreter::new();
+        let (out, n) = group(&mut i, &[rel(REL_X, 2), rel(REL_WHEEL, 1), syn()]);
+        assert_eq!(n, 2);
+        assert_eq!(out[0], Logical::Motion { dx: 2, dy: 0, buttons: 0, modifiers: 0, time_ns: T });
+        assert_eq!(out[1], Logical::Wheel { dz: 1, buttons: 0, modifiers: 0, time_ns: T });
+    }
+
+    /// Detents within one group are summed, and a group with none emits nothing.
+    #[test]
+    fn wheel_detents_accumulate_within_a_group_and_a_still_wheel_is_not_an_event() {
+        let mut i = Interpreter::new();
+        let (out, n) = group(&mut i, &[rel(REL_WHEEL, 1), rel(REL_WHEEL, 2), syn()]);
+        assert_eq!(n, 1);
+        assert_eq!(out[0], Logical::Wheel { dz: 3, buttons: 0, modifiers: 0, time_ns: T });
+
+        let (_, n) = group(&mut i, &[rel(REL_WHEEL, 0), syn()]);
+        assert_eq!(n, 0, "a zero delta is not an event, as for motion");
+
+        // And the accumulator was reset by the flush, or the next group would re-report it.
+        let (_, n) = group(&mut i, &[key(30, true), syn()]);
+        assert_eq!(n, 1, "the key alone");
+    }
+
+    /// A loss discards accumulated detents rather than re-emitting them afterwards.
+    #[test]
+    fn a_drop_discards_a_wheel_the_group_had_accumulated() {
+        let mut i = Interpreter::new();
+        let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
+        i.feed(rel(REL_WHEEL, 4), &mut out); // no SYN yet
+        i.feed(dropped(), &mut out);
+        let (_, n) = group(&mut i, &[syn()]);
+        assert_eq!(n, 0, "the interrupted group's detents did not survive the gap");
     }
 
     #[test]
     fn a_partial_group_interrupted_by_a_drop_does_not_leak_into_the_next() {
         let mut i = Interpreter::new();
-        let mut out = [Logical::Dropped; MAX_PER_GROUP];
+        let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
         i.feed(key(30, true), &mut out); // no SYN yet
         i.feed(dropped(), &mut out);
         let (out2, n) = group(&mut i, &[key(31, true), syn()]);
         assert_eq!(n, 1, "only the new group's key");
-        assert_eq!(out2[0], Logical::Key { keycode: 31, pressed: true, modifiers: 0 });
+        assert_eq!(out2[0], Logical::Key { keycode: 31, pressed: true, modifiers: 0, time_ns: T });
     }
 
     #[test]
@@ -557,5 +691,40 @@ mod tests {
         let mut i = Interpreter::new();
         let (_, n) = group(&mut i, &[rel(REL_X, 0), rel(REL_Y, 0), syn()]);
         assert_eq!(n, 0, "a zero delta is not an event");
+    }
+
+    /// Each event carries the time of the record that produced it, not the group's last.
+    ///
+    /// **The times are made different on purpose**, which the helpers above cannot do: they
+    /// stamp one constant, so every assertion in this module holds equally for an interpreter
+    /// that took the `SYN`'s time for everything. This is the one that tells those apart — a
+    /// transition keeps the stamp of *its own* interrupt, and only the accumulated motion,
+    /// which is several records added together, takes the group's closing time.
+    #[test]
+    fn the_interrupts_own_time_reaches_each_event() {
+        let at = |mut e: InputEvent, t: u64| {
+            e.time_ns = t;
+            e
+        };
+        let mut i = Interpreter::new();
+        let mut out = [Logical::Dropped { time_ns: 0 }; MAX_PER_GROUP];
+        i.feed(at(key(BTN_LEFT, true), 100), &mut out);
+        i.feed(at(rel(REL_X, 3), 200), &mut out);
+        let n = i.feed(at(syn(), 300), &mut out);
+        assert_eq!(n, 2);
+        assert_eq!(
+            out[0],
+            Logical::Button { button: BTN_LEFT, pressed: true, buttons: 1, modifiers: 0, time_ns: 100 },
+            "the button kept the moment it was pressed, not the moment the group closed"
+        );
+        assert_eq!(
+            out[1],
+            Logical::Motion { dx: 3, dy: 0, buttons: 1, modifiers: 0, time_ns: 300 },
+            "the motion is the group's, so it takes the group's time"
+        );
+
+        // And a loss is a moment as well — the compositor stamps what it synthesises with it.
+        assert_eq!(i.feed(at(dropped(), 400), &mut out), 1);
+        assert_eq!(out[0], Logical::Dropped { time_ns: 400 });
     }
 }

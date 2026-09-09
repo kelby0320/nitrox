@@ -520,6 +520,11 @@ pub struct App {
     /// **Fed by the binary**, which is the only half that can read a clock — see
     /// [`App::note_press`] and `libui::click`.
     clicks: libui::click::Clicks,
+    /// Where within the thumb the scrollbar was taken hold of — see
+    /// [`ScrollGrab`](libui::widget::ScrollGrab).
+    ///
+    /// **One per window rather than one per pane**, because a grab is: one button, one drag.
+    scroll_grab: libui::widget::ScrollGrab,
     /// What number the press being routed now is in its run; `1` unless a run is under way.
     click_run: u32,
     /// The modifiers held at that press — what makes Ctrl-click and Shift-click expressible.
@@ -751,8 +756,10 @@ pub enum Msg {
     Grab(u64),
     /// The "up" control was pressed.
     Up,
-    /// The scrollbar is being dragged — see [`ListState::drag_to`].
+    /// A pointer event over the scrollbar — see [`ScrollGrab`](libui::widget::ScrollGrab).
     Scroll(PointerEvent),
+    /// The wheel turned over the listing — see [`ListState::wheel`].
+    Wheel(PointerEvent),
     /// A key reached the window.
     Key(KeyEvent),
     /// The title bar was dragged.
@@ -814,6 +821,7 @@ impl App {
             properties: None,
             location: None,
             clicks: libui::click::Clicks::new(),
+            scroll_grab: libui::widget::ScrollGrab::new(),
             click_run: 1,
             click_mods: 0,
             next_key: TAB_KEY_BASE + 1,
@@ -1061,15 +1069,22 @@ impl App {
                     .and_then(|i| self.pane().entries.get(i))
                     .map(|e| (e.name.clone(), 0, 0));
             }
-            // **The drag converts through the widget's own arithmetic** — `ListState::drag_to`,
-            // the same `ScrollState::offset_at` `nxterm` uses for its grid — so a list and a
-            // terminal cannot disagree about where a thumb points (M11 Part E batch 6).
+            // **The drag converts through the widget's own arithmetic** — `ListState::bar` and
+            // `ScrollGrab`, the same pair `nxterm` uses for its grid — so a list and a terminal
+            // cannot disagree about where a thumb points (M11 Part E batch 6), nor about what
+            // taking hold of one means (M14 Part I).
             Msg::Scroll(p) => {
-                if p.buttons != 0 {
-                    let (h, total) = (self.list_h(), self.pane().entries.len());
-                    self.pane_mut().list.drag_to(h, ROW_H, total, p.y);
+                let (h, total) = (self.list_h(), self.pane().entries.len());
+                let bar = self.pane().list.bar(h, ROW_H, total);
+                if let Some(offset) = self.scroll_grab.apply(bar, h, p) {
+                    self.pane_mut().list.offset = offset as usize;
                 }
             }
+            // **The same conversion the terminal does, from the widget that owns it**
+            // (M14 Part I). `list_view` clamps the offset against the rows it is given on the
+            // next build, so this does not need the count — and a second clamp here is how a
+            // list ends up unable to reach its last row.
+            Msg::Wheel(p) => self.pane_mut().list.wheel(p.wheel),
             Msg::Up => {
                 let up = parent(&self.pane().path);
                 // The root is its own parent, so this is a no-op there rather than an error —
@@ -2313,7 +2328,12 @@ impl App {
             Some(Msg::Scroll),
             highlight,
             &ui,
-        );
+        )
+        // **On the element the widget returns, rather than through a tenth parameter.** A
+        // wheel bubbles to the nearest `on_wheel`, and `list_view`'s outermost node is exactly
+        // the region a person means by "over the list" — rows and scrollbar both. The widget
+        // needs to know nothing about it (M14 Part I).
+        .on_wheel(Msg::Wheel);
 
         let body = window_frame(
             title,
@@ -4481,6 +4501,46 @@ mod tests {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// The wheel scrolls the listing, **through the real tree and router**.
+    ///
+    /// **The wiring is the thing under test.** `ListState::wheel` is `libui`'s and tested there;
+    /// what only this can say is that the element `list_view` returns carries an `on_wheel` at
+    /// all — delete the one line and every other test in this file stays green while the
+    /// browser silently stops scrolling.
+    #[test]
+    fn the_wheel_scrolls_the_listing() {
+        let mut a = app();
+        // More rows than fit, or there is nothing to scroll and the offset clamps back to zero.
+        a.show("/home", (0..80).map(|i| Entry::file(&alloc::format!("f{i}"))).collect());
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let theme = UiTheme::default();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("the view is diffable");
+        let mut router = libui::route::Router::new();
+
+        let ev = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_WHEEL,
+            wheel: 2,
+            // Over the middle of the window, which is the listing.
+            x: (size.w / 2) as i32,
+            y: (size.h / 2) as i32,
+            ..Default::default()
+        };
+        let (msgs, _) = router.pointer(&tree, &e, &l, ev);
+        assert!(!msgs.is_empty(), "nothing over the listing took the wheel");
+        for m in msgs {
+            a.update(m);
+        }
+        assert_eq!(
+            a.pane().list.offset,
+            2 * libui::click::WHEEL_UNITS as usize,
+            "two detents down is two detents' worth of rows"
+        );
     }
 
     /// A click on the menu bar opens the menu even when its two halves fall in different frames.

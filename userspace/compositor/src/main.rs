@@ -1175,7 +1175,7 @@ fn route_one_batch(
             let Some(ev) = InputEvent::read(raw) else {
                 continue;
             };
-            let mut logical = [libinput::Logical::Dropped; libinput::MAX_PER_GROUP];
+            let mut logical = [libinput::Logical::Dropped { time_ns: 0 }; libinput::MAX_PER_GROUP];
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
                 let routed = srv.router.route(l, &mut srv.stack, out);
@@ -1290,7 +1290,7 @@ fn route_one_batch(
                 let diag = meta_change.is_some()
                     || matches!(
                         *l,
-                        libinput::Logical::Button { .. } | libinput::Logical::Dropped
+                        libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. }
                     );
                 // Already inside the enclosing `unsafe` block, so no inner one: the
                 // justification is that this is a single-threaded server and the counter is
@@ -1316,7 +1316,7 @@ fn route_one_batch(
                         // local run), so the absence is real rather than truncation. No
                         // `SYN_DROPPED` either, so the ring did not overflow: the event went
                         // missing below this, not above it.
-                        libinput::Logical::Dropped => {
+                        libinput::Logical::Dropped { .. } => {
                             pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
                         }
                         _ => {
@@ -1353,7 +1353,7 @@ fn route_one_batch(
                 // second after that — bypassing the router entirely, since `fire_repeat` enqueues
                 // straight to the focused session. Holding `Super+1` while already on desktop 1
                 // filled the terminal with `1`s (PR #241 review, blocking 1).
-                if let libinput::Logical::Key { keycode, pressed, modifiers } = *l
+                if let libinput::Logical::Key { keycode, pressed, modifiers, .. } = *l
                     && !routed.consumed
                 {
                     srv.repeat = compositor::Repeat::after_key(
@@ -1367,7 +1367,7 @@ fn route_one_batch(
                 }
                 // A `SYN_DROPPED` means the held-key set is a guess, so a repeat started
                 // from it is too — `libinput` has already reset what it accumulated.
-                if matches!(l, libinput::Logical::Dropped) {
+                if matches!(l, libinput::Logical::Dropped { .. }) {
                     srv.repeat = None;
                 }
             }

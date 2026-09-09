@@ -756,6 +756,8 @@ pub const POINTER_BUTTON: u16 = 1;
 pub const POINTER_ENTER: u16 = 2;
 /// The pointer left this window.
 pub const POINTER_LEAVE: u16 = 3;
+/// The wheel turned; `wheel` says by how much and which way.
+pub const POINTER_WHEEL: u16 = 4;
 
 /// `POINTER_BUTTON` flag: the button went down. Absent means it came up.
 pub const POINTER_PRESSED: u16 = 1 << 0;
@@ -793,15 +795,44 @@ pub struct PointerEvent {
     /// it right only while it also held keyboard focus, so shift-clicking an unfocused
     /// window would silently behave as a plain click (PR #180 review, finding 3).
     pub modifiers: u16,
-    /// Reserved; zero.
-    pub _pad: u16,
+    /// Wheel detents on `POINTER_WHEEL`, otherwise zero. **Positive is down.**
+    ///
+    /// The same direction [`y`](Self::y) grows in, and the same direction Wayland's
+    /// `wl_pointer.axis` is positive in, so a client adding this to a scroll offset needs no
+    /// sign of its own. The device layer's `REL_WHEEL` is positive-down for the same reason —
+    /// see `rsproto-input-ops.md`, where the deviation from Linux's opposite convention is
+    /// stated rather than left to be discovered.
+    ///
+    /// **A count, not a distance.** One detent is one, and a client decides what a detent is
+    /// worth — three lines in a terminal, a row in a list. Several can arrive at once when the
+    /// device reports faster than the compositor sends.
+    ///
+    /// This took the record's two reserved bytes, which is what they were reserved for.
+    pub wheel: i16,
     /// Window-local x.
     pub x: i32,
     /// Window-local y.
     pub y: i32,
+    /// Monotonic milliseconds **at the interrupt** that produced this event.
+    ///
+    /// **Not when the client received it**, which is the whole reason the field exists. A
+    /// double click is two presses close in time, and a client with no timestamp has to read
+    /// its own clock at delivery — so a client stalled between two *deliberate* single clicks
+    /// receives them closer together than they were made and reads them as a double. Delivery
+    /// cannot pull events further apart than a stall bunched them, so the error runs one way
+    /// only, which is why this was deferred (`press-time`) rather than blocking; it is
+    /// paid off here because the wheel wanted the same record widened.
+    ///
+    /// **Milliseconds, and 64 bits.** The kernel stamps nanoseconds and the compositor divides
+    /// once, because a client that has to divide is a client that can forget to — and passing
+    /// nanoseconds to a double-click interval expressed in milliseconds fails *silently*, as a
+    /// desktop where double click stopped working. X11 and Wayland both carry milliseconds and
+    /// both carry 32 of them, which wraps every 49 days and makes every toolkit special-case
+    /// it; there is no reason to inherit that.
+    pub time_ms: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<PointerEvent>() == 24);
+const _: () = assert!(core::mem::size_of::<PointerEvent>() == 32);
 
 /// This window gained or lost the keyboard.
 ///
@@ -2217,9 +2248,13 @@ impl KeyEvent {
 }
 
 impl PointerEvent {
-    /// A pointer record for `window` at window-local `(x, y)`.
+    /// A pointer record for `window` at window-local `(x, y)`, `time_ms` into the clock.
     ///
-    /// A constructor for the same reason [`KeyEvent::new`] is one.
+    /// A constructor for the same reason [`KeyEvent::new`] is one. **The time is an argument
+    /// rather than a builder** — every record has one, and a defaulted timestamp is a record
+    /// stamped zero that reads as "the beginning of time" to anything comparing two of them.
+    /// The wheel is the builder ([`with_wheel`](Self::with_wheel)), because only one kind
+    /// carries it.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         window: u32,
@@ -2230,13 +2265,19 @@ impl PointerEvent {
         modifiers: u16,
         x: i32,
         y: i32,
+        time_ms: u64,
     ) -> Self {
-        Self { window, kind, button, buttons, flags, modifiers, _pad: 0, x, y }
+        Self { window, kind, button, buttons, flags, modifiers, wheel: 0, x, y, time_ms }
     }
 
-    /// Serialise into exactly 24 little-endian bytes.
+    /// The same record, carrying `wheel` detents.
+    pub const fn with_wheel(self, wheel: i16) -> Self {
+        Self { wheel, ..self }
+    }
+
+    /// Serialise into exactly 32 little-endian bytes.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < 24 {
+        if out.len() < 32 {
             return None;
         }
         out[0..4].copy_from_slice(&self.window.to_le_bytes());
@@ -2245,15 +2286,16 @@ impl PointerEvent {
         out[8..10].copy_from_slice(&self.buttons.to_le_bytes());
         out[10..12].copy_from_slice(&self.flags.to_le_bytes());
         out[12..14].copy_from_slice(&self.modifiers.to_le_bytes());
-        out[14..16].copy_from_slice(&0u16.to_le_bytes());
+        out[14..16].copy_from_slice(&self.wheel.to_le_bytes());
         out[16..20].copy_from_slice(&self.x.to_le_bytes());
         out[20..24].copy_from_slice(&self.y.to_le_bytes());
-        Some(24)
+        out[24..32].copy_from_slice(&self.time_ms.to_le_bytes());
+        Some(32)
     }
 
-    /// Parse from exactly 24 little-endian bytes.
+    /// Parse from exactly 32 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 24 {
+        if b.len() < 32 {
             return None;
         }
         Some(Self {
@@ -2263,9 +2305,12 @@ impl PointerEvent {
             buttons: u16::from_le_bytes([b[8], b[9]]),
             flags: u16::from_le_bytes([b[10], b[11]]),
             modifiers: u16::from_le_bytes([b[12], b[13]]),
-            _pad: 0,
+            wheel: i16::from_le_bytes([b[14], b[15]]),
             x: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
             y: i32::from_le_bytes([b[20], b[21], b[22], b[23]]),
+            time_ms: u64::from_le_bytes([
+                b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31],
+            ]),
         })
     }
 }
@@ -2602,8 +2647,10 @@ mod tests {
             MOD_SHIFT | MOD_CTRL,
             -3,
             -4,
-        );
-        let mut b = [0u8; 24];
+            0x0102_0304_0506_0708,
+        )
+        .with_wheel(-2);
+        let mut b = [0u8; 32];
         e.write(&mut b).unwrap();
         assert_eq!(&b[0..4], &0x4142_4344u32.to_le_bytes(), "window @0");
         assert_eq!(&b[4..6], &POINTER_BUTTON.to_le_bytes(), "kind @4");
@@ -2611,11 +2658,30 @@ mod tests {
         assert_eq!(&b[8..10], &0x2122u16.to_le_bytes(), "buttons @8");
         assert_eq!(&b[10..12], &POINTER_PRESSED.to_le_bytes(), "flags @10");
         assert_eq!(&b[12..14], &(MOD_SHIFT | MOD_CTRL).to_le_bytes(), "modifiers @12");
-        assert_eq!(&b[14..16], &0u16.to_le_bytes(), "reserved @14, zero");
+        assert_eq!(&b[14..16], &(-2i16).to_le_bytes(), "wheel @14, signed");
         assert_eq!(&b[16..20], &(-3i32).to_le_bytes(), "x @16, signed");
         assert_eq!(&b[20..24], &(-4i32).to_le_bytes(), "y @20, signed");
+        assert_eq!(&b[24..32], &0x0102_0304_0506_0708u64.to_le_bytes(), "time_ms @24");
         assert_eq!(PointerEvent::read(&b), Some(e));
-        assert!(PointerEvent::read(&b[..23]).is_none(), "23 bytes is not a pointer record");
+        assert!(PointerEvent::read(&b[..31]).is_none(), "31 bytes is not a pointer record");
+    }
+
+    /// The reader takes the wheel and the time from the bytes, rather than defaulting them.
+    ///
+    /// **Handed bytes a correct writer would not produce**, which is the only way to test a
+    /// reader: a round trip through `write` passes for a `read` that returned `wheel: 0` and
+    /// `time_ms: 0` whenever the writer happened to be given zeros, and the compositor's
+    /// records carry zero in one field or the other most of the time.
+    #[test]
+    fn a_pointer_record_reads_its_wheel_and_its_clock_from_the_wire() {
+        let mut b = [0u8; 32];
+        b[4..6].copy_from_slice(&POINTER_WHEEL.to_le_bytes());
+        b[14..16].copy_from_slice(&(-1i16).to_le_bytes());
+        b[24..32].copy_from_slice(&12_345u64.to_le_bytes());
+        let e = PointerEvent::read(&b).expect("32 bytes is a pointer record");
+        assert_eq!(e.kind, POINTER_WHEEL);
+        assert_eq!(e.wheel, -1, "the wheel is signed on the way in as well as out");
+        assert_eq!(e.time_ms, 12_345);
     }
 
     #[test]

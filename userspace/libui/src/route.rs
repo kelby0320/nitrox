@@ -32,7 +32,8 @@ use alloc::vec::Vec;
 
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_PRESSED, PointerEvent,
+    KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_PRESSED, POINTER_WHEEL,
+    PointerEvent,
 };
 
 use crate::diff::{Tree, Widget};
@@ -358,6 +359,7 @@ impl Router {
         let at = Point::new(event.x, event.y);
         let pressed = event.kind == POINTER_BUTTON && event.flags & POINTER_PRESSED != 0;
         let released = event.kind == POINTER_BUTTON && event.flags & POINTER_PRESSED == 0;
+        let wheel = event.kind == POINTER_WHEEL;
 
         // **The press decides the capture, from where the cursor is.** Anything else and a
         // drag that leaves the widget stops being that widget's drag.
@@ -417,7 +419,13 @@ impl Router {
         // brought it in. Suppressed while captured, for the compositor's own reason: telling
         // a widget the cursor left while it is still receiving that cursor's events is two
         // contradictory statements at once.
-        if self.capture.is_none() {
+        //
+        // **And suppressed for a wheel**, which moved no cursor: a scroll is not a crossing,
+        // and the compositor makes the same call one layer down — its `Logical::Wheel` arm
+        // does not run `update_crossing` either. Without this a wheel arriving before any
+        // motion (a tree built under a cursor already resting on it) hands the widget an enter
+        // it did not cross into.
+        if self.capture.is_none() && !wheel {
             // The cursor leaving the window leaves every widget in it, wherever the last
             // coordinates happened to point.
             let now = if left_window { None } else { hit_test(tree.root(), layout, at) };
@@ -451,6 +459,21 @@ impl Router {
                     has(e).then_some((n, e))
                 })
             };
+
+            // **The wheel goes to `on_wheel` and nowhere else**, walking up until something
+            // claims it. A widget that merely tracks the cursor must not swallow a scroll it
+            // has no opinion about — see [`Element::on_wheel`].
+            if wheel {
+                if let Some((n, e)) = nearest(&|e: &Element<Msg>| e.on_wheel.is_some())
+                    && let Some(f) = e.on_wheel
+                    && let Some(l) = layout_at(layout, &path[..n])
+                {
+                    out.push(f(localise(event, l.rect)));
+                }
+                // Nothing below applies: a wheel is not a press, not a release, and moved no
+                // cursor, so it opens no capture, fires no click and changes no focus.
+                return (out, target);
+            }
 
             if !window_crossing
                 && let Some((n, e)) = nearest(&|e: &Element<Msg>| e.on_pointer.is_some())
@@ -593,13 +616,20 @@ impl Router {
         // The state that was true when the cursor crossed, from the event that moved it —
         // a crossing has no buttons or modifiers of its own, and inventing zeroes would tell
         // a widget the button it is about to be dragged with is not held.
+        //
+        // **The wheel is zeroed with `button` and `flags`**, and for the same reason: those are
+        // about the *transition*, and a crossing is not the transition that caused it. Carried
+        // through, a crossing provoked by a wheel event would arrive at a widget claiming
+        // detents of its own, and the widget would scroll twice for one turn. The time is
+        // carried, because "when did the cursor enter" has the same answer as "when did the
+        // event that moved it happen".
         let ev = PointerEvent {
             kind,
             button: 0,
             buttons: cause.buttons,
             flags: 0,
             modifiers: cause.modifiers,
-            _pad: 0,
+            wheel: 0,
             ..localise(cause, l.rect)
         };
         out.push(f(ev));
@@ -754,6 +784,7 @@ mod tests {
         Pressed(u8),
         Key(KeyEvent),
         Ptr(PointerEvent),
+        Wheel(PointerEvent),
     }
 
     /// Lay out and diff, returning the tree and layout the router works against.
@@ -1517,5 +1548,83 @@ mod tests {
             })
             .expect("a motion");
         assert_eq!(m.x, -100, "100px left of the captured widget's left edge");
+    }
+
+    // ---- the wheel (M14 Part I) ----
+
+    fn turn(x: i32, y: i32, dz: i16) -> PointerEvent {
+        PointerEvent {
+            kind: librsproto::surface::POINTER_WHEEL,
+            wheel: dz,
+            x,
+            y,
+            ..Default::default()
+        }
+    }
+
+    /// A wheel walks up to the nearest `on_wheel`, past widgets that only track the pointer.
+    ///
+    /// **The whole reason the wheel is not an `on_pointer` kind.** The thing under the cursor
+    /// is a row; the thing that scrolls is the pane around it. If the row's `on_pointer` — which
+    /// exists for hover — claimed the wheel, the pane would never see it and the list would not
+    /// scroll, with nothing to say why.
+    #[test]
+    fn a_wheel_bubbles_past_a_pointer_handler_to_the_nearest_wheel_handler() {
+        let e: Element<Msg> = sized(Size::new(400, 400), stack(vec![
+            sized(Size::new(200, 200), custom(1, Size::new(0, 0))).on_pointer(Msg::Ptr),
+        ]))
+        .on_wheel(Msg::Wheel);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+
+        let (msgs, _) = r.pointer(&t, &e, &l, turn(50, 60, 2));
+        assert_eq!(msgs.len(), 1, "exactly one handler took it");
+        let Msg::Wheel(p) = &msgs[0] else { panic!("the wheel handler, not the pointer one") };
+        assert_eq!(p.wheel, 2);
+        assert_eq!((p.x, p.y), (50, 60), "widget-local, like every other record");
+    }
+
+    /// `on_pointer` never sees a wheel, even with no `on_wheel` anywhere above it.
+    ///
+    /// **The negative half, and it is the one that would rot.** Delivering the wheel to
+    /// `on_pointer` as well "so nothing is lost" is the obvious kindness, and it is what makes
+    /// a widget scroll twice — once from its own handler and once from the pane's.
+    #[test]
+    fn a_pointer_handler_never_receives_a_wheel() {
+        let e: Element<Msg> =
+            sized(Size::new(400, 400), custom(1, Size::new(0, 0))).on_pointer(Msg::Ptr);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        let (msgs, _) = r.pointer(&t, &e, &l, turn(10, 10, 1));
+        assert!(msgs.is_empty(), "a tree with no wheel handler scrolls nothing: {msgs:?}");
+    }
+
+    /// A wheel is not a press: no capture, no click, no focus change.
+    ///
+    /// Each of those is a separate branch of `pointer`, and each would fire on a record whose
+    /// `flags` and `buttons` are zero only by accident of what a wheel record contains.
+    #[test]
+    fn a_wheel_opens_no_gesture_and_moves_no_focus() {
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(200, 480), custom(1, Size::new(0, 0)).on_key(|k| Some(Msg::Key(k)))),
+            sized(Size::new(200, 480), custom(2, Size::new(0, 0)))
+                .on_press(Msg::Pressed(9))
+                .on_wheel(Msg::Wheel),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        // Focus the first widget by clicking it, so the wheel has something to steal.
+        r.pointer(&t, &e, &l, press(10, 10));
+        r.pointer(&t, &e, &l, release(10, 10));
+        let focused = r.focused();
+        assert!(focused.is_some(), "precondition: the keyboard is somewhere");
+
+        let (msgs, _) = r.pointer(&t, &e, &l, turn(300, 10, 1));
+        assert!(matches!(msgs.as_slice(), [Msg::Wheel(_)]), "only the wheel: {msgs:?}");
+        assert_eq!(r.focused(), focused, "scrolling over a widget must not take the keyboard");
+
+        // And no capture was opened: a release now is not the second half of anything.
+        let (msgs, _) = r.pointer(&t, &e, &l, release(300, 10));
+        assert!(!msgs.contains(&Msg::Pressed(9)), "a wheel became half a click: {msgs:?}");
     }
 }

@@ -25,7 +25,7 @@ use libdraw::geom::Size;
 // they all share; `libui::paint::Theme` names the same type for the painting half.
 pub use libdraw::theme::Theme;
 
-use librsproto::surface::PointerEvent;
+use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
     Edge, Element, IconKind, Insets, bevel, column, dock, docked, fill, icon, padding, row, sized,
@@ -449,15 +449,31 @@ impl ScrollState {
     /// was a picture of a scrollbar. The terminal is the first thing to want to *use* one,
     /// which is the milestone rule working as intended — see the decision log, 2026-08-12.
     ///
-    /// **The thumb's centre rather than its top**, so that clicking a spot on the track jumps
-    /// to it and a drag holds the thumb under the cursor. It follows that a grab anywhere on
-    /// the thumb re-centres it — the small jump every toolkit without a grab *offset* has, and
-    /// removing it needs interaction state the toolkit does not yet keep (`TODO(scroll-grab)`).
+    /// **The thumb's centre rather than its top**, which is what "jump to here" means for a
+    /// press on the *track*. It is the wrong answer for a press on the **thumb** — that
+    /// re-centres a thumb the person grabbed by its end, so it jumps before the drag begins —
+    /// and [`ScrollGrab`] is what tells the two presses apart. This is the track half.
     ///
     /// `y` is signed because a drag routinely leaves the widget: the router hands a captured
     /// widget negative coordinates rather than clamping, and this clamps at the ends instead —
     /// which is what makes dragging past the bottom stay at the bottom.
     pub fn offset_at(&self, track: u32, y: i32) -> u32 {
+        let (_, len) = self.thumb(track);
+        self.offset_for_thumb_top(track, y - len as i32 / 2)
+    }
+
+    /// The offset that puts the thumb's **top** at `top` pixels down a track of `track`.
+    ///
+    /// [`thumb`](Self::thumb)'s inverse, and the half M4 did not ship: the toolkit could say
+    /// where a thumb goes for a given offset but not what offset a grab means, so a scrollbar
+    /// was a picture of a scrollbar. The terminal is the first thing to want to *use* one,
+    /// which is the milestone rule working as intended — see the decision log, 2026-08-12.
+    ///
+    /// **The top rather than the centre**, because a drag that keeps the thumb under the cursor
+    /// has to keep it under the *same part* of the cursor it was taken by — see [`ScrollGrab`].
+    /// It took until M14 Part I to say so: `offset_at` centred, so every grab moved the thumb
+    /// before the drag began.
+    pub fn offset_for_thumb_top(&self, track: u32, top: i32) -> u32 {
         let max_offset = self.total.saturating_sub(self.visible);
         if max_offset == 0 || track == 0 {
             return 0;
@@ -469,7 +485,7 @@ impl ScrollState {
             // be invented, and `MIN_THUMB` makes this reachable on a short bar.
             return 0;
         }
-        let pos = (y - len as i32 / 2).clamp(0, span as i32) as u32;
+        let pos = top.clamp(0, span as i32) as u32;
         // **Truncating, like [`thumb`](Self::thumb)**, which is what keeps the pair consistent:
         // the round trip is exact wherever the division is, and neither end needs help — at the
         // bottom `pos` is `span`, so `span * max / span` is `max` however it rounds. A first
@@ -477,6 +493,99 @@ impl ScrollState {
         // unreachable, which is simply not true; deleting it left every test green, so it was
         // half a line of mid-drag accuracy bought with a claim that did not hold.
         ((pos as u64 * max_offset as u64) / span as u64) as u32
+    }
+}
+
+/// Where within the thumb a scrollbar drag took hold.
+///
+/// **The interaction state a scrollbar needs and a widget cannot keep.** `widget-toolkit.md` §3
+/// reserves retained state for things the application has no opinion about, and this qualifies:
+/// nobody has an opinion about where inside a thumb a button landed. It lives in a small value
+/// the application holds — the same shape as [`click::Clicks`](crate::click::Clicks), and for
+/// the same reason: the toolkit's widgets are rebuilt every frame and have nowhere to put it.
+///
+/// **What it buys.** Without it the only inverse available is "put the thumb's centre under the
+/// cursor", so grabbing a thumb near either end makes it jump by up to half its length before
+/// the drag begins — the defect the `scroll-grab` deferral recorded from M4 until M14 Part I.
+/// With it,
+/// a press on the thumb moves nothing and the thumb then follows the pointer exactly.
+///
+/// A press on the **track** still jumps, because that is what a track click means; the thumb
+/// centres on the cursor and is held there for the rest of that drag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ScrollGrab {
+    /// Pixels between the thumb's top and where the press landed, while a drag is running.
+    within: Option<i32>,
+    /// Which button took the grab — the only one whose events this drag answers.
+    ///
+    /// **The router hands a captured widget every button's events**, and drops its own capture
+    /// only when *all* of them come up, so a second button tapped mid-drag arrives here as a
+    /// press and a release belonging to a gesture this grab is not part of. The compositor keeps
+    /// `grab_button` for the identical reason one layer down (PR #248 review, blocking 1).
+    button: u16,
+}
+
+impl ScrollGrab {
+    /// A tracker holding nothing.
+    pub const fn new() -> Self {
+        Self { within: None, button: 0 }
+    }
+
+    /// Whether a drag is in progress.
+    pub fn dragging(&self) -> bool {
+        self.within.is_some()
+    }
+
+    /// Apply one pointer event over the bar; answer where the bar should now be.
+    ///
+    /// `None` means this event is not part of a drag — a hover, a crossing, or the release that
+    /// ends one — and the caller should leave its offset alone.
+    ///
+    /// `state` is the bar as it is *now* and `track` the height it was drawn at; both are the
+    /// numbers the caller passed to [`scrollbar`], and a drag converted against a different
+    /// geometry from the one drawn puts the thumb where the pointer is not.
+    pub fn apply(&mut self, state: ScrollState, track: u32, ev: PointerEvent) -> Option<u32> {
+        let is_button = ev.kind == POINTER_BUTTON;
+        // **Only the button that took the grab is answered.** Pressing a second one mid-drag
+        // would otherwise re-take the grab from wherever the cursor happens to be — a jump, if
+        // that is off the thumb — and its *release* would end a gesture the person is still
+        // making, leaving the bar stranded while the router goes on delivering to it. The old
+        // `if p.buttons != 0` test in each application kept following (PR #288 review, 1).
+        if is_button && self.within.is_some() && ev.button != self.button {
+            return None;
+        }
+        if is_button && ev.flags & POINTER_PRESSED == 0 {
+            // The release, which the router delivers to the captured widget wherever the
+            // cursor has got to. Nothing moves; the grab ends.
+            self.within = None;
+            return None;
+        }
+        if is_button {
+            let (pos, len) = state.thumb(track);
+            let (top, bottom) = (pos as i32, pos as i32 + len as i32);
+            if ev.y >= top && ev.y < bottom {
+                // **On the thumb: nothing moves.** Remembering where within it the press
+                // landed is the whole of this type, and returning the offset unchanged —
+                // rather than one recomputed from the thumb's position — keeps a grab exact
+                // where the position arithmetic truncates.
+                self.within = Some(ev.y - top);
+                self.button = ev.button;
+                return Some(state.offset);
+            }
+            // On the track: jump, then hold the thumb centred for the rest of the drag.
+            self.within = Some(len as i32 / 2);
+            self.button = ev.button;
+            return Some(state.offset_at(track, ev.y));
+        }
+        let within = self.within?;
+        if ev.buttons == 0 {
+            // A motion with nothing held after a grab we never saw released — the router
+            // suppresses crossings mid-capture, so this is a lost release rather than a hover.
+            // Ending the drag beats following a pointer nobody is pressing.
+            self.within = None;
+            return None;
+        }
+        Some(state.offset_for_thumb_top(track, ev.y - within))
     }
 }
 
@@ -1865,20 +1974,38 @@ impl ListState {
 const ROW_PAD: Insets = Insets { top: 2, right: 6, bottom: 2, left: 6 };
 
 impl ListState {
-    /// Move the offset to where a drag on the scrollbar's track points.
+    /// Scroll by a turn of the wheel, `dz` detents, positive **down**.
+    ///
+    /// **No upper clamp here**, deliberately: [`list_view`] already clamps the offset against
+    /// the rows it is given every time it builds, and it is the one that knows how many fit.
+    /// A second clamp would need the caller to pass a count it has no other reason to have,
+    /// and two clamps disagreeing is how a list ends up unable to reach its last row.
+    ///
+    /// **Widened before multiplying**, because `dz` saturates at the compositor: a consumer
+    /// that stalled while somebody scrolled receives thousands of detents, and `i16`
+    /// arithmetic on that scrolls the other way.
+    pub fn wheel(&mut self, dz: i16) {
+        let rows = i64::from(dz) * i64::from(crate::click::WHEEL_UNITS);
+        self.offset = if rows < 0 {
+            self.offset.saturating_sub(rows.unsigned_abs() as usize)
+        } else {
+            self.offset.saturating_add(rows as usize)
+        };
+    }
+
+    /// This list as a scrollbar's state.
     ///
     /// **The conversion belongs here, not in each caller**, because the widget already knows the
-    /// arithmetic and the caller only knows the numbers it passed in. `nxterm` does the same
-    /// conversion with the same [`ScrollState::offset_at`], from a grid's coordinates — this is
-    /// that for a list, so the two cannot drift apart on rounding.
+    /// arithmetic and the caller only knows the numbers it passed in. `nxterm` builds the same
+    /// thing from a grid's line numbers — this is that for a list, so the two cannot drift apart
+    /// on rounding.
     ///
     /// Takes the same `height`, `row_height` and row count [`list_view`] was given: a drag
     /// converted against a different geometry from the one drawn puts the thumb where the pointer
     /// is not (M11 Part E batch 6).
-    pub fn drag_to(&mut self, height: u32, row_height: u32, total: usize, y: i32) {
+    pub fn bar(&self, height: u32, row_height: u32, total: usize) -> ScrollState {
         let visible = if row_height == 0 { 0 } else { height / row_height };
-        let bar = ScrollState { offset: self.offset as u32, visible, total: total as u32 };
-        self.offset = bar.offset_at(height, y) as usize;
+        ScrollState { offset: self.offset as u32, visible, total: total as u32 }
     }
 }
 
@@ -2028,6 +2155,36 @@ mod list_view_tests {
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
         labels.iter().map(|&(key, label)| ListRow { key, label, marked: false }).collect()
+    }
+
+    /// The wheel moves the offset by whole rows, and stops at the top.
+    ///
+    /// **The bottom is not clamped here and that is deliberate** — `list_view` does it against
+    /// the rows it is handed, which is the only place the count is known. This checks the half
+    /// that *is* here: the direction, the multiplier, and that scrolling up past the first row
+    /// stops rather than wrapping to an enormous offset (`offset` is unsigned, so the failure
+    /// would be a list showing nothing at all).
+    #[test]
+    fn the_wheel_moves_whole_rows_and_stops_at_the_top() {
+        let mut st = ListState { selected: None, offset: 0 };
+        st.wheel(2);
+        assert_eq!(st.offset, 2 * crate::click::WHEEL_UNITS as usize, "positive is down");
+        st.wheel(-1);
+        assert_eq!(st.offset, crate::click::WHEEL_UNITS as usize);
+        st.wheel(-100);
+        assert_eq!(st.offset, 0, "a scroll off the top stops there");
+    }
+
+    /// A saturated delta scrolls a long way down rather than wrapping upward.
+    ///
+    /// **20 000 rather than `i16::MAX`**: `32767 * 3` wraps back round to a *positive* `i16`, so
+    /// the largest value passes against the broken arithmetic this exists to catch. The value
+    /// has to be one whose overflow is visible — the same trap `nxterm`'s copy of this test hit.
+    #[test]
+    fn a_huge_wheel_delta_does_not_wrap_upward() {
+        let mut st = ListState { selected: None, offset: 100 };
+        st.wheel(20_000);
+        assert!(st.offset > 100, "scrolled down, not back to the top: {}", st.offset);
     }
 
     /// A **marked** row is drawn as a selected one, and an unmarked one is not.
@@ -2248,6 +2405,28 @@ mod list_view_tests {
         assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
     }
 
+    /// A press at `y` on a bar, and the offset it asks for.
+    fn press_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<u32> {
+        g.apply(st, track, PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: POINTER_PRESSED,
+            y,
+            ..Default::default()
+        })
+    }
+
+    /// A motion to `y` with the button still held.
+    fn drag_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<u32> {
+        g.apply(st, track, PointerEvent {
+            kind: librsproto::surface::POINTER_MOTION,
+            buttons: 1,
+            y,
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn a_drag_on_the_track_moves_the_offset_and_a_release_does_not() {
         // **The scrollbar was decoration.** `list_view` built one and gave it no pointer handler,
@@ -2255,19 +2434,131 @@ mod list_view_tests {
         // is not, which is the defect this crate's own notes keep naming. `nxterm` builds its
         // scrollbar directly and has always wired this (M11 Part E batch 6).
         let mut st = ListState::default();
+        let mut g = ScrollGrab::new();
         // Twenty rows of 20px in a 100px viewport: five visible, fifteen of travel.
-        st.drag_to(100, 20, 20, 100);
+        let bar = |st: &ListState| st.bar(100, 20, 20);
+        st.offset = press_bar(&mut g, bar(&st), 100, 100).expect("a press on the track scrolls") as usize;
         assert!(st.offset > 0, "a drag to the bottom of the track moved nothing");
         let bottom = st.offset;
-        st.drag_to(100, 20, 20, 0);
+        st.offset = drag_bar(&mut g, bar(&st), 100, 0).expect("still dragging") as usize;
         assert_eq!(st.offset, 0, "a drag to the top did not come back");
         assert!(bottom <= 15, "the offset ran past the last full screen of rows");
 
+        // The release moves nothing and ends the drag.
+        let released = g.apply(bar(&st), 100, PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: 0,
+            flags: 0,
+            y: 100,
+            ..Default::default()
+        });
+        assert_eq!(released, None, "a release is not a position");
+        assert!(!g.dragging());
+        assert_eq!(drag_bar(&mut g, bar(&st), 100, 90), None, "and the bar stopped following");
+
         // A list that fits has nowhere to go, and must not be moved by a drag on a track that is
-        // not drawn — the case `offset_at` returns zero for.
+        // not drawn — the case the position arithmetic returns zero for.
         let mut st = ListState::default();
-        st.drag_to(100, 20, 3, 100);
+        let mut g = ScrollGrab::new();
+        st.offset = press_bar(&mut g, st.bar(100, 20, 3), 100, 100).unwrap_or(0) as usize;
         assert_eq!(st.offset, 0, "a list shorter than its viewport scrolled");
+    }
+
+    /// Grabbing the thumb by its end does not move it — the `scroll-grab` deferral, closed.
+    ///
+    /// **The defect this exists for is a *jump* on the press**, before the drag has begun: with
+    /// only "put the thumb's centre under the cursor" available, a press on the thumb's top edge
+    /// moved the content by half a thumb, so aiming at the thumb threw away the position you
+    /// were looking at. Every toolkit that avoids it remembers where within the thumb the press
+    /// landed.
+    #[test]
+    fn a_press_on_the_thumb_does_not_move_it_and_the_drag_then_tracks_the_pointer() {
+        // A long scrollback: 1000 units, 20 visible, in a 200px track. The thumb is clamped to
+        // `MIN_THUMB`, so it is *much* shorter than the travel — which is when a re-centring
+        // grab is least noticeable and a wrong one still throws the view a long way.
+        let track = 200;
+        let st = ScrollState { offset: 400, visible: 20, total: 1000 };
+        let (pos, len) = st.thumb(track);
+        assert!(len >= MIN_THUMB, "premise: the thumb is at its floor");
+
+        for (what, y) in [("its top edge", pos as i32), ("its bottom edge", pos as i32 + len as i32 - 1)] {
+            let mut g = ScrollGrab::new();
+            assert_eq!(
+                press_bar(&mut g, st, track, y),
+                Some(400),
+                "{what}: taking hold of the thumb moved the content"
+            );
+            assert!(g.dragging());
+
+            // And from there it follows the pointer: ten pixels down the track is ten pixels of
+            // thumb travel, whichever end it was taken by.
+            let moved = drag_bar(&mut g, st, track, y + 10).expect("dragging");
+            let expected = st.offset_for_thumb_top(track, pos as i32 + 10);
+            assert_eq!(moved, expected, "{what}: the thumb did not follow by the distance moved");
+        }
+    }
+
+    /// A second button tapped mid-drag neither ends the drag nor re-takes it.
+    ///
+    /// **The router delivers every button's events to the captured widget**, and clears its own
+    /// capture only when *all* of them come up (`released && event.buttons == 0`) — so pressing
+    /// the right button without letting go of the left arrives here as a press and a release of
+    /// a button this grab knows nothing about. Answering either of them would strand the bar:
+    /// the router still believes the gesture is live, so the person goes on dragging and
+    /// nothing follows. The code this replaced (`if p.buttons != 0` in each application) kept
+    /// following, so this is a regression the review caught (PR #288, finding 1).
+    #[test]
+    fn a_second_buttons_press_and_release_do_not_disturb_the_drag() {
+        const RIGHT: u16 = 0x111;
+        let track = 200;
+        let st = ScrollState { offset: 400, visible: 20, total: 1000 };
+        let (pos, _) = st.thumb(track);
+        let mut g = ScrollGrab::new();
+        press_bar(&mut g, st, track, pos as i32);
+        assert!(g.dragging(), "precondition: the left button took the thumb");
+
+        // The right button goes down while the left is still held: two buttons in the mask.
+        let other = |flags: u16, buttons: u16| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: RIGHT,
+            buttons,
+            flags,
+            // Far from the thumb, so re-taking the grab here would visibly jump the bar.
+            y: track as i32 - 1,
+            ..Default::default()
+        };
+        assert_eq!(g.apply(st, track, other(POINTER_PRESSED, 0b011)), None, "the press answered");
+        assert_eq!(g.apply(st, track, other(0, 0b001)), None, "the release answered");
+        assert!(g.dragging(), "a button this grab never took ended it");
+
+        // And the drag still tracks the pointer, from the offset it was taken at.
+        let moved = drag_bar(&mut g, st, track, pos as i32 + 10).expect("still dragging");
+        assert_eq!(moved, st.offset_for_thumb_top(track, pos as i32 + 10));
+    }
+
+    /// A press on the track still jumps, and holds the thumb centred afterwards.
+    ///
+    /// **The other half of the rule**, and the reason the grab is not simply "always keep the
+    /// press offset": a click on empty track means "go there", and there is no thumb under the
+    /// cursor to preserve a relationship with.
+    #[test]
+    fn a_press_on_the_track_jumps_and_then_holds_the_thumb_centred() {
+        let track = 200;
+        let st = ScrollState { offset: 0, visible: 20, total: 1000 };
+        let (_, len) = st.thumb(track);
+        let mut g = ScrollGrab::new();
+
+        let jumped = press_bar(&mut g, st, track, 150).expect("a track press scrolls");
+        assert_eq!(jumped, st.offset_at(track, 150), "the thumb's centre came to the cursor");
+        assert!(jumped > 0);
+
+        let after = drag_bar(&mut g, st, track, 160).expect("dragging");
+        assert_eq!(
+            after,
+            st.offset_for_thumb_top(track, 160 - len as i32 / 2),
+            "and it stayed centred as the drag continued"
+        );
     }
 
     #[test]

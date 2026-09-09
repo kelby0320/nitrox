@@ -21,16 +21,35 @@
 //! and takes its place at the back. This is what X11 and Wayland both do, and it works for
 //! the same reason there: a motion record carries an absolute window-local position, so the
 //! newest one says everything the older ones did. A hundred motion events during a drag
-//! become one queued record, and the discrete events — keys, buttons, crossings, releases —
-//! are bounded by what a human can physically do.
+//! become one queued record.
 //!
-//! Removing the old motion and pushing the new at the **back**, rather than overwriting it
+//! **At most one wheel per window per gesture, and the detents are *summed*** (M14 Part I,
+//! PR #288 review). A wheel could not take motion's rule — `wheel` is a **delta**, so replacing
+//! the old record with the new one silently loses everything but the last detent — and leaving
+//! it uncoalesced would have made it the first pointer kind to take a queue slot per event, in a
+//! queue whose depth is justified by there not being one. Summing is the third answer, and it is
+//! the only lossless one: `3` then `2` becomes one record of `5`, which is what the person did.
+//! It follows the same remove-and-append as motion, so the total arrives at the *later* record's
+//! position rather than the earlier one's.
+//!
+//! **Only into a record that agrees about `modifiers` and `buttons`.** Those ride on every
+//! pointer record and change what a scroll *means* — Ctrl-scroll is a zoom in most applications
+//! — so summing across a modifier change would turn three scrolled lines and two zoomed steps
+//! into five zoomed steps.
+//!
+//! Removing the old record and pushing the new at the **back**, rather than overwriting it
 //! in place, keeps the queue in the order things happened: a motion that occurred after a
 //! keystroke is delivered after it.
+//!
+//! **What is left uncoalesced is still not bounded by "what a human can do".** A held key
+//! repeats every `REPEAT_INTERVAL_NS`, so `Outbound::Key` streams through this queue on a
+//! stalled client exactly as it did before the wheel existed. That is a pre-existing property
+//! of key repeat rather than something the wheel introduced, and it is the reason the sentence
+//! above is about the *pointer* kinds specifically.
 
 use alloc::vec::Vec;
 
-use librsproto::surface::{KeyEvent, POINTER_MOTION, PointerEvent};
+use librsproto::surface::{KeyEvent, POINTER_MOTION, POINTER_WHEEL, PointerEvent};
 
 /// One message addressed to one window.
 ///
@@ -151,17 +170,32 @@ impl Outbound {
         }
     }
 
-    /// Whether this is pointer motion — the only kind that coalesces.
+    /// Whether this is pointer motion — the kind that coalesces by *replacement*.
     fn is_motion(&self) -> bool {
         matches!(self, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION)
+    }
+
+    /// This record's wheel, if it is one: the window it is for, its detents, and the state it
+    /// was turned under.
+    ///
+    /// **The state is part of the identity**, because it decides whether two turns may be added
+    /// together: see the module docs on summing.
+    fn as_wheel(&self) -> Option<(u32, i16, u16, u16)> {
+        match self {
+            Outbound::Pointer { event } if event.kind == POINTER_WHEEL => {
+                Some((event.window, event.wheel, event.modifiers, event.buttons))
+            }
+            _ => None,
+        }
     }
 }
 
 /// How many messages a session queues before the oldest are discarded.
 ///
-/// With motion coalesced this holds *discrete* events only — keys, buttons, crossings,
-/// releases — so it is sized against what a person can do in the time a client takes to
-/// drain, not against a stream.
+/// With motion replaced and wheel detents summed, **no pointer kind takes more than one slot
+/// per window** — so this is sized against what a person can do in the time a client takes to
+/// drain, not against a stream. Keys are the exception and always were: a held key repeats, so
+/// `Outbound::Key` streams through here whatever the pointer is doing (PR #288 review, 3).
 pub const OUTBOX_MAX: usize = 32;
 
 /// One session's pending messages, oldest first.
@@ -182,11 +216,26 @@ impl Outbox {
     /// Returns `true` if something had to be discarded — the caller logs that, because a
     /// silently shortened event stream is the failure this whole module exists to make
     /// visible rather than merely rarer.
-    pub fn push(&mut self, rec: Outbound) -> bool {
+    pub fn push(&mut self, mut rec: Outbound) -> bool {
         if rec.is_motion() {
             // Remove any motion already queued for this window; the new one supersedes it.
             let w = rec.window();
             self.q.retain(|q| !(q.is_motion() && q.window() == w));
+        }
+        // **A wheel is added to the one already queued rather than replacing it.** A detent is a
+        // delta, so the newest record is only the last part of the truth — see the module docs.
+        if let Some((w, dz, mods, buttons)) = rec.as_wheel() {
+            let same = |q: &Outbound| {
+                matches!(q.as_wheel(), Some((qw, _, qm, qb)) if qw == w && qm == mods && qb == buttons)
+            };
+            if let Some(i) = self.q.iter().position(same) {
+                let carried = self.q.remove(i).as_wheel().map_or(0, |(_, dz, _, _)| dz);
+                if let Outbound::Pointer { event } = &mut rec {
+                    // Saturating, like the compositor's own conversion into this field: a very
+                    // long stall means a very long scroll, and wrapping would scroll back.
+                    event.wheel = carried.saturating_add(dz);
+                }
+            }
         }
         let mut discarded = false;
         if self.q.len() >= OUTBOX_MAX {
@@ -242,7 +291,7 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use librsproto::surface::{POINTER_BUTTON, POINTER_ENTER};
+    use librsproto::surface::{MOD_CTRL, POINTER_BUTTON, POINTER_ENTER};
 
     fn motion(window: u32, x: i32) -> Outbound {
         Outbound::Pointer {
@@ -314,6 +363,89 @@ mod tests {
             event: PointerEvent { window: 1, kind: POINTER_BUTTON, ..Default::default() },
         });
         assert_eq!(o.len(), 7);
+    }
+
+    /// A wheel record for `window`, `dz` detents, turned with `mods` held.
+    fn wheel(window: u32, dz: i16, mods: u16) -> Outbound {
+        Outbound::Pointer {
+            event: PointerEvent {
+                window,
+                kind: POINTER_WHEEL,
+                wheel: dz,
+                modifiers: mods,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Detents are **summed** into the queued record, not replaced by it and not left to pile up.
+    ///
+    /// **The two obvious rules are both wrong here**, which is the whole reason this is its own
+    /// case. `x` is a *position*, so motion's replace-coalescing keeps the whole truth; `wheel`
+    /// is a *delta*, so replacing loses every detent but the last — a client scrolling steadily
+    /// would find its page creeping. Leaving it uncoalesced instead makes it the first pointer
+    /// kind to take a queue slot per event, which is precisely what `OUTBOX_MAX`'s depth is
+    /// justified by not happening (PR #288 review, 3). Summing is lossless *and* bounded.
+    #[test]
+    fn wheel_detents_are_summed_into_one_queued_record() {
+        let mut o = Outbox::new();
+        for _ in 0..5 {
+            assert!(!o.push(wheel(1, 1, 0)), "nothing should be discarded");
+        }
+        assert_eq!(o.len(), 1, "five detents are one record");
+        assert_eq!(drain(&mut o), [wheel(1, 5, 0)], "and it carries all five");
+
+        // Both directions, since a delta is signed: three down then two up is one net detent.
+        let mut o = Outbox::new();
+        o.push(wheel(1, 3, 0));
+        o.push(wheel(1, -2, 0));
+        assert_eq!(drain(&mut o), [wheel(1, 1, 0)]);
+    }
+
+    /// Summing is per window, and only across turns that mean the same thing.
+    ///
+    /// **`modifiers` decides what a scroll *is***: Ctrl-scroll is a zoom in most applications, so
+    /// adding three scrolled lines to two zoomed steps would deliver five zoomed steps. The same
+    /// argument holds for `buttons`, which is what makes a wheel turned mid-drag distinct.
+    #[test]
+    fn a_wheel_does_not_sum_across_a_window_or_a_modifier_change() {
+        let mut o = Outbox::new();
+        o.push(wheel(1, 1, 0));
+        o.push(wheel(2, 1, 0));
+        o.push(wheel(1, 1, MOD_CTRL));
+        assert_eq!(o.len(), 3, "three different things: {:?}", o.len());
+        assert_eq!(drain(&mut o), [wheel(1, 1, 0), wheel(2, 1, 0), wheel(1, 1, MOD_CTRL)]);
+    }
+
+    /// A summed wheel is delivered at the **later** record's place in the queue.
+    ///
+    /// The same rule motion follows, and for the same reason: a wheel turned after a keystroke
+    /// must not arrive before it. Overwriting the earlier record in place would do exactly that.
+    #[test]
+    fn a_summed_wheel_keeps_its_place_behind_what_happened_first() {
+        let mut o = Outbox::new();
+        o.push(wheel(1, 1, 0));
+        o.push(key(1, 30));
+        o.push(wheel(1, 1, 0));
+        assert_eq!(drain(&mut o), [key(1, 30), wheel(1, 2, 0)]);
+    }
+
+    /// Scrolling cannot evict a `Release`, which is the property the bound exists for.
+    ///
+    /// **The failure this prevents is permanent**: `libsurface`'s `Window::acquire` blocks in
+    /// `sys_wait` with no timeout, so a lost `Release` hangs the client for ever with one line in
+    /// a log to say so. Before the detents were summed, `OUTBOX_MAX` turns of the wheel pushed it
+    /// off the front — and `nxterm` repaints its whole viewport per wheel record, so falling
+    /// behind while scrolling is the expected case rather than a contrived one.
+    #[test]
+    fn a_release_survives_a_long_scroll() {
+        let mut o = Outbox::new();
+        o.push(Outbound::Release { window: 1, buffer: 7 });
+        for _ in 0..OUTBOX_MAX * 4 {
+            assert!(!o.push(wheel(1, 1, 0)), "a scroll discarded a queued record");
+        }
+        assert_eq!(o.len(), 2, "the release and one summed wheel");
+        assert_eq!(o.front(), Some(&Outbound::Release { window: 1, buffer: 7 }));
     }
 
     #[test]

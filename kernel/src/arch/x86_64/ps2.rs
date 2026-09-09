@@ -73,6 +73,29 @@ const CONFIG_AUX_CLOCK_OFF: u8 = 0x20;
 const DEV_RESET: u8 = 0xFF;
 /// Device command: enable reporting (the mouse needs it; it boots silent).
 const DEV_ENABLE_REPORTING: u8 = 0xF4;
+/// Device command: set the sample rate; the rate follows as a second data byte.
+const DEV_SET_SAMPLE_RATE: u8 = 0xF3;
+/// Device command: report the device id — `0x00` a plain mouse, `0x03` one with a wheel.
+const DEV_GET_DEVICE_ID: u8 = 0xF2;
+
+/// The sample rates that ask a mouse to become an IntelliMouse, in order.
+///
+/// **A knock, not a command.** There is no "do you have a wheel" query: Microsoft's
+/// IntelliMouse looks for this exact sequence of sample-rate settings, and a device that
+/// recognises it changes its id from `0x00` to `0x03` and starts sending **four**-byte
+/// packets. A device that does not simply ends up sampling at 80 Hz, which is why the rate
+/// is set again afterwards. Every PS/2 stack does this — Linux's `psmouse` calls it
+/// `intellimouse_sequence` — and QEMU's emulated mouse implements it.
+const WHEEL_KNOCK: [u8; 3] = [200, 100, 80];
+
+/// The device id an IntelliMouse answers with once the knock has been recognised.
+const ID_WHEEL: u8 = 0x03;
+
+/// The rate to leave the mouse reporting at, in Hz.
+///
+/// **Restored after the knock**, whose last step leaves a wheel-capable mouse at 80 Hz — a
+/// visibly coarser cursor than the 100 Hz default, bought by a probe rather than chosen.
+const SAMPLE_RATE: u8 = 100;
 
 /// ISA IRQ the keyboard port raises.
 const KBD_IRQ: u8 = 1;
@@ -199,6 +222,13 @@ pub struct Present {
     pub keyboard: bool,
     /// An aux port that answered its reset — a mouse.
     pub mouse: bool,
+    /// That mouse answered the IntelliMouse knock and is sending **four**-byte packets.
+    ///
+    /// **The packet length is the reason this has to be reported rather than inferred.** A
+    /// three-byte decoder fed four-byte packets is not merely missing a wheel: it reads every
+    /// packet one byte out of phase for ever, which is the framing failure `mouse.rs` exists
+    /// to avoid. Whoever asked for the wheel has to tell the decoder it worked.
+    pub wheel: bool,
 }
 
 /// Bring the controller up, synchronously and with interrupts still masked.
@@ -249,6 +279,10 @@ pub unsafe fn init() -> Present {
         // 0xFA ack, then 0xAA self-test, then the device id (0x00 for a plain mouse).
         found.mouse = ack == 0xFA && (matches!(a, Some(0xAA)) || matches!(b, Some(0xAA)));
         if found.mouse {
+            // 4. Ask for the wheel, **before reporting is enabled**: the knock and the id
+            //    query are a conversation, and a mouse already reporting would be
+            //    interleaving movement packets into it.
+            found.wheel = knock_for_wheel();
             // A PS/2 mouse boots with reporting **off** and says nothing until told.
             let _ = aux_command(DEV_ENABLE_REPORTING);
         }
@@ -256,6 +290,63 @@ pub unsafe fn init() -> Present {
 
     flush();
     found
+}
+
+/// Ask the mouse for a wheel, and say whether it has one.
+///
+/// Sends the [`WHEEL_KNOCK`] sample rates, then reads the device id back. `true` means the
+/// device answered [`ID_WHEEL`] and will now send four-byte packets — a promise the caller
+/// **must** pass on to the packet decoder, since nothing in the stream distinguishes a
+/// four-byte packet from a three-byte one.
+///
+/// ## `false` is only safe until the knock lands
+///
+/// **Returning `false` is not free after the third rate has been acknowledged.** A device that
+/// recognises the sequence switches to four-byte packets *there*, not when its id is read — so a
+/// failure at the id query would leave a four-byte mouse behind a three-byte decoder, which
+/// frames every packet at an offset for ever and is exactly the "wanders the screen pressing
+/// buttons" failure a cautious `false` is supposed to avoid. Before the loop finishes, `false`
+/// really is free: the sequence is recognised only when all three land.
+///
+/// So **anything but a confirmed [`ID_WHEEL`] resets the device**, which unambiguously puts it
+/// back to three-byte packets whatever it had decided — a failed ack, a timed-out read, or an id
+/// this code does not know. A reset also restores the default sample rate, which is why only the
+/// `true` path has to put the rate back.
+///
+/// Reasoned from the control flow rather than demonstrated: it needs an i8042 that acknowledges
+/// three commands and then times out, which nothing here can inject (PR #288 review, 2).
+fn knock_for_wheel() -> bool {
+    for rate in WHEEL_KNOCK {
+        if aux_command(DEV_SET_SAMPLE_RATE) != Some(0xFA) || aux_command(rate) != Some(0xFA) {
+            // Nothing has changed shape yet, so there is nothing to put back.
+            return false;
+        }
+    }
+    if aux_command(DEV_GET_DEVICE_ID) != Some(0xFA) || read_data() != Some(ID_WHEEL) {
+        return reset_to_three_bytes();
+    }
+    // Undo the knock's parting gift of 80 Hz — the wheel path is the only one that has to,
+    // since the reset above restores the default rate for every other outcome.
+    if aux_command(DEV_SET_SAMPLE_RATE) == Some(0xFA) {
+        let _ = aux_command(SAMPLE_RATE);
+    }
+    true
+}
+
+/// Reset the mouse and consume its replies. Always answers `false` — "no wheel".
+///
+/// **The only way to be sure of the packet length after the knock has landed.** `0xFF` returns
+/// the device to its power-on state: three-byte packets, default sample rate, reporting off —
+/// and [`init`] enables reporting immediately afterwards, which it does for every mouse anyway.
+fn reset_to_three_bytes() -> bool {
+    if aux_command(DEV_RESET) == Some(0xFA) {
+        // The self-test byte and the device id, in that order. Consumed here for the reason the
+        // whole bring-up is polled: a `0xAA` that reached the scancode decoder would be a
+        // phantom Left Shift release.
+        let _ = read_data();
+        let _ = read_data();
+    }
+    false
 }
 
 /// Route the keyboard and aux interrupts to `kbd`/`aux` and enable them in the controller.

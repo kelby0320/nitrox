@@ -560,7 +560,15 @@ pub const KEY_REPEAT: i32 = 2;
 pub const REL_X: u16 = 0x00;
 /// Vertical motion; positive is **down**.
 pub const REL_Y: u16 = 0x01;
-/// Wheel detents.
+/// Wheel detents; positive is **down**, toward the user.
+///
+/// **The same direction [`REL_Y`] is positive in**, and deliberately *not* Linux's, which is
+/// positive-up. This table takes Linux's codes; the sign convention here is the screen's, so
+/// that everything above the driver — `libinput`, the compositor, a client adding a delta to a
+/// scroll offset — needs no sign of its own. The PS/2 wire already reports positive as toward
+/// the user, so unlike `REL_Y` nothing negates it. Stated in
+/// `docs/spec/rsproto-input-ops.md` beside `REL_Y`'s note, because a wheel that scrolls the
+/// wrong way is a one-character mistake and an unmistakable symptom.
 pub const REL_WHEEL: u16 = 0x08;
 
 
