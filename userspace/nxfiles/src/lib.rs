@@ -129,6 +129,14 @@ pub const TAB_KEY_BASE: u64 = 1 << 63;
 /// read a theme file to know where to click.
 pub const SIDEBAR_W: u32 = 148;
 
+/// How much space sits between the quick-access panel and everything around it.
+///
+/// **A margin rather than an edge** (M15 Part E): the panel has a ground of its own now, and what
+/// makes it read as a *panel* rather than as part of the listing is the window showing through
+/// around it. Reported from running it — "add some margin around the quick access panel just to
+/// separate it from the rest".
+pub const SIDEBAR_PAD: u32 = 6;
+
 /// The folders the sidebar offers beneath Home.
 ///
 /// **Named here and made by the image build**, which is the arrangement M14 Part D chose while
@@ -224,16 +232,6 @@ pub const CONFIRM_DELETE_KEY: u64 = 22;
 /// The element key on its *keep* answer — the right button.
 pub const CONFIRM_KEEP_KEY: u64 = 23;
 
-/// Which menu is open, if either.
-///
-/// **Two, because the operations divide in two**: *File* makes and unmakes things, *Edit* acts
-/// on what is selected. It is the division every file browser draws, and it is the reason `copy`
-/// does not sit beside `delete`.
-///
-/// **They are indices into [`App::menu_table`] since M14 Part A**, not an enum. The enum existed to
-/// give each menu a key and a popup tree; both are the toolkit's now, and a `Menu` that only
-/// said "File or Edit" was a second spelling of `0` and `1`.
-pub const MENU_COUNT: usize = 2;
 
 /// What a menu row asks for.
 ///
@@ -839,7 +837,10 @@ impl App {
             closing: false,
             new_window: false,
             quit: false,
-            menus: MenuState::new(MENU_COUNT),
+            // **Zero, because the length is set every frame.** `set_anchors` replaces this
+            // vector before anything reads it, and sizing it here from a constant is
+            // what drifted (M15 Part E).
+            menus: MenuState::new(0),
             prompt: None,
             confirm: None,
             dialog_focused: true,
@@ -934,7 +935,7 @@ impl App {
         libfs::sort(&mut entries, p.order);
         p.path = String::from(path);
         p.entries = entries;
-        p.list = ListState { selected: (!p.entries.is_empty()).then_some(0), offset: 0 };
+        p.list = ListState::at((!p.entries.is_empty()).then_some(0), 0);
         // **A listing of another directory has nothing the old picks refer to.** Same argument as
         // the selection reset above it.
         self.marked.clear();
@@ -1821,6 +1822,32 @@ impl App {
         self.resize_requested.take()
     }
 
+    /// Record where each bar word sits, so an open menu knows where to hang from.
+    ///
+    /// **Here rather than in the binary, since M15 Part E.** Three applications each copied this
+    /// loop, and the count in it was a constant beside a `menu_table` that grew: `nxfiles` asked
+    /// for two anchors while its bar had three menus, so *View* opened a popup with nowhere to
+    /// go and drew nothing at all. In the binary it was untestable — no host test builds a
+    /// `main.rs` — which is why it could be wrong for two milestones. Here it is one method with
+    /// one count, and a test walks the whole bar through it.
+    pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
+        let n = self.menu_count();
+        self.menus.set_anchors(
+            (0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect(),
+        );
+    }
+
+    /// How many menus the bar has — **derived from the table, never declared**.
+    ///
+    /// **A constant here drifted and cost the View menu** (M15 Part E). `MENU_COUNT` was 2 while
+    /// `menu_table` returned three menus, so the binary asked for two anchors,
+    /// `MenuState::anchor` answered `None` for the third, and clicking *View* opened a menu that
+    /// had nowhere to hang from — a bar word that did nothing, with no error anywhere. Two
+    /// numbers that must be equal are one number.
+    pub fn menu_count(&self) -> usize {
+        self.menu_table().len()
+    }
+
     /// The bar's menus, in bar order.
     ///
     /// **Built rather than stored**, and it takes `&self` because half the rows depend on state:
@@ -2306,15 +2333,23 @@ impl App {
             })
             .collect();
         self.sidebar.selected = here;
+        // **The panel is built for the height it will be drawn at**, which is the box minus the
+        // margin on each side — the obligation `list_view` states, and the one thing a margin
+        // around a scrolling widget is easy to get wrong.
+        let side_h = h.saturating_sub(2 * SIDEBAR_PAD);
         let sidebar = list_view(
             &side_rows,
             &mut self.sidebar,
-            h,
+            side_h,
             ROW_H,
             place_row,
             None,
             None,
             hovered,
+            // **A ground of its own** (M15): a sidebar drawn in the list's ground is a list with
+            // a gap in it, and the report from running it was that the quick-access folders
+            // "need a different background color so it's clear it's actually a sidebar".
+            Some(ui.sidebar),
             &ui,
         );
 
@@ -2327,6 +2362,7 @@ impl App {
             Some(grab_row),
             Some(Msg::Scroll),
             highlight,
+            None,
             &ui,
         )
         // **On the element the widget returns, rather than through a tenth parameter.** A
@@ -2351,7 +2387,11 @@ impl App {
                     // window's location rather than the listing's.
                     docked(
                         Edge::Left,
-                        sized(Size::new(SIDEBAR_W, h), sidebar).key(SIDEBAR_KEY),
+                        sized(
+                            Size::new(SIDEBAR_W + 2 * SIDEBAR_PAD, h),
+                            padding(Insets::all(SIDEBAR_PAD), sidebar),
+                        )
+                        .key(SIDEBAR_KEY),
                     ),
                 ],
             // **Sized to the height it was built for.** `list_view` does not size itself, and
@@ -4501,6 +4541,112 @@ mod tests {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// **Every** menu in the bar can be opened, not just the ones a test happened to name.
+    ///
+    /// **The View menu did nothing for two milestones** (M15 Part E). `MENU_COUNT` was a
+    /// constant beside a `menu_table` that grew: the binary asked for two anchors, the third
+    /// menu's `anchor()` answered `None`, and the popup had nowhere to hang from — a bar word
+    /// that opened nothing, silently. The count is derived now, and this walks the *whole* bar
+    /// rather than a menu chosen when the test was written.
+    #[test]
+    fn every_menu_in_the_bar_has_somewhere_to_hang_from() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let view = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+        let n = a.menu_count();
+        assert!(n >= 2, "a bar with fewer than two menus is not this window's");
+        // **Through the method the binary calls**, which is the whole point of it being a
+        // method: the loop that was wrong lived in a `main.rs` no test builds.
+        a.place_menus(&view, &l);
+        for i in 0..n {
+            a.menus.toggle(i);
+            assert_eq!(a.menus.open(), Some(i));
+            assert!(
+                a.menus.anchor().is_some(),
+                "menu {i} of {n} opened with nowhere to hang from, so nothing would be drawn"
+            );
+            a.menus.close();
+        }
+    }
+
+    /// The quick-access panel is inset from everything around it.
+    ///
+    /// **A margin is what makes it read as a panel** (M15 Part E). It has a ground of its own
+    /// since Part A; what separates it from the listing and the window's edge is the window
+    /// showing through around it, and the number is easy to lose the next time this dock is
+    /// rearranged.
+    #[test]
+    fn the_quick_access_panel_has_a_margin_around_it() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let e = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+        let box_ = libui::layout::locate(&e, &l, SIDEBAR_KEY).expect("the sidebar is keyed");
+        let row = libui::layout::locate(&e, &l, SIDEBAR_ROW_KEY).expect("its first row is keyed");
+        assert_eq!(
+            row.origin.x - box_.origin.x,
+            SIDEBAR_PAD as i32,
+            "the panel is flush with the window's edge"
+        );
+        assert_eq!(
+            (box_.origin.x + box_.size.w as i32) - (row.origin.x + row.size.w as i32),
+            SIDEBAR_PAD as i32,
+            "the panel is flush with the listing"
+        );
+    }
+
+    /// A scrollbar drag survives the repaint that follows it.
+    ///
+    /// **This is the test the earlier ones were missing, and the bug they let through.** Every
+    /// other pointer test here routes an event and reads the state; the *application* rebuilds
+    /// its tree after every event, and `list_view` followed the selection on every build — so a
+    /// drag computed the right offset and the next frame put it back on row 0. The bar moved and
+    /// the listing did not, which is exactly what was reported (M15 Part D).
+    #[test]
+    fn a_scrollbar_drag_survives_the_next_repaint() {
+        let mut a = app();
+        a.show("/home", (0..80).map(|i| Entry::file(&alloc::format!("f{i}"))).collect());
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let theme = UiTheme::default();
+        let mut tree = libui::diff::Tree::new();
+        let mut r = libui::route::Router::new();
+        // A frame, exactly as the binary draws one.
+        let mut frame = |a: &mut App, tree: &mut libui::diff::Tree| {
+            let e = a.view(&theme, None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            tree.update(&e, &l).expect("diffable");
+            (e, l)
+        };
+
+        let (e, l) = frame(&mut a, &mut tree);
+        let x = size.w as i32 - 8;
+        let press = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x,
+            y: (size.h / 2) as i32,
+            ..Default::default()
+        };
+        for m in r.pointer(&tree, &e, &l, press).0 {
+            a.update(m);
+        }
+        let scrolled = a.pane().list.offset;
+        assert!(scrolled > 0, "the press on the bar scrolled nowhere");
+
+        frame(&mut a, &mut tree);
+        assert_eq!(
+            a.pane().list.offset,
+            scrolled,
+            "the repaint put the listing back where its selection is"
+        );
     }
 
     /// The wheel scrolls the listing, **through the real tree and router**.

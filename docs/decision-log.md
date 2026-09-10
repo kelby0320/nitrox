@@ -24561,3 +24561,212 @@ for every Enter, which the failing version of that test said out loud.
 **Milestone 14 is complete**: nine parts in six days, three deferrals closed (`press-time`,
 `scroll-grab`, and the wheel), one left open with a trigger (`chooser-hidden`), and a list that
 was wrong about the code five times — always by claiming something missing that already existed.
+
+
+---
+
+## 2026-09-10 — controls that look like controls (M15 Part A)
+
+The maintainer ran M14 on QEMU and sent eight items. **Six of them are one complaint**: a surface
+that is a control does not say so.
+
+**The scrollbar was the instructive one, because the report was wrong about the mechanism and
+right about the experience.** "Click and drag on the scrollbar doesn't seem to work" — and it
+works: measured in the guest before anything was changed, a press grabs the thumb without moving
+it and a drag scrolls to the end (offset 0 → 9 → 13, the maximum). Measured again after resizing
+the window smaller, which is what the maintainer had done, and it still works. What is broken is
+that **the groove is exactly the colour of the list beside it**, so the only thing on screen to
+aim at is the thumb — a fraction of a bar you cannot see. Three probes went into establishing
+that, two of them in the guest, and the fourth thing tried was reading the widget: `scrollbar`
+fills `theme.track`, and so does `list_view`.
+
+**`track`'s own doc had recorded the compromise and named the trigger.** It said the reference
+desktop puts a list's ground at `#FCFCFC` and a scrollbar's groove at `#E6E4E3`, that "one field
+has to be both", and that splitting them "is a field, and a field is worth more evidence than one
+screenshot". This is the evidence: a person could not find the scrollbar. That is a good outcome
+for a note written eleven days earlier — the argument for the split was already on the page, with
+its price and its trigger, so the decision took minutes rather than a debate.
+
+**A button's edge is what makes it a button.** The face is `#EDECEB` on a `#FFFFFF` window:
+eighteen units per channel, which is a difference that survives a screenshot comparison and does
+not survive a person looking at a window. Every desktop draws an edge; this toolkit drew one only
+around the *focused* control, so at rest a button was a word on a barely-tinted rectangle.
+
+**Centring the label needed a node, and the lack of one had been invisible.** `padding` places a
+child at an inset from its parent's origin — so a button 80 pixels wide with a 20-pixel word had
+58 pixels of face to the right of its label, in every window of every application. `Node::Center`
+is the first wrapper in this toolkit that *moves* its child rather than passing its rectangle
+through, which is why it is a node rather than an insets calculation: the amount depends on the
+child's measured size and the parent's rectangle, and only layout knows both.
+
+**A sidebar drawn in the list's ground is a list with a gap in it.** `list_view` takes a ground
+now, and only `nxfiles`' sidebar passes one. A colour rather than a flag, because what a panel is
+depends on the theme.
+
+**And the reference scene was lying about menu bars.** It built its bar from `button`s; no
+application does — `menu::bar` makes `menu_item`s. Nobody noticed for four milestones, and what
+found it was buttons growing an edge: the picture came back with two boxed words where a menu bar
+should be. A reference that is not what applications draw is a polish pass judging the wrong
+thing, which is precisely what `preview` exists to prevent.
+
+
+---
+
+## 2026-09-10 — the pointer reaches the document, and a dialog can leave a directory (M15 Parts B and C)
+
+**Two of the eight items were features that had been half-built and never connected.**
+
+**`TextAreaState::place` and `extend_to` have existed since M10**, documented *then* as "what a
+press does" and "what a drag does" — and nothing ever called them, because `text_area` took no
+pointer events at all. An editor whose entire content is text you point at could move its caret
+only with the arrow keys, for five milestones, with the method that does it sitting in the same
+file under a comment saying what it was for. **A widget that takes no events is not a half-built
+feature; it is an invisible one**, and what found it was somebody using the editor.
+
+**The pixel-to-column conversion belongs to the application**, because `libui` has no glyphs —
+the same seam `Metrics` is at layout time. `at_point` is *given* a way to measure a string. The
+column it returns is the **nearest boundary** rather than the character under the cursor, which
+is what makes clicking the right half of a letter put the caret after it.
+
+**`text_area`'s doc had said for two milestones that a scrollbar is the application's to
+compose.** `nxterm` composes one for its grid; `nxedit` never did, so a document longer than its
+window had nothing on screen to say so. `TextAreaState` grew `bar` and `scroll_to` — the pair
+`ListState` already had, so the two cannot disagree about where a thumb points — and a drag
+leaves the caret alone, because what a scrollbar changes is what is *shown*.
+
+**A key collision, found by the first test that routed a real press.** `AREA_INNER_KEY` was
+written as 40, which is `MENU_BAR_KEY` and the base of a *range*: `locate` answered with the menu
+bar's rectangle for the document, and a press meant for the caret landed on chrome. `nxfiles`
+grew a test against exactly this in M14 Part D after a listing row lit whichever chrome shared its
+number; `nxedit` has one now. **The lesson is that a key is a number nothing checks** — not a
+name, not a type — so the guard has to be a test that enumerates them.
+
+**The chooser could only go down.** Every move it had was a row, and a row is only a move if it
+happens to be a directory — so a dialog that opened in the wrong place had to be cancelled and
+reopened from a buffer that was somewhere else. It has an *up* control and `Backspace`, which is
+the browser's binding for the same move: one desktop, one way out of a directory. **Except while
+saving**, where `Backspace` edits the name — a key that walked out of the directory from under a
+half-typed filename would be the surprise, and there is a field holding the keyboard to say so.
+
+**And the dialog's height is a sum of its parts, which the first version of that row broke.**
+`CHOOSER_H` is derived rather than chosen; a row left to measure itself takes its button's height
+and every part below it loses what the button took. The test that pins the list and the name
+field at the sizes they were built for is what caught it — a test written in M14 Part C's review
+for a different reason entirely.
+
+**The second version broke the row across instead of down.** The path wants centring *vertically*
+— a `text` measures to the theme's line height and the button is taller, so padding it down by a
+constant is wrong the moment the font changes — and `center` does both axes, which put a short
+path at x = 207 in a 420-wide dialog: detached from the button it belongs beside, with its left
+edge moving as the string grew. So `Center` carries which axes it moves on, and `center_v` is the
+half a label *beside* a control wants. **Down is always; across is a choice**, and a wrapper that
+offers only "both" makes the wrong one the easy one.
+
+
+---
+
+## 2026-09-10 — a scroll that the next frame threw away (M15 Part D)
+
+**"The terminal scrollbar works fine, but the ones for files and text edit do not."** That
+comparison is what found it, after three probes in the guest and two on the host had each shown
+the drag working — because every one of them routed an event and read the state, and none of them
+*redrew* in between.
+
+`nxterm`'s grid follows nothing: it keeps a `view_top` and a `scroll_to_line`. `list_view` and
+`text_area` both call `ensure_visible` at the top of **every build**, to keep the selection or the
+caret on screen — and an application repaints after every event. So the sequence was: press,
+compute the right offset, repaint, `ensure_visible` sees the selection is row 0 and pulls the
+offset back to 0, draw. The bar moved under the pointer and the content never did.
+
+**Following a selection is what a *changed* selection asks for.** Both states remember the one
+they last scrolled to, so arrow keys still pull the view along and a scrollbar no longer fights
+the caret. `ListState` gained `at` for it: the bookkeeping is a private field, which is precisely
+what stops a caller writing it in a struct literal and is why the constructor exists.
+
+**And "changed" was drawn too narrowly at first, which is worse than not following at all.** The
+text area's guard keyed on the caret's *line* — so after a deliberate scroll, typing put characters
+into a document that stayed off screen, and Left, Right, Home and End moved a caret nobody could
+see. It keys on `(line, column, revision, visible height)` now: the caret moved, the text changed,
+or the window did. `revision` was already the "the text changed" counter, so following an edit cost
+nothing but noticing it belonged there. `ListState`'s is `(index, visible)` for the same reason —
+a shrunk window that puts the selection off screen must re-follow without waiting for the selection
+to move.
+
+**Part B is what made it reachable**, and that is the pattern rather than the accident: before this
+branch a `text_area` had no scrollbar and no wheel, so there was no way to be scrolled away from
+the caret and no way for a too-narrow guard to show. Two new capabilities composed — scroll away,
+then type — and no single-widget test reaches across the seam between them.
+
+**The lesson is about the shape of the test, not the bug.** Six tests covered scrollbar dragging
+across three applications and all six passed while two of the three bars did nothing, because
+they all had the same shape: build a tree, route a press, route a motion, read the state. The
+application does something none of them did — it *builds the tree again* between events, and the
+build is where the state was being overwritten. **A widget whose build mutates the state it is
+given cannot be tested without building it twice.** The three new tests redraw.
+
+That also explains why the guest probes agreed with the host: they read `nxfiles`' receipts and
+the offsets in them were correct. The offset *was* correct, at the moment it was measured. What
+was wrong was what happened next, and nothing was printing that.
+
+
+---
+
+## 2026-09-10 — a menu with nowhere to hang from (M15 Part E)
+
+**"Does the View menu contain anything? No menu appears when I click it."** It contains six rows,
+and it had never once been drawn. `MENU_COUNT` was a constant declared beside a `menu_table` that
+grew: M14 Part D added a third menu to `nxfiles` and left the constant at two, so the binary asked
+for two anchors, `MenuState::anchor` answered `None` for the third, and the popup had nowhere to
+hang from. A bar word that lit under the pointer, toggled its state, and drew nothing.
+
+**Two numbers that must be equal are one number.** The count is derived from the table now, in all
+three applications rather than only the one that drifted — `nxterm` and `nxedit` happen to have
+two menus each today, which is exactly the state `nxfiles` was in before somebody added a menu.
+
+**The half that matters is where the loop lives.** It was in each `main.rs`, copied three times,
+and *no host test builds a `main.rs`* — so the code that was wrong was also the code nothing could
+check. Moving it to `App::place_menus` made it testable, and each application's test walks its
+**whole bar** through that method rather than a menu chosen when the test was written. Reinstating
+a constant inside `place_menus` fails all three: "menu 2 of 3 …" in `nxfiles`, "menu 1 of 2 …" in
+`nxterm` and `nxedit`, which have two menus each today.
+
+**The first attempt at that test passed against the bug**, which is what sent the loop to the
+library. It set the anchors itself from the derived count and opened each menu — asserting a
+property of `MenuState` that was never in doubt, while the defect sat in a binary the test did not
+touch. A test that reimplements the thing it is checking is not a test of it.
+
+**And the fix went into one crate while the diagnosis went into all three** — `nxfiles`' test
+called `place_menus`; `nxterm`'s and `nxedit`'s kept the reimplemented loop, so `place_menus` was
+uncovered in two of the three applications and review caught it. Writing the lesson down is not
+applying it: the sweep for siblings is a separate step from the fix, and this entry existed,
+naming the trap, while two instances of it sat in the same commit.
+
+
+---
+
+## 2026-09-10 — a hover is a surface, lit (M15 Part F)
+
+Part A gave `nxfiles`' sidebar a ground of its own and **the rows went on painting over it**. A
+row filled `theme.track` whatever the list's ground was, so the panel colour appeared only in the
+gap below the last row: list-coloured tiles on a grey field. The ground parameter reached the
+outer fill and nothing else, which is the shape of a change that is *almost* complete — the thing
+it was for is the thing it missed.
+
+**The hover is derived from the ground rather than named.** `face_hover` is one near-white, and a
+near-white is the lit version of exactly one surface; on a grey panel it reads as a different
+control rather than the same one under a pointer. `shade(+9)` is the step this palette already
+uses between `face` and `face_hover`, so a list on any ground gets a hover that belongs to the
+same desktop. **The default path still returns `theme.face_hover` unchanged**, which is what keeps
+every other list in the system painting exactly as it did — a derivation that also changed the
+windows nobody complained about would be a second, unasked-for change riding along.
+
+**The selection stays blue in both panes.** It answers the same question — "this is the row an
+action will act on" — and a sidebar that answered it differently from the listing beside it would
+be two answers to one question, which is the rule M11 Part E batch 5 settled for hover and
+selection competing.
+
+**The test needed a selection to see the hover at all**, which is worth recording because it is
+the second time this fixture has caught somebody out: with nothing selected, a hovered row *is*
+the primary highlight and is drawn blue, so a list with no selection never reaches the hover
+branch. The first version of the test asserted `face_hover` appears and it did not, for a reason
+that had nothing to do with the change.

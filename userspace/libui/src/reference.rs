@@ -56,7 +56,7 @@ use crate::layout::layout;
 use crate::paint::{FontMetrics, Theme, paint};
 use crate::widget::{
     ListRow, ListState, ScrollState, TextAreaState, TextFieldState, WidgetState, button,
-    list_view, menu_bar, scrollbar, text_area, text_field,
+    list_view, menu_bar, menu_item, scrollbar, text_area, text_field,
 };
 
 /// The reference UI's width, in pixels.
@@ -144,10 +144,14 @@ pub fn view() -> Element<Msg> {
         vec![
             docked(
                 Edge::Top,
+                // **`menu_item`, which is what an application's bar is made of** — `menu::bar`
+                // builds these, and no application has ever put a `button` in a menu bar. The
+                // reference did, and it went unnoticed until buttons grew an edge in M15 and the
+                // picture showed two boxed words where a menu bar should be.
                 menu_bar(
                     vec![
-                        button("File", Msg::File, WidgetState::default(), &theme),
-                        button("Edit", Msg::Edit, WidgetState::default(), &theme),
+                        menu_item("File", Msg::File, false, &theme),
+                        menu_item("Edit", Msg::Edit, true, &theme),
                     ],
                     24,
                     &theme,
@@ -208,8 +212,8 @@ fn reference_field() -> TextFieldState {
 /// nothing to persist. That is the one case where discarding the scroll is right, and since
 /// M10 Part C it is expressed by the state being local rather than by a `_` in a pattern.
 fn reference_list(theme: &Theme) -> Element<Msg> {
-    let mut state = ListState { selected: Some(1), offset: 0 };
-    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, None, None, theme);
+    let mut state = ListState::at(Some(1), 0);
+    let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, None, None, None, theme);
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.
     crate::element::sized(Size::new(0, LIST_H), e)
@@ -253,7 +257,7 @@ fn reference_area(theme: &Theme) -> Element<Msg> {
     }];
     crate::element::sized(
         Size::new(0, AREA_H),
-        text_area(&mut a, AREA_H, ROW_H, true, &ink, theme),
+        text_area(&mut a, AREA_H, ROW_H, true, &ink, None, theme),
     )
 }
 

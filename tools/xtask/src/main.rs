@@ -3347,6 +3347,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // starts past it while the strips above still span the full width. `nxfiles::SIDEBAR_W` is
     // the browser's own version of this number.
     const SIDEBAR_W: i32 = 148;
+    // **And the margin around it** (M15 Part E), which moved every sidebar row down by its height
+    // without moving a listing row at all. `nxfiles::SIDEBAR_PAD` is the browser's own version.
+    const SIDEBAR_PAD: i32 = 6;
     const TITLE_BAR_H: i32 = 26;
     const PATH_H: i32 = 24;
     const ROW_H: i32 = 20;
@@ -3357,6 +3360,11 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let row_y = |row: i32| {
         files_win.2 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + PATH_H + row * ROW_H + ROW_H / 2
     };
+    // **A sidebar row is `SIDEBAR_PAD` lower than the listing row beside it**, since M15 Part E
+    // put a margin around the panel. Aiming at a listing row still landed inside the sidebar row
+    // of the same index — 4px into a 20px row rather than at its middle — so the gate passed and
+    // said nothing about having lost most of its margin (PR #290 review, 6).
+    let side_y = |row: i32| row_y(row) + SIDEBAR_PAD;
 
     // **The sidebar** (M14 Part D). One press on *Documents* goes there — one, not two: a sidebar
     // row has nothing to select and no second verb, so the listing's double click would be a rule
@@ -3367,9 +3375,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // cannot link the browser to compare them — so a folder staged under another name answers
     // "no such directory" here rather than differing silently.
     //
-    // Sidebar rows are Home, the three folders, then Root; they start at the same y as the
-    // listing because both sit below the path strip.
-    click_at(&mut qmp, &mut session, files_win.1 + 40, row_y(1))?;
+    // Sidebar rows are Home, the three folders, then Root; they sit `SIDEBAR_PAD` below the
+    // listing rows beside them, because the panel is inset from the content it shares an edge
+    // with while the strips above span the full width.
+    click_at(&mut qmp, &mut session, files_win.1 + 40, side_y(1))?;
     session.expect("nxfiles: listed /home/Documents - ")?;
     println!("  ok: one press on a sidebar row went there");
     press(&mut qmp, "backspace")?;
@@ -3391,7 +3400,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("  ok: Ctrl+C put a path on the clipboard");
 
     // Into an empty directory, by the sidebar, and paste there.
-    click_at(&mut qmp, &mut session, files_win.1 + 40, row_y(1))?;
+    click_at(&mut qmp, &mut session, files_win.1 + 40, side_y(1))?;
     session.expect("nxfiles: listed /home/Documents - 0 entries")?;
     qmp.send_key("ctrl", true)?;
     press(&mut qmp, "v")?;

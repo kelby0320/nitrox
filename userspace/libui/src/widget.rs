@@ -29,8 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, column, dock, docked, fill, icon, padding, row, sized,
-    stack, text,
+    Edge, Element, IconKind, Insets, bevel, center, column, dock, docked, fill, icon, padding,
+    row, sized, stack, text,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -80,17 +80,28 @@ pub fn button<Msg>(
     } else {
         theme.face
     };
-    // Bottom to top: the ring, then the face, then the label. A `Stack` gives every layer
-    // the whole area, so the ring is only visible because the face above it is inset by the
-    // ring's width — and the label sits above both, inset further so it clears the edge.
+    // Bottom to top: the ring or the border, then the face, then the label. A `Stack` gives
+    // every layer the whole area, so the outline is only visible because the face above it is
+    // inset — and the label sits above both.
+    //
+    // **An edge, always** (M15). A face at `#EDECEB` on a window at `#FFFFFF` is a difference of
+    // eighteen units per channel: technically not the ground, and in a real window indisputably
+    // invisible — the report was that buttons need "a different color background … so you know
+    // it's a button". What actually says *button* is the edge, which is what every desktop
+    // draws and what this toolkit had only around a focused control.
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if state.active {
         layers.push(fill(theme.focus_ring));
         layers.push(padding(Insets::all(RING), fill(face)));
     } else {
-        layers.push(fill(face));
+        layers.push(fill(theme.border));
+        layers.push(padding(Insets::all(BORDER), fill(face)));
     }
-    layers.push(padding(BUTTON_PAD, text(label)));
+    // **Centred, which is what a button's label is everywhere else in the world.** It was against
+    // the top-left corner of the face: `padding` places a child at an inset from the origin, and
+    // a face is usually much wider than the word on it, so every button in this toolkit read as
+    // a label with a box drawn round it. `center` is the node that was missing.
+    layers.push(center(padding(BUTTON_PAD, text(label))));
     stack(layers).on_press(msg).focusable()
 }
 
@@ -400,6 +411,13 @@ const MENU_ITEM_PAD: Insets = Insets { top: 3, right: 10, bottom: 3, left: 10 };
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;
 
+/// How wide a resting control's edge is, in pixels.
+///
+/// **One, because it is a line rather than a ring.** The focus ring is two so that it reads as
+/// a state; an edge is what makes a shape a control at rest, and a second pixel of it would
+/// compete with the ring instead of sitting under it.
+const BORDER: u32 = 1;
+
 /// Where a scrollbar is and how much of its content is visible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ScrollState {
@@ -610,12 +628,12 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
     sized(
         Size::new(width, 0),
         stack(alloc::vec![
-            fill(theme.track),
+            fill(theme.groove),
             column(alloc::vec![
-                sized(Size::new(0, pos), fill(theme.track)),
+                sized(Size::new(0, pos), fill(theme.groove)),
                 sized(Size::new(0, len), bevel(theme.thumb)),
                 // The remainder, so the thumb does not stretch to the bottom.
-                fill(theme.track).flex(1),
+                fill(theme.groove).flex(1),
             ]),
         ]),
     )
@@ -1037,6 +1055,20 @@ pub struct TextAreaState {
     goal: Option<usize>,
     /// The first visible line.
     offset: usize,
+    /// What the last [`ensure_visible`](Self::ensure_visible) was for: the cursor's line and
+    /// column, the text's revision, and how many lines fitted.
+    ///
+    /// **Everything that could have put the caret out of view, and nothing else.** A keystroke
+    /// moves the caret, an edit changes the revision, and a window that got shorter changes the
+    /// count — any of those means the view should follow again. A *repaint* changes none of
+    /// them, which is the whole point: following on every build is what made a scrollbar
+    /// impossible (M15 Part D).
+    ///
+    /// **Derived rather than a flag somebody sets.** A "please scroll to the caret" boolean has
+    /// to be set by every mutator, and a missed one is silent — which is exactly the bug this
+    /// field's first version had: it keyed on the *line* alone, so typing (which does not change
+    /// the line) left the person typing into a document they could not see (PR #290 review, 1).
+    followed: Option<(usize, usize, u64, usize)>,
     /// How many times the *text* has changed.
     ///
     /// **Because "is this buffer modified?" is a question only the state can answer.** An editor
@@ -1116,6 +1148,7 @@ impl Default for TextAreaState {
             anchor: None,
             goal: None,
             offset: 0,
+            followed: None,
             revision: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1335,6 +1368,70 @@ impl TextAreaState {
         // being undone together with it.
         self.group = None;
         (from, to)
+    }
+
+    /// The (line, column) a pointer at widget-local `(x, y)` is over.
+    ///
+    /// **Given a way to measure text rather than a font**, for [`Metrics`](crate::layout::Metrics)'
+    /// reason one layer down: this crate has no glyphs, and the application that draws the area
+    /// already holds the metrics it was laid out with. Pass `|s| metrics.text_size(s).w`.
+    ///
+    /// **The column is the *nearest boundary*, not the character under the cursor.** Clicking the
+    /// right half of a letter puts the caret after it, which is what every editor does and what
+    /// makes clicking at the end of a word land after the word rather than inside it.
+    ///
+    /// Coordinates are the ones [`text_area`] hands its pointer handler, so this subtracts the
+    /// padding the widget draws with — a caller cannot know that number and should not have to.
+    pub fn at_point(&self, x: i32, y: i32, row_height: u32, width: impl Fn(&str) -> u32)
+        -> (usize, usize)
+    {
+        let y = y - FIELD_PAD.top as i32;
+        let row = if row_height == 0 { 0 } else { (y.max(0) as u32 / row_height) as usize };
+        // **Clamped rather than refused.** A press below the last line means its end, which is
+        // what dragging off the bottom of a selection has to mean.
+        let line = (self.offset + row).min(self.lines.len().saturating_sub(1));
+        let text = &self.lines[line];
+        let x = x - FIELD_PAD.left as i32;
+        if x <= 0 {
+            return (line, 0);
+        }
+        // Walk the boundaries, keeping the one whose drawn width is nearest the cursor. Linear
+        // in the line's length and measured once per boundary, which is what a proportional font
+        // costs: there is no arithmetic that turns a pixel into a column when every glyph is a
+        // different width.
+        let mut best = (0usize, u32::MAX);
+        for col in text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(core::iter::once(text.len()))
+        {
+            let w = width(&text[..col]);
+            let d = w.abs_diff(x as u32);
+            if d < best.1 {
+                best = (col, d);
+            }
+        }
+        (line, best.0)
+    }
+
+    /// This buffer as a scrollbar's state, for `visible` lines on screen.
+    ///
+    /// The same shape [`ListState::bar`] has, and for the same reason: the widget owns the
+    /// arithmetic, so a bar and the text beside it cannot disagree about where a thumb points.
+    pub fn bar(&self, visible: usize) -> ScrollState {
+        ScrollState {
+            offset: self.offset as u32,
+            visible: visible as u32,
+            total: self.lines.len() as u32,
+        }
+    }
+
+    /// Scroll so `offset` is the first visible line, clamped to what there is.
+    ///
+    /// **The cursor does not move.** A scrollbar drag changes what is *shown*; an editor that
+    /// dragged the caret along with the view would lose the place the person was working at.
+    pub fn scroll_to(&mut self, offset: usize, visible: usize) {
+        self.offset = offset.min(self.lines.len().saturating_sub(visible.max(1)));
     }
 
     /// Select from `from` to `to`, putting the cursor at `to`.
@@ -1700,6 +1797,14 @@ impl TextAreaState {
         if visible == 0 {
             return;
         }
+        // Once per *reason to follow*, for [`ListState::ensure_visible`]'s reason: a document
+        // that followed its caret on every build could not be scrolled away from it, and one
+        // that followed only on a line change let you type into a screen you were not looking at.
+        let now = (self.line, self.col, self.revision, visible);
+        if self.followed == Some(now) {
+            return;
+        }
+        self.followed = Some(now);
         if self.line < self.offset {
             self.offset = self.line;
         } else if self.line >= self.offset + visible {
@@ -1779,6 +1884,14 @@ pub struct InkRun {
 /// `height` is what the caller will lay it out at; wrap the result in `sized` to keep the two in
 /// step, for the reason [`list_view`] gives.
 ///
+/// **`pointer` is what makes it clickable** (M15). The state has had `place` and `extend_to`
+/// since M10 — documented, then, as "what a press does" and "what a drag does" — and no widget
+/// ever handed them anything: this took no pointer events at all, so an editor's caret could
+/// only be moved with the arrow keys. The handler receives widget-local coordinates; the
+/// application turns them into a line and a column with
+/// [`TextAreaState::at_point`](TextAreaState::at_point), because that needs to measure text and
+/// this crate has no glyphs.
+///
 /// **What it draws:** the visible lines, the selection behind the text on each, the caret when
 /// `active`, and each line in the colours `ink` gives it. What it does *not* draw is a scrollbar
 /// — that is `scrollbar`'s, composed beside it by an application that wants one, the way the
@@ -1793,6 +1906,7 @@ pub fn text_area<Msg>(
     row_height: u32,
     active: bool,
     ink: &[InkRun],
+    pointer: Option<fn(PointerEvent) -> Msg>,
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -1890,7 +2004,14 @@ pub fn text_area<Msg>(
     let mut layers = alloc::vec::Vec::with_capacity(2);
     layers.push(fill(theme.track));
     layers.push(padding(FIELD_PAD, column(rows)));
-    stack(layers).focusable()
+    let mut e = stack(layers).focusable();
+    if let Some(f) = pointer {
+        // **On the whole area, including its padding.** A press in the margin beside a line is a
+        // press on that line — `at_point` subtracts the padding itself, which is the number a
+        // caller cannot know.
+        e = e.on_pointer(f);
+    }
+    e
 }
 
 /// One row of a [`list_view`].
@@ -1939,9 +2060,34 @@ pub struct ListState {
     pub selected: Option<usize>,
     /// The first visible row.
     pub offset: usize,
+    /// What the last [`ensure_visible`](Self::ensure_visible) was for: the selected row, and how
+    /// many rows fitted.
+    ///
+    /// **What stops "keep the selection on screen" from meaning "never scroll anywhere else".**
+    /// `list_view` calls `ensure_visible` on every build, so without this a list whose selection
+    /// is row 0 snaps its offset back to 0 on every repaint — and since an application repaints
+    /// after every event, a scrollbar drag computed the right offset and had it thrown away
+    /// before anything was drawn. The bar moved and the list did not (M15 Part D).
+    ///
+    /// **The row count is part of it**, so a window that got shorter brings the selection back
+    /// into view rather than waiting for it to move. `TextAreaState` carries the text's revision
+    /// here too; a list has no equivalent, because everything that changes a list's rows also
+    /// replaces its selection.
+    followed: Option<(usize, usize)>,
 }
 
 impl ListState {
+    /// A list showing `offset` first, with `selected` picked.
+    ///
+    /// **A constructor rather than a literal**, since M15 Part D: the state carries one piece of
+    /// bookkeeping ([`followed`](Self::followed)) that no caller has an opinion about, and a
+    /// private field cannot be written in a struct literal from another module — which is the
+    /// point. `selected` and `offset` stay public, because a caller does have opinions about
+    /// those.
+    pub fn at(selected: Option<usize>, offset: usize) -> Self {
+        Self { selected, offset, followed: None }
+    }
+
     /// Move the selection down one row, answering whether anything changed.
     ///
     /// From nothing selected this selects the first row, which is what a launcher wants when
@@ -1986,6 +2132,13 @@ impl ListState {
         if visible == 0 {
             return;
         }
+        // **Once per selection, not once per build.** Following a selection is what a *changed*
+        // selection asks for; doing it every time the widget is built makes every other way of
+        // scrolling impossible, because the next repaint undoes it.
+        if self.followed == Some((i, visible)) {
+            return;
+        }
+        self.followed = Some((i, visible));
         if i < self.offset {
             self.offset = i;
         } else if i >= self.offset + visible {
@@ -2071,6 +2224,11 @@ impl ListState {
 /// (An earlier version of this sentence claimed a caller "cannot get it out of step", which is
 /// exactly backwards; PR #233 review.)
 ///
+/// **`ground` is the colour behind the rows**, or `None` for the ordinary list ground. The one
+/// caller that passes something is a *sidebar*: a panel beside content has to be told from the
+/// content at a glance, and drawn in the list's own ground it reads as a list with a gap in it
+/// (M15). A colour rather than a flag, because what a panel is depends on the theme.
+///
 /// **`state` is taken by `&mut` and scrolled in place** to follow the selection — see
 /// [`ensure_visible`](ListState::ensure_visible).
 ///
@@ -2096,6 +2254,7 @@ pub fn list_view<Msg>(
     grab: Option<fn(u64) -> Msg>,
     scroll: Option<fn(PointerEvent) -> Msg>,
     hovered: Option<u64>,
+    ground: Option<Rgb>,
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -2118,6 +2277,16 @@ pub fn list_view<Msg>(
     let max_offset = rows.len().saturating_sub(visible);
     state.offset = state.offset.min(max_offset);
 
+    // **The surface the rows sit on, and what one looks like under the pointer.** A row used to
+    // fill `theme.track` whatever the list's ground was, so a panel with a ground of its own had
+    // list-coloured tiles painted over it and the panel showed only below the last row (M15
+    // Part F). A caller that names a ground gets its hover derived from it, because a hover is
+    // "this surface, lit" rather than a colour of its own — and the default path keeps
+    // `face_hover` exactly, so every other list in the system paints as it did.
+    let (ground, lit) = match ground {
+        Some(g) => (g, g.shade(HOVER_LIFT)),
+        None => (theme.track, theme.face_hover),
+    };
     let last = (state.offset + visible).min(rows.len());
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
@@ -2141,8 +2310,8 @@ pub fn list_view<Msg>(
                 padding(ROW_PAD, text(r.label)),
             ])
         } else {
-            let ground = if hovered == Some(r.key) { theme.face_hover } else { theme.track };
-            stack(alloc::vec![fill(ground), padding(ROW_PAD, text(r.label))])
+            let face = if hovered == Some(r.key) { lit } else { ground };
+            stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))])
         };
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
@@ -2181,11 +2350,18 @@ pub fn list_view<Msg>(
     } else {
         list
     };
-    stack(alloc::vec![fill(theme.track), body]).focusable()
+    stack(alloc::vec![fill(ground), body]).focusable()
 }
 
+/// How far a row is lightened under the pointer, per channel.
+///
+/// **The step this palette already uses**: `face_hover` is `face` plus nine. Deriving it means a
+/// list on any ground gets a hover that belongs to the same desktop, rather than one that only
+/// suits the ground the toolkit shipped with.
+const HOVER_LIFT: i16 = 9;
+
 /// How wide a list's scrollbar is, in pixels.
-const SCROLLBAR_W: u32 = 10;
+const SCROLLBAR_W: u32 = 12;
 
 #[cfg(test)]
 mod list_view_tests {
@@ -2206,7 +2382,7 @@ mod list_view_tests {
     /// would be a list showing nothing at all).
     #[test]
     fn the_wheel_moves_whole_rows_and_stops_at_the_top() {
-        let mut st = ListState { selected: None, offset: 0 };
+        let mut st = ListState::at(None, 0);
         st.wheel(2);
         assert_eq!(st.offset, 2 * crate::click::WHEEL_UNITS as usize, "positive is down");
         st.wheel(-1);
@@ -2222,9 +2398,61 @@ mod list_view_tests {
     /// has to be one whose overflow is visible — the same trap `nxterm`'s copy of this test hit.
     #[test]
     fn a_huge_wheel_delta_does_not_wrap_upward() {
-        let mut st = ListState { selected: None, offset: 100 };
+        let mut st = ListState::at(None, 100);
         st.wheel(20_000);
         assert!(st.offset > 100, "scrolled down, not back to the top: {}", st.offset);
+    }
+
+    /// A row rests on the list's own ground, and is lit from it.
+    ///
+    /// **A row used to fill `theme.track` whatever the list's ground was** (M15 Part F), so a
+    /// panel with a ground of its own had list-coloured tiles painted over it — the panel showed
+    /// only in the gap below the last row, which is not what a panel is. The hover is derived
+    /// from the ground for the same reason: a hover is "this surface, lit", not a colour of its
+    /// own, and one fixed near-white belongs to exactly one ground.
+    #[test]
+    fn a_rows_ground_is_the_lists_and_its_hover_is_derived_from_it() {
+        let p = Theme::default();
+        let data = [(1u64, "alpha"), (2, "beta")];
+        let panel = Rgb::new(0xDD, 0xDA, 0xD6);
+        // **A selection is kept, and the hover is on a *different* row.** With nothing selected
+        // a hovered row is the primary highlight — the blue one — so a fixture without a
+        // selection never reaches the hover branch at all (M11 Part E, batch 5).
+        let fills_of = |ground: Option<Rgb>, hovered: Option<u64>| {
+            let mut st = ListState::at(Some(0), 0);
+            let e: Element<u64> =
+                list_view(&rows(&data), &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
+            let mut out = Vec::new();
+            fn walk<M>(e: &Element<M>, out: &mut Vec<Rgb>) {
+                if let crate::element::Node::Fill(c) = &e.node {
+                    out.push(*c);
+                }
+                for c in e.children() {
+                    walk(c, out);
+                }
+            }
+            walk(&e, &mut out);
+            out
+        };
+
+        // The default list is untouched: rows on `track`, lit with `face_hover`.
+        let plain = fills_of(None, Some(2));
+        assert!(plain.contains(&p.track), "the ordinary list stopped using the theme's ground");
+        assert!(plain.contains(&p.face_hover), "…or its hover");
+
+        // A list on a panel rests on the panel and lights from it.
+        let on_panel = fills_of(Some(panel), None);
+        assert!(on_panel.contains(&panel), "the rows are not on the ground they were given");
+        assert!(
+            !on_panel.contains(&p.track),
+            "a row painted the list's default ground over the panel: {on_panel:?}"
+        );
+        let hovered = fills_of(Some(panel), Some(2));
+        assert!(
+            hovered.contains(&panel.shade(HOVER_LIFT)),
+            "the hover was not derived from the ground: {hovered:?}"
+        );
+        assert!(!hovered.contains(&p.face_hover), "…and it is not the default one either");
     }
 
     /// A **marked** row is drawn as a selected one, and an unmarked one is not.
@@ -2243,8 +2471,8 @@ mod list_view_tests {
         let build = |marked: bool, selected: Option<usize>| {
             let mut r = rows(&label);
             r[1].marked = marked;
-            let mut st = ListState { selected, offset: 0 };
-            nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, &Theme::default()))
+            let mut st = ListState { selected, offset: 0, ..Default::default() };
+            nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, None, &Theme::default()))
         };
         let plain = build(false, None);
         let marked = build(true, None);
@@ -2259,7 +2487,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -2269,7 +2497,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -2279,9 +2507,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -2291,13 +2519,13 @@ mod list_view_tests {
     #[test]
     fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
-        let mut state = ListState { selected: Some(19), offset: 0 };
+        let mut state = ListState::at(Some(19), 0);
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -2319,17 +2547,77 @@ mod list_view_tests {
     /// Shrinking to nothing leaves nothing selected, rather than row `-1`.
     #[test]
     fn a_list_that_empties_clears_the_selection() {
-        let mut state = ListState { selected: Some(3), offset: 2 };
+        let mut state = ListState::at(Some(3), 2);
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
 
     /// A selection moved with the keyboard must stay on screen.
+    /// Following the selection does not undo a deliberate scroll.
+    ///
+    /// **The bug the maintainer reported as "the scrollbar doesn't work"** (M15 Part D). Both
+    /// `list_view` and `text_area` call `ensure_visible` on every build, and an application
+    /// repaints after every event — so with the selection on row 0, a scrollbar drag computed
+    /// the right offset and the very next frame put it back. The bar moved and the list did not.
+    /// `nxterm` was unaffected because its grid follows nothing: it keeps a `view_top` instead.
+    #[test]
+    fn following_a_selection_happens_once_per_selection_not_once_per_build() {
+        let mut s = ListState::at(Some(0), 0);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 0);
+
+        // A scrollbar drag, then the repaint that follows every event.
+        s.offset = 20;
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 20, "the repaint dragged the list back to its selection");
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 20, "…and again on the frame after that");
+
+        // **But a selection that *moves* is still followed**, which is what the rule is for.
+        s.down(40);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 1, "the selection moved and the view did not follow it");
+    }
+
+    /// A window that gets shorter brings the selection back into view.
+    ///
+    /// **The case a key of "the selection we last followed" alone gets wrong**, and the one
+    /// flagged when Part D landed: a shrink can put the selection off screen without the
+    /// selection moving, so a rule that waits for it to move leaves a list highlighting a row
+    /// nobody can see (PR #290 review, 1).
+    #[test]
+    fn a_shorter_window_brings_the_selection_back() {
+        let mut s = ListState::at(Some(9), 0);
+        s.ensure_visible(10);
+        assert_eq!(s.offset, 0, "precondition: ten rows fit, so nothing moved");
+
+        // Four fit now, and the selection is past the bottom.
+        s.ensure_visible(4);
+        assert_eq!(s.offset, 6, "the selection was left below a window that shrank");
+    }
+
+    /// The same rule for a document's caret.
+    #[test]
+    fn a_document_scrolls_away_from_its_caret_and_stays_there() {
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        a.ensure_visible(3);
+        assert_eq!(a.offset(), 0);
+
+        a.scroll_to(6, 3);
+        a.ensure_visible(3);
+        assert_eq!(a.offset(), 6, "the repaint dragged the document back to its caret");
+
+        // Typing moves the caret, and the view follows it again.
+        a.apply(KEY_DOWN, 0);
+        a.ensure_visible(3);
+        assert_eq!(a.offset(), 1, "the caret moved to line 1 and the view did not follow it");
+    }
+
     #[test]
     fn the_scroll_follows_the_selection_in_both_directions() {
-        let mut s = ListState { selected: Some(7), offset: 0 };
+        let mut s = ListState::at(Some(7), 0);
         s.ensure_visible(5);
         assert_eq!(s.offset, 3, "scrolling down did not bring the selection into view");
         s.selected = Some(1);
@@ -2353,7 +2641,7 @@ mod list_view_tests {
     /// Both ends stop rather than wrapping, and report no change.
     #[test]
     fn the_selection_stops_at_both_ends() {
-        let mut s = ListState { selected: Some(2), offset: 0 };
+        let mut s = ListState::at(Some(2), 0);
         assert!(!s.down(3), "the selection moved past the last row");
         s.selected = Some(0);
         assert!(!s.up(), "the selection moved above the first row");
@@ -2366,11 +2654,11 @@ mod list_view_tests {
     #[test]
     fn declines_the_keys_that_belong_above_it() {
         for key in [28u16, 1, 15] {
-            let mut s = ListState { selected: Some(1), offset: 0 };
+            let mut s = ListState::at(Some(1), 0);
             assert!(!s.apply(key, 4), "keycode {key} was claimed by the list");
             assert_eq!(s.selected, Some(1));
         }
-        let mut s = ListState { selected: Some(1), offset: 0 };
+        let mut s = ListState::at(Some(1), 0);
         assert!(s.apply(108, 4), "Down was not claimed");
         assert_eq!(s.selected, Some(2));
     }
@@ -2437,11 +2725,12 @@ mod list_view_tests {
             None,
             Some(|_| 0),
             None,
+            None,
             &p,
         );
         assert_eq!(handlers(&with), 1, "the scrollbar took no pointer handler");
         let without: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
     }
 
@@ -2610,7 +2899,7 @@ mod list_view_tests {
         let p = Theme::default();
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), &p);
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
         assert_eq!(row_faces(&e)[1], p.focus_ring, "the hovered row has no border");
         assert_eq!(row_bevels(&e)[1], Some(p.selection), "the hovered row is not the blue");
         assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
@@ -2624,13 +2913,14 @@ mod list_view_tests {
         // same weight — two answers to "what happens if I act now" is one too many.
         let e: Element<u64> = list_view(
             &rows(&data),
-            &mut ListState { selected: Some(1), offset: 0 },
+            &mut ListState::at(Some(1), 0),
             100,
             20,
             |k| k,
             None,
             None,
             Some(1),
+            None,
             &p,
         );
         let faces = row_faces(&e);
@@ -2641,13 +2931,14 @@ mod list_view_tests {
         // And hovering the *selected* row leaves it selected rather than downgrading it.
         let e: Element<u64> = list_view(
             &rows(&data),
-            &mut ListState { selected: Some(1), offset: 0 },
+            &mut ListState::at(Some(1), 0),
             100,
             20,
             |k| k,
             None,
             None,
             Some(2),
+            None,
             &p,
         );
         assert_eq!(row_faces(&e)[1], p.focus_ring, "selection lost to hover");
@@ -2659,7 +2950,7 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&data), &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
@@ -2680,11 +2971,11 @@ mod list_view_tests {
         let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -2693,7 +2984,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -2702,7 +2993,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 
@@ -3177,18 +3468,57 @@ mod tests {
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
         assert_eq!(fb.get_pixel(0, 0), Some(p.focus_ring), "the ring is on the edge");
-        assert_eq!(fb.get_pixel(40, 20), Some(p.face), "and the face is inside it");
+        // **Inside the ring but away from the label**, which is centred since M15: the middle
+        // of the button is where the word is, so a sample taken there is a glyph.
+        assert_eq!(fb.get_pixel(6, 20), Some(p.face), "and the face is inside it");
     }
 
+    /// A resting button has an edge, and it is not the focus ring.
+    ///
+    /// **What makes a shape read as a control** (M15). The face is eighteen units per channel
+    /// from a white window, which is a difference nobody can see — the report from running it
+    /// was that buttons "need different color background … so you know it's a button". An edge
+    /// is what every desktop draws and what this toolkit had only around a focused control.
     #[test]
-    fn an_unfocused_button_draws_no_ring() {
+    fn a_resting_button_has_a_border_and_a_focused_one_keeps_the_ring() {
         let p = Theme::default();
         let t = Theme::default();
         let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.face), "face all the way to the edge");
+        assert_eq!(fb.get_pixel(0, 0), Some(p.border), "a resting button has no edge at all");
+        assert_ne!(p.border, p.face, "…and the edge is not the face");
+        assert_eq!(fb.get_pixel(6, 20), Some(p.face), "the face is inside the edge");
+    }
+
+    /// The label is in the middle of the button, not against its corner.
+    ///
+    /// **Measured as a distance from each edge**, because the exact pixels a glyph lands on are
+    /// the font's business: what this asserts is that the ink is not hard against the left,
+    /// which is where `padding` alone put it — a button 80 wide with a word 20 wide had 58
+    /// pixels of face to the right of its label (M15).
+    #[test]
+    fn a_buttons_label_is_centred_in_its_face() {
+        let p = Theme::default();
+        let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
+        let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
+        let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
+        paint(&mut fb, &font(), &p, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
+        let inked: Vec<u32> = (0..80)
+            .filter(|x| {
+                (0..40).any(|y| {
+                    let c = fb.get_pixel(*x, y);
+                    c != Some(p.face) && c != Some(p.border)
+                })
+            })
+            .collect();
+        let (first, last) = (inked[0], inked[inked.len() - 1]);
+        let (left, right) = (first, 79 - last);
+        assert!(
+            left.abs_diff(right) <= 2,
+            "the label sits {left} from the left and {right} from the right"
+        );
     }
 
     #[test]
@@ -3771,19 +4101,19 @@ two");
         // the widget takes `&mut` precisely so it cannot be forgotten (PR #257 review).
         let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7");
         let p = Theme::default();
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 0);
 
         for _ in 0..5 {
             a.apply(KEY_DOWN, 0);
         }
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 3, "line 5 is visible in a three-line window");
 
         for _ in 0..5 {
             a.apply(KEY_UP, 0);
         }
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 0, "and it scrolls back the other way");
     }
 
@@ -3912,7 +4242,7 @@ two");
         // never does. Both directions here, counted in the tree (PR #258 review, blocking 2).
         let p = Theme::default();
         let draw = |a: &mut TextAreaState| -> usize {
-            let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], &p);
+            let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], None, &p);
             fills(&e, p.focus_ring)
         };
 
@@ -3940,7 +4270,7 @@ two");
 
         let mut a = area();
         a.apply(KEY_END, 0);
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], None, &p);
         assert_eq!(fills(&e, p.focus_ring), 0, "and none at all when the widget is not active");
     }
 
@@ -3977,6 +4307,7 @@ two");
             16,
             false,
             &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(
@@ -3987,6 +4318,66 @@ two");
             ],
             "the line was not split at the run's edge"
         );
+    }
+
+    /// A pixel becomes a line and a column, and the column is the nearest boundary.
+    ///
+    /// **Nearest, not the character under the cursor**: clicking the right half of a letter puts
+    /// the caret after it, which is what every editor does and what makes clicking past the end
+    /// of a word land after the word rather than inside it.
+    #[test]
+    fn a_point_becomes_the_nearest_line_and_column() {
+        // Eight pixels a character, which is what the fixed metric these tests use gives.
+        let w = |s: &str| (s.chars().count() * 8) as u32;
+        let a = TextAreaState::with_text("abcdef\nghi");
+        let px = |col: usize| FIELD_PAD.left as i32 + col as i32 * 8;
+        let py = |row: usize| FIELD_PAD.top as i32 + row as i32 * 16 + 4;
+
+        assert_eq!(a.at_point(px(0), py(0), 16, w), (0, 0));
+        assert_eq!(a.at_point(px(3), py(0), 16, w), (0, 3), "a boundary is itself");
+        assert_eq!(a.at_point(px(3) + 6, py(0), 16, w), (0, 4), "past the middle is the next");
+        assert_eq!(a.at_point(px(3) + 2, py(0), 16, w), (0, 3), "before it is this one");
+        assert_eq!(a.at_point(px(0), py(1), 16, w), (1, 0), "the second row is the second line");
+
+        // **Off the ends is clamped, in both directions.** A drag runs off a widget routinely —
+        // the router hands a captured widget negative coordinates rather than clamping them.
+        assert_eq!(a.at_point(-40, py(0), 16, w), (0, 0));
+        assert_eq!(a.at_point(px(99), py(0), 16, w), (0, 6), "past the end of the line is its end");
+        assert_eq!(a.at_point(px(0), py(9), 16, w), (1, 0), "past the last line is the last line");
+        assert_eq!(a.at_point(px(0), -80, 16, w), (0, 0));
+    }
+
+    /// A scrolled area maps a point to the line that is *on screen* there.
+    ///
+    /// **The offset is the whole of it**, and leaving it out is the bug that makes clicking work
+    /// perfectly until the first time somebody scrolls — after which every click lands the same
+    /// number of lines too high.
+    #[test]
+    fn a_point_is_read_against_what_is_on_screen() {
+        let w = |s: &str| (s.chars().count() * 8) as u32;
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        a.scroll_to(4, 3);
+        assert_eq!(a.offset(), 4, "precondition: scrolled");
+        let y = FIELD_PAD.top as i32 + 4;
+        assert_eq!(a.at_point(FIELD_PAD.left as i32, y, 16, w).0, 4, "the top row is line 4");
+    }
+
+    /// The scrollbar's state, and a scroll that leaves the cursor where it was.
+    #[test]
+    fn a_text_area_reports_a_bar_and_scrolls_without_moving_the_cursor() {
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        let bar = a.bar(4);
+        assert_eq!((bar.offset, bar.visible, bar.total), (0, 4, 10));
+        assert!(bar.scrollable());
+
+        let before = a.cursor();
+        a.scroll_to(3, 4);
+        assert_eq!(a.offset(), 3);
+        assert_eq!(a.cursor(), before, "a scrollbar drag moved the caret");
+        // Clamped to what is left, so a drag past the end shows the last screen rather than
+        // scrolling into blank space.
+        a.scroll_to(99, 4);
+        assert_eq!(a.offset(), 6, "ten lines, four visible");
     }
 
     /// The caret is drawn where the cursor is in the middle of a line.
@@ -4004,7 +4395,7 @@ two");
             a.apply(KEY_RIGHT, 0);
         }
         assert_eq!(a.cursor(), (0, 2), "precondition: mid-line, with no selection");
-        let e: Element<()> = text_area(&mut a, 16, 16, true, &[], &p);
+        let e: Element<()> = text_area(&mut a, 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.focus_ring), 1, "no caret while typing in the middle of a line");
     }
 
@@ -4027,6 +4418,7 @@ two");
             16,
             true,
             &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(fills(&e, p.selection), 1, "precondition: the keyword is selected");
@@ -4053,6 +4445,7 @@ two");
             16,
             false,
             &[InkRun { line: 0, start: 1, end: 99, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(
@@ -4069,6 +4462,7 @@ two");
             16,
             false,
             &[InkRun { line: 0, start: 1, end: 2, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(inked(&e).len(), 1, "the line was split inside a character: {:?}", inked(&e));
@@ -4081,6 +4475,7 @@ two");
             16,
             false,
             &[InkRun { line: 40, start: 0, end: 2, colour: KEYWORD }],
+            None,
             &p,
         );
         assert!(inked(&e).iter().all(|(_, c)| c.is_none()));
@@ -4094,11 +4489,11 @@ two");
         let mut a = area();
         a.apply(KEY_RIGHT, 0);
         a.apply(KEY_DOWN, MOD_SHIFT);
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.selection), 2, "the tail of line 0 and the head of line 1");
 
         let mut a = area();
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.selection), 0, "and nothing when nothing is selected");
     }
 
@@ -4116,7 +4511,7 @@ two");
         assert_eq!(a.text(), "ab\nde\nfghi");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &Theme::default());
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
         assert_eq!(fills(&e, Theme::default().selection), 0, "nothing is selected, so nothing \
             is highlighted");
 
@@ -4135,7 +4530,7 @@ two");
         a.extend_to(0, 3);
         assert!(a.apply(KEY_BACKSPACE, 0));
         assert_eq!(a.text(), "ab\nde\nfghi");
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &Theme::default());
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
     }
 
     #[test]

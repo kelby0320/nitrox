@@ -5130,3 +5130,177 @@ list, and emphatically no completion. Part G colours tokens. Icons for window co
 and a lookup path). The control panel, which stays trigger-gated on settings outgrowing a
 hand-edited file. Split panes, profiles, or a terminal that is configurable at all. `nxfiles`
 growing a second view mode. Anything that needs the network.
+
+## Milestone 15 — controls that look like controls ✅ complete (2026-09-10)
+
+Named 2026-09-10, from the maintainer's list after running M14 on QEMU. **Eight items, and six
+of them are the same complaint**: a surface that is a control does not say so. A button whose
+face is eighteen units from the window behind it; a scrollbar whose groove is *exactly* the
+colour of the list beside it, so only the thumb is visible; a sidebar drawn in the list's own
+ground. The report for the scrollbar was "click and drag doesn't seem to work" — and the
+mechanism works, measured in the guest before anything was changed: the press grabs the thumb
+without moving it and the drag scrolls to the end. What does not work is *finding* it.
+
+**Six parts in the end, not three.** Three answered the list; three came from the maintainer
+running each fix and finding the next thing — a scroll the next frame threw away, a menu with
+nowhere to hang from, and a panel whose rows painted over it. That loop *is* the milestone's
+method: every one of those three was invisible to the host suite and obvious in ten seconds of
+use.
+
+**That is the milestone's shape, and it is why these are one milestone rather than eight
+tickets.** M11 gave this desktop a light theme measured off a reference; what it did not do is
+check that each control still reads as one against it, and a palette tuned by looking at a
+picture of the whole screen is exactly how a groove ends up matching the list.
+
+- [x] **Part A — the surfaces** ✅ (2026-09-10): the groove, the button and the sidebar.
+- [x] **Part B — the text area learns the pointer** ✅ (2026-09-10): click to place the cursor,
+      drag to select, and the scrollbar `nxedit` never had.
+- [x] **Part C — the chooser navigates** ✅ (2026-09-10): an Open dialog that can leave the
+      directory it opened in.
+- [x] **Part D — a scroll that survives the next frame** ✅ (2026-09-10): why two of the three
+      scrollbars did nothing, and the terminal's worked.
+- [x] **Part E — a menu with nowhere to hang from** ✅ (2026-09-10): why *View* opened nothing,
+      and a margin around the quick-access panel.
+- [x] **Part F — a row sits on the ground it was given** ✅ (2026-09-10): the sidebar's rows were
+      still painting the listing's ground over its panel.
+
+### Part F — a row sits on the ground it was given ✅ complete (2026-09-10)
+
+**Part A gave the sidebar a ground and the rows kept painting over it.** A row filled
+`theme.track` whatever the list's ground was, so a panel with a colour of its own showed it only
+in the gap below the last row — list-coloured tiles on a grey field, which is not what a panel
+is. Reported from running it, as "change the colour of the buttons on the quick access panel to
+match the panel background".
+
+- [x] **A row rests on the list's ground** ✅, which is the parameter Part A added and the rows
+      ignored.
+- [x] **Its hover is derived from that ground** ✅ — `shade(+9)`, the step this palette already
+      uses between `face` and `face_hover`. **A hover is "this surface, lit"** rather than a
+      colour of its own, and one fixed near-white belongs to exactly one ground. The default path
+      keeps `face_hover` exactly, so every other list in the system paints as it did.
+
+**The selection stays blue.** It is the same answer to the same question in both panes — "this is
+the row an action will act on" — and a sidebar that highlighted differently from the listing
+beside it would be two answers to one question.
+
+### Part E — a menu with nowhere to hang from ✅ complete (2026-09-10)
+
+**Reported as "no menu appears when I click View".** `MENU_COUNT` was a constant beside a
+`menu_table` that grew: `nxfiles` had three menus and asked for **two** anchors, so
+`MenuState::anchor` answered `None` for the third and the popup had nowhere to go. A bar word
+that opened nothing, silently, since M14 Part D added the menu.
+
+- [x] **The count is derived from the table** ✅, in all three applications rather than only the
+      one that drifted. Two numbers that must be equal are one number.
+
+- [x] **The anchor loop moved out of `main.rs`** ✅, which is the half that matters. Three
+      binaries each copied it, and no host test builds a `main.rs` — so the loop that was wrong
+      was also the loop nothing could check. `App::place_menus` is one method with one count, and
+      each application walks its *whole* bar through it in a test: reinstating a constant inside
+      the method fails all three — "menu 2 of 3 …" in `nxfiles`, "menu 1 of 2 …" in the two
+      applications with two menus. Two of those three tests reimplemented the loop instead of
+      calling the method until review caught them.
+
+- [x] **A margin around the quick-access panel** ✅. It has had a ground of its own since Part A;
+      what makes it read as a *panel* is the window showing through around it.
+
+### Part D — a scroll that survives the next frame ✅ complete (2026-09-10)
+
+**Reported as "the terminal scrollbar works, the other two do not", which is the comparison that
+found it.** `nxterm`'s grid follows nothing — it keeps a `view_top` — while `list_view` and
+`text_area` both call `ensure_visible` on *every build*, and an application repaints after every
+event. So a drag computed the right offset and the very next frame put it back on the selection:
+the bar moved, the content did not, and every host test passed because each of them routed an
+event and read the state without redrawing in between.
+
+- [x] **A selection is followed when it *changes*, not continuously** ✅. Both states remember
+      the selection they last scrolled to, so arrow keys still pull the view along and a
+      scrollbar no longer fights the caret. `ListState` gained a constructor for it: the
+      bookkeeping is private, which is what stops a caller writing it in a struct literal.
+
+- [x] **"Changed" is the caret, the text, *and* the window** ✅. The first version keyed on the
+      caret's line alone, which meant typing after a scroll put characters into a document that
+      stayed off screen — worse than not following at all. `(line, column, revision, visible)`
+      for the text area, `(index, visible)` for the list.
+
+- [x] **The regression tests redraw** ✅ — the thing the earlier ones did not. Each of the three
+      new ones presses, rebuilds the tree the way the binary does, and asserts the offset held.
+      The typing case needs the two new capabilities composed — scroll away, then type — which is
+      why no single-widget test reached it.
+
+### Part C — the chooser navigates ✅ complete (2026-09-10)
+
+- [x] **An *up* control, and `Backspace`** ✅. Every move a chooser had was *downward* — a row,
+      if it happened to be a directory — so a dialog that opened in the wrong place had to be
+      cancelled and reopened from a buffer that was somewhere else. `Backspace` is the browser's
+      own binding for the same move: one desktop, one way out of a directory.
+
+      **Except while saving**, where `Backspace` edits the name. A key that walked out of the
+      directory from under a half-typed filename would be the surprise, and there is a field
+      holding the keyboard to prove the intent.
+
+      **The row is sized, and the frame grew by four pixels.** `CHOOSER_H` is a sum of its parts
+      and this row is one of them; left to measure itself it takes the button's height and every
+      part below it loses what the button took — which is what the first version did, caught by
+      the test that pins the list and the field at the sizes they were built for.
+
+      **And the path is centred down the row, not across it.** `center` moves its child on both
+      axes, which put a short path in the middle of the dialog rather than beside the button it
+      belongs to. `Center` carries which axes it moves on now, and `center_v` is the vertical
+      half — what a label beside a control wants.
+
+**Not done here, and not a gap**: a location bar, quick-access places, and showing hidden files
+(`TODO(chooser-hidden)`, which has a trigger of its own). What the report asked for was a way to
+navigate; a dialog that can go up and descend can reach anything.
+
+### Part B — the text area learns the pointer ✅ complete (2026-09-10)
+
+- [x] **A press places the caret and a drag selects** ✅. **`TextAreaState` was already ready**:
+      `place` and `extend_to` have existed since M10, documented then as "what a press does" and
+      "what a drag does" — and no widget ever handed them anything, because `text_area` took no
+      pointer events at all. So the editor's caret could be moved only with the arrow keys, in a
+      window whose whole content is text you point at.
+
+      **The conversion needs a font, so the application does it.** `at_point` turns a widget-local
+      pixel into a line and a column given a way to measure a string, because `libui` has no
+      glyphs — the same seam `Metrics` is one layer down, and the same one `nxterm::note_press`
+      uses for a clock. The column is the **nearest boundary** rather than the character under the
+      cursor, which is what makes clicking the right half of a letter land after it.
+
+- [x] **A scrollbar for the document** ✅. `text_area`'s own doc had always said it draws none and
+      that composing one is the application's — `nxterm` does exactly that for its grid, and this
+      window never did. `TextAreaState` grew `bar` and `scroll_to`, the pair `ListState` already
+      had, so a bar and the text beside it cannot disagree about where a thumb points. **A drag
+      leaves the caret where it was**: what a scrollbar changes is what is *shown*.
+
+- [x] **A key collision, found by the first test that routed a real press** ✅ — not a box.
+      `AREA_INNER_KEY` was written as 40, which is `MENU_BAR_KEY` and the *base of a range*, so
+      `locate` answered with the menu bar's rectangle for the document and the press landed on
+      chrome. `nxfiles` grew a test against exactly this in M14 Part D; `nxedit` has one now.
+
+### Part A — the surfaces ✅ complete (2026-09-10)
+
+- [x] **A scrollbar's groove is its own colour** ✅. `track` was documented as "a scrollbar's
+      groove, and a list's ground", and that field's own note recorded the compromise: the
+      reference desktop puts a list at `#FCFCFC` and a groove at `#E6E4E3`, "one field has to be
+      both", and splitting them "is worth more evidence than one screenshot". **The evidence
+      arrived from running it.** `groove` is `#E6E4E3` now and the bar is 12 pixels rather than
+      10 — the width `nxterm` already used for its own.
+
+- [x] **A button has an edge** ✅, and its label is centred. The face is `#EDECEB` against a
+      `#FFFFFF` window: technically not the ground, and in a real window indisputably invisible.
+      What says *button* is the edge — every desktop draws one, and this toolkit had it only
+      around a focused control. **Centring needed a node**: `padding` places a child at an inset
+      from the origin, so every button in this toolkit had its word against the top-left corner
+      of a face usually much wider than it. `Node::Center` is the wrapper that was missing, and
+      it is the first one that *moves* its child rather than passing its rectangle through.
+
+- [x] **A sidebar is a panel, not a list with a gap in it** ✅. `list_view` takes a `ground`, and
+      `nxfiles` passes `theme.sidebar` — the one surface that has to be told from the content
+      beside it at a glance, which is why it is a colour rather than a derivation.
+
+- [x] **The reference scene stopped lying about menu bars** ✅ — found by this part rather than
+      looked for. It built its bar out of `button`s, which no application does (`menu::bar` makes
+      `menu_item`s), and nobody noticed until buttons grew an edge and the picture showed two
+      boxed words where a menu bar should be. A reference picture that is not what applications
+      draw is a polish pass judging the wrong thing.

@@ -53,7 +53,9 @@ the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file
 | `face_hover` | `"#RRGGBB"` | A button under the pointer |
 | `face_pressed` | `"#RRGGBB"` | A button being held |
 | `focus_ring` | `"#RRGGBB"` | The ring around the focused widget, and the text caret |
-| `track` | `"#RRGGBB"` | A scrollbar's groove, and a list's ground |
+| `track` | `"#RRGGBB"` | A list's ground |
+| `groove` | `"#RRGGBB"` | A scrollbar's channel — **darker than `track`**, or the bar is invisible |
+| `sidebar` | `"#RRGGBB"` | A panel beside content, such as the file browser's |
 | `thumb` | `"#RRGGBB"` | A scrollbar's thumb |
 | `selection` | `"#RRGGBB"` | Behind selected text |
 | `syntax_keyword` | `"#RRGGBB"` | A language's reserved words, and TOML's `true`/`false` |

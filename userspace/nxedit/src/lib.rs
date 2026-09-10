@@ -44,7 +44,8 @@ use libui::element::{
 };
 use libui::widget::{
     GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
-    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, tab_strip,
+    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
+    tab_strip,
     text_area, text_field, title_bar, window_frame,
 };
 
@@ -59,6 +60,19 @@ pub const ROW_H: u32 = 20;
 
 /// The element key on the text area.
 pub const AREA_KEY: u64 = 1;
+
+/// The document's own key inside the area's dock — see [`AREA_KEY`].
+///
+/// **Not 40**, which is [`MENU_BAR_KEY`] and the *base* of a range: the first version of this
+/// used it, and `locate` answered with the menu bar — a control at the top of the window
+/// standing in for the document, which is the aliasing `nxfiles` filed a test against in M14
+/// Part D after a listing row lit whichever chrome shared its number.
+pub const AREA_INNER_KEY: u64 = 20;
+/// The document scrollbar's key.
+pub const AREA_BAR_KEY: u64 = 21;
+/// How wide the document's scrollbar is, in pixels. `nxterm`'s number, for one desktop's worth
+/// of muscle memory.
+pub const SCROLL_W: u32 = 12;
 /// The element key on the save control.
 pub const SAVE_KEY: u64 = 2;
 /// The element key on the title bar.
@@ -152,8 +166,6 @@ pub const UNDO_KEYCODE: u16 = 44;
 pub const REDO_KEYCODE: u16 = 21;
 /// The key that opens the find field: `f`.
 pub const FIND_KEYCODE: u16 = 33;
-/// How many menus the bar carries. `File` and `Edit`.
-pub const MENU_COUNT: usize = 2;
 
 /// The menu bar's height in pixels — one row of chrome, matching the browser's.
 pub const MENU_BAR_H: u32 = 24;
@@ -340,6 +352,14 @@ pub struct Chooser {
 
 /// Everything the editor is.
 pub struct App {
+    /// A pointer event over the document, awaiting the metrics that can resolve it.
+    ///
+    /// **One, not a queue.** Each is a position, and the newest is the answer: a press followed
+    /// by three motions in one batch means the caret goes where the last one was, which is what
+    /// a drag looks like when the loop is behind.
+    area_pointer: Option<PointerEvent>,
+    /// Where within the document scrollbar's thumb a drag took hold.
+    scroll_grab: libui::widget::ScrollGrab,
     /// The open buffers, in the order their tabs are drawn. **Never empty**: the last one closing
     /// closes the window, so every method below can assume there is a current buffer.
     buffers: Vec<Buffer>,
@@ -591,8 +611,20 @@ pub enum Msg {
     ChooserAccept,
     /// The chooser's *Cancel*, its close button, or `Esc`.
     ChooserCancel,
+    /// Leave the directory the chooser is showing — its *up* control, or `Backspace`.
+    ChooserUp,
     /// The wheel turned over the chooser — see [`ListState::wheel`](libui::widget::ListState::wheel).
     ChooserWheel(PointerEvent),
+    /// A pointer event over the document — a press places the caret, a drag selects.
+    ///
+    /// **Recorded rather than acted on**, because turning a pixel into a column means measuring
+    /// text and this crate has no glyphs. The binary resolves it with the metrics it drew with;
+    /// see [`App::take_area_pointer`].
+    AreaPointer(PointerEvent),
+    /// A pointer event over the document's scrollbar.
+    AreaScroll(PointerEvent),
+    /// The wheel turned over the document.
+    AreaWheel(PointerEvent),
     /// Open another window of this editor — `Ctrl+Shift+N`, or File ▸ New Window.
     ///
     /// **Recorded, not done.** A window is a compositor object and this crate makes no syscalls;
@@ -729,6 +761,8 @@ impl App {
     /// An editor for `path`, with an empty buffer until something is loaded into it.
     pub fn new(path: &str, home: &str) -> App {
         App {
+            area_pointer: None,
+            scroll_grab: libui::widget::ScrollGrab::new(),
             buffers: alloc::vec![Buffer::new(TAB_KEY_BASE, path)],
             current: TAB_KEY_BASE,
             chooser: None,
@@ -738,7 +772,10 @@ impl App {
             replaced: 0,
             new_window: false,
             quit: false,
-            menus: MenuState::new(MENU_COUNT),
+            // **Zero, because the length is set every frame.** `set_anchors` replaces this
+            // vector before anything reads it, and sizing it here from a constant is
+            // what drifted (M15 Part E).
+            menus: MenuState::new(0),
             next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
@@ -1157,9 +1194,41 @@ impl App {
             }
             Msg::ChooserAccept => self.chooser_accept(),
             Msg::ChooserCancel => self.chooser = None,
+            // **The root is its own parent**, so this is a no-op there rather than an error —
+            // `libfs::parent` states that rule and `nxfiles` relies on the same one, which is
+            // why neither greys the control: a control that disables itself at the root is one
+            // more state to draw for a case nobody is surprised by.
+            Msg::ChooserUp => {
+                if let Some(c) = self.chooser.as_ref() {
+                    let up = core::str::from_utf8(libfs::parent(c.dir.as_bytes())).unwrap_or("/");
+                    if up != c.dir {
+                        self.chooser_list = Some(String::from(up));
+                    }
+                }
+            }
             // **Declined when no chooser is open**, which is not defensive: the dialog is a
             // second window and its records arrive on the same session, so one in flight when
             // the dialog closes reaches this.
+            // **Kept, not resolved.** The binary hands it back through `take_area_pointer` with
+            // something that can measure a string — the same seam `note_press` uses in `nxterm`
+            // for the same reason: this half of the application makes no syscalls and holds no
+            // font.
+            Msg::AreaPointer(p) => self.area_pointer = Some(p),
+            Msg::AreaScroll(p) => {
+                let visible = (self.area_h() / ROW_H) as usize;
+                let bar = self.buf().text.bar(visible);
+                let h = self.area_h();
+                if let Some(offset) = self.scroll_grab.apply(bar, h, p) {
+                    self.buf_mut().text.scroll_to(offset as usize, visible);
+                }
+            }
+            Msg::AreaWheel(p) => {
+                let visible = (self.area_h() / ROW_H) as usize;
+                let by = i64::from(p.wheel) * i64::from(libui::click::WHEEL_UNITS);
+                let at = self.buf().text.offset() as i64;
+                let want = (at + by).max(0) as usize;
+                self.buf_mut().text.scroll_to(want, visible);
+            }
             Msg::ChooserWheel(p) => {
                 if let Some(c) = self.chooser.as_mut() {
                     c.state.list.wheel(p.wheel);
@@ -1490,6 +1559,32 @@ impl App {
         self.buf_mut().text.apply(k.keycode, k.modifiers);
     }
 
+    /// Record where each bar word sits, so an open menu knows where to hang from.
+    ///
+    /// **Here rather than in the binary, since M15 Part E.** Three applications each copied this
+    /// loop, and the count in it was a constant beside a `menu_table` that grew: `nxfiles` asked
+    /// for two anchors while its bar had three menus, so *View* opened a popup with nowhere to
+    /// go and drew nothing at all. In the binary it was untestable — no host test builds a
+    /// `main.rs` — which is why it could be wrong for two milestones. Here it is one method with
+    /// one count, and a test walks the whole bar through it.
+    pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
+        let n = self.menu_count();
+        self.menus.set_anchors(
+            (0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect(),
+        );
+    }
+
+    /// How many menus the bar has — **derived from the table, never declared**.
+    ///
+    /// **A constant here drifted and cost the View menu** (M15 Part E). `MENU_COUNT` was 2 while
+    /// `menu_table` returned three menus, so the binary asked for two anchors,
+    /// `MenuState::anchor` answered `None` for the third, and clicking *View* opened a menu that
+    /// had nowhere to hang from — a bar word that did nothing, with no error anywhere. Two
+    /// numbers that must be equal are one number.
+    pub fn menu_count(&self) -> usize {
+        self.menu_table().len()
+    }
+
     /// The bar's menus, in bar order.
     ///
     /// **Built rather than stored**, and it takes `&self` because half the rows depend on state:
@@ -1608,6 +1703,7 @@ impl App {
             CHOOSER_KEY,
             hovered,
             Msg::ChooserRow,
+            Msg::ChooserUp,
             Msg::ChooserAccept,
             Msg::ChooserCancel,
             ui,
@@ -1647,6 +1743,31 @@ impl App {
             }));
         }
         out
+    }
+
+    /// Resolve a pointer event over the document, given a way to measure text.
+    ///
+    /// **Called by the binary after `update`**, with `width` measuring a string the way the area
+    /// was drawn — `|s| metrics.text_size(s).w`. A press places the caret and drops the
+    /// selection; a motion with a button held extends it. Anything else is ignored, which is
+    /// what keeps a hover from moving somebody's cursor.
+    ///
+    /// Answers whether anything changed, so the caller can decide to redraw.
+    pub fn take_area_pointer(&mut self, width: impl Fn(&str) -> u32) -> bool {
+        let Some(p) = self.area_pointer.take() else { return false };
+        let pressed = p.kind == librsproto::surface::POINTER_BUTTON
+            && p.flags & librsproto::surface::POINTER_PRESSED != 0;
+        let dragging = p.kind == librsproto::surface::POINTER_MOTION && p.buttons & 1 != 0;
+        if !pressed && !dragging {
+            return false;
+        }
+        let (line, col) = self.buf().text.at_point(p.x, p.y, ROW_H, width);
+        if pressed {
+            self.buf_mut().text.place(line, col);
+        } else {
+            self.buf_mut().text.extend_to(line, col);
+        }
+        true
     }
 
     /// What the current buffer is being highlighted as, for a receipt.
@@ -1710,6 +1831,13 @@ impl App {
                     libkern::abi::KEY_UP => {
                         c.state.list.up();
                     }
+                    // **Backspace goes up while opening**, which is the browser's own binding:
+                    // one desktop, one way to leave a directory. In `Save` it edits the name
+                    // instead — there is a field holding the keyboard, and a key that navigated
+                    // out from under a half-typed filename would be the surprise.
+                    libkern::abi::KEY_BACKSPACE if c.mode == chooser::Mode::Open => {
+                        self.update(Msg::ChooserUp);
+                    }
                     // **Nothing to type into when opening**, and swallowing the key is the point:
                     // a dialog holds the keyboard, so a character that fell through would reach
                     // nothing at all rather than the buffer behind it.
@@ -1751,7 +1879,7 @@ impl App {
         // **The selection resets**, for `nxfiles::show`'s reason: a listing of a *different*
         // directory has no row the old selection refers to, and a clamped stale index silently
         // selects whatever happens to sit at that position.
-        c.state.list = libui::widget::ListState { selected: None, offset: 0 };
+        c.state.list = libui::widget::ListState::at(None, 0);
     }
 
     /// Open the chooser, looking at the current buffer's directory.
@@ -2099,9 +2227,31 @@ impl App {
         // element is under the point. Dropping a file on the title bar does nothing, which is
         // the honest answer: the title bar is not where a document goes.
         let focused = self.focused;
-        let area =
-            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, &ui)
-                .on_drop(Msg::Dropped);
+        let visible = (h / ROW_H) as usize;
+        let bar = self.buf().text.bar(visible);
+        let area = text_area(
+            &mut self.buf_mut().text,
+            h,
+            ROW_H,
+            focused,
+            &ink,
+            Some(Msg::AreaPointer),
+            &ui,
+        )
+        .on_drop(Msg::Dropped)
+        .on_wheel(Msg::AreaWheel);
+        // **A scrollbar beside it, which this editor never had** (M15). `text_area` draws none —
+        // its own doc says so, and says it is the application's to compose, which `nxterm` does
+        // for its grid and this window did not. Without it a document longer than the window had
+        // nothing to say so, and no way to move but the arrow keys.
+        let area = dock(
+            alloc::vec![docked(
+                Edge::Right,
+                sized(Size::new(SCROLL_W, h), scrollbar(bar, SCROLL_W, h, &ui).on_pointer(Msg::AreaScroll))
+                    .key(AREA_BAR_KEY),
+            )],
+            area.key(AREA_INNER_KEY),
+        );
 
         let body = window_frame(
             title,
@@ -2298,6 +2448,246 @@ mod tests {
     const KEY_X: u16 = 45;
     /// `1` — the key that tells a swallowed chord from an unprintable one.
     const KEY_1: u16 = 2;
+
+    /// Every key this window uses names a different element.
+    ///
+    /// **A key is a number and nothing checks it** — the diff pairs by key within a parent, and
+    /// `locate` answers with the first node carrying one, so two constants that collide make a
+    /// control stand in for another. `AREA_INNER_KEY` was written as 40, which is
+    /// [`MENU_BAR_KEY`] and the *base of a range*: `locate` returned the menu bar's rectangle
+    /// for the document, and the press that should have moved the caret landed on the chrome.
+    /// `nxfiles` grew the same test in M14 Part D after a listing row lit whichever chrome
+    /// shared its number (M15 Part B).
+    #[test]
+    fn every_element_key_in_this_window_is_its_own() {
+        // The menu bar is a base: one key per menu, from `MENU_BAR_KEY` upwards.
+        let menus = App::new("/home/x", "/home").menu_table().len() as u64;
+        let mut keys: Vec<u64> = alloc::vec![
+            AREA_KEY,
+            AREA_INNER_KEY,
+            AREA_BAR_KEY,
+            SAVE_KEY,
+            TITLE_KEY,
+            GRIP_KEY,
+            STRIP_KEY,
+            STATUS_KEY,
+            TAB_STRIP_KEY,
+            POSITION_KEY,
+            BAR_KEY,
+        ];
+        keys.extend(MENU_BAR_KEY..MENU_BAR_KEY + menus);
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "two of {keys:?} are the same number");
+    }
+
+    // ---- the pointer over the document (M15 Part B) ----
+
+    /// Eight pixels a character, which is what `CELL` gives these tests.
+    fn width(s: &str) -> u32 {
+        (s.chars().count() * 8) as u32
+    }
+
+    /// A pointer event over the document, routed through the real tree.
+    fn area_event(a: &mut App, kind: u16, flags: u16, buttons: u16, x: i32, y: i32) {
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let mut r = libui::route::Router::new();
+        let p = librsproto::surface::PointerEvent {
+            kind,
+            button: 0x110,
+            buttons,
+            flags,
+            x,
+            y,
+            ..Default::default()
+        };
+        for m in r.pointer(&tree, &e, &l, p).0 {
+            a.update(m);
+        }
+        a.take_area_pointer(width);
+    }
+
+    /// Where the document starts inside the window, in window coordinates.
+    fn area_origin(a: &mut App) -> (i32, i32) {
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+        let r = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document is keyed");
+        (r.origin.x, r.origin.y)
+    }
+
+    /// A press puts the caret where it landed — **through the real tree**.
+    ///
+    /// **The editor could not be clicked into at all until M15.** `TextAreaState::place` has
+    /// existed since M10, documented as "what a press does", and no widget ever handed it
+    /// anything: `text_area` took no pointer events, so the only way to move a caret was the
+    /// arrow keys.
+    #[test]
+    fn a_press_places_the_caret_where_it_landed() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("hello world\nsecond line", b"hello world\nsecond line\n");
+        assert_eq!(a.buf().text.cursor(), (0, 0), "precondition: at the start");
+
+        let (ox, oy) = area_origin(&mut a);
+        // Four characters into the second row.
+        area_event(&mut a, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED, 1,
+                   ox + 6 + 4 * 8, oy + 4 + ROW_H as i32);
+        assert_eq!(a.buf().text.cursor(), (1, 4), "the press did not move the caret");
+        assert!(a.buf().text.selection().is_none(), "a press selects nothing");
+    }
+
+    /// A press and a drag select the range between them.
+    #[test]
+    fn a_drag_selects_from_the_press_to_the_pointer() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("hello world", b"hello world\n");
+        let (ox, oy) = area_origin(&mut a);
+        let y = oy + 4;
+        area_event(&mut a, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED, 1, ox + 6, y);
+        area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 1, ox + 6 + 5 * 8, y);
+        assert_eq!(
+            a.buf().text.selected_text().as_deref(),
+            Some("hello"),
+            "the drag did not select from the press"
+        );
+
+        // A motion with nothing held is a hover, and must not move anything.
+        let before = a.buf().text.cursor();
+        area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 0, ox + 6, y);
+        assert_eq!(a.buf().text.cursor(), before, "a hover moved the caret");
+    }
+
+    /// The document has a scrollbar, and dragging it scrolls without moving the caret.
+    #[test]
+    fn the_document_scrollbar_scrolls_and_leaves_the_caret_alone() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        let text: String = (0..200).map(|i| alloc::format!("line {i}\n")).collect();
+        a.loaded(&text, text.as_bytes());
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+        let bar = libui::layout::locate(&e, &l, AREA_BAR_KEY).expect("the bar is keyed");
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let mut r = libui::route::Router::new();
+
+        let before = a.buf().text.cursor();
+        let at = |y: i32, kind: u16, flags: u16| librsproto::surface::PointerEvent {
+            kind,
+            button: 0x110,
+            buttons: 1,
+            flags,
+            x: bar.origin.x + 6,
+            y,
+            ..Default::default()
+        };
+        let mid = bar.origin.y + bar.size.h as i32 / 2;
+        for m in r.pointer(&tree, &e, &l, at(mid, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED)).0 {
+            a.update(m);
+        }
+        assert!(a.buf().text.offset() > 0, "a press on the bar's middle scrolled nowhere");
+        let after_press = a.buf().text.offset();
+        for m in r.pointer(&tree, &e, &l, at(mid + 40, librsproto::surface::POINTER_MOTION, 0)).0 {
+            a.update(m);
+        }
+        assert!(a.buf().text.offset() > after_press, "the drag did not follow the pointer");
+        assert_eq!(a.buf().text.cursor(), before, "a scrollbar drag moved the caret");
+    }
+
+    /// Typing brings the view back to the caret, however far it was scrolled away.
+    ///
+    /// **The regression Part D introduced and Part B made reachable** (PR #290 review, 1).
+    /// `ensure_visible` keyed its "already followed" flag on the cursor's *line*, and typing does
+    /// not change the line — so after a scrollbar drag the guard fired on every repaint, the
+    /// character went into line 0, and the person went on looking at line 142. Before this branch
+    /// a text area had no scrollbar and no wheel, so there was no way to scroll away from the
+    /// caret at all.
+    #[test]
+    fn typing_brings_the_view_back_to_the_caret() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        let text: String = (0..200).map(|i| alloc::format!("line {i}\n")).collect();
+        a.loaded(&text, text.as_bytes());
+        let visible = (a.area_h() / ROW_H) as usize;
+
+        // A frame first, as the application draws one before anything is touched — otherwise
+        // the *first* `ensure_visible` is the one that follows, and the scroll below never
+        // happened from the widget's point of view.
+        a.buf_mut().text.ensure_visible(visible);
+        // Scroll a long way from the caret, which is at (0, 0).
+        a.buf_mut().text.scroll_to(142, visible);
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(a.buf().text.offset(), 142, "precondition: scrolled away and staying there");
+
+        // Now type. The character lands on line 0 — where the caret is — so the view has to
+        // come back to it, which is what every editor does.
+        type_into(&mut a, "a");
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(
+            a.buf().text.offset(),
+            0,
+            "the character went into a line the person cannot see"
+        );
+
+        // And moving the caret does the same, even without changing its line.
+        a.buf_mut().text.scroll_to(142, visible);
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(a.buf().text.offset(), 142, "precondition: scrolled away again");
+        press_key(&mut a, libkern::abi::KEY_RIGHT);
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(a.buf().text.offset(), 0, "a caret that moved was left off screen");
+    }
+
+    /// A document scroll survives the repaint that follows it — see `nxfiles`' twin of this.
+    ///
+    /// **`text_area` followed the caret on every build**, so a scrollbar drag was undone before
+    /// anything was drawn: the bar moved and the document did not (M15 Part D).
+    #[test]
+    fn a_document_scroll_survives_the_next_repaint() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        let text: String = (0..200).map(|i| alloc::format!("line {i}\n")).collect();
+        a.loaded(&text, text.as_bytes());
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let mut tree = libui::diff::Tree::new();
+        let mut frame = |a: &mut App, tree: &mut libui::diff::Tree| {
+            let e = a.view(&theme, None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+            tree.update(&e, &l).expect("diffable");
+            (e, l)
+        };
+        let (e, l) = frame(&mut a, &mut tree);
+        let bar = libui::layout::locate(&e, &l, AREA_BAR_KEY).expect("the bar is keyed");
+        let mut r = libui::route::Router::new();
+        let press = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x: bar.origin.x + 6,
+            y: bar.origin.y + bar.size.h as i32 / 2,
+            ..Default::default()
+        };
+        for m in r.pointer(&tree, &e, &l, press).0 {
+            a.update(m);
+        }
+        let scrolled = a.buf().text.offset();
+        assert!(scrolled > 0, "the press on the bar scrolled nowhere");
+
+        frame(&mut a, &mut tree);
+        assert_eq!(
+            a.buf().text.offset(),
+            scrolled,
+            "the repaint put the document back where its caret is"
+        );
+    }
 
     // ---- syntax highlighting (M14 Part G) ----
 
@@ -3921,6 +4311,56 @@ mod tests {
         );
     }
 
+    /// The chooser can leave the directory it opened in.
+    ///
+    /// **What "navigation" means in a dialog with no location bar** (M15 Part C). Before this
+    /// the only moves were *down* — a row, if it was a directory — so a chooser opened in the
+    /// wrong place had to be cancelled and reopened from a buffer that was somewhere else.
+    #[test]
+    fn the_chooser_goes_up_by_control_and_by_backspace() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home/papers/drafts", alloc::vec![(String::from("a.txt"), false)]);
+
+        a.update(Msg::ChooserUp);
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"));
+        a.show_chooser("/home/papers", alloc::vec![(String::from("b.txt"), false)]);
+
+        // Backspace is the browser's binding for the same move — one desktop, one way up.
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_BACKSPACE, 1, 0));
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home"));
+        a.show_chooser("/", alloc::vec![(String::from("home"), true)]);
+
+        // **The root is its own parent**, so this asks for nothing rather than erroring.
+        a.update(Msg::ChooserUp);
+        assert_eq!(a.take_chooser_list(), None, "the root tried to go somewhere");
+        assert!(a.chooser().is_some(), "and the dialog is still open");
+    }
+
+    /// In `Save`, Backspace edits the name instead of navigating.
+    ///
+    /// **The one place the two bindings disagree, and it has to be this way**: a key that walked
+    /// out of the directory from under a half-typed filename would be the surprise, and there is
+    /// a field holding the keyboard to prove the intent.
+    #[test]
+    fn backspace_edits_the_name_while_saving() {
+        let mut a = app();
+        a.update(Msg::SaveAs);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home/papers", alloc::vec![]);
+        let before = a.chooser().expect("open").state.name.text().to_string();
+        assert!(!before.is_empty(), "precondition: the field is seeded with the buffer's name");
+
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_BACKSPACE, 1, 0));
+        assert_eq!(a.take_chooser_list(), None, "saving navigated instead of editing");
+        assert_eq!(
+            a.chooser().expect("open").state.name.text().len(),
+            before.len() - 1,
+            "the name was not edited"
+        );
+    }
+
     /// Opening walks into directories and answers with a file.
     #[test]
     fn the_chooser_descends_and_then_answers() {
@@ -4062,4 +4502,35 @@ mod tests {
         let after = String::from(a.chooser().unwrap().state.name.text());
         assert_ne!(after, seeded, "the name field took the character: {after:?}");
     }
+
+    /// **Every** menu in the bar can be opened, not just the ones a test happened to name.
+    ///
+    /// **The View menu did nothing for two milestones** (M15 Part E). `MENU_COUNT` was a
+    /// constant beside a `menu_table` that grew: the binary asked for two anchors, the third
+    /// menu's `anchor()` answered `None`, and the popup had nowhere to hang from — a bar word
+    /// that opened nothing, silently. The count is derived now, and this walks the *whole* bar
+    /// rather than a menu chosen when the test was written.
+    #[test]
+    fn every_menu_in_the_bar_has_somewhere_to_hang_from() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let view = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+        let n = a.menu_count();
+        assert!(n >= 2, "a bar with fewer than two menus is not this window's");
+        // **Through the method the binary calls**, which is the whole point of it being a
+        // method: the loop that was wrong lived in a `main.rs` no test builds.
+        a.place_menus(&view, &l);
+        for i in 0..n {
+            a.menus.toggle(i);
+            assert_eq!(a.menus.open(), Some(i));
+            assert!(
+                a.menus.anchor().is_some(),
+                "menu {i} of {n} opened with nowhere to hang from, so nothing would be drawn"
+            );
+            a.menus.close();
+        }
+    }
+
 }

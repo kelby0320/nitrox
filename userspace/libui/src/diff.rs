@@ -73,6 +73,9 @@ pub enum Fingerprint {
     Offset,
     /// [`Node::Ink`], with its colour — a recolour repaints, like a fill's.
     Ink(libdraw::format::Rgb),
+    /// [`Node::Center`]. Like `Offset`, it carries nothing — not even which axes it centres
+    /// on: what it changes is a rect, and a rect change is already what `reconcile` damages on.
+    Center,
     /// [`Node::Custom`], with its discriminator and size.
     Custom(u32, libdraw::geom::Size),
 }
@@ -96,6 +99,7 @@ impl Fingerprint {
             // ink change moves nothing, so a fingerprint without it would leave a recoloured
             // subtree undamaged and the old colour on screen.
             Node::Ink { colour, .. } => Fingerprint::Ink(*colour),
+            Node::Center { .. } => Fingerprint::Center,
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
     }

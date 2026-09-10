@@ -25,13 +25,13 @@ use librsproto::surface::{Role};
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 
-use libui::layout::{layout, locate};
+use libui::layout::{layout};
 use libui::paint::{FontMetrics, Theme};
 
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
 use nxfiles::{
-    App, Dialog, Entry, FileOp, Gesture, MENU_BAR_KEY, MENU_COUNT, Msg, TITLE,
+    App, Dialog, Entry, FileOp, Gesture, Msg, TITLE,
 };
 
 use alloc::boxed::Box;
@@ -513,9 +513,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Where each menu drops from, read every frame rather than when one opens: a bar item's
         // position is a fact about the layout, and before the first one there is nowhere to put
         // a popup at all.
-        app.menus.set_anchors(
-            (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        app.place_menus(&ui, &l);
         // The layout is computed here rather than inside `present` because the menu bar's
         // anchors are read from it — see `present_laid_out`.
         if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
