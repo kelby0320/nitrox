@@ -32,13 +32,13 @@ use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 
 use libui::damage::union_opt;
-use libui::layout::{layout, locate};
+use libui::layout::{layout};
 use libui::paint::FontMetrics;
 use libui::paint::{Theme};
 
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome, Menu};
-use nxterm::{App, GRID_KEY, GRID_KIND, MENU_BAR_KEY, MENU_COUNT, Msg, rows_in};
+use nxterm::{App, GRID_KEY, GRID_KIND, Msg, rows_in};
 
 /// `alloc` backing — the element tree, the grid and the render all allocate.
 #[global_allocator]
@@ -523,9 +523,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // The anchors for the next frame's popup — **one per bar word**. Read every frame rather
         // than only when a menu opens: a word's position is a fact about the layout, not about
         // the menu, and reading it on open means reading it before the first layout exists.
-        app.menus.set_anchors(
-            (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        app.place_menus(&ui, &l);
 
         // ---- the menu's window ----
         //

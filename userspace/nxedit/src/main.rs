@@ -31,12 +31,12 @@ use librsproto::surface::{Role};
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 
-use libui::layout::{Metrics as _, layout, locate};
+use libui::layout::{Metrics as _, layout};
 use libui::paint::{FontMetrics, Theme};
 
 use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
-use nxedit::{App, MENU_BAR_KEY, MENU_COUNT, Msg, to_bytes};
+use nxedit::{App, Msg, to_bytes};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -514,9 +514,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Where each menu drops from, read every frame rather than when one opens: a bar word's
         // position is a fact about the layout, and before the first one there is nowhere to put a
         // popup at all — which is exactly what "could not open the menu" means without this.
-        app.menus.set_anchors(
-            (0..MENU_COUNT).map(|i| locate(&ui, &l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        app.place_menus(&ui, &l);
         // **The window is a `libui::window::Child` since M14 Part B**, top-level role and all —
         // the same value the menu and the dialog below have always been. What this loop keeps is
         // what a *main* window has and they do not: the `sys_wait`, a `Configure` to answer, and

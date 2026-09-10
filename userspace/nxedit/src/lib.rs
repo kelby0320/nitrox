@@ -166,8 +166,6 @@ pub const UNDO_KEYCODE: u16 = 44;
 pub const REDO_KEYCODE: u16 = 21;
 /// The key that opens the find field: `f`.
 pub const FIND_KEYCODE: u16 = 33;
-/// How many menus the bar carries. `File` and `Edit`.
-pub const MENU_COUNT: usize = 2;
 
 /// The menu bar's height in pixels — one row of chrome, matching the browser's.
 pub const MENU_BAR_H: u32 = 24;
@@ -774,7 +772,10 @@ impl App {
             replaced: 0,
             new_window: false,
             quit: false,
-            menus: MenuState::new(MENU_COUNT),
+            menus: // **Zero, because the length is set every frame.** `set_anchors` replaces this
+            // vector before anything reads it, and sizing it here from a constant is
+            // what drifted (M15 Part E).
+            MenuState::new(0),
             next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
@@ -1556,6 +1557,32 @@ impl App {
             return;
         }
         self.buf_mut().text.apply(k.keycode, k.modifiers);
+    }
+
+    /// Record where each bar word sits, so an open menu knows where to hang from.
+    ///
+    /// **Here rather than in the binary, since M15 Part E.** Three applications each copied this
+    /// loop, and the count in it was a constant beside a `menu_table` that grew: `nxfiles` asked
+    /// for two anchors while its bar had three menus, so *View* opened a popup with nowhere to
+    /// go and drew nothing at all. In the binary it was untestable — no host test builds a
+    /// `main.rs` — which is why it could be wrong for two milestones. Here it is one method with
+    /// one count, and a test walks the whole bar through it.
+    pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
+        let n = self.menu_count();
+        self.menus.set_anchors(
+            (0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect(),
+        );
+    }
+
+    /// How many menus the bar has — **derived from the table, never declared**.
+    ///
+    /// **A constant here drifted and cost the View menu** (M15 Part E). `MENU_COUNT` was 2 while
+    /// `menu_table` returned three menus, so the binary asked for two anchors,
+    /// `MenuState::anchor` answered `None` for the third, and clicking *View* opened a menu that
+    /// had nowhere to hang from — a bar word that did nothing, with no error anywhere. Two
+    /// numbers that must be equal are one number.
+    pub fn menu_count(&self) -> usize {
+        self.menu_table().len()
     }
 
     /// The bar's menus, in bar order.
@@ -4432,4 +4459,35 @@ mod tests {
         let after = String::from(a.chooser().unwrap().state.name.text());
         assert_ne!(after, seeded, "the name field took the character: {after:?}");
     }
+
+    /// **Every** menu in the bar can be opened, not just the ones a test happened to name.
+    ///
+    /// **The View menu did nothing for two milestones** (M15 Part E). `MENU_COUNT` was a
+    /// constant beside a `menu_table` that grew: the binary asked for two anchors, the third
+    /// menu's `anchor()` answered `None`, and the popup had nowhere to hang from — a bar word
+    /// that opened nothing, silently. The count is derived now, and this walks the *whole* bar
+    /// rather than a menu chosen when the test was written.
+    #[test]
+    fn every_menu_in_the_bar_has_somewhere_to_hang_from() {
+        let mut a = app();
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let view = a.view(&UiTheme::default(), None);
+        let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
+        let n = a.menu_count();
+        assert!(n >= 2, "a bar with fewer than two menus is not this window's");
+        a.menus.set_anchors(
+            (0..n).map(|i| libui::layout::locate(&view, &l, MENU_BAR_KEY + i as u64)).collect(),
+        );
+        for i in 0..n {
+            a.menus.toggle(i);
+            assert_eq!(a.menus.open(), Some(i));
+            assert!(
+                a.menus.anchor().is_some(),
+                "menu {i} of {n} opened with nowhere to hang from, so nothing would be drawn"
+            );
+            a.menus.close();
+        }
+    }
+
 }

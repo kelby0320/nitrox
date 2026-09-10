@@ -24685,3 +24685,29 @@ given cannot be tested without building it twice.** The three new tests redraw.
 That also explains why the guest probes agreed with the host: they read `nxfiles`' receipts and
 the offsets in them were correct. The offset *was* correct, at the moment it was measured. What
 was wrong was what happened next, and nothing was printing that.
+
+
+---
+
+## 2026-09-10 — a menu with nowhere to hang from (M15 Part E)
+
+**"Does the View menu contain anything? No menu appears when I click it."** It contains six rows,
+and it had never once been drawn. `MENU_COUNT` was a constant declared beside a `menu_table` that
+grew: M14 Part D added a third menu to `nxfiles` and left the constant at two, so the binary asked
+for two anchors, `MenuState::anchor` answered `None` for the third, and the popup had nowhere to
+hang from. A bar word that lit under the pointer, toggled its state, and drew nothing.
+
+**Two numbers that must be equal are one number.** The count is derived from the table now, in all
+three applications rather than only the one that drifted — `nxterm` and `nxedit` happen to have
+two menus each today, which is exactly the state `nxfiles` was in before somebody added a menu.
+
+**The half that matters is where the loop lives.** It was in each `main.rs`, copied three times,
+and *no host test builds a `main.rs`* — so the code that was wrong was also the code nothing could
+check. Moving it to `App::place_menus` made it testable, and the test walks the **whole bar**
+rather than a menu chosen when the test was written: reinstating the constant fails with "menu 2
+of 3 opened with nowhere to hang from, so nothing would be drawn".
+
+**The first attempt at that test passed against the bug**, which is what sent the loop to the
+library. It set the anchors itself from the derived count and opened each menu — asserting a
+property of `MenuState` that was never in doubt, while the defect sat in a binary the test did not
+touch. A test that reimplements the thing it is checking is not a test of it.

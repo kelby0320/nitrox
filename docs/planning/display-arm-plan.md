@@ -5153,6 +5153,27 @@ picture of the whole screen is exactly how a groove ends up matching the list.
       directory it opened in.
 - [x] **Part D — a scroll that survives the next frame** ✅ (2026-09-10): why two of the three
       scrollbars did nothing, and the terminal's worked.
+- [x] **Part E — a menu with nowhere to hang from** ✅ (2026-09-10): why *View* opened nothing,
+      and a margin around the quick-access panel.
+
+### Part E — a menu with nowhere to hang from ✅ complete (2026-09-10)
+
+**Reported as "no menu appears when I click View".** `MENU_COUNT` was a constant beside a
+`menu_table` that grew: `nxfiles` had three menus and asked for **two** anchors, so
+`MenuState::anchor` answered `None` for the third and the popup had nowhere to go. A bar word
+that opened nothing, silently, since M14 Part D added the menu.
+
+- [x] **The count is derived from the table** ✅, in all three applications rather than only the
+      one that drifted. Two numbers that must be equal are one number.
+
+- [x] **The anchor loop moved out of `main.rs`** ✅, which is the half that matters. Three
+      binaries each copied it, and no host test builds a `main.rs` — so the loop that was wrong
+      was also the loop nothing could check. `App::place_menus` is one method with one count, and
+      each application walks its *whole* bar through it in a test: reinstating the constant fails
+      with "menu 2 of 3 opened with nowhere to hang from".
+
+- [x] **A margin around the quick-access panel** ✅. It has had a ground of its own since Part A;
+      what makes it read as a *panel* is the window showing through around it.
 
 ### Part D — a scroll that survives the next frame ✅ complete (2026-09-10)
 
