@@ -5141,6 +5141,12 @@ ground. The report for the scrollbar was "click and drag doesn't seem to work" â
 mechanism works, measured in the guest before anything was changed: the press grabs the thumb
 without moving it and the drag scrolls to the end. What does not work is *finding* it.
 
+**Six parts in the end, not three.** Three answered the list; three came from the maintainer
+running each fix and finding the next thing â€” a scroll the next frame threw away, a menu with
+nowhere to hang from, and a panel whose rows painted over it. That loop *is* the milestone's
+method: every one of those three was invisible to the host suite and obvious in ten seconds of
+use.
+
 **That is the milestone's shape, and it is why these are one milestone rather than eight
 tickets.** M11 gave this desktop a light theme measured off a reference; what it did not do is
 check that each control still reads as one against it, and a palette tuned by looking at a
