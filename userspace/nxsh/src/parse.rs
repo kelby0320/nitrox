@@ -54,7 +54,7 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 /// take symbols, every conventional one being spoken for — `|` is the pipe, `&` the
 /// background suffix, `^` the force-external prefix.
 /// TODO(shell-bitwise): `docs/rationale/deferred-decisions.md`.
-const OPERATORS: &[&str] = &[
+pub(crate) const OPERATORS: &[&str] = &[
     "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last",
     "skip", "dedupe", "take", "count", "sum", "min", "max", "avg", "reduce",
     // §10b's Part E families: strings, records, numbers.
@@ -65,7 +65,7 @@ const OPERATORS: &[&str] = &[
 
 /// Shell-state builtins (§3): they mutate the shell's own process state, which an
 /// external program structurally cannot do.
-const BUILTINS: &[&str] = &["cd", "exit"];
+pub(crate) const BUILTINS: &[&str] = &["cd", "exit"];
 
 /// Operators whose bareword argument is a *predicate*, and therefore desugars to an
 /// implicit `{ |it| … }` closure (§8b).

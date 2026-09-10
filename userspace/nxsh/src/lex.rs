@@ -807,8 +807,13 @@ fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-/// What may follow a leading `/` for it to be a path rather than division.
-fn is_path_char(c: u8) -> bool {
+/// What may follow a leading `/` for it to be a path rather than division — and what
+/// [`crate::complete`] treats as the extent of the word under the cursor.
+///
+/// **The same question in both places**, which is why they share one answer rather than
+/// each keeping its own: a completion that disagreed with the lexer about where a word
+/// begins would offer to finish something the lexer then reads as two tokens.
+pub(crate) fn is_path_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'/')
 }
 
@@ -828,36 +833,48 @@ fn starts_keyword(s: &[u8], kw: &[u8]) -> bool {
         && (s.len() == kw.len() || !is_ident_char(s[kw.len()]))
 }
 
+/// The language's keywords, and the token each becomes.
+///
+/// **One table rather than a `match` plus a list of names**, because there are two consumers
+/// now: the lexer, which turns a word into a token, and completion, which offers the words.
+/// A `match` cannot be enumerated, so the second consumer would have been a hand-copied list
+/// — and the failure of a stale copy is silent, a keyword that simply never appears when you
+/// press Tab. Linear scan over 27 entries, on the same reasoning `Interp`'s scopes use: at
+/// this size it beats hashing, and identifiers are lexed one line at a time here.
+pub const KEYWORDS: &[(&str, Tok)] = &[
+    ("let", Tok::Let),
+    ("mut", Tok::Mut),
+    ("const", Tok::Const),
+    ("pub", Tok::Pub),
+    ("if", Tok::If),
+    ("else", Tok::Else),
+    ("for", Tok::For),
+    ("in", Tok::In),
+    ("while", Tok::While),
+    ("break", Tok::Break),
+    ("continue", Tok::Continue),
+    ("def", Tok::Def),
+    ("return", Tok::Return),
+    ("fail", Tok::Fail),
+    ("try", Tok::Try),
+    ("catch", Tok::Catch),
+    ("strict", Tok::Strict),
+    ("match", Tok::Match),
+    ("use", Tok::Use),
+    ("as", Tok::As),
+    ("expect", Tok::Expect),
+    ("assert", Tok::Assert),
+    ("parse", Tok::Parse),
+    ("true", Tok::True),
+    ("false", Tok::False),
+    ("null", Tok::Null),
+    ("_", Tok::Underscore),
+];
+
 fn keyword_or_ident(w: &str) -> Tok {
-    match w {
-        "let" => Tok::Let,
-        "mut" => Tok::Mut,
-        "const" => Tok::Const,
-        "pub" => Tok::Pub,
-        "if" => Tok::If,
-        "else" => Tok::Else,
-        "for" => Tok::For,
-        "in" => Tok::In,
-        "while" => Tok::While,
-        "break" => Tok::Break,
-        "continue" => Tok::Continue,
-        "def" => Tok::Def,
-        "return" => Tok::Return,
-        "fail" => Tok::Fail,
-        "try" => Tok::Try,
-        "catch" => Tok::Catch,
-        "strict" => Tok::Strict,
-        "match" => Tok::Match,
-        "use" => Tok::Use,
-        "as" => Tok::As,
-        "expect" => Tok::Expect,
-        "assert" => Tok::Assert,
-        "parse" => Tok::Parse,
-        "true" => Tok::True,
-        "false" => Tok::False,
-        "null" => Tok::Null,
-        "_" => Tok::Underscore,
-        _ => Tok::Ident(String::from(w)),
+    match KEYWORDS.iter().find(|(k, _)| *k == w) {
+        Some((_, t)) => t.clone(),
+        None => Tok::Ident(String::from(w)),
     }
 }
 

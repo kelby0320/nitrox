@@ -16,8 +16,8 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
 ## Structure — and the reason for it
 
 - **`src/lib.rs` and friends — the language.** `lex`, `parse`, `ast`, `eval`, `value`,
-  `ops`, `repl`, `regex`. **No syscalls.** Host-tested (`cargo test -p nxsh --lib`) in a
-  second rather than through a 90-second boot.
+  `ops`, `repl`, `regex`, `complete`. **No syscalls.** Host-tested
+  (`cargo test -p nxsh --lib`) in a second rather than through a 90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
   reader, the filesystem.
 
@@ -110,7 +110,15 @@ before it fed the evaluator a whole script through `run`, which is why three
 interactive-only bugs got in — the stale `cd` guard, `list /`, and `def` hoisting.
 
 What it does *not* cover is the console loop in `main.rs`: byte reading, backspace, Ctrl-D,
-the prompt itself. That needs a driven console — see `TODO(nxsh-console-tests)`.
+the prompt itself. That needs a driven console, and `cargo xtask test-interactive` is it —
+it boots the release image and types at the real prompt. The deferral that asked for this
+(`nxsh-console-tests`) was resolved that way on 2026-08-03 rather than by extracting the
+loop, and the reasoning is in the Resolved table of `docs/rationale/deferred-decisions.md`.
+
+**So anything that can be a decision rather than a byte should be.** A boot is the right
+price for "does a keystroke reach the shell" and much too high for "what does this prefix
+match". `complete` is the worked example: the whole decision table is library code with a
+`MockHost` under it, and the console loop's share is "press Tab, write what it says".
 
 ## Forbidden patterns
 

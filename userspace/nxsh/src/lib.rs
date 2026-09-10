@@ -20,6 +20,7 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod complete;
 pub mod eval;
 pub mod history;
 pub mod host;
@@ -30,6 +31,7 @@ pub mod regex;
 pub mod repl;
 pub mod value;
 
+pub use complete::{Completion, Where, word_at_end};
 pub use eval::{EvalError, Interp, Mode as RunMode};
 pub use host::{Host, MockHost, MockLog, NullHost, PipelineRun, StageSpec, StageStatus};
 pub use lex::{LexError, Lexer, Mode as LexMode, Tok};
