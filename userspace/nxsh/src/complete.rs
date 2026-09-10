@@ -191,6 +191,66 @@ impl Completion {
     }
 }
 
+/// The bytes that show `candidates` beneath the line being edited.
+///
+/// **A decision, not byte plumbing**, which is why it is here and not in the console loop: how
+/// many fit on a row, what gets cut, and how the cut is reported are all things a host test can
+/// check in a second, and the loop's share is one `write`.
+///
+/// **Wrapped at 80 columns because that is what a serial console is**, and because nothing
+/// tells this shell the width of the terminal it is talking to: the tty protocol carries no
+/// size, and the one terminal that knows its own grid (`nxterm`) has no way to say so. A
+/// too-narrow guess wraps untidily on a wide terminal; a too-wide one would wrap *mid-name* on
+/// a narrow one, which is the failure that matters. When a size op exists, this is the caller
+/// that wants it.
+///
+/// Capped at [`MAX_LISTED`], with the remainder **counted** rather than dropped silently — a
+/// prefix that matches four hundred things should say so rather than look like a shell that
+/// lost some.
+///
+/// `\r\n` rather than `\n`: the shell holds the line discipline itself, so nothing downstream
+/// adds the carriage return.
+pub fn listing(candidates: &[String]) -> Vec<u8> {
+    const WIDTH: usize = 80;
+    const GAP: usize = 2;
+
+    let shown = candidates.len().min(MAX_LISTED);
+    let mut out = Vec::from(&b"\r\n"[..]);
+    if shown == 0 {
+        return out;
+    }
+    // One column width for all of them, so the names line up: a grid of ragged rows is harder
+    // to read than a slightly wasteful even one.
+    let widest = candidates[..shown].iter().map(|c| c.chars().count()).max().unwrap_or(0);
+    // At least one per row, or a name wider than the terminal would divide by zero.
+    let per_row = (WIDTH / (widest + GAP)).max(1);
+
+    for (i, c) in candidates[..shown].iter().enumerate() {
+        out.extend_from_slice(c.as_bytes());
+        if (i + 1) % per_row == 0 || i + 1 == shown {
+            out.extend_from_slice(b"\r\n");
+        } else {
+            for _ in 0..(widest + GAP - c.chars().count()) {
+                out.push(b' ');
+            }
+        }
+    }
+    if candidates.len() > shown {
+        out.extend_from_slice(b"... and ");
+        push_u64(&mut out, (candidates.len() - shown) as u64);
+        out.extend_from_slice(b" more\r\n");
+    }
+    out
+}
+
+/// `n` in decimal, appended to `out`.
+fn push_u64(out: &mut Vec<u8>, n: u64) {
+    if n >= 10 {
+        push_u64(out, n / 10);
+    }
+    out.push(b'0' + (n % 10) as u8);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +368,58 @@ mod tests {
             ],
         };
         assert_eq!(c.common_prefix(), "note");
+    }
+
+    fn listed(candidates: &[&str]) -> String {
+        let v: Vec<String> = candidates.iter().map(|c| String::from(*c)).collect();
+        String::from_utf8(listing(&v)).expect("the listing is text")
+    }
+
+    /// The listing starts on a line of its own and every candidate is in it.
+    #[test]
+    fn a_listing_puts_each_candidate_on_the_screen() {
+        let out = listed(&["copy", "count", "continue"]);
+        assert!(out.starts_with("\r\n"), "the listing must leave the line being edited alone");
+        for want in ["copy", "count", "continue"] {
+            assert!(out.contains(want), "{want} is missing from {out:?}");
+        }
+        assert!(out.ends_with("\r\n"), "the prompt is written after this and needs a fresh line");
+    }
+
+    /// Names line up in columns, and a row holds as many as 80 characters allow.
+    #[test]
+    fn a_listing_fills_a_row_before_starting_another() {
+        // Four characters plus two of gap is six; 80 / 6 is 13.
+        let names: Vec<&str> = alloc::vec!["abcd"; 13];
+        assert_eq!(listed(&names).matches("\r\n").count(), 2, "13 six-wide names are one row");
+        let names: Vec<&str> = alloc::vec!["abcd"; 14];
+        assert_eq!(listed(&names).matches("\r\n").count(), 3, "the 14th starts a second row");
+    }
+
+    /// A name wider than the terminal gets a row to itself rather than a division by zero.
+    #[test]
+    fn a_name_wider_than_the_screen_does_not_divide_by_zero() {
+        let long = "a".repeat(200);
+        let out = listed(&[&long, &long]);
+        assert_eq!(out.matches("\r\n").count(), 3, "one row each, plus the leading break");
+    }
+
+    /// Too many to show says so, rather than showing some and looking complete.
+    #[test]
+    fn a_listing_counts_what_it_could_not_show() {
+        let names: Vec<String> = (0..MAX_LISTED + 7).map(|i| alloc::format!("n{i}")).collect();
+        let out = String::from_utf8(listing(&names)).expect("text");
+        assert!(out.contains("... and 7 more"), "the remainder was dropped silently: {out:?}");
+        assert!(out.contains("n0"), "the first candidate should still be shown");
+        assert!(
+            !out.contains(&alloc::format!("n{}", MAX_LISTED)),
+            "a candidate past the cap was shown"
+        );
+    }
+
+    /// Nothing to list is not a crash — `listing` is called with what `complete` found.
+    #[test]
+    fn an_empty_listing_is_just_a_newline() {
+        assert_eq!(listed(&[]), "\r\n");
     }
 }

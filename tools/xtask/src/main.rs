@@ -1232,6 +1232,41 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 19d. **Tab completion** (§11c), asserted through what the shell *ran* rather than
+    //      through what appeared. A completion is erase-and-rewrite bytes on a wire, so
+    //      matching on them would assert on the capture; pressing Enter afterwards and
+    //      checking the result asserts that the **buffer** was replaced, which is the part
+    //      that matters. Step 8 makes the same argument for history recall.
+    //
+    //      `send_raw` because Tab is a key, not a line: `send` would submit `who` as well.
+    s.send_raw("who\t")?;
+    s.send("")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+
+    //      A path, and the one place a completion has to know something a name lookup does
+    //      not: `Pictures` is a directory, so it keeps its trailing slash and gets no space
+    //      — which is what lets a second Tab descend into it. The prompt is the `PWD`, so
+    //      it says whether the whole path arrived.
+    s.send_raw("cd /home/Pic\t")?;
+    s.send("")?;
+    s.expect("/home/Pictures")?;
+    s.send("cd /home")?;
+    s.expect("/home>")?;
+
+    //      An ambiguous prefix shows the choice instead of guessing. `Do` matches two of
+    //      the three staged folders, so nothing can be typed for you and the list is the
+    //      only useful answer; one more character then makes it unique.
+    s.send_raw("cd /home/Do\t")?;
+    s.expect("Documents/")?;
+    s.expect("Downloads/")?;
+    s.send_raw("c\t")?;
+    s.send("")?;
+    s.expect("/home/Documents")?;
+    s.send("cd /home")?;
+    s.expect("/home>")?;
+    steps += 1;
+
     // 20. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
     //     observable rather than merely "the shell left". Before Part C the driver matched
     //     the literal line `exit`, so `exit 3` missed it entirely and came back as

@@ -24819,3 +24819,63 @@ removed the copy.
 `test-interactive` step 7 nests the call now — `format("add={}", add(2, 3))` — which is what the
 step was always for: a generic operator and a user `def` dispatching together in one line. It had
 stood as a two-line workaround with a comment saying the nested form was rejected.
+
+
+---
+
+## 2026-09-10 — Tab, and the line that will not parse (nxsh M5 Parts B and C)
+
+**§11c specified tab completion in the shell's first design pass and it was never built.** The
+reason it stayed unbuilt is worth more than the feature: the plan's closing section said "what
+remains gated is completion (needs schema work)", and that sentence is true of *half* of what
+§11c calls completion. Schema-aware **field** completion — `filter siz<TAB>` → `size` — needs a
+pipeline's shape known statically. Command names and file paths need nothing this shell has not
+had since Milestone 3. One word doing duty for two things kept the achievable half waiting.
+
+**The line being completed does not parse, and cannot be made to.** It is unfinished by
+definition — that is what makes it the line you press Tab on — so the parser is not the tool.
+Both questions are answered lexically from the raw bytes:
+
+- **Where the word begins** is the lexer's own `is_path_char`, *shared* rather than copied. A
+  completion that disagreed with the lexer about where a word begins would offer to finish
+  something the lexer then reads as two tokens. Narrowing that set fails four completion tests,
+  which is the coupling working.
+- **Whether a command or a path belongs there** is what precedes it. The interesting case is
+  `(`: it opens a pipeline in `(list /bin | count)` and an argument list in `format("{}", x)`,
+  and **adjacency separates them** — the same signal §5b's grammar reads. A word containing a
+  `/` is a path wherever it sits, since `./script.nx` is a command written as a path and §9h
+  leaves this shell no search path to resolve a bare name against.
+
+**Two consumers made the lexer's keyword `match` a table.** Completion has to enumerate the
+keywords and a `match` cannot be enumerated, so the alternative was a hand-copied list — whose
+staleness is *silent*, a keyword that simply never appears when you press Tab. Two things that
+must be equal are one thing, and the linear scan over 27 entries is the same trade `Interp`'s
+scopes already make.
+
+**`Host` grew `commands` and `list_dir` rather than the library growing a path.** Where programs
+come from is the host's knowledge — `PROGRAM_DIRS` lives in the binary beside the resolution
+`run` already does — and a library that listed `/bin` itself would be a second answer free to
+disagree with the first. `list_dir` is the filesystem-and-namespace **union** `list` shows,
+because a mount point is a place you can `cd` into and a Tab that could not see one would
+disagree with what is on the screen. That is the rule `cd` learned the hard way in Milestone 3.5,
+applied before it could bite a second time.
+
+**The division of labour is the point, and the gate's price is what sets it.** The console loop
+in `main.rs` is the one part of this shell no host test builds; `nxsh-console-tests` was resolved
+by booting a release image and typing at it, which is the right price for "does a keystroke reach
+the shell" and much too high for "what does this prefix match". So everything that is a
+*decision* is library code — the word, the position, the candidates, and the column layout — and
+what stays in the loop is one `write`. `listing` was written in `main.rs` first and moved for
+exactly this reason, one commit after the rule was written down.
+
+**The gate asserts on what the shell ran, not on what appeared.** A completion is
+erase-and-rewrite bytes on a wire; matching on them would assert on the capture rather than on
+the shell. Pressing Enter afterwards and checking the result proves the **buffer** was replaced,
+which is the part that matters — the same argument step 8 makes for history recall. Disabling the
+Tab arm makes the gate fail on `who`.
+
+**Not done, and each with a trigger rather than a shrug.** Flag names (`list --rev<TAB>`) need no
+design, only a mechanism: nothing in the RS protocol asks a program what flags it accepts.
+Schema-aware field completion needs the schema work §11c always said it did. And the listing is
+wrapped at 80 columns because nothing tells this shell how wide its terminal is — the tty
+protocol carries no size and `nxterm`, which knows its own grid, has no way to say so.

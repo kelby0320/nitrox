@@ -418,6 +418,39 @@ impl Host for NitroxHost {
         }
     }
 
+    fn commands(&mut self) -> Vec<String> {
+        // **The same list `resolve_program` searches**, walked rather than probed — which is
+        // what keeps Tab from offering a name the shell would then fail to run, or hiding one
+        // it could. A directory that will not list contributes nothing; completion is
+        // best-effort by contract.
+        let mut out = Vec::new();
+        for dir in PROGRAM_DIRS {
+            let path = dir.strip_suffix(b"/").unwrap_or(dir);
+            if let Ok(entries) = libfs::list_dir(self.namespace, path) {
+                for e in entries {
+                    out.push(String::from_utf8_lossy(e.name()).into_owned());
+                }
+            }
+        }
+        out
+    }
+
+    fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
+        // `libfs::list_dir` is the filesystem-and-namespace **union** — the same answer `list`
+        // gives, which is the point: a mount point and a kernel-served directory are places you
+        // can `cd` into, and a Tab that could not see them would disagree with what is on
+        // screen. The rule that these two must ask the namespace the same question is the one
+        // `cd` learned the hard way (`userspace/nxsh/CLAUDE.md`).
+        match libfs::list_dir(self.namespace, dir.as_bytes()) {
+            Ok(entries) => entries
+                .iter()
+                .map(|e| (String::from_utf8_lossy(e.name()).into_owned(),
+                     e.kind == librsproto::file::DIRENT_KIND_DIR))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn diag(&mut self, text: &str) {
         kprint(text.as_bytes());
     }
@@ -902,6 +935,46 @@ fn repl(
                 out.extend_from_slice(&st.redraw());
                 tty_write(tty, &out);
                 search = Some(st);
+                continue;
+            }
+            // **Tab completes** (§11c), intercepted before the discipline the way `Ctrl-R`
+            // is, and for the same reason: a tab is not a character in a line, and feeding
+            // it would put one there.
+            //
+            // What to *decide* is `nxsh::complete`'s, tested on the host; what is left here
+            // is what only this loop can do — write bytes and redraw. The prompt is the
+            // continuation one mid-statement, because that is what is on the screen.
+            if b == b'\t' {
+                let line = String::from_utf8_lossy(disc.line()).into_owned();
+                let c = interp.complete(&line);
+                let filled = c.apply(&line, c.common_prefix());
+                if filled != line {
+                    // Something unambiguous to add: type it for them. A lone candidate that
+                    // is not a directory also gets a space, since the word is finished and
+                    // the next one has to start somewhere; a directory does not, so a second
+                    // Tab descends into it.
+                    let mut new_line = filled;
+                    if c.candidates.len() == 1 && !new_line.ends_with('/') {
+                        new_line.push(' ');
+                    }
+                    let redraw = disc.replace_line(new_line.as_bytes());
+                    tty_write(tty, &redraw);
+                } else if c.candidates.len() > 1 {
+                    // Nothing left that they all agree on, so show the choice. The list goes
+                    // on its own lines and the prompt is written again beneath it — no cursor
+                    // addressing, which is what keeps this working on the serial console.
+                    tty_write(tty, &nxsh::complete::listing(&c.candidates));
+                    match pending.is_empty() {
+                        true => tty_write(
+                            tty,
+                            nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes(),
+                        ),
+                        false => {
+                            tty_write(tty, nxsh::repl::continuation_prompt().as_bytes())
+                        }
+                    }
+                    tty_write(tty, disc.line());
+                }
                 continue;
             }
             match disc.feed(b) {

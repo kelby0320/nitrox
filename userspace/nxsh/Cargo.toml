@@ -17,6 +17,10 @@ libheap = { path = "../libheap" }
 # input (history needs it) but must not become a fourth copy of backspace and kill.
 tty-server = { path = "../tty-server" }
 librsproto = { path = "../librsproto", features = ["io"] }
+# Directory listings, for `cd`'s check and for Tab completion. The *union* of the
+# filesystem and the namespace lives here and has three consumers now, which is exactly
+# the rule that put it here (`userspace/CLAUDE.md`): a helper with two belongs below both.
+libfs = { path = "../libfs" }
 libstream = { path = "../libstream", features = ["io"] }
 
 [lib]

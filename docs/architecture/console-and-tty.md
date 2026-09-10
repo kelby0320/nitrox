@@ -1,6 +1,6 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-09-02.** The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-09-10.** The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -196,8 +196,15 @@ right behaviour anyway.
    `Ctrl-R` searches it. History and search are pure logic in `nxsh`'s library half, so
    they host-test; the terminal work stays in the binary half.
 
-   Stage 3 is complete except completion, which is a separate piece needing the schema
-   work. What remains of §11's rich REPL past that needs the rest of the input arm — the driver landed in M3 Part A, but modifier
+   **Tab completion joined it on 2026-09-10** and is the same shape: `nxsh::complete`
+   decides — where the word begins, whether a command or a path belongs there, what the
+   candidates are, how the list is laid out — and the binary half writes the bytes. The
+   decision half tests against a `MockHost` in a second; the byte half is proved by
+   `test-interactive` pressing Tab at a real prompt.
+
+   Stage 3 is complete except **schema-aware** completion, which is the separate piece
+   needing the schema work — `filter siz<TAB>` → `size`, from a pipeline's statically known
+   shape. What remains of §11's rich REPL past that needs the rest of the input arm — the driver landed in M3 Part A, but modifier
    state and routing are `libinput` and the compositor (M3 Part C) — or
    a process-group concept (job control).
 4. Later, independently: job control (needs a process-group concept), key events (needs the

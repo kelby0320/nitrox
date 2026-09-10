@@ -1469,26 +1469,49 @@ short of what the design already said, and neither was visible from inside the t
       load-bearing part** — a hand-picked snapshot is what goes stale when the struct gains a
       field, and it would fail as a mis-parse rather than as a compile error.
 
-- [ ] **Part B — completion, the half that is not the terminal.** §11c's baseline is "command names
-      across all four categories (§3), file paths". Command position and argument position are
-      decided lexically from the line and the cursor, the way every shell does it; candidates come
-      from the four name tables plus what the `Host` can list. Pure, and host-tested — the point of
-      the `Host` seam is that "what is in `/bin`" is a question a `MockHost` can answer.
+- [x] **Part B — completion, the half that is not the terminal** ✅ (2026-09-10). §11c's baseline
+      is "command names across all four categories (§3), file paths". Both questions are decided
+      lexically from the raw line, which matters because a line being completed is unfinished by
+      definition and will not parse: where the word begins is the lexer's own `is_path_char`,
+      shared rather than copied; whether a command or a path belongs there is what precedes it.
+
+      **The `(` is the interesting case.** `(list /bin | count)` opens a pipeline and takes a
+      stage; `format("{}", x)` opens an argument list and takes a value. Adjacency separates
+      them, which is the same signal §5b's grammar reads. And a word containing a `/` is a path
+      wherever it sits — `./script.nx` is a command written as a path, and §9h leaves this shell
+      no search path to resolve a bare name against anyway.
+
+      `Host` grew `commands` and `list_dir`, both defaulted and best-effort. *Where* programs come
+      from is the host's knowledge, and `list_dir` is the filesystem-and-namespace union `list`
+      shows — a Tab that could not see a mount point would disagree with what is on screen, which
+      is the rule `cd` learned the hard way.
 
       **What is still gated is the *schema-aware* half** (`filter siz<TAB>` → `size`), which is
-      what needs a pipeline's shape known statically. The plan's own closing section says
+      what needs a pipeline's shape known statically. The plan's own closing section said
       "completion (needs schema work)" without that qualifier, which reads as though the baseline
-      were gated too; it is not, and never was.
+      were gated too; it is not, and never was. Corrected there.
 
-- [ ] **Part C — completion, the terminal half.** Tab is intercepted in the REPL's key loop the way
-      `Ctrl-R` already is, before the discipline sees it. One candidate completes; several insert
-      the longest common prefix, and print the list if that adds nothing. Listing needs no cursor
-      addressing — a newline, the names, the prompt, the line again — which is why this does not
-      wait on the terminal capability `history-pager` waits on.
+- [x] **Part C — completion at the prompt, and the gate that can see it** ✅ (2026-09-10). Tab is
+      intercepted in the REPL's key loop the way `Ctrl-R` already is, before the discipline sees
+      it: a tab is not a character in a line, and feeding it would put one there. One candidate is
+      typed for you and gets a trailing space unless it is a directory, which keeps its slash so a
+      second Tab descends. Several insert what they all agree on, and list the choice when that
+      adds nothing.
 
-- [ ] **Part D — the gate.** `test-interactive` presses Tab at a real prompt and checks what comes
-      back. The console loop is the part `nxsh`'s host tests structurally cannot reach, and that
-      gate is the answer this repo already chose for it (`nxsh-console-tests`, resolved 2026-08-03).
+      **Listing needs no cursor addressing** — a newline, the names, the prompt, the line again —
+      which is why this did not wait on the terminal capability `history-pager` waits on. It is
+      wrapped at 80 columns because nothing tells this shell how wide its terminal is; when a size
+      op exists, this is the caller that wants it.
+
+      **The gate is not a separate part, because it is the only test this half can have.**
+      `test-interactive` presses Tab at a real prompt and asserts on what the shell *ran* rather
+      than on what appeared — a completion is erase-and-rewrite bytes, so matching on them would
+      assert on the capture, while pressing Enter afterwards proves the buffer was replaced. Step
+      8 makes the same argument for history recall. Disabling the Tab arm fails the gate.
+
+      **And the layout went to the library because of that gate's price.** `listing` started in
+      `main.rs` beside the `write`, where no host test builds it; how many fit on a row and how
+      the cut is reported are decisions, and a boot is the wrong price for checking them.
 
 ---
 

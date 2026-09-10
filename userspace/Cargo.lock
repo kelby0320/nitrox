@@ -336,6 +336,7 @@ dependencies = [
 name = "nxsh"
 version = "0.1.0"
 dependencies = [
+ "libfs",
  "libheap",
  "libkern",
  "librsproto",
