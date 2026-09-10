@@ -1355,6 +1355,70 @@ impl TextAreaState {
         (from, to)
     }
 
+    /// The (line, column) a pointer at widget-local `(x, y)` is over.
+    ///
+    /// **Given a way to measure text rather than a font**, for [`Metrics`](crate::layout::Metrics)'
+    /// reason one layer down: this crate has no glyphs, and the application that draws the area
+    /// already holds the metrics it was laid out with. Pass `|s| metrics.text_size(s).w`.
+    ///
+    /// **The column is the *nearest boundary*, not the character under the cursor.** Clicking the
+    /// right half of a letter puts the caret after it, which is what every editor does and what
+    /// makes clicking at the end of a word land after the word rather than inside it.
+    ///
+    /// Coordinates are the ones [`text_area`] hands its pointer handler, so this subtracts the
+    /// padding the widget draws with — a caller cannot know that number and should not have to.
+    pub fn at_point(&self, x: i32, y: i32, row_height: u32, width: impl Fn(&str) -> u32)
+        -> (usize, usize)
+    {
+        let y = y - FIELD_PAD.top as i32;
+        let row = if row_height == 0 { 0 } else { (y.max(0) as u32 / row_height) as usize };
+        // **Clamped rather than refused.** A press below the last line means its end, which is
+        // what dragging off the bottom of a selection has to mean.
+        let line = (self.offset + row).min(self.lines.len().saturating_sub(1));
+        let text = &self.lines[line];
+        let x = x - FIELD_PAD.left as i32;
+        if x <= 0 {
+            return (line, 0);
+        }
+        // Walk the boundaries, keeping the one whose drawn width is nearest the cursor. Linear
+        // in the line's length and measured once per boundary, which is what a proportional font
+        // costs: there is no arithmetic that turns a pixel into a column when every glyph is a
+        // different width.
+        let mut best = (0usize, u32::MAX);
+        for col in text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(core::iter::once(text.len()))
+        {
+            let w = width(&text[..col]);
+            let d = w.abs_diff(x as u32);
+            if d < best.1 {
+                best = (col, d);
+            }
+        }
+        (line, best.0)
+    }
+
+    /// This buffer as a scrollbar's state, for `visible` lines on screen.
+    ///
+    /// The same shape [`ListState::bar`] has, and for the same reason: the widget owns the
+    /// arithmetic, so a bar and the text beside it cannot disagree about where a thumb points.
+    pub fn bar(&self, visible: usize) -> ScrollState {
+        ScrollState {
+            offset: self.offset as u32,
+            visible: visible as u32,
+            total: self.lines.len() as u32,
+        }
+    }
+
+    /// Scroll so `offset` is the first visible line, clamped to what there is.
+    ///
+    /// **The cursor does not move.** A scrollbar drag changes what is *shown*; an editor that
+    /// dragged the caret along with the view would lose the place the person was working at.
+    pub fn scroll_to(&mut self, offset: usize, visible: usize) {
+        self.offset = offset.min(self.lines.len().saturating_sub(visible.max(1)));
+    }
+
     /// Select from `from` to `to`, putting the cursor at `to`.
     ///
     /// **Total, and clamped**, because the caller's coordinates may be stale: the range a paste
@@ -1797,6 +1861,14 @@ pub struct InkRun {
 /// `height` is what the caller will lay it out at; wrap the result in `sized` to keep the two in
 /// step, for the reason [`list_view`] gives.
 ///
+/// **`pointer` is what makes it clickable** (M15). The state has had `place` and `extend_to`
+/// since M10 — documented, then, as "what a press does" and "what a drag does" — and no widget
+/// ever handed them anything: this took no pointer events at all, so an editor's caret could
+/// only be moved with the arrow keys. The handler receives widget-local coordinates; the
+/// application turns them into a line and a column with
+/// [`TextAreaState::at_point`](TextAreaState::at_point), because that needs to measure text and
+/// this crate has no glyphs.
+///
 /// **What it draws:** the visible lines, the selection behind the text on each, the caret when
 /// `active`, and each line in the colours `ink` gives it. What it does *not* draw is a scrollbar
 /// — that is `scrollbar`'s, composed beside it by an application that wants one, the way the
@@ -1811,6 +1883,7 @@ pub fn text_area<Msg>(
     row_height: u32,
     active: bool,
     ink: &[InkRun],
+    pointer: Option<fn(PointerEvent) -> Msg>,
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -1908,7 +1981,14 @@ pub fn text_area<Msg>(
     let mut layers = alloc::vec::Vec::with_capacity(2);
     layers.push(fill(theme.track));
     layers.push(padding(FIELD_PAD, column(rows)));
-    stack(layers).focusable()
+    let mut e = stack(layers).focusable();
+    if let Some(f) = pointer {
+        // **On the whole area, including its padding.** A press in the margin beside a line is a
+        // press on that line — `at_point` subtracts the padding itself, which is the number a
+        // caller cannot know.
+        e = e.on_pointer(f);
+    }
+    e
 }
 
 /// One row of a [`list_view`].
@@ -3837,19 +3917,19 @@ two");
         // the widget takes `&mut` precisely so it cannot be forgotten (PR #257 review).
         let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7");
         let p = Theme::default();
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 0);
 
         for _ in 0..5 {
             a.apply(KEY_DOWN, 0);
         }
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 3, "line 5 is visible in a three-line window");
 
         for _ in 0..5 {
             a.apply(KEY_UP, 0);
         }
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(a.offset(), 0, "and it scrolls back the other way");
     }
 
@@ -3978,7 +4058,7 @@ two");
         // never does. Both directions here, counted in the tree (PR #258 review, blocking 2).
         let p = Theme::default();
         let draw = |a: &mut TextAreaState| -> usize {
-            let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], &p);
+            let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], None, &p);
             fills(&e, p.focus_ring)
         };
 
@@ -4006,7 +4086,7 @@ two");
 
         let mut a = area();
         a.apply(KEY_END, 0);
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, false, &[], None, &p);
         assert_eq!(fills(&e, p.focus_ring), 0, "and none at all when the widget is not active");
     }
 
@@ -4043,6 +4123,7 @@ two");
             16,
             false,
             &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(
@@ -4053,6 +4134,66 @@ two");
             ],
             "the line was not split at the run's edge"
         );
+    }
+
+    /// A pixel becomes a line and a column, and the column is the nearest boundary.
+    ///
+    /// **Nearest, not the character under the cursor**: clicking the right half of a letter puts
+    /// the caret after it, which is what every editor does and what makes clicking past the end
+    /// of a word land after the word rather than inside it.
+    #[test]
+    fn a_point_becomes_the_nearest_line_and_column() {
+        // Eight pixels a character, which is what the fixed metric these tests use gives.
+        let w = |s: &str| (s.chars().count() * 8) as u32;
+        let a = TextAreaState::with_text("abcdef\nghi");
+        let px = |col: usize| FIELD_PAD.left as i32 + col as i32 * 8;
+        let py = |row: usize| FIELD_PAD.top as i32 + row as i32 * 16 + 4;
+
+        assert_eq!(a.at_point(px(0), py(0), 16, w), (0, 0));
+        assert_eq!(a.at_point(px(3), py(0), 16, w), (0, 3), "a boundary is itself");
+        assert_eq!(a.at_point(px(3) + 6, py(0), 16, w), (0, 4), "past the middle is the next");
+        assert_eq!(a.at_point(px(3) + 2, py(0), 16, w), (0, 3), "before it is this one");
+        assert_eq!(a.at_point(px(0), py(1), 16, w), (1, 0), "the second row is the second line");
+
+        // **Off the ends is clamped, in both directions.** A drag runs off a widget routinely —
+        // the router hands a captured widget negative coordinates rather than clamping them.
+        assert_eq!(a.at_point(-40, py(0), 16, w), (0, 0));
+        assert_eq!(a.at_point(px(99), py(0), 16, w), (0, 6), "past the end of the line is its end");
+        assert_eq!(a.at_point(px(0), py(9), 16, w), (1, 0), "past the last line is the last line");
+        assert_eq!(a.at_point(px(0), -80, 16, w), (0, 0));
+    }
+
+    /// A scrolled area maps a point to the line that is *on screen* there.
+    ///
+    /// **The offset is the whole of it**, and leaving it out is the bug that makes clicking work
+    /// perfectly until the first time somebody scrolls — after which every click lands the same
+    /// number of lines too high.
+    #[test]
+    fn a_point_is_read_against_what_is_on_screen() {
+        let w = |s: &str| (s.chars().count() * 8) as u32;
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        a.scroll_to(4, 3);
+        assert_eq!(a.offset(), 4, "precondition: scrolled");
+        let y = FIELD_PAD.top as i32 + 4;
+        assert_eq!(a.at_point(FIELD_PAD.left as i32, y, 16, w).0, 4, "the top row is line 4");
+    }
+
+    /// The scrollbar's state, and a scroll that leaves the cursor where it was.
+    #[test]
+    fn a_text_area_reports_a_bar_and_scrolls_without_moving_the_cursor() {
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        let bar = a.bar(4);
+        assert_eq!((bar.offset, bar.visible, bar.total), (0, 4, 10));
+        assert!(bar.scrollable());
+
+        let before = a.cursor();
+        a.scroll_to(3, 4);
+        assert_eq!(a.offset(), 3);
+        assert_eq!(a.cursor(), before, "a scrollbar drag moved the caret");
+        // Clamped to what is left, so a drag past the end shows the last screen rather than
+        // scrolling into blank space.
+        a.scroll_to(99, 4);
+        assert_eq!(a.offset(), 6, "ten lines, four visible");
     }
 
     /// The caret is drawn where the cursor is in the middle of a line.
@@ -4070,7 +4211,7 @@ two");
             a.apply(KEY_RIGHT, 0);
         }
         assert_eq!(a.cursor(), (0, 2), "precondition: mid-line, with no selection");
-        let e: Element<()> = text_area(&mut a, 16, 16, true, &[], &p);
+        let e: Element<()> = text_area(&mut a, 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.focus_ring), 1, "no caret while typing in the middle of a line");
     }
 
@@ -4093,6 +4234,7 @@ two");
             16,
             true,
             &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(fills(&e, p.selection), 1, "precondition: the keyword is selected");
@@ -4119,6 +4261,7 @@ two");
             16,
             false,
             &[InkRun { line: 0, start: 1, end: 99, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(
@@ -4135,6 +4278,7 @@ two");
             16,
             false,
             &[InkRun { line: 0, start: 1, end: 2, colour: KEYWORD }],
+            None,
             &p,
         );
         assert_eq!(inked(&e).len(), 1, "the line was split inside a character: {:?}", inked(&e));
@@ -4147,6 +4291,7 @@ two");
             16,
             false,
             &[InkRun { line: 40, start: 0, end: 2, colour: KEYWORD }],
+            None,
             &p,
         );
         assert!(inked(&e).iter().all(|(_, c)| c.is_none()));
@@ -4160,11 +4305,11 @@ two");
         let mut a = area();
         a.apply(KEY_RIGHT, 0);
         a.apply(KEY_DOWN, MOD_SHIFT);
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.selection), 2, "the tail of line 0 and the head of line 1");
 
         let mut a = area();
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &p);
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
         assert_eq!(fills(&e, p.selection), 0, "and nothing when nothing is selected");
     }
 
@@ -4182,7 +4327,7 @@ two");
         assert_eq!(a.text(), "ab\nde\nfghi");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
-        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &Theme::default());
+        let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
         assert_eq!(fills(&e, Theme::default().selection), 0, "nothing is selected, so nothing \
             is highlighted");
 
@@ -4201,7 +4346,7 @@ two");
         a.extend_to(0, 3);
         assert!(a.apply(KEY_BACKSPACE, 0));
         assert_eq!(a.text(), "ab\nde\nfghi");
-        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], &Theme::default());
+        let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
     }
 
     #[test]

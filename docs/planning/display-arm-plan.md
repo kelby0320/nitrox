@@ -5147,9 +5147,34 @@ check that each control still reads as one against it, and a palette tuned by lo
 picture of the whole screen is exactly how a groove ends up matching the list.
 
 - [x] **Part A — the surfaces** ✅ (2026-09-10): the groove, the button and the sidebar.
-- [ ] **Part B — the text area learns the pointer**: click to place the cursor, drag to select,
-      and the scrollbar `nxedit` never had.
+- [x] **Part B — the text area learns the pointer** ✅ (2026-09-10): click to place the cursor,
+      drag to select, and the scrollbar `nxedit` never had.
 - [ ] **Part C — the chooser navigates**: an Open dialog that can leave the directory it opened in.
+
+### Part B — the text area learns the pointer ✅ complete (2026-09-10)
+
+- [x] **A press places the caret and a drag selects** ✅. **`TextAreaState` was already ready**:
+      `place` and `extend_to` have existed since M10, documented then as "what a press does" and
+      "what a drag does" — and no widget ever handed them anything, because `text_area` took no
+      pointer events at all. So the editor's caret could be moved only with the arrow keys, in a
+      window whose whole content is text you point at.
+
+      **The conversion needs a font, so the application does it.** `at_point` turns a widget-local
+      pixel into a line and a column given a way to measure a string, because `libui` has no
+      glyphs — the same seam `Metrics` is one layer down, and the same one `nxterm::note_press`
+      uses for a clock. The column is the **nearest boundary** rather than the character under the
+      cursor, which is what makes clicking the right half of a letter land after it.
+
+- [x] **A scrollbar for the document** ✅. `text_area`'s own doc had always said it draws none and
+      that composing one is the application's — `nxterm` does exactly that for its grid, and this
+      window never did. `TextAreaState` grew `bar` and `scroll_to`, the pair `ListState` already
+      had, so a bar and the text beside it cannot disagree about where a thumb points. **A drag
+      leaves the caret where it was**: what a scrollbar changes is what is *shown*.
+
+- [x] **A key collision, found by the first test that routed a real press** ✅ — not a box.
+      `AREA_INNER_KEY` was written as 40, which is `MENU_BAR_KEY` and the *base of a range*, so
+      `locate` answered with the menu bar's rectangle for the document and the press landed on
+      chrome. `nxfiles` grew a test against exactly this in M14 Part D; `nxedit` has one now.
 
 ### Part A — the surfaces ✅ complete (2026-09-10)
 

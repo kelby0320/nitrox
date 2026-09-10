@@ -31,7 +31,7 @@ use librsproto::surface::{Role};
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 
-use libui::layout::{layout, locate};
+use libui::layout::{Metrics as _, layout, locate};
 use libui::paint::{FontMetrics, Theme};
 
 use libui::window::Child;
@@ -1201,6 +1201,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
+                    // **The half only the binary can do** (M15): turning a pixel into a column
+                    // means measuring text with the font the area was drawn with, and the
+                    // library half of this application holds neither a font nor a syscall. The
+                    // same seam `nxterm::note_press` uses for the clock.
+                    let m = FontMetrics::new(&font, theme.font_px);
+                    app.take_area_pointer(|s| m.text_size(s).w);
                 }
                 WindowEvent::Focus(f) => {
                     top.route(&ui, &font, &theme, &WindowEvent::Focus(f));

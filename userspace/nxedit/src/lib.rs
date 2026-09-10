@@ -44,7 +44,8 @@ use libui::element::{
 };
 use libui::widget::{
     GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
-    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, tab_strip,
+    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, scrollbar,
+    tab_strip,
     text_area, text_field, title_bar, window_frame,
 };
 
@@ -59,6 +60,19 @@ pub const ROW_H: u32 = 20;
 
 /// The element key on the text area.
 pub const AREA_KEY: u64 = 1;
+
+/// The document's own key inside the area's dock — see [`AREA_KEY`].
+///
+/// **Not 40**, which is [`MENU_BAR_KEY`] and the *base* of a range: the first version of this
+/// used it, and `locate` answered with the menu bar — a control at the top of the window
+/// standing in for the document, which is the aliasing `nxfiles` filed a test against in M14
+/// Part D after a listing row lit whichever chrome shared its number.
+pub const AREA_INNER_KEY: u64 = 20;
+/// The document scrollbar's key.
+pub const AREA_BAR_KEY: u64 = 21;
+/// How wide the document's scrollbar is, in pixels. `nxterm`'s number, for one desktop's worth
+/// of muscle memory.
+pub const SCROLL_W: u32 = 12;
 /// The element key on the save control.
 pub const SAVE_KEY: u64 = 2;
 /// The element key on the title bar.
@@ -340,6 +354,14 @@ pub struct Chooser {
 
 /// Everything the editor is.
 pub struct App {
+    /// A pointer event over the document, awaiting the metrics that can resolve it.
+    ///
+    /// **One, not a queue.** Each is a position, and the newest is the answer: a press followed
+    /// by three motions in one batch means the caret goes where the last one was, which is what
+    /// a drag looks like when the loop is behind.
+    area_pointer: Option<PointerEvent>,
+    /// Where within the document scrollbar's thumb a drag took hold.
+    scroll_grab: libui::widget::ScrollGrab,
     /// The open buffers, in the order their tabs are drawn. **Never empty**: the last one closing
     /// closes the window, so every method below can assume there is a current buffer.
     buffers: Vec<Buffer>,
@@ -593,6 +615,16 @@ pub enum Msg {
     ChooserCancel,
     /// The wheel turned over the chooser — see [`ListState::wheel`](libui::widget::ListState::wheel).
     ChooserWheel(PointerEvent),
+    /// A pointer event over the document — a press places the caret, a drag selects.
+    ///
+    /// **Recorded rather than acted on**, because turning a pixel into a column means measuring
+    /// text and this crate has no glyphs. The binary resolves it with the metrics it drew with;
+    /// see [`App::take_area_pointer`].
+    AreaPointer(PointerEvent),
+    /// A pointer event over the document's scrollbar.
+    AreaScroll(PointerEvent),
+    /// The wheel turned over the document.
+    AreaWheel(PointerEvent),
     /// Open another window of this editor — `Ctrl+Shift+N`, or File ▸ New Window.
     ///
     /// **Recorded, not done.** A window is a compositor object and this crate makes no syscalls;
@@ -729,6 +761,8 @@ impl App {
     /// An editor for `path`, with an empty buffer until something is loaded into it.
     pub fn new(path: &str, home: &str) -> App {
         App {
+            area_pointer: None,
+            scroll_grab: libui::widget::ScrollGrab::new(),
             buffers: alloc::vec![Buffer::new(TAB_KEY_BASE, path)],
             current: TAB_KEY_BASE,
             chooser: None,
@@ -1160,6 +1194,26 @@ impl App {
             // **Declined when no chooser is open**, which is not defensive: the dialog is a
             // second window and its records arrive on the same session, so one in flight when
             // the dialog closes reaches this.
+            // **Kept, not resolved.** The binary hands it back through `take_area_pointer` with
+            // something that can measure a string — the same seam `note_press` uses in `nxterm`
+            // for the same reason: this half of the application makes no syscalls and holds no
+            // font.
+            Msg::AreaPointer(p) => self.area_pointer = Some(p),
+            Msg::AreaScroll(p) => {
+                let visible = (self.area_h() / ROW_H) as usize;
+                let bar = self.buf().text.bar(visible);
+                let h = self.area_h();
+                if let Some(offset) = self.scroll_grab.apply(bar, h, p) {
+                    self.buf_mut().text.scroll_to(offset as usize, visible);
+                }
+            }
+            Msg::AreaWheel(p) => {
+                let visible = (self.area_h() / ROW_H) as usize;
+                let by = i64::from(p.wheel) * i64::from(libui::click::WHEEL_UNITS);
+                let at = self.buf().text.offset() as i64;
+                let want = (at + by).max(0) as usize;
+                self.buf_mut().text.scroll_to(want, visible);
+            }
             Msg::ChooserWheel(p) => {
                 if let Some(c) = self.chooser.as_mut() {
                     c.state.list.wheel(p.wheel);
@@ -1649,6 +1703,31 @@ impl App {
         out
     }
 
+    /// Resolve a pointer event over the document, given a way to measure text.
+    ///
+    /// **Called by the binary after `update`**, with `width` measuring a string the way the area
+    /// was drawn — `|s| metrics.text_size(s).w`. A press places the caret and drops the
+    /// selection; a motion with a button held extends it. Anything else is ignored, which is
+    /// what keeps a hover from moving somebody's cursor.
+    ///
+    /// Answers whether anything changed, so the caller can decide to redraw.
+    pub fn take_area_pointer(&mut self, width: impl Fn(&str) -> u32) -> bool {
+        let Some(p) = self.area_pointer.take() else { return false };
+        let pressed = p.kind == librsproto::surface::POINTER_BUTTON
+            && p.flags & librsproto::surface::POINTER_PRESSED != 0;
+        let dragging = p.kind == librsproto::surface::POINTER_MOTION && p.buttons & 1 != 0;
+        if !pressed && !dragging {
+            return false;
+        }
+        let (line, col) = self.buf().text.at_point(p.x, p.y, ROW_H, width);
+        if pressed {
+            self.buf_mut().text.place(line, col);
+        } else {
+            self.buf_mut().text.extend_to(line, col);
+        }
+        true
+    }
+
     /// What the current buffer is being highlighted as, for a receipt.
     ///
     /// **A name rather than a boolean**, because the interesting failure is not "highlighting
@@ -2099,9 +2178,31 @@ impl App {
         // element is under the point. Dropping a file on the title bar does nothing, which is
         // the honest answer: the title bar is not where a document goes.
         let focused = self.focused;
-        let area =
-            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, &ui)
-                .on_drop(Msg::Dropped);
+        let visible = (h / ROW_H) as usize;
+        let bar = self.buf().text.bar(visible);
+        let area = text_area(
+            &mut self.buf_mut().text,
+            h,
+            ROW_H,
+            focused,
+            &ink,
+            Some(Msg::AreaPointer),
+            &ui,
+        )
+        .on_drop(Msg::Dropped)
+        .on_wheel(Msg::AreaWheel);
+        // **A scrollbar beside it, which this editor never had** (M15). `text_area` draws none —
+        // its own doc says so, and says it is the application's to compose, which `nxterm` does
+        // for its grid and this window did not. Without it a document longer than the window had
+        // nothing to say so, and no way to move but the arrow keys.
+        let area = dock(
+            alloc::vec![docked(
+                Edge::Right,
+                sized(Size::new(SCROLL_W, h), scrollbar(bar, SCROLL_W, h, &ui).on_pointer(Msg::AreaScroll))
+                    .key(AREA_BAR_KEY),
+            )],
+            area.key(AREA_INNER_KEY),
+        );
 
         let body = window_frame(
             title,
@@ -2298,6 +2399,159 @@ mod tests {
     const KEY_X: u16 = 45;
     /// `1` — the key that tells a swallowed chord from an unprintable one.
     const KEY_1: u16 = 2;
+
+    /// Every key this window uses names a different element.
+    ///
+    /// **A key is a number and nothing checks it** — the diff pairs by key within a parent, and
+    /// `locate` answers with the first node carrying one, so two constants that collide make a
+    /// control stand in for another. `AREA_INNER_KEY` was written as 40, which is
+    /// [`MENU_BAR_KEY`] and the *base of a range*: `locate` returned the menu bar's rectangle
+    /// for the document, and the press that should have moved the caret landed on the chrome.
+    /// `nxfiles` grew the same test in M14 Part D after a listing row lit whichever chrome
+    /// shared its number (M15 Part B).
+    #[test]
+    fn every_element_key_in_this_window_is_its_own() {
+        // The menu bar is a base: one key per menu, from `MENU_BAR_KEY` upwards.
+        let menus = App::new("/home/x", "/home").menu_table().len() as u64;
+        let mut keys: Vec<u64> = alloc::vec![
+            AREA_KEY,
+            AREA_INNER_KEY,
+            AREA_BAR_KEY,
+            SAVE_KEY,
+            TITLE_KEY,
+            GRIP_KEY,
+            STRIP_KEY,
+            STATUS_KEY,
+            TAB_STRIP_KEY,
+            POSITION_KEY,
+            BAR_KEY,
+        ];
+        keys.extend(MENU_BAR_KEY..MENU_BAR_KEY + menus);
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "two of {keys:?} are the same number");
+    }
+
+    // ---- the pointer over the document (M15 Part B) ----
+
+    /// Eight pixels a character, which is what `CELL` gives these tests.
+    fn width(s: &str) -> u32 {
+        (s.chars().count() * 8) as u32
+    }
+
+    /// A pointer event over the document, routed through the real tree.
+    fn area_event(a: &mut App, kind: u16, flags: u16, buttons: u16, x: i32, y: i32) {
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let mut r = libui::route::Router::new();
+        let p = librsproto::surface::PointerEvent {
+            kind,
+            button: 0x110,
+            buttons,
+            flags,
+            x,
+            y,
+            ..Default::default()
+        };
+        for m in r.pointer(&tree, &e, &l, p).0 {
+            a.update(m);
+        }
+        a.take_area_pointer(width);
+    }
+
+    /// Where the document starts inside the window, in window coordinates.
+    fn area_origin(a: &mut App) -> (i32, i32) {
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+        let r = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document is keyed");
+        (r.origin.x, r.origin.y)
+    }
+
+    /// A press puts the caret where it landed — **through the real tree**.
+    ///
+    /// **The editor could not be clicked into at all until M15.** `TextAreaState::place` has
+    /// existed since M10, documented as "what a press does", and no widget ever handed it
+    /// anything: `text_area` took no pointer events, so the only way to move a caret was the
+    /// arrow keys.
+    #[test]
+    fn a_press_places_the_caret_where_it_landed() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("hello world\nsecond line", b"hello world\nsecond line\n");
+        assert_eq!(a.buf().text.cursor(), (0, 0), "precondition: at the start");
+
+        let (ox, oy) = area_origin(&mut a);
+        // Four characters into the second row.
+        area_event(&mut a, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED, 1,
+                   ox + 6 + 4 * 8, oy + 4 + ROW_H as i32);
+        assert_eq!(a.buf().text.cursor(), (1, 4), "the press did not move the caret");
+        assert!(a.buf().text.selection().is_none(), "a press selects nothing");
+    }
+
+    /// A press and a drag select the range between them.
+    #[test]
+    fn a_drag_selects_from_the_press_to_the_pointer() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        a.loaded("hello world", b"hello world\n");
+        let (ox, oy) = area_origin(&mut a);
+        let y = oy + 4;
+        area_event(&mut a, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED, 1, ox + 6, y);
+        area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 1, ox + 6 + 5 * 8, y);
+        assert_eq!(
+            a.buf().text.selected_text().as_deref(),
+            Some("hello"),
+            "the drag did not select from the press"
+        );
+
+        // A motion with nothing held is a hover, and must not move anything.
+        let before = a.buf().text.cursor();
+        area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 0, ox + 6, y);
+        assert_eq!(a.buf().text.cursor(), before, "a hover moved the caret");
+    }
+
+    /// The document has a scrollbar, and dragging it scrolls without moving the caret.
+    #[test]
+    fn the_document_scrollbar_scrolls_and_leaves_the_caret_alone() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        let text: String = (0..200).map(|i| alloc::format!("line {i}\n")).collect();
+        a.loaded(&text, text.as_bytes());
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let e = a.view(&theme, None);
+        let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+        let bar = libui::layout::locate(&e, &l, AREA_BAR_KEY).expect("the bar is keyed");
+        let mut tree = libui::diff::Tree::new();
+        tree.update(&e, &l).expect("diffable");
+        let mut r = libui::route::Router::new();
+
+        let before = a.buf().text.cursor();
+        let at = |y: i32, kind: u16, flags: u16| librsproto::surface::PointerEvent {
+            kind,
+            button: 0x110,
+            buttons: 1,
+            flags,
+            x: bar.origin.x + 6,
+            y,
+            ..Default::default()
+        };
+        let mid = bar.origin.y + bar.size.h as i32 / 2;
+        for m in r.pointer(&tree, &e, &l, at(mid, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED)).0 {
+            a.update(m);
+        }
+        assert!(a.buf().text.offset() > 0, "a press on the bar's middle scrolled nowhere");
+        let after_press = a.buf().text.offset();
+        for m in r.pointer(&tree, &e, &l, at(mid + 40, librsproto::surface::POINTER_MOTION, 0)).0 {
+            a.update(m);
+        }
+        assert!(a.buf().text.offset() > after_press, "the drag did not follow the pointer");
+        assert_eq!(a.buf().text.cursor(), before, "a scrollbar drag moved the caret");
+    }
 
     // ---- syntax highlighting (M14 Part G) ----
 

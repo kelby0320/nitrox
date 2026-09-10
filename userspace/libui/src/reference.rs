@@ -257,7 +257,7 @@ fn reference_area(theme: &Theme) -> Element<Msg> {
     }];
     crate::element::sized(
         Size::new(0, AREA_H),
-        text_area(&mut a, AREA_H, ROW_H, true, &ink, theme),
+        text_area(&mut a, AREA_H, ROW_H, true, &ink, None, theme),
     )
 }
 
