@@ -293,6 +293,13 @@ ordering box below real rather than theoretical.
       work on the boot manifest — critical path — rather than retrofit, and the retrofit's value
       does not depend on it.
 
+      **Scheduled 2026-09-10 as [Phase 5](phase-5-bare-metal.md) Part C**, because the live
+      image needs the same mechanism: its `/bin` is a subtree bind of the in-kernel
+      `/initramfs` endpoint. That is the same sentence this box already wrote — "bind an
+      already-mounted server's endpoint at another path, with a subtree base" — arriving with a
+      second consumer, which is when this project builds things. Closing it there closes this
+      plan's last box as a side effect.
+
       **`init` still has 20 `selftest` cfgs**, and they are C2's, not this one's: the demo
       chain (`run_test_harness`), the four `run_*` graphical spawns, and the
       `cfg(not(selftest))` supervision of `service-mgr` — ordinary code that becomes service

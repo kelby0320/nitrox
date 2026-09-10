@@ -24964,3 +24964,79 @@ and the decision was wrong in three cases out of four. A comment is where reason
 stop being checked. When the reasoning is load-bearing — this cannot panic, these two questions
 are the same, this branch is unreachable — the answer is to make it a test or to make it
 structural, and to keep the comment for *why*, not for *therefore*.
+
+
+---
+
+## 2026-09-10 — Phase 4 closes, and the plan grows a machine (Phases 5–9)
+
+Two decisions, and the second only became possible because of the first.
+
+### Phase 4 is complete, and what closed it was bookkeeping
+
+**Phase 3 closed against a written Definition of Done and Phase 4 had none.** Its own text
+said "this phase is open-ended", and that sentence is the whole explanation for why a phase
+whose north star had been met for a month went on looking unfinished. Two things kept it open
+and neither was work:
+
+- **Three of the flagship applications' boxes were still unticked** while the applications
+  shipped, because the work was tracked in `display-arm-plan.md` and the phase document was
+  never reconciled.
+- **The task list held three *subsequent* north stars** — the browser, networking, and a
+  sysadmin layer — which its own prose called separate. A phase that contains the next three
+  phases cannot finish.
+
+The DoD is written now, in Phase 3's shape: *the north star met on a release image, driven by
+a person, and held by gates.* That is true — a release boot reaches a greeter, a login starts a
+session, and three applications run with menus, dialogs, a chooser, highlighting, scrollbars
+and a clipboard, under six gates. **The lesson is not about this phase: a phase without a
+written stopping condition does not stop.**
+
+### The plan gets a machine
+
+Phases 5/6/7 were agreed on 2026-08-25 as the portable runtime, networking, and the browser —
+and never written down anywhere, which is its own small lesson about decisions that live only
+in a conversation. They are written now, and **bare metal and USB go in front of them**.
+
+**Everything built in four phases has only ever executed under QEMU.** That is not a small
+asterisk. An emulator is a model, and the omissions we already know about are in this file with
+"real hardware" as their literal trigger. The argument for going now is **debuggability**: a
+`std::thread` bug and an interrupt-routing bug look identical from userspace, so every phase
+built on an unverified foundation inherits the ambiguity, and the cost of resolving it grows
+with the amount of code standing on top.
+
+**The target machine was surveyed before the plan was written**, which changed three things.
+The laptop's keyboard is on the i8042, so the existing driver gives a keyboard on day one —
+but its trackpad is I²C-HID, so there is **no pointer at all** without a new stack, and a USB
+mouse is the cheaper one because xHCI brings thumb drives with it. That is what turned USB from
+an opportunistic item into Phase 6. Linux drives that machine's AHCI over **MSI**, which
+reclassifies the MSI deferral from performance work into the thing most likely to decide
+whether the disk works. And the machine **has no serial port**, while `kprint` writes to COM1 —
+so a boot that dies before userspace is a black screen with nothing to say why, and an
+on-screen kernel console became a prerequisite rather than a nicety.
+
+### The live image, and the discipline that makes a temporary stage safe
+
+Booting from USB does not give a root filesystem on that stick: Limine reads the kernel and
+initramfs through **UEFI Boot Services** and then exits them, after which an ext4 partition on
+the stick is unreachable with no USB driver. So the first boot runs root-from-initramfs — about
+5 MB in a machine with 6 GB — which also has the property that makes it worth having: **it
+removes storage from the equation**, so a black screen has one fewer possible cause.
+
+It is explicitly temporary, and the maintainer's constraint is the right one: *no production
+code may change to enable it.* No `#[cfg(feature = "live")]` anywhere. The live-ness is a
+different `init.toml`, a different `services.toml` and a fatter initramfs — build-tool
+concerns, and deleting them is the whole revert.
+
+**That is enforceable rather than merely intended.** `check-images` already compares the test
+and release initramfs and fails on any new divergence, on the retrofit's principle that *the
+software under test is the software that ships*. Extending it to a third mode makes the claim
+mechanical: the live image's **programs must be byte-identical** to the release image's, and
+only its data may differ.
+
+**And the one mechanism it needs is one we already owe.** For `/bin` to come from the
+initramfs, `init.toml` needs "bind an already-available endpoint at another path, scoped to a
+subtree" — which is word-for-word the blocker on `/subtreetest`, the last build-mode `cfg` in
+`init`, deferred from the test-path retrofit on 2026-08-24. So the live image does not want
+throwaway code; it wants a general feature arriving with its second consumer, and building it
+finishes the retrofit as a side effect.

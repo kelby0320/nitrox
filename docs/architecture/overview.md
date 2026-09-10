@@ -1,13 +1,22 @@
 # Nitrox — Architecture Overview
 
-**Status:** Phases 0–3 complete (2026-07-21) — the kernel, capability substrate, boot to
-userspace and the service ecosystem are all built and running. Phase 4 (a windowed desktop)
-is in progress: the typed shell is built through Milestone 4, and the display arm has
-started — **Milestone 1 is complete** (`libdraw` compositing, `/dev/framebuffer` bound, and
-both halves of the test gate). Sections below describing the **display server, compositor
-and windowing are still forward-looking**; see
-[`display-arm-plan.md`](../planning/display-arm-plan.md) for what exists versus what does
-not. Verified 2026-08-05.
+**Status:** Phases 0–4 complete (Phase 4 closed 2026-09-10) — the kernel, capability
+substrate, boot to userspace, the service ecosystem **and a usable windowed desktop** are all
+built and running. A release image boots to a graphical greeter; a login starts a session with
+a compositor, a shared toolkit, and three applications (`nxterm`, `nxfiles`, `nxedit`). The
+typed shell is built through Milestone 5 and the display arm through Milestone 15.
+
+The sections below describing the display server, compositor and windowing **are no longer
+forward-looking** — an earlier version of this line said they were, and it stayed that way for
+a month after they were built. [`widget-toolkit.md`](widget-toolkit.md),
+[`display-substrate.md`](display-substrate.md), [`graphical-session.md`](graphical-session.md),
+[`ui-composition-model.md`](ui-composition-model.md) and
+[`input-subsystem.md`](input-subsystem.md) are the current-behaviour documents for that arm and
+carry Status lines of their own.
+
+**Phase 5 — bare metal — is active**: everything above has only ever run under QEMU, and the
+target is a real laptop. See [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
+Verified 2026-09-10.
 
 Nitrox is a hobby operating system written in Rust. This document is the entry point to the project's architecture documentation. It's intended to be read in one sitting and to give you a working mental model of the system. It is not a specification — it is orientation.
 

@@ -1,16 +1,51 @@
 # Nitrox Implementation Plan — Phase 4 — A usable windowed desktop
 
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
-current status, the full phase list, and the cross-cutting workstreams. Phases 0–3 are
-complete; Phase 4 is active.
+current status, the full phase list, and the cross-cutting workstreams. Phases 0–4 are
+complete; Phase 5 is active.
 
 ---
 
-## Phase 4+: A usable windowed desktop (and beyond)
+## Phase 4: A usable windowed desktop ✅ complete (2026-09-10)
 
 **Goal:** move from toy demos to an OS that looks and behaves like a production system
-from a user's perspective. The phase distinction breaks down here — this is ongoing
-development rather than discrete phases.
+from a user's perspective.
+
+### Definition of Done — written 2026-09-10, met on the same day
+
+Phase 3 closed against a written stopping condition and this one had none, which is the whole
+reason it looked open-ended for a month after its north star was met. The condition, stated
+now and in the same shape as Phase 3's:
+
+> **The north star is met on a release image, driven by a person, and held by gates.** A
+> compositor on the boot framebuffer, one shared toolkit, and three flagship applications a
+> person can log in to and use — not a demonstration of the machinery, an image somebody could
+> boot and work in.
+
+Met. A release boot reaches a graphical greeter, a login starts a session, and `nxterm`,
+`nxfiles` and `nxedit` run with menus, dialogs, a file chooser, syntax highlighting, scrollbars
+and a clipboard between them. Six gates hold it: `check-display`, `check-input`,
+`check-terminal`, `check-login`, `test-interactive` and `test-qemu`.
+
+**And, as Phase 3's DoD put it, this is machinery complete and demonstrated rather than an
+exhaustive catalogue.** The desktop is missing a control panel, an icon set, and a dozen
+niceties tracked as deferrals with triggers. None of them is the phase.
+
+**What closed it was not more work — it was bookkeeping.** Three of the flagship applications'
+own boxes were still unticked here while the applications shipped, because the work was tracked
+in [`display-arm-plan.md`](display-arm-plan.md) and this document was never reconciled. And it
+carried three *subsequent* north stars in its own task list, which have now moved to
+[Phases 6–9](#subsequent-north-stars--now-phases-69).
+
+### The arms that built it
+
+- **The display arm** — [`display-arm-plan.md`](display-arm-plan.md), Milestones 1–15, ending
+  2026-09-10 with the controls-that-look-like-controls pass.
+- **The typed shell and coreutils** — [`shell-coreutils-plan.md`](shell-coreutils-plan.md),
+  Milestones 1–5.
+- **The test-path retrofit** — [`test-path-retrofit.md`](test-path-retrofit.md), complete bar
+  the `/subtreetest` binding, which [Phase 5](phase-5-bare-metal.md) Part C now carries because
+  the live image needs the same mechanism.
 
 **North star (scoped now): a usable windowed desktop.** A compositor on the boot
 framebuffer, one shared GUI toolkit, and three flagship apps — a **GUI terminal**, a **GUI
@@ -290,7 +325,7 @@ had to weaken are restored and serving as their regression tests:
 
 One, and it is a syscall that was designed and never built:
 
-- [ ] **`sys_process_terminate`.** `Rights::TERMINATE` is defined, granted on every `Process`
+- [x] **`sys_process_terminate`** ✅ (2026-08-04, shell Milestone 4 Part G). `Rights::TERMINATE` is defined, granted on every `Process`
   handle a spawn returns, and enforced by the type/rights table — **and no syscall consumes
   it.** Nothing in the 36-syscall surface can terminate another process. Two things already
   in the tree assume it exists: shell design §1 says a failed stage under `strict` terminates
@@ -580,15 +615,16 @@ takes the test paths out of `init` and `session-mgr` before three more processes
   scope arithmetic, 15/15 boots under 8-way host load, and three negative controls — an
   injected inversion panics with both lock names, an un-scoped dispatcher fails the check,
   and disabling *only* the floor-raising reproduces the withdrawn failure 6/6.
-- [ ] Display server over the persisted **boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind; firmware-fixed resolution, one linear framebuffer, no acceleration)
-- [ ] Input routing: keyboard + mouse (PS/2 under QEMU; USB HID later — see below)
-- [ ] Font rasterization (a `no_std`-friendly Rust crate, e.g. `fontdue`/`ab_glyph`) + a text/ANSI render path
+- [x] Display server over the persisted **boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind; firmware-fixed resolution, one linear framebuffer, no acceleration)
+- [x] Input routing: keyboard + mouse (PS/2 under QEMU; USB HID in [Phase 6](phase-6-usb.md))
+- [x] Font rasterization (a `no_std`-friendly Rust crate, e.g. `fontdue`/`ab_glyph`) + a text/ANSI render path
 
 ### Compositor + shared GUI toolkit
 
-- [ ] Compositor (userspace server): windows/surfaces, stacking, focus, damage/redraw
-- [ ] Shared GUI toolkit (the "common GUI library"): window creation, an event loop, drawing primitives, basic widgets. **Conventional surface model first** (apps draw into a surface; the compositor composites — Wayland-shaped)
-- [ ] **Dynamic linking** — scheduled here rather than "opportunistic", with the
+- [x] Compositor (userspace server): windows/surfaces, stacking, focus, damage/redraw
+- [x] Shared GUI toolkit (the "common GUI library"): window creation, an event loop, drawing primitives, basic widgets. **Conventional surface model first** (apps draw into a surface; the compositor composites — Wayland-shaped)
+- [ ] **Dynamic linking** — **moved to [Phase 7](phase-7-portable-runtime.md)** (2026-09-10),
+  where TLS is built; it was scheduled here rather than "opportunistic", with the
   process-memory-model bundle (CoW, lazy `MemoryObject`, rlimits, guard pages). Everything
   is static today and that is correct at 13–73 KB per binary, but **static linking defeats
   page sharing exactly where it starts to pay**: shared file-backed text (B4a) shares pages
@@ -602,11 +638,11 @@ takes the test paths out of `init` and `session-mgr` before three more processes
 
 ### Desktop apps (the north-star MVP)
 
-- [ ] **GUI terminal** (hosts the shell) — the MVP flagship
-- [ ] **GUI file browser**
-- [ ] **GUI text editor**
+- [x] **GUI terminal** (hosts the shell) — the MVP flagship
+- [x] **GUI file browser**
+- [x] **GUI text editor**
 
-### The full std cluster (parallel, consumer-driven)
+### The full std cluster — moved to [Phase 7](phase-7-portable-runtime.md)
 
 Not a desktop-MVP gate — the desktop can be built on `no_std + alloc` + crates + FP. Full std
 lands with **portable application programs** and the **browser**. `std` is the portable API
@@ -618,40 +654,29 @@ namespace (bounded ambient, capability-safe); `std::io` blocking maps to `sys_io
 - [ ] Thread-local storage (`FS_BASE` / `sys_thread_set_tls`)
 - [ ] Real `std::thread` — multi-threaded user processes; this triggers the slice-3b **cross-CPU deschedule IPI** (its first consumer) + per-thread FPU/TLS
 - [ ] `std` subset over the native ABI: `std::{fs,io,sync,thread}` (`net` after networking)
-- [ ] Target spec: `x86_64-unknown-nitrox.json`
+- [x] Target spec: `x86_64-unknown-nitrox.json` ✅ (2026-07-21, with the hard-float ABI)
 - [ ] First non-trivial external Rust crate ported unmodified; a Nitrox program cross-built + run on Linux (portability proof)
 
-### Subsequent north stars
+### Subsequent north stars — now Phases 6–9
 
-**Web browser** (a capstone / integration test — exercises networking, TLS, threads, FP/SIMD,
-graphics, fonts, memory, std at once). Favor a **hybrid**: reuse pure-Rust Servo crates
-(`html5ever`, `cssparser`, `selectors`) + a pure-Rust JS engine (`Boa`, restricted subset)
-over porting full Servo (SpiderMonkey/C/GPU weight, which would force the POSIX C shim early).
-Portable to Nitrox/Linux/Windows.
+**Moved out on 2026-09-10, which is what let this phase close.** These were never Phase 4
+finishing; they are what comes after it, and keeping them here is what made a met north star
+look like an unfinished phase. Each now has its own document:
 
-- [ ] Restricted HTML/CSS/JS engine on pure-Rust crates
-- [ ] `rustls`-based HTTPS (needs networking below)
-
-**Networking** (gates `std::net`, NTP, the browser's fetch path):
-
-- [ ] Network driver (e1000 or virtio-net as starting point)
-- [ ] Userspace netstack server (smoltcp port or from-scratch)
-- [ ] Socket-as-namespace-resource architecture
-- [ ] DHCP, DNS
-- [ ] TLS-the-protocol via `rustls` + a Rust crypto provider
-
-**Package management + system administration** (the content-store daemon + generations + GC,
-pulled up from the Phase 3 backlog; the "sysadmin layer" of a production-feel OS):
-
-- [ ] Package manager daemon (list/add/remove store paths)
-- [ ] Generation manifests + atomic switch/rollback
-- [ ] Store GC (mark reachable, sweep unreachable)
+- [Phase 5 — bare metal](phase-5-bare-metal.md): the machine this has all been for.
+- [Phase 6 — USB](phase-6-usb.md): a pointer, thumb drives, and the first loadable driver.
+  Absorbs the "USB subsystem" and "fs-server-fat read-write" items below.
+- [Phase 7 — the portable runtime](phase-7-portable-runtime.md): TLS, `std::thread`, the `std`
+  subset, dynamic linking. Absorbs "The full std cluster" above.
+- [Phase 8 — networking](phase-8-networking.md).
+- [Phase 9 — the browser](phase-9-browser.md), with package management and sysadmin as a
+  parallel opportunistic track.
 
 ### Opportunistic / trigger-driven
 
 Landed when a concrete consumer or need appears, not on a fixed schedule:
 
-- [ ] **USB subsystem** (xHCI + USB core + HID) — real-hardware input/storage; QEMU gives PS/2, so it trails the QEMU-first loop
+- [x] **USB subsystem** — **scheduled as [Phase 6](phase-6-usb.md)** (2026-09-10). No longer opportunistic: the target laptop's trackpad is I²C-HID, so a USB mouse is the only affordable pointer, and thumb drives need it too.
 - [ ] **POSIX C shim** — deferred until a must-have C dependency forces it (target the pure-Rust ecosystem first)
 - [ ] **Additional filesystems:** fs-server-fat read-write (ESP updates from within the OS; also the orphaned Phase-2 "FAT read-only" deferral folds in here), btrfs/xfs if a use case emerges
 - [ ] **Phase 2 ACPI:** vendor ACPICA (`kernel/vendor/acpica/`), OSL (`kernel/src/kacpi/osl/`), `bindgen` integration, power-management daemon — triggered by laptop / graceful-shutdown needs
@@ -660,6 +685,13 @@ Landed when a concrete consumer or need appears, not on a fixed schedule:
 
 ### Notes
 
-This phase is open-ended. The implementation plan stops being useful as a fine-grained
-tracking tool around here; ongoing work is better tracked as GitHub issues / project boards.
-The north star and the decision log (2026-07-20) are the durable guides.
+**An earlier version of this section said "this phase is open-ended", and that sentence was the
+problem.** Phase 3 closed against a written Definition of Done; Phase 4 had a north star, a
+list containing three *subsequent* north stars, and an explicit disclaimer that it could not be
+tracked. So a phase whose stated goal was met went on looking unfinished, because its list
+still held work belonging to phases that had not been written yet.
+
+Fixed on 2026-09-10 by doing what should have happened at the start: writing the Definition of
+Done above, moving the subsequent north stars into their own phase documents, and reconciling
+the checkboxes against what was actually built. The lesson is not about this phase — it is that
+**a phase without a written stopping condition does not stop.**
