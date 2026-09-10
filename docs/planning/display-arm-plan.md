@@ -5151,6 +5151,25 @@ picture of the whole screen is exactly how a groove ends up matching the list.
       drag to select, and the scrollbar `nxedit` never had.
 - [x] **Part C — the chooser navigates** ✅ (2026-09-10): an Open dialog that can leave the
       directory it opened in.
+- [x] **Part D — a scroll that survives the next frame** ✅ (2026-09-10): why two of the three
+      scrollbars did nothing, and the terminal's worked.
+
+### Part D — a scroll that survives the next frame ✅ complete (2026-09-10)
+
+**Reported as "the terminal scrollbar works, the other two do not", which is the comparison that
+found it.** `nxterm`'s grid follows nothing — it keeps a `view_top` — while `list_view` and
+`text_area` both call `ensure_visible` on *every build*, and an application repaints after every
+event. So a drag computed the right offset and the very next frame put it back on the selection:
+the bar moved, the content did not, and every host test passed because each of them routed an
+event and read the state without redrawing in between.
+
+- [x] **A selection is followed when it *changes*, not continuously** ✅. Both states remember
+      the selection they last scrolled to, so arrow keys still pull the view along and a
+      scrollbar no longer fights the caret. `ListState` gained a constructor for it: the
+      bookkeeping is private, which is what stops a caller writing it in a struct literal.
+
+- [x] **The regression tests redraw** ✅ — the thing the earlier ones did not. Each of the three
+      new ones presses, rebuilds the tree the way the binary does, and asserts the offset held.
 
 ### Part C — the chooser navigates ✅ complete (2026-09-10)
 

@@ -1852,7 +1852,7 @@ impl App {
         // **The selection resets**, for `nxfiles::show`'s reason: a listing of a *different*
         // directory has no row the old selection refers to, and a clamped stale index silently
         // selects whatever happens to sit at that position.
-        c.state.list = libui::widget::ListState { selected: None, offset: 0 };
+        c.state.list = libui::widget::ListState::at(None, 0);
     }
 
     /// Open the chooser, looking at the current buffer's directory.
@@ -2573,6 +2573,50 @@ mod tests {
         }
         assert!(a.buf().text.offset() > after_press, "the drag did not follow the pointer");
         assert_eq!(a.buf().text.cursor(), before, "a scrollbar drag moved the caret");
+    }
+
+    /// A document scroll survives the repaint that follows it — see `nxfiles`' twin of this.
+    ///
+    /// **`text_area` followed the caret on every build**, so a scrollbar drag was undone before
+    /// anything was drawn: the bar moved and the document did not (M15 Part D).
+    #[test]
+    fn a_document_scroll_survives_the_next_repaint() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        let text: String = (0..200).map(|i| alloc::format!("line {i}\n")).collect();
+        a.loaded(&text, text.as_bytes());
+        let theme = UiTheme::default();
+        let size = a.window_size();
+        let mut tree = libui::diff::Tree::new();
+        let mut frame = |a: &mut App, tree: &mut libui::diff::Tree| {
+            let e = a.view(&theme, None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
+            tree.update(&e, &l).expect("diffable");
+            (e, l)
+        };
+        let (e, l) = frame(&mut a, &mut tree);
+        let bar = libui::layout::locate(&e, &l, AREA_BAR_KEY).expect("the bar is keyed");
+        let mut r = libui::route::Router::new();
+        let press = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x: bar.origin.x + 6,
+            y: bar.origin.y + bar.size.h as i32 / 2,
+            ..Default::default()
+        };
+        for m in r.pointer(&tree, &e, &l, press).0 {
+            a.update(m);
+        }
+        let scrolled = a.buf().text.offset();
+        assert!(scrolled > 0, "the press on the bar scrolled nowhere");
+
+        frame(&mut a, &mut tree);
+        assert_eq!(
+            a.buf().text.offset(),
+            scrolled,
+            "the repaint put the document back where its caret is"
+        );
     }
 
     // ---- syntax highlighting (M14 Part G) ----

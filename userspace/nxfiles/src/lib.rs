@@ -934,7 +934,7 @@ impl App {
         libfs::sort(&mut entries, p.order);
         p.path = String::from(path);
         p.entries = entries;
-        p.list = ListState { selected: (!p.entries.is_empty()).then_some(0), offset: 0 };
+        p.list = ListState::at((!p.entries.is_empty()).then_some(0), 0);
         // **A listing of another directory has nothing the old picks refer to.** Same argument as
         // the selection reset above it.
         self.marked.clear();
@@ -4506,6 +4506,55 @@ mod tests {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// A scrollbar drag survives the repaint that follows it.
+    ///
+    /// **This is the test the earlier ones were missing, and the bug they let through.** Every
+    /// other pointer test here routes an event and reads the state; the *application* rebuilds
+    /// its tree after every event, and `list_view` followed the selection on every build — so a
+    /// drag computed the right offset and the next frame put it back on row 0. The bar moved and
+    /// the listing did not, which is exactly what was reported (M15 Part D).
+    #[test]
+    fn a_scrollbar_drag_survives_the_next_repaint() {
+        let mut a = app();
+        a.show("/home", (0..80).map(|i| Entry::file(&alloc::format!("f{i}"))).collect());
+        let cell = libui::layout::FixedCell { w: 8, h: 16 };
+        let size = a.window_size();
+        let theme = UiTheme::default();
+        let mut tree = libui::diff::Tree::new();
+        let mut r = libui::route::Router::new();
+        // A frame, exactly as the binary draws one.
+        let mut frame = |a: &mut App, tree: &mut libui::diff::Tree| {
+            let e = a.view(&theme, None);
+            let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
+            tree.update(&e, &l).expect("diffable");
+            (e, l)
+        };
+
+        let (e, l) = frame(&mut a, &mut tree);
+        let x = size.w as i32 - 8;
+        let press = librsproto::surface::PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            x,
+            y: (size.h / 2) as i32,
+            ..Default::default()
+        };
+        for m in r.pointer(&tree, &e, &l, press).0 {
+            a.update(m);
+        }
+        let scrolled = a.pane().list.offset;
+        assert!(scrolled > 0, "the press on the bar scrolled nowhere");
+
+        frame(&mut a, &mut tree);
+        assert_eq!(
+            a.pane().list.offset,
+            scrolled,
+            "the repaint put the listing back where its selection is"
+        );
     }
 
     /// The wheel scrolls the listing, **through the real tree and router**.

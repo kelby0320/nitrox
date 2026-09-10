@@ -212,7 +212,7 @@ fn reference_field() -> TextFieldState {
 /// nothing to persist. That is the one case where discarding the scroll is right, and since
 /// M10 Part C it is expressed by the state being local rather than by a `_` in a pattern.
 fn reference_list(theme: &Theme) -> Element<Msg> {
-    let mut state = ListState { selected: Some(1), offset: 0 };
+    let mut state = ListState::at(Some(1), 0);
     let e = list_view(&ROWS, &mut state, LIST_H, ROW_H, Msg::Row, None, None, None, None, theme);
     // Fixed height: the list is the last thing in the column and would otherwise take
     // whatever is left, which makes the picture depend on `HEIGHT` rather than on the widget.

@@ -24653,3 +24653,35 @@ half-typed filename would be the surprise, and there is a field holding the keyb
 and every part below it loses what the button took. The test that pins the list and the name
 field at the sizes they were built for is what caught it — a test written in M14 Part C's review
 for a different reason entirely.
+
+
+---
+
+## 2026-09-10 — a scroll that the next frame threw away (M15 Part D)
+
+**"The terminal scrollbar works fine, but the ones for files and text edit do not."** That
+comparison is what found it, after three probes in the guest and two on the host had each shown
+the drag working — because every one of them routed an event and read the state, and none of them
+*redrew* in between.
+
+`nxterm`'s grid follows nothing: it keeps a `view_top` and a `scroll_to_line`. `list_view` and
+`text_area` both call `ensure_visible` at the top of **every build**, to keep the selection or the
+caret on screen — and an application repaints after every event. So the sequence was: press,
+compute the right offset, repaint, `ensure_visible` sees the selection is row 0 and pulls the
+offset back to 0, draw. The bar moved under the pointer and the content never did.
+
+**Following a selection is what a *changed* selection asks for.** Both states remember the one
+they last scrolled to, so arrow keys still pull the view along and a scrollbar no longer fights
+the caret. `ListState` gained `at` for it: the bookkeeping is a private field, which is precisely
+what stops a caller writing it in a struct literal and is why the constructor exists.
+
+**The lesson is about the shape of the test, not the bug.** Six tests covered scrollbar dragging
+across three applications and all six passed while two of the three bars did nothing, because
+they all had the same shape: build a tree, route a press, route a motion, read the state. The
+application does something none of them did — it *builds the tree again* between events, and the
+build is where the state was being overwritten. **A widget whose build mutates the state it is
+given cannot be tested without building it twice.** The three new tests redraw.
+
+That also explains why the guest probes agreed with the host: they read `nxfiles`' receipts and
+the offsets in them were correct. The offset *was* correct, at the moment it was measured. What
+was wrong was what happened next, and nothing was printing that.

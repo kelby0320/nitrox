@@ -65,14 +65,14 @@ pub struct ChooserState {
 impl ChooserState {
     /// A chooser with nothing selected and an empty name.
     pub fn new() -> Self {
-        Self { list: ListState { selected: None, offset: 0 }, name: TextFieldState::new() }
+        Self { list: ListState::at(None, 0), name: TextFieldState::new() }
     }
 
     /// A chooser opened to save `name` — the buffer's current name, so Save As starts from what
     /// the file is called rather than from nothing.
     pub fn saving(name: &str) -> Self {
         Self {
-            list: ListState { selected: None, offset: 0 },
+            list: ListState::at(None, 0),
             name: TextFieldState::with_text(name),
         }
     }

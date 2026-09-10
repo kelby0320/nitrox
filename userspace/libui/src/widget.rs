@@ -1055,6 +1055,9 @@ pub struct TextAreaState {
     goal: Option<usize>,
     /// The first visible line.
     offset: usize,
+    /// The cursor line [`ensure_visible`](Self::ensure_visible) last scrolled to — see
+    /// [`ListState::followed`], which is the same rule for the same reason.
+    followed: Option<usize>,
     /// How many times the *text* has changed.
     ///
     /// **Because "is this buffer modified?" is a question only the state can answer.** An editor
@@ -1134,6 +1137,7 @@ impl Default for TextAreaState {
             anchor: None,
             goal: None,
             offset: 0,
+            followed: None,
             revision: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1782,6 +1786,12 @@ impl TextAreaState {
         if visible == 0 {
             return;
         }
+        // Once per cursor line, for [`ListState::ensure_visible`]'s reason: a document that
+        // followed its caret on every build could not be scrolled away from it.
+        if self.followed == Some(self.line) {
+            return;
+        }
+        self.followed = Some(self.line);
         if self.line < self.offset {
             self.offset = self.line;
         } else if self.line >= self.offset + visible {
@@ -2037,9 +2047,28 @@ pub struct ListState {
     pub selected: Option<usize>,
     /// The first visible row.
     pub offset: usize,
+    /// The selection [`ensure_visible`](Self::ensure_visible) last scrolled to.
+    ///
+    /// **What stops "keep the selection on screen" from meaning "never scroll anywhere else".**
+    /// `list_view` calls `ensure_visible` on every build, so without this a list whose selection
+    /// is row 0 snaps its offset back to 0 on every repaint — and since an application repaints
+    /// after every event, a scrollbar drag computed the right offset and had it thrown away
+    /// before anything was drawn. The bar moved and the list did not (M15 Part D).
+    followed: Option<usize>,
 }
 
 impl ListState {
+    /// A list showing `offset` first, with `selected` picked.
+    ///
+    /// **A constructor rather than a literal**, since M15 Part D: the state carries one piece of
+    /// bookkeeping ([`followed`](Self::followed)) that no caller has an opinion about, and a
+    /// private field cannot be written in a struct literal from another module — which is the
+    /// point. `selected` and `offset` stay public, because a caller does have opinions about
+    /// those.
+    pub fn at(selected: Option<usize>, offset: usize) -> Self {
+        Self { selected, offset, followed: None }
+    }
+
     /// Move the selection down one row, answering whether anything changed.
     ///
     /// From nothing selected this selects the first row, which is what a launcher wants when
@@ -2084,6 +2113,13 @@ impl ListState {
         if visible == 0 {
             return;
         }
+        // **Once per selection, not once per build.** Following a selection is what a *changed*
+        // selection asks for; doing it every time the widget is built makes every other way of
+        // scrolling impossible, because the next repaint undoes it.
+        if self.followed == Some(i) {
+            return;
+        }
+        self.followed = Some(i);
         if i < self.offset {
             self.offset = i;
         } else if i >= self.offset + visible {
@@ -2310,7 +2346,7 @@ mod list_view_tests {
     /// would be a list showing nothing at all).
     #[test]
     fn the_wheel_moves_whole_rows_and_stops_at_the_top() {
-        let mut st = ListState { selected: None, offset: 0 };
+        let mut st = ListState::at(None, 0);
         st.wheel(2);
         assert_eq!(st.offset, 2 * crate::click::WHEEL_UNITS as usize, "positive is down");
         st.wheel(-1);
@@ -2326,7 +2362,7 @@ mod list_view_tests {
     /// has to be one whose overflow is visible — the same trap `nxterm`'s copy of this test hit.
     #[test]
     fn a_huge_wheel_delta_does_not_wrap_upward() {
-        let mut st = ListState { selected: None, offset: 100 };
+        let mut st = ListState::at(None, 100);
         st.wheel(20_000);
         assert!(st.offset > 100, "scrolled down, not back to the top: {}", st.offset);
     }
@@ -2347,7 +2383,7 @@ mod list_view_tests {
         let build = |marked: bool, selected: Option<usize>| {
             let mut r = rows(&label);
             r[1].marked = marked;
-            let mut st = ListState { selected, offset: 0 };
+            let mut st = ListState { selected, offset: 0, ..Default::default() };
             nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, None, &Theme::default()))
         };
         let plain = build(false, None);
@@ -2395,7 +2431,7 @@ mod list_view_tests {
     #[test]
     fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
-        let mut state = ListState { selected: Some(19), offset: 0 };
+        let mut state = ListState::at(Some(19), 0);
         let _: Element<u64> =
             list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
@@ -2423,7 +2459,7 @@ mod list_view_tests {
     /// Shrinking to nothing leaves nothing selected, rather than row `-1`.
     #[test]
     fn a_list_that_empties_clears_the_selection() {
-        let mut state = ListState { selected: Some(3), offset: 2 };
+        let mut state = ListState::at(Some(3), 2);
         let _: Element<u64> =
             list_view(&[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
@@ -2431,9 +2467,52 @@ mod list_view_tests {
     }
 
     /// A selection moved with the keyboard must stay on screen.
+    /// Following the selection does not undo a deliberate scroll.
+    ///
+    /// **The bug the maintainer reported as "the scrollbar doesn't work"** (M15 Part D). Both
+    /// `list_view` and `text_area` call `ensure_visible` on every build, and an application
+    /// repaints after every event — so with the selection on row 0, a scrollbar drag computed
+    /// the right offset and the very next frame put it back. The bar moved and the list did not.
+    /// `nxterm` was unaffected because its grid follows nothing: it keeps a `view_top` instead.
+    #[test]
+    fn following_a_selection_happens_once_per_selection_not_once_per_build() {
+        let mut s = ListState::at(Some(0), 0);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 0);
+
+        // A scrollbar drag, then the repaint that follows every event.
+        s.offset = 20;
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 20, "the repaint dragged the list back to its selection");
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 20, "…and again on the frame after that");
+
+        // **But a selection that *moves* is still followed**, which is what the rule is for.
+        s.down(40);
+        s.ensure_visible(5);
+        assert_eq!(s.offset, 1, "the selection moved and the view did not follow it");
+    }
+
+    /// The same rule for a document's caret.
+    #[test]
+    fn a_document_scrolls_away_from_its_caret_and_stays_there() {
+        let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        a.ensure_visible(3);
+        assert_eq!(a.offset(), 0);
+
+        a.scroll_to(6, 3);
+        a.ensure_visible(3);
+        assert_eq!(a.offset(), 6, "the repaint dragged the document back to its caret");
+
+        // Typing moves the caret, and the view follows it again.
+        a.apply(KEY_DOWN, 0);
+        a.ensure_visible(3);
+        assert_eq!(a.offset(), 1, "the caret moved to line 1 and the view did not follow it");
+    }
+
     #[test]
     fn the_scroll_follows_the_selection_in_both_directions() {
-        let mut s = ListState { selected: Some(7), offset: 0 };
+        let mut s = ListState::at(Some(7), 0);
         s.ensure_visible(5);
         assert_eq!(s.offset, 3, "scrolling down did not bring the selection into view");
         s.selected = Some(1);
@@ -2457,7 +2536,7 @@ mod list_view_tests {
     /// Both ends stop rather than wrapping, and report no change.
     #[test]
     fn the_selection_stops_at_both_ends() {
-        let mut s = ListState { selected: Some(2), offset: 0 };
+        let mut s = ListState::at(Some(2), 0);
         assert!(!s.down(3), "the selection moved past the last row");
         s.selected = Some(0);
         assert!(!s.up(), "the selection moved above the first row");
@@ -2470,11 +2549,11 @@ mod list_view_tests {
     #[test]
     fn declines_the_keys_that_belong_above_it() {
         for key in [28u16, 1, 15] {
-            let mut s = ListState { selected: Some(1), offset: 0 };
+            let mut s = ListState::at(Some(1), 0);
             assert!(!s.apply(key, 4), "keycode {key} was claimed by the list");
             assert_eq!(s.selected, Some(1));
         }
-        let mut s = ListState { selected: Some(1), offset: 0 };
+        let mut s = ListState::at(Some(1), 0);
         assert!(s.apply(108, 4), "Down was not claimed");
         assert_eq!(s.selected, Some(2));
     }
@@ -2729,7 +2808,7 @@ mod list_view_tests {
         // same weight — two answers to "what happens if I act now" is one too many.
         let e: Element<u64> = list_view(
             &rows(&data),
-            &mut ListState { selected: Some(1), offset: 0 },
+            &mut ListState::at(Some(1), 0),
             100,
             20,
             |k| k,
@@ -2747,7 +2826,7 @@ mod list_view_tests {
         // And hovering the *selected* row leaves it selected rather than downgrading it.
         let e: Element<u64> = list_view(
             &rows(&data),
-            &mut ListState { selected: Some(1), offset: 0 },
+            &mut ListState::at(Some(1), 0),
             100,
             20,
             |k| k,
@@ -2766,7 +2845,7 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, None, None, &p);
+            list_view(&rows(&data), &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
