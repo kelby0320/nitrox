@@ -24711,3 +24711,33 @@ of 3 opened with nowhere to hang from, so nothing would be drawn".
 library. It set the anchors itself from the derived count and opened each menu — asserting a
 property of `MenuState` that was never in doubt, while the defect sat in a binary the test did not
 touch. A test that reimplements the thing it is checking is not a test of it.
+
+
+---
+
+## 2026-09-10 — a hover is a surface, lit (M15 Part F)
+
+Part A gave `nxfiles`' sidebar a ground of its own and **the rows went on painting over it**. A
+row filled `theme.track` whatever the list's ground was, so the panel colour appeared only in the
+gap below the last row: list-coloured tiles on a grey field. The ground parameter reached the
+outer fill and nothing else, which is the shape of a change that is *almost* complete — the thing
+it was for is the thing it missed.
+
+**The hover is derived from the ground rather than named.** `face_hover` is one near-white, and a
+near-white is the lit version of exactly one surface; on a grey panel it reads as a different
+control rather than the same one under a pointer. `shade(+9)` is the step this palette already
+uses between `face` and `face_hover`, so a list on any ground gets a hover that belongs to the
+same desktop. **The default path still returns `theme.face_hover` unchanged**, which is what keeps
+every other list in the system painting exactly as it did — a derivation that also changed the
+windows nobody complained about would be a second, unasked-for change riding along.
+
+**The selection stays blue in both panes.** It answers the same question — "this is the row an
+action will act on" — and a sidebar that answered it differently from the listing beside it would
+be two answers to one question, which is the rule M11 Part E batch 5 settled for hover and
+selection competing.
+
+**The test needed a selection to see the hover at all**, which is worth recording because it is
+the second time this fixture has caught somebody out: with nothing selected, a hovered row *is*
+the primary highlight and is drawn blue, so a list with no selection never reaches the hover
+branch. The first version of the test asserted `face_hover` appears and it did not, for a reason
+that had nothing to do with the change.

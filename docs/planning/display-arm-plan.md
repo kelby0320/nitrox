@@ -5155,6 +5155,27 @@ picture of the whole screen is exactly how a groove ends up matching the list.
       scrollbars did nothing, and the terminal's worked.
 - [x] **Part E — a menu with nowhere to hang from** ✅ (2026-09-10): why *View* opened nothing,
       and a margin around the quick-access panel.
+- [x] **Part F — a row sits on the ground it was given** ✅ (2026-09-10): the sidebar's rows were
+      still painting the listing's ground over its panel.
+
+### Part F — a row sits on the ground it was given ✅ complete (2026-09-10)
+
+**Part A gave the sidebar a ground and the rows kept painting over it.** A row filled
+`theme.track` whatever the list's ground was, so a panel with a colour of its own showed it only
+in the gap below the last row — list-coloured tiles on a grey field, which is not what a panel
+is. Reported from running it, as "change the colour of the buttons on the quick access panel to
+match the panel background".
+
+- [x] **A row rests on the list's ground** ✅, which is the parameter Part A added and the rows
+      ignored.
+- [x] **Its hover is derived from that ground** ✅ — `shade(+9)`, the step this palette already
+      uses between `face` and `face_hover`. **A hover is "this surface, lit"** rather than a
+      colour of its own, and one fixed near-white belongs to exactly one ground. The default path
+      keeps `face_hover` exactly, so every other list in the system paints as it did.
+
+**The selection stays blue.** It is the same answer to the same question in both panes — "this is
+the row an action will act on" — and a sidebar that highlighted differently from the listing
+beside it would be two answers to one question.
 
 ### Part E — a menu with nowhere to hang from ✅ complete (2026-09-10)
 

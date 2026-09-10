@@ -2258,6 +2258,16 @@ pub fn list_view<Msg>(
     let max_offset = rows.len().saturating_sub(visible);
     state.offset = state.offset.min(max_offset);
 
+    // **The surface the rows sit on, and what one looks like under the pointer.** A row used to
+    // fill `theme.track` whatever the list's ground was, so a panel with a ground of its own had
+    // list-coloured tiles painted over it and the panel showed only below the last row (M15
+    // Part F). A caller that names a ground gets its hover derived from it, because a hover is
+    // "this surface, lit" rather than a colour of its own — and the default path keeps
+    // `face_hover` exactly, so every other list in the system paints as it did.
+    let (ground, lit) = match ground {
+        Some(g) => (g, g.shade(HOVER_LIFT)),
+        None => (theme.track, theme.face_hover),
+    };
     let last = (state.offset + visible).min(rows.len());
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
@@ -2281,8 +2291,8 @@ pub fn list_view<Msg>(
                 padding(ROW_PAD, text(r.label)),
             ])
         } else {
-            let ground = if hovered == Some(r.key) { theme.face_hover } else { theme.track };
-            stack(alloc::vec![fill(ground), padding(ROW_PAD, text(r.label))])
+            let face = if hovered == Some(r.key) { lit } else { ground };
+            stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))])
         };
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
@@ -2321,8 +2331,15 @@ pub fn list_view<Msg>(
     } else {
         list
     };
-    stack(alloc::vec![fill(ground.unwrap_or(theme.track)), body]).focusable()
+    stack(alloc::vec![fill(ground), body]).focusable()
 }
+
+/// How far a row is lightened under the pointer, per channel.
+///
+/// **The step this palette already uses**: `face_hover` is `face` plus nine. Deriving it means a
+/// list on any ground gets a hover that belongs to the same desktop, rather than one that only
+/// suits the ground the toolkit shipped with.
+const HOVER_LIFT: i16 = 9;
 
 /// How wide a list's scrollbar is, in pixels.
 const SCROLLBAR_W: u32 = 12;
@@ -2365,6 +2382,58 @@ mod list_view_tests {
         let mut st = ListState::at(None, 100);
         st.wheel(20_000);
         assert!(st.offset > 100, "scrolled down, not back to the top: {}", st.offset);
+    }
+
+    /// A row rests on the list's own ground, and is lit from it.
+    ///
+    /// **A row used to fill `theme.track` whatever the list's ground was** (M15 Part F), so a
+    /// panel with a ground of its own had list-coloured tiles painted over it — the panel showed
+    /// only in the gap below the last row, which is not what a panel is. The hover is derived
+    /// from the ground for the same reason: a hover is "this surface, lit", not a colour of its
+    /// own, and one fixed near-white belongs to exactly one ground.
+    #[test]
+    fn a_rows_ground_is_the_lists_and_its_hover_is_derived_from_it() {
+        let p = Theme::default();
+        let data = [(1u64, "alpha"), (2, "beta")];
+        let panel = Rgb::new(0xDD, 0xDA, 0xD6);
+        // **A selection is kept, and the hover is on a *different* row.** With nothing selected
+        // a hovered row is the primary highlight — the blue one — so a fixture without a
+        // selection never reaches the hover branch at all (M11 Part E, batch 5).
+        let fills_of = |ground: Option<Rgb>, hovered: Option<u64>| {
+            let mut st = ListState::at(Some(0), 0);
+            let e: Element<u64> =
+                list_view(&rows(&data), &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
+            let mut out = Vec::new();
+            fn walk<M>(e: &Element<M>, out: &mut Vec<Rgb>) {
+                if let crate::element::Node::Fill(c) = &e.node {
+                    out.push(*c);
+                }
+                for c in e.children() {
+                    walk(c, out);
+                }
+            }
+            walk(&e, &mut out);
+            out
+        };
+
+        // The default list is untouched: rows on `track`, lit with `face_hover`.
+        let plain = fills_of(None, Some(2));
+        assert!(plain.contains(&p.track), "the ordinary list stopped using the theme's ground");
+        assert!(plain.contains(&p.face_hover), "…or its hover");
+
+        // A list on a panel rests on the panel and lights from it.
+        let on_panel = fills_of(Some(panel), None);
+        assert!(on_panel.contains(&panel), "the rows are not on the ground they were given");
+        assert!(
+            !on_panel.contains(&p.track),
+            "a row painted the list's default ground over the panel: {on_panel:?}"
+        );
+        let hovered = fills_of(Some(panel), Some(2));
+        assert!(
+            hovered.contains(&panel.shade(HOVER_LIFT)),
+            "the hover was not derived from the ground: {hovered:?}"
+        );
+        assert!(!hovered.contains(&p.face_hover), "…and it is not the default one either");
     }
 
     /// A **marked** row is drawn as a selected one, and an unmarked one is not.
