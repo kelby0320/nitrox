@@ -171,6 +171,23 @@ pub enum Node<Msg> {
         /// The child.
         child: Box<Element<Msg>>,
     },
+    /// A child drawn in a different ink.
+    ///
+    /// **A wrapper rather than a colour on [`Text`](Self::Text)**, because ink is inherited: a
+    /// run of coloured text is usually several nodes — a highlighted keyword under a selection
+    /// is a `Stack` of a fill and a text — and the alternative is every leaf carrying a colour
+    /// its parent has to remember to set. `paint` threads the current ink down the subtree, so
+    /// this colours everything inside it that draws ink: text and icons.
+    ///
+    /// **It changes no geometry**: it measures and arranges exactly as its child, like a
+    /// [`Padding`](Self::Padding) of nothing. Nesting is innermost-wins, which is what makes a
+    /// run inside a coloured block able to differ from it.
+    Ink {
+        /// The colour text and icons inside are drawn in.
+        colour: Rgb,
+        /// The child.
+        child: Box<Element<Msg>>,
+    },
     /// A rectangle of flat colour.
     ///
     /// The one painting primitive the composites need: a button's face, a scrollbar's track
@@ -410,7 +427,8 @@ impl<Msg> Element<Msg> {
             }
             Node::Padding { child, .. }
             | Node::Sized { child, .. }
-            | Node::Offset { child, .. } => (&[], Some(child), None),
+            | Node::Offset { child, .. }
+            | Node::Ink { child, .. } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
         let docked: Option<&Vec<Docked<Msg>>> = match &self.node {
@@ -480,6 +498,13 @@ pub fn bevel<Msg>(colour: Rgb) -> Element<Msg> {
 /// drawn centred in whatever box it lands in.
 pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
     Element::new(Node::Icon(kind))
+}
+
+/// A child drawn in `colour` — see [`Node::Ink`].
+///
+/// Changes no geometry, so it can be wrapped around anything without moving it.
+pub fn ink<Msg>(colour: Rgb, child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Ink { colour, child: Box::new(child) })
 }
 
 /// A child shifted `(dx, dy)` from its parent's origin, at its own measured size.

@@ -259,6 +259,14 @@ Containers, and no more than these:
 
 Plus `padding`, fixed `sized`, and `offset` wrappers. That is the whole layout vocabulary.
 
+**And `ink`, which is a wrapper that changes no geometry** (M14 Part G): it measures and arranges
+exactly as its child and colours everything inside it that draws ink, text and icons alike, with
+the innermost winning. Before it, every glyph in this toolkit was `theme.foreground`, because
+`Node::Text` carried only a `String`. A wrapper rather than a colour on the text node because ink
+is *inherited*: a coloured run is usually several nodes — a highlighted keyword under a selection
+is a `stack` of a fill and a text — and the alternative is every leaf carrying a colour its parent
+has to remember to set.
+
 **Not a CSS box model.** Margins-collapsing, floats, and inline flow are an enormous surface
 for a system whose first application is a rectangle with a bar on top.
 
@@ -553,6 +561,14 @@ function": `Element::on_key` is a **function pointer**, so a widget cannot close
 to mutate, and the editing rules have to live somewhere the application can call. Putting them
 next to the widget rather than in each caller is what stops two implementations of Home and End
 existing.
+
+**`text_area` also takes a list of coloured runs** — a line, a byte range and a colour (M14
+Part G). Colours rather than token kinds, which is what keeps this toolkit out of the business of
+knowing what a language is: the application scans its own text and looks the colour up in the
+theme. The widget merges those split points into the ones the selection and the caret already
+make, and **takes a run's bounds only where they are character boundaries of the line as it is
+now** — because they are computed from the buffer as it was a moment ago, so an edit can leave
+one naming bytes that are gone or landing inside a character.
 
 **Two of the three are no longer pure functions of that state, as of M10 Part C.** `text_area`
 and `list_view` take it by `&mut` and scroll it themselves, because a caller cannot be *required*

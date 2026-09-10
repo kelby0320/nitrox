@@ -21,6 +21,7 @@
 //! concession — Milestone 5's terminal grid is an escape-hatch client, so the escape hatch
 //! is a first-class path rather than an afterthought.
 
+use libdraw::format::Rgb;
 use libdraw::framebuffer::Framebuffer;
 use libdraw::geom::{Point, Rect};
 use libdraw::text::Font;
@@ -87,7 +88,7 @@ pub fn paint<F, Msg, C>(
     // recomputes the geometry and the offset per pixel, and `paint` clears the whole damage
     // rectangle on every frame (PR #185 review, finding 6).
     fb.fill_rect(damage, theme.background);
-    draw(fb, font, theme, element, layout, damage, custom);
+    draw(fb, font, theme, element, layout, damage, theme.foreground, custom);
 }
 
 /// [`paint`], **without clearing to the theme's ground first**.
@@ -112,7 +113,7 @@ pub fn paint_over<F, Msg, C>(
     F: Framebuffer + ?Sized,
     C: FnMut(u32, Rect, Rect, &mut F),
 {
-    draw(fb, font, theme, element, layout, damage, custom);
+    draw(fb, font, theme, element, layout, damage, theme.foreground, custom);
 }
 
 /// Draw a window control inside `rect`, clipped to `clip`.
@@ -163,6 +164,12 @@ fn draw_icon<F: Framebuffer + ?Sized>(
     }
 }
 
+/// Draw one node and its subtree, in `ink`.
+///
+/// **`ink` is threaded rather than read from the theme at each leaf**, which is the whole of
+/// [`Node::Ink`]: a text node's colour is a property of where it sits, and a leaf that looked
+/// the colour up itself could not be inside something coloured. The root is called with
+/// `theme.foreground`, so a tree with no ink node draws exactly as it did before this existed.
 fn draw<F, Msg, C>(
     fb: &mut F,
     font: &Font,
@@ -170,6 +177,7 @@ fn draw<F, Msg, C>(
     e: &Element<Msg>,
     l: &Layout,
     damage: Rect,
+    ink: Rgb,
     custom: &mut C,
 ) where
     F: Framebuffer + ?Sized,
@@ -195,7 +203,7 @@ fn draw<F, Msg, C>(
                 Point::new(l.rect.origin.x, baseline),
                 s,
                 theme.font_px,
-                theme.foreground,
+                ink,
                 clip,
             );
         }
@@ -203,7 +211,14 @@ fn draw<F, Msg, C>(
         // **The node's own rect, not the clip.** The ramp is a property of the shape being
         // drawn; passing the clip would make a one-row repaint paint a one-row gradient.
         Node::Bevel(colour) => fb.fill_rect_bevel(l.rect, clip, *colour, theme.bevel),
-        Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, theme.foreground),
+        Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, ink),
+        // **Not a container arm**, which is what would happen by default and is the whole bug
+        // this node exists to avoid: it would paint its child correctly and ignore the colour.
+        Node::Ink { colour, child } => {
+            if let Some(cl) = l.children.first() {
+                draw(fb, font, theme, child, cl, damage, *colour, custom);
+            }
+        }
         Node::Custom { kind, .. } => custom(*kind, l.rect, clip, fb),
         // Containers draw nothing of their own; their children are the picture. Painted in
         // `children()` order, so a `Stack`'s last layer lands on top — the reverse of the
@@ -211,7 +226,7 @@ fn draw<F, Msg, C>(
         // can click.
         _ => {
             for (ce, cl) in e.children().zip(l.children.iter()) {
-                draw(fb, font, theme, ce, cl, damage, custom);
+                draw(fb, font, theme, ce, cl, damage, ink, custom);
             }
         }
     }
@@ -284,6 +299,115 @@ mod tests {
 
     fn fb_has_ink(b: &MemFramebuffer, t: &Theme, x: u32, y: u32) -> bool {
         b.get_pixel(x, y) != Some(t.background)
+    }
+
+    /// Every pixel drawn, as a set of colours.
+    ///
+    /// **A set rather than one coordinate, and never an exact match against the ink.** Glyphs
+    /// are antialiased: `draw_str` blends coverage between the ink and what is under it, and at
+    /// 16 px a stem is a pixel and a half wide, so a letter may contain *no* fully-covered
+    /// pixel at all — an assertion that the ink appears exactly can fail on a correct
+    /// implementation. What survives blending against a white ground is the **hue**: grey ink
+    /// blends to grey, red ink blends to pinks whose red channel leads. That is what the
+    /// helpers below ask about.
+    fn painted(b: &MemFramebuffer, t: &Theme) -> Vec<Rgb> {
+        let mut out = Vec::new();
+        for y in 0..H {
+            for x in 0..W {
+                if let Some(c) = b.get_pixel(x, y)
+                    && c != t.background
+                    && !out.contains(&c)
+                {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether every painted pixel is a neutral grey — what the default ink blends to.
+    fn all_grey(c: &[Rgb]) -> bool {
+        c.iter().all(|p| p.r == p.g && p.g == p.b)
+    }
+
+    /// Whether anything was drawn whose red channel leads, i.e. in [`RED`].
+    fn any_reddish(c: &[Rgb]) -> bool {
+        c.iter().any(|p| p.r > p.g && p.g == p.b)
+    }
+
+    /// Whether anything was drawn whose green channel leads, i.e. in [`GREEN`].
+    fn any_greenish(c: &[Rgb]) -> bool {
+        c.iter().any(|p| p.g > p.r && p.r == p.b)
+    }
+
+    const RED: Rgb = Rgb::new(0xFF, 0x00, 0x00);
+    const GREEN: Rgb = Rgb::new(0x00, 0xFF, 0x00);
+
+    #[test]
+    fn text_inside_an_ink_node_is_drawn_in_that_colour() {
+        let (f, t) = (font(), Theme::default());
+
+        let mut plain = fb();
+        go(&mut plain, &f, &t, &column(vec![text("Hi")]), Rect::new(0, 0, W, H));
+        let before = painted(&plain, &t);
+        assert!(!before.is_empty(), "nothing was drawn at all");
+        assert!(all_grey(&before), "the theme's grey ink is what text uses by default");
+
+        let mut coloured = fb();
+        let e: Element<Msg> = column(vec![crate::element::ink(RED, text("Hi"))]);
+        go(&mut coloured, &f, &t, &e, Rect::new(0, 0, W, H));
+        let after = painted(&coloured, &t);
+        assert!(any_reddish(&after), "the wrapper's colour never reached the glyphs");
+        assert!(
+            !all_grey(&after) && !after.iter().any(|p| *p == t.foreground),
+            "the theme's ink was drawn as well, so the leaf ignored what it was given"
+        );
+    }
+
+    /// Ink is inherited, and the innermost wins.
+    ///
+    /// **Both halves in one tree**, because they are the two ways the threading can be wrong: a
+    /// version that only coloured its *immediate* child leaves the nested text at the theme's
+    /// ink, and one that took the outermost leaves it red.
+    #[test]
+    fn ink_is_inherited_and_the_innermost_wins() {
+        let (f, t) = (font(), Theme::default());
+        let mut b = fb();
+        let e: Element<Msg> = crate::element::ink(
+            RED,
+            column(vec![text("outer"), crate::element::ink(GREEN, column(vec![text("inner")]))]),
+        );
+        go(&mut b, &f, &t, &e, Rect::new(0, 0, W, H));
+        let c = painted(&b, &t);
+        assert!(any_reddish(&c), "the outer text lost its ink through the column");
+        assert!(any_greenish(&c), "the inner ink did not override the outer");
+        assert!(
+            !c.iter().any(|p| *p == t.foreground),
+            "something was still drawn in the theme's ink"
+        );
+    }
+
+    /// An ink node changes no geometry.
+    ///
+    /// **The property that lets it be wrapped around anything.** A version that measured as zero
+    /// — the obvious mistake, since `Fill` and `Icon` do — would collapse every coloured run in a
+    /// text area to nothing, and the line would draw on top of itself.
+    #[test]
+    fn an_ink_node_lays_out_exactly_as_its_child() {
+        let (f, t) = (font(), Theme::default());
+        let m = FontMetrics::new(&f, t.font_px);
+        let bare: Element<Msg> = column(vec![text("measure me")]);
+        let wrapped: Element<Msg> = column(vec![crate::element::ink(RED, text("measure me"))]);
+        let (a, b) = (
+            layout(&bare, Rect::new(0, 0, W, H), &m),
+            layout(&wrapped, Rect::new(0, 0, W, H), &m),
+        );
+        assert_eq!(a.children[0].rect, b.children[0].rect, "the wrapper is not its child's size");
+        assert_eq!(
+            a.children[0].rect,
+            b.children[0].children[0].rect,
+            "the text inside the wrapper moved or resized"
+        );
     }
 
     #[test]

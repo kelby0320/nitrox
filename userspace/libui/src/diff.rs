@@ -71,6 +71,8 @@ pub enum Fingerprint {
     /// break-test showed the two carried the same information and only one was reachable, the
     /// same shape as the bounds check removed from `libterm`'s `render_rows`.
     Offset,
+    /// [`Node::Ink`], with its colour — a recolour repaints, like a fill's.
+    Ink(libdraw::format::Rgb),
     /// [`Node::Custom`], with its discriminator and size.
     Custom(u32, libdraw::geom::Size),
 }
@@ -90,6 +92,10 @@ impl Fingerprint {
             Node::Bevel(c) => Fingerprint::Bevel(*c),
             Node::Icon(k) => Fingerprint::Icon(*k),
             Node::Offset { .. } => Fingerprint::Offset,
+            // **With its colour**, unlike `Offset` and for the reason `Fill` carries one: an
+            // ink change moves nothing, so a fingerprint without it would leave a recoloured
+            // subtree undamaged and the old colour on screen.
+            Node::Ink { colour, .. } => Fingerprint::Ink(*colour),
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
     }

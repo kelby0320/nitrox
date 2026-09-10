@@ -4432,7 +4432,22 @@ Multiple outputs, USB HID, dynamic linking and the process-memory-model bundle, 
 any kind. Each is tracked in [`phase-4-desktop.md`](phase-4-desktop.md) or
 `deferred-decisions.md`.
 
-## Milestone 14 — the applications, and what a menu is
+## Milestone 14 — the applications, and what a menu is ✅ complete (2026-09-09)
+
+**Nine parts, built F, H, A, B, C, D, E, I, G**, over six days. Two of them were not on the
+original list: **H** split out of F when costing showed desktop entries cross the namespace, and
+**I** split out of E because "the scroll wheel" reads like a terminal feature and is a vertical
+slice through the input path plus a wire-format change.
+
+**One box below is unticked and stays that way.** `nxedit`'s chooser has no `Ctrl+H`, which is
+`TODO(chooser-hidden)` — a filed deferral with a trigger, not work this milestone owes. Three
+other deferrals were *closed* by it: `press-time`, `scroll-grab` and the wheel's own.
+
+**The list was wrong about the code five times**, always in the direction of claiming something
+missing that existed — a delete confirmation, an unsaved-changes prompt, `mtime` in `libfs`, a
+menu-bar widget, and key repeat reaching a widget. Each was found by reading the code before
+building, which is why "check the boxes against the source before starting a part" became the
+habit partway through.
 
 Named 2026-09-03, from the maintainer's own list after living with M13's desktop. **The north
 star is stated as a comparison**, which is the useful kind: nxterm, nxedit and nxfiles should be
@@ -5014,7 +5029,7 @@ plausibly bears on it, and the change that would (a compositor that re-sends a m
 is known-bad: PR #280 tried it and broke the drag step three runs out of three. The entry's
 trigger stands.
 
-### Part G — syntax highlighting
+### Part G — syntax highlighting ✅ complete (2026-09-09)
 
 Wanted as a stretch on 2026-09-03 and **promoted the same day**, when costing it turned up a
 premise that was wrong in the direction that makes it cheaper.
@@ -5036,7 +5051,7 @@ not survive reading `nxsh::lex`:
 like", over text that is not a program yet.** They are different jobs, and the second one has to be
 total over garbage.
 
-- [ ] **One tolerant, table-driven scanner** — the shape small editors use. A language is a table:
+- [x] **One tolerant, table-driven scanner** ✅ — the shape small editors use. A language is a table:
       line-comment markers, block-comment delimiters, string rules (delimiter, escape, whether it
       spans lines), a keyword list, whether numbers are lexed. One scanner drives all of them and
       is total by construction: an unterminated string simply runs to the end and is coloured as a
@@ -5045,7 +5060,7 @@ total over garbage.
       **The cost that matters is that it is paid once.** The scanner is the work; a language after
       it is a table.
 
-- [ ] **The languages this system actually contains**, rather than a generic list: **nxsh**,
+- [x] **The languages this system actually contains** ✅, rather than a generic list: **nxsh**,
       **TOML** (`init.toml`, `services.toml`, `theme.toml`, every profile manifest), **Markdown**
       (every document in `docs/`), and **Rust**. Anything else, and any file with no extension, is
       plain text — which is a supported answer rather than a gap.
@@ -5056,29 +5071,57 @@ total over garbage.
       and a fence is the same multi-line state block comments already need — but if it starts
       bending the table into a general grammar, Markdown goes and the other three stay.
 
-- [ ] **A file's language comes from its extension**, which forces a decision this repository has
+- [x] **A file's language comes from its extension** ✅, which forced a decision this repository had
       been deferring: `docs/spec/shell-language.md` says in as many words that `.nx` is "a
       placeholder, not a real decision". Highlighting cannot dispatch on a placeholder, so this
       part settles it — deliberately, in the spec, rather than by whatever string the first `match`
       arm happens to contain.
 
-- [ ] **Token colours live in `Theme`**, and this is the one place M11's "not a colour of its own"
+- [x] **Token colours live in `Theme`** ✅, and this is the one place M11's "not a colour of its own"
       rule genuinely does not apply: a keyword and a comment are not derivable from a window's
       ground and its ink. Six or so entries with defaults in `Theme::light()`, which also means a
       `theme.toml` can change them the day anyone wants to.
 
-- [ ] **The text area renders styled runs.** The enabling half, and the one worth building even if
+- [x] **The text area renders styled runs** ✅. The enabling half, and the one worth building even if
       every language were dropped. `text_area` already splits each line into pieces to place the
       selection and the caret, so "a line is a sequence of runs" exists; what does not is a colour
       on one — `Node::Text` carries only a `String`. So an ink wrapper that `paint::draw` threads
       through its subtree, and the highlight's split points merged into the ones the widget already
       computes.
 
-- [ ] **Multi-line constructs are the fiddly part, and the only one.** A block comment or a fenced
+- [x] **Multi-line constructs are the fiddly part, and the only one** ✅. A block comment or a fenced
       code block makes line *N*'s colours depend on where line *N−1* ended. So a start-state is
       cached per line, and an edit re-scans downward until the computed state matches the cached
       one. Getting this wrong is how colours go stale above or below an edit — the failure mode to
       write a test for rather than to look for by eye.
+
+      **Two things that had to be right, and each has a control that fails without it.** The
+      rescan starts at or *above* the edit: `update` takes the minimum of the cursor's line
+      before and after, because an insertion runs from where the cursor was to where it ended
+      up, a deleted selection leaves the cursor at its start, and an undo moves it to where the
+      edit being undone began. And the **early exit is off when the line count changed**, since
+      `starts` is indexed by line: inserting one shifts every entry below it, so "the state here
+      already matches" compares against a different line's state, exits on the first line, and
+      leaves everything below wearing the colours of the line that used to be there.
+
+      **Only the start states are cached; the runs are recomputed for the visible lines every
+      frame.** That is what makes a stale colour impossible rather than merely unlikely — a run
+      is derived from the line's text as it is now, so the worst a stale cache can do is start a
+      line in the wrong state, which is the one thing the rescan maintains.
+
+**What the scanner deliberately does not do.** Rust character literals are not coloured, because
+the same quote opens a lifetime and `&'static str` would otherwise open a string running to the
+end of the line — telling those apart needs a grammar. Markdown emphasis is not coloured, for the
+same reason one level down: `*` pairs across a line are a grammar, and that is exactly where the
+table would have started bending into one. Markdown was named in this plan as the drop candidate
+if it stretched the table; it did not, because a line prefix and a fence were rules the table
+already needed.
+
+**The one toolkit change was worth having on its own.** Before this, every glyph `libui` drew was
+`theme.foreground` — `Node::Text` carried only a `String`. `Node::Ink` is a wrapper that changes
+no geometry and colours its whole subtree, innermost-wins, so a selected keyword keeps its colour
+under the highlight. That composition is in `check-display`'s reference picture now, which makes
+it the only check on the ink path that compares pixels rather than a tree.
 
 ### What M14 is not
 

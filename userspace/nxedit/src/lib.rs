@@ -25,6 +25,8 @@
 
 extern crate alloc;
 
+pub mod syntax;
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -41,7 +43,7 @@ use libui::element::{
     with_spacing,
 };
 use libui::widget::{
-    GRIP_W, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
+    GRIP_W, InkRun, TAB_STRIP_H, Theme as UiTheme, TITLE_BAR_H, TextAreaState, TextFieldState,
     TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, resize_grip, tab_strip,
     text_area, text_field, title_bar, window_frame,
 };
@@ -282,6 +284,31 @@ pub struct Buffer {
     saved_at: u64,
     /// Why this buffer may not be written, or `None` when it may.
     blocked: Option<String>,
+    /// The language this buffer's **name** implies, or `None` for plain text.
+    ///
+    /// Named by [`App::language_name`] for the receipt the binary prints.
+    ///
+    /// Settled when the buffer is named — at open, and again when Save As renames it — because
+    /// that is when it can change. Rescanning on a rename is what makes `Save As … .md` colour
+    /// the text without reopening it.
+    lang: Option<syntax::Language>,
+    /// What was open at the start of each line: the scanner's state, cached per line.
+    ///
+    /// **The whole of the multi-line problem.** A block comment or a fenced block makes line
+    /// *N*'s colours depend on where line *N−1* ended, so a line cannot be scanned alone — and
+    /// scanning from the top of the file on every frame is O(file) per keystroke. This is the
+    /// small half that is cached; the *runs* are recomputed for the visible lines each frame,
+    /// which is what keeps them from ever being stale.
+    starts: alloc::vec::Vec<syntax::State>,
+    /// The revision [`starts`](Self::starts) was computed for.
+    scanned_at: u64,
+    /// The lowest line an edit has touched since the last scan.
+    ///
+    /// **The rescan cannot start below this**, and it cannot early-exit above it: an edit
+    /// changes the state entering every line *after* it, so a scan that stopped at the first
+    /// matching state before reaching the edit would stop immediately and leave every colour
+    /// below it stale. `usize::MAX` means nothing has been touched.
+    dirty_from: usize,
     /// The buffer did not match the file the moment it was read.
     ///
     /// **Because reading is not always lossless.** `TextAreaState::with_text` drops a `\r` from
@@ -608,6 +635,25 @@ pub enum Msg {
     Paste,
 }
 
+/// What a token kind is drawn in.
+///
+/// **The one place this application maps meaning onto a colour**, and the reason `libui` is
+/// handed colours rather than kinds: a toolkit that took kinds would have to know what a
+/// keyword is, and `Theme` would have to carry a table indexed by an enum belonging to one
+/// application. [`syntax::Kind::Plain`] never reaches here — it is not emitted as a run.
+fn colour_of(kind: syntax::Kind, theme: &UiTheme) -> libdraw::format::Rgb {
+    match kind {
+        syntax::Kind::Keyword => theme.syntax_keyword,
+        syntax::Kind::Str => theme.syntax_string,
+        syntax::Kind::Comment => theme.syntax_comment,
+        syntax::Kind::Number => theme.syntax_number,
+        syntax::Kind::Heading => theme.syntax_heading,
+        syntax::Kind::Variable => theme.syntax_variable,
+        // Plain text is the theme's foreground, which the widget draws without being told.
+        syntax::Kind::Plain => theme.foreground,
+    }
+}
+
 impl Buffer {
     /// A buffer for `path`, empty until something is loaded into it.
     fn new(key: u64, path: &str) -> Buffer {
@@ -619,6 +665,57 @@ impl Buffer {
             saved_at: 0,
             blocked: None,
             differs: false,
+            lang: syntax::for_name(libfs::basename_str(path)),
+            starts: alloc::vec::Vec::new(),
+            scanned_at: u64::MAX,
+            dirty_from: 0,
+        }
+    }
+
+    /// Bring [`starts`](Self::starts) up to date with the text, if it is not already.
+    ///
+    /// **Downward from the edit until the state matches what was cached**, which is the whole
+    /// of the incremental part: typing inside a string re-scans to the end of that string and
+    /// stops, rather than to the end of the file.
+    ///
+    /// **Except when the line count changed**, where the early exit is unsound: inserting a line
+    /// shifts every cached entry below it, so a "match" is a comparison against a *different*
+    /// line's state. Then it runs to the end, which is a paste or a newline rather than a
+    /// keystroke.
+    fn rescan(&mut self) {
+        let rev = self.text.revision();
+        if self.scanned_at == rev {
+            return;
+        }
+        self.scanned_at = rev;
+        let Some(lang) = self.lang else {
+            self.starts.clear();
+            self.dirty_from = usize::MAX;
+            return;
+        };
+        let lines = self.text.lines();
+        let n = lines.len();
+        let count_changed = self.starts.len() != n;
+        self.starts.resize(n, syntax::State::Normal);
+        // **An edit nobody located means the whole buffer, exit and all.** `usize::MAX` is
+        // "nothing was touched", so reaching it with a changed revision means somebody edited
+        // without saying where — and the answer has to be the *safe* one rather than the cheap
+        // one. Clamping it into range names the **last** line, which re-derives a single state
+        // and leaves every one above it stale; starting at zero is no better on its own,
+        // because the early exit then fires on line 0 for any edit further down. Both are
+        // needed, which is why `unknown` also suppresses the exit below (PR #289 review,
+        // blocking 1: `pasted` was such a path for the whole of Part G).
+        let unknown = self.dirty_from == usize::MAX;
+        let from = if unknown { 0 } else { self.dirty_from.min(n.saturating_sub(1)) };
+        self.dirty_from = usize::MAX;
+        let mut st = if from == 0 { syntax::State::Normal } else { self.starts[from] };
+        for i in from..n {
+            self.starts[i] = st;
+            let (_, next) = syntax::scan(&lang, &lines[i], st);
+            st = next;
+            if !count_changed && !unknown && i + 1 < n && self.starts[i + 1] == st {
+                return;
+            }
         }
     }
 
@@ -752,6 +849,14 @@ impl App {
     pub fn loaded(&mut self, text: &str, raw: &[u8]) {
         let b = self.buf_mut();
         b.text = TextAreaState::with_text(text);
+        // A whole new buffer, so everything below line 0 is unscanned. **`starts` is cleared
+        // as well as invalidated**: leaving the old file's states in place with the same length
+        // as the new one would let the early exit compare against them and return on line 0
+        // (PR #289 review, optional 5 — latent today, since this only ever runs on a fresh
+        // buffer, and one line to close).
+        b.starts.clear();
+        b.dirty_from = 0;
+        b.scanned_at = u64::MAX;
         b.saved_at = b.text.revision();
         b.blocked = None;
         b.differs = to_bytes(&b.text.text()) != raw;
@@ -889,6 +994,10 @@ impl App {
     pub fn pasted(&mut self, text: &str, index: u32, serial: u64) {
         let buffer = self.current;
         let (from, to) = self.buf_mut().text.insert_text(text);
+        // **A paste is an edit that never passed through `update`**, so it reports its own
+        // position — see [`Buffer::dirty_from`]. `Msg::Paste` only asks the clipboard; this is
+        // called when the answer arrives (PR #289 review, blocking 1).
+        self.edited_at(from.0);
         self.cycling = Some(Cycling { buffer, from, to, index, serial });
         self.status = String::from("pasted");
     }
@@ -906,6 +1015,9 @@ impl App {
         }
         self.buf_mut().text.select_range(c.from, c.to);
         let (from, to) = self.buf_mut().text.insert_text(text);
+        // The replaced range starts where the previous paste did, which is at or above where
+        // this one starts.
+        self.edited_at(c.from.0.min(from.0));
         self.cycling = Some(Cycling { buffer: c.buffer, from, to, index, serial });
         self.status = String::from("pasted the one before");
     }
@@ -982,6 +1094,36 @@ impl App {
 
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
+        // **Where an edit landed, recorded here rather than by the toolkit** (M14 Part G). The
+        // highlighter needs the lowest line a change touched, and the cursor's line before and
+        // after bracket every edit this application can make: an insertion runs from where the
+        // cursor was to where it ended up, a deleted selection leaves the cursor at its start,
+        // and an undo moves it to where the edit being undone began. The minimum of the two is
+        // therefore at or above the first line whose colours can have changed.
+        //
+        // **Outside the match**, so a message added later cannot forget to do it.
+        let was = (self.current, self.buf().text.cursor().0, self.buf().text.revision());
+        self.dispatch(msg);
+        if self.current == was.0 && self.buf().text.revision() != was.2 {
+            let now = self.buf().text.cursor().0;
+            let from = was.1.min(now);
+            let b = self.buf_mut();
+            b.dirty_from = b.dirty_from.min(from);
+        }
+    }
+
+    /// Record that an edit touched line `from`, so the next scan starts at or above it.
+    ///
+    /// **For the paths that do not go through [`update`](Self::update)** — a clipboard answer
+    /// arrives from the binary rather than as a message, so the bracket `update` computes never
+    /// sees it.
+    fn edited_at(&mut self, from: usize) {
+        let b = self.buf_mut();
+        b.dirty_from = b.dirty_from.min(from);
+    }
+
+    /// The body of [`update`](Self::update). See there for what wraps it.
+    fn dispatch(&mut self, msg: Msg) {
         // **Every message that is not a key is an action, and an action ends a cycle** — see
         // `key`, which handles its own case because one key is the exception. Switching tabs,
         // saving, and closing a dialog are all "something else happened".
@@ -1478,6 +1620,44 @@ impl App {
         .on_wheel(Msg::ChooserWheel)
     }
 
+    /// The coloured runs of the lines that are on screen.
+    ///
+    /// **The runs are recomputed every frame and only the start states are cached**, which is
+    /// what makes a stale colour impossible: a run is derived from the line's text *as it is
+    /// now*, so the worst a stale cache can do is start a line in the wrong state, and that is
+    /// the one thing [`Buffer::rescan`] maintains. Caching runs instead would mean holding a
+    /// `Vec` per line of the file to save scanning the forty that are visible.
+    fn ink(&mut self, theme: &UiTheme, visible: usize) -> Vec<InkRun> {
+        self.buf_mut().text.ensure_visible(visible);
+        self.buf_mut().rescan();
+        let b = self.buf();
+        let Some(lang) = b.lang else {
+            return Vec::new();
+        };
+        let lines = b.text.lines();
+        let mut out = Vec::new();
+        for i in b.text.offset()..(b.text.offset() + visible).min(lines.len()) {
+            let start = b.starts.get(i).copied().unwrap_or_default();
+            let (runs, _) = syntax::scan(&lang, &lines[i], start);
+            out.extend(runs.iter().map(|r| InkRun {
+                line: i,
+                start: r.start,
+                end: r.end,
+                colour: colour_of(r.kind, theme),
+            }));
+        }
+        out
+    }
+
+    /// What the current buffer is being highlighted as, for a receipt.
+    ///
+    /// **A name rather than a boolean**, because the interesting failure is not "highlighting
+    /// off" but "highlighted as the wrong thing" — a `.toml` read as Markdown colours nothing
+    /// and looks exactly like a scanner that never ran.
+    pub fn language_name(&self) -> &'static str {
+        syntax::name_of(self.buf().lang)
+    }
+
     /// The open menu's popup, framed — the root of a second window, not a layer in this one.
     pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let menus = self.menu_table();
@@ -1672,6 +1852,13 @@ impl App {
         let name = String::from(libfs::basename_str(path));
         let b = self.buf_mut();
         b.path = String::from(path);
+        // **The language is settled by the name, so a rename re-settles it.** Saving an untitled
+        // buffer as `notes.md` colours it without reopening the file, which is what a person
+        // naming a file expects to see happen.
+        b.lang = syntax::for_name(&name);
+        b.starts.clear();
+        b.dirty_from = 0;
+        b.scanned_at = u64::MAX;
         b.name = name;
         let key = b.key;
         self.save_requested = Some(key);
@@ -1900,6 +2087,12 @@ impl App {
         );
 
         let h = self.area_h();
+        // **Before the widget is built, and against the same window it will draw.** `text_area`
+        // scrolls the state to follow the cursor as its first act, so runs computed from the
+        // offset as it stands now would be for a different set of lines whenever a keystroke
+        // moved the view. Calling it here settles the offset first; the widget's own call then
+        // finds nothing to do.
+        let ink = self.ink(&ui, (h / ROW_H) as usize);
         // **The text area takes drops; the chrome does not.** That distinction is the whole of
         // what decision 3 buys — the compositor knows only that this window declared an
         // acceptor, and *where* on the window a drop means something is decided here, by which
@@ -1907,7 +2100,8 @@ impl App {
         // the honest answer: the title bar is not where a document goes.
         let focused = self.focused;
         let area =
-            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ui).on_drop(Msg::Dropped);
+            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, &ui)
+                .on_drop(Msg::Dropped);
 
         let body = window_frame(
             title,
@@ -2104,6 +2298,239 @@ mod tests {
     const KEY_X: u16 = 45;
     /// `1` — the key that tells a swallowed chord from an unprintable one.
     const KEY_1: u16 = 2;
+
+    // ---- syntax highlighting (M14 Part G) ----
+
+    /// An editor holding `text` from a file called `name`.
+    fn coloured(name: &str, text: &str) -> App {
+        let mut a = App::new(&alloc::format!("/home/{name}"), "/home");
+        a.loaded(text, text.as_bytes());
+        a
+    }
+
+    /// Type `text`, reaching for shift when a character needs it.
+    ///
+    /// `type_into` presses unshifted keys only, which cannot spell `/*`.
+    fn type_shifted(a: &mut App, text: &str) {
+        for want in text.bytes() {
+            let (code, mods) = (1u16..=90)
+                .find_map(|c| match libinput::keymap::to_char(c, 0) {
+                    Some(got) if got == want => Some((c, 0)),
+                    _ => match libinput::keymap::to_char(c, MOD_SHIFT) {
+                        Some(got) if got == want => Some((c, MOD_SHIFT)),
+                        _ => None,
+                    },
+                })
+                .unwrap_or_else(|| panic!("no keycode types {:?}", want as char));
+            key(a, code, mods);
+        }
+    }
+
+    /// The runs the current buffer would draw, as `(line, text, colour)`.
+    fn ink_of(a: &mut App) -> Vec<(usize, String, libdraw::format::Rgb)> {
+        let ui = UiTheme::default();
+        let lines: Vec<String> = a.buf().text.lines().to_vec();
+        a.ink(&ui, 40)
+            .iter()
+            .map(|r| (r.line, String::from(&lines[r.line][r.start..r.end]), r.colour))
+            .collect()
+    }
+
+    #[test]
+    fn a_files_extension_decides_what_it_is_coloured_as() {
+        let ui = UiTheme::default();
+        let mut a = coloured("init.toml", "[server]\nport = 80 # here\n");
+        assert_eq!(a.language_name(), "toml");
+        assert_eq!(
+            ink_of(&mut a),
+            alloc::vec![
+                (0, String::from("[server]"), ui.syntax_heading),
+                (1, String::from("80"), ui.syntax_number),
+                (1, String::from("# here"), ui.syntax_comment),
+            ]
+        );
+
+        // A name this system knows nothing about is plain text, which is an answer rather than
+        // a gap: no runs at all, and the widget draws one colour.
+        let mut a = coloured("notes.txt", "[server]\nport = 80\n");
+        assert_eq!(a.language_name(), "plain");
+        assert!(ink_of(&mut a).is_empty());
+    }
+
+    /// Naming a buffer settles its language — the Save As path.
+    #[test]
+    fn saving_under_a_new_name_recolours_the_buffer() {
+        let mut a = coloured("untitled", "# a heading\n");
+        assert!(ink_of(&mut a).is_empty(), "an unknown name colours nothing");
+
+        a.adopt_path("/home/notes.md");
+        assert_eq!(a.language_name(), "markdown");
+        assert_eq!(
+            ink_of(&mut a),
+            alloc::vec![(0, String::from("# a heading"), UiTheme::default().syntax_heading)],
+            "the rename did not re-settle the language"
+        );
+    }
+
+    /// An edit above a block comment recolours the lines **below** it.
+    ///
+    /// **The failure the plan named**: colours going stale below an edit is what a per-line
+    /// cache gets wrong, and it is invisible unless a test asks. Opening a comment on line 0
+    /// must turn lines 1 and 2 into comment, and closing it again must turn them back —
+    /// neither line was touched by the keystroke.
+    #[test]
+    fn opening_a_block_comment_recolours_the_lines_below_the_edit() {
+        let ui = UiTheme::default();
+        let mut a = coloured("lib.rs", "\nlet a = 1;\nlet b = 2;\n");
+        let keywords = |a: &mut App| {
+            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
+        };
+        assert_eq!(keywords(&mut a), 2, "precondition: two `let`s are coloured");
+
+        // Type `/*` at the very start, which is where the cursor is.
+        type_shifted(&mut a, "/*");
+        assert_eq!(keywords(&mut a), 0, "the lines below the edit are still code");
+        let runs = ink_of(&mut a);
+        assert!(
+            runs.iter().all(|(_, _, c)| *c == ui.syntax_comment),
+            "everything below an open block comment is a comment: {runs:?}"
+        );
+        assert_eq!(runs.len(), 3, "one run per line, each the whole line");
+
+        // …and closing it puts them back, which is the same staleness in the other direction.
+        type_shifted(&mut a, "*/");
+        assert_eq!(keywords(&mut a), 2, "closing the comment left the lines below stale");
+    }
+
+    /// The rescan starts at or **above** the edit, even when the cursor ends up below it.
+    ///
+    /// **The case a "rescan from the cursor's line" rule gets wrong**, and the reason `update`
+    /// takes the minimum of the cursor before and after. Pressing Enter leaves the cursor on the
+    /// *new* line — one below the line that was split — so a rescan starting there would begin
+    /// from a cached state belonging to a line that has since moved down, and read the whole of
+    /// the shifted line as a string.
+    #[test]
+    fn a_newline_rescans_from_the_line_that_was_split_not_from_the_cursor() {
+        let ui = UiTheme::default();
+        // A Rust string that spans lines, so there is a state to get wrong.
+        let mut a = coloured("lib.rs", "let a = \"x\ny\";\n");
+        assert_eq!(
+            ink_of(&mut a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count(),
+            1,
+            "precondition: `let` is coloured and the string runs to the next line"
+        );
+
+        // Enter at the very start: every line moves down one, and the cursor ends on line 1.
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(a.buf().text.cursor().0, 1, "precondition: the cursor is below the split");
+        let runs = ink_of(&mut a);
+        assert!(
+            runs.iter().any(|(l, t, c)| *l == 1 && t == "let" && *c == ui.syntax_keyword),
+            "the line that moved down was scanned from a stale state: {runs:?}"
+        );
+    }
+
+    /// A paste recolours the lines below it, exactly as typing the same bytes does.
+    ///
+    /// **A paste does not go through `update`.** `Msg::Paste` only asks the clipboard; the
+    /// binary calls [`App::pasted`] when the answer arrives, so the bookkeeping `update` does
+    /// for every message is skipped — and `dirty_from` left at its "nothing was touched" value
+    /// clamps to the *last* line, which re-derives one line and leaves every state above it as
+    /// it was before the pasted text existed. Both `let`s stayed coloured under an open block
+    /// comment, permanently: `rescan` records the revision either way, so nothing later put it
+    /// right (PR #289 review, blocking 1).
+    ///
+    /// **Typing the same two bytes is the control**, and it passed throughout — which is the
+    /// asymmetry the test above cannot see.
+    #[test]
+    fn a_pasted_block_comment_recolours_the_lines_below_it() {
+        let ui = UiTheme::default();
+        let keywords = |a: &mut App| {
+            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
+        };
+        let mut a = coloured("lib.rs", "let a = 1;\nlet b = 2;\n");
+        assert_eq!(keywords(&mut a), 2, "precondition: a frame has been drawn");
+
+        a.pasted("/*\n", 0, 1);
+        assert_eq!(
+            keywords(&mut a),
+            0,
+            "the lines below the paste kept the colours they had before it"
+        );
+
+        // **A paste that adds no line, below the top**, which is the case the fallback alone
+        // cannot answer: with the line count unchanged the scan may exit at the first state
+        // that matches, and starting from line 0 it matches immediately — so the edit is never
+        // reached. This is what makes `pasted` reporting its own position load-bearing rather
+        // than merely an optimisation.
+        // The pasted line carries no keyword of its own, so what the assertion sees is the
+        // line *below* it — which is the only place the staleness shows.
+        let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
+        assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
+        press_key(&mut a, libkern::abi::KEY_DOWN);
+        a.pasted("/*", 0, 1);
+        assert_eq!(keywords(&mut a), 1, "only `fn`, above the comment, is still a keyword");
+
+        // …and cycling the ring to another entry is the same path, with the same hole.
+        let mut a = coloured("lib.rs", "let a = 1;\nlet b = 2;\n");
+        assert_eq!(keywords(&mut a), 2);
+        a.pasted("//\n", 0, 1);
+        assert_eq!(keywords(&mut a), 2, "a line comment leaves the lines below it alone");
+        a.cycled("/*\n", 1, 2);
+        assert_eq!(keywords(&mut a), 0, "the cycled paste did not recolour below itself");
+    }
+
+    /// An edit that reports nothing still recolours correctly — slowly, rather than wrongly.
+    ///
+    /// **The contract that makes the next bypass a performance bug instead of a silent one.**
+    /// `pasted` was exactly such a path for the whole of Part G: it edits the buffer without
+    /// going through `update`, so `dirty_from` stayed at "nothing was touched" and the rescan
+    /// re-derived the last line only. This reaches into the buffer the same way, and asserts
+    /// the colours below the edit are right anyway.
+    ///
+    /// **Both halves of the fallback are needed and this needs both**: starting at line 0 is
+    /// not enough on its own, because the early exit fires on line 0 for an edit further down.
+    #[test]
+    fn an_edit_that_says_nothing_about_where_it_landed_still_recolours_below_itself() {
+        let ui = UiTheme::default();
+        let keywords = |a: &mut App| {
+            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
+        };
+        let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
+        assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
+
+        // Straight into the state, naming no line and changing none of the count.
+        a.buf_mut().text.select_range((1, 0), (1, 0));
+        a.buf_mut().text.insert_text("/*");
+        assert_eq!(keywords(&mut a), 1, "the lines below an unreported edit went stale");
+    }
+
+    /// Inserting a line above a block comment does not leave the cache one line out of step.
+    ///
+    /// **The early exit is unsound when the line count changed**, which is what the guard on it
+    /// is for: `starts` is indexed by line, so inserting a line shifts every entry below the
+    /// insertion and a "the state here already matches" comparison is then against a *different
+    /// line's* state. It exits on the first line and everything below keeps the colours of the
+    /// line that used to be there.
+    ///
+    /// The closer is what makes it visible: `*/` inside a block comment is a comment, and `*/`
+    /// outside one is not anything at all.
+    #[test]
+    fn inserting_a_line_above_a_block_comment_does_not_shift_the_cache_under_it() {
+        let ui = UiTheme::default();
+        let mut a = coloured("lib.rs", "let a = 1;\n/*\nstill\n*/\n");
+        let closer = |a: &mut App| {
+            ink_of(a).iter().filter(|(_, t, c)| t == "*/" && *c == ui.syntax_comment).count()
+        };
+        assert_eq!(closer(&mut a), 1, "precondition: the closer is part of the comment");
+
+        press_key(&mut a, libkern::abi::KEY_ENTER);
+        assert_eq!(
+            closer(&mut a),
+            1,
+            "the cache was read one line out of step, so the comment's closer fell outside it"
+        );
+    }
 
     #[test]
     fn a_failed_save_keeps_the_buffer_and_says_so() {

@@ -56,6 +56,12 @@ the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file
 | `track` | `"#RRGGBB"` | A scrollbar's groove, and a list's ground |
 | `thumb` | `"#RRGGBB"` | A scrollbar's thumb |
 | `selection` | `"#RRGGBB"` | Behind selected text |
+| `syntax_keyword` | `"#RRGGBB"` | A language's reserved words, and TOML's `true`/`false` |
+| `syntax_string` | `"#RRGGBB"` | String literals, Markdown code spans and fenced blocks |
+| `syntax_comment` | `"#RRGGBB"` | Comments, and Markdown block quotes |
+| `syntax_number` | `"#RRGGBB"` | Numeric literals |
+| `syntax_heading` | `"#RRGGBB"` | A Markdown heading, a TOML `[table]` header |
+| `syntax_variable` | `"#RRGGBB"` | A shell variable — `$name` and `${name}` |
 | `title_active` | `"#RRGGBB"` | A title bar whose window holds the keyboard |
 | `title_inactive` | `"#RRGGBB"` | A title bar whose window does not |
 | `cursor_body` | `"#RRGGBB"` | The pointer's fill |
@@ -69,6 +75,13 @@ the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file
 | `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
 | `wallpaper` | `"/path"` or `""` | A PNG to draw behind everything. Empty means none |
 | `wallpaper_mode` | `"fit"` | How it is placed when it is not the screen's size |
+
+**The six `syntax_*` keys are the one place a colour is not derived from a surface** (M14
+Part G). Every other key here is a ground or its ink, and a widget wanting a third was told to
+derive one; a keyword and a comment cannot be derived from a window's ground, because what they
+encode is meaning rather than depth. They are read by whatever highlights text — today
+`nxedit` — and ignored by everything else, so a theme that omits them is a theme with the
+shipped scheme, like any other omitted key.
 
 **Two fonts because a grid is not a label** (M11 Part D). Everything the toolkit draws takes
 `font_ui`; `nxterm`'s grid takes `font_mono`, and `nxterm` is the one program that loads both —

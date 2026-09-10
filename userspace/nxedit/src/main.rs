@@ -83,12 +83,17 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
         Ok(bytes) => match core::str::from_utf8(&bytes) {
             Ok(text) => {
                 app.loaded(text, &bytes);
+                // **The language is on this line rather than one of its own** (M14 Part G), so
+                // a gate that already waits for the open learns it for free — and the receipt a
+                // person reads in a log says what the editor decided a file *is*. Appended, so
+                // every expectation matching the prefix goes on matching.
                 libkern::debug::Line::new()
                     .s(b"nxedit: opened ")
                     .untrusted(path.as_bytes())
                     .s(b" - ")
                     .u(bytes.len() as u64)
-                    .s(b" bytes")
+                    .s(b" bytes, highlighted as ")
+                    .s(app.language_name().as_bytes())
                     .end();
             }
             // **Refused rather than mangled.** A lossy conversion would show a file that is not
