@@ -1429,15 +1429,66 @@ Gated on the console/tty server + compositor terminal (later in Phase 4). Covers
 Shift-Enter continuation (needs a key-event channel), job control's `fg`/`&`, schema-aware
 completion, and the prompt's live `PipelineStatus` glyph. Tracked but out of this subproject.
 **Partly delivered ahead of schedule** (2026-08-03): the console/tty server landed, and with it raw
-mode, history recall and reverse-search. What remains gated is completion (needs schema work),
-Shift-Enter (needs a key-event channel), and job control (needs process groups — and, as Milestone
-4 Part G found, a terminate syscall).
+mode, history recall and reverse-search. What remains gated is **schema-aware** completion (needs
+schema work), Shift-Enter (needs a key-event channel), and job control (needs process groups — and,
+as Milestone 4 Part G found, a terminate syscall).
+
+**"Completion" was too broad here, and reading it as written is what kept the baseline waiting.**
+§11c splits it: command names and file paths need nothing this shell does not have, while
+schema-aware *field* completion is the half that needs a pipeline's shape known statically. The
+baseline is Milestone 5 Part B below; only the field half is still gated.
 
 ### Explicitly out of scope (design §10a/§13, carried forward)
 
 Process management (`ps`/`kill` — needs the "how does a command acquire a capability handle to a
 process it didn't spawn" design pass), networking tools (netstack deferred), user-definable aliases
 with baked-in arguments, package system beyond single-file `use`, circular-import resolution.
+
+### Milestone 5 — what using it asked for (2026-09-10)
+
+**Both items came from the maintainer using the shell**, which is where the last three parts of the
+display arm's M15 came from too. Neither is a gap in the design: §11c specified tab completion and
+§5b specified calls with parenthesised arguments. Both are places the *implementation* stopped
+short of what the design already said, and neither was visible from inside the test suite.
+
+- [x] **Part A — a call is an expression wherever an expression is** ✅ (2026-09-10).
+      `let x = age_plus_n(my_age(), 3)` did not parse. The deferral (`shell-nested-call`) named two
+      independent causes and prescribed a fix for each; there was **one** cause and neither fix was
+      needed. `paren_args` must see the token *after* an identifier to tell `f(name: v)` from
+      `f(name.field)` — one more than the lexer caches — so it consumed the identifier and resumed
+      in a hand-written copy of the expression tiers.
+
+      **Everything wrong followed from the copy existing.** It had no `(` arm, which is both
+      reported shapes; and its binary tier folded flat, which nobody had found:
+      `format("{}", a + b * c)` was `(a + b) * c` while the same expression anywhere else was not.
+      Silently wrong arithmetic, reachable from any argument list whose argument begins with a name.
+
+      The fix is a **rewind**: `Lexer` is `Clone`, `paren_args` marks, looks for the `:`, and puts
+      the lexer back if there is none. An argument is then parsed by `expr` like every other
+      expression, and 82 lines go. **Cloning the whole lexer rather than a chosen subset is the
+      load-bearing part** — a hand-picked snapshot is what goes stale when the struct gains a
+      field, and it would fail as a mis-parse rather than as a compile error.
+
+- [ ] **Part B — completion, the half that is not the terminal.** §11c's baseline is "command names
+      across all four categories (§3), file paths". Command position and argument position are
+      decided lexically from the line and the cursor, the way every shell does it; candidates come
+      from the four name tables plus what the `Host` can list. Pure, and host-tested — the point of
+      the `Host` seam is that "what is in `/bin`" is a question a `MockHost` can answer.
+
+      **What is still gated is the *schema-aware* half** (`filter siz<TAB>` → `size`), which is
+      what needs a pipeline's shape known statically. The plan's own closing section says
+      "completion (needs schema work)" without that qualifier, which reads as though the baseline
+      were gated too; it is not, and never was.
+
+- [ ] **Part C — completion, the terminal half.** Tab is intercepted in the REPL's key loop the way
+      `Ctrl-R` already is, before the discipline sees it. One candidate completes; several insert
+      the longest common prefix, and print the list if that adds nothing. Listing needs no cursor
+      addressing — a newline, the names, the prompt, the line again — which is why this does not
+      wait on the terminal capability `history-pager` waits on.
+
+- [ ] **Part D — the gate.** `test-interactive` presses Tab at a real prompt and checks what comes
+      back. The console loop is the part `nxsh`'s host tests structurally cannot reach, and that
+      gate is the answer this repo already chose for it (`nxsh-console-tests`, resolved 2026-08-03).
 
 ---
 

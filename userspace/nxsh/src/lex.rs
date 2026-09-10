@@ -234,6 +234,15 @@ type Result<T> = core::result::Result<T, LexError>;
 /// One token of lookahead is cached. If it is asked for again in a *different* mode it is
 /// re-lexed from its own start offset, which is why [`pending_start`](Self::pending_start)
 /// is kept — re-lexing has to be exact, not approximate.
+///
+/// **`Clone` is the parser's second token of lookahead.** One place needs to see the token
+/// *after* an identifier before deciding what the identifier is — `f(name: v)` against
+/// `f(name.field)` — and cloning the whole lexer, looking, and putting it back is exact by
+/// construction. A hand-picked snapshot of "the fields that matter" would be the thing that
+/// goes stale the next time this struct gains a field, and the failure would be a
+/// mis-parse rather than a compile error. The clone costs at most one cached token and
+/// happens once per argument that begins with a name.
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a [u8],
     /// Offset just past the cached token, or the scan position when nothing is cached.

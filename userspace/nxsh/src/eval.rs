@@ -3716,6 +3716,42 @@ x"), "5");
         Ok(last.map(|s| alloc::string::String::from(s.trim_end())))
     }
 
+    /// A call in an argument list is **evaluated**, which is what the report was about.
+    ///
+    /// "`let x = age_plus_n(my_age(), 3)` won't compile because `my_age()` isn't
+    /// evaluated." It parses now, and this is the other half: the inner call runs, its
+    /// value becomes the outer call's argument, and the answer is 44 rather than a
+    /// function object or a name.
+    #[test]
+    fn a_call_in_an_argument_list_is_evaluated() {
+        let out = repl(&[
+            "def my_age() { 41 }",
+            "def age_plus_n(a, n) { a + n }",
+            "let x = age_plus_n(my_age(), 3)",
+            "x",
+        ])
+        .expect("the report's own script should run");
+        assert_eq!(out.as_deref(), Some("44"));
+
+        // Nested into an operator, and two deep, so the argument is not merely passed
+        // along unevaluated to something that would have called it anyway.
+        let out = repl(&["def double(n) { n * 2 }", "format(\"n={}\", double(double(3)))"])
+            .expect("a nested call inside an operator should run");
+        assert_eq!(out.as_deref(), Some("n=12"));
+    }
+
+    /// Argument-position arithmetic means what it means everywhere else.
+    ///
+    /// The parser had a second copy of the binary tiers reachable only from an argument
+    /// that began with an identifier, and it folded flat — so this returned 12, not 8,
+    /// and nothing said so.
+    #[test]
+    fn arithmetic_in_an_argument_list_keeps_its_precedence() {
+        let out = repl(&["let a = 2", "let b = 3", "let c = 2", "format(\"{}\", a + b * c)"])
+            .expect("arithmetic in an argument list should run");
+        assert_eq!(out.as_deref(), Some("8"), "an argument list changed what `+` and `*` mean");
+    }
+
     /// **A `def` typed at the prompt has to be callable on the next line.**
     ///
     /// It was not: `exec` treats `Stmt::Def` as a no-op because definitions are registered

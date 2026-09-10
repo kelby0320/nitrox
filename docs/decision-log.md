@@ -24770,3 +24770,52 @@ the second time this fixture has caught somebody out: with nothing selected, a h
 the primary highlight and is drawn blue, so a list with no selection never reaches the hover
 branch. The first version of the test asserted `face_hover` appears and it did not, for a reason
 that had nothing to do with the change.
+
+
+---
+
+## 2026-09-10 — the copy of the expression tiers nobody knew was there (nxsh M5 Part A)
+
+**"`let x = age_plus_n(my_age(), 3)` won't compile because `my_age()` isn't evaluated."** It was
+not evaluated because it was never parsed: a call inside an argument list was a syntax error, and
+had been since arguments were written.
+
+**The deferral naming it prescribed two fixes, and neither was needed.** `shell-nested-call` said
+there were two independent causes — a bare `name(` that could not be classified once the name was
+consumed, and a qualified `a.b(` missing from one of two copies of the postfix tier — and that a
+fix for either left the other broken. Both halves of that were measured, both directions, and both
+were true *of the code as written*. What the entry did not name is why the code was written that
+way, which is the only thing that mattered.
+
+`paren_args` has to tell `f(name: v)` from `f(name.field)`, and that needs the token **after** an
+identifier — one more than the lexer caches. So it consumed the identifier and resumed in a
+hand-written copy of the expression tiers. Every defect followed from the copy existing.
+
+**Including one nobody had found.** The copy's binary tier folded flat across whatever operators
+followed, so `format("{}", a + b * c)` parsed as `(a + b) * c` — while `format("{}", 1 + 2 * 3)`
+and `let z = a + b * c` were both right, because neither reaches the copy. An argument list
+silently changed what arithmetic means, and only for an argument beginning with a name. That is
+worse than the reported bug: a parse error stops you, and this does not.
+
+**The fix is a rewind rather than a third copy.** `Lexer` derives `Clone`; `paren_args` marks,
+bumps the identifier, looks for the `:`, and puts the lexer back if there is none. An argument is
+then parsed by `expr` like every other expression — one `(` arm, one precedence ladder, 82 lines
+deleted — and both reported shapes and the precedence bug go together because they were one thing.
+
+**Cloning the whole lexer, not a chosen subset of its fields.** A hand-picked snapshot is exactly
+what goes stale the next time the struct gains a field, and it would fail as a *mis-parse* rather
+than as a compile error — the same argument as "two numbers that must be equal are one number",
+applied to state. The clone costs at most one cached token and happens once per argument that
+begins with a name.
+
+**The lesson is about what a deferral entry is for.** This one was thorough — two causes, each
+traced to a line number, each fix measured in both directions — and being thorough about the
+symptom is what made it stop before the question that dissolves it: *why is there a second copy of
+this tier at all?* An entry that describes what fails is a bug report. What makes it worth keeping
+is the account of why the code has the shape it has, because that is what the eventual fix acts
+on. Recorded the same way here: the copy existed for one real reason, and removing the reason
+removed the copy.
+
+`test-interactive` step 7 nests the call now — `format("add={}", add(2, 3))` — which is what the
+step was always for: a generic operator and a user `def` dispatching together in one line. It had
+stood as a two-line workaround with a comment saying the nested form was rejected.

@@ -1003,15 +1003,14 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    of them before this step even runs — so the step passed on a `seq=` or `uptime_ns=`
     //    digit as readily as on the shell's answer, and was observed doing exactly that.
     //
-    //    The call is bound with `let` and formatted on the next line rather than nested as
-    //    `format("add={}", add(2, 3))`, which nxsh rejects — a user-function call inside an
-    //    argument list is a parse error ("expected , or ) in an argument list"). Both
-    //    constructs used here are already exercised by steps 12 and 14.
+    //    **The call is nested now**, which is what this step is really for: `format` is a
+    //    generic operator and `add` a user `def`, so one line proves the two dispatch
+    //    together through the argument list. It could not be written until 2026-09-10 —
+    //    a call inside an argument list was a parse error, and the two-line workaround
+    //    that stood here carried a comment saying so (`shell-nested-call`).
     s.send("def add(a, b) { a + b }")?;
     s.expect("/home>")?;
-    s.send("let sum = add(2, 3)")?;
-    s.expect("/home>")?;
-    s.send("format(\"add={}\", sum)")?;
+    s.send("format(\"add={}\", add(2, 3))")?;
     s.expect("add=5")?;
     steps += 1;
 
