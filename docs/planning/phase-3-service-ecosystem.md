@@ -135,7 +135,7 @@ With the kernel-first band done, the next sequenced work is the **userspace
 runtime foundation** the services are built on. Sequencing rationale (decided
 2026-07-13 — see the decision log):
 
-- **Defer a real `std` port** (Phase 4+, unchanged). std is POSIX-shaped —
+- **Defer a real `std` port** — now [Phase 7](phase-7-portable-runtime.md). std is POSIX-shaped —
   ambient-authority `fs`/`net`, synchronous blocking `io`, errno, signals,
   `thread_local!` — none of which map onto Nitrox's capability + async-first +
   no-signals model without either lying (reintroducing the Unix patterns the OS

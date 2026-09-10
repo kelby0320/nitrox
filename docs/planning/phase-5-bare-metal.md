@@ -13,10 +13,12 @@ complete; Phase 5 is active.
 **Why this comes before the portable runtime, networking and the browser.** Everything built
 through Phase 4 has only ever executed under QEMU. That is not a small asterisk: an emulator
 is a *model* of a machine, and every model omits something. The omissions we already know
-about are written down — `_PRT` interrupt routing, framebuffer cache attributes, shared INTx —
-each carrying "real hardware" as its literal trigger in
-[`deferred-decisions.md`](../rationale/deferred-decisions.md). The ones we do not know about
-are the reason to go.
+about are written down in [`deferred-decisions.md`](../rationale/deferred-decisions.md). **Two
+name "real hardware" as their trigger** — shared INTx, and framebuffer cache attributes. The
+third, `_PRT` interrupt routing, is the one this phase found *misfiled*: it sits under MSI/MSI-X,
+whose stated trigger is "NVMe, multi-queue NICs, or performance work on interrupt-heavy
+devices", and Part A is the argument that it is a correctness unblocker instead. The ones we do
+not know about are the reason to go.
 
 The ordering argument is about **debuggability**, not enthusiasm. A `std::thread` bug and an
 interrupt-routing bug look identical from userspace. Every phase built on an untested
@@ -75,7 +77,7 @@ i8042 is on the IOAPIC. See Part A.
 
 ---
 
-## Part A — MSI, because INTx may not be routable at all ✅ / ⬜
+## Part A — MSI, because INTx may not be routable at all ⬜
 
 - [ ] **MSI (and MSI-X where a device offers it) for PCI devices**, replacing the IOAPIC path
       for AHCI.

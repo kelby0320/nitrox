@@ -290,8 +290,10 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
   - The order is **MSI → an on-screen kernel console → a live image → a hardware report → the
     laptop's own resolution → the first boot → cache attributes → the installer**, and all but
     the last three land under existing gates before the machine is plugged in.
-  - Three deferrals whose stated trigger is literally "real hardware" are what this phase
-    exists to fire: `_PRT`/MSI routing, framebuffer cache attributes, and shared INTx.
+  - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
+    INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
+    it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness
+    unblocker.
 
 ---
 

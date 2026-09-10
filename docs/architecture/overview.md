@@ -10,13 +10,22 @@ The sections below describing the display server, compositor and windowing **are
 forward-looking** — an earlier version of this line said they were, and it stayed that way for
 a month after they were built. [`widget-toolkit.md`](widget-toolkit.md),
 [`display-substrate.md`](display-substrate.md), [`graphical-session.md`](graphical-session.md),
-[`ui-composition-model.md`](ui-composition-model.md) and
-[`input-subsystem.md`](input-subsystem.md) are the current-behaviour documents for that arm and
-carry Status lines of their own.
+[`ui-composition-model.md`](ui-composition-model.md), [`input-subsystem.md`](input-subsystem.md),
+[`desktop-shell.md`](desktop-shell.md) and [`clipboard.md`](clipboard.md) are the
+current-behaviour documents for that arm and carry Status lines of their own. **Two of them
+still outrun their code and say so in their own Status lines** — `desktop-shell.md`'s tray is
+v2, and `ui-composition-model.md`'s ports are unscheduled — which is the pattern root
+`CLAUDE.md` describes rather than one to copy.
 
 **Phase 5 — bare metal — is active**: everything above has only ever run under QEMU, and the
 target is a real laptop. See [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
-Verified 2026-09-10.
+
+**Re-checked 2026-09-10: the Status line, the division-of-the-system diagram, the runtime-library
+list, and the phase pointers.** Named rather than left as an unqualified "Verified", because an
+unqualified one is exactly what let this document keep a diagram reading "compositor TBD" three
+lines under a Status line saying the compositor was built (PR #292 review, blocking 1). The
+prose in the sections below has *not* been audited line by line since 2026-08-05; where it and
+the per-subsystem documents disagree, those win.
 
 Nitrox is a hobby operating system written in Rust. This document is the entry point to the project's architecture documentation. It's intended to be read in one sitting and to give you a working mental model of the system. It is not a specification — it is orientation.
 
@@ -53,15 +62,17 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │ Userspace                                                       │
 │                                                                 │
 │   User applications                                             │
-│   Shell (nxsh); libdraw + /dev/framebuffer (M1); compositor TBD │
-│   Service manager, session manager, profile servers             │
+│   Desktop shell, compositor; nxterm / nxfiles / nxedit          │
+│   Shell (nxsh)                                                  │
+│   Service manager, session managers, profile + input servers    │
 │   Resource servers (fs-servers, netstack, etc.)                 │
 │   Init (PID 1)                                                  │
 │                                                                 │
-│   Runtime libraries: libheap, libos, libstream, librsproto      │
+│   Runtime libraries: libheap, libos, libstream, librsproto,     │
+│                      libdraw/libui/libsurface, libfs, …         │
 │   Raw syscall layer:  libkern                                   │
 └────────────────────────────────────┬────────────────────────────┘
-                                     │ syscall boundary (~30 syscalls)
+                                     │ syscall boundary (39 syscalls)
 ┌────────────────────────────────────┴────────────────────────────┐
 │ Kernel                                                          │
 │                                                                 │
@@ -216,8 +227,14 @@ See: [service manager architecture](service-manager.md), [boot flow architecture
 
 ### Runtime libraries
 
-Five crates, layered. Each has (or will have) a design doc under `docs/architecture/`,
-sliced in just-in-time as the crate is built:
+**Fifteen crates**, layered. The five below are the *foundation* — the ones every program
+sits on, and the ones the `std` port has to reckon with. The rest are the display and system
+arms built since (`libdraw`, `libui`, `libsurface`, `libterm`, `libinput`, `libsession`,
+`libfs`, `libtime`, `libcrypto`, `liblog`); `userspace/CLAUDE.md` holds the layering rules and
+each crate's own `CLAUDE.md` its constraints.
+
+Each has (or will have) a design doc under `docs/architecture/`, sliced in just-in-time as the
+crate is built:
 
 - **libkern**: raw syscall wrappers, `#![no_std]`, no `alloc`. ABI types and unsafe `extern` declarations. Used directly by early services (init, fs-servers, eshell).
 - **libheap**: the freeing userspace heap — the `#[global_allocator]` backing `alloc`. `#![no_std]`, no `alloc` (it provides it). See [libheap.md](libheap.md).
@@ -227,7 +244,7 @@ sliced in just-in-time as the crate is built:
 
 There is deliberately **no `librt` / green-thread crate.** A Go-style fiber scheduler was considered and rejected: it adds no concurrency the `async` executor doesn't already provide (both multiplex over `sys_wait`), only a blocking-style syntax, while introducing a second non-standard concurrency runtime that fights a future `std` the same way `async` does (`thread_local!`, `std::sync`) with no upside — and Rust itself removed green threads pre-1.0 for these reasons. See the decision log (2026-07-13).
 
-A future `std` port will eventually provide `std::fs`, `std::thread`, `std::net` over the native handle-based interface, enabling the broader Rust ecosystem — deferred until the syscall ABI is stabilizing (see the implementation plan's Phase 4+ std-port note). It is built **on top of** these libraries, not as a separate reimplementation: only std's per-OS platform layer (`std::sys`) is written for Nitrox, and it forwards to the native stack. The libraries sort by how they relate to that port — some **feed the pal** (survive *below* std: libkern's syscall floor, libheap's allocator engine, libos's wait/notification plumbing), and some **provide what std never will** (survive *beside* std: libos's async runtime, libstream's typed I/O, librsproto). A crate that does neither — that std simply supersedes — is a stopgap and is not built as a durable library (this is why there is no standalone sync-wrapper crate: that role is `std::io`). Beyond the POSIX-semantics mismatch (ambient authority, synchronous I/O, signals), the port's main structural task is that `std` wants to *own* the process singletons — the global allocator, the entry point, the panic runtime, and TLS — which the native libraries also provide; the libraries are therefore built so those singletons are **swappable engines `std::sys` can adopt** rather than hard-wired statics (e.g. libheap's engine/registration split). The panic strategy stays `panic = "abort"` across the port.
+A future `std` port will eventually provide `std::fs`, `std::thread`, `std::net` over the native handle-based interface, enabling the broader Rust ecosystem — and it is [Phase 7](../planning/phase-7-portable-runtime.md). It is built **on top of** these libraries, not as a separate reimplementation: only std's per-OS platform layer (`std::sys`) is written for Nitrox, and it forwards to the native stack. The libraries sort by how they relate to that port — some **feed the pal** (survive *below* std: libkern's syscall floor, libheap's allocator engine, libos's wait/notification plumbing), and some **provide what std never will** (survive *beside* std: libos's async runtime, libstream's typed I/O, librsproto). A crate that does neither — that std simply supersedes — is a stopgap and is not built as a durable library (this is why there is no standalone sync-wrapper crate: that role is `std::io`). Beyond the POSIX-semantics mismatch (ambient authority, synchronous I/O, signals), the port's main structural task is that `std` wants to *own* the process singletons — the global allocator, the entry point, the panic runtime, and TLS — which the native libraries also provide; the libraries are therefore built so those singletons are **swappable engines `std::sys` can adopt** rather than hard-wired statics (e.g. libheap's engine/registration split). The panic strategy stays `panic = "abort"` across the port.
 
 See: [libos](libos.md), [libheap](libheap.md). (`libstream` and `librsproto` do not yet have
 their own architecture docs; `librsproto`'s contracts are the `rsproto-*` specs.)

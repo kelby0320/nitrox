@@ -25040,3 +25040,45 @@ subtree" — which is word-for-word the blocker on `/subtreetest`, the last buil
 `init`, deferred from the test-path retrofit on 2026-08-24. So the live image does not want
 throwaway code; it wants a general feature arriving with its second consumer, and building it
 finishes the retrofit as a side effect.
+
+
+---
+
+## 2026-09-10 — the reconciliation that stopped one level short (PR #292 review)
+
+The PR that closed Phase 4 argued that **stale bookkeeping makes finished work look
+unfinished** — and then left stale bookkeeping. Every finding in its review is that one shape.
+
+- `overview.md`'s **Status line** was corrected to say the compositor is built; its **layering
+  diagram**, three lines below, still read `compositor TBD`, and its library section still said
+  "Five crates" against fifteen. A reader following root `CLAUDE.md`'s instruction to read the
+  orientation doc first would have reached exactly the conclusion the fix was for.
+- `phase-4-desktop.md` gained the header `✅ complete` while its body still said the shell
+  subproject was **active at Milestone 1, on a long-merged branch**.
+- Both subproject plans **cited as the authority** for "Milestones 1–15 complete" and
+  "Milestones 1–5 complete" still opened with `🚧`, and seven display-arm milestone headings
+  lagged their own fully-ticked part boxes.
+
+**The lesson is about where a reconciliation stops.** Each of those is one level of indirection
+away from something that *was* fixed: the Status line but not the body it vouches for, the
+index but not the plans it points at, the phase but not the subprojects that make it up. A
+correction propagates as far as the person doing it happens to look, and "as far as I happened
+to look" is not a boundary anybody can check afterwards.
+
+The rule that would have caught it: **when a claim changes, fix every place that repeats it,
+and say in the Status line which parts were re-checked.** An unqualified "Verified 2026-09-10"
+on a document whose body has not been read is the mechanism, not an accident of it —
+`overview.md` now names the four sections that were checked and says plainly that the rest has
+not been audited since 2026-08-05.
+
+**Two counts were also wrong, and both were checkable.** "Three deferrals whose stated trigger
+is literally 'real hardware'" — there are two, and the third is the one the same PR argues is
+*misfiled*, which the PR's own annotation said. And a `[x]` was used for USB, which is not
+built, in the same diff that left the dynamic-linking box `[ ]` with a "moved to Phase 7" note:
+two conventions for one operation, in one file, on one day. The convention is root `CLAUDE.md`'s
+and it is not ambiguous — a checkbox in `planning/` means **built**.
+
+**Adding "✅ complete" to seven headings broke an inbound anchor**, which `check-docs` caught.
+Worth recording because it is the same failure mode as versioned filenames: a heading is an
+address, and renaming one rots every link to it. The gate exists; the habit of running it
+before pushing is what makes the gate useful.

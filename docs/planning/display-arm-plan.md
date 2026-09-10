@@ -1,6 +1,17 @@
 # Nitrox Display Arm — Subproject Plan
 
-**Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
+**Status:** ✅ **complete — Milestones 1–15** (2026-08-05 to 2026-09-10). The design was
+settled before the first line; this is the order it got built in, and the record of what each
+milestone decided. It is a [Phase 4](phase-4-desktop.md) subproject, and Phase 4 closed on the
+day M15 did.
+
+**One box is deliberately open** (M11 Part F, the control panel, descoped 2026-09-01) and the
+open deferrals the arm accumulated are in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md), each with a trigger. Neither is
+outstanding work against this plan.
+
+The historical status block below is kept as written — it is the running record of what was
+true when, and rewriting it would destroy the evidence.
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
 self-hash, and the `screendump` smoke gate. **Milestones 1–2 are complete** (2026-08-06). A real client drives the compositor on every
 `test-qemu` run, and the display gate compares a picture that arrived through the whole
@@ -1539,7 +1550,7 @@ so the feedback arrives while the design is still fresh. The alternative — a t
 M6 — was considered and rejected (maintainer's call, 2026-08-12): a shell built to be discarded is
 a third thing to maintain and its feedback is worth less than it costs.
 
-## Milestone 7 — the graphical session
+## Milestone 7 — the graphical session ✅ complete (2026-08-25)
 
 **New in the 2026-08-12 re-scope**, and the piece whose absence caused the M5 Part C
 misassignment: nothing in `docs/` said who authenticates a graphical user or who spawns the
@@ -1858,7 +1869,7 @@ serves and holds `BIND_NAMESPACE`. Each is designed; none has run. The mitigatio
 gate exists before Part E starts, so a shell that comes up wrong is distinguishable from a greeter
 that never logged in — which is exactly the confusion that would otherwise cost the most time.
 
-## Milestone 8 — desktops and the overview
+## Milestone 8 — desktops and the overview ✅ complete (2026-08-26)
 
 **Details pass 2026-08-26.** The remainder of the old Milestone 6, now resting on a shell that
 exists. Six parts, in dependency order; the shape follows Milestone 7's, where each part is
@@ -2207,7 +2218,7 @@ also reach the focused window.
   deliberately plain, and polish is worth more once there is more to polish (maintainer,
   2026-08-26).
 
-## Milestone 9 — window decorations and interaction
+## Milestone 9 — window decorations and interaction ✅ complete (2026-08-28)
 
 **Details pass 2026-08-27.** Six parts in dependency order, gated one at a time, the shape
 Milestones 7 and 8 used.
@@ -2628,7 +2639,7 @@ dependency cut in two rather than two independent things.
   reasoning is geometry, and it would be worth revisiting if a client ever needed chrome it
   could not draw.
 
-## Milestone 10 — applications, and drag-and-drop between them
+## Milestone 10 — applications, and drag-and-drop between them ✅ complete (2026-09-01)
 
 **Details pass 2026-08-30.** Six parts in dependency order, gated one at a time, the shape M8 and
 M9 used. A file browser and a text editor as ordinary applications rather than as parts to be
@@ -3009,7 +3020,15 @@ That M10 Part E *adds* to the substrate is not a reason to have kept it in `desi
   the whole of the feedback. Filed with per-client cursors, which the substrate doc already
   defers.
 
-## Milestone 11 — themes and visual polish
+## Milestone 11 — themes and visual polish ✅ complete (2026-09-01)
+
+**One box below stays open and is not owed**: Part F, the control panel, was descoped the same
+day ("not built and no longer scheduled") and its gate box goes with it. **M11's stated
+stopping condition — "M11 ends when the Open section is empty" — was unreachable as written**,
+because the two items that remained were *reclassified* rather than done: the icons became
+`TODO(icon-set)`, and drop shadows moved to M13 Part C. Recorded here rather than left as a
+milestone that can never close.
+
 
 **Details pass 2026-09-01.** Sketched 2026-08-26 and planned now that M10 has closed, which is
 when its own trigger fired: there is something to polish. Six parts, and the fifth is not like
@@ -3233,12 +3252,12 @@ it is noticed on. Its own list, and its own milestone.
       asserts only enough to know the picture is of a working desktop rather than a blank screen,
       that being the one failure that would otherwise be read as a design opinion.
 
-- [ ] **The list itself** — [`m11-polish-list.md`](m11-polish-list.md), the maintainer's, written
+- [x] **The list itself** — [`m11-polish-list.md`](m11-polish-list.md), the maintainer's, written
       while driving. Decision 5 says this plan does not contain it; what this box does is give it
       a file, and a place for the two kinds of thing that are *not* polish to go instead (feel,
       and M12 capability).
 
-- [ ] **Batch 1 — the palette turns light** ✅ (2026-09-01). One theme, and `Theme::light()`
+- [x] **Batch 1 — the palette turns light** ✅ (2026-09-01). One theme, and `Theme::light()`
       *replaces* `Theme::dark()` rather than joining it: decision 4 applied, because two themes
       double the reference pictures and double the judgement each polish item takes. Values are
       measured from the maintainer's reference desktop rather than invented.
@@ -3252,7 +3271,7 @@ it is noticed on. Its own list, and its own milestone.
       the desktop light is exactly the event that shows the tie was to the sixteen ANSI colours,
       which are tuned for a dark ground and would put invisible text on a white one.
 
-- [ ] **Batch 2a — the chrome grows a third dimension** ✅ (2026-09-01). Gradients, drawn window
+- [x] **Batch 2a — the chrome grows a third dimension** ✅ (2026-09-01). Gradients, drawn window
       controls, and a line around anything with an edge.
 
       **One bevel number for every gradient**, not a pair of colours per surface: the reference's
@@ -3499,7 +3518,7 @@ it is noticed on. Its own list, and its own milestone.
       it.
 
 
-## Milestone 12 — applications, deepened
+## Milestone 12 — applications, deepened ✅ complete (2026-09-02)
 
 Named 2026-08-30 as part of M10's details pass, so that "the editor should have tabs" has
 somewhere to go that is not M10.
@@ -3552,7 +3571,7 @@ pass existed, which left two incompatible letterings dated the same day; PR #266
   scoped.
 - **Images.** The decoder, the asset path, and the wallpaper as a shell-owned background window.
 
-**What moved out.** The compositor work is [Milestone 13](#milestone-13--the-compositors-feel):
+**What moved out.** The compositor work is [Milestone 13](#milestone-13--the-compositors-feel--complete-2026-09-03):
 different work, driven by measurement rather than by use, and a milestone holding both cannot say
 when it is done. **The control panel is trigger-gated rather than scheduled** — see below.
 
@@ -4276,7 +4295,7 @@ about interpolation. The maintainer wants both eventually — "it'd be nice to h
 options" — so the theme key is designed with room for a mode beside the path, and only one mode
 ships.
 
-## Milestone 13 — the compositor's feel
+## Milestone 13 — the compositor's feel ✅ complete (2026-09-03)
 
 Named 2026-09-01, when M11's polish pass produced two reports that were not about appearance and
 one diagnosis that explained both.

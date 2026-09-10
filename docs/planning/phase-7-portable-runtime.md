@@ -36,8 +36,10 @@ being speculative work.
 ### The dynamic-linking premise has expired, and that is the argument for doing it
 
 The deferral was written on the finding that **static linking is correct at 13–73 KB per
-binary**. Measured 2026-09-10, the shipped binaries are **176–539 KB** — five to seven times
-that — and there are five of them each embedding the whole widget toolkit and the font
+binary**. Measured 2026-09-10 from the release build, the shipped binaries are **176–539 KB**:
+the smallest is 2.4× the *top* of that range and the largest 7.4×, and against its bottom they
+are 13× and 41×. Whichever end you take, the range the decision rested on no longer contains
+them — and there are five binaries each embedding the whole widget toolkit and the font
 rasteriser. Its own note said "build the loader at the second or third app"; there are five.
 
 That is not an argument that static linking was wrong. It is an argument that the condition the

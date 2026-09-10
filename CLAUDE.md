@@ -99,8 +99,9 @@ every build and zero test cfgs, and its login proof lives here as steps 5a–5c.
 it behaves in a release one. `docs/planning/test-path-retrofit.md` is the plan that made that
 true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to one — and
 it is complete. The one left is `init`'s `/subtreetest` binding, which needs a **bind-mount
-concept in `init.toml`** and is deferred past that plan as capability work; the box naming it is
-still open there.
+concept in `init.toml`**; it was deferred past that plan as capability work and is **scheduled
+as Phase 5 Part C** (`docs/planning/phase-5-bare-metal.md`), because the live image needs the
+same mechanism — its `/bin` is a subtree bind of the in-kernel `/initramfs` endpoint.
 
 `cargo xtask check-images` is what keeps the property: it fails if a test image and a release
 image start differing in anything new.

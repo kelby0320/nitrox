@@ -569,9 +569,10 @@ systemwide tracing.
 
 ### Typed shell + coreutils (subproject)
 
-The prereqs above are in, so this subproject is **🚧 active** (from 2026-07-24, at Milestone 1 —
-`list` + `copy`, branch `phase-4/coreutils-m1`). The language, interpreter, generic operators,
-coreutils breadth, and a minimal (non-rich) REPL are its scope:
+✅ **Complete — Milestones 1–5** (2026-07-24 to 2026-09-10): the coreutils, the `nxsh`
+interpreter, the shell as the login leaf, language completeness, and tab completion. The
+language, interpreter, generic operators, coreutils breadth, and a minimal (non-rich) REPL were
+its scope, and all of it is built.
 
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).
@@ -676,9 +677,9 @@ look like an unfinished phase. Each now has its own document:
 
 Landed when a concrete consumer or need appears, not on a fixed schedule:
 
-- [x] **USB subsystem** — **scheduled as [Phase 6](phase-6-usb.md)** (2026-09-10). No longer opportunistic: the target laptop's trackpad is I²C-HID, so a USB mouse is the only affordable pointer, and thumb drives need it too.
+- [ ] **USB subsystem** — **moved to [Phase 6](phase-6-usb.md)** (2026-09-10), and no longer opportunistic: the target laptop's trackpad is I²C-HID, so a USB mouse is the only affordable pointer, and thumb drives need it too. Left unticked deliberately — a checkbox here means *built*, and no USB code exists.
 - [ ] **POSIX C shim** — deferred until a must-have C dependency forces it (target the pure-Rust ecosystem first)
-- [ ] **Additional filesystems:** fs-server-fat read-write (ESP updates from within the OS; also the orphaned Phase-2 "FAT read-only" deferral folds in here), btrfs/xfs if a use case emerges
+- [ ] **Additional filesystems:** fs-server-fat read-write — **moved to [Phase 6](phase-6-usb.md)** (2026-09-10), because a thumb drive is FAT32 and needs it whether or not anybody updates a bootloader in place; the orphaned Phase-2 "FAT read-only" deferral folds in there. btrfs/xfs stay here, if a use case emerges.
 - [ ] **Phase 2 ACPI:** vendor ACPICA (`kernel/vendor/acpica/`), OSL (`kernel/src/kacpi/osl/`), `bindgen` integration, power-management daemon — triggered by laptop / graceful-shutdown needs
 - [ ] **GPU / compositor acceleration** — modesetting GPU driver is out of scope (opacity); the boot framebuffer is the display substrate
 - [ ] **aarch64:** fill `kernel/src/arch/aarch64/` stubs once x86_64 is mature; equivalent userspace work

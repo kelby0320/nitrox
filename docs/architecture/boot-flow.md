@@ -1,8 +1,9 @@
 # Boot Flow
 
-**Status:** Current. Describes the boot as it runs today — UEFI → Limine → kernel → `init`
-→ fs-server → `service-mgr` → `auth-service` → `session-mgr` → login → `nxsh` (Phases 0–3
-complete, 2026-07-21). Every stage below is exercised on each CI run by
+**Status:** Current (last checked 2026-09-10). Describes the boot as it runs today — UEFI →
+Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
+`nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
+2026-09-10). Every stage below is exercised on each CI run by
 `cargo xtask test-qemu` (headless, adjudicated by `isa-debug-exit`) and
 `cargo xtask test-interactive` (expect-driven over the serial console).
 Verified against source 2026-08-24, when the demo chain and the graphical clients became service declarations and §5 was rewritten (the display arm's position in § 5 changed that day).
