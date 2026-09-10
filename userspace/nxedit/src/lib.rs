@@ -697,14 +697,23 @@ impl Buffer {
         let n = lines.len();
         let count_changed = self.starts.len() != n;
         self.starts.resize(n, syntax::State::Normal);
-        let from = self.dirty_from.min(n.saturating_sub(1));
+        // **An edit nobody located means the whole buffer, exit and all.** `usize::MAX` is
+        // "nothing was touched", so reaching it with a changed revision means somebody edited
+        // without saying where — and the answer has to be the *safe* one rather than the cheap
+        // one. Clamping it into range names the **last** line, which re-derives a single state
+        // and leaves every one above it stale; starting at zero is no better on its own,
+        // because the early exit then fires on line 0 for any edit further down. Both are
+        // needed, which is why `unknown` also suppresses the exit below (PR #289 review,
+        // blocking 1: `pasted` was such a path for the whole of Part G).
+        let unknown = self.dirty_from == usize::MAX;
+        let from = if unknown { 0 } else { self.dirty_from.min(n.saturating_sub(1)) };
         self.dirty_from = usize::MAX;
         let mut st = if from == 0 { syntax::State::Normal } else { self.starts[from] };
         for i in from..n {
             self.starts[i] = st;
             let (_, next) = syntax::scan(&lang, &lines[i], st);
             st = next;
-            if !count_changed && i + 1 < n && self.starts[i + 1] == st {
+            if !count_changed && !unknown && i + 1 < n && self.starts[i + 1] == st {
                 return;
             }
         }
@@ -840,7 +849,12 @@ impl App {
     pub fn loaded(&mut self, text: &str, raw: &[u8]) {
         let b = self.buf_mut();
         b.text = TextAreaState::with_text(text);
-        // A whole new buffer, so everything below line 0 is unscanned.
+        // A whole new buffer, so everything below line 0 is unscanned. **`starts` is cleared
+        // as well as invalidated**: leaving the old file's states in place with the same length
+        // as the new one would let the early exit compare against them and return on line 0
+        // (PR #289 review, optional 5 — latent today, since this only ever runs on a fresh
+        // buffer, and one line to close).
+        b.starts.clear();
         b.dirty_from = 0;
         b.scanned_at = u64::MAX;
         b.saved_at = b.text.revision();
@@ -980,6 +994,10 @@ impl App {
     pub fn pasted(&mut self, text: &str, index: u32, serial: u64) {
         let buffer = self.current;
         let (from, to) = self.buf_mut().text.insert_text(text);
+        // **A paste is an edit that never passed through `update`**, so it reports its own
+        // position — see [`Buffer::dirty_from`]. `Msg::Paste` only asks the clipboard; this is
+        // called when the answer arrives (PR #289 review, blocking 1).
+        self.edited_at(from.0);
         self.cycling = Some(Cycling { buffer, from, to, index, serial });
         self.status = String::from("pasted");
     }
@@ -997,6 +1015,9 @@ impl App {
         }
         self.buf_mut().text.select_range(c.from, c.to);
         let (from, to) = self.buf_mut().text.insert_text(text);
+        // The replaced range starts where the previous paste did, which is at or above where
+        // this one starts.
+        self.edited_at(c.from.0.min(from.0));
         self.cycling = Some(Cycling { buffer: c.buffer, from, to, index, serial });
         self.status = String::from("pasted the one before");
     }
@@ -1089,6 +1110,16 @@ impl App {
             let b = self.buf_mut();
             b.dirty_from = b.dirty_from.min(from);
         }
+    }
+
+    /// Record that an edit touched line `from`, so the next scan starts at or above it.
+    ///
+    /// **For the paths that do not go through [`update`](Self::update)** — a clipboard answer
+    /// arrives from the binary rather than as a message, so the bracket `update` computes never
+    /// sees it.
+    fn edited_at(&mut self, from: usize) {
+        let b = self.buf_mut();
+        b.dirty_from = b.dirty_from.min(from);
     }
 
     /// The body of [`update`](Self::update). See there for what wraps it.
@@ -2397,6 +2428,81 @@ mod tests {
             runs.iter().any(|(l, t, c)| *l == 1 && t == "let" && *c == ui.syntax_keyword),
             "the line that moved down was scanned from a stale state: {runs:?}"
         );
+    }
+
+    /// A paste recolours the lines below it, exactly as typing the same bytes does.
+    ///
+    /// **A paste does not go through `update`.** `Msg::Paste` only asks the clipboard; the
+    /// binary calls [`App::pasted`] when the answer arrives, so the bookkeeping `update` does
+    /// for every message is skipped — and `dirty_from` left at its "nothing was touched" value
+    /// clamps to the *last* line, which re-derives one line and leaves every state above it as
+    /// it was before the pasted text existed. Both `let`s stayed coloured under an open block
+    /// comment, permanently: `rescan` records the revision either way, so nothing later put it
+    /// right (PR #289 review, blocking 1).
+    ///
+    /// **Typing the same two bytes is the control**, and it passed throughout — which is the
+    /// asymmetry the test above cannot see.
+    #[test]
+    fn a_pasted_block_comment_recolours_the_lines_below_it() {
+        let ui = UiTheme::default();
+        let keywords = |a: &mut App| {
+            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
+        };
+        let mut a = coloured("lib.rs", "let a = 1;\nlet b = 2;\n");
+        assert_eq!(keywords(&mut a), 2, "precondition: a frame has been drawn");
+
+        a.pasted("/*\n", 0, 1);
+        assert_eq!(
+            keywords(&mut a),
+            0,
+            "the lines below the paste kept the colours they had before it"
+        );
+
+        // **A paste that adds no line, below the top**, which is the case the fallback alone
+        // cannot answer: with the line count unchanged the scan may exit at the first state
+        // that matches, and starting from line 0 it matches immediately — so the edit is never
+        // reached. This is what makes `pasted` reporting its own position load-bearing rather
+        // than merely an optimisation.
+        // The pasted line carries no keyword of its own, so what the assertion sees is the
+        // line *below* it — which is the only place the staleness shows.
+        let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
+        assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
+        press_key(&mut a, libkern::abi::KEY_DOWN);
+        a.pasted("/*", 0, 1);
+        assert_eq!(keywords(&mut a), 1, "only `fn`, above the comment, is still a keyword");
+
+        // …and cycling the ring to another entry is the same path, with the same hole.
+        let mut a = coloured("lib.rs", "let a = 1;\nlet b = 2;\n");
+        assert_eq!(keywords(&mut a), 2);
+        a.pasted("//\n", 0, 1);
+        assert_eq!(keywords(&mut a), 2, "a line comment leaves the lines below it alone");
+        a.cycled("/*\n", 1, 2);
+        assert_eq!(keywords(&mut a), 0, "the cycled paste did not recolour below itself");
+    }
+
+    /// An edit that reports nothing still recolours correctly — slowly, rather than wrongly.
+    ///
+    /// **The contract that makes the next bypass a performance bug instead of a silent one.**
+    /// `pasted` was exactly such a path for the whole of Part G: it edits the buffer without
+    /// going through `update`, so `dirty_from` stayed at "nothing was touched" and the rescan
+    /// re-derived the last line only. This reaches into the buffer the same way, and asserts
+    /// the colours below the edit are right anyway.
+    ///
+    /// **Both halves of the fallback are needed and this needs both**: starting at line 0 is
+    /// not enough on its own, because the early exit fires on line 0 for an edit further down.
+    #[test]
+    fn an_edit_that_says_nothing_about_where_it_landed_still_recolours_below_itself() {
+        let ui = UiTheme::default();
+        let keywords = |a: &mut App| {
+            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
+        };
+        let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
+        assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
+
+        // Straight into the state, naming no line and changing none of the count.
+        a.buf_mut().text.select_range((1, 0), (1, 0));
+        a.buf_mut().text.insert_text("/*");
+        assert_eq!(keywords(&mut a), 1, "the lines below an unreported edit went stale");
     }
 
     /// Inserting a line above a block comment does not leave the cache one line out of step.

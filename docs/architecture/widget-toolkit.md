@@ -566,8 +566,9 @@ existing.
 Part G). Colours rather than token kinds, which is what keeps this toolkit out of the business of
 knowing what a language is: the application scans its own text and looks the colour up in the
 theme. The widget merges those split points into the ones the selection and the caret already
-make, and **clamps them**, because they are computed from the buffer as it was a moment ago and
-an edit can leave one naming bytes that are gone.
+make, and **takes a run's bounds only where they are character boundaries of the line as it is
+now** — because they are computed from the buffer as it was a moment ago, so an edit can leave
+one naming bytes that are gone or landing inside a character.
 
 **Two of the three are no longer pure functions of that state, as of M10 Part C.** `text_area`
 and `list_view` take it by `&mut` and scroll it themselves, because a caller cannot be *required*

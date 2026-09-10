@@ -1751,9 +1751,11 @@ impl TextAreaState {
 /// knowing what a language is: the application scans its own text and looks the colour up in the
 /// theme, and the widget merely draws what it is handed. `nxedit::syntax` is the first producer.
 ///
-/// **Byte offsets, and the widget clamps them.** A cache of these is computed from the buffer as
-/// it was a moment ago, so an edit can leave one naming bytes past the end of a shortened line —
-/// which must be a wrong colour for one frame rather than a panic.
+/// **Byte offsets, and the widget does not trust them.** A cache of these is computed from the
+/// buffer as it was a moment ago, so an edit can leave one naming bytes past the end of a
+/// shortened line, or inside a character — which must be a wrong colour for one frame rather
+/// than a panic. A run's bounds become split points only where they are character boundaries of
+/// the line as it is *now*, which refuses both.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InkRun {
     /// Which line, as an index into the state's lines.
@@ -1843,13 +1845,15 @@ pub fn text_area<Msg>(
         if let Some(cc) = caret {
             cuts.push(cc);
         }
-        // **Clamped, not trusted.** These come from a scan of the buffer as it was, so an edit
-        // that shortened this line leaves runs naming bytes past its end — and a cut that split
-        // a character would panic on the slice below.
+        // **Not trusted: a cut has to be a character boundary of *this* line.** These come from
+        // a scan of the buffer as it was, so an edit that shortened this line leaves runs naming
+        // bytes past its end, and a cut inside a multi-byte character would panic on the slice
+        // below. `is_char_boundary` refuses both — it is false for every index past the end —
+        // which is the whole of the defence. A `min(l.len())` beside it reads like the guard and
+        // is dead: the only index it changes is one already in `cuts` (PR #289 review, 4).
         let runs = ink.iter().filter(|r| r.line == i);
         for r in runs.clone() {
             for b in [r.start, r.end] {
-                let b = b.min(l.len());
                 if l.is_char_boundary(b) {
                     cuts.push(b);
                 }
@@ -3983,6 +3987,25 @@ two");
             ],
             "the line was not split at the run's edge"
         );
+    }
+
+    /// The caret is drawn where the cursor is in the middle of a line.
+    ///
+    /// **The commonest caret position there is, and the one the rewrite newly depends on `cuts`
+    /// for.** Every other test puts it at column 0, at the line's end, or at an end of a
+    /// selection — each of which is already a cut for another reason, so deleting the caret's
+    /// own cut left all 240 tests green while a person typing mid-line saw no caret at all
+    /// (PR #289 review, 2).
+    #[test]
+    fn the_caret_is_drawn_in_the_middle_of_a_line() {
+        let p = Theme::default();
+        let mut a = TextAreaState::with_text("abcdef");
+        for _ in 0..2 {
+            a.apply(KEY_RIGHT, 0);
+        }
+        assert_eq!(a.cursor(), (0, 2), "precondition: mid-line, with no selection");
+        let e: Element<()> = text_area(&mut a, 16, 16, true, &[], &p);
+        assert_eq!(fills(&e, p.focus_ring), 1, "no caret while typing in the middle of a line");
     }
 
     /// A coloured run under a selection keeps its colour.

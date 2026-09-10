@@ -328,8 +328,7 @@ fn scan_from(
     let mut i = at;
     while i < line.len() {
         // A line comment takes everything after it.
-        if let Some(m) = lang.line_comments.iter().find(|c| line[i..].starts_with(**c)) {
-            let _ = m;
+        if lang.line_comments.iter().any(|c| line[i..].starts_with(c)) {
             push(&mut out, i, line.len(), Kind::Comment);
             return (out, state);
         }
@@ -410,6 +409,19 @@ fn scan_from(
             while j < line.len() && is_word(b[j]) {
                 j += 1;
             }
+            // **A number may carry a decimal point and an identifier may not**, which is why
+            // this is here rather than in `is_word`: `.` as a general joiner would swallow the
+            // `self` in `self.foo` and stop colouring the commonest keyword in the language it
+            // was added for. A point counts only when a digit follows it, so `1.5` is one
+            // number and Rust's `1..2` is two (PR #289 review, 3).
+            if b[i].is_ascii_digit() {
+                while j + 1 < line.len() && b[j] == b'.' && b[j + 1].is_ascii_digit() {
+                    j += 1;
+                    while j < line.len() && is_word(b[j]) {
+                        j += 1;
+                    }
+                }
+            }
             let word = &line[i..j];
             if b[i].is_ascii_digit() {
                 if lang.numbers {
@@ -445,8 +457,15 @@ fn close_string(line: &str, from: usize, delim: char, escape: bool) -> Option<us
     None
 }
 
-/// Whether `b` is part of a word: a letter, a digit, or one of the joiners a number or an
-/// identifier can carry (`_`, `.`, `-` in a TOML key, `x` in `0x1F` — all letters already).
+/// Whether `b` is part of a word: a letter, a digit or an underscore.
+///
+/// **`.` and `-` are not**, deliberately. A point joins the parts of a *number* and that is
+/// handled where numbers are scanned, because as a general rule it would make `self.foo` one
+/// word and stop `self` being a keyword. A hyphen would join a TOML key, which is not coloured
+/// at all — so it would buy nothing and break `a-b` in every other language.
+///
+/// The doc here claimed both of them until PR #289's review pointed at the body, which had
+/// never accepted either.
 fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -583,6 +602,30 @@ mod tests {
         );
         let (_, st) = scan(&RUST, "fn f<'a>(s: &'a str) {}", State::Normal);
         assert_eq!(st, State::Normal, "and it left nothing open for the next line");
+    }
+
+    /// A float is one number, and a range is two.
+    ///
+    /// **The visible half is the float**: `1.5` scanned as two numbers renders as a coloured
+    /// digit, a foreground-coloured dot and a coloured digit — in the two languages most likely
+    /// to be open on this system (PR #289 review, 3).
+    #[test]
+    fn a_decimal_point_joins_a_number_and_nothing_else() {
+        assert_eq!(runs(&TOML, "timeout = 1.5"), vec![("1.5", Kind::Number)]);
+        assert_eq!(runs(&RUST, "let x = 1.0;"), vec![
+            ("let", Kind::Keyword),
+            ("1.0", Kind::Number),
+        ]);
+        // A point with no digit after it ends the number, so Rust's range is two of them.
+        assert_eq!(runs(&RUST, "for i in 1..2 {"), vec![
+            ("for", Kind::Keyword),
+            ("in", Kind::Keyword),
+            ("1", Kind::Number),
+            ("2", Kind::Number),
+        ]);
+        // …and a point after an *identifier* is not part of anything: the keyword still ends at
+        // it, which is what makes `self.foo` work.
+        assert_eq!(runs(&RUST, "self.field"), vec![("self", Kind::Keyword)]);
     }
 
     #[test]

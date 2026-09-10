@@ -24502,10 +24502,13 @@ often as at its end, and getting it wrong cost PR #258 a blocking finding. As cu
 ordering left. Every existing caret and selection test passed unchanged, which is the evidence
 that it is the same widget.
 
-**Runs are clamped rather than trusted**, because they are computed from the buffer as it was a
-moment ago: an edit that shortens a line leaves one naming bytes that are gone, and a bound
-landing inside a multi-byte character would panic on the slice. A wrong colour for one frame is
-the right failure; a crashed editor is not.
+**A run's bounds are not trusted**, because they are computed from the buffer as it was a moment
+ago: an edit that shortens a line leaves one naming bytes that are gone, and a bound landing
+inside a multi-byte character would panic on the slice. They become split points only where they
+are character boundaries of the line as it is *now*, which refuses both — a wrong colour for one
+frame is the right failure, and a crashed editor is not. **The `min(len)` written beside that
+check was dead** and three separate documents credited it with the work, which is what a reviewer
+found by deleting it and watching every test stay green (PR #289 review, 4).
 
 **Only the start states are cached.** A run is derived from the line's text as it is *now*, so a
 stale colour is impossible — the worst a stale cache can do is start a line in the wrong state,
@@ -24517,6 +24520,31 @@ and its **early exit is off when the line count changed**, since `starts` is ind
 inserting one shifts every entry below it — so "the state here already matches" compares against
 a different line's state, exits on the first line, and leaves a block comment's `*/` outside the
 comment.
+
+**"Outside the match, so a message added later cannot forget" — and the paste is not a message.**
+`update` brackets every edit by taking the minimum of the cursor's line before and after, and that
+argument is sound for everything that goes through it. A paste does not: `Msg::Paste` only asks
+the clipboard, and the binary calls `App::pasted` when the answer arrives. So `dirty_from` stayed
+at "nothing was touched", which the rescan *clamped into range* — naming the **last** line,
+re-deriving one state and leaving every one above it as it was before the pasted text existed.
+Pasting a block-comment opener left the code below it coloured as code, permanently, since the
+rescan records the revision either way. Typing the same two bytes was always right, which is the
+asymmetry a test of one path cannot see. Found in review (PR #289, blocking 1).
+
+**The fix is two things, and the second is the one that matters.** `pasted` and `cycled` report
+where they edited, which keeps a paste incremental. And an *unlocated* edit — a revision that
+moved with nothing saying where — now rescans the whole buffer **with the early exit suppressed**,
+because either half alone is not enough: clamping names the last line, and starting at zero
+without suppressing the exit stops on line 0 for any edit further down. That turns the next
+bypass into a performance question instead of a silent wrong answer, and there is a test that
+edits the buffer through a path reporting nothing.
+
+**A guard three documents credited with work it does not do.** The runs a text area is handed are
+untrusted, and what refuses a bad one is `is_char_boundary` against the line as it is now — false
+for every index past the end as well as for one inside a character. The `min(len)` beside it was
+dead code: the only index it changed was one already in the cut list. The code comment, the
+toolkit document and the first draft of this entry all named the clamp as the defence. Deleting it
+and watching every test stay green is how a reviewer found that (PR #289 review, 4).
 
 **`.nx` is settled**, in `shell-language.md`, where it had been "a placeholder, not a real
 decision" since that document was written. Not `.sh`, because this does not accept one's scripts;
