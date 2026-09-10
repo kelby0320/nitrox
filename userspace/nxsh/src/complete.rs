@@ -16,9 +16,15 @@
 //! ## The two questions
 //!
 //! **Where does the word begin?** Scan back from the cursor over
-//! [`is_path_char`](crate::lex::is_path_char) — the lexer's own answer, shared rather than
-//! copied, because a completion that disagreed with the lexer about where a word begins
-//! would offer to finish something the lexer then reads as two tokens.
+//! [`is_word_char`](crate::lex::is_word_char) — the lexer's **word-mode** rule, shared rather
+//! than copied, because it is genuinely the same question: an argument is lexed in word mode,
+//! so this is the run the shell will read as one token. Everything but whitespace and the
+//! structure that closes an argument list counts, operators included.
+//!
+//! **Not `is_path_char`**, which the first version used. That one answers a narrower question
+//! in *expression* mode — whether a leading `/` is a path or a division sign — and `+` fails
+//! it, so `cd my+not<TAB>` was cut into `my+` and `not` and the tail was completed into
+//! `cd my+notes.txt`: a path nobody typed, silently substituted (PR #291 review, 2).
 //!
 //! **Is it a command or a path?** Look at what precedes it. A word at the start of the line,
 //! or after `|`, `{`, a newline, or a *pipeline* `(`, is the head of a stage and takes a
@@ -70,17 +76,34 @@ pub struct Word<'a> {
 pub fn word_at_end(line: &str) -> Word<'_> {
     let b = line.as_bytes();
     let mut start = b.len();
-    while start > 0 && crate::lex::is_path_char(b[start - 1]) {
+    while start > 0 && crate::lex::is_word_char(b[start - 1]) {
         start -= 1;
     }
-    Word { start, text: &line[start..], at: position(b, start) }
+    Word { start, text: &line[start..], at: position(line, start) }
 }
 
 /// What precedes the word beginning at `start`.
-fn position(b: &[u8], start: usize) -> Where {
+fn position(line: &str, start: usize) -> Where {
+    let b = line.as_bytes();
     let mut i = start;
-    while i > 0 && matches!(b[i - 1], b' ' | b'\t' | b'\r') {
-        i -= 1;
+    loop {
+        while i > 0 && matches!(b[i - 1], b' ' | b'\t' | b'\r') {
+            i -= 1;
+        }
+        // **A newline ends a statement only when what precedes it is a finished one.** Inside
+        // an unclosed construct, or after a trailing `|`, it is a *continuation* — the second
+        // line of `format("{}",` is an argument list, not a fresh prompt — so look through it
+        // and let the real preceding token decide. `needs_continuation` is the language's own
+        // answer to that and lexes properly, so a brace inside a string does not open
+        // anything; asking it here is what keeps this from being a second implementation.
+        if i > 0
+            && b[i - 1] == b'\n'
+            && crate::repl::needs_continuation(&line[..i - 1]) != crate::repl::Continue::No
+        {
+            i -= 1;
+            continue;
+        }
+        break;
     }
     if i == 0 {
         return Where::Command;
@@ -94,7 +117,7 @@ fn position(b: &[u8], start: usize) -> Where {
         // count)` opens a pipeline, so a stage follows; `format("{}", x)` opens an argument
         // list, so a value does. The grammar reads adjacency here too — `f(` is a call and
         // `f (` is not written — which is what makes this a rule rather than a guess.
-        b'(' if i < 2 || !crate::lex::is_path_char(b[i - 2]) => Where::Command,
+        b'(' if i < 2 || !crate::lex::is_word_char(b[i - 2]) => Where::Command,
         _ => Where::Argument,
     }
 }
@@ -155,6 +178,17 @@ pub fn matching_names<'a>(frag: &str, names: impl Iterator<Item = &'a str>) -> V
     out
 }
 
+/// What a Tab press should do to the line being edited.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// Leave the line exactly as it is.
+    Nothing,
+    /// Replace the whole line with this.
+    Replace(String),
+    /// Show the candidates. The line does not change.
+    List,
+}
+
 /// What a Tab press found.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Completion {
@@ -176,21 +210,28 @@ impl Completion {
     /// is unambiguous, so typing it for the person is free, and what is left is exactly the
     /// choice they still have to make. With one candidate it is that candidate.
     ///
-    /// Byte-wise, and safe to be: every candidate shares the fragment that produced it, so
-    /// the common prefix is at least that long, and a split inside a multi-byte character
-    /// would need two candidates agreeing on a leading byte and differing inside the same
-    /// character — impossible, since UTF-8 continuation bytes are only reached through a
-    /// lead byte that already differed.
+    /// **Character-wise, because a byte-wise scan can stop inside a character.** The first
+    /// version was byte-wise and carried a doc comment arguing that was safe: two candidates
+    /// would have to agree on a lead byte and differ inside the same character, which it
+    /// claimed impossible. It is not — `é` is `C3 A9` and `è` is `C3 A8`, `日` is `E6 97 A5`
+    /// and `文` is `E6 96 87` — so a directory holding two names that differ in an accent
+    /// made Tab slice mid-character and **panic**, which in the shipped binary reaches
+    /// `#[panic_handler]` and ends the login session (PR #291 review, blocking 1).
+    ///
+    /// Counting `len_utf8` as it goes means the offset is a character boundary by
+    /// construction rather than by an argument about UTF-8 that has to stay true.
     pub fn common_prefix(&self) -> &str {
         let Some(first) = self.candidates.first() else { return "" };
         let mut n = first.len();
         for c in &self.candidates[1..] {
             let mut i = 0;
-            let (a, b) = (first.as_bytes(), c.as_bytes());
-            while i < n && i < b.len() && a[i] == b[i] {
-                i += 1;
+            for (a, b) in first.chars().zip(c.chars()) {
+                if a != b || i >= n {
+                    break;
+                }
+                i += a.len_utf8();
             }
-            n = i;
+            n = n.min(i);
         }
         &first[..n]
     }
@@ -200,6 +241,32 @@ impl Completion {
         let mut out = String::from(&line[..self.start]);
         out.push_str(text);
         out
+    }
+
+    /// What a Tab press should do to `line`.
+    ///
+    /// **The last decision that was living in the console loop.** Whether to type something,
+    /// show the choice, or do nothing is a decision like the other three, and keeping it in
+    /// `main.rs` is what let a lone candidate equal to the typed word fall between two arms
+    /// and do nothing at all (PR #291 review, 5). The loop's share is now `match` and write.
+    pub fn action(&self, line: &str) -> Action {
+        let Some(filled) = self.filled(line) else { return Action::Nothing };
+        let mut out = filled;
+        // **A lone candidate ends the word, so it gets a space** — even when it adds nothing
+        // else, which is the case that used to be dropped: `list notes.txt<TAB>` on the only
+        // match. A directory gets its slash instead, so a second Tab descends into it.
+        if self.candidates.len() == 1 && !out.ends_with('/') {
+            out.push(' ');
+        }
+        if out != line {
+            return Action::Replace(out);
+        }
+        // Nothing they all agree on that is not already typed. With one candidate there is
+        // nothing left to say; with several, the choice is the only useful answer.
+        match self.candidates.len() > 1 {
+            true => Action::List,
+            false => Action::Nothing,
+        }
     }
 
     /// `line` with the word replaced by everything the candidates agree on, or `None` when
@@ -341,6 +408,29 @@ mod tests {
         assert_eq!(word_at_end("add(1, fo").at, Where::Argument);
     }
 
+    /// A newline is a statement boundary or a continuation, and only the language knows.
+    ///
+    /// **The console loop accumulates continuation lines and the discipline does not**, so a
+    /// completion given only the physical line sees column 0 and offers command names in the
+    /// middle of an argument list (PR #291 review, 3). Asking `needs_continuation` is what
+    /// tells the two apart, and it lexes rather than counting brackets — so a `(` inside a
+    /// string opens nothing here either.
+    #[test]
+    fn a_newline_inside_an_unclosed_construct_is_not_a_new_statement() {
+        // Finished statement, then a newline: a fresh stage head.
+        assert_eq!(word_at_end("whoami\nli").at, Where::Command);
+        assert_eq!(word_at_end("list /bin\ncd /ho").at, Where::Argument);
+        // Unclosed: the newline is a continuation and the argument list is still open.
+        assert_eq!(word_at_end("format(\"{}\",\nDoc").at, Where::Argument);
+        assert_eq!(word_at_end("f(\n  a,\n  b").at, Where::Argument);
+        // A trailing pipe expects a stage, which is a command wherever it sits.
+        assert_eq!(word_at_end("list /bin |\nco").at, Where::Command);
+        // An open block takes statements, so its next line is a head.
+        assert_eq!(word_at_end("if true {\nli").at, Where::Command);
+        // A bracket inside a string opens nothing — the thing a character count gets wrong.
+        assert_eq!(word_at_end("display \"(\"\nli").at, Where::Command);
+    }
+
     #[test]
     fn a_path_splits_at_its_last_slash() {
         assert_eq!(split_path("/home/do"), ("/home/", "do"));
@@ -411,6 +501,52 @@ mod tests {
         );
     }
 
+    /// Every arm of what a Tab press does, including the one that used to fall through.
+    ///
+    /// **The lone-candidate-already-typed case is the reason this is a function.** With the
+    /// decision split across two `if`s in the console loop it matched neither: `filled` equals
+    /// the line so the "type it for them" arm was skipped, and there was one candidate so the
+    /// "show the choice" arm was too. `list notes.txt<TAB>` did nothing at all
+    /// (PR #291 review, 5).
+    #[test]
+    fn every_outcome_of_a_tab_press() {
+        let start = 5;
+        let c = |names: &[&str]| Completion {
+            start,
+            candidates: names.iter().map(|n| String::from(*n)).collect(),
+        };
+
+        // Nothing matched.
+        assert_eq!(c(&[]).action("list zz"), Action::Nothing);
+
+        // One match, and something to add: typed for you, with a space to start the next word.
+        assert_eq!(
+            c(&["notes.txt"]).action("list not"),
+            Action::Replace(String::from("list notes.txt "))
+        );
+        // One match that is a directory: a slash, not a space, so a second Tab descends.
+        assert_eq!(
+            c(&["Documents/"]).action("list Doc"),
+            Action::Replace(String::from("list Documents/"))
+        );
+        // **One match, already fully typed**: still the space, and this is what fell through.
+        assert_eq!(
+            c(&["notes.txt"]).action("list notes.txt"),
+            Action::Replace(String::from("list notes.txt "))
+        );
+
+        // Several, with something they all agree on: type that much and stop.
+        assert_eq!(
+            c(&["Documents/", "Downloads/"]).action("list D"),
+            Action::Replace(String::from("list Do"))
+        );
+        // Several, agreeing on nothing more: the choice is the only useful answer.
+        assert_eq!(c(&["Documents/", "Downloads/"]).action("list Do"), Action::List);
+        // A directory already complete with several under it also lists rather than sitting
+        // there — the candidates differ past the word.
+        assert_eq!(c(&["a/x", "a/y"]).action("list a/"), Action::List);
+    }
+
     /// Nothing matched means the line is left exactly as it was typed.
     ///
     /// **This is the bug the `..` report actually found.** `common_prefix` of no candidates
@@ -438,6 +574,31 @@ mod tests {
         assert_eq!(one.apply("list /home/n", one.common_prefix()), "list /home/notes.txt");
 
         assert_eq!(Completion::none(0).common_prefix(), "");
+    }
+
+    /// Two names that differ **inside** a character still share a whole-character prefix.
+    ///
+    /// **The first version's doc argued this was impossible and it was wrong.** `é` is
+    /// `C3 A9` and `è` is `C3 A8`; `日` is `E6 97 A5` and `文` is `E6 96 87`. Two candidates
+    /// can share a lead byte and diverge in a continuation byte, so a byte-wise scan lands
+    /// mid-character and slicing there panics — which in the shipped binary reaches
+    /// `#[panic_handler]` and ends the login session. Reachable from a directory holding two
+    /// files whose names differ in an accent (PR #291 review, blocking 1).
+    #[test]
+    fn a_prefix_never_splits_a_character() {
+        for (a, b, want) in [
+            ("café", "cafè", "caf"),
+            ("日本", "文字", ""),
+            ("données", "donné", "donné"),
+            // The pair that motivated it, as whole path candidates.
+            ("/home/café.txt", "/home/cafè.txt", "/home/caf"),
+        ] {
+            let c = Completion {
+                start: 0,
+                candidates: vec![String::from(a), String::from(b)],
+            };
+            assert_eq!(c.common_prefix(), want, "for {a:?} and {b:?}");
+        }
     }
 
     /// A prefix shared by *every* candidate, including when one candidate is that prefix.

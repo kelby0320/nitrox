@@ -1332,8 +1332,9 @@ and paths everywhere else, including at a stage head when the word contains a `/
 `./script.nx` is a command written as a path. A directory candidate keeps its trailing slash so
 a second Tab descends, and `.` and `..` complete as the directories they name — they are path
 syntax rather than entries, so they are offered for a dotted fragment and not as contents. One
-answer is typed for you; several insert what they all agree on and then list the choice. A word
-that matches nothing is left exactly as typed. **Flag names are not done and need no design work, only a mechanism**: a
+answer is typed for you, with a trailing space unless it is a directory. Several take two
+presses: the first types the part they all agree on, and a second lists the choice once there is
+nothing left to add. A word that matches nothing is left exactly as typed. **Flag names are not done and need no design work, only a mechanism**: a
 program's flags are not introspectable, because nothing in the RS protocol asks a program what
 it accepts. That is the trigger.
 

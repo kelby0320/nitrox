@@ -1534,6 +1534,33 @@ short of what the design already said, and neither was visible from inside the t
       the first has to produce `../`, which is not directly observable, so the second lists
       through it.
 
+- [x] **Part E — what the review found** ✅ (2026-09-10). Four of the five are the same shape:
+      a rule that was *stated* in a doc comment instead of being made true in the code.
+
+      **`common_prefix` panicked on two names that differ inside a character.** Its doc argued
+      that a byte-wise scan was safe because two candidates would have to share a lead byte and
+      differ in a continuation byte — which is what `é` (`C3 A9`) and `è` (`C3 A8`) do. A
+      directory holding both made Tab slice mid-character and panic, and in the shipped binary
+      that reaches `#[panic_handler]` and **ends the login session**. Counting `len_utf8` makes
+      the offset a boundary by construction rather than by an argument that has to stay true.
+
+      **The word set was the wrong one of the lexer's two.** `is_path_char` answers "is this
+      `/` a path or a division sign" in *expression* mode; an argument is lexed in **word**
+      mode. `+` fails the narrow test, so `cd my+not<TAB>` was cut into `my+` and `not` and the
+      tail was completed into `cd my+notes.txt` — a path nobody typed, silently substituted.
+      `is_word_char` is the honest answer and every existing test survives the widening.
+
+      **A continuation line was completed as a fresh statement.** The discipline resets per
+      physical line while the loop accumulates the earlier ones, so the second line of
+      `format("{}",` looked like column 0. The loop passes the whole statement now, and
+      `position` asks `needs_continuation` whether a newline separates or continues — the
+      language's own answer, which lexes, so a bracket inside a string opens nothing.
+
+      **And the last decision left in the loop had a hole in it.** A lone candidate equal to
+      the word matched neither `if`, so `list notes.txt<TAB>` did nothing. `Completion::action`
+      is the whole decision now — `Nothing`, `Replace`, `List` — leaving the loop a `match` and
+      a write, which is where Part C said the line should be.
+
 ---
 
 ## Part 3 — First-session checklist (for the forked work)

@@ -3871,6 +3871,75 @@ x"), "5");
         assert_eq!(i.complete("cd ../ho").candidates, alloc::vec![String::from("../home/")]);
     }
 
+    /// Two files whose names differ in an accent complete without taking the shell down.
+    ///
+    /// The unit test for this is on `common_prefix`; this is the path a person actually
+    /// walks — `libfs::list_dir` hands back names through `from_utf8_lossy`, which keeps
+    /// valid non-ASCII rather than flattening it, so the bytes reach the prefix scan.
+    #[test]
+    fn accented_names_complete_rather_than_panicking() {
+        let mut h = completing_host();
+        h.entries.push((
+            String::from("/home/notes"),
+            alloc::vec![
+                (String::from("caf\u{e9}.txt"), false),
+                (String::from("caf\u{e8}.txt"), false),
+            ],
+        ));
+        let mut i = Interp::with_host(Box::new(h), Mode::Repl);
+        i.set_env(env_with(&[("PWD", "/home")]));
+        let c = i.complete("list /home/notes/ca");
+        assert_eq!(c.candidates.len(), 2);
+        assert_eq!(c.common_prefix(), "/home/notes/caf");
+        assert_eq!(c.filled("list /home/notes/ca").as_deref(), Some("list /home/notes/caf"));
+    }
+
+    /// Tab must never splice a candidate into the **middle** of what was typed.
+    ///
+    /// **`+` is an ordinary character in a filename and an operator in an expression**, and
+    /// the first version cut the word at the lexer's *expression*-mode path rule — so
+    /// `cd my+not<TAB>` completed the trailing `not` and handed back `cd my+notes.txt`, a
+    /// path the person never typed and which does not exist (PR #291 review, 2). An argument
+    /// is read in **word** mode, where the run is unbroken, so the word is `my+not`, it
+    /// matches nothing, and the line is left alone.
+    #[test]
+    fn a_candidate_is_never_spliced_into_the_middle_of_a_word() {
+        let mut i = completing();
+        for line in ["cd my+not", "cd a~not", "cd x@not", "list 50%not"] {
+            let c = i.complete(line);
+            assert!(
+                c.candidates.is_empty(),
+                "{line} completed to {:?} — a fragment of the word was matched on its own",
+                c.candidates
+            );
+            assert_eq!(c.filled(line), None, "{line} would have been rewritten");
+        }
+        // …and the same word with a separator in front of it still completes.
+        assert_eq!(i.complete("cd not").candidates, alloc::vec![String::from("notes.txt")]);
+        // The unspaced binding is the sharpest case: `let x=not` used to become
+        // `let x=notes.txt`, which is a filename substituted for the start of an expression.
+        assert!(i.complete("let x=not").candidates.is_empty());
+        // But a space is a real boundary, so this is still an ordinary path completion.
+        assert_eq!(i.complete("let x = not").candidates, alloc::vec![String::from("notes.txt")]);
+    }
+
+    /// The second line of a statement completes as the statement, not as a fresh prompt.
+    ///
+    /// The console loop hands `complete` the accumulated statement rather than the physical
+    /// line for exactly this; without it the newline reads as a statement boundary and an
+    /// argument list is offered command names (PR #291 review, 3).
+    #[test]
+    fn a_continuation_line_completes_in_the_statement_it_continues() {
+        let mut i = completing();
+        assert_eq!(
+            i.complete("format(\"{}\",\nDo").candidates,
+            alloc::vec![String::from("Documents/"), String::from("Downloads/")],
+            "a continuation line was completed as if it were a new statement"
+        );
+        // And a finished statement followed by a newline is still a fresh head.
+        assert_eq!(i.complete("whoami\nwho").candidates, alloc::vec![String::from("whoami")]);
+    }
+
     /// A word that matches nothing leaves the line exactly as it was typed.
     ///
     /// The bug the `..` report actually found, and it was never about `..`: any unmatched

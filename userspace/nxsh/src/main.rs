@@ -946,38 +946,46 @@ fn repl(
             // continuation one mid-statement, because that is what is on the screen.
             if b == b'\t' {
                 let line = String::from_utf8_lossy(disc.line()).into_owned();
-                let c = interp.complete(&line);
-                // **`filled` is `None` when nothing matched**, and that is the whole reason
-                // it returns an `Option`: the common prefix of no candidates is the empty
-                // string, so applying it would replace the word with nothing. The first
-                // version did exactly that, and Tab on any unmatched word deleted it.
-                let Some(filled) = c.filled(&line) else { continue };
-                if filled != line {
-                    // Something unambiguous to add: type it for them. A lone candidate that
-                    // is not a directory also gets a space, since the word is finished and
-                    // the next one has to start somewhere; a directory does not, so a second
-                    // Tab descends into it.
-                    let mut new_line = filled;
-                    if c.candidates.len() == 1 && !new_line.ends_with('/') {
-                        new_line.push(' ');
-                    }
-                    let redraw = disc.replace_line(new_line.as_bytes());
-                    tty_write(tty, &redraw);
-                } else if c.candidates.len() > 1 {
-                    // Nothing left that they all agree on, so show the choice. The list goes
-                    // on its own lines and the prompt is written again beneath it — no cursor
-                    // addressing, which is what keeps this working on the serial console.
-                    tty_write(tty, &nxsh::complete::listing(&c.candidates));
-                    match pending.is_empty() {
-                        true => tty_write(
-                            tty,
-                            nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes(),
-                        ),
-                        false => {
-                            tty_write(tty, nxsh::repl::continuation_prompt().as_bytes())
+                // **The whole statement, not the physical line.** `disc` is reset per line
+                // while `pending` accumulates the earlier ones, so completing `line` alone
+                // makes every continuation line look like column 0 — and the second line of
+                // `format("{}",` would be offered command names instead of paths. A `\n` is
+                // not a word character, so a word cannot span the join and the completion's
+                // offsets stay inside the physical line (PR #291 review, 3).
+                let mut whole = pending.clone();
+                whole.push_str(&line);
+                let c = interp.complete(&whole);
+                // **What to do is `complete`'s answer, not this loop's.** `Nothing` covers
+                // both "nothing matched" and "nothing left to add": the common prefix of no
+                // candidates is the empty string, and a loop that applied it blindly deleted
+                // the word being typed, which is what the first version did.
+                match c.action(&whole) {
+                    nxsh::complete::Action::Nothing => {}
+                    nxsh::complete::Action::Replace(full) => {
+                        // `strip_prefix` rather than an index: if the accumulated half were
+                        // ever not a prefix of the result, doing nothing beats writing a
+                        // corrupted line.
+                        if let Some(new_line) = full.strip_prefix(pending.as_str()) {
+                            let redraw = disc.replace_line(new_line.as_bytes());
+                            tty_write(tty, &redraw);
                         }
                     }
-                    tty_write(tty, disc.line());
+                    nxsh::complete::Action::List => {
+                        // The list goes on its own lines and the prompt is written again
+                        // beneath it — no cursor addressing, which is what keeps this working
+                        // on the serial console.
+                        tty_write(tty, &nxsh::complete::listing(&c.candidates));
+                        match pending.is_empty() {
+                            true => tty_write(
+                                tty,
+                                nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes(),
+                            ),
+                            false => {
+                                tty_write(tty, nxsh::repl::continuation_prompt().as_bytes())
+                            }
+                        }
+                        tty_write(tty, disc.line());
+                    }
                 }
                 continue;
             }

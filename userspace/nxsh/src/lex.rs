@@ -807,19 +807,27 @@ fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-/// What may follow a leading `/` for it to be a path rather than division — and what
-/// [`crate::complete`] treats as the extent of the word under the cursor.
+/// What may follow a leading `/` for it to be a path rather than division.
 ///
-/// **The same question in both places**, which is why they share one answer rather than
-/// each keeping its own: a completion that disagreed with the lexer about where a word
-/// begins would offer to finish something the lexer then reads as two tokens.
-pub(crate) fn is_path_char(c: u8) -> bool {
+/// **Expression mode only, and narrower than [`is_word_char`].** It answers one question at
+/// one place — is this `/` a path or a division sign — and is not the general "what is a
+/// word" rule. Completion used it for that and got a word boundary the lexer does not
+/// share: `+` fails this test, so `cd my+not` was cut into `my+` and `not`, and Tab
+/// completed the tail into a path nobody typed (PR #291 review, 2).
+fn is_path_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'/')
 }
 
 /// What continues a bareword. Ends at whitespace and at the structure that can close an
 /// argument list — everything else, operators included, is ordinary text in a word.
-fn is_word_char(c: u8) -> bool {
+///
+/// **Also what [`crate::complete`] takes as the extent of the word under the cursor**, and
+/// shared rather than copied because it is genuinely the same question: an argument is
+/// lexed in word mode, so this is the run the shell will read as one token. A completion
+/// that cut the word anywhere else would either offer to finish something the lexer then
+/// reads as two tokens, or — the way round it actually failed — splice a candidate into the
+/// middle of a word the person had typed.
+pub(crate) fn is_word_char(c: u8) -> bool {
     !matches!(
         c,
         0 | b' ' | b'\t' | b'\r' | b'\n' | b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"'
@@ -841,7 +849,7 @@ fn starts_keyword(s: &[u8], kw: &[u8]) -> bool {
 /// — and the failure of a stale copy is silent, a keyword that simply never appears when you
 /// press Tab. Linear scan over 27 entries, on the same reasoning `Interp`'s scopes use: at
 /// this size it beats hashing, and identifiers are lexed one line at a time here.
-pub const KEYWORDS: &[(&str, Tok)] = &[
+pub(crate) const KEYWORDS: &[(&str, Tok)] = &[
     ("let", Tok::Let),
     ("mut", Tok::Mut),
     ("const", Tok::Const),

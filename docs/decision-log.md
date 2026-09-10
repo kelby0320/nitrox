@@ -24912,3 +24912,55 @@ which nothing on screen shows, and the second lists through it.
 That is the third time on this branch that a test has had to be aimed at where the two
 implementations *differ* rather than at where the feature is visible, and the first two were
 found by the same method: run the control before believing the test.
+
+
+---
+
+## 2026-09-10 — four comments that were arguments instead of code (nxsh M5 Part E)
+
+PR #291's review found five things, and four are one shape: **a rule stated in a doc comment
+rather than made true by the code.** Each comment was reasoning I had done and then written
+down; none of it was checked, and three of the four were wrong.
+
+**`common_prefix` panicked, under a comment explaining why it could not.** The scan was
+byte-wise and the doc argued that was safe — a split inside a character "would need two
+candidates agreeing on a leading byte and differing inside the same character — impossible".
+`é` is `C3 A9` and `è` is `C3 A8`. `日` is `E6 97 A5` and `文` is `E6 96 87`. A directory with
+two names differing in an accent made Tab slice mid-character, and in the shipped binary that
+reaches `#[panic_handler]`, prints `nxsh: panic` and exits — **a Tab press ends the login
+session**. The fix counts `len_utf8`, so the offset is a character boundary by construction.
+The lesson is not about UTF-8: a comment that argues an invariant holds is a claim, and a claim
+in a comment is the one kind that no test ever runs.
+
+**The word boundary was the wrong one of the lexer's two rules, under a comment saying they
+were the same question.** `is_path_char` decides whether a leading `/` is a path or a division
+sign, in *expression* mode. An argument is lexed in **word** mode, where the rule is
+`is_word_char` and far broader. `+` fails the narrow one, so `cd my+not<TAB>` cut the word into
+`my+` and `not`, completed the tail, and handed back `cd my+notes.txt` — a path the person never
+typed, silently substituted for what they did. Sharing the *right* rule costs nothing and every
+existing test survives the widening; sharing the wrong one and calling it "the same question"
+is what stopped the next reader from noticing.
+
+**A continuation line was completed as though it were a fresh prompt**, because the loop handed
+`complete` the physical line while the statement lived in `pending`. Both halves needed fixing:
+the loop passes the whole statement, and `position` now asks `needs_continuation` whether a
+newline separates two statements or continues one. That function lexes rather than counting
+brackets, so a `(` inside a string opens nothing here either — which is the reason to ask the
+language rather than write a second answer.
+
+**And the last decision left in the console loop had a hole in it.** Part C moved the layout to
+the library on the argument that a decision belongs where a host test can reach it, and left
+"insert, or list, or nothing" behind as two `if`s. A lone candidate equal to the word matched
+neither: `list notes.txt<TAB>` did nothing at all. It is `Completion::action` now, returning
+`Nothing`/`Replace`/`List`, and the loop is a `match` and a write. **The rule was right and I
+applied it to three of the four things in the loop** — the same partial sweep this branch's own
+Part A entry warns about, one commit later.
+
+**The fifth is the one that was only a comment**: the spec said several candidates "insert what
+they all agree on and then list the choice", which reads as one press doing both. It is two.
+
+**What to take from this.** Every one of these was a *comment I wrote to explain a decision*,
+and the decision was wrong in three cases out of four. A comment is where reasoning goes to
+stop being checked. When the reasoning is load-bearing — this cannot panic, these two questions
+are the same, this branch is unreachable — the answer is to make it a test or to make it
+structural, and to keep the comment for *why*, not for *therefore*.

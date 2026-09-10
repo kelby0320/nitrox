@@ -1282,6 +1282,18 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send_raw("\x03")?;
     s.expect("/home>")?;
 
+    //      **A continuation line completes as part of the statement it continues.** The
+    //      discipline is reset per physical line while the shell accumulates the earlier
+    //      ones, so a completion handed only the physical line sees column 0 and offers
+    //      command names inside an argument list. Nothing that starts with `Do` is a
+    //      command, so without the accumulated half this produces no listing at all.
+    s.send("format(\"{}\",")?;
+    s.expect("... ")?;
+    s.send_raw("Do\t")?;
+    s.expect("Documents/")?;
+    s.send_raw("\x03")?;
+    s.expect("/home>")?;
+
     //      And a word that matches nothing is **left alone**. This was the bug the `..`
     //      report found, and it was never about `..`: the common prefix of no candidates is
     //      the empty string, so Tab replaced the word with it and deleted what you had
