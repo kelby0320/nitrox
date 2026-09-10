@@ -1265,6 +1265,32 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home/Documents")?;
     s.send("cd /home")?;
     s.expect("/home>")?;
+
+    //      **`..` completes**, which is path syntax rather than a directory entry — nothing
+    //      in a listing is called `..`, so it can only come from completion knowing what a
+    //      path is.
+    //
+    //      **Two Tabs, and the first one is the test.** `cd ..` has to become `cd ../`,
+    //      which is not directly observable — so the second Tab lists through it, and
+    //      `../bin/` is a token that can appear nowhere else. Written as one Tab on `cd ../`
+    //      this step passed with the dot entries removed: an already-slashed word has an
+    //      *empty* fragment and never asks about `..` at all, so it was testing path
+    //      resolution and reporting it as completion.
+    s.send_raw("cd ..\t")?;
+    s.send_raw("\t")?;
+    s.expect("../bin/")?;
+    s.send_raw("\x03")?;
+    s.expect("/home>")?;
+
+    //      And a word that matches nothing is **left alone**. This was the bug the `..`
+    //      report found, and it was never about `..`: the common prefix of no candidates is
+    //      the empty string, so Tab replaced the word with it and deleted what you had
+    //      typed. If that came back, the line here would be empty and the shell would answer
+    //      a bare Enter with a prompt rather than with this.
+    s.send_raw("zzz\t")?;
+    s.send("")?;
+    s.expect("could not resolve `zzz`")?;
+    s.expect("/home>")?;
     steps += 1;
 
     // 20. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is

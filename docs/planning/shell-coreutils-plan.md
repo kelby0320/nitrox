@@ -1513,6 +1513,27 @@ short of what the design already said, and neither was visible from inside the t
       `main.rs` beside the `write`, where no host test builds it; how many fit on a row and how
       the cut is reported are decisions, and a boot is the wrong price for checking them.
 
+- [x] **Part D — `..`, and the word Tab was deleting** ✅ (2026-09-10), both reported from using
+      it: "`cd ..<TAB>` should show a list of completions, but it currently just erases the
+      `..`".
+
+      **`.` and `..` are path syntax, not directory contents**, which is why they were missing:
+      `libfs::list_dir` filters them out and the file browser does not show them, so they cannot
+      arrive with a listing. They are offered when the *fragment* begins with a dot — somebody
+      spelling one — and not for a bare `list <TAB>`, which asks what is in here and must not
+      answer with syntax.
+
+      **The erasure was the worse half and was never about `..`.** The common prefix of no
+      candidates is the empty string, and the console loop substituted it for the word — so Tab
+      on *anything* unmatched deleted what you had typed. `Completion::filled` returns `None`
+      now, which makes it unrepresentable rather than a rule every caller has to remember.
+
+      **The gate's first version passed with the fix removed.** It pressed Tab on `cd ../`,
+      which has an *empty* fragment and never asks about `..` at all — it was testing path
+      resolution and reporting it as completion. Two Tabs on the unslashed `cd ..` is the test:
+      the first has to produce `../`, which is not directly observable, so the second lists
+      through it.
+
 ---
 
 ## Part 3 — First-session checklist (for the forked work)

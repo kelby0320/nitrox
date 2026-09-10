@@ -947,7 +947,11 @@ fn repl(
             if b == b'\t' {
                 let line = String::from_utf8_lossy(disc.line()).into_owned();
                 let c = interp.complete(&line);
-                let filled = c.apply(&line, c.common_prefix());
+                // **`filled` is `None` when nothing matched**, and that is the whole reason
+                // it returns an `Option`: the common prefix of no candidates is the empty
+                // string, so applying it would replace the word with nothing. The first
+                // version did exactly that, and Tab on any unmatched word deleted it.
+                let Some(filled) = c.filled(&line) else { continue };
                 if filled != line {
                     // Something unambiguous to add: type it for them. A lone candidate that
                     // is not a directory also gets a space, since the word is finished and

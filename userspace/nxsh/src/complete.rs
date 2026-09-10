@@ -116,14 +116,26 @@ pub fn split_path(word: &str) -> (&str, &str) {
 ///
 /// **The trailing slash is what makes a second Tab descend**, and it is also the only signal
 /// in a flat list that a name is a place rather than a thing.
+///
+/// **`.` and `..` are considered alongside `names`, but only for a dotted fragment.** They are
+/// not directory *contents* — `libfs::list_dir` filters them out and the file browser does not
+/// show them — so a bare `list <TAB>`, which asks what is in here, must not answer with them.
+/// They are how a path spells *where you are* and *where you came from*, and a fragment
+/// beginning with a dot is somebody spelling one: `cd ..<TAB>` used to erase the `..` rather
+/// than offer the parent, which is what this is for.
 pub fn matching_paths(dir: &str, frag: &str, names: &[(String, bool)]) -> Vec<String> {
-    let mut out: Vec<String> = names
-        .iter()
+    /// Both are directories, which is what gives them their trailing slash.
+    const DOTS: [(&str, bool); 2] = [(".", true), ("..", true)];
+
+    let dots = DOTS.iter().filter(|_| frag.starts_with('.')).map(|(n, d)| (*n, *d));
+    let listed = names.iter().map(|(n, d)| (n.as_str(), *d));
+    let mut out: Vec<String> = dots
+        .chain(listed)
         .filter(|(n, _)| n.starts_with(frag))
         .map(|(n, is_dir)| {
             let mut s = String::from(dir);
             s.push_str(n);
-            if *is_dir {
+            if is_dir {
                 s.push('/');
             }
             s
@@ -188,6 +200,23 @@ impl Completion {
         let mut out = String::from(&line[..self.start]);
         out.push_str(text);
         out
+    }
+
+    /// `line` with the word replaced by everything the candidates agree on, or `None` when
+    /// there is nothing to replace it with.
+    ///
+    /// **`None` rather than the line with the word deleted.** [`common_prefix`] of no
+    /// candidates is the empty string, so a caller that applies it blindly *erases* the word
+    /// being typed — which is what the first version of the console loop did, making Tab on
+    /// any unmatched word delete it. A `Some`/`None` here is the difference between a rule
+    /// every caller has to remember and one it cannot get wrong.
+    ///
+    /// [`common_prefix`]: Self::common_prefix
+    pub fn filled(&self, line: &str) -> Option<String> {
+        match self.candidates.is_empty() {
+            true => None,
+            false => Some(self.apply(line, self.common_prefix())),
+        }
     }
 }
 
@@ -334,6 +363,65 @@ mod tests {
             vec![String::from("notes.txt")],
             "a file gets no trailing slash — only a place you can go into does"
         );
+    }
+
+    /// `.` and `..` complete, because they are path syntax the person has already begun.
+    ///
+    /// **Reported from using it**: `cd ..<TAB>` erased the `..` instead of offering the
+    /// parent. They are not *entries* — `libfs::list_dir` filters them out, and the file
+    /// browser does not show them — so they cannot arrive with the listing; but a fragment
+    /// that starts with a dot is somebody spelling one of them, and completing what they
+    /// have begun is the whole job.
+    #[test]
+    fn the_parent_and_the_current_directory_complete() {
+        let entries = names(&[("Documents", true), ("notes.txt", false)]);
+        assert_eq!(matching_paths("", "..", &entries), vec![String::from("../")]);
+        assert_eq!(
+            matching_paths("", ".", &entries),
+            vec![String::from("../"), String::from("./")],
+            "a lone dot is the start of both"
+        );
+        // Deeper in a path, they are the same two.
+        assert_eq!(matching_paths("/home/", "..", &entries), vec![String::from("/home/../")]);
+    }
+
+    /// …and they are **not** offered as contents when nothing was typed.
+    ///
+    /// `list <TAB>` asks what is in this directory. `.` and `..` are not in it — they are
+    /// how you spell where you are and where you came from — so putting them in that answer
+    /// would be putting syntax in a listing.
+    #[test]
+    fn a_bare_tab_does_not_offer_dot_entries() {
+        let entries = names(&[("Documents", true), ("notes.txt", false)]);
+        assert_eq!(
+            matching_paths("", "", &entries),
+            vec![String::from("Documents/"), String::from("notes.txt")],
+        );
+        // Nor does a fragment that is not itself dotted, even one containing a dot.
+        assert_eq!(matching_paths("", "notes.", &entries), vec![String::from("notes.txt")]);
+    }
+
+    /// A hidden name and the dot entries share a prefix and all three are offered.
+    #[test]
+    fn a_dotted_fragment_matches_hidden_names_too() {
+        let entries = names(&[(".config", true), ("notes.txt", false)]);
+        assert_eq!(
+            matching_paths("", ".", &entries),
+            vec![String::from("../"), String::from("./"), String::from(".config/")],
+        );
+    }
+
+    /// Nothing matched means the line is left exactly as it was typed.
+    ///
+    /// **This is the bug the `..` report actually found.** `common_prefix` of no candidates
+    /// is the empty string, and substituting it for the word *deletes* the word — so Tab on
+    /// anything unmatched erased what you had written. `filled` makes that unrepresentable
+    /// rather than leaving it to every caller to remember.
+    #[test]
+    fn a_completion_that_found_nothing_changes_nothing() {
+        assert_eq!(Completion::none(3).filled("cd zz"), None);
+        let one = Completion { start: 3, candidates: vec![String::from("zzz")] };
+        assert_eq!(one.filled("cd zz").as_deref(), Some("cd zzz"));
     }
 
     #[test]

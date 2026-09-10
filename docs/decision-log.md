@@ -24879,3 +24879,36 @@ design, only a mechanism: nothing in the RS protocol asks a program what flags i
 Schema-aware field completion needs the schema work §11c always said it did. And the listing is
 wrapped at 80 columns because nothing tells this shell how wide its terminal is — the tty
 protocol carries no size and `nxterm`, which knows its own grid, has no way to say so.
+
+
+---
+
+## 2026-09-10 — the Tab that deleted your word (nxsh M5 Part D)
+
+**"`cd ..<TAB>` should show a list of completions, but it currently just erases the `..`."** Two
+bugs, and the reported one is the smaller.
+
+**`.` and `..` were missing because they are not directory contents.** `libfs::list_dir` filters
+them out and the file browser does not show them, so nothing that lists a directory can ever
+produce them — they are how a path spells *where you are* and *where you came from*. Completion
+offers them when the fragment begins with a dot, which is somebody spelling one, and not for a
+bare `list <TAB>`, which asks what is in here and would otherwise be answered with syntax.
+
+**The erasure was never about `..`.** `common_prefix` of no candidates is the empty string, and
+the console loop substituted it for the word — so Tab on *any* unmatched word deleted what had
+been typed. `..` is simply the unmatched word a person is most likely to try. The fix is
+`Completion::filled` returning `Option`: with nothing to offer there is no line to produce, so
+the loop cannot erase. **Unrepresentable beats documented** — the alternative was a comment
+telling every future caller not to apply an empty prefix, which is the kind of rule that holds
+until the second caller.
+
+**The gate's first version passed with the fix removed, and the reason is worth keeping.** It
+pressed Tab on `cd ../` — already slashed, so `split_path` gives an **empty** fragment and the
+dot entries are never consulted. It was exercising path resolution and reporting it as
+completion: a green test for a feature that did not exist. What distinguishes them is the
+unslashed word, so the step presses Tab twice on `cd ..` — the first has to turn it into `../`,
+which nothing on screen shows, and the second lists through it.
+
+That is the third time on this branch that a test has had to be aimed at where the two
+implementations *differ* rather than at where the feature is visible, and the first two were
+found by the same method: run the control before believing the test.

@@ -3846,6 +3846,46 @@ x"), "5");
         assert!(i.complete("list /nowhere/x").candidates.is_empty());
     }
 
+    /// `..` completes to the parent, and a second Tab lists what is in it.
+    ///
+    /// **Reported from using it**: `cd ..<TAB>` erased the `..`. Two things were wrong —
+    /// `..` was not a candidate at all, and a completion that found nothing replaced the
+    /// word with the empty string instead of leaving it alone.
+    #[test]
+    fn the_parent_directory_completes_and_then_lists() {
+        let mut i = completing();
+        // `..` is a directory, so it gains a slash rather than a space…
+        assert_eq!(i.complete("cd ..").candidates, alloc::vec![String::from("../")]);
+        // …and the slash is what makes the next Tab a listing of the parent, which from
+        // `/home` is the root.
+        assert_eq!(
+            i.complete("cd ../").candidates,
+            alloc::vec![String::from("../bin/"), String::from("../home/")],
+        );
+        // A dot alone is the start of both, and `.` is a real place to name.
+        assert_eq!(
+            i.complete("cd .").candidates,
+            alloc::vec![String::from("../"), String::from("./")],
+        );
+        // Through a `..` to something under it.
+        assert_eq!(i.complete("cd ../ho").candidates, alloc::vec![String::from("../home/")]);
+    }
+
+    /// A word that matches nothing leaves the line exactly as it was typed.
+    ///
+    /// The bug the `..` report actually found, and it was never about `..`: any unmatched
+    /// word was replaced by the empty common prefix. `filled` returns `None` so that the
+    /// console loop cannot do it.
+    #[test]
+    fn a_completion_that_matches_nothing_leaves_the_word_alone() {
+        let mut i = completing();
+        for line in ["cd zzz", "zzz", "list /home/zzz"] {
+            let c = i.complete(line);
+            assert!(c.candidates.is_empty(), "{line} should match nothing");
+            assert_eq!(c.filled(line), None, "{line} would have had its word erased");
+        }
+    }
+
     /// A word with a slash in it is a path even at the head of a stage.
     ///
     /// `./script.nx` and `/bin/list` are commands written as paths, and this shell has no
