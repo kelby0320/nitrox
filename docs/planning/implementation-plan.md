@@ -28,12 +28,25 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 1 — Kernel substrate | [phase-1-kernel-substrate.md](phase-1-kernel-substrate.md) | ✅ complete |
 | 2 — Filesystem and namespace | [phase-2-filesystem-namespace.md](phase-2-filesystem-namespace.md) | ✅ complete (2026-06-26) |
 | 3 — Service ecosystem | [phase-3-service-ecosystem.md](phase-3-service-ecosystem.md) | ✅ complete (2026-07-21) |
-| 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | 🚧 active |
+| 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
+| 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | 🚧 active |
+| 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
+| 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
+| 8 — Networking | [phase-8-networking.md](phase-8-networking.md) | planned |
+| 9 — The browser | [phase-9-browser.md](phase-9-browser.md) | planned |
+
+**Phases 5–9 were shaped in two passes.** The 2026-08-25 pass split what remained of Phase 4's
+open-ended list into a portable runtime, networking, and the browser. The 2026-09-10 pass put
+**bare metal and USB in front of them**, because everything built so far has only ever run
+under an emulator and every later phase inherits that ambiguity — a `std::thread` bug and an
+interrupt-routing bug look identical from userspace. See the decision log for both.
 
 **Subproject plans** (detailed breakdowns that hang off a phase):
 
 - [shell-coreutils-plan.md](shell-coreutils-plan.md) — the typed shell + coreutils (a Phase 4
   subproject; assumes the Phase 4 CLI substrate prereqs are built first).
+- [display-arm-plan.md](display-arm-plan.md) — the compositor, toolkit and applications
+  (a Phase 4 subproject; Milestones 1–15, complete).
 
 ## Current status
 
@@ -54,7 +67,12 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   Definition-of-Done clauses (libstream + typed-log demo; the `/proc` scheduler-stats surface). The
   remaining backlog services are consumer-driven and defer to Phase 4. `std` is a serious
   compatibility target (2026-07-20 std stance).
-- **Phase 4 (a usable windowed desktop → browser, networking, sysadmin):** 🚧 active.
+- **Phase 4 (a usable windowed desktop):** ✅ **complete (2026-09-10)** — a release image
+  reaches a graphical greeter, a login starts a session, and `nxterm`, `nxfiles` and `nxedit`
+  run with menus, dialogs, a file chooser, syntax highlighting, scrollbars and a clipboard
+  between them, held by six gates. The Definition of Done was written on the day it closed and
+  is in [phase-4-desktop.md](phase-4-desktop.md); the phase's title used to end "→ browser,
+  networking, sysadmin", and those three are now Phases 7–9.
   - **Substrate hardening** (the concurrency-review gate into Phase 4) — ✅ done (Parts A–F, F1–F12
     fixed; decision log 2026-07-21).
   - **Floating-point + SIMD enablement** — ✅ done (Parts A–D; per-thread XSAVE, hard-float userspace
@@ -62,7 +80,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **CLI substrate prereqs** — directory ops, `Value` collection types, and the stdio/pipe
     convention (plus the `parent`/`child` retirement into a conforming test harness) — ✅ done
     (2026-07-23/24). See [phase-4-desktop.md](phase-4-desktop.md) → "CLI substrate prereqs".
-  - **The typed shell + coreutils subproject** — 🚧 active from 2026-07-24. **Milestones 1,
+  - **The typed shell + coreutils subproject** — ✅ complete, from 2026-07-24. **Milestones 1,
     2, 3 and 3.5 complete**: the coreutils, the `nxsh` interpreter, and the shell as the
     login leaf (2026-07-31). **Milestone 4 — language completeness — planned 2026-08-04**
     from an audit of the built language against the design doc (now v1.2); it carries one
@@ -73,7 +91,7 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **Substrate gaps it surfaced** — exit-time handle reclamation, the wall clock, and file
     truncate — all ✅ (2026-07-24). See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
     gaps surfaced by the coreutils subproject".
-  - **The display arm** — 🚧 in progress (**M1–M4 complete**: pixels + the gate 2026-08-05,
+  - **The display arm** — ✅ **complete (Milestones 1–15, 2026-09-10)**. (**M1–M4**: pixels + the gate 2026-08-05,
     a client with a surface 2026-08-06, input end to end 2026-08-10, the widget toolkit
     2026-08-11. **M5 — the GUI terminal — ✅ complete (2026-08-13)**: Part A (terminal semantics —
     `libterm`'s parser, grid, render and encoder, plus the blend that unblocked antialiasing)
@@ -259,11 +277,23 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     [docs/architecture/ui-composition-model.md](../architecture/ui-composition-model.md);
     build order in [display-arm-plan.md](display-arm-plan.md). Milestone 1 is the test
     gate: the compositor composites a known scene and host and guest agree on the hash.
-  - **Now: pre-CLI substrate hardening** (the deferral audit, 2026-07-24) — four slices
-    landing before coreutils Milestone 2: trustworthy deferral docs + CI running the QEMU
-    gate; the demand-fault path (fill cookie, read-ahead, blocking second faulter, shared
-    file-backed text); fs/ext4 completeness for M2; and the now-triggered hygiene items.
+  - **Pre-CLI substrate hardening** (the deferral audit, 2026-07-24) — ✅ done: trustworthy
+    deferral docs + CI running the QEMU gate; the demand-fault path (fill cookie, read-ahead,
+    blocking second faulter, shared file-backed text); fs/ext4 completeness for M2; and the
+    now-triggered hygiene items.
     See [phase-4-desktop.md](phase-4-desktop.md) → "Pre-CLI substrate hardening".
+
+- **Phase 5 (Bare metal):** 🚧 **active from 2026-09-10** — the first phase whose goal is a
+  machine rather than a feature. Target: an Acer Aspire A315-51 (i5-7200U, 6 GB, 1 TB SATA),
+  whose hardware was surveyed before the plan was written; the details and what each row means
+  for Nitrox are in [phase-5-bare-metal.md](phase-5-bare-metal.md).
+  - The order is **MSI → an on-screen kernel console → a live image → a hardware report → the
+    laptop's own resolution → the first boot → cache attributes → the installer**, and all but
+    the last three land under existing gates before the machine is plugged in.
+  - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
+    INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
+    it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness
+    unblocker.
 
 ---
 

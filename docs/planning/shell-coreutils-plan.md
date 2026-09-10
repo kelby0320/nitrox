@@ -1,9 +1,13 @@
 # Nitrox Shell & Coreutils — Subproject Plan
 
-**Status:** 🚧 active (started 2026-07-24; Milestones 1, 2, 3 and 3.5 complete — the shell is the
-login leaf as of 2026-07-31 — and **Milestone 4, language completeness, planned 2026-08-04**). The three CLI substrate prereqs (§1C) are
-all in, so the milestones below are unblocked. This is a large, multi-slice subproject running in
-its own Claude Code session(s); this document is the entry point for that work.
+**Status:** ✅ **complete — Milestones 1, 2, 3, 3.5, 4 and 5** (2026-07-24 to 2026-09-10): the
+coreutils, the `nxsh` interpreter, the shell as the login leaf (2026-07-31), language
+completeness (2026-08-04), and what using it asked for (2026-09-10). A
+[Phase 4](phase-4-desktop.md) subproject, closed with it.
+
+What remains is deferred with triggers rather than owed: schema-aware completion needs the
+schema work, job control needs process groups, and the rest is in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md) and design §12.
 
 ## What this is
 
@@ -130,7 +134,7 @@ producer/consumer pair in QEMU). **Do not start the milestones below until they 
 call in C3 (raise `SPAWN_MAX_HANDLES` vs. stack-resident bootstrap block) must be recorded in the
 decision log when it's made.
 
-### Milestone 1 — the first coreutils (first integrated proof)
+### Milestone 1 — the first coreutils (first integrated proof) ✅ complete (2026-07-24)
 
 Two **native** coreutils that exercise the whole substrate end to end — the first real subproject
 deliverable, and the first time the prereqs are proven *integrated* rather than in isolation:
@@ -195,7 +199,7 @@ demo drains a stage's stream before reaping it, and `list`'s demo requires a pla
 date. The remaining known timestamp gap is `mtime` on an **in-place overwrite**, which Model A
 hides from the fs-server (`deferred-decisions.md`).
 
-### Milestone 2 — coreutils breadth
+### Milestone 2 — coreutils breadth ✅ complete
 
 The rest of §10c: `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` (resolve
 B2 here). Each native, each a TSM1 stage. Aliasing (§10e) is namespace-bind data, not a program.
@@ -447,7 +451,7 @@ was the fixture rather than the feature — a second writable mount, met by bind
 fs-server again at its own subtree base — and with somewhere to test it, the recursive directory
 case took shared tree walks rather than a third copy of the loop.
 
-### Milestone 3 — the interpreter (`nxsh`)
+### Milestone 3 — the interpreter (`nxsh`) ✅ complete
 
 Lexer → parser (§8/§9) → tree-walking evaluator → generic operators → the process boundary → a
 minimal REPL. Float formatting (C6) lands here. This is the largest milestone in the subproject and
@@ -687,7 +691,7 @@ also lands.
 schema-aware completion, and everything in §12. `usersh` stays the login leaf until Part F proves
 `nxsh` in-guest; switching `session-mgr` over is the last step, not the first.
 
-### Milestone 3.5 — what a child inherits (B3 + `cd`)
+### Milestone 3.5 — what a child inherits (B3 + `cd`) ✅ complete (2026-07-31, the login leaf)
 
 **Sequenced after Part G, and designed with the maintainer 2026-07-30.** B3 was nominally
 Milestone 3 scope ("resolve as it comes up") and never came up. Three items filed
@@ -1050,7 +1054,7 @@ a closer, so there is no right operand and division is *impossible*.
 those. `list /` at the prompt shows `home`, `bin`, `session`, `dev` — the four bindings
 the session was built with, and nothing else.*
 
-### Milestone 4 — language completeness (planned 2026-08-04)
+### Milestone 4 — language completeness ✅ complete (2026-08-04)
 
 **Where this came from.** Not a feature wish-list: an audit of the *built* language against the
 design doc, run by driving the interpreter rather than reading the grammar — which is how items
@@ -1444,7 +1448,7 @@ Process management (`ps`/`kill` — needs the "how does a command acquire a capa
 process it didn't spawn" design pass), networking tools (netstack deferred), user-definable aliases
 with baked-in arguments, package system beyond single-file `use`, circular-import resolution.
 
-### Milestone 5 — what using it asked for (2026-09-10)
+### Milestone 5 — what using it asked for ✅ complete (2026-09-10)
 
 **Both items came from the maintainer using the shell**, which is where the last three parts of the
 display arm's M15 came from too. Neither is a gap in the design: §11c specified tab completion and

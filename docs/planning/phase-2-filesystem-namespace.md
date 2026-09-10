@@ -1,8 +1,8 @@
 # Nitrox Implementation Plan — Phase 2 — Filesystem and namespace
 
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
-current status, the full phase list, and the cross-cutting workstreams. Phases 0–3 are
-complete; Phase 4 is active.
+current status, the full phase list, and the cross-cutting workstreams. Phases 0–4 are
+complete; Phase 5 is active.
 
 ---
 

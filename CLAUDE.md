@@ -99,8 +99,9 @@ every build and zero test cfgs, and its login proof lives here as steps 5a–5c.
 it behaves in a release one. `docs/planning/test-path-retrofit.md` is the plan that made that
 true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to one — and
 it is complete. The one left is `init`'s `/subtreetest` binding, which needs a **bind-mount
-concept in `init.toml`** and is deferred past that plan as capability work; the box naming it is
-still open there.
+concept in `init.toml`**; it was deferred past that plan as capability work and is **scheduled
+as Phase 5 Part C** (`docs/planning/phase-5-bare-metal.md`), because the live image needs the
+same mechanism — its `/bin` is a subtree bind of the in-kernel `/initramfs` endpoint.
 
 `cargo xtask check-images` is what keeps the property: it fails if a test image and a release
 image start differing in anything new.
@@ -290,4 +291,4 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phases 0–3 (foundation, kernel substrate, boot-to-userspace, service ecosystem) are **complete** (Phase 3 closed 2026-07-21). Phase 4 (toward a usable windowed desktop) is next. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
+Phases 0–4 (foundation, kernel substrate, boot-to-userspace, service ecosystem, a usable windowed desktop) are **complete** (Phase 4 closed 2026-09-10). **Phase 5 — bare metal — is active**: everything so far has only ever run under QEMU, and the target is a real laptop (`docs/planning/phase-5-bare-metal.md`). Phases 6–9 are USB, the portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

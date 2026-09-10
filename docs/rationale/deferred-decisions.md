@@ -71,11 +71,26 @@ loader (`export!` table, ELF relocation, ABI-hash enforcement) which is itself
 deferred (see "Kernel module infrastructure" above). Trigger: hot-pluggable or
 optional hardware that isn't on the boot path.
 
+> **The trigger fires in Phase 6** (2026-09-10). Every driver Nitrox has is on the boot path;
+> USB devices are the first that are not, and they arrive as several consumers at once (HID,
+> mass storage, per-device), which is the condition this project builds an abstraction under.
+> See [`phase-6-usb.md`](../planning/phase-6-usb.md).
+
 **MSI / MSI-X (message-signalled interrupts).** Phase 2 routes device
 interrupts through the IOAPIC (legacy line interrupts), which is sufficient for
 the QEMU AHCI controller. MSI/MSI-X (and the per-vector affinity they enable)
 land when a device needs them. Trigger: NVMe, multi-queue NICs, or performance
 work on interrupt-heavy devices.
+
+> **Scheduled as Phase 5 Part A (2026-09-10), and the trigger above turned out to be the
+> wrong one.** This is filed as performance work; on real hardware it is a **correctness**
+> unblocker. The AHCI driver takes its GSI from the PCI interrupt-line register, which QEMU's
+> firmware programs and real UEFI frequently does not — the authoritative routing is the ACPI
+> DSDT's `_PRT`, which needs AML, which means ACPICA. MSI needs none of that: the device is
+> told a vector and a LAPIC address and writes it itself. The target laptop is evidence
+> rather than argument — Linux drives its AHCI and xHCI over MSI
+> (`IR-PCI-MSI-0000:00:17.0`) and leaves only the i8042 on the IOAPIC. See
+> [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
 
 **A dedicated arch trait for the device-interrupt *installation* facility.**
 `install_pci_irq` (the composite that registers a handler in the arch vector
@@ -95,6 +110,11 @@ justify the trait (the project builds an abstraction at its second consumer); th
 assumes each handled GSI has one owner. MSI/MSI-X are never shared, so this only
 matters for legacy INTx sharing. Trigger: real hardware where INTx lines are
 shared across functions.
+
+> **Likely to be closed by removal rather than by building it** (2026-09-10). Phase 5 Part A
+> moves PCI devices to MSI, and an MSI vector is never shared — so the population this entry
+> covers shrinks to devices that are not MSI-capable. Revisit when the first such device
+> appears, and if none does, retire this.
 
 **IOMMU programming and userspace drivers.** Granting a `DeviceNode` /
 `InterruptObject` to a userspace driver process safely requires programming the
@@ -1312,6 +1332,10 @@ not only in the doc that decided it.
   operators alone is not the trade.
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
+> **The workflow arrived from a different direction** (2026-09-10): a USB thumb drive is
+> FAT32, so Phase 6 needs this whether or not anybody ever updates a bootloader in place. The
+> ESP-write case comes free with it, and Phase 5's installer would like it.
+
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
 of a directory for a record with enough slack before appending a new block, and the server
 caches nothing between calls — so filling a directory with N entries re-reads its blocks N
@@ -1414,6 +1438,12 @@ reorder them in ways a device does not expect.
 Fixing it needs a cache-attribute field on `MemoryObject`, a way for the namespace server to set
 it, and a PAT or MTRR story. **Trigger: the first boot on real hardware**, which is also the first
 time anybody could observe it.
+
+> **Scheduled as Phase 5 Part G** (2026-09-10), deliberately *after* the first boot rather than
+> before it: the trigger is observation, and picking an attribute blind would be guessing at
+> what this framebuffer wants. The target machine's is a GOP linear framebuffer at
+> `0xa0000000`, 1366×768×32 with a **padded pitch of 5504** — the padding is already handled,
+> the caching is not.
 
 **An icon set — `TODO(icon-set)` <!-- check-deferrals: no-code-site -->.** The window controls are
 drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming

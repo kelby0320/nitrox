@@ -1,8 +1,8 @@
 # Nitrox Implementation Plan — Phase 1 — Kernel substrate
 
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
-current status, the full phase list, and the cross-cutting workstreams. Phases 0–3 are
-complete; Phase 4 is active.
+current status, the full phase list, and the cross-cutting workstreams. Phases 0–4 are
+complete; Phase 5 is active.
 
 ---
 
@@ -246,7 +246,7 @@ silent reset.
       — **landed in Phase 4** (2026-07-21, `phase-4/fp-enablement` Part A), ahead
       of its first hard-float userspace consumer rather than gated on it. Eager
       `XSAVE`/`XRSTOR` (FXSAVE fallback) in `sched::switch_into`; per-CPU enable in
-      `arch::fpu_init_cpu`. See the Phase 4+ "Floating-point + SIMD" section and
+      `arch::fpu_init_cpu`. See [Phase 4](phase-4-desktop.md)'s "Floating-point + SIMD" section and
       the decision log (2026-07-21).
 - [x] Context switch emitted from Rust as a `#[unsafe(naked)]`
       `context_switch` (`kernel/src/arch/x86_64/context.rs`), **not** NASM —
