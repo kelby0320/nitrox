@@ -469,10 +469,10 @@ impl App {
             next_key: TAB_KEY_BASE + 1,
             new_window: false,
             quit: false,
-            menus: // **Zero, because the length is set every frame.** `set_anchors` replaces this
+            // **Zero, because the length is set every frame.** `set_anchors` replaces this
             // vector before anything reads it, and sizing it here from a constant is
             // what drifted (M15 Part E).
-            MenuState::new(0),
+            menus: MenuState::new(0),
             focused: true,
             metrics,
             // `libterm`'s ANSI palette — the sixteen colours a program addresses with
@@ -3082,9 +3082,9 @@ mod tests {
         let l = layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
         let n = a.menu_count();
         assert!(n >= 2, "a bar with fewer than two menus is not this window's");
-        a.menus.set_anchors(
-            (0..n).map(|i| locate(&view, &l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        // **Through the method the binary calls**, which is the whole point of it being a
+        // method: the loop that was wrong lived in a `main.rs` no test builds.
+        a.place_menus(&view, &l);
         for i in 0..n {
             a.menus.toggle(i);
             assert_eq!(a.menus.open(), Some(i));

@@ -180,7 +180,17 @@ pub enum Node<Msg> {
     ///
     /// It measures as its child, so a `center` that is *given* only what it asked for changes
     /// nothing; centring happens in the space a parent hands it beyond that.
+    ///
+    /// **Down is always; across is a choice.** A label on a button wants both. A label *beside*
+    /// a control — the chooser's path next to its up button — wants the vertical half only:
+    /// centred across as well, a short path floats in the middle of the dialog and its left edge
+    /// moves with the length of the string.
     Center {
+        /// Whether the child is centred across its rectangle as well as down it.
+        ///
+        /// `false` leaves it at the rectangle's left edge, where a run of text belongs when
+        /// something else in the row is what the eye follows.
+        across: bool,
         /// The child.
         child: Box<Element<Msg>>,
     },
@@ -442,7 +452,7 @@ impl<Msg> Element<Msg> {
             | Node::Sized { child, .. }
             | Node::Offset { child, .. }
             | Node::Ink { child, .. }
-            | Node::Center { child } => (&[], Some(child), None),
+            | Node::Center { child, .. } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
         let docked: Option<&Vec<Docked<Msg>>> = match &self.node {
@@ -516,7 +526,16 @@ pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
 
 /// A child in the middle of its parent's rectangle — see [`Node::Center`].
 pub fn center<Msg>(child: Element<Msg>) -> Element<Msg> {
-    Element::new(Node::Center { child: Box::new(child) })
+    Element::new(Node::Center { across: true, child: Box::new(child) })
+}
+
+/// A child centred *down* its parent's rectangle and left where it starts across it — see
+/// [`Node::Center`].
+///
+/// What a label beside a control wants: it sits on the control's middle whatever the theme's
+/// text size is, without its left edge drifting with the length of the string.
+pub fn center_v<Msg>(child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Center { across: false, child: Box::new(child) })
 }
 
 /// A child drawn in `colour` — see [`Node::Ink`].

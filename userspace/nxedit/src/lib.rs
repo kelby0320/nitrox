@@ -772,10 +772,10 @@ impl App {
             replaced: 0,
             new_window: false,
             quit: false,
-            menus: // **Zero, because the length is set every frame.** `set_anchors` replaces this
+            // **Zero, because the length is set every frame.** `set_anchors` replaces this
             // vector before anything reads it, and sizing it here from a constant is
             // what drifted (M15 Part E).
-            MenuState::new(0),
+            menus: MenuState::new(0),
             next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
@@ -2600,6 +2600,49 @@ mod tests {
         }
         assert!(a.buf().text.offset() > after_press, "the drag did not follow the pointer");
         assert_eq!(a.buf().text.cursor(), before, "a scrollbar drag moved the caret");
+    }
+
+    /// Typing brings the view back to the caret, however far it was scrolled away.
+    ///
+    /// **The regression Part D introduced and Part B made reachable** (PR #290 review, 1).
+    /// `ensure_visible` keyed its "already followed" flag on the cursor's *line*, and typing does
+    /// not change the line — so after a scrollbar drag the guard fired on every repaint, the
+    /// character went into line 0, and the person went on looking at line 142. Before this branch
+    /// a text area had no scrollbar and no wheel, so there was no way to scroll away from the
+    /// caret at all.
+    #[test]
+    fn typing_brings_the_view_back_to_the_caret() {
+        let mut a = App::new("/home/notes.txt", "/home");
+        let text: String = (0..200).map(|i| alloc::format!("line {i}\n")).collect();
+        a.loaded(&text, text.as_bytes());
+        let visible = (a.area_h() / ROW_H) as usize;
+
+        // A frame first, as the application draws one before anything is touched — otherwise
+        // the *first* `ensure_visible` is the one that follows, and the scroll below never
+        // happened from the widget's point of view.
+        a.buf_mut().text.ensure_visible(visible);
+        // Scroll a long way from the caret, which is at (0, 0).
+        a.buf_mut().text.scroll_to(142, visible);
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(a.buf().text.offset(), 142, "precondition: scrolled away and staying there");
+
+        // Now type. The character lands on line 0 — where the caret is — so the view has to
+        // come back to it, which is what every editor does.
+        type_into(&mut a, "a");
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(
+            a.buf().text.offset(),
+            0,
+            "the character went into a line the person cannot see"
+        );
+
+        // And moving the caret does the same, even without changing its line.
+        a.buf_mut().text.scroll_to(142, visible);
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(a.buf().text.offset(), 142, "precondition: scrolled away again");
+        press_key(&mut a, libkern::abi::KEY_RIGHT);
+        a.buf_mut().text.ensure_visible(visible);
+        assert_eq!(a.buf().text.offset(), 0, "a caret that moved was left off screen");
     }
 
     /// A document scroll survives the repaint that follows it — see `nxfiles`' twin of this.
@@ -4476,9 +4519,9 @@ mod tests {
         let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
         let n = a.menu_count();
         assert!(n >= 2, "a bar with fewer than two menus is not this window's");
-        a.menus.set_anchors(
-            (0..n).map(|i| libui::layout::locate(&view, &l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        // **Through the method the binary calls**, which is the whole point of it being a
+        // method: the loop that was wrong lived in a `main.rs` no test builds.
+        a.place_menus(&view, &l);
         for i in 0..n {
             a.menus.toggle(i);
             assert_eq!(a.menus.open(), Some(i));

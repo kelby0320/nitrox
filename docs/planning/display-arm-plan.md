@@ -5196,8 +5196,10 @@ that opened nothing, silently, since M14 Part D added the menu.
 - [x] **The anchor loop moved out of `main.rs`** ✅, which is the half that matters. Three
       binaries each copied it, and no host test builds a `main.rs` — so the loop that was wrong
       was also the loop nothing could check. `App::place_menus` is one method with one count, and
-      each application walks its *whole* bar through it in a test: reinstating the constant fails
-      with "menu 2 of 3 opened with nowhere to hang from".
+      each application walks its *whole* bar through it in a test: reinstating a constant inside
+      the method fails all three — "menu 2 of 3 …" in `nxfiles`, "menu 1 of 2 …" in the two
+      applications with two menus. Two of those three tests reimplemented the loop instead of
+      calling the method until review caught them.
 
 - [x] **A margin around the quick-access panel** ✅. It has had a ground of its own since Part A;
       what makes it read as a *panel* is the window showing through around it.
@@ -5216,8 +5218,15 @@ event and read the state without redrawing in between.
       scrollbar no longer fights the caret. `ListState` gained a constructor for it: the
       bookkeeping is private, which is what stops a caller writing it in a struct literal.
 
+- [x] **"Changed" is the caret, the text, *and* the window** ✅. The first version keyed on the
+      caret's line alone, which meant typing after a scroll put characters into a document that
+      stayed off screen — worse than not following at all. `(line, column, revision, visible)`
+      for the text area, `(index, visible)` for the list.
+
 - [x] **The regression tests redraw** ✅ — the thing the earlier ones did not. Each of the three
       new ones presses, rebuilds the tree the way the binary does, and asserts the offset held.
+      The typing case needs the two new capabilities composed — scroll away, then type — which is
+      why no single-widget test reached it.
 
 ### Part C — the chooser navigates ✅ complete (2026-09-10)
 
@@ -5234,6 +5243,11 @@ event and read the state without redrawing in between.
       and this row is one of them; left to measure itself it takes the button's height and every
       part below it loses what the button took — which is what the first version did, caught by
       the test that pins the list and the field at the sizes they were built for.
+
+      **And the path is centred down the row, not across it.** `center` moves its child on both
+      axes, which put a short path in the middle of the dialog rather than beside the button it
+      belongs to. `Center` carries which axes it moves on now, and `center_v` is the vertical
+      half — what a label beside a control wants.
 
 **Not done here, and not a gap**: a location bar, quick-access places, and showing hidden files
 (`TODO(chooser-hidden)`, which has a trigger of its own). What the report asked for was a way to

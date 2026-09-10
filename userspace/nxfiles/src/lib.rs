@@ -837,10 +837,10 @@ impl App {
             closing: false,
             new_window: false,
             quit: false,
-            menus: // **Zero, because the length is set every frame.** `set_anchors` replaces this
+            // **Zero, because the length is set every frame.** `set_anchors` replaces this
             // vector before anything reads it, and sizing it here from a constant is
             // what drifted (M15 Part E).
-            MenuState::new(0),
+            menus: MenuState::new(0),
             prompt: None,
             confirm: None,
             dialog_focused: true,

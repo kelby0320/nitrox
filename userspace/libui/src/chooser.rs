@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use libdraw::geom::Size;
 
-use crate::element::{Element, Insets, center, column, padding, row, sized, text};
+use crate::element::{Element, Insets, center_v, column, padding, row, sized, text};
 use crate::widget::{
     DIALOG_BUTTON_H, DIALOG_PAD, ListRow, ListState, Theme, WINDOW_BORDER, WINDOW_FRAME, button,
     dialog_frame_sized, list_view, text_field, TextFieldState, WidgetState,
@@ -161,9 +161,11 @@ pub fn view<Msg: Clone>(
                     theme,
                 ))
                 .key(key_base + 7),
-                // Centred rather than padded, so the path sits on the button's middle whatever
-                // the theme's text size is.
-                padding(Insets { top: 0, right: 0, bottom: 0, left: 6 }, center(text(path)))
+                // Centred *down* rather than padded, so the path sits on the button's middle
+                // whatever the theme's text size is. Not across: a `center` on both axes puts a
+                // short path in the middle of the dialog, detached from the button it belongs
+                // beside, with its left edge moving as the path grows (PR #290 review, 3).
+                padding(Insets { top: 0, right: 0, bottom: 0, left: 6 }, center_v(text(path)))
                     .flex(1)
                     .key(key_base + 8),
             ]),
@@ -278,7 +280,7 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use crate::diff::Tree;
-    use crate::layout::{FixedCell, layout};
+    use crate::layout::{FixedCell, Layout, layout, locate};
     use libdraw::geom::Rect;
 
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
@@ -445,5 +447,55 @@ mod tests {
             // `padding`, and the path is the only thing that distinguishes them.
             tree.update(&e, &l).unwrap_or_else(|err| panic!("selection {sel:?}: {err:?}"));
         }
+    }
+
+    /// The rectangle of the first `Text` whose string is `want`.
+    ///
+    /// **By content rather than by key**, because the interesting element here is not keyed:
+    /// the key is on the `padding` that wraps it, and the padding takes the whole flex cell
+    /// whether or not the text inside it moved.
+    fn text_rect<M>(e: &Element<M>, l: &Layout, want: &str) -> Option<Rect> {
+        if let crate::element::Node::Text(t) = &e.node {
+            if t == want {
+                return Some(l.rect);
+            }
+        }
+        e.children().zip(l.children.iter()).find_map(|(c, cl)| text_rect(c, cl, want))
+    }
+
+    /// The path sits on the up button's middle, and starts beside it rather than in the
+    /// middle of the dialog.
+    ///
+    /// **Both halves, because the first fix broke the second.** Centring the path was for the
+    /// vertical: a `text` measures to the theme's line height and the button is taller, so
+    /// padding it down by a constant is wrong the moment the font changes. `center` does both
+    /// axes, which put a short path at x = 207 in a 420-wide dialog — detached from the button
+    /// it belongs beside, with its left edge moving as the path grows (PR #290 review, 3).
+    #[test]
+    fn the_path_sits_beside_the_up_button_not_in_the_middle_of_the_dialog() {
+        let mut st = ChooserState::new();
+        let e = build(Mode::Open, &mut st);
+        let l = layout(&e, BOUNDS, &CELL);
+        let up = locate(&e, &l, 100 + 7).expect("the up button is keyed key_base + 7");
+        let path = text_rect(&e, &l, "/home").expect("the path is drawn");
+
+        // Across: hard against the button, not floating.
+        assert_eq!(
+            path.origin.x,
+            up.origin.x + up.size.w as i32 + 6,
+            "the path should start 6px right of the up button, not at {}",
+            path.origin.x
+        );
+        // …which is nowhere near the middle: the failing version put it there.
+        let middle = BOUNDS.origin.x + (BOUNDS.size.w.saturating_sub(path.size.w) / 2) as i32;
+        assert_ne!(path.origin.x, middle, "the path is centred across the dialog");
+
+        // Down: on the button's middle, within the rounding `Center` leaves at the bottom.
+        let path_mid = path.origin.y + (path.size.h / 2) as i32;
+        let up_mid = up.origin.y + (up.size.h / 2) as i32;
+        assert!(
+            (path_mid - up_mid).abs() <= 1,
+            "the path's middle is at {path_mid} and the button's at {up_mid}"
+        );
     }
 }

@@ -1055,9 +1055,20 @@ pub struct TextAreaState {
     goal: Option<usize>,
     /// The first visible line.
     offset: usize,
-    /// The cursor line [`ensure_visible`](Self::ensure_visible) last scrolled to — see
-    /// [`ListState::followed`], which is the same rule for the same reason.
-    followed: Option<usize>,
+    /// What the last [`ensure_visible`](Self::ensure_visible) was for: the cursor's line and
+    /// column, the text's revision, and how many lines fitted.
+    ///
+    /// **Everything that could have put the caret out of view, and nothing else.** A keystroke
+    /// moves the caret, an edit changes the revision, and a window that got shorter changes the
+    /// count — any of those means the view should follow again. A *repaint* changes none of
+    /// them, which is the whole point: following on every build is what made a scrollbar
+    /// impossible (M15 Part D).
+    ///
+    /// **Derived rather than a flag somebody sets.** A "please scroll to the caret" boolean has
+    /// to be set by every mutator, and a missed one is silent — which is exactly the bug this
+    /// field's first version had: it keyed on the *line* alone, so typing (which does not change
+    /// the line) left the person typing into a document they could not see (PR #290 review, 1).
+    followed: Option<(usize, usize, u64, usize)>,
     /// How many times the *text* has changed.
     ///
     /// **Because "is this buffer modified?" is a question only the state can answer.** An editor
@@ -1786,12 +1797,14 @@ impl TextAreaState {
         if visible == 0 {
             return;
         }
-        // Once per cursor line, for [`ListState::ensure_visible`]'s reason: a document that
-        // followed its caret on every build could not be scrolled away from it.
-        if self.followed == Some(self.line) {
+        // Once per *reason to follow*, for [`ListState::ensure_visible`]'s reason: a document
+        // that followed its caret on every build could not be scrolled away from it, and one
+        // that followed only on a line change let you type into a screen you were not looking at.
+        let now = (self.line, self.col, self.revision, visible);
+        if self.followed == Some(now) {
             return;
         }
-        self.followed = Some(self.line);
+        self.followed = Some(now);
         if self.line < self.offset {
             self.offset = self.line;
         } else if self.line >= self.offset + visible {
@@ -2047,14 +2060,20 @@ pub struct ListState {
     pub selected: Option<usize>,
     /// The first visible row.
     pub offset: usize,
-    /// The selection [`ensure_visible`](Self::ensure_visible) last scrolled to.
+    /// What the last [`ensure_visible`](Self::ensure_visible) was for: the selected row, and how
+    /// many rows fitted.
     ///
     /// **What stops "keep the selection on screen" from meaning "never scroll anywhere else".**
     /// `list_view` calls `ensure_visible` on every build, so without this a list whose selection
     /// is row 0 snaps its offset back to 0 on every repaint — and since an application repaints
     /// after every event, a scrollbar drag computed the right offset and had it thrown away
     /// before anything was drawn. The bar moved and the list did not (M15 Part D).
-    followed: Option<usize>,
+    ///
+    /// **The row count is part of it**, so a window that got shorter brings the selection back
+    /// into view rather than waiting for it to move. `TextAreaState` carries the text's revision
+    /// here too; a list has no equivalent, because everything that changes a list's rows also
+    /// replaces its selection.
+    followed: Option<(usize, usize)>,
 }
 
 impl ListState {
@@ -2116,10 +2135,10 @@ impl ListState {
         // **Once per selection, not once per build.** Following a selection is what a *changed*
         // selection asks for; doing it every time the widget is built makes every other way of
         // scrolling impossible, because the next repaint undoes it.
-        if self.followed == Some(i) {
+        if self.followed == Some((i, visible)) {
             return;
         }
-        self.followed = Some(i);
+        self.followed = Some((i, visible));
         if i < self.offset {
             self.offset = i;
         } else if i >= self.offset + visible {
@@ -2560,6 +2579,23 @@ mod list_view_tests {
         s.down(40);
         s.ensure_visible(5);
         assert_eq!(s.offset, 1, "the selection moved and the view did not follow it");
+    }
+
+    /// A window that gets shorter brings the selection back into view.
+    ///
+    /// **The case a key of "the selection we last followed" alone gets wrong**, and the one
+    /// flagged when Part D landed: a shrink can put the selection off screen without the
+    /// selection moving, so a rule that waits for it to move leaves a list highlighting a row
+    /// nobody can see (PR #290 review, 1).
+    #[test]
+    fn a_shorter_window_brings_the_selection_back() {
+        let mut s = ListState::at(Some(9), 0);
+        s.ensure_visible(10);
+        assert_eq!(s.offset, 0, "precondition: ten rows fit, so nothing moved");
+
+        // Four fit now, and the selection is past the bottom.
+        s.ensure_visible(4);
+        assert_eq!(s.offset, 6, "the selection was left below a window that shrank");
     }
 
     /// The same rule for a document's caret.

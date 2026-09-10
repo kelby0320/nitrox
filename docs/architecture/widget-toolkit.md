@@ -1,7 +1,10 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-08), and this document describes what exists.**
-M14 Part D added `click.rs` — a pure run counter that answers "how many clicks is this", given a
+**Status: built (2026-08-11, last checked 2026-09-10), and this document describes what exists.**
+M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
+child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
+`list_view` following their caret or selection once per change rather than every frame; §7 and the
+catalogue below carry both. M14 Part D added `click.rs` — a pure run counter that answers "how many clicks is this", given a
 position and a time, so a double click needs no clock inside a module that may not have one.
 `window::Child` hosts **top-level** windows as of M14 Part B, which is what lets one process own
 several — all three applications do. M14 Part C added `chooser.rs` — a file chooser as a widget over a
@@ -257,7 +260,21 @@ Containers, and no more than these:
 | `dock` | Pin children to an edge, the last child fills the rest | The scrollbar on the right of the grid |
 | `stack` | Overlay children in paint order, positioned within the parent | Menu popups over the grid |
 
-Plus `padding`, fixed `sized`, and `offset` wrappers. That is the whole layout vocabulary.
+Plus `padding`, fixed `sized`, `center` / `center_v`, and `offset` wrappers. That is the whole
+layout vocabulary.
+
+**And `center`, which is the one wrapper that *moves* its child** (M15 Part C) rather than passing
+its rectangle through: it measures as its child, and places that measured size in the middle of
+whatever the parent hands it beyond. So a `center` given only what it asked for changes nothing —
+centring happens in the slack. Rounding leaves the extra pixel on the right and the bottom.
+
+It is the one thing `padding` cannot express. A label centred with padding is a label whose insets
+have to be recomputed for every string and every window width, which is §5's layout engine written
+in application code; before this every button's text sat against the top-left of a face usually
+much wider than the word on it. **Down is always, across is a choice**: `center_v` centres
+vertically and leaves the child at its rectangle's left edge, which is what a label *beside* a
+control wants — the file chooser's path next to its up button. Centred across too, a short path
+floats in the middle of the dialog and its left edge moves as the string grows.
 
 **And `ink`, which is a wrapper that changes no geometry** (M14 Part G): it measures and arranges
 exactly as its child and colours everything inside it that draws ink, text and icons alike, with
@@ -464,7 +481,13 @@ space for it:
 
 | Widget | Why it exists |
 |---|---|
-| `text_area` | The editor's buffer. Multi-line, with a cursor, a **selection**, a goal column for vertical movement, and scrolling that follows the cursor. `TextAreaState` carries all of it; the widget draws the visible lines, the selection behind them and the caret |
+| `text_area` | The editor's buffer. Multi-line, with a cursor, a **selection**, a goal column for vertical movement, and a scrollbar and wheel of its own since M15 Part B. It **takes pointer events**: a press places the caret at the point (`TextAreaState::at_point`), a drag from there extends the selection, and a press on the bar scrolls or grabs the thumb. `TextAreaState` carries all of it; the widget draws the visible lines, the selection behind them and the caret |
+
+**Its scrolling follows the caret's *line*, not its every move** (M15 Part D). Following on every
+build is what a scrollbar cannot survive: `ensure_visible` runs each frame, so a view scrolled away
+from the caret snapped back before the next paint and the thumb would not move. It re-follows when
+the caret's line or column changes, when the text changes, or when the window's visible height
+does — and stays where it was put otherwise. `ListState` follows its selection under the same rule.
 
 **And M11 Part E added four more, from the same rule seen from the other side** — these came
 from *driving* the desktop rather than from building an application, which is what a polish pass
@@ -677,7 +700,7 @@ the directory with `libfs::list_dir` and orders it with `libfs::sort`.
 |---|---|
 | `Mode` | `Open` or `Save`. The two jobs differ in exactly two things — whether there is a name field, and what the accepting button says (`verb`) |
 | `ChooserState` | Selection, scroll, and the name being typed. **The listing is deliberately not in here**: it belongs to whoever read it, and a copy would be a second answer to "what is in this directory" that could go stale unnoticed |
-| `view` | The tree: a title, the path strip, the rows, a name field when saving, and Cancel beside the verb |
+| `view` | The tree: a title, the path strip with an **up** button on its left, the rows, a name field when saving, and Cancel beside the verb |
 
 **One widget for both jobs**, because a second would be this layout maintained twice and the first
 divergence would be a chooser that looks different depending on why it opened.

@@ -24654,6 +24654,14 @@ and every part below it loses what the button took. The test that pins the list 
 field at the sizes they were built for is what caught it — a test written in M14 Part C's review
 for a different reason entirely.
 
+**The second version broke the row across instead of down.** The path wants centring *vertically*
+— a `text` measures to the theme's line height and the button is taller, so padding it down by a
+constant is wrong the moment the font changes — and `center` does both axes, which put a short
+path at x = 207 in a 420-wide dialog: detached from the button it belongs beside, with its left
+edge moving as the string grew. So `Center` carries which axes it moves on, and `center_v` is the
+half a label *beside* a control wants. **Down is always; across is a choice**, and a wrapper that
+offers only "both" makes the wrong one the easy one.
+
 
 ---
 
@@ -24674,6 +24682,20 @@ offset back to 0, draw. The bar moved under the pointer and the content never di
 they last scrolled to, so arrow keys still pull the view along and a scrollbar no longer fights
 the caret. `ListState` gained `at` for it: the bookkeeping is a private field, which is precisely
 what stops a caller writing it in a struct literal and is why the constructor exists.
+
+**And "changed" was drawn too narrowly at first, which is worse than not following at all.** The
+text area's guard keyed on the caret's *line* — so after a deliberate scroll, typing put characters
+into a document that stayed off screen, and Left, Right, Home and End moved a caret nobody could
+see. It keys on `(line, column, revision, visible height)` now: the caret moved, the text changed,
+or the window did. `revision` was already the "the text changed" counter, so following an edit cost
+nothing but noticing it belonged there. `ListState`'s is `(index, visible)` for the same reason —
+a shrunk window that puts the selection off screen must re-follow without waiting for the selection
+to move.
+
+**Part B is what made it reachable**, and that is the pattern rather than the accident: before this
+branch a `text_area` had no scrollbar and no wheel, so there was no way to be scrolled away from
+the caret and no way for a too-narrow guard to show. Two new capabilities composed — scroll away,
+then type — and no single-widget test reaches across the seam between them.
 
 **The lesson is about the shape of the test, not the bug.** Six tests covered scrollbar dragging
 across three applications and all six passed while two of the three bars did nothing, because
@@ -24703,14 +24725,21 @@ two menus each today, which is exactly the state `nxfiles` was in before somebod
 
 **The half that matters is where the loop lives.** It was in each `main.rs`, copied three times,
 and *no host test builds a `main.rs`* — so the code that was wrong was also the code nothing could
-check. Moving it to `App::place_menus` made it testable, and the test walks the **whole bar**
-rather than a menu chosen when the test was written: reinstating the constant fails with "menu 2
-of 3 opened with nowhere to hang from, so nothing would be drawn".
+check. Moving it to `App::place_menus` made it testable, and each application's test walks its
+**whole bar** through that method rather than a menu chosen when the test was written. Reinstating
+a constant inside `place_menus` fails all three: "menu 2 of 3 …" in `nxfiles`, "menu 1 of 2 …" in
+`nxterm` and `nxedit`, which have two menus each today.
 
 **The first attempt at that test passed against the bug**, which is what sent the loop to the
 library. It set the anchors itself from the derived count and opened each menu — asserting a
 property of `MenuState` that was never in doubt, while the defect sat in a binary the test did not
 touch. A test that reimplements the thing it is checking is not a test of it.
+
+**And the fix went into one crate while the diagnosis went into all three** — `nxfiles`' test
+called `place_menus`; `nxterm`'s and `nxedit`'s kept the reimplemented loop, so `place_menus` was
+uncovered in two of the three applications and review caught it. Writing the lesson down is not
+applying it: the sweep for siblings is a separate step from the fix, and this entry existed,
+naming the trap, while two instances of it sat in the same commit.
 
 
 ---

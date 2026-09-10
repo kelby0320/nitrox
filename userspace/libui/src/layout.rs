@@ -151,7 +151,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
         Node::Ink { child, .. } => measure(child, c, m),
         // **A centred child asks for what it needs**, which is what makes `center` composable:
         // a button's face is sized by the caller, and the label inside it takes its own width.
-        Node::Center { child } => measure(child, c, m),
+        Node::Center { child, .. } => measure(child, c, m),
         Node::Padding { insets, child } => {
             let inner = measure(child, c.shrink(insets.horizontal(), insets.vertical()), m);
             Size::new(
@@ -263,9 +263,12 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
         // its child rather than merely passing the rectangle through. Rounding leaves the extra
         // pixel on the right and the bottom, which is what every layout engine does and what
         // keeps a one-pixel-narrow label from drifting left of centre.
-        Node::Center { child } => {
+        Node::Center { across, child } => {
             let want = measure(child, Constraints::loose(rect.size), m);
-            let x = rect.origin.x + (rect.size.w.saturating_sub(want.w) / 2) as i32;
+            let x = match across {
+                true => rect.origin.x + (rect.size.w.saturating_sub(want.w) / 2) as i32,
+                false => rect.origin.x,
+            };
             let y = rect.origin.y + (rect.size.h.saturating_sub(want.h) / 2) as i32;
             let placed = Rect::new(x, y, want.w.min(rect.size.w), want.h.min(rect.size.h));
             alloc::vec![arrange(child, placed, m)]
@@ -467,8 +470,8 @@ mod tests {
     fn meas(e: &Element<Msg>, c: Constraints) -> Size {
         measure(e, c, &CELL)
     }
-    use crate::element::{Insets, column, custom, dock, docked, fill, offset, padding, row,
-                         sized, stack, text, with_spacing};
+    use crate::element::{Insets, center, center_v, column, custom, dock, docked, fill, offset,
+                         padding, row, sized, stack, text, with_spacing};
     use alloc::vec;
     use libdraw::format::Rgb;
 
@@ -713,6 +716,25 @@ mod tests {
             padding(Insets::all(5), offset(10, 4, sized(Size::new(8, 8), fill(Rgb::BLACK))));
         let l = lay(&e, Rect::new(100, 200, 80, 60));
         assert_eq!(l.children[0].rect.origin, Point::new(115, 209));
+    }
+
+    /// `center` moves its child on both axes; `center_v` moves it down and not across.
+    ///
+    /// **The contract the vocabulary rests on.** The chooser's path wants the vertical half
+    /// alone, and getting both is not a smaller version of the same thing — it is a label that
+    /// detaches from the control it labels and slides as its string grows (PR #290 review, 3).
+    #[test]
+    fn center_moves_on_both_axes_and_center_v_only_down() {
+        let child = || -> Element<Msg> { sized(Size::new(20, 10), fill(Rgb::BLACK)).key(1) };
+        let bounds = Rect::new(0, 0, 100, 50);
+
+        let both: Element<Msg> = sized(Size::new(100, 50), center(child()));
+        let r = locate(&both, &lay(&both, bounds), 1).expect("the child is in the tree");
+        assert_eq!(r, Rect::new(40, 20, 20, 10), "`center` should move on both axes");
+
+        let down: Element<Msg> = sized(Size::new(100, 50), center_v(child()));
+        let r = locate(&down, &lay(&down, bounds), 1).expect("the child is in the tree");
+        assert_eq!(r, Rect::new(0, 20, 20, 10), "`center_v` should move down only");
     }
 
     #[test]
