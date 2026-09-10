@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use libdraw::geom::Size;
 
-use crate::element::{Element, Insets, column, padding, row, sized, text};
+use crate::element::{Element, Insets, center, column, padding, row, sized, text};
 use crate::widget::{
     DIALOG_BUTTON_H, DIALOG_PAD, ListRow, ListState, Theme, WINDOW_BORDER, WINDOW_FRAME, button,
     dialog_frame_sized, list_view, text_field, TextFieldState, WidgetState,
@@ -92,7 +92,20 @@ impl Default for ChooserState {
 /// button lights that button as the pointer passes over it. It was seven keys called six until
 /// PR #284's review, which is the version of this that bites a caller starting its next range at
 /// `key_base + KEYS`.
-pub const KEYS: u64 = 7;
+pub const KEYS: u64 = 9;
+
+/// How wide the *up* button is, in pixels.
+///
+/// **A square**, because its label is an arrow rather than a word: sized to the text it would be
+/// as wide as one glyph plus padding and would read as a typo rather than a control.
+const UP_W: u32 = 28;
+
+/// How tall the row holding it — and the path beside it — is.
+///
+/// The name field's height, so the two controls in this dialog are the same size. It replaced
+/// `TEXT_H_MAX` in [`CHOOSER_H`]'s sum when the row gained a button, which is four pixels the
+/// window grew by rather than four the list lost.
+const UP_H: u32 = FIELD_H;
 
 /// The chooser's tree: a path strip, the rows, a name field when saving, and two answers.
 ///
@@ -108,6 +121,7 @@ pub fn view<Msg: Clone>(
     key_base: u64,
     hovered: Option<u64>,
     on_row: fn(u64) -> Msg,
+    up: Msg,
     accept: Msg,
     cancel: Msg,
     theme: &Theme,
@@ -124,9 +138,38 @@ pub fn view<Msg: Clone>(
     // makes the whole dialog undiffable, which shows up as a window that opens and never draws
     // rather than as anything resembling a layout problem. `the_chooser_diffs_across_a_selection`
     // caught it on the first run.
-    let here =
-        padding(Insets { top: 0, right: DIALOG_PAD, bottom: 4, left: DIALOG_PAD }, text(path))
-            .key(key_base + 4);
+    // **Where you are, and the way out of it** (M15 Part C). A chooser that could only descend
+    // was a dialog you had to cancel and reopen to leave a directory — the report from running it
+    // was that the Open dialog "needs more features, e.g. navigation". `Up` is the whole of what
+    // navigation means here: every other move is a row.
+    //
+    // **A row rather than a strip of its own**, so the dialog's height is unchanged: `CHOOSER_H`
+    // is what the window is created at, and a chooser that grew by a strip would be a dialog
+    // whose rows no longer fit in it.
+    let here = padding(
+        Insets { top: 0, right: DIALOG_PAD, bottom: 4, left: DIALOG_PAD },
+        // **Sized, because the frame's height is derived from what it contains.** `CHOOSER_H` is
+        // a sum of its parts and this row is one of them; left to measure itself it takes the
+        // button's height, and every part below it loses what the button took.
+        sized(
+            Size::new(0, UP_H),
+            row(alloc::vec![
+                sized(Size::new(UP_W, 0), button(
+                    "\u{2191}",
+                    up,
+                    WidgetState { hovered: hovered == Some(key_base + 7), ..Default::default() },
+                    theme,
+                ))
+                .key(key_base + 7),
+                // Centred rather than padded, so the path sits on the button's middle whatever
+                // the theme's text size is.
+                padding(Insets { top: 0, right: 0, bottom: 0, left: 6 }, center(text(path)))
+                    .flex(1)
+                    .key(key_base + 8),
+            ]),
+        ),
+    )
+    .key(key_base + 4);
     // **Sized to the height it was built for**, which is the rule every other `list_view` caller
     // follows and this one did not: the widget computes `visible` from the height it is *told*,
     // so a list drawn shorter than that has rows it will not scroll to and no scrollbar to say so
@@ -208,7 +251,7 @@ pub const CHOOSER_W: u32 = 420;
 /// is why the list can still be asserted to be exactly [`ROWS_H`] at every one of them.
 pub const CHOOSER_H: u32 = WINDOW_BORDER
     + (2 * DIALOG_PAD + TEXT_H_MAX)
-    + (FIELD_GAP + TEXT_H_MAX)
+    + (FIELD_GAP + UP_H)
     + ROWS_H
     + (FIELD_GAP + FIELD_H)
     + (DIALOG_BUTTON_H + DIALOG_PAD)
@@ -244,6 +287,7 @@ mod tests {
     #[derive(Clone, PartialEq, Eq, Debug)]
     enum Msg {
         Row(u64),
+        Up,
         Accept,
         Cancel,
     }
@@ -271,7 +315,7 @@ mod tests {
     }
 
     fn build(mode: Mode, st: &mut ChooserState) -> Element<Msg> {
-        view(mode, "/home", &rows(), st, 100, None, Msg::Row, Msg::Accept, Msg::Cancel,
+        view(mode, "/home", &rows(), st, 100, None, Msg::Row, Msg::Up, Msg::Accept, Msg::Cancel,
              &Theme::default())
     }
 

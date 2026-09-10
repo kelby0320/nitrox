@@ -5131,7 +5131,7 @@ and a lookup path). The control panel, which stays trigger-gated on settings out
 hand-edited file. Split panes, profiles, or a terminal that is configurable at all. `nxfiles`
 growing a second view mode. Anything that needs the network.
 
-## Milestone 15 — controls that look like controls
+## Milestone 15 — controls that look like controls ✅ complete (2026-09-10)
 
 Named 2026-09-10, from the maintainer's list after running M14 on QEMU. **Eight items, and six
 of them are the same complaint**: a surface that is a control does not say so. A button whose
@@ -5149,7 +5149,28 @@ picture of the whole screen is exactly how a groove ends up matching the list.
 - [x] **Part A — the surfaces** ✅ (2026-09-10): the groove, the button and the sidebar.
 - [x] **Part B — the text area learns the pointer** ✅ (2026-09-10): click to place the cursor,
       drag to select, and the scrollbar `nxedit` never had.
-- [ ] **Part C — the chooser navigates**: an Open dialog that can leave the directory it opened in.
+- [x] **Part C — the chooser navigates** ✅ (2026-09-10): an Open dialog that can leave the
+      directory it opened in.
+
+### Part C — the chooser navigates ✅ complete (2026-09-10)
+
+- [x] **An *up* control, and `Backspace`** ✅. Every move a chooser had was *downward* — a row,
+      if it happened to be a directory — so a dialog that opened in the wrong place had to be
+      cancelled and reopened from a buffer that was somewhere else. `Backspace` is the browser's
+      own binding for the same move: one desktop, one way out of a directory.
+
+      **Except while saving**, where `Backspace` edits the name. A key that walked out of the
+      directory from under a half-typed filename would be the surprise, and there is a field
+      holding the keyboard to prove the intent.
+
+      **The row is sized, and the frame grew by four pixels.** `CHOOSER_H` is a sum of its parts
+      and this row is one of them; left to measure itself it takes the button's height and every
+      part below it loses what the button took — which is what the first version did, caught by
+      the test that pins the list and the field at the sizes they were built for.
+
+**Not done here, and not a gap**: a location bar, quick-access places, and showing hidden files
+(`TODO(chooser-hidden)`, which has a trigger of its own). What the report asked for was a way to
+navigate; a dialog that can go up and descend can reach anything.
 
 ### Part B — the text area learns the pointer ✅ complete (2026-09-10)
 

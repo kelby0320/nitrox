@@ -613,6 +613,8 @@ pub enum Msg {
     ChooserAccept,
     /// The chooser's *Cancel*, its close button, or `Esc`.
     ChooserCancel,
+    /// Leave the directory the chooser is showing — its *up* control, or `Backspace`.
+    ChooserUp,
     /// The wheel turned over the chooser — see [`ListState::wheel`](libui::widget::ListState::wheel).
     ChooserWheel(PointerEvent),
     /// A pointer event over the document — a press places the caret, a drag selects.
@@ -1191,6 +1193,18 @@ impl App {
             }
             Msg::ChooserAccept => self.chooser_accept(),
             Msg::ChooserCancel => self.chooser = None,
+            // **The root is its own parent**, so this is a no-op there rather than an error —
+            // `libfs::parent` states that rule and `nxfiles` relies on the same one, which is
+            // why neither greys the control: a control that disables itself at the root is one
+            // more state to draw for a case nobody is surprised by.
+            Msg::ChooserUp => {
+                if let Some(c) = self.chooser.as_ref() {
+                    let up = core::str::from_utf8(libfs::parent(c.dir.as_bytes())).unwrap_or("/");
+                    if up != c.dir {
+                        self.chooser_list = Some(String::from(up));
+                    }
+                }
+            }
             // **Declined when no chooser is open**, which is not defensive: the dialog is a
             // second window and its records arrive on the same session, so one in flight when
             // the dialog closes reaches this.
@@ -1662,6 +1676,7 @@ impl App {
             CHOOSER_KEY,
             hovered,
             Msg::ChooserRow,
+            Msg::ChooserUp,
             Msg::ChooserAccept,
             Msg::ChooserCancel,
             ui,
@@ -1788,6 +1803,13 @@ impl App {
                     }
                     libkern::abi::KEY_UP => {
                         c.state.list.up();
+                    }
+                    // **Backspace goes up while opening**, which is the browser's own binding:
+                    // one desktop, one way to leave a directory. In `Save` it edits the name
+                    // instead — there is a field holding the keyboard, and a key that navigated
+                    // out from under a half-typed filename would be the surprise.
+                    libkern::abi::KEY_BACKSPACE if c.mode == chooser::Mode::Open => {
+                        self.update(Msg::ChooserUp);
                     }
                     // **Nothing to type into when opening**, and swallowing the key is the point:
                     // a dialog holds the keyboard, so a character that fell through would reach
@@ -4172,6 +4194,56 @@ mod tests {
         assert_eq!(
             a.chooser().expect("still open").state.list.offset,
             libui::click::WHEEL_UNITS as usize,
+        );
+    }
+
+    /// The chooser can leave the directory it opened in.
+    ///
+    /// **What "navigation" means in a dialog with no location bar** (M15 Part C). Before this
+    /// the only moves were *down* — a row, if it was a directory — so a chooser opened in the
+    /// wrong place had to be cancelled and reopened from a buffer that was somewhere else.
+    #[test]
+    fn the_chooser_goes_up_by_control_and_by_backspace() {
+        let mut a = app();
+        a.update(Msg::OpenFile);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home/papers/drafts", alloc::vec![(String::from("a.txt"), false)]);
+
+        a.update(Msg::ChooserUp);
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"));
+        a.show_chooser("/home/papers", alloc::vec![(String::from("b.txt"), false)]);
+
+        // Backspace is the browser's binding for the same move — one desktop, one way up.
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_BACKSPACE, 1, 0));
+        assert_eq!(a.take_chooser_list().as_deref(), Some("/home"));
+        a.show_chooser("/", alloc::vec![(String::from("home"), true)]);
+
+        // **The root is its own parent**, so this asks for nothing rather than erroring.
+        a.update(Msg::ChooserUp);
+        assert_eq!(a.take_chooser_list(), None, "the root tried to go somewhere");
+        assert!(a.chooser().is_some(), "and the dialog is still open");
+    }
+
+    /// In `Save`, Backspace edits the name instead of navigating.
+    ///
+    /// **The one place the two bindings disagree, and it has to be this way**: a key that walked
+    /// out of the directory from under a half-typed filename would be the surprise, and there is
+    /// a field holding the keyboard to prove the intent.
+    #[test]
+    fn backspace_edits_the_name_while_saving() {
+        let mut a = app();
+        a.update(Msg::SaveAs);
+        let _ = a.take_chooser_list();
+        a.show_chooser("/home/papers", alloc::vec![]);
+        let before = a.chooser().expect("open").state.name.text().to_string();
+        assert!(!before.is_empty(), "precondition: the field is seeded with the buffer's name");
+
+        a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_BACKSPACE, 1, 0));
+        assert_eq!(a.take_chooser_list(), None, "saving navigated instead of editing");
+        assert_eq!(
+            a.chooser().expect("open").state.name.text().len(),
+            before.len() - 1,
+            "the name was not edited"
         );
     }
 

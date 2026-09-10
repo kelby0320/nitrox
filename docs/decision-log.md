@@ -24608,3 +24608,48 @@ application does — `menu::bar` makes `menu_item`s. Nobody noticed for four mil
 found it was buttons growing an edge: the picture came back with two boxed words where a menu bar
 should be. A reference that is not what applications draw is a polish pass judging the wrong
 thing, which is precisely what `preview` exists to prevent.
+
+
+---
+
+## 2026-09-10 — the pointer reaches the document, and a dialog can leave a directory (M15 Parts B and C)
+
+**Two of the eight items were features that had been half-built and never connected.**
+
+**`TextAreaState::place` and `extend_to` have existed since M10**, documented *then* as "what a
+press does" and "what a drag does" — and nothing ever called them, because `text_area` took no
+pointer events at all. An editor whose entire content is text you point at could move its caret
+only with the arrow keys, for five milestones, with the method that does it sitting in the same
+file under a comment saying what it was for. **A widget that takes no events is not a half-built
+feature; it is an invisible one**, and what found it was somebody using the editor.
+
+**The pixel-to-column conversion belongs to the application**, because `libui` has no glyphs —
+the same seam `Metrics` is at layout time. `at_point` is *given* a way to measure a string. The
+column it returns is the **nearest boundary** rather than the character under the cursor, which
+is what makes clicking the right half of a letter put the caret after it.
+
+**`text_area`'s doc had said for two milestones that a scrollbar is the application's to
+compose.** `nxterm` composes one for its grid; `nxedit` never did, so a document longer than its
+window had nothing on screen to say so. `TextAreaState` grew `bar` and `scroll_to` — the pair
+`ListState` already had, so the two cannot disagree about where a thumb points — and a drag
+leaves the caret alone, because what a scrollbar changes is what is *shown*.
+
+**A key collision, found by the first test that routed a real press.** `AREA_INNER_KEY` was
+written as 40, which is `MENU_BAR_KEY` and the base of a *range*: `locate` answered with the menu
+bar's rectangle for the document, and a press meant for the caret landed on chrome. `nxfiles`
+grew a test against exactly this in M14 Part D after a listing row lit whichever chrome shared its
+number; `nxedit` has one now. **The lesson is that a key is a number nothing checks** — not a
+name, not a type — so the guard has to be a test that enumerates them.
+
+**The chooser could only go down.** Every move it had was a row, and a row is only a move if it
+happens to be a directory — so a dialog that opened in the wrong place had to be cancelled and
+reopened from a buffer that was somewhere else. It has an *up* control and `Backspace`, which is
+the browser's binding for the same move: one desktop, one way out of a directory. **Except while
+saving**, where `Backspace` edits the name — a key that walked out of the directory from under a
+half-typed filename would be the surprise, and there is a field holding the keyboard to say so.
+
+**And the dialog's height is a sum of its parts, which the first version of that row broke.**
+`CHOOSER_H` is derived rather than chosen; a row left to measure itself takes its button's height
+and every part below it loses what the button took. The test that pins the list and the name
+field at the sizes they were built for is what caught it — a test written in M14 Part C's review
+for a different reason entirely.
