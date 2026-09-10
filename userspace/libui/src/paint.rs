@@ -214,6 +214,8 @@ fn draw<F, Msg, C>(
         Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, ink),
         // **Not a container arm**, which is what would happen by default and is the whole bug
         // this node exists to avoid: it would paint its child correctly and ignore the colour.
+        // `Center` needs no arm of its own: its child is a child like any other, and the
+        // container arm below paints it at the rectangle `arrange` gave it.
         Node::Ink { colour, child } => {
             if let Some(cl) = l.children.first() {
                 draw(fb, font, theme, child, cl, damage, *colour, custom);

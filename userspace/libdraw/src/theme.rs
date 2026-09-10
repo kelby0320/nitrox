@@ -82,8 +82,27 @@ pub struct Theme {
     pub face_pressed: Rgb,
     /// The ring drawn around the focused widget.
     pub focus_ring: Rgb,
-    /// A scrollbar's groove, and a list's ground.
+    /// A list's ground — the paper its rows sit on.
+    ///
+    /// **It was the scrollbar's groove as well until M15**, and this field's own note said why
+    /// that was a compromise: the reference desktop puts a list at `#FCFCFC` and a groove at
+    /// `#E6E4E3`, "one field has to be both", and splitting them "is worth more evidence than
+    /// one screenshot". The evidence arrived from running it — a scrollbar drawn in the same
+    /// colour as the list beside it is a control nobody can see, and the report was that
+    /// dragging it "doesn't seem to work".
     pub track: Rgb,
+    /// A scrollbar's groove — the channel the thumb runs in.
+    ///
+    /// **Darker than [`track`](Self::track) on purpose.** What it has to do is say *where the
+    /// scrollbar is* when the thumb is elsewhere: a groove matching the content beside it leaves
+    /// a thumb floating on nothing, so the only thing a person can aim at is the thumb itself.
+    pub groove: Rgb,
+    /// A panel beside content — the file browser's sidebar.
+    ///
+    /// **The one surface that has to be told from the content next to it at a glance**, which is
+    /// why it is a colour rather than a derivation. A sidebar drawn in the list's ground is a
+    /// list with a gap in it; what makes it read as chrome is that it is plainly not paper.
+    pub sidebar: Rgb,
     /// A scrollbar's thumb.
     pub thumb: Rgb,
     /// The background behind selected text.
@@ -271,6 +290,12 @@ impl Theme {
             // the thumb. Splitting them is a field, and a field is worth more evidence than one
             // screenshot.
             track: Rgb::new(0xF0, 0xEF, 0xEE),
+            // **The reference's own groove**, which this palette had been rounding into `track`
+            // since M11: `#E6E4E3` against a `#F0EFEE` list is a channel you can see without
+            // being a difference anybody has to look for.
+            groove: Rgb::new(0xE6, 0xE4, 0xE3),
+            // Darker again, because a panel is further from paper than a groove is.
+            sidebar: Rgb::new(0xDD, 0xDA, 0xD6),
             thumb: Rgb::new(0x8E, 0xB1, 0xDD),
             selection: Rgb::new(0x93, 0xB5, 0xE0),
 
@@ -393,6 +418,8 @@ impl Theme {
                 "face_pressed" => set(&mut t.face_pressed, value),
                 "focus_ring" => set(&mut t.focus_ring, value),
                 "track" => set(&mut t.track, value),
+                "groove" => set(&mut t.groove, value),
+                "sidebar" => set(&mut t.sidebar, value),
                 "thumb" => set(&mut t.thumb, value),
                 "selection" => set(&mut t.selection, value),
                 "syntax_keyword" => set(&mut t.syntax_keyword, value),
@@ -509,6 +536,8 @@ impl Theme {
             face_pressed,
             focus_ring,
             track,
+            groove,
+            sidebar,
             thumb,
             selection,
             syntax_keyword,
@@ -540,6 +569,8 @@ impl Theme {
             ("face_pressed", face_pressed),
             ("focus_ring", focus_ring),
             ("track", track),
+            ("groove", groove),
+            ("sidebar", sidebar),
             ("thumb", thumb),
             ("selection", selection),
             ("syntax_keyword", syntax_keyword),
@@ -891,8 +922,8 @@ mod tests {
         let text = t.to_config();
         assert_eq!(
             text.lines().count(),
-            28,
-            "sixteen colours, six syntax colours, a size, a bevel, two fonts, a wallpaper and \
+            30,
+            "eighteen colours, six syntax colours, a size, a bevel, two fonts, a wallpaper and \
              its mode"
         );
         let (back, issues) = Theme::from_config(&text);

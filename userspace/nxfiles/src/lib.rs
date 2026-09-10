@@ -2315,6 +2315,10 @@ impl App {
             None,
             None,
             hovered,
+            // **A ground of its own** (M15): a sidebar drawn in the list's ground is a list with
+            // a gap in it, and the report from running it was that the quick-access folders
+            // "need a different background color so it's clear it's actually a sidebar".
+            Some(ui.sidebar),
             &ui,
         );
 
@@ -2327,6 +2331,7 @@ impl App {
             Some(grab_row),
             Some(Msg::Scroll),
             highlight,
+            None,
             &ui,
         )
         // **On the element the widget returns, rather than through a tenth parameter.** A

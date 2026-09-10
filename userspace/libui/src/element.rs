@@ -171,6 +171,19 @@ pub enum Node<Msg> {
         /// The child.
         child: Box<Element<Msg>>,
     },
+    /// A child placed in the middle of what its parent gives it.
+    ///
+    /// **The one thing `padding` cannot express.** A label centred with padding is a label
+    /// whose insets have to be recomputed for every string and every window width — so before
+    /// this, every button in this toolkit had its text against the top-left corner of a face
+    /// that was usually much wider than the word on it.
+    ///
+    /// It measures as its child, so a `center` that is *given* only what it asked for changes
+    /// nothing; centring happens in the space a parent hands it beyond that.
+    Center {
+        /// The child.
+        child: Box<Element<Msg>>,
+    },
     /// A child drawn in a different ink.
     ///
     /// **A wrapper rather than a colour on [`Text`](Self::Text)**, because ink is inherited: a
@@ -428,7 +441,8 @@ impl<Msg> Element<Msg> {
             Node::Padding { child, .. }
             | Node::Sized { child, .. }
             | Node::Offset { child, .. }
-            | Node::Ink { child, .. } => (&[], Some(child), None),
+            | Node::Ink { child, .. }
+            | Node::Center { child } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
         let docked: Option<&Vec<Docked<Msg>>> = match &self.node {
@@ -498,6 +512,11 @@ pub fn bevel<Msg>(colour: Rgb) -> Element<Msg> {
 /// drawn centred in whatever box it lands in.
 pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
     Element::new(Node::Icon(kind))
+}
+
+/// A child in the middle of its parent's rectangle — see [`Node::Center`].
+pub fn center<Msg>(child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Center { child: Box::new(child) })
 }
 
 /// A child drawn in `colour` — see [`Node::Ink`].

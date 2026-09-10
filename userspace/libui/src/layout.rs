@@ -149,6 +149,9 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
         }
         // Ink changes no geometry, so it measures as its child does.
         Node::Ink { child, .. } => measure(child, c, m),
+        // **A centred child asks for what it needs**, which is what makes `center` composable:
+        // a button's face is sized by the caller, and the label inside it takes its own width.
+        Node::Center { child } => measure(child, c, m),
         Node::Padding { insets, child } => {
             let inner = measure(child, c.shrink(insets.horizontal(), insets.vertical()), m);
             Size::new(
@@ -256,6 +259,17 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
         Node::Sized { child, .. } => alloc::vec![arrange(child, rect, m)],
         // The child takes the whole rect: an ink wrapper is transparent to layout.
         Node::Ink { child, .. } => alloc::vec![arrange(child, rect, m)],
+        // **The child at its measured size, placed in the middle** — the one wrapper that moves
+        // its child rather than merely passing the rectangle through. Rounding leaves the extra
+        // pixel on the right and the bottom, which is what every layout engine does and what
+        // keeps a one-pixel-narrow label from drifting left of centre.
+        Node::Center { child } => {
+            let want = measure(child, Constraints::loose(rect.size), m);
+            let x = rect.origin.x + (rect.size.w.saturating_sub(want.w) / 2) as i32;
+            let y = rect.origin.y + (rect.size.h.saturating_sub(want.h) / 2) as i32;
+            let placed = Rect::new(x, y, want.w.min(rect.size.w), want.h.min(rect.size.h));
+            alloc::vec![arrange(child, placed, m)]
+        }
 
         // `rect` is already the offset one, computed above.
         Node::Offset { child, .. } => alloc::vec![arrange(child, rect, m)],

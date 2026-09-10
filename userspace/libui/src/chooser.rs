@@ -134,7 +134,7 @@ pub fn view<Msg: Clone>(
     // blocking 1).
     let rows = sized(
         Size::new(0, ROWS_H),
-        list_view(entries, &mut state.list, ROWS_H, ROW_H, on_row, None, None, hovered, theme),
+        list_view(entries, &mut state.list, ROWS_H, ROW_H, on_row, None, None, hovered, None, theme),
     )
     .key(key_base);
     // **Active, because in `Save` this field is the only thing taking characters.** The chooser's

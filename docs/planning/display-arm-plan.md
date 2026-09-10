@@ -5130,3 +5130,50 @@ list, and emphatically no completion. Part G colours tokens. Icons for window co
 and a lookup path). The control panel, which stays trigger-gated on settings outgrowing a
 hand-edited file. Split panes, profiles, or a terminal that is configurable at all. `nxfiles`
 growing a second view mode. Anything that needs the network.
+
+## Milestone 15 — controls that look like controls
+
+Named 2026-09-10, from the maintainer's list after running M14 on QEMU. **Eight items, and six
+of them are the same complaint**: a surface that is a control does not say so. A button whose
+face is eighteen units from the window behind it; a scrollbar whose groove is *exactly* the
+colour of the list beside it, so only the thumb is visible; a sidebar drawn in the list's own
+ground. The report for the scrollbar was "click and drag doesn't seem to work" — and the
+mechanism works, measured in the guest before anything was changed: the press grabs the thumb
+without moving it and the drag scrolls to the end. What does not work is *finding* it.
+
+**That is the milestone's shape, and it is why these are one milestone rather than eight
+tickets.** M11 gave this desktop a light theme measured off a reference; what it did not do is
+check that each control still reads as one against it, and a palette tuned by looking at a
+picture of the whole screen is exactly how a groove ends up matching the list.
+
+- [x] **Part A — the surfaces** ✅ (2026-09-10): the groove, the button and the sidebar.
+- [ ] **Part B — the text area learns the pointer**: click to place the cursor, drag to select,
+      and the scrollbar `nxedit` never had.
+- [ ] **Part C — the chooser navigates**: an Open dialog that can leave the directory it opened in.
+
+### Part A — the surfaces ✅ complete (2026-09-10)
+
+- [x] **A scrollbar's groove is its own colour** ✅. `track` was documented as "a scrollbar's
+      groove, and a list's ground", and that field's own note recorded the compromise: the
+      reference desktop puts a list at `#FCFCFC` and a groove at `#E6E4E3`, "one field has to be
+      both", and splitting them "is worth more evidence than one screenshot". **The evidence
+      arrived from running it.** `groove` is `#E6E4E3` now and the bar is 12 pixels rather than
+      10 — the width `nxterm` already used for its own.
+
+- [x] **A button has an edge** ✅, and its label is centred. The face is `#EDECEB` against a
+      `#FFFFFF` window: technically not the ground, and in a real window indisputably invisible.
+      What says *button* is the edge — every desktop draws one, and this toolkit had it only
+      around a focused control. **Centring needed a node**: `padding` places a child at an inset
+      from the origin, so every button in this toolkit had its word against the top-left corner
+      of a face usually much wider than it. `Node::Center` is the wrapper that was missing, and
+      it is the first one that *moves* its child rather than passing its rectangle through.
+
+- [x] **A sidebar is a panel, not a list with a gap in it** ✅. `list_view` takes a `ground`, and
+      `nxfiles` passes `theme.sidebar` — the one surface that has to be told from the content
+      beside it at a glance, which is why it is a colour rather than a derivation.
+
+- [x] **The reference scene stopped lying about menu bars** ✅ — found by this part rather than
+      looked for. It built its bar out of `button`s, which no application does (`menu::bar` makes
+      `menu_item`s), and nobody noticed until buttons grew an edge and the picture showed two
+      boxed words where a menu bar should be. A reference picture that is not what applications
+      draw is a polish pass judging the wrong thing.

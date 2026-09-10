@@ -24561,3 +24561,50 @@ for every Enter, which the failing version of that test said out loud.
 **Milestone 14 is complete**: nine parts in six days, three deferrals closed (`press-time`,
 `scroll-grab`, and the wheel), one left open with a trigger (`chooser-hidden`), and a list that
 was wrong about the code five times — always by claiming something missing that already existed.
+
+
+---
+
+## 2026-09-10 — controls that look like controls (M15 Part A)
+
+The maintainer ran M14 on QEMU and sent eight items. **Six of them are one complaint**: a surface
+that is a control does not say so.
+
+**The scrollbar was the instructive one, because the report was wrong about the mechanism and
+right about the experience.** "Click and drag on the scrollbar doesn't seem to work" — and it
+works: measured in the guest before anything was changed, a press grabs the thumb without moving
+it and a drag scrolls to the end (offset 0 → 9 → 13, the maximum). Measured again after resizing
+the window smaller, which is what the maintainer had done, and it still works. What is broken is
+that **the groove is exactly the colour of the list beside it**, so the only thing on screen to
+aim at is the thumb — a fraction of a bar you cannot see. Three probes went into establishing
+that, two of them in the guest, and the fourth thing tried was reading the widget: `scrollbar`
+fills `theme.track`, and so does `list_view`.
+
+**`track`'s own doc had recorded the compromise and named the trigger.** It said the reference
+desktop puts a list's ground at `#FCFCFC` and a scrollbar's groove at `#E6E4E3`, that "one field
+has to be both", and that splitting them "is a field, and a field is worth more evidence than one
+screenshot". This is the evidence: a person could not find the scrollbar. That is a good outcome
+for a note written eleven days earlier — the argument for the split was already on the page, with
+its price and its trigger, so the decision took minutes rather than a debate.
+
+**A button's edge is what makes it a button.** The face is `#EDECEB` on a `#FFFFFF` window:
+eighteen units per channel, which is a difference that survives a screenshot comparison and does
+not survive a person looking at a window. Every desktop draws an edge; this toolkit drew one only
+around the *focused* control, so at rest a button was a word on a barely-tinted rectangle.
+
+**Centring the label needed a node, and the lack of one had been invisible.** `padding` places a
+child at an inset from its parent's origin — so a button 80 pixels wide with a 20-pixel word had
+58 pixels of face to the right of its label, in every window of every application. `Node::Center`
+is the first wrapper in this toolkit that *moves* its child rather than passing its rectangle
+through, which is why it is a node rather than an insets calculation: the amount depends on the
+child's measured size and the parent's rectangle, and only layout knows both.
+
+**A sidebar drawn in the list's ground is a list with a gap in it.** `list_view` takes a ground
+now, and only `nxfiles`' sidebar passes one. A colour rather than a flag, because what a panel is
+depends on the theme.
+
+**And the reference scene was lying about menu bars.** It built its bar from `button`s; no
+application does — `menu::bar` makes `menu_item`s. Nobody noticed for four milestones, and what
+found it was buttons growing an edge: the picture came back with two boxed words where a menu bar
+should be. A reference that is not what applications draw is a polish pass judging the wrong
+thing, which is precisely what `preview` exists to prevent.

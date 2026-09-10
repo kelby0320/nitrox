@@ -29,8 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, column, dock, docked, fill, icon, padding, row, sized,
-    stack, text,
+    Edge, Element, IconKind, Insets, bevel, center, column, dock, docked, fill, icon, padding,
+    row, sized, stack, text,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -80,17 +80,28 @@ pub fn button<Msg>(
     } else {
         theme.face
     };
-    // Bottom to top: the ring, then the face, then the label. A `Stack` gives every layer
-    // the whole area, so the ring is only visible because the face above it is inset by the
-    // ring's width — and the label sits above both, inset further so it clears the edge.
+    // Bottom to top: the ring or the border, then the face, then the label. A `Stack` gives
+    // every layer the whole area, so the outline is only visible because the face above it is
+    // inset — and the label sits above both.
+    //
+    // **An edge, always** (M15). A face at `#EDECEB` on a window at `#FFFFFF` is a difference of
+    // eighteen units per channel: technically not the ground, and in a real window indisputably
+    // invisible — the report was that buttons need "a different color background … so you know
+    // it's a button". What actually says *button* is the edge, which is what every desktop
+    // draws and what this toolkit had only around a focused control.
     let mut layers = alloc::vec::Vec::with_capacity(3);
     if state.active {
         layers.push(fill(theme.focus_ring));
         layers.push(padding(Insets::all(RING), fill(face)));
     } else {
-        layers.push(fill(face));
+        layers.push(fill(theme.border));
+        layers.push(padding(Insets::all(BORDER), fill(face)));
     }
-    layers.push(padding(BUTTON_PAD, text(label)));
+    // **Centred, which is what a button's label is everywhere else in the world.** It was against
+    // the top-left corner of the face: `padding` places a child at an inset from the origin, and
+    // a face is usually much wider than the word on it, so every button in this toolkit read as
+    // a label with a box drawn round it. `center` is the node that was missing.
+    layers.push(center(padding(BUTTON_PAD, text(label))));
     stack(layers).on_press(msg).focusable()
 }
 
@@ -400,6 +411,13 @@ const MENU_ITEM_PAD: Insets = Insets { top: 3, right: 10, bottom: 3, left: 10 };
 /// How wide the focus ring is, in pixels.
 const RING: u32 = 2;
 
+/// How wide a resting control's edge is, in pixels.
+///
+/// **One, because it is a line rather than a ring.** The focus ring is two so that it reads as
+/// a state; an edge is what makes a shape a control at rest, and a second pixel of it would
+/// compete with the ring instead of sitting under it.
+const BORDER: u32 = 1;
+
 /// Where a scrollbar is and how much of its content is visible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ScrollState {
@@ -610,12 +628,12 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
     sized(
         Size::new(width, 0),
         stack(alloc::vec![
-            fill(theme.track),
+            fill(theme.groove),
             column(alloc::vec![
-                sized(Size::new(0, pos), fill(theme.track)),
+                sized(Size::new(0, pos), fill(theme.groove)),
                 sized(Size::new(0, len), bevel(theme.thumb)),
                 // The remainder, so the thumb does not stretch to the bottom.
-                fill(theme.track).flex(1),
+                fill(theme.groove).flex(1),
             ]),
         ]),
     )
@@ -2071,6 +2089,11 @@ impl ListState {
 /// (An earlier version of this sentence claimed a caller "cannot get it out of step", which is
 /// exactly backwards; PR #233 review.)
 ///
+/// **`ground` is the colour behind the rows**, or `None` for the ordinary list ground. The one
+/// caller that passes something is a *sidebar*: a panel beside content has to be told from the
+/// content at a glance, and drawn in the list's own ground it reads as a list with a gap in it
+/// (M15). A colour rather than a flag, because what a panel is depends on the theme.
+///
 /// **`state` is taken by `&mut` and scrolled in place** to follow the selection — see
 /// [`ensure_visible`](ListState::ensure_visible).
 ///
@@ -2096,6 +2119,7 @@ pub fn list_view<Msg>(
     grab: Option<fn(u64) -> Msg>,
     scroll: Option<fn(PointerEvent) -> Msg>,
     hovered: Option<u64>,
+    ground: Option<Rgb>,
     theme: &Theme,
 ) -> Element<Msg> {
     let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
@@ -2181,11 +2205,11 @@ pub fn list_view<Msg>(
     } else {
         list
     };
-    stack(alloc::vec![fill(theme.track), body]).focusable()
+    stack(alloc::vec![fill(ground.unwrap_or(theme.track)), body]).focusable()
 }
 
 /// How wide a list's scrollbar is, in pixels.
-const SCROLLBAR_W: u32 = 10;
+const SCROLLBAR_W: u32 = 12;
 
 #[cfg(test)]
 mod list_view_tests {
@@ -2244,7 +2268,7 @@ mod list_view_tests {
             let mut r = rows(&label);
             r[1].marked = marked;
             let mut st = ListState { selected, offset: 0 };
-            nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, &Theme::default()))
+            nodes(&list_view(&r, &mut st, 100, 20, |k| k, None, None, None, None, &Theme::default()))
         };
         let plain = build(false, None);
         let marked = build(true, None);
@@ -2259,7 +2283,7 @@ mod list_view_tests {
         let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
         let r = rows(&data);
         let e: Element<u64> =
-            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&r, &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
     }
 
@@ -2269,7 +2293,7 @@ mod list_view_tests {
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -2279,9 +2303,9 @@ mod list_view_tests {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
         let a: Element<u64> =
-            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&before), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         let b: Element<u64> =
-            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&after), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -2293,11 +2317,11 @@ mod list_view_tests {
         let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
         let mut state = ListState { selected: Some(19), offset: 0 };
         let _: Element<u64> =
-            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&long), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 15, "the scroll did not follow the selection");
         let short = [(0u64, "hit"), (1, "hit"), (2, "hit")];
         let e: Element<u64> =
-            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&short), &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
         assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
@@ -2321,7 +2345,7 @@ mod list_view_tests {
     fn a_list_that_empties_clears_the_selection() {
         let mut state = ListState { selected: Some(3), offset: 2 };
         let _: Element<u64> =
-            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&[], &mut state, 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(state.selected, None, "an empty list kept a selection");
         assert_eq!(state.offset, 0);
     }
@@ -2437,11 +2461,12 @@ mod list_view_tests {
             None,
             Some(|_| 0),
             None,
+            None,
             &p,
         );
         assert_eq!(handlers(&with), 1, "the scrollbar took no pointer handler");
         let without: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
     }
 
@@ -2610,7 +2635,7 @@ mod list_view_tests {
         let p = Theme::default();
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), &p);
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
         assert_eq!(row_faces(&e)[1], p.focus_ring, "the hovered row has no border");
         assert_eq!(row_bevels(&e)[1], Some(p.selection), "the hovered row is not the blue");
         assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
@@ -2631,6 +2656,7 @@ mod list_view_tests {
             None,
             None,
             Some(1),
+            None,
             &p,
         );
         let faces = row_faces(&e);
@@ -2648,6 +2674,7 @@ mod list_view_tests {
             None,
             None,
             Some(2),
+            None,
             &p,
         );
         assert_eq!(row_faces(&e)[1], p.focus_ring, "selection lost to hover");
@@ -2659,7 +2686,7 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let p = Theme::default();
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&data), &mut ListState { selected: Some(1), offset: 0 }, 100, 20, |k| k, None, None, None, None, &p);
         let faces = row_faces(&e);
         assert_eq!(faces.len(), 2);
         assert_ne!(faces[0], faces[1], "the selected row looks like the others");
@@ -2680,11 +2707,11 @@ mod list_view_tests {
         let p = Theme::default();
         let few = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
-            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&few), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert!(!has_row_node(&e), "a list that fits drew a scrollbar");
         let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
         let e: Element<u64> =
-            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, &p);
+            list_view(&rows(&many), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
         assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
     }
 
@@ -2693,7 +2720,7 @@ mod list_view_tests {
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -2702,7 +2729,7 @@ mod list_view_tests {
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
         let e: Element<u64> =
-            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, &Theme::default());
+            list_view(&rows(&data), &mut ListState::default(), 100, 0, |k| k, None, None, None, None, &Theme::default());
         assert_eq!(keys(&e).len(), 0);
     }
 
@@ -3177,18 +3204,57 @@ mod tests {
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
         assert_eq!(fb.get_pixel(0, 0), Some(p.focus_ring), "the ring is on the edge");
-        assert_eq!(fb.get_pixel(40, 20), Some(p.face), "and the face is inside it");
+        // **Inside the ring but away from the label**, which is centred since M15: the middle
+        // of the button is where the word is, so a sample taken there is a glyph.
+        assert_eq!(fb.get_pixel(6, 20), Some(p.face), "and the face is inside it");
     }
 
+    /// A resting button has an edge, and it is not the focus ring.
+    ///
+    /// **What makes a shape read as a control** (M15). The face is eighteen units per channel
+    /// from a white window, which is a difference nobody can see — the report from running it
+    /// was that buttons "need different color background … so you know it's a button". An edge
+    /// is what every desktop draws and what this toolkit had only around a focused control.
     #[test]
-    fn an_unfocused_button_draws_no_ring() {
+    fn a_resting_button_has_a_border_and_a_focused_one_keeps_the_ring() {
         let p = Theme::default();
         let t = Theme::default();
         let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-        assert_eq!(fb.get_pixel(0, 0), Some(p.face), "face all the way to the edge");
+        assert_eq!(fb.get_pixel(0, 0), Some(p.border), "a resting button has no edge at all");
+        assert_ne!(p.border, p.face, "…and the edge is not the face");
+        assert_eq!(fb.get_pixel(6, 20), Some(p.face), "the face is inside the edge");
+    }
+
+    /// The label is in the middle of the button, not against its corner.
+    ///
+    /// **Measured as a distance from each edge**, because the exact pixels a glyph lands on are
+    /// the font's business: what this asserts is that the ink is not hard against the left,
+    /// which is where `padding` alone put it — a button 80 wide with a word 20 wide had 58
+    /// pixels of face to the right of its label (M15).
+    #[test]
+    fn a_buttons_label_is_centred_in_its_face() {
+        let p = Theme::default();
+        let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
+        let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
+        let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
+        paint(&mut fb, &font(), &p, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
+        let inked: Vec<u32> = (0..80)
+            .filter(|x| {
+                (0..40).any(|y| {
+                    let c = fb.get_pixel(*x, y);
+                    c != Some(p.face) && c != Some(p.border)
+                })
+            })
+            .collect();
+        let (first, last) = (inked[0], inked[inked.len() - 1]);
+        let (left, right) = (first, 79 - last);
+        assert!(
+            left.abs_diff(right) <= 2,
+            "the label sits {left} from the left and {right} from the right"
+        );
     }
 
     #[test]

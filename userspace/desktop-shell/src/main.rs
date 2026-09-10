@@ -575,6 +575,7 @@ fn modal_view(
         None,
         Some(ModalMsg::Scroll),
         hovered,
+        None,
         theme,
     );
     // **Framed, because a popup is the one surface with nothing behind it to define its edge**
