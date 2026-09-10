@@ -1003,15 +1003,14 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //    of them before this step even runs — so the step passed on a `seq=` or `uptime_ns=`
     //    digit as readily as on the shell's answer, and was observed doing exactly that.
     //
-    //    The call is bound with `let` and formatted on the next line rather than nested as
-    //    `format("add={}", add(2, 3))`, which nxsh rejects — a user-function call inside an
-    //    argument list is a parse error ("expected , or ) in an argument list"). Both
-    //    constructs used here are already exercised by steps 12 and 14.
+    //    **The call is nested now**, which is what this step is really for: `format` is a
+    //    generic operator and `add` a user `def`, so one line proves the two dispatch
+    //    together through the argument list. It could not be written until 2026-09-10 —
+    //    a call inside an argument list was a parse error, and the two-line workaround
+    //    that stood here carried a comment saying so (`shell-nested-call`).
     s.send("def add(a, b) { a + b }")?;
     s.expect("/home>")?;
-    s.send("let sum = add(2, 3)")?;
-    s.expect("/home>")?;
-    s.send("format(\"add={}\", sum)")?;
+    s.send("format(\"add={}\", add(2, 3))")?;
     s.expect("add=5")?;
     steps += 1;
 
@@ -1230,6 +1229,79 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // …and the listing says how much is there without saying what it is.
     s.send("clip --list | count")?;
     s.expect("2")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 19d. **Tab completion** (§11c), asserted through what the shell *ran* rather than
+    //      through what appeared. A completion is erase-and-rewrite bytes on a wire, so
+    //      matching on them would assert on the capture; pressing Enter afterwards and
+    //      checking the result asserts that the **buffer** was replaced, which is the part
+    //      that matters. Step 8 makes the same argument for history recall.
+    //
+    //      `send_raw` because Tab is a key, not a line: `send` would submit `who` as well.
+    s.send_raw("who\t")?;
+    s.send("")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+
+    //      A path, and the one place a completion has to know something a name lookup does
+    //      not: `Pictures` is a directory, so it keeps its trailing slash and gets no space
+    //      — which is what lets a second Tab descend into it. The prompt is the `PWD`, so
+    //      it says whether the whole path arrived.
+    s.send_raw("cd /home/Pic\t")?;
+    s.send("")?;
+    s.expect("/home/Pictures")?;
+    s.send("cd /home")?;
+    s.expect("/home>")?;
+
+    //      An ambiguous prefix shows the choice instead of guessing. `Do` matches two of
+    //      the three staged folders, so nothing can be typed for you and the list is the
+    //      only useful answer; one more character then makes it unique.
+    s.send_raw("cd /home/Do\t")?;
+    s.expect("Documents/")?;
+    s.expect("Downloads/")?;
+    s.send_raw("c\t")?;
+    s.send("")?;
+    s.expect("/home/Documents")?;
+    s.send("cd /home")?;
+    s.expect("/home>")?;
+
+    //      **`..` completes**, which is path syntax rather than a directory entry — nothing
+    //      in a listing is called `..`, so it can only come from completion knowing what a
+    //      path is.
+    //
+    //      **Two Tabs, and the first one is the test.** `cd ..` has to become `cd ../`,
+    //      which is not directly observable — so the second Tab lists through it, and
+    //      `../bin/` is a token that can appear nowhere else. Written as one Tab on `cd ../`
+    //      this step passed with the dot entries removed: an already-slashed word has an
+    //      *empty* fragment and never asks about `..` at all, so it was testing path
+    //      resolution and reporting it as completion.
+    s.send_raw("cd ..\t")?;
+    s.send_raw("\t")?;
+    s.expect("../bin/")?;
+    s.send_raw("\x03")?;
+    s.expect("/home>")?;
+
+    //      **A continuation line completes as part of the statement it continues.** The
+    //      discipline is reset per physical line while the shell accumulates the earlier
+    //      ones, so a completion handed only the physical line sees column 0 and offers
+    //      command names inside an argument list. Nothing that starts with `Do` is a
+    //      command, so without the accumulated half this produces no listing at all.
+    s.send("format(\"{}\",")?;
+    s.expect("... ")?;
+    s.send_raw("Do\t")?;
+    s.expect("Documents/")?;
+    s.send_raw("\x03")?;
+    s.expect("/home>")?;
+
+    //      And a word that matches nothing is **left alone**. This was the bug the `..`
+    //      report found, and it was never about `..`: the common prefix of no candidates is
+    //      the empty string, so Tab replaced the word with it and deleted what you had
+    //      typed. If that came back, the line here would be empty and the shell would answer
+    //      a bare Enter with a prompt rather than with this.
+    s.send_raw("zzz\t")?;
+    s.send("")?;
+    s.expect("could not resolve `zzz`")?;
     s.expect("/home>")?;
     steps += 1;
 

@@ -54,7 +54,7 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 /// take symbols, every conventional one being spoken for — `|` is the pipe, `&` the
 /// background suffix, `^` the force-external prefix.
 /// TODO(shell-bitwise): `docs/rationale/deferred-decisions.md`.
-const OPERATORS: &[&str] = &[
+pub(crate) const OPERATORS: &[&str] = &[
     "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last",
     "skip", "dedupe", "take", "count", "sum", "min", "max", "avg", "reduce",
     // §10b's Part E families: strings, records, numbers.
@@ -65,7 +65,7 @@ const OPERATORS: &[&str] = &[
 
 /// Shell-state builtins (§3): they mutate the shell's own process state, which an
 /// external program structurally cannot do.
-const BUILTINS: &[&str] = &["cd", "exit"];
+pub(crate) const BUILTINS: &[&str] = &["cd", "exit"];
 
 /// Operators whose bareword argument is a *predicate*, and therefore desugars to an
 /// implicit `{ |it| … }` closure (§8b).
@@ -1114,14 +1114,25 @@ impl<'a> Parser<'a> {
                 args.push(Arg::PipeFill);
             } else if let Tok::Ident(n) = self.peek()? {
                 // `name: value` — a named argument. `:` is legal only in fixed positions
-                // (§8a), and this is one of them. Seeing which requires consuming the
-                // identifier first, so the non-named case resumes from it.
+                // (§8a), and this is one of them. Telling it from an ordinary expression
+                // needs the token *after* the identifier, which is one more than the lexer
+                // caches — so take a mark, look, and put it back if there was no `:`.
+                //
+                // **The rewind is what makes an argument an expression like any other.**
+                // The first version consumed the identifier and resumed in a hand-written
+                // copy of the expression tiers, and that copy was wrong in two ways at
+                // once: it had no arm for a `(` (so `add(2, 3)` and `utils.helper(1)` were
+                // both syntax errors as arguments), and its binary tier folded flat (so
+                // `format("{}", a + b * c)` was `(a + b) * c` while the same expression
+                // anywhere else was not). Both are gone with the copy — see the resolved
+                // `shell-nested-call` entry.
+                let mark = self.lx.clone();
                 self.bump()?;
                 if self.eat(&Tok::Colon)? {
                     args.push(Arg::Named(n, self.expr()?));
                 } else {
-                    let e = self.continue_expr_from(Expr::Ident(n))?;
-                    args.push(Arg::Positional(e));
+                    self.lx = mark;
+                    args.push(Arg::Positional(self.expr()?));
                 }
             } else {
                 args.push(Arg::Positional(self.expr()?));
@@ -1134,88 +1145,6 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "expected `,` or `)` in an argument list")?;
             return Ok(args);
         }
-    }
-
-    /// Resume expression parsing when `primary` has already been consumed.
-    ///
-    /// Needed only in `paren_args`, which must consume an identifier to see whether a `:`
-    /// follows. Applies the postfix and binary tiers to the value already in hand.
-    ///
-    /// **No call can appear in an argument list**, and the two shapes fail for two different
-    /// reasons. `format("add={}", add(2, 3))` and `format("x={}", utils.helper(1))` both report
-    /// "expected `,` or `)` in an argument list"; a parenthesised *pipeline* in the same
-    /// position is fine, which is why the gap went unnoticed.
-    ///
-    /// A bare `name(` is not this function's to fix. Calls on a plain name are built in
-    /// [`Self::command_or_ident`], which needs the **name** — it picks `CallKind::Operator`
-    /// vs `Def` from `OPERATORS` — and `paren_args` has already consumed that name (to see
-    /// whether a `:` follows) and holds only an `Expr`. Routing bare-`Ident`-then-`(` through
-    /// that construction is what makes `add(2, 3)` parse, and it must keep the `OPERATORS`
-    /// test: hardcoding `CallKind::Def` silently changes dispatch for names like `count`.
-    ///
-    /// A qualified `a.b(` *is* this function's, and is the divergence from [`Self::postfix`]:
-    /// that tier's `(` arm handles exactly `Expr::Field(Ident, _)`, and this copy omits it.
-    ///
-    /// Neither fix covers the other — measured, both directions, 2026-08-18.
-    /// TODO(shell-nested-call): see `docs/rationale/deferred-decisions.md`.
-    fn continue_expr_from(&mut self, first: Expr) -> Result<Expr> {
-        let mut e = first;
-        // Postfix tier.
-        loop {
-            e = match self.peek()? {
-                Tok::Dot => {
-                    self.bump()?;
-                    Expr::Field(Box::new(e), self.ident("expected a field name")?)
-                }
-                Tok::QuestionDot => {
-                    self.bump()?;
-                    Expr::TryField(Box::new(e), self.ident("expected a field name")?)
-                }
-                Tok::LBracket => {
-                    self.bump()?;
-                    let idx = self.expr()?;
-                    self.expect(&Tok::RBracket, "expected `]`")?;
-                    Expr::Index(Box::new(e), Box::new(idx))
-                }
-                Tok::Question => {
-                    self.bump()?;
-                    return self.fail(
-                        "`?` was retired in design v1.2 — an operation that fails already \
-                         propagates to its caller, so there was nothing for it to mark. \
-                         Use `try { … } catch { … }` to recover (§2)",
-                    );
-                }
-                _ => break,
-            };
-        }
-        // Binary tiers, lowest-effort form: fold left across whatever operators follow.
-        // Precedence still holds because each right operand is parsed at the tier below.
-        loop {
-            let (op, rhs) = match self.peek()? {
-                Tok::Star => (BinOp::Mul, true),
-                Tok::Slash => (BinOp::Div, true),
-                Tok::Percent => (BinOp::Rem, true),
-                Tok::Plus => (BinOp::Add, true),
-                Tok::Minus => (BinOp::Sub, true),
-                Tok::PlusPlus => (BinOp::Concat, true),
-                Tok::Lt => (BinOp::Lt, true),
-                Tok::Le => (BinOp::Le, true),
-                Tok::Gt => (BinOp::Gt, true),
-                Tok::Ge => (BinOp::Ge, true),
-                Tok::EqEq => (BinOp::Eq, true),
-                Tok::Ne => (BinOp::Ne, true),
-                Tok::Match_ => (BinOp::Match, true),
-                Tok::AndAnd => (BinOp::And, true),
-                Tok::QuestionQuestion => (BinOp::Coalesce, true),
-                Tok::OrOr => (BinOp::Or, true),
-                _ => break,
-            };
-            let _ = rhs;
-            self.bump()?;
-            let r = self.unary()?;
-            e = Expr::Binary(op, Box::new(e), Box::new(r));
-        }
-        Ok(e)
     }
 
     /// Bareword-form arguments to a generic operator or builtin: expressions and flags,
@@ -2061,5 +1990,105 @@ for line in open ./log.txt {
         // …and the `for` form is untouched, which is the pair that matters.
         let s = script("for x in [1, 2] {\n x\n}");
         assert!(matches!(s.stmts[0], Stmt::For { .. }));
+    }
+}
+
+#[cfg(test)]
+mod argument_list_tests {
+    use super::*;
+
+    fn script(src: &str) -> Script {
+        match parse_script(src) {
+            Ok(s) => s,
+            Err(e) => panic!("`{src}` failed at line {}: {}", e.line, e.message),
+        }
+    }
+
+    /// The argument of a call is an **expression**, with no exceptions for how it begins.
+    ///
+    /// **Reported from using the shell**: `let x = age_plus_n(my_age(), 3)` would not
+    /// compile, because `my_age()` was not evaluated — it was not even parsed. Every shape
+    /// here failed with "expected `,` or `)` in an argument list" while a parenthesised
+    /// *pipeline* in the same position parsed, which is why the gap survived: the escape
+    /// hatch people reach for when something does not parse happened to be the one thing
+    /// that worked.
+    #[test]
+    fn a_call_can_be_an_argument() {
+        for src in [
+            // The report, verbatim in shape.
+            "def my_age() { 41 }\ndef age_plus_n(a, n) { a + n }\nlet x = age_plus_n(my_age(), 3)",
+            // A `def` call inside an operator's argument list.
+            "def add(a, b) { a + b }\nformat(\"add={}\", add(2, 3))",
+            // An operator called in call form, nested.
+            "format(\"n={}\", count([1, 2, 3]))",
+            // A qualified name — §9h's `use … as` — which failed for a *different* reason.
+            "format(\"x={}\", utils.helper(1))",
+            // Nested two deep, and in the first argument rather than a later one.
+            "def f(a) { a }\nf(f(f(1)))",
+            // Named arguments still work, and mix with calls.
+            "def g(a, b) { a }\ndef h() { 1 }\ng(h(), b: h())",
+            // The workaround this replaces, which must keep working.
+            "def add(a, b) { a + b }\nlet sum = add(2, 3)\nformat(\"add={}\", sum)",
+            // And the shape that always parsed, as a control on the fix.
+            "format(\"len={}\", (\"hello\" | count))",
+        ] {
+            script(src);
+        }
+    }
+
+    /// An argument that begins with an identifier gets the **same** precedence as one that
+    /// does not.
+    ///
+    /// **This is the finding the deferral did not have.** `paren_args` consumed an
+    /// identifier to see whether a `:` followed, and resumed in a hand-rolled copy of the
+    /// binary tiers that folded flat — so `format("{}", a + b * c)` was `(a + b) * c`
+    /// while `format("{}", 1 + 2 * 3)` and `let z = a + b * c` were both right. Silently
+    /// wrong arithmetic rather than a parse error, and reachable from any argument list.
+    #[test]
+    fn an_argument_starting_with_a_name_binds_like_any_other() {
+        let by_name = one_arg("format(\"{}\", a + b * c)");
+        let by_literal = one_arg("format(\"{}\", 1 + 2 * 3)");
+        assert!(
+            matches!(by_name, Expr::Binary(BinOp::Add, _, _)),
+            "`a + b * c` as an argument parsed as {by_name:?}, not an addition"
+        );
+        assert!(
+            matches!(by_literal, Expr::Binary(BinOp::Add, _, _)),
+            "the literal control changed shape: {by_literal:?}"
+        );
+    }
+
+    /// Every tier below the top one, exercised from argument position.
+    ///
+    /// The old copy listed its operators by hand, so the question "does this tier exist in
+    /// both places" had to be asked operator by operator. It is one tier now; this pins
+    /// that it is.
+    #[test]
+    fn an_argument_reaches_every_tier() {
+        for (src, want) in [
+            ("format(\"{}\", a ?? b)", BinOp::Coalesce),
+            ("format(\"{}\", a || b && c)", BinOp::Or),
+            ("format(\"{}\", a == b)", BinOp::Eq),
+            ("format(\"{}\", a ++ b)", BinOp::Concat),
+            ("format(\"{}\", a - b)", BinOp::Sub),
+        ] {
+            match one_arg(src) {
+                Expr::Binary(op, _, _) => assert_eq!(op, want, "{src}"),
+                other => panic!("{src} parsed as {other:?}"),
+            }
+        }
+        // Postfix still binds tighter than any of them.
+        assert!(matches!(one_arg("format(\"{}\", a.b + c)"), Expr::Binary(BinOp::Add, _, _)));
+        assert!(matches!(one_arg("format(\"{}\", a[0] + c)"), Expr::Binary(BinOp::Add, _, _)));
+    }
+
+    /// The second positional argument of the one call in `src`.
+    fn one_arg(src: &str) -> Expr {
+        let s = script(src);
+        let Stmt::Expr(Expr::Call(c)) = &s.stmts[0] else { panic!("{src}: not a call") };
+        match &c.args[1] {
+            Arg::Positional(e) => e.clone(),
+            other => panic!("{src}: argument 1 is {other:?}"),
+        }
     }
 }

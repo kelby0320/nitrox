@@ -1429,15 +1429,137 @@ Gated on the console/tty server + compositor terminal (later in Phase 4). Covers
 Shift-Enter continuation (needs a key-event channel), job control's `fg`/`&`, schema-aware
 completion, and the prompt's live `PipelineStatus` glyph. Tracked but out of this subproject.
 **Partly delivered ahead of schedule** (2026-08-03): the console/tty server landed, and with it raw
-mode, history recall and reverse-search. What remains gated is completion (needs schema work),
-Shift-Enter (needs a key-event channel), and job control (needs process groups — and, as Milestone
-4 Part G found, a terminate syscall).
+mode, history recall and reverse-search. What remains gated is **schema-aware** completion (needs
+schema work), Shift-Enter (needs a key-event channel), and job control (needs process groups — and,
+as Milestone 4 Part G found, a terminate syscall).
+
+**"Completion" was too broad here, and reading it as written is what kept the baseline waiting.**
+§11c splits it: command names and file paths need nothing this shell does not have, while
+schema-aware *field* completion is the half that needs a pipeline's shape known statically. The
+baseline is Milestone 5 Part B below; only the field half is still gated.
 
 ### Explicitly out of scope (design §10a/§13, carried forward)
 
 Process management (`ps`/`kill` — needs the "how does a command acquire a capability handle to a
 process it didn't spawn" design pass), networking tools (netstack deferred), user-definable aliases
 with baked-in arguments, package system beyond single-file `use`, circular-import resolution.
+
+### Milestone 5 — what using it asked for (2026-09-10)
+
+**Both items came from the maintainer using the shell**, which is where the last three parts of the
+display arm's M15 came from too. Neither is a gap in the design: §11c specified tab completion and
+§5b specified calls with parenthesised arguments. Both are places the *implementation* stopped
+short of what the design already said, and neither was visible from inside the test suite.
+
+- [x] **Part A — a call is an expression wherever an expression is** ✅ (2026-09-10).
+      `let x = age_plus_n(my_age(), 3)` did not parse. The deferral (`shell-nested-call`) named two
+      independent causes and prescribed a fix for each; there was **one** cause and neither fix was
+      needed. `paren_args` must see the token *after* an identifier to tell `f(name: v)` from
+      `f(name.field)` — one more than the lexer caches — so it consumed the identifier and resumed
+      in a hand-written copy of the expression tiers.
+
+      **Everything wrong followed from the copy existing.** It had no `(` arm, which is both
+      reported shapes; and its binary tier folded flat, which nobody had found:
+      `format("{}", a + b * c)` was `(a + b) * c` while the same expression anywhere else was not.
+      Silently wrong arithmetic, reachable from any argument list whose argument begins with a name.
+
+      The fix is a **rewind**: `Lexer` is `Clone`, `paren_args` marks, looks for the `:`, and puts
+      the lexer back if there is none. An argument is then parsed by `expr` like every other
+      expression, and 82 lines go. **Cloning the whole lexer rather than a chosen subset is the
+      load-bearing part** — a hand-picked snapshot is what goes stale when the struct gains a
+      field, and it would fail as a mis-parse rather than as a compile error.
+
+- [x] **Part B — completion, the half that is not the terminal** ✅ (2026-09-10). §11c's baseline
+      is "command names across all four categories (§3), file paths". Both questions are decided
+      lexically from the raw line, which matters because a line being completed is unfinished by
+      definition and will not parse: where the word begins is the lexer's own `is_path_char`,
+      shared rather than copied; whether a command or a path belongs there is what precedes it.
+
+      **The `(` is the interesting case.** `(list /bin | count)` opens a pipeline and takes a
+      stage; `format("{}", x)` opens an argument list and takes a value. Adjacency separates
+      them, which is the same signal §5b's grammar reads. And a word containing a `/` is a path
+      wherever it sits — `./script.nx` is a command written as a path, and §9h leaves this shell
+      no search path to resolve a bare name against anyway.
+
+      `Host` grew `commands` and `list_dir`, both defaulted and best-effort. *Where* programs come
+      from is the host's knowledge, and `list_dir` is the filesystem-and-namespace union `list`
+      shows — a Tab that could not see a mount point would disagree with what is on screen, which
+      is the rule `cd` learned the hard way.
+
+      **What is still gated is the *schema-aware* half** (`filter siz<TAB>` → `size`), which is
+      what needs a pipeline's shape known statically. The plan's own closing section said
+      "completion (needs schema work)" without that qualifier, which reads as though the baseline
+      were gated too; it is not, and never was. Corrected there.
+
+- [x] **Part C — completion at the prompt, and the gate that can see it** ✅ (2026-09-10). Tab is
+      intercepted in the REPL's key loop the way `Ctrl-R` already is, before the discipline sees
+      it: a tab is not a character in a line, and feeding it would put one there. One candidate is
+      typed for you and gets a trailing space unless it is a directory, which keeps its slash so a
+      second Tab descends. Several insert what they all agree on, and list the choice when that
+      adds nothing.
+
+      **Listing needs no cursor addressing** — a newline, the names, the prompt, the line again —
+      which is why this did not wait on the terminal capability `history-pager` waits on. It is
+      wrapped at 80 columns because nothing tells this shell how wide its terminal is; when a size
+      op exists, this is the caller that wants it.
+
+      **The gate is not a separate part, because it is the only test this half can have.**
+      `test-interactive` presses Tab at a real prompt and asserts on what the shell *ran* rather
+      than on what appeared — a completion is erase-and-rewrite bytes, so matching on them would
+      assert on the capture, while pressing Enter afterwards proves the buffer was replaced. Step
+      8 makes the same argument for history recall. Disabling the Tab arm fails the gate.
+
+      **And the layout went to the library because of that gate's price.** `listing` started in
+      `main.rs` beside the `write`, where no host test builds it; how many fit on a row and how
+      the cut is reported are decisions, and a boot is the wrong price for checking them.
+
+- [x] **Part D — `..`, and the word Tab was deleting** ✅ (2026-09-10), both reported from using
+      it: "`cd ..<TAB>` should show a list of completions, but it currently just erases the
+      `..`".
+
+      **`.` and `..` are path syntax, not directory contents**, which is why they were missing:
+      `libfs::list_dir` filters them out and the file browser does not show them, so they cannot
+      arrive with a listing. They are offered when the *fragment* begins with a dot — somebody
+      spelling one — and not for a bare `list <TAB>`, which asks what is in here and must not
+      answer with syntax.
+
+      **The erasure was the worse half and was never about `..`.** The common prefix of no
+      candidates is the empty string, and the console loop substituted it for the word — so Tab
+      on *anything* unmatched deleted what you had typed. `Completion::filled` returns `None`
+      now, which makes it unrepresentable rather than a rule every caller has to remember.
+
+      **The gate's first version passed with the fix removed.** It pressed Tab on `cd ../`,
+      which has an *empty* fragment and never asks about `..` at all — it was testing path
+      resolution and reporting it as completion. Two Tabs on the unslashed `cd ..` is the test:
+      the first has to produce `../`, which is not directly observable, so the second lists
+      through it.
+
+- [x] **Part E — what the review found** ✅ (2026-09-10). Four of the five are the same shape:
+      a rule that was *stated* in a doc comment instead of being made true in the code.
+
+      **`common_prefix` panicked on two names that differ inside a character.** Its doc argued
+      that a byte-wise scan was safe because two candidates would have to share a lead byte and
+      differ in a continuation byte — which is what `é` (`C3 A9`) and `è` (`C3 A8`) do. A
+      directory holding both made Tab slice mid-character and panic, and in the shipped binary
+      that reaches `#[panic_handler]` and **ends the login session**. Counting `len_utf8` makes
+      the offset a boundary by construction rather than by an argument that has to stay true.
+
+      **The word set was the wrong one of the lexer's two.** `is_path_char` answers "is this
+      `/` a path or a division sign" in *expression* mode; an argument is lexed in **word**
+      mode. `+` fails the narrow test, so `cd my+not<TAB>` was cut into `my+` and `not` and the
+      tail was completed into `cd my+notes.txt` — a path nobody typed, silently substituted.
+      `is_word_char` is the honest answer and every existing test survives the widening.
+
+      **A continuation line was completed as a fresh statement.** The discipline resets per
+      physical line while the loop accumulates the earlier ones, so the second line of
+      `format("{}",` looked like column 0. The loop passes the whole statement now, and
+      `position` asks `needs_continuation` whether a newline separates or continues — the
+      language's own answer, which lexes, so a bracket inside a string opens nothing.
+
+      **And the last decision left in the loop had a hole in it.** A lone candidate equal to
+      the word matched neither `if`, so `list notes.txt<TAB>` did nothing. `Completion::action`
+      is the whole decision now — `Nothing`, `Replace`, `List` — leaving the loop a `match` and
+      a write, which is where Part C said the line should be.
 
 ---
 

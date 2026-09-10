@@ -24770,3 +24770,197 @@ the second time this fixture has caught somebody out: with nothing selected, a h
 the primary highlight and is drawn blue, so a list with no selection never reaches the hover
 branch. The first version of the test asserted `face_hover` appears and it did not, for a reason
 that had nothing to do with the change.
+
+
+---
+
+## 2026-09-10 — the copy of the expression tiers nobody knew was there (nxsh M5 Part A)
+
+**"`let x = age_plus_n(my_age(), 3)` won't compile because `my_age()` isn't evaluated."** It was
+not evaluated because it was never parsed: a call inside an argument list was a syntax error, and
+had been since arguments were written.
+
+**The deferral naming it prescribed two fixes, and neither was needed.** `shell-nested-call` said
+there were two independent causes — a bare `name(` that could not be classified once the name was
+consumed, and a qualified `a.b(` missing from one of two copies of the postfix tier — and that a
+fix for either left the other broken. Both halves of that were measured, both directions, and both
+were true *of the code as written*. What the entry did not name is why the code was written that
+way, which is the only thing that mattered.
+
+`paren_args` has to tell `f(name: v)` from `f(name.field)`, and that needs the token **after** an
+identifier — one more than the lexer caches. So it consumed the identifier and resumed in a
+hand-written copy of the expression tiers. Every defect followed from the copy existing.
+
+**Including one nobody had found.** The copy's binary tier folded flat across whatever operators
+followed, so `format("{}", a + b * c)` parsed as `(a + b) * c` — while `format("{}", 1 + 2 * 3)`
+and `let z = a + b * c` were both right, because neither reaches the copy. An argument list
+silently changed what arithmetic means, and only for an argument beginning with a name. That is
+worse than the reported bug: a parse error stops you, and this does not.
+
+**The fix is a rewind rather than a third copy.** `Lexer` derives `Clone`; `paren_args` marks,
+bumps the identifier, looks for the `:`, and puts the lexer back if there is none. An argument is
+then parsed by `expr` like every other expression — one `(` arm, one precedence ladder, 82 lines
+deleted — and both reported shapes and the precedence bug go together because they were one thing.
+
+**Cloning the whole lexer, not a chosen subset of its fields.** A hand-picked snapshot is exactly
+what goes stale the next time the struct gains a field, and it would fail as a *mis-parse* rather
+than as a compile error — the same argument as "two numbers that must be equal are one number",
+applied to state. The clone costs at most one cached token and happens once per argument that
+begins with a name.
+
+**The lesson is about what a deferral entry is for.** This one was thorough — two causes, each
+traced to a line number, each fix measured in both directions — and being thorough about the
+symptom is what made it stop before the question that dissolves it: *why is there a second copy of
+this tier at all?* An entry that describes what fails is a bug report. What makes it worth keeping
+is the account of why the code has the shape it has, because that is what the eventual fix acts
+on. Recorded the same way here: the copy existed for one real reason, and removing the reason
+removed the copy.
+
+`test-interactive` step 7 nests the call now — `format("add={}", add(2, 3))` — which is what the
+step was always for: a generic operator and a user `def` dispatching together in one line. It had
+stood as a two-line workaround with a comment saying the nested form was rejected.
+
+
+---
+
+## 2026-09-10 — Tab, and the line that will not parse (nxsh M5 Parts B and C)
+
+**§11c specified tab completion in the shell's first design pass and it was never built.** The
+reason it stayed unbuilt is worth more than the feature: the plan's closing section said "what
+remains gated is completion (needs schema work)", and that sentence is true of *half* of what
+§11c calls completion. Schema-aware **field** completion — `filter siz<TAB>` → `size` — needs a
+pipeline's shape known statically. Command names and file paths need nothing this shell has not
+had since Milestone 3. One word doing duty for two things kept the achievable half waiting.
+
+**The line being completed does not parse, and cannot be made to.** It is unfinished by
+definition — that is what makes it the line you press Tab on — so the parser is not the tool.
+Both questions are answered lexically from the raw bytes:
+
+- **Where the word begins** is the lexer's own `is_path_char`, *shared* rather than copied. A
+  completion that disagreed with the lexer about where a word begins would offer to finish
+  something the lexer then reads as two tokens. Narrowing that set fails four completion tests,
+  which is the coupling working.
+- **Whether a command or a path belongs there** is what precedes it. The interesting case is
+  `(`: it opens a pipeline in `(list /bin | count)` and an argument list in `format("{}", x)`,
+  and **adjacency separates them** — the same signal §5b's grammar reads. A word containing a
+  `/` is a path wherever it sits, since `./script.nx` is a command written as a path and §9h
+  leaves this shell no search path to resolve a bare name against.
+
+**Two consumers made the lexer's keyword `match` a table.** Completion has to enumerate the
+keywords and a `match` cannot be enumerated, so the alternative was a hand-copied list — whose
+staleness is *silent*, a keyword that simply never appears when you press Tab. Two things that
+must be equal are one thing, and the linear scan over 27 entries is the same trade `Interp`'s
+scopes already make.
+
+**`Host` grew `commands` and `list_dir` rather than the library growing a path.** Where programs
+come from is the host's knowledge — `PROGRAM_DIRS` lives in the binary beside the resolution
+`run` already does — and a library that listed `/bin` itself would be a second answer free to
+disagree with the first. `list_dir` is the filesystem-and-namespace **union** `list` shows,
+because a mount point is a place you can `cd` into and a Tab that could not see one would
+disagree with what is on the screen. That is the rule `cd` learned the hard way in Milestone 3.5,
+applied before it could bite a second time.
+
+**The division of labour is the point, and the gate's price is what sets it.** The console loop
+in `main.rs` is the one part of this shell no host test builds; `nxsh-console-tests` was resolved
+by booting a release image and typing at it, which is the right price for "does a keystroke reach
+the shell" and much too high for "what does this prefix match". So everything that is a
+*decision* is library code — the word, the position, the candidates, and the column layout — and
+what stays in the loop is one `write`. `listing` was written in `main.rs` first and moved for
+exactly this reason, one commit after the rule was written down.
+
+**The gate asserts on what the shell ran, not on what appeared.** A completion is
+erase-and-rewrite bytes on a wire; matching on them would assert on the capture rather than on
+the shell. Pressing Enter afterwards and checking the result proves the **buffer** was replaced,
+which is the part that matters — the same argument step 8 makes for history recall. Disabling the
+Tab arm makes the gate fail on `who`.
+
+**Not done, and each with a trigger rather than a shrug.** Flag names (`list --rev<TAB>`) need no
+design, only a mechanism: nothing in the RS protocol asks a program what flags it accepts.
+Schema-aware field completion needs the schema work §11c always said it did. And the listing is
+wrapped at 80 columns because nothing tells this shell how wide its terminal is — the tty
+protocol carries no size and `nxterm`, which knows its own grid, has no way to say so.
+
+
+---
+
+## 2026-09-10 — the Tab that deleted your word (nxsh M5 Part D)
+
+**"`cd ..<TAB>` should show a list of completions, but it currently just erases the `..`."** Two
+bugs, and the reported one is the smaller.
+
+**`.` and `..` were missing because they are not directory contents.** `libfs::list_dir` filters
+them out and the file browser does not show them, so nothing that lists a directory can ever
+produce them — they are how a path spells *where you are* and *where you came from*. Completion
+offers them when the fragment begins with a dot, which is somebody spelling one, and not for a
+bare `list <TAB>`, which asks what is in here and would otherwise be answered with syntax.
+
+**The erasure was never about `..`.** `common_prefix` of no candidates is the empty string, and
+the console loop substituted it for the word — so Tab on *any* unmatched word deleted what had
+been typed. `..` is simply the unmatched word a person is most likely to try. The fix is
+`Completion::filled` returning `Option`: with nothing to offer there is no line to produce, so
+the loop cannot erase. **Unrepresentable beats documented** — the alternative was a comment
+telling every future caller not to apply an empty prefix, which is the kind of rule that holds
+until the second caller.
+
+**The gate's first version passed with the fix removed, and the reason is worth keeping.** It
+pressed Tab on `cd ../` — already slashed, so `split_path` gives an **empty** fragment and the
+dot entries are never consulted. It was exercising path resolution and reporting it as
+completion: a green test for a feature that did not exist. What distinguishes them is the
+unslashed word, so the step presses Tab twice on `cd ..` — the first has to turn it into `../`,
+which nothing on screen shows, and the second lists through it.
+
+That is the third time on this branch that a test has had to be aimed at where the two
+implementations *differ* rather than at where the feature is visible, and the first two were
+found by the same method: run the control before believing the test.
+
+
+---
+
+## 2026-09-10 — four comments that were arguments instead of code (nxsh M5 Part E)
+
+PR #291's review found five things, and four are one shape: **a rule stated in a doc comment
+rather than made true by the code.** Each comment was reasoning I had done and then written
+down; none of it was checked, and three of the four were wrong.
+
+**`common_prefix` panicked, under a comment explaining why it could not.** The scan was
+byte-wise and the doc argued that was safe — a split inside a character "would need two
+candidates agreeing on a leading byte and differing inside the same character — impossible".
+`é` is `C3 A9` and `è` is `C3 A8`. `日` is `E6 97 A5` and `文` is `E6 96 87`. A directory with
+two names differing in an accent made Tab slice mid-character, and in the shipped binary that
+reaches `#[panic_handler]`, prints `nxsh: panic` and exits — **a Tab press ends the login
+session**. The fix counts `len_utf8`, so the offset is a character boundary by construction.
+The lesson is not about UTF-8: a comment that argues an invariant holds is a claim, and a claim
+in a comment is the one kind that no test ever runs.
+
+**The word boundary was the wrong one of the lexer's two rules, under a comment saying they
+were the same question.** `is_path_char` decides whether a leading `/` is a path or a division
+sign, in *expression* mode. An argument is lexed in **word** mode, where the rule is
+`is_word_char` and far broader. `+` fails the narrow one, so `cd my+not<TAB>` cut the word into
+`my+` and `not`, completed the tail, and handed back `cd my+notes.txt` — a path the person never
+typed, silently substituted for what they did. Sharing the *right* rule costs nothing and every
+existing test survives the widening; sharing the wrong one and calling it "the same question"
+is what stopped the next reader from noticing.
+
+**A continuation line was completed as though it were a fresh prompt**, because the loop handed
+`complete` the physical line while the statement lived in `pending`. Both halves needed fixing:
+the loop passes the whole statement, and `position` now asks `needs_continuation` whether a
+newline separates two statements or continues one. That function lexes rather than counting
+brackets, so a `(` inside a string opens nothing here either — which is the reason to ask the
+language rather than write a second answer.
+
+**And the last decision left in the console loop had a hole in it.** Part C moved the layout to
+the library on the argument that a decision belongs where a host test can reach it, and left
+"insert, or list, or nothing" behind as two `if`s. A lone candidate equal to the word matched
+neither: `list notes.txt<TAB>` did nothing at all. It is `Completion::action` now, returning
+`Nothing`/`Replace`/`List`, and the loop is a `match` and a write. **The rule was right and I
+applied it to three of the four things in the loop** — the same partial sweep this branch's own
+Part A entry warns about, one commit later.
+
+**The fifth is the one that was only a comment**: the spec said several candidates "insert what
+they all agree on and then list the choice", which reads as one press doing both. It is two.
+
+**What to take from this.** Every one of these was a *comment I wrote to explain a decision*,
+and the decision was wrong in three cases out of four. A comment is where reasoning goes to
+stop being checked. When the reasoning is load-bearing — this cannot panic, these two questions
+are the same, this branch is unreachable — the answer is to make it a test or to make it
+structural, and to keep the comment for *why*, not for *therefore*.

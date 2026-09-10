@@ -418,6 +418,39 @@ impl Host for NitroxHost {
         }
     }
 
+    fn commands(&mut self) -> Vec<String> {
+        // **The same list `resolve_program` searches**, walked rather than probed — which is
+        // what keeps Tab from offering a name the shell would then fail to run, or hiding one
+        // it could. A directory that will not list contributes nothing; completion is
+        // best-effort by contract.
+        let mut out = Vec::new();
+        for dir in PROGRAM_DIRS {
+            let path = dir.strip_suffix(b"/").unwrap_or(dir);
+            if let Ok(entries) = libfs::list_dir(self.namespace, path) {
+                for e in entries {
+                    out.push(String::from_utf8_lossy(e.name()).into_owned());
+                }
+            }
+        }
+        out
+    }
+
+    fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
+        // `libfs::list_dir` is the filesystem-and-namespace **union** — the same answer `list`
+        // gives, which is the point: a mount point and a kernel-served directory are places you
+        // can `cd` into, and a Tab that could not see them would disagree with what is on
+        // screen. The rule that these two must ask the namespace the same question is the one
+        // `cd` learned the hard way (`userspace/nxsh/CLAUDE.md`).
+        match libfs::list_dir(self.namespace, dir.as_bytes()) {
+            Ok(entries) => entries
+                .iter()
+                .map(|e| (String::from_utf8_lossy(e.name()).into_owned(),
+                     e.kind == librsproto::file::DIRENT_KIND_DIR))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn diag(&mut self, text: &str) {
         kprint(text.as_bytes());
     }
@@ -902,6 +935,58 @@ fn repl(
                 out.extend_from_slice(&st.redraw());
                 tty_write(tty, &out);
                 search = Some(st);
+                continue;
+            }
+            // **Tab completes** (§11c), intercepted before the discipline the way `Ctrl-R`
+            // is, and for the same reason: a tab is not a character in a line, and feeding
+            // it would put one there.
+            //
+            // What to *decide* is `nxsh::complete`'s, tested on the host; what is left here
+            // is what only this loop can do — write bytes and redraw. The prompt is the
+            // continuation one mid-statement, because that is what is on the screen.
+            if b == b'\t' {
+                let line = String::from_utf8_lossy(disc.line()).into_owned();
+                // **The whole statement, not the physical line.** `disc` is reset per line
+                // while `pending` accumulates the earlier ones, so completing `line` alone
+                // makes every continuation line look like column 0 — and the second line of
+                // `format("{}",` would be offered command names instead of paths. A `\n` is
+                // not a word character, so a word cannot span the join and the completion's
+                // offsets stay inside the physical line (PR #291 review, 3).
+                let mut whole = pending.clone();
+                whole.push_str(&line);
+                let c = interp.complete(&whole);
+                // **What to do is `complete`'s answer, not this loop's.** `Nothing` covers
+                // both "nothing matched" and "nothing left to add": the common prefix of no
+                // candidates is the empty string, and a loop that applied it blindly deleted
+                // the word being typed, which is what the first version did.
+                match c.action(&whole) {
+                    nxsh::complete::Action::Nothing => {}
+                    nxsh::complete::Action::Replace(full) => {
+                        // `strip_prefix` rather than an index: if the accumulated half were
+                        // ever not a prefix of the result, doing nothing beats writing a
+                        // corrupted line.
+                        if let Some(new_line) = full.strip_prefix(pending.as_str()) {
+                            let redraw = disc.replace_line(new_line.as_bytes());
+                            tty_write(tty, &redraw);
+                        }
+                    }
+                    nxsh::complete::Action::List => {
+                        // The list goes on its own lines and the prompt is written again
+                        // beneath it — no cursor addressing, which is what keeps this working
+                        // on the serial console.
+                        tty_write(tty, &nxsh::complete::listing(&c.candidates));
+                        match pending.is_empty() {
+                            true => tty_write(
+                                tty,
+                                nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes(),
+                            ),
+                            false => {
+                                tty_write(tty, nxsh::repl::continuation_prompt().as_bytes())
+                            }
+                        }
+                        tty_write(tty, disc.line());
+                    }
+                }
                 continue;
             }
             match disc.feed(b) {

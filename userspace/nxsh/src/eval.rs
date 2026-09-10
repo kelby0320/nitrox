@@ -278,6 +278,51 @@ impl Interp {
         self.rebind_env();
     }
 
+    /// What a Tab press at the end of `line` should offer (§11c).
+    ///
+    /// **The gathering half of completion**; the deciding half is [`crate::complete`], which
+    /// is pure and where the rules are tested. This is here because the answer needs things
+    /// only an interpreter has: the `def`s that have been typed, and a `Host` to ask what is
+    /// in a directory.
+    ///
+    /// **A word containing a `/` is a path wherever it appears**, including at the head of a
+    /// stage. `./script.nx` and `/bin/list` are commands written as paths, and §9h's rule
+    /// for `use` is the same one — an explicit relative path rather than a search. So the
+    /// slash decides before the position does.
+    pub fn complete(&mut self, line: &str) -> crate::complete::Completion {
+        use crate::complete::{Completion, Where, matching_names, matching_paths, split_path,
+                              word_at_end};
+        let w = word_at_end(line);
+        let as_path = w.at == Where::Argument || w.text.contains('/');
+        if !as_path {
+            // §3's four categories, plus what the person has defined. Keywords whose spelling
+            // is not a word are skipped: `_` is in the table because it is a token, and
+            // offering it at a prompt would be offering punctuation.
+            let keywords = crate::lex::KEYWORDS
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|k| k.as_bytes().first().is_some_and(u8::is_ascii_alphabetic));
+            let commands = self.host.commands();
+            let names = keywords
+                .chain(crate::parse::BUILTINS.iter().copied())
+                .chain(crate::parse::OPERATORS.iter().copied())
+                .chain(self.functions.iter().map(|(n, _)| n.as_str()))
+                .chain(commands.iter().map(alloc::string::String::as_str));
+            return Completion { start: w.start, candidates: matching_names(w.text, names) };
+        }
+
+        let (dir, frag) = split_path(w.text);
+        // An empty directory part means the word is a bare name, which is relative to `PWD`.
+        let target = match self.resolve_path(if dir.is_empty() { "." } else { dir }) {
+            Ok(p) => p,
+            // A path that will not resolve has nothing under it to offer. Not an error: a
+            // Tab that finds nothing does nothing, and the line is unfinished by definition.
+            Err(_) => return Completion::none(w.start),
+        };
+        let entries = self.host.list_dir(&target);
+        Completion { start: w.start, candidates: matching_paths(dir, frag, &entries) }
+    }
+
     /// The host, for a driver that needs to flush or inspect it after a run.
     pub fn host_mut(&mut self) -> &mut dyn Host {
         &mut *self.host
@@ -3714,6 +3759,267 @@ x"), "5");
         }
         // `display` terminates with a newline; the tests care about the value.
         Ok(last.map(|s| alloc::string::String::from(s.trim_end())))
+    }
+
+    /// A host with a `/bin`, a `PWD` and something under it, for completion.
+    fn completing_host() -> MockHost {
+        let mut h = MockHost::new();
+        h.commands = alloc::vec![
+            String::from("list"),
+            String::from("copy"),
+            String::from("whoami"),
+        ];
+        h.entries = alloc::vec![
+            (
+                String::from("/home"),
+                alloc::vec![
+                    (String::from("Documents"), true),
+                    (String::from("Downloads"), true),
+                    (String::from("notes.txt"), false),
+                ],
+            ),
+            (String::from("/bin"), alloc::vec![(String::from("list"), false)]),
+            (
+                String::from("/"),
+                alloc::vec![(String::from("bin"), true), (String::from("home"), true)],
+            ),
+        ];
+        h
+    }
+
+    /// An interpreter completing from `/home`.
+    fn completing() -> Interp {
+        let mut i = Interp::with_host(Box::new(completing_host()), Mode::Repl);
+        i.set_env(env_with(&[("PWD", "/home")]));
+        i
+    }
+
+    /// A stage head offers §3's four categories and the `def`s that have been typed.
+    ///
+    /// **All four, checked separately**, because they come from four different places — a
+    /// table in the lexer, two in the parser, the interpreter's own map, and the host — and
+    /// a single assertion on one prefix would pass with three of the five sources unwired.
+    #[test]
+    fn a_stage_head_completes_every_category_of_name() {
+        let mut i = completing();
+        i.run_line("def deploy() { 1 }").expect("a def at the prompt");
+
+        // A language keyword.
+        assert_eq!(i.complete("le").candidates, alloc::vec![String::from("let")]);
+        // A shell-state builtin. `exi` rather than `ex`, which `expect` also answers to —
+        // a prefix shared by two sources proves neither.
+        assert_eq!(i.complete("exi").candidates, alloc::vec![String::from("exit")]);
+        // A generic value operator.
+        assert_eq!(i.complete("ded").candidates, alloc::vec![String::from("dedupe")]);
+        // An external program, which only the host knows about.
+        assert_eq!(i.complete("who").candidates, alloc::vec![String::from("whoami")]);
+        // And the function just defined, which nothing but this interpreter knows.
+        assert_eq!(i.complete("dep").candidates, alloc::vec![String::from("deploy")]);
+    }
+
+    /// `_` is a token, not something to offer at a prompt.
+    #[test]
+    fn punctuation_in_the_keyword_table_is_not_a_candidate() {
+        let mut i = completing();
+        assert!(
+            !i.complete("").candidates.iter().any(|c| c == "_"),
+            "the pipeline-fill placeholder is punctuation and was offered as a name"
+        );
+    }
+
+    /// An argument completes against the filesystem, relative to `PWD`.
+    #[test]
+    fn an_argument_completes_a_path() {
+        let mut i = completing();
+        // Relative: the bare fragment is resolved against `PWD`, which is `/home`.
+        assert_eq!(
+            i.complete("list Do").candidates,
+            alloc::vec![String::from("Documents/"), String::from("Downloads/")],
+        );
+        // Absolute: the directory part comes back on every candidate, so replacing the
+        // whole word with one is right.
+        assert_eq!(
+            i.complete("list /home/n").candidates,
+            alloc::vec![String::from("/home/notes.txt")],
+        );
+        // A directory the mock does not know is not an error, it is nothing to offer.
+        assert!(i.complete("list /nowhere/x").candidates.is_empty());
+    }
+
+    /// `..` completes to the parent, and a second Tab lists what is in it.
+    ///
+    /// **Reported from using it**: `cd ..<TAB>` erased the `..`. Two things were wrong —
+    /// `..` was not a candidate at all, and a completion that found nothing replaced the
+    /// word with the empty string instead of leaving it alone.
+    #[test]
+    fn the_parent_directory_completes_and_then_lists() {
+        let mut i = completing();
+        // `..` is a directory, so it gains a slash rather than a space…
+        assert_eq!(i.complete("cd ..").candidates, alloc::vec![String::from("../")]);
+        // …and the slash is what makes the next Tab a listing of the parent, which from
+        // `/home` is the root.
+        assert_eq!(
+            i.complete("cd ../").candidates,
+            alloc::vec![String::from("../bin/"), String::from("../home/")],
+        );
+        // A dot alone is the start of both, and `.` is a real place to name.
+        assert_eq!(
+            i.complete("cd .").candidates,
+            alloc::vec![String::from("../"), String::from("./")],
+        );
+        // Through a `..` to something under it.
+        assert_eq!(i.complete("cd ../ho").candidates, alloc::vec![String::from("../home/")]);
+    }
+
+    /// Two files whose names differ in an accent complete without taking the shell down.
+    ///
+    /// The unit test for this is on `common_prefix`; this is the path a person actually
+    /// walks — `libfs::list_dir` hands back names through `from_utf8_lossy`, which keeps
+    /// valid non-ASCII rather than flattening it, so the bytes reach the prefix scan.
+    #[test]
+    fn accented_names_complete_rather_than_panicking() {
+        let mut h = completing_host();
+        h.entries.push((
+            String::from("/home/notes"),
+            alloc::vec![
+                (String::from("caf\u{e9}.txt"), false),
+                (String::from("caf\u{e8}.txt"), false),
+            ],
+        ));
+        let mut i = Interp::with_host(Box::new(h), Mode::Repl);
+        i.set_env(env_with(&[("PWD", "/home")]));
+        let c = i.complete("list /home/notes/ca");
+        assert_eq!(c.candidates.len(), 2);
+        assert_eq!(c.common_prefix(), "/home/notes/caf");
+        assert_eq!(c.filled("list /home/notes/ca").as_deref(), Some("list /home/notes/caf"));
+    }
+
+    /// Tab must never splice a candidate into the **middle** of what was typed.
+    ///
+    /// **`+` is an ordinary character in a filename and an operator in an expression**, and
+    /// the first version cut the word at the lexer's *expression*-mode path rule — so
+    /// `cd my+not<TAB>` completed the trailing `not` and handed back `cd my+notes.txt`, a
+    /// path the person never typed and which does not exist (PR #291 review, 2). An argument
+    /// is read in **word** mode, where the run is unbroken, so the word is `my+not`, it
+    /// matches nothing, and the line is left alone.
+    #[test]
+    fn a_candidate_is_never_spliced_into_the_middle_of_a_word() {
+        let mut i = completing();
+        for line in ["cd my+not", "cd a~not", "cd x@not", "list 50%not"] {
+            let c = i.complete(line);
+            assert!(
+                c.candidates.is_empty(),
+                "{line} completed to {:?} — a fragment of the word was matched on its own",
+                c.candidates
+            );
+            assert_eq!(c.filled(line), None, "{line} would have been rewritten");
+        }
+        // …and the same word with a separator in front of it still completes.
+        assert_eq!(i.complete("cd not").candidates, alloc::vec![String::from("notes.txt")]);
+        // The unspaced binding is the sharpest case: `let x=not` used to become
+        // `let x=notes.txt`, which is a filename substituted for the start of an expression.
+        assert!(i.complete("let x=not").candidates.is_empty());
+        // But a space is a real boundary, so this is still an ordinary path completion.
+        assert_eq!(i.complete("let x = not").candidates, alloc::vec![String::from("notes.txt")]);
+    }
+
+    /// The second line of a statement completes as the statement, not as a fresh prompt.
+    ///
+    /// The console loop hands `complete` the accumulated statement rather than the physical
+    /// line for exactly this; without it the newline reads as a statement boundary and an
+    /// argument list is offered command names (PR #291 review, 3).
+    #[test]
+    fn a_continuation_line_completes_in_the_statement_it_continues() {
+        let mut i = completing();
+        assert_eq!(
+            i.complete("format(\"{}\",\nDo").candidates,
+            alloc::vec![String::from("Documents/"), String::from("Downloads/")],
+            "a continuation line was completed as if it were a new statement"
+        );
+        // And a finished statement followed by a newline is still a fresh head.
+        assert_eq!(i.complete("whoami\nwho").candidates, alloc::vec![String::from("whoami")]);
+    }
+
+    /// A word that matches nothing leaves the line exactly as it was typed.
+    ///
+    /// The bug the `..` report actually found, and it was never about `..`: any unmatched
+    /// word was replaced by the empty common prefix. `filled` returns `None` so that the
+    /// console loop cannot do it.
+    #[test]
+    fn a_completion_that_matches_nothing_leaves_the_word_alone() {
+        let mut i = completing();
+        for line in ["cd zzz", "zzz", "list /home/zzz"] {
+            let c = i.complete(line);
+            assert!(c.candidates.is_empty(), "{line} should match nothing");
+            assert_eq!(c.filled(line), None, "{line} would have had its word erased");
+        }
+    }
+
+    /// A word with a slash in it is a path even at the head of a stage.
+    ///
+    /// `./script.nx` and `/bin/list` are commands written as paths, and this shell has no
+    /// search path to resolve a bare name against anyway (§9h). Offering `list`, `let` and
+    /// `lower` for `/bi` would be offering names that cannot go there.
+    #[test]
+    fn a_command_written_as_a_path_completes_as_a_path() {
+        let mut i = completing();
+        assert_eq!(i.complete("/bi").candidates, alloc::vec![String::from("/bin/")]);
+        // …and a second Tab descends into it, which is what the trailing slash is for.
+        assert_eq!(i.complete("/bin/li").candidates, alloc::vec![String::from("/bin/list")]);
+    }
+
+    /// Completing does not run anything, and leaves the interpreter as it found it.
+    ///
+    /// A Tab press is not an evaluation, and the one thing that would make this unusable is
+    /// a completion with a side effect — `list_dir` on the real host opens a directory
+    /// session, so this is the assertion that it stayed a *read*.
+    #[test]
+    fn completing_runs_nothing() {
+        let host = completing_host();
+        let log = host.log();
+        let mut i = Interp::with_host(Box::new(host), Mode::Repl);
+        i.set_env(env_with(&[("PWD", "/home")]));
+        i.complete("list Do");
+        i.complete("who");
+        assert!(log.borrow().runs.is_empty(), "completing spawned a pipeline");
+        assert!(log.borrow().output.is_empty(), "completing wrote to stdout");
+        assert!(log.borrow().diagnostics.is_empty(), "completing wrote a diagnostic");
+    }
+
+    /// A call in an argument list is **evaluated**, which is what the report was about.
+    ///
+    /// "`let x = age_plus_n(my_age(), 3)` won't compile because `my_age()` isn't
+    /// evaluated." It parses now, and this is the other half: the inner call runs, its
+    /// value becomes the outer call's argument, and the answer is 44 rather than a
+    /// function object or a name.
+    #[test]
+    fn a_call_in_an_argument_list_is_evaluated() {
+        let out = repl(&[
+            "def my_age() { 41 }",
+            "def age_plus_n(a, n) { a + n }",
+            "let x = age_plus_n(my_age(), 3)",
+            "x",
+        ])
+        .expect("the report's own script should run");
+        assert_eq!(out.as_deref(), Some("44"));
+
+        // Nested into an operator, and two deep, so the argument is not merely passed
+        // along unevaluated to something that would have called it anyway.
+        let out = repl(&["def double(n) { n * 2 }", "format(\"n={}\", double(double(3)))"])
+            .expect("a nested call inside an operator should run");
+        assert_eq!(out.as_deref(), Some("n=12"));
+    }
+
+    /// Argument-position arithmetic means what it means everywhere else.
+    ///
+    /// The parser had a second copy of the binary tiers reachable only from an argument
+    /// that began with an identifier, and it folded flat — so this returned 12, not 8,
+    /// and nothing said so.
+    #[test]
+    fn arithmetic_in_an_argument_list_keeps_its_precedence() {
+        let out = repl(&["let a = 2", "let b = 3", "let c = 2", "format(\"{}\", a + b * c)"])
+            .expect("arithmetic in an argument list should run");
+        assert_eq!(out.as_deref(), Some("8"), "an argument list changed what `+` and `*` mean");
     }
 
     /// **A `def` typed at the prompt has to be callable on the next line.**

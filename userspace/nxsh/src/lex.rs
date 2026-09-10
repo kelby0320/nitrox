@@ -234,6 +234,15 @@ type Result<T> = core::result::Result<T, LexError>;
 /// One token of lookahead is cached. If it is asked for again in a *different* mode it is
 /// re-lexed from its own start offset, which is why [`pending_start`](Self::pending_start)
 /// is kept — re-lexing has to be exact, not approximate.
+///
+/// **`Clone` is the parser's second token of lookahead.** One place needs to see the token
+/// *after* an identifier before deciding what the identifier is — `f(name: v)` against
+/// `f(name.field)` — and cloning the whole lexer, looking, and putting it back is exact by
+/// construction. A hand-picked snapshot of "the fields that matter" would be the thing that
+/// goes stale the next time this struct gains a field, and the failure would be a
+/// mis-parse rather than a compile error. The clone costs at most one cached token and
+/// happens once per argument that begins with a name.
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a [u8],
     /// Offset just past the cached token, or the scan position when nothing is cached.
@@ -799,13 +808,26 @@ fn is_ident_char(c: u8) -> bool {
 }
 
 /// What may follow a leading `/` for it to be a path rather than division.
+///
+/// **Expression mode only, and narrower than [`is_word_char`].** It answers one question at
+/// one place — is this `/` a path or a division sign — and is not the general "what is a
+/// word" rule. Completion used it for that and got a word boundary the lexer does not
+/// share: `+` fails this test, so `cd my+not` was cut into `my+` and `not`, and Tab
+/// completed the tail into a path nobody typed (PR #291 review, 2).
 fn is_path_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'/')
 }
 
 /// What continues a bareword. Ends at whitespace and at the structure that can close an
 /// argument list — everything else, operators included, is ordinary text in a word.
-fn is_word_char(c: u8) -> bool {
+///
+/// **Also what [`crate::complete`] takes as the extent of the word under the cursor**, and
+/// shared rather than copied because it is genuinely the same question: an argument is
+/// lexed in word mode, so this is the run the shell will read as one token. A completion
+/// that cut the word anywhere else would either offer to finish something the lexer then
+/// reads as two tokens, or — the way round it actually failed — splice a candidate into the
+/// middle of a word the person had typed.
+pub(crate) fn is_word_char(c: u8) -> bool {
     !matches!(
         c,
         0 | b' ' | b'\t' | b'\r' | b'\n' | b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"'
@@ -819,36 +841,48 @@ fn starts_keyword(s: &[u8], kw: &[u8]) -> bool {
         && (s.len() == kw.len() || !is_ident_char(s[kw.len()]))
 }
 
+/// The language's keywords, and the token each becomes.
+///
+/// **One table rather than a `match` plus a list of names**, because there are two consumers
+/// now: the lexer, which turns a word into a token, and completion, which offers the words.
+/// A `match` cannot be enumerated, so the second consumer would have been a hand-copied list
+/// — and the failure of a stale copy is silent, a keyword that simply never appears when you
+/// press Tab. Linear scan over 27 entries, on the same reasoning `Interp`'s scopes use: at
+/// this size it beats hashing, and identifiers are lexed one line at a time here.
+pub(crate) const KEYWORDS: &[(&str, Tok)] = &[
+    ("let", Tok::Let),
+    ("mut", Tok::Mut),
+    ("const", Tok::Const),
+    ("pub", Tok::Pub),
+    ("if", Tok::If),
+    ("else", Tok::Else),
+    ("for", Tok::For),
+    ("in", Tok::In),
+    ("while", Tok::While),
+    ("break", Tok::Break),
+    ("continue", Tok::Continue),
+    ("def", Tok::Def),
+    ("return", Tok::Return),
+    ("fail", Tok::Fail),
+    ("try", Tok::Try),
+    ("catch", Tok::Catch),
+    ("strict", Tok::Strict),
+    ("match", Tok::Match),
+    ("use", Tok::Use),
+    ("as", Tok::As),
+    ("expect", Tok::Expect),
+    ("assert", Tok::Assert),
+    ("parse", Tok::Parse),
+    ("true", Tok::True),
+    ("false", Tok::False),
+    ("null", Tok::Null),
+    ("_", Tok::Underscore),
+];
+
 fn keyword_or_ident(w: &str) -> Tok {
-    match w {
-        "let" => Tok::Let,
-        "mut" => Tok::Mut,
-        "const" => Tok::Const,
-        "pub" => Tok::Pub,
-        "if" => Tok::If,
-        "else" => Tok::Else,
-        "for" => Tok::For,
-        "in" => Tok::In,
-        "while" => Tok::While,
-        "break" => Tok::Break,
-        "continue" => Tok::Continue,
-        "def" => Tok::Def,
-        "return" => Tok::Return,
-        "fail" => Tok::Fail,
-        "try" => Tok::Try,
-        "catch" => Tok::Catch,
-        "strict" => Tok::Strict,
-        "match" => Tok::Match,
-        "use" => Tok::Use,
-        "as" => Tok::As,
-        "expect" => Tok::Expect,
-        "assert" => Tok::Assert,
-        "parse" => Tok::Parse,
-        "true" => Tok::True,
-        "false" => Tok::False,
-        "null" => Tok::Null,
-        "_" => Tok::Underscore,
-        _ => Tok::Ident(String::from(w)),
+    match KEYWORDS.iter().find(|(k, _)| *k == w) {
+        Some((_, t)) => t.clone(),
+        None => Tok::Ident(String::from(w)),
     }
 }
 

@@ -1326,6 +1326,21 @@ Persistent history across sessions, up/down navigation, incremental reverse-sear
 (`Ctrl-R`-equivalent). Tab completion baseline: command names across all four categories (§3),
 file paths, and flag names where a program's flags are introspectable.
 
+**Built 2026-09-10, minus the flags.** Tab completes command names at the head of a stage —
+keywords, shell-state builtins, generic operators, `def`s, and the programs the host can name —
+and paths everywhere else, including at a stage head when the word contains a `/`, since
+`./script.nx` is a command written as a path. A directory candidate keeps its trailing slash so
+a second Tab descends, and `.` and `..` complete as the directories they name — they are path
+syntax rather than entries, so they are offered for a dotted fragment and not as contents. One
+answer is typed for you, with a trailing space unless it is a directory. Several take two
+presses: the first types the part they all agree on, and a second lists the choice once there is
+nothing left to add. A word that matches nothing is left exactly as typed. **Flag names are not done and need no design work, only a mechanism**: a
+program's flags are not introspectable, because nothing in the RS protocol asks a program what
+it accepts. That is the trigger.
+
+**History is not yet persistent across sessions** — it is a ring in the running shell, so a new
+login starts empty.
+
 **Flagged as a future nice-to-have, not scoped now:** schema-aware field completion (`filter
 siz<TAB>` → `size`, using an upstream pipeline's known `Table` shape). Plausible since shape is
 often statically knowable from ascriptions, but needs real design — does it require speculatively

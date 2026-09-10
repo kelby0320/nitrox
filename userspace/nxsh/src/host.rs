@@ -133,6 +133,37 @@ pub trait Host {
     /// Ordinary output: what `display` and the REPL's auto-display write to.
     fn out(&mut self, text: &str);
 
+    /// The external programs this shell could run by name, for completion (§11c).
+    ///
+    /// **On the trait rather than in the library**, because *where* programs come from is
+    /// the host's knowledge — `PROGRAM_DIRS` lives in the binary, beside the resolution
+    /// [`run`](Self::run) already does — and a library that listed `/bin` itself would be a
+    /// second answer to a question this trait already answers, free to disagree with the
+    /// first.
+    ///
+    /// A best-effort list: a host with nothing to say returns nothing, and completion then
+    /// offers the three categories it can always name. Never an error — a failed listing at
+    /// a prompt is a Tab that does less, not a shell that reports a problem.
+    fn commands(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// What is directly under `dir`, each name with whether it is itself a directory.
+    ///
+    /// `dir` is absolute — the caller resolves against `PWD`, the way every other path the
+    /// shell uses for itself is resolved. Best-effort like [`commands`](Self::commands),
+    /// and for the same reason.
+    ///
+    /// **The union of the filesystem and the namespace**, which is what `list` shows and
+    /// therefore what completion must show: a mount point and a kernel-served directory are
+    /// both places you can `cd` into, and a Tab that could not see them would disagree with
+    /// the listing on screen. `libfs::list_dir` is that union and is what the real host
+    /// calls.
+    fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
+        let _ = dir;
+        Vec::new()
+    }
+
     /// Has the terminal asked this evaluation to stop? (§11h)
     ///
     /// Called at statement boundaries and between loop iterations, so it must be cheap —
@@ -206,6 +237,14 @@ pub struct MockHost {
     pub files: Vec<(String, Vec<u8>)>,
     /// Directories the mock reports as existing, for `cd`.
     pub dirs: Vec<String>,
+    /// What each directory contains: absolute directory → (name, is a directory).
+    ///
+    /// Separate from [`dirs`](Self::dirs), which answers "does this exist" and says nothing
+    /// about contents — a directory can exist and be empty, and a test of completion needs
+    /// to be able to say so.
+    pub entries: Vec<(String, Vec<(String, bool)>)>,
+    /// External program names, for completion.
+    pub commands: Vec<String>,
     /// What the host was asked to do, shared so a test can still read it after the
     /// interpreter has taken ownership of the host.
     log: Rc<RefCell<MockLog>>,
@@ -245,6 +284,8 @@ impl MockHost {
             crashing: Vec::new(),
             files: Vec::new(),
             dirs: Vec::new(),
+            entries: Vec::new(),
+            commands: Vec::new(),
             log: Rc::new(RefCell::new(MockLog::default())),
             interrupt_after: None,
         }
@@ -298,6 +339,18 @@ impl MockHost {
 }
 
 impl Host for MockHost {
+    fn commands(&mut self) -> Vec<String> {
+        self.commands.clone()
+    }
+
+    fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
+        self.entries
+            .iter()
+            .find(|(d, _)| d == dir)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_default()
+    }
+
     fn interrupted(&mut self) -> bool {
         match &mut self.interrupt_after {
             // Consumed, not sticky — the contract the trait documents, and the behaviour
