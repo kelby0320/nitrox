@@ -50,7 +50,10 @@ const HEADER_MULTIFUNCTION: u8 = 0x80;
 
 /// Read/write access to one function's configuration space. Abstracted so the
 /// decoding/sizing logic is host-testable against a synthetic config space.
-trait Cfg {
+///
+/// `pub(crate)` because a driver programming its own capabilities needs one, not
+/// just the enumeration path.
+pub(crate) trait Cfg {
     fn read32(&self, off: u16) -> u32;
     fn write32(&self, off: u16, val: u32);
 }
@@ -341,6 +344,169 @@ pub fn enumerate() -> KVec<ObjectRef> {
     out
 }
 
+// --- The capability list ----------------------------------------------------
+
+/// `status` bit 4: the function implements a capability list.
+const STATUS_CAP_LIST: u32 = 1 << 4;
+/// Config offset of the capability-list pointer (header types 0 and 1 alike).
+const REG_CAP_PTR: u16 = 0x34;
+/// Capabilities live in `0x40..=0xFC`, dword-aligned (PCI 3.0 §6.7).
+const CAP_FIRST: u16 = 0x40;
+const CAP_LAST: u16 = 0xFC;
+
+/// Capability ID: MSI (PCI 3.0 §6.8.1).
+pub(crate) const CAP_ID_MSI: u8 = 0x05;
+
+/// Config offset of the first capability with `id`, or `None` if the function
+/// has no capability list or does not implement one with that id.
+///
+/// The walk is **bounded by the number of dword-aligned slots the list can
+/// occupy**, so a device that reports a circular or malformed chain terminates
+/// the search instead of hanging the boot.
+pub(crate) fn find_capability<C: Cfg>(cfg: &C, id: u8) -> Option<u16> {
+    if cfg.read32(REG_COMMAND) & (STATUS_CAP_LIST << 16) == 0 {
+        return None;
+    }
+    let mut off = (cfg.read32(REG_CAP_PTR) & 0xFC) as u16;
+    for _ in 0..=((CAP_LAST - CAP_FIRST) / 4) {
+        if !(CAP_FIRST..=CAP_LAST).contains(&off) {
+            return None; // the chain ended (next = 0) or pointed out of range
+        }
+        let hdr = cfg.read32(off);
+        if (hdr & 0xFF) as u8 == id {
+            return Some(off);
+        }
+        off = ((hdr >> 8) & 0xFC) as u16;
+    }
+    None
+}
+
+// --- MSI --------------------------------------------------------------------
+//
+// The capability's *layout* is selected by Message Control bit 7, and it is not
+// a widening: Message Data sits at `+0x0C` when the address is 64-bit and at
+// `+0x08` when it is 32-bit. Both target machines' AHCI controllers matter here
+// and they disagree — QEMU's ICH9 is 64-bit, the laptop's Sunrise Point-LP is
+// 32-bit — and no QEMU boot can exercise the second. That is what the host tests
+// below are for. See `docs/planning/phase-5-bare-metal.md` § "The divergence
+// QEMU structurally cannot catch".
+
+/// Message Control bit 0: MSI enable.
+const MSI_CTL_ENABLE: u16 = 1 << 0;
+/// Message Control bits 3:1: log2 of the vectors the function can be given.
+const MSI_CTL_MMC_SHIFT: u16 = 1;
+/// Message Control bits 6:4: log2 of the vectors it is actually given.
+const MSI_CTL_MME_MASK: u16 = 0b111 << 4;
+/// Message Control bit 7: the message address is 64-bit.
+const MSI_CTL_ADDR64: u16 = 1 << 7;
+/// Message Control bit 8: per-vector masking, and hence Mask/Pending Bits.
+const MSI_CTL_PVM: u16 = 1 << 8;
+
+/// What a driver needs in order to program a function's MSI capability.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MsiCap {
+    /// Config offset of the capability header.
+    pub off: u16,
+    /// Message Control bit 7 — **which selects the structure**, not merely the
+    /// address width. See [`msi_data_offset`].
+    pub addr64: bool,
+    /// Message Control bit 8. When clear the capability has no Mask or Pending
+    /// Bits registers at all and simply ends after Message Data; neither
+    /// controller on either target machine sets it.
+    pub per_vector_mask: bool,
+    /// Message Control bits 3:1: log2 of the vectors the function can accept.
+    /// We request one regardless, so this is recorded rather than acted on.
+    pub multi_message_capable: u8,
+}
+
+/// Config offset of this capability's **Message Data** register.
+///
+/// `+0x0C` in the 64-bit form, where `+0x08` holds the upper address; `+0x08` in
+/// the 32-bit form, where the capability then ends. Writing Data at the wrong one
+/// leaves Data zero and the device signalling vector 0.
+pub(crate) fn msi_data_offset(cap: &MsiCap) -> u16 {
+    if cap.addr64 { cap.off + 0x0C } else { cap.off + 0x08 }
+}
+
+/// Decode the function's MSI capability, or `None` if it has none.
+pub(crate) fn read_msi<C: Cfg>(cfg: &C) -> Option<MsiCap> {
+    let off = find_capability(cfg, CAP_ID_MSI)?;
+    let ctl = (cfg.read32(off) >> 16) as u16;
+    Some(MsiCap {
+        off,
+        addr64: ctl & MSI_CTL_ADDR64 != 0,
+        per_vector_mask: ctl & MSI_CTL_PVM != 0,
+        multi_message_capable: ((ctl >> MSI_CTL_MMC_SHIFT) & 0b111) as u8,
+    })
+}
+
+/// Point the function's MSI capability at `addr`/`data` and enable it with
+/// **one** vector (Multiple Message Enable = 0).
+///
+/// `addr` and `data` are the architecture's business — see
+/// [`crate::arch::msi_message`] — and the layout is this module's.
+///
+/// # Safety
+/// Ring-0, boot-time. On return the device may write `data` to `addr` at any
+/// time, so the vector's handler must already be registered and the driver ready
+/// to receive it. The caller is also responsible for disabling the function's
+/// INTx (see [`set_intx_disabled`]), which MSI does not do by itself.
+pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data: u16) {
+    // Message Address: dword-aligned, its low two bits reserved-zero.
+    cfg.write32(cap.off + 0x04, (addr & 0xFFFF_FFFC) as u32);
+    if cap.addr64 {
+        cfg.write32(cap.off + 0x08, (addr >> 32) as u32);
+    }
+    // Message Data is 16 bits and shares its dword with reserved space, so
+    // read-modify-write rather than zeroing the other half.
+    let data_off = msi_data_offset(cap);
+    let keep = cfg.read32(data_off) & 0xFFFF_0000;
+    cfg.write32(data_off, keep | data as u32);
+    // Enable, one vector. The header's low half (id, next) is read-only, so
+    // writing it back unchanged is a no-op on hardware.
+    let hdr = cfg.read32(cap.off);
+    let ctl = ((hdr >> 16) as u16 & !MSI_CTL_MME_MASK) | MSI_CTL_ENABLE;
+    cfg.write32(cap.off, (hdr & 0xFFFF) | ((ctl as u32) << 16));
+}
+
+// --- The command register ---------------------------------------------------
+
+/// `command` bit 2: the function may act as a DMA bus master.
+const CMD_BUS_MASTER: u32 = 1 << 2;
+/// `command` bit 10: the function's INTx assertion is suppressed.
+const CMD_INTX_DISABLE: u32 = 1 << 10;
+
+/// Let the function act as a DMA bus master, returning whether it already could.
+///
+/// **Nothing in Nitrox used to do this**, and DMA worked anyway because the
+/// firmware hands every function over with the bit already set. That is a
+/// property of the firmware we boot under, not of the machine, so a driver that
+/// DMAs sets it for itself.
+pub(crate) fn enable_bus_master<C: Cfg>(cfg: &C) -> bool {
+    let cs = cfg.read32(REG_COMMAND);
+    let was = cs & CMD_BUS_MASTER != 0;
+    if !was {
+        cfg.write32(REG_COMMAND, cs | CMD_BUS_MASTER);
+    }
+    was
+}
+
+/// Suppress or allow the function's legacy INTx assertion.
+///
+/// Enabling MSI does not do this, so a device left with INTx enabled can deliver
+/// both — and the IOAPIC entry the INTx path routed is still live.
+pub(crate) fn set_intx_disabled<C: Cfg>(cfg: &C, disabled: bool) {
+    let cs = cfg.read32(REG_COMMAND);
+    let next = if disabled {
+        cs | CMD_INTX_DISABLE
+    } else {
+        cs & !CMD_INTX_DISABLE
+    };
+    if next != cs {
+        cfg.write32(REG_COMMAND, next);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +555,182 @@ mod tests {
                 self.armed.borrow_mut()[idx] = false;
             }
         }
+    }
+
+    // --- Capability list + MSI ----------------------------------------------
+
+    /// A config space with a capability list: `status` bit 4 set, the pointer at
+    /// `0x34`, and one MSI capability at `off` carrying `ctl` as its Message
+    /// Control. `next` chains onward (0 terminates).
+    fn with_msi(off: u16, ctl: u16, next: u8) -> FakeCfg {
+        let mut c = FakeCfg::new();
+        c.set(REG_COMMAND, (STATUS_CAP_LIST << 16) | 0x0006);
+        c.set(REG_CAP_PTR, off as u32);
+        c.set(off, CAP_ID_MSI as u32 | ((next as u32) << 8) | ((ctl as u32) << 16));
+        c
+    }
+
+    /// QEMU's ICH9 AHCI, read off a live boot: MSI at `0x80`, control `0x0080`.
+    fn qemu_ahci_msi() -> FakeCfg {
+        with_msi(0x80, 0x0080, 0xA8)
+    }
+
+    /// The laptop's Sunrise Point-LP AHCI, read from `lspci -vv`: MSI at `0x80`,
+    /// `Count=1/1 Maskable- 64bit-` — so Message Control is `0x0000`.
+    fn laptop_ahci_msi() -> FakeCfg {
+        with_msi(0x80, 0x0000, 0xA8)
+    }
+
+    #[test]
+    fn the_capability_walk_follows_the_chain_to_a_later_entry() {
+        let mut c = FakeCfg::new();
+        c.set(REG_COMMAND, STATUS_CAP_LIST << 16);
+        c.set(REG_CAP_PTR, 0x70);
+        c.set(0x70, 0x01 | (0x80 << 8)); // power management -> 0x80
+        c.set(0x80, CAP_ID_MSI as u32 | (0xA8 << 8));
+        c.set(0xA8, 0x12); // SATA, end of chain
+        assert_eq!(find_capability(&c, CAP_ID_MSI), Some(0x80));
+        assert_eq!(find_capability(&c, 0x12), Some(0xA8), "the last entry is reachable");
+        assert_eq!(find_capability(&c, 0x11), None, "MSI-X is not in this chain");
+    }
+
+    #[test]
+    fn the_capability_walk_declines_when_the_status_bit_is_clear() {
+        let mut c = qemu_ahci_msi();
+        // Everything is still in place except the claim that a list exists. A
+        // function without the bit may have anything at 0x34.
+        c.set(REG_COMMAND, 0x0006);
+        assert_eq!(find_capability(&c, CAP_ID_MSI), None);
+    }
+
+    #[test]
+    fn the_capability_walk_terminates_on_a_circular_chain() {
+        // Positive control first: the same two entries, chain terminated.
+        let mut ok = FakeCfg::new();
+        ok.set(REG_COMMAND, STATUS_CAP_LIST << 16);
+        ok.set(REG_CAP_PTR, 0x40);
+        ok.set(0x40, 0x01 | (0x50 << 8));
+        ok.set(0x50, 0x10);
+        assert_eq!(find_capability(&ok, 0x10), Some(0x50), "control: a sane chain resolves");
+
+        // Now point the second entry back at the first. Searching for something
+        // absent must return rather than walk forever.
+        let mut loopy = ok;
+        loopy.set(0x50, 0x10 | (0x40 << 8));
+        assert_eq!(find_capability(&loopy, CAP_ID_MSI), None);
+    }
+
+    #[test]
+    fn the_capability_walk_rejects_a_pointer_outside_the_capability_region() {
+        let mut c = FakeCfg::new();
+        c.set(REG_COMMAND, STATUS_CAP_LIST << 16);
+        c.set(REG_CAP_PTR, 0x10); // inside the header, not a capability
+        assert_eq!(find_capability(&c, CAP_ID_MSI), None);
+    }
+
+    #[test]
+    fn the_two_target_controllers_decode_to_different_shapes() {
+        let qemu = read_msi(&qemu_ahci_msi()).expect("QEMU's AHCI advertises MSI");
+        assert_eq!(qemu.off, 0x80);
+        assert!(qemu.addr64, "QEMU's ICH9 AHCI is 64-bit");
+        assert!(!qemu.per_vector_mask, "and non-maskable");
+        assert_eq!(qemu.multi_message_capable, 0, "one vector");
+
+        let laptop = read_msi(&laptop_ahci_msi()).expect("the laptop's AHCI advertises MSI");
+        assert_eq!(laptop.off, 0x80, "at the same offset, which is the trap");
+        assert!(!laptop.addr64, "the laptop's Sunrise Point-LP AHCI is 32-bit");
+        assert!(!laptop.per_vector_mask);
+        assert_eq!(laptop.multi_message_capable, 0);
+    }
+
+    /// **The test this whole part exists to make possible.** No QEMU boot can
+    /// reach the 32-bit branch, because QEMU's AHCI is 64-bit; a driver shaped by
+    /// the emulator writes Data at `+0x0C` and leaves the real Message Data —
+    /// `+0x08` — holding whatever the upper-address write put there.
+    #[test]
+    fn a_32_bit_capability_takes_its_data_at_plus_8_and_nothing_beyond() {
+        let c = laptop_ahci_msi();
+        let cap = read_msi(&c).unwrap();
+        assert_eq!(msi_data_offset(&cap), 0x88);
+        // SAFETY: a synthetic config space; nothing is armed by this write.
+        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) };
+
+        assert_eq!(c.read32(0x84), 0xFEE0_0000, "message address");
+        assert_eq!(c.read32(0x88) & 0xFFFF, 0x0031, "message data, at +0x08");
+        assert_eq!(
+            c.read32(0x8C),
+            0,
+            "+0x0C is past the end of a 32-bit non-maskable capability and must \
+             not be written — on the laptop it is reserved space before the SATA \
+             capability at 0xA8"
+        );
+    }
+
+    #[test]
+    fn a_64_bit_capability_takes_the_upper_address_at_plus_8_and_data_at_plus_c() {
+        let c = qemu_ahci_msi();
+        let cap = read_msi(&c).unwrap();
+        assert_eq!(msi_data_offset(&cap), 0x8C);
+        // SAFETY: a synthetic config space.
+        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) };
+
+        assert_eq!(c.read32(0x84), 0xFEE0_0000, "message address, low half");
+        assert_eq!(c.read32(0x88), 0, "message address, upper half");
+        assert_eq!(c.read32(0x8C) & 0xFFFF, 0x0031, "message data, at +0x0C");
+    }
+
+    #[test]
+    fn programming_msi_preserves_the_reserved_half_of_the_data_dword() {
+        let mut c = laptop_ahci_msi();
+        c.set(0x88, 0xDEAD_0000); // reserved upper half, arbitrarily non-zero
+        let cap = read_msi(&c).unwrap();
+        // SAFETY: a synthetic config space.
+        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) };
+        assert_eq!(c.read32(0x88), 0xDEAD_0031, "16-bit field, read-modify-write");
+    }
+
+    #[test]
+    fn programming_msi_enables_exactly_one_vector() {
+        // A function that could take eight (MMC = 3) still gets one.
+        let c = with_msi(0x80, 0x0086, 0);
+        let cap = read_msi(&c).unwrap();
+        assert_eq!(cap.multi_message_capable, 3, "capable of 8");
+        // SAFETY: a synthetic config space.
+        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0030) };
+
+        let ctl = (c.read32(0x80) >> 16) as u16;
+        assert_ne!(ctl & MSI_CTL_ENABLE, 0, "enabled");
+        assert_eq!(ctl & MSI_CTL_MME_MASK, 0, "multiple message enable = 1 vector");
+        assert_eq!(c.read32(0x80) & 0xFF, CAP_ID_MSI as u32, "capability id preserved");
+        assert_eq!((c.read32(0x80) >> 8) & 0xFF, 0, "next pointer preserved");
+    }
+
+    // --- The command register ------------------------------------------------
+
+    #[test]
+    fn enabling_bus_master_reports_whether_the_firmware_had_already_done_it() {
+        // What both target machines' firmware actually hands over.
+        let mut already = FakeCfg::new();
+        already.set(REG_COMMAND, 0x0007);
+        assert!(enable_bus_master(&already), "firmware had set it");
+        assert_eq!(already.read32(REG_COMMAND) & 0xFFFF, 0x0007, "unchanged");
+
+        // And a function handed over without it, which is what we must not assume
+        // away: decode bits on, bus mastering off.
+        let mut not_yet = FakeCfg::new();
+        not_yet.set(REG_COMMAND, 0x0003);
+        assert!(!enable_bus_master(&not_yet), "firmware had not");
+        assert_eq!(not_yet.read32(REG_COMMAND) & 0xFFFF, 0x0007, "now it is set");
+    }
+
+    #[test]
+    fn intx_disable_is_its_own_bit_and_leaves_the_decode_bits_alone() {
+        let mut c = FakeCfg::new();
+        c.set(REG_COMMAND, 0x0007);
+        set_intx_disabled(&c, true);
+        assert_eq!(c.read32(REG_COMMAND) & 0xFFFF, 0x0407, "bit 10 set, 0..2 intact");
+        set_intx_disabled(&c, false);
+        assert_eq!(c.read32(REG_COMMAND) & 0xFFFF, 0x0007, "and it is reversible");
     }
 
     /// A QEMU-ICH9-like AHCI controller header (header type 0, BAR5 = ABAR).
