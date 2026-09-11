@@ -92,6 +92,15 @@ work on interrupt-heavy devices.
 > (`IR-PCI-MSI-0000:00:17.0`) and leaves only the i8042 on the IOAPIC. See
 > [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
 
+> **Split in two by Part A's detail pass (2026-09-11): MSI lands, MSI-X stays here.** A
+> capability walk found MSI-X on neither the laptop's AHCI (`00:17.0`) nor its xHCI (`00:14.0`)
+> — the xHCI's eight vectors are plain MSI — which are the two functions Part A and Phase 6 rest
+> on, and the only two the laptop capture covers. In the QEMU machine, walked in full, the only
+> MSI-X device is the e1000e, which has no driver until Phase 8. MSI-X is also a different
+> mechanism, not a wider MSI: a vector table and pending-bit array in a device BAR. Building it
+> in Part A would be building it at its *zeroth* consumer. **New trigger for MSI-X alone:** the
+> first driver that both advertises it and wants more vectors than MSI's capability can give.
+
 **A dedicated arch trait for the device-interrupt *installation* facility.**
 `install_pci_irq` (the composite that registers a handler in the arch vector
 table + routes a GSI to it — Part 3) is currently a **neutral free function**
