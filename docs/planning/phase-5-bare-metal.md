@@ -77,14 +77,21 @@ i8042 is on the IOAPIC. See Part A.
 
 ---
 
-## Part A — MSI, because INTx may not be routable at all ⬜
+## Part A — MSI, because INTx may not be routable at all ✅
 
-- [ ] **MSI for PCI devices**, replacing the IOAPIC path for AHCI.
+- [x] **MSI for PCI devices**, replacing the IOAPIC path for AHCI.
 
-**This is the part most likely to decide whether the disk works.** The AHCI driver currently
-takes its interrupt line straight from the PCI Interrupt Line register
-(`kernel/src/drivers/ahci.rs`, with the comment "`_PRT` routing is deferred") and uses it as a
-GSI. QEMU's firmware programs that register to match the IOAPIC, so it works there. Real UEFI
+> **Landed 2026-09-11.** AHCI acquires its interrupt over MSI on both target machines' shape of
+> controller, with INTx kept as the fallback for a function advertising no capability. The
+> boxes below are ticked and **the prose is past tense to match** — everything from here to
+> Part B describes what was built, not what was intended. `cargo xtask test-qemu` adjudicates
+> which path was taken (`check_ahci_msi_path`), and the control for that gate is in
+> § "The gate".
+
+**This was the part most likely to decide whether the disk works.** The AHCI driver used to
+take its interrupt line straight from the PCI Interrupt Line register
+(`kernel/src/drivers/ahci.rs`, with the comment "`_PRT` routing is deferred") and use it as a
+GSI. QEMU's firmware programs that register to match the IOAPIC, so it worked there. Real UEFI
 frequently leaves it meaningless, because the authoritative routing lives in the ACPI DSDT's
 `_PRT` — **which requires an AML interpreter**, i.e. vendoring ACPICA.
 
@@ -94,14 +101,16 @@ Every PCIe function on Sunrise Point-LP supports it, and Linux uses it on this e
 That reclassifies the existing MSI deferral — filed under "performance work on interrupt-heavy
 devices" — as **the real-hardware unblocker**.
 
-Two deferrals resolve with it. The MSI/MSI-X entry closes, and **shared INTx chaining**
-(trigger: "real hardware where INTx lines are shared across functions") becomes moot for
-anything MSI-capable, because MSI vectors are never shared.
+Two deferrals moved with it, though not the two this section first predicted. The MSI half of
+the MSI/MSI-X entry closed and **MSI-X kept an entry of its own** (see § "Scope"); the
+`ArchIrqInstall` entry closed outright. **Shared INTx chaining** (trigger: "real hardware where
+INTx lines are shared across functions") is not closed but is further from mattering: it now
+covers only a function with no MSI capability at all.
 
-- [ ] The device-interrupt install family gains its **second member**, which is the trigger the
+- [x] The device-interrupt install family gains its **second member**, which is the trigger the
       existing deferral names for promoting `install_pci_irq` into an `ArchIrqInstall` trait.
       Build the abstraction now, at the second consumer, not before.
-- [ ] Keep the IOAPIC path: the i8042 is on GSI 1 on this machine and is not going anywhere
+- [x] Keep the IOAPIC path: the i8042 is on GSI 1 on this machine and is not going anywhere
       (`interrupts.txt`: `1: … IR-IO-APIC 1-edge i8042`).
 
 ### What the emulator and the machine actually report
@@ -146,10 +155,10 @@ capability at `[a8]`, where it does nothing. The device is left signalling vecto
 a device vector at all, so the disk's completion interrupt never arrives. The boot hangs on the
 first read, on the machine, with every gate green.
 
-- [ ] **The form is selected by reading Message Control bit 7**, and both branches exist from the
+- [x] **The form is selected by reading Message Control bit 7**, and both branches exist from the
       first commit — not a 64-bit driver with a 32-bit fixup added after the laptop refuses to
       boot.
-- [ ] **The 32-bit branch is the one under host test.** `pci/mod.rs`'s existing `FakeCfg` can
+- [x] **The 32-bit branch is the one under host test.** `pci/mod.rs`'s existing `FakeCfg` can
       model a 32-bit, non-maskable capability, so the laptop's shape is covered by `cargo xtask
       test` even though no QEMU boot can exercise it. Model it **without** Mask Bits, as the real
       devices are: a fake that carries them turns the misdirected write into a modelled register
@@ -174,33 +183,35 @@ function *was* walked, the only MSI-X device is the e1000e, which has no driver 
 
 ### The pieces, in dependency order
 
-- [ ] **Config-space access that outlives enumeration.** This does not exist today.
+- [x] **Config-space access that outlives enumeration.** It did not exist:
       `kernel/src/pci/mod.rs` reserves *one* vmap page and repoints it per function inside
-      `enumerate()`; when that returns, no driver can read its own config space. MSI is entirely
-      config-space writes, so this is the first deliverable rather than a detail of a later one.
-      `ResourceDescriptor` already carries `seg`/`bus`/`dev`/`func`, so the address is
-      re-derivable. What needs deciding is the mapping's **lifetime**: a page per claimed device,
-      or one shared window behind a lock. The shared window is a mutual-exclusion problem the
-      enumeration-time code never had, because it ran before the scheduler existed.
-- [ ] **A capability-list walk** in the neutral PCI module: Status bit 4, the pointer at `0x34`,
+      `enumerate()`, so when that returned, no driver could read its own config space. MSI is
+      entirely config-space writes, which made this the first deliverable rather than a detail
+      of a later one. `ResourceDescriptor` already carried `seg`/`bus`/`dev`/`func`, so the
+      address was re-derivable. **Decided: a page per claimed device** (`pci::Config`), not one
+      shared window behind a lock. A shared window would be a mutual-exclusion problem the
+      enumeration-time code never had, because it ran before the scheduler existed, and it would
+      buy back one page per Tier 1 driver — the wrong trade at this count. The mapping is
+      permanent, because vmap never reclaims VA.
+- [x] **A capability-list walk** in the neutral PCI module: Status bit 4, the pointer at `0x34`,
       the `id`/`next` chain, with a cycle bound. Capability *layout* is PCI-SIG and identical on
       every architecture, so this is neutral kernel code by the same argument that puts ECAM
       enumeration there.
-- [ ] **The arch seam, chosen before the code is written.** The MSI message *layout* is
+- [x] **The arch seam, chosen before the code was written.** The MSI message *layout* is
       x86-specific: the address encodes a LAPIC destination (`0xFEE0_0000 | dest << 12`) and the
       data encodes a vector and delivery mode. The capability *write* is not. Two shapes are
       available and they are not equivalent — (1) `arch` exposes `msi_message(vector, cpu) ->
       (addr, data)` and neutral PCI code writes the capability, or (2)
       `ArchIrqInstall::install_msi(cfg, handler)` takes a config-space accessor and does the
-      whole thing inside `arch/`. **Prefer (1):** it keeps PCI knowledge out of `arch/`,
+      whole thing inside `arch/`. **Took (1):** it keeps PCI knowledge out of `arch/`,
       mirroring the split already made between `IrqRouter` (routing) and `Platform` (firmware
       facts), and it leaves the capability walk host-testable against `FakeCfg`, which is where
       the 32-bit form above gets its coverage. `cargo xtask check-arch` enforces whichever is
       picked, so picking after the code is written is the expensive order.
-- [ ] **The trait promotion.** `install_pci_irq` is a neutral free function carrying a
+- [x] **The trait promotion.** `install_pci_irq` is a neutral free function carrying a
       `TODO(msi)` that names exactly this moment. The family gains its second member, so it
       becomes `ArchIrqInstall` with the INTx and MSI installs side by side.
-- [ ] **The driver switch, with INTx kept as the fallback.** AHCI prefers MSI when the capability
+- [x] **The driver switch, with INTx kept as the fallback.** AHCI prefers MSI when the capability
       is present and falls back to the interrupt-line GSI when it is not. Keeping both is not a
       test accommodation: it is what a device with no MSI capability needs, and the i8042 stays
       on the IOAPIC regardless.
@@ -219,13 +230,13 @@ for us that we have therefore never done for ourselves. It is the same config-sp
 needs, so it costs almost nothing here; met at Part F instead, it presents as "the disk does
 nothing" with the entire boot as the suspect list.
 
-- [ ] The driver sets bus-master enable explicitly rather than inheriting it.
+- [x] The driver sets bus-master enable explicitly rather than inheriting it.
 
 **Enabling MSI means disabling INTx.** The Interrupt Disable bit (command bit 10) is clear on
 every function at handoff. A device left able to deliver both, with the IOAPIC entry we routed
 still live, is a spurious-interrupt source that would present as a driver bug.
 
-- [ ] Setting MSI Enable also sets Interrupt Disable; taking the INTx fallback leaves it clear.
+- [x] Setting MSI Enable also sets Interrupt Disable; taking the INTx fallback leaves it clear.
 
 ### The gate, and the control that makes it mean something
 
@@ -233,10 +244,12 @@ still live, is a spurious-interrupt source that would present as a driver bug.
 produced by a driver that silently fell back to INTx, which is this part's most likely real
 failure. So the adjudication is on *which path was taken*, not on the boot succeeding:
 
-- [ ] The driver says which path it took — it already prints a line of the form
-      `ahci: INTx GSI10 -> vec 0x30` — and an `xtask` check reads that line. PR #293 spent a
-      branch on self-tests nobody read; this one is written with its reader.
-- [ ] **Match the path token (`INTx` versus `MSI`), never the vector**, which is not stable
+- [x] The driver says which path it took — `ahci: irq via MSI (vec 0x31, addr 0xfee00000, data
+      0x0031, 64-bit cap at 0x80)` or `ahci: irq via INTx (GSI 10, vec 0x31)` — and
+      `check_ahci_msi_path` in `tools/xtask/src/main.rs` reads that line from `test-qemu`'s
+      transcript. PR #293 spent a branch on self-tests nobody read; this one landed with its
+      reader in the same commit.
+- [x] **Match the path token (`INTx` versus `MSI`), never the vector**, which is not stable
       across builds: the selftest image's `IrqRouter::self_test` registers `pit_tick` and never
       releases the slot, so AHCI lands at `0x31` there and at `0x30` in a release image. All
       eight captured transcripts in `tools/build-cache/` split on exactly that line. A matcher
@@ -244,11 +257,11 @@ failure. So the adjudication is on *which path was taken*, not on the boot succe
       time it is pointed at `check-login` or `test-interactive`. Part A's own switch moves the
       number again, which is the section's thesis restated: the claim under test is the path, not
       the vector.
-- [ ] A **forced-INTx probe** still boots, since that path stays as the fallback.
-- [ ] **The negative control to run before calling it done:** make the capability walk fail to
+- [x] A **forced-INTx probe** still boots, since that path stays as the fallback.
+- [x] **The negative control to run before calling it done:** make the capability walk fail to
       find MSI. The boot must still pass *and* the adjudicated line must change. A gate that
       reports the same thing either way is the defect, not the test.
-- [ ] The **`CAP.S64A` assert** belongs in this change (flagged in PR #293). The HBA reports
+- [x] The **`CAP.S64A` assert** belongs in this change (flagged in PR #293). The HBA reports
       `S64A` under QEMU and the decision log treats 64-bit DMA as a considered call, but the
       kernel reads `CAP` and only prints it — a violated assumption is silent corruption rather
       than a refusal. Same shape as the rest of Part A: read a capability register and act on it.

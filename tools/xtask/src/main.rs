@@ -7717,6 +7717,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_login_chain(&transcript)?;
             check_demo_chain(&transcript)?;
             check_display_selftest(&transcript)?;
+            check_ahci_msi_path(&transcript)?;
             check_block_read_selftest(&transcript)?;
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
@@ -7768,6 +7769,53 @@ fn check_oversize_refused(transcript: &[u8]) -> R<()> {
          was discovered at all, when the first one publishes no fragment limit (the ramdisk's \
          `u32::MAX`), or when the probe's own allocation failed. An AHCI disk that came up is \
          none of those."
+        .into())
+}
+
+/// Assert that the AHCI driver acquired its interrupt over **MSI**, not by falling back to
+/// INTx.
+///
+/// **A passing `test-qemu` proves nothing about this on its own**, which is the whole reason
+/// the check exists. QEMU's firmware programs the PCI interrupt-line register to match the
+/// IOAPIC, so the INTx fallback works perfectly here — the boot, the block read self-test and
+/// the verdict are identical either way. Real UEFI frequently leaves that register
+/// meaningless, so a silent fallback is a bug only the target machine would report, by not
+/// booting.
+///
+/// **Matches the path token and never the vector**, deliberately. The vector is not stable
+/// across builds: the selftest image's `IrqRouter::self_test` registers `pit_tick` and never
+/// releases the slot, so AHCI lands on `0x31` there and `0x30` in a release image, and every
+/// captured transcript in `tools/build-cache` splits on exactly that line. A matcher written
+/// against the literal would pass this gate — `test-qemu` is a selftest image — and fail the
+/// first time it were pointed at `check-login` or `test-interactive`. Part A's own switch
+/// moved the number again.
+///
+/// The INTx arm is a **failure, not a skip**: every AHCI controller on either target machine
+/// advertises MSI (capability at `0x80` on both), so taking the fallback under QEMU means the
+/// capability walk, the message composition or the capability write went wrong — not that the
+/// hardware lacked the feature.
+fn check_ahci_msi_path(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if text.contains("ahci: irq via MSI") {
+        println!("xtask: the AHCI controller took the MSI interrupt path ✓");
+        return Ok(());
+    }
+    if text.contains("ahci: irq via INTx") {
+        return Err("the AHCI driver fell back to INTx. QEMU's ICH9 AHCI advertises MSI at \
+             capability 0x80, so the fallback firing here means the driver did not find it or \
+             could not program it — `pci::find_capability`, `pci::read_msi`, \
+             `ArchIrqInstall::install_msi` (which declines a destination wider than eight \
+             bits), or `pci::Config::map`, whose failure logs its own line just above. The \
+             boot still passes, because QEMU's firmware programs the interrupt-line register \
+             and real UEFI often does not — which is the bug this gate exists to catch before \
+             the laptop does."
+            .into());
+    }
+    Err("the AHCI driver printed no interrupt-path line — expected \"ahci: irq via MSI\" or \
+         \"ahci: irq via INTx\". Both arms print one, so its absence means the controller \
+         never reached interrupt installation at all: no ABAR, no SATA disk on an implemented \
+         port, a failed DMA allocation, or an HBA declined for lacking CAP.S64A. Each of those \
+         logs its own line above this point."
         .into())
 }
 
