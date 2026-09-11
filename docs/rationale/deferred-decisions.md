@@ -76,43 +76,18 @@ optional hardware that isn't on the boot path.
 > mass storage, per-device), which is the condition this project builds an abstraction under.
 > See [`phase-6-usb.md`](../planning/phase-6-usb.md).
 
-**MSI / MSI-X (message-signalled interrupts).** Phase 2 routes device
-interrupts through the IOAPIC (legacy line interrupts), which is sufficient for
-the QEMU AHCI controller. MSI/MSI-X (and the per-vector affinity they enable)
-land when a device needs them. Trigger: NVMe, multi-queue NICs, or performance
-work on interrupt-heavy devices.
+**MSI-X (table-based message-signalled interrupts).** **MSI** itself landed in Phase 5 Part A
+(2026-09-11) and has moved to the Resolved table; MSI-X did not, and it is a different mechanism
+wearing a similar name rather than a wider MSI — a vector table and a pending-bit array living
+in a device BAR, so it needs a BAR mapping, a policy for allocating the table, and per-vector
+masking rules that plain MSI does not have.
 
-> **Scheduled as Phase 5 Part A (2026-09-10), and the trigger above turned out to be the
-> wrong one.** This is filed as performance work; on real hardware it is a **correctness**
-> unblocker. The AHCI driver takes its GSI from the PCI interrupt-line register, which QEMU's
-> firmware programs and real UEFI frequently does not — the authoritative routing is the ACPI
-> DSDT's `_PRT`, which needs AML, which means ACPICA. MSI needs none of that: the device is
-> told a vector and a LAPIC address and writes it itself. The target laptop is evidence
-> rather than argument — Linux drives its AHCI and xHCI over MSI
-> (`IR-PCI-MSI-0000:00:17.0`) and leaves only the i8042 on the IOAPIC. See
-> [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
-
-> **Split in two by Part A's detail pass (2026-09-11): MSI lands, MSI-X stays here.** A
-> capability walk found MSI-X on neither the laptop's AHCI (`00:17.0`) nor its xHCI (`00:14.0`)
-> — the xHCI's eight vectors are plain MSI — which are the two functions Part A and Phase 6 rest
-> on, and the only two the laptop capture covers. In the QEMU machine, walked in full, the only
-> MSI-X device is the e1000e, which has no driver until Phase 8. MSI-X is also a different
-> mechanism, not a wider MSI: a vector table and pending-bit array in a device BAR. Building it
-> in Part A would be building it at its *zeroth* consumer. **New trigger for MSI-X alone:** the
-> first driver that both advertises it and wants more vectors than MSI's capability can give.
-
-**A dedicated arch trait for the device-interrupt *installation* facility.**
-`install_pci_irq` (the composite that registers a handler in the arch vector
-table + routes a GSI to it — Part 3) is currently a **neutral free function**
-(`crate::arch::install_pci_irq`), not a method on `ArchIrqRouter`: it spans three
-hardware abstractions (the handler registry, the local controller, and the
-router) and belongs to none. When the device-interrupt *family* grows a second
-member — **MSI/MSI-X install**, **shared-INTx chaining**, or **IRQ teardown**
-(Tier 2 module unload drains + unhooks an IRQ) — promote the family into its own
-arch trait (e.g. `ArchIrqInstall`), distinct from `ArchIrqRouter` (pure routing)
-and `ArchIrq` (the local controller). One method + one consumer today does not
-justify the trait (the project builds an abstraction at its second consumer); the
-`TODO(msi)` on the function marks the trigger.
+It is deferred because **nothing in reach wants it**. A capability walk of both target machines
+found MSI-X on neither the laptop's AHCI (`00:17.0`) nor its xHCI (`00:14.0`) — the xHCI's eight
+vectors are plain MSI — and those two functions are what Phase 5 and
+[Phase 6](../planning/phase-6-usb.md) rest on. The only MSI-X device in the QEMU machine is the
+e1000e, which has no driver until [Phase 8](../planning/phase-8-networking.md). Trigger: the
+first driver that both advertises MSI-X and wants more vectors than its MSI capability can give.
 
 **Shared PCI INTx interrupt chaining.** The "chain of handlers, each returning
 *mine* / *not mine*" model for shared legacy interrupt lines is deferred; Phase 2
@@ -122,7 +97,9 @@ shared across functions.
 
 > **Likely to be closed by removal rather than by building it** (2026-09-10). Phase 5 Part A
 > moves PCI devices to MSI, and an MSI vector is never shared — so the population this entry
-> covers shrinks to devices that are not MSI-capable. Revisit when the first such device
+> covers shrinks to devices that are not MSI-capable. **Part A landed on 2026-09-11** and the
+> shrinkage is real: AHCI takes the MSI path on both target machines, and INTx survives only as
+> the fallback for a function advertising no capability. Revisit when the first such device
 > appears, and if none does, retire this.
 
 **IOMMU programming and userspace drivers.** Granting a `DeviceNode` /
@@ -1989,6 +1966,8 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| MSI (message-signalled interrupts) | 2026-09-11 | Phase 5 Part A, and **the trigger this entry carried was the wrong one** — it was filed as performance work ("NVMe, multi-queue NICs, or performance work on interrupt-heavy devices") when on real hardware it is a correctness unblocker: the AHCI driver took its GSI from the PCI interrupt-line register, which QEMU's firmware programs and real UEFI frequently leaves meaningless, the authoritative routing being the DSDT's `_PRT` — which needs AML, which means ACPICA. MSI needs none of it. `pci::read_msi` and `pci::program_msi` decode and program the capability, `ArchIrqInstall::install_msi` composes the x86 message, and AHCI prefers MSI while keeping INTx as the fallback for a function that advertises no capability. **Message Control bit 7 selects the structure, not the address width**: Message Data sits at `+0x0C` when the address is 64-bit and `+0x08` when it is not, and the two target controllers disagree — QEMU's ICH9 AHCI is 64-bit, the laptop's Sunrise Point-LP is not — so the branch the target machine takes is the one no QEMU boot can exercise. Host tests carry both shapes, built from the real captures, and are negative-controlled by forcing the offset to `+0x0C` unconditionally, which is the driver the emulator alone would have produced. Bus mastering and the INTx-disable bit came with it, being the same config-space plumbing: nothing in Nitrox had ever set either, and DMA worked only because the firmware did. MSI-X stays deferred with a consumer-based trigger of its own. |
+| A dedicated arch trait for the device-interrupt *installation* facility (`msi`) | 2026-09-11 | Built in Phase 5 Part A **at the second consumer**, which is what this entry asked for. `ArchIrqInstall` carries `install_intx` — the old neutral `install_pci_irq` free function, moved verbatim — and `install_msi`, in `kernel/src/arch/irq_install.rs` with the x86 half in `kernel/src/arch/x86_64/irq_install.rs`: a module of its own rather than more of `ioapic.rs`, because only the INTx half is the IOAPIC's business at all. The MSI half yields a **message** rather than programming a device, which is where the arch boundary falls — the address and data are architectural, the PCI capability they are written into is not. It also refuses rather than truncates when a destination will not fit the compatibility format's eight bits, a narrowing the dense-index binding already assumed and nothing had written down. **Closing this exposed a hole in `check-deferrals` itself**: the last `TODO(msi)` marker in the tree was the gate's own doc comment illustrating the tag syntax, so the entry was backed by an example rather than by a code site, and would have stayed green with its real marker deleted. The illustration is a placeholder now, and the gate fails correctly on an unbacked entry again. |
 | A call cannot be nested in an argument list (`shell-nested-call`) | 2026-09-10 | Reported from using the shell — `let x = age_plus_n(my_age(), 3)` did not compile, because `my_age()` was never parsed. **The entry named two causes and prescribed a fix for each; there was one cause and neither fix was needed.** `paren_args` has to see the token *after* an identifier to tell `f(name: v)` from `f(name.field)`, which is one more than the lexer caches — so it consumed the identifier and resumed in a hand-written copy of the expression tiers. Everything wrong followed from the copy existing: no `(` arm (both reported shapes), and a binary tier that folded flat. **That last one nobody had found**: `format("{}", a + b * c)` parsed as `(a + b) * c` while `format("{}", 1 + 2 * 3)` and `let z = a + b * c` were both right, so an argument list silently changed the meaning of arithmetic whenever the argument began with a name. The fix is a **rewind** — `Lexer` is `Clone`, `paren_args` marks, looks for the `:`, and puts the lexer back if there is none — after which an argument is parsed by `expr` like every other expression and the 82-line copy is deleted. Cloning the whole lexer rather than a chosen subset of its fields is the point: a hand-picked snapshot is what goes stale when the struct gains a field, and it would fail as a mis-parse rather than as a compile error. `test-interactive` step 7's two-line workaround is gone. |
 | A scrollbar's grab offset (`scroll-grab`) | 2026-09-09 | M14 Part I, taken while the wheel was already in this code — the entry's own framing was "a question of where it lives rather than whether it is allowed", and the answer is `libui::widget::ScrollGrab`, a value the **application** holds. The same shape as `libui::click::Clicks` and for the same reason: the toolkit's widgets are rebuilt every frame and have nowhere to keep state that outlives an event. `ScrollState` gained `offset_for_thumb_top`, the inverse `offset_at` should always have been expressed in terms of — `offset_at` remains, because centring is exactly right for a press on the **track**, and `ScrollGrab` is what tells the two presses apart. A press on the thumb now returns the offset *unchanged* rather than one recomputed from the thumb's position, which keeps a grab exact where the position arithmetic truncates. `ListState::drag_to` became `ListState::bar`, since what the caller now needs from the widget is the `ScrollState`, not the conversion. Two consumers: `nxterm`'s grid bar and `nxfiles`' listing. **M9's drag-to-move, the trigger this entry finally acquired, had already solved its own half separately** — the compositor's `grab_at` records the pointer at the press for exactly this reason (PR #247 review, finding 4), which is the same idea one layer down and stays where it is. |
 | A press time on the wire (`press-time`) | 2026-09-09 | M14 Part I, folded into the scroll wheel's change at the maintainer's direction: the wheel wanted an *axis* on `PointerEvent` and this wanted a *timestamp*, which is one pass over the wire format, its spec doc and its construction sites rather than two. `libinput::Logical` carries the kernel's `time_ns` on **every** variant, `Dropped` included — a loss is a moment too, and the compositor synthesises crossings on one that have to be stamped with something. The router mirrors it beside `buttons` and `modifiers`, for the reason those are mirrored: enter and leave are generated rather than received, so they have no event of their own to read. `PointerEvent` carries **milliseconds**, divided once at `emit` — a client that had to divide is a client that can forget to, and nanoseconds fed to an interval expressed in milliseconds fails silently, as a desktop where double click stopped working. **On the event rather than beside it**: passing the time as a second argument to `route` costs no field and hands the next edit the `now` already in scope, which is the bug this closes. `nxterm` and `nxfiles` both lost their `clock_ms()`. |

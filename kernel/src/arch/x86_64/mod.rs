@@ -10,6 +10,7 @@ pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod ioapic;
+pub mod irq_install;
 pub mod paging;
 /// QEMU integration-test exit primitive — only under the `test-harness` feature.
 #[cfg(feature = "test-harness")]

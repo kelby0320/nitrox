@@ -8378,10 +8378,19 @@ fn cmd_check_nightly() -> R<()> {
 /// ever reviewed, and each surfaced only when a consumer tripped over it (audit,
 /// 2026-07-24). A `TODO` is a deferral; this makes the code half of that mechanical.
 ///
-/// The document must name the tag **literally** — `TODO(msi)`, not just the word "msi" —
-/// because a bare short tag (`mm`) matches half the prose in any technical document, which
-/// would make the check pass without recording anything. Naming it also makes the entry
-/// searchable from the code and vice versa.
+/// The document must name the tag **literally** — the whole `TODO(<tag>)` form, not just the
+/// bare word inside it — because a short tag on its own (`mm`) matches half the prose in any
+/// technical document, which would make the check pass without recording anything. Naming it
+/// also makes the entry searchable from the code and vice versa.
+///
+/// **The illustration above is a placeholder on purpose.** This file is one of the three roots
+/// the reverse check scans, so spelling a real tag here makes this comment count as that
+/// deferral's code marker. Until 2026-09-11 the line read the MSI tag literally, and it had
+/// been the *only* marker backing that entry since the real one was written — so the entry
+/// stayed green when its marker was deleted, which is the exact failure the reverse check was
+/// added to catch. Sibling comments in this file name real tags deliberately, as
+/// cross-references from code that relates to them; an example of the *syntax* relates to
+/// nothing and must not name one.
 /// One family of ABI constants mirrored between the kernel and `userspace/libkern`.
 ///
 /// `pattern` is matched per line on both sides; capture group semantics are handled by

@@ -25,7 +25,7 @@
 use crate::arch::Platform;
 use crate::arch::platform::{ArchPlatform, EcamRegion};
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{KBox, KVec};
+use crate::libkern::{AllocError, KBox, KVec};
 use crate::mm::{PhysAddr, VirtAddr, kvmap};
 use crate::object::ObjectRef;
 use crate::object::device_node::{
@@ -51,8 +51,8 @@ const HEADER_MULTIFUNCTION: u8 = 0x80;
 /// Read/write access to one function's configuration space. Abstracted so the
 /// decoding/sizing logic is host-testable against a synthetic config space.
 ///
-/// `pub(crate)` because a driver programming its own capabilities needs one, not
-/// just the enumeration path.
+/// `pub(crate)` because a driver programming its own capabilities needs one —
+/// see [`Config`], the window that outlives [`enumerate`].
 pub(crate) trait Cfg {
     fn read32(&self, off: u16) -> u32;
     fn write32(&self, off: u16, val: u32);
@@ -342,6 +342,68 @@ pub fn enumerate() -> KVec<ObjectRef> {
     }
     crate::kprintln!("pci: enumeration complete ({} function(s) found)", found);
     out
+}
+
+// --- Config space that outlives enumeration ---------------------------------
+//
+// `enumerate` reserves one scan window and repoints it per function, so it is
+// gone by the time a driver is bound. A driver that must program its own
+// capabilities (MSI) needs a window of its own, and `ResourceDescriptor` carries
+// the `seg`/`bus`/`dev`/`func` the address is derived from.
+
+/// Why a function's configuration space could not be reached.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigError {
+    /// No firmware ECAM window covers this function's segment and bus. Either
+    /// the descriptor did not come from [`enumerate`], or the firmware described
+    /// a bus it does not map.
+    NoEcamWindow,
+    /// The window is covered but could not be mapped (out of VA or page tables).
+    Unmappable(AllocError),
+}
+
+/// A function's 4 KiB configuration space, mapped uncached for as long as the
+/// holder keeps it — the driver-side counterpart to [`enumerate`]'s shared scan
+/// window.
+///
+/// **The mapping is permanent.** The vmap allocator never reclaims VA, so
+/// dropping a `Config` returns nothing; one page per claimed device is the price,
+/// and Tier 1 drivers are few and bound once at boot. A shared window behind a
+/// lock would save that page and cost a lock on a path that runs after the
+/// scheduler exists — the wrong trade at this count.
+pub(crate) struct Config {
+    inner: MmioCfg,
+}
+
+impl Config {
+    /// Map the configuration space of the function `desc` describes.
+    ///
+    /// Boot-time; must run after [`ArchPlatform::init`] (the ECAM windows) and
+    /// the kvmap.
+    pub(crate) fn map(desc: &ResourceDescriptor) -> Result<Config, ConfigError> {
+        let region = Platform::pcie_ecam_regions()
+            .iter()
+            .find(|r| r.segment == desc.seg && desc.bus >= r.bus_start && desc.bus <= r.bus_end)
+            .ok_or(ConfigError::NoEcamWindow)?;
+        let phys = func_phys(region, desc.bus, desc.dev, desc.func);
+        // SAFETY: `phys` is a 4 KiB-aligned config-space frame inside a firmware
+        // -described ECAM window, which is device memory and never RAM.
+        let va = unsafe { kvmap::map_mmio(phys, 1) }.map_err(ConfigError::Unmappable)?;
+        Ok(Config {
+            inner: MmioCfg {
+                base: va.as_u64() as *mut u8,
+            },
+        })
+    }
+}
+
+impl Cfg for Config {
+    fn read32(&self, off: u16) -> u32 {
+        self.inner.read32(off)
+    }
+    fn write32(&self, off: u16, val: u32) {
+        self.inner.write32(off, val)
+    }
 }
 
 // --- The capability list ----------------------------------------------------
