@@ -25213,16 +25213,23 @@ from the `lspci -vv` capture of 2026-09-10. "QEMU-testable in full" had been a c
 
 **The finding that justifies the pass: the laptop's AHCI is 32-bit MSI and QEMU's is 64-bit.**
 Message Control bit 7 does not select a wider address — it selects a different structure.
-Message Data sits at `+0x0C` in the 64-bit form and at `+0x08` in the 32-bit one, where the
-64-bit form keeps Mask Bits. A driver written against QEMU writes Data into the mask register on
-the laptop, leaves Data zero, and the device signals vector 0: no completion interrupt, a boot
-that hangs on the first read, and every gate green. **No QEMU boot can catch it**, which inverts
-the usual relationship — the 32-bit form is the one that must be under *host* test, against the
-`FakeCfg` that `pci/mod.rs` already has, precisely because the emulator exercises the other one.
+Message Data sits at `+0x0C` in the 64-bit form and at `+0x08` in the 32-bit one, and since
+neither controller advertises per-vector masking, the laptop's capability is ten bytes and simply
+ends there. A driver shaped by QEMU therefore writes the upper address — zero — into the real
+Message Data at `+0x08`, and its `+0x0C` write lands in reserved config space between the MSI
+capability and the SATA one, where it does nothing. The device signals vector 0: no completion
+interrupt, a boot that hangs on the first read, and every gate green. **No QEMU boot can catch
+it**, which inverts the usual relationship — the 32-bit form is the one that must be under *host*
+test, against the `FakeCfg` that `pci/mod.rs` already has, precisely because the emulator
+exercises the other one. The fake models it **without** mask bits, as the hardware is; one that
+carries them would absorb the misdirected write into a modelled register and make the test tamer
+than the machine.
 
 **MSI-X is dropped from Part A on evidence, not on effort.** Neither the laptop's AHCI nor its
-xHCI advertises MSI-X; the xHCI's eight vectors are plain MSI. The only MSI-X device in either
-machine is QEMU's e1000e, which has no driver until Phase 8. Building it in Part A would be
+xHCI advertises MSI-X; the xHCI's eight vectors are plain MSI. Those are the two functions Part A
+and Phase 6 rest on, and also the only two the laptop capture covers — its NIC and I²C controller
+were never walked, so the claim stops there. In the QEMU machine, where every function was
+walked, the only MSI-X device is the e1000e, which has no driver until Phase 8. Building it in Part A would be
 building at the zeroth consumer, against this project's own rule — and **Phase 6 will not need
 it either**, which is the part that was not obvious before the probe. The deferral splits: MSI
 closes with Part A, MSI-X keeps its own entry and gets its own trigger.

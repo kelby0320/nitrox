@@ -93,9 +93,10 @@ work on interrupt-heavy devices.
 > [`phase-5-bare-metal.md`](../planning/phase-5-bare-metal.md).
 
 > **Split in two by Part A's detail pass (2026-09-11): MSI lands, MSI-X stays here.** A
-> capability walk of both machines found MSI-X on neither the laptop's AHCI (`00:17.0`) nor its
-> xHCI (`00:14.0`) — the xHCI's eight vectors are plain MSI — and the only MSI-X device in the
-> QEMU machine is the e1000e, which has no driver until Phase 8. MSI-X is also a different
+> capability walk found MSI-X on neither the laptop's AHCI (`00:17.0`) nor its xHCI (`00:14.0`)
+> — the xHCI's eight vectors are plain MSI — which are the two functions Part A and Phase 6 rest
+> on, and the only two the laptop capture covers. In the QEMU machine, walked in full, the only
+> MSI-X device is the e1000e, which has no driver until Phase 8. MSI-X is also a different
 > mechanism, not a wider MSI: a vector table and pending-bit array in a device BAR. Building it
 > in Part A would be building it at its *zeroth* consumer. **New trigger for MSI-X alone:** the
 > first driver that both advertises it and wants more vectors than MSI's capability can give.

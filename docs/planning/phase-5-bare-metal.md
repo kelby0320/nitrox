@@ -115,7 +115,7 @@ plugged in rests on this rather than on a datasheet.
 |---|---|---|
 | QEMU q35 `00:1f.2` ICH9 AHCI `8086:2922` | at `0x80`, **64-bit**, 1 vector, non-maskable | none (SATA cap at `0xa8`) |
 | Laptop `00:17.0` Sunrise Point-LP AHCI `8086:9d03` | at `0x80`, **32-bit**, 1 vector, non-maskable | none (SATA cap at `0xa8`) |
-| Laptop `00:14.0` Sunrise Point-LP xHCI `8086:9d2f` | at `0x80`, 64-bit, **8 vectors** | none |
+| Laptop `00:14.0` Sunrise Point-LP xHCI `8086:9d2f` | at `0x80`, 64-bit, **8 vectors**, non-maskable | none |
 | QEMU `00:02.0` e1000e `8086:10d3` | at `0xd0`, 64-bit | at `0xa0`, 5 vectors, BIR 3 |
 
 QEMU's AHCI HBA reports `CAP 0xc0141f05` — `S64A` set, 32 command slots, 6 ports.
@@ -128,22 +128,34 @@ also contains the one divergence that matters, and it is not the one the plan ex
 **The laptop's AHCI is 32-bit MSI; QEMU's is 64-bit.** That is not a detail of degree — it
 changes the capability structure's *layout*. Message Control bit 7 selects between two:
 
-| Offset | 64-bit form (QEMU) | 32-bit form (the laptop) |
+| Offset | 64-bit form (QEMU's AHCI) | 32-bit form (the laptop's AHCI) |
 |---|---|---|
+| `+0x02` | Message Control | Message Control |
 | `+0x04` | Message Address | Message Address |
 | `+0x08` | Message Upper Address | **Message Data** |
-| `+0x0C` | **Message Data** | Mask Bits |
+| `+0x0C` | **Message Data** | *(end of the capability)* |
 
-A driver that writes Data at `+0x0C` because that is what worked under QEMU writes into the
-**Mask Bits** register on the laptop and leaves Data at zero. The device then signals vector 0 —
-not a device vector at all — and the disk's completion interrupt never arrives. The boot hangs
-on the first read, on the machine, with every gate green.
+**Neither controller has Mask or Pending Bits**: those exist only when Message Control bit 8
+(per-vector masking) is set, and both report `Maskable-`. So the laptop's structure is ten bytes
+— `0x80` id/next, `0x82` control, `0x84` address, `0x88` data — and stops.
 
-- [ ] **Both forms are written from the start**, and the **32-bit form is the one under host
-      test**. `pci/mod.rs`'s existing `FakeCfg` can model a 32-bit-only capability, so the
-      laptop's shape is covered by `cargo xtask test` even though no QEMU boot can exercise it.
-      This is the inversion worth keeping: the emulator tests the path the target does *not*
-      take, so the host test is not a nicety here.
+Now trace a driver shaped by QEMU against that. Its `+0x08` write puts the *upper address* —
+zero, since `0xFEE0_0000` fits in 32 bits — straight into **Message Data**. Its `+0x0C` write
+lands at config offset `0x8C`, reserved space between the MSI capability at `[80]` and the SATA
+capability at `[a8]`, where it does nothing. The device is left signalling vector 0, which is not
+a device vector at all, so the disk's completion interrupt never arrives. The boot hangs on the
+first read, on the machine, with every gate green.
+
+- [ ] **The form is selected by reading Message Control bit 7**, and both branches exist from the
+      first commit — not a 64-bit driver with a 32-bit fixup added after the laptop refuses to
+      boot.
+- [ ] **The 32-bit branch is the one under host test.** `pci/mod.rs`'s existing `FakeCfg` can
+      model a 32-bit, non-maskable capability, so the laptop's shape is covered by `cargo xtask
+      test` even though no QEMU boot can exercise it. Model it **without** Mask Bits, as the real
+      devices are: a fake that carries them turns the misdirected write into a modelled register
+      instead of into nothing, which is a tamer failure than the target's. This is the inversion
+      worth keeping — the emulator tests the branch the target does *not* take, so the host test
+      is not a nicety here.
 
 ### Scope: MSI, not MSI-X
 
@@ -152,11 +164,13 @@ config-space capability and nothing more; MSI-X is a vector table and a pending-
 in a device BAR, which means mapping a BAR, an allocation policy for the table, and per-vector
 masking rules — a distinct mechanism wearing a similar name.
 
-The evidence is that it has **no consumer on the target machine at all**: neither its AHCI nor
-its xHCI advertises MSI-X, and the xHCI's eight vectors are plain MSI. The only MSI-X device in
-either machine is QEMU's e1000e, which has no driver until [Phase 8](phase-8-networking.md). So
-MSI-X here would be built at its *zeroth* consumer — and [Phase 6](phase-6-usb.md) will not need
-it either.
+The evidence is that it has **no consumer in either phase that would use it**: neither the
+laptop's AHCI nor its xHCI advertises MSI-X, and the xHCI's eight vectors are plain MSI. Those
+two functions are the ones Part A and [Phase 6](phase-6-usb.md) depend on, and they are also the
+only two the laptop capture covers — the Realtek NIC and the Designware I²C controller were
+never capability-walked, so this says nothing about them. In the QEMU machine, where every
+function *was* walked, the only MSI-X device is the e1000e, which has no driver until
+[Phase 8](phase-8-networking.md). So MSI-X here would be built at its *zeroth* consumer.
 
 ### The pieces, in dependency order
 
@@ -219,9 +233,17 @@ still live, is a spurious-interrupt source that would present as a driver bug.
 produced by a driver that silently fell back to INTx, which is this part's most likely real
 failure. So the adjudication is on *which path was taken*, not on the boot succeeding:
 
-- [ ] The driver says which path it took — it already prints `ahci: INTx GSI10 -> vec 0x31` — and
-      an `xtask` check reads that line. PR #293 spent a branch on self-tests nobody read; this
-      one is written with its reader.
+- [ ] The driver says which path it took — it already prints a line of the form
+      `ahci: INTx GSI10 -> vec 0x30` — and an `xtask` check reads that line. PR #293 spent a
+      branch on self-tests nobody read; this one is written with its reader.
+- [ ] **Match the path token (`INTx` versus `MSI`), never the vector**, which is not stable
+      across builds: the selftest image's `IrqRouter::self_test` registers `pit_tick` and never
+      releases the slot, so AHCI lands at `0x31` there and at `0x30` in a release image. All
+      eight captured transcripts in `tools/build-cache/` split on exactly that line. A matcher
+      written against the literal passes `test-qemu` — Part A's named gate — and fails the first
+      time it is pointed at `check-login` or `test-interactive`. Part A's own switch moves the
+      number again, which is the section's thesis restated: the claim under test is the path, not
+      the vector.
 - [ ] A **forced-INTx probe** still boots, since that path stays as the fallback.
 - [ ] **The negative control to run before calling it done:** make the capability walk fail to
       find MSI. The boot must still pass *and* the adjudicated line must change. A gate that
@@ -238,6 +260,13 @@ doing: it enables VT-d and writes remappable-format MSI addresses. Nitrox will w
 compatibility-format addresses straight to `0xFEE0_0000`, which is correct **provided nothing
 has enabled remapping before us**. Firmware normally has not. Part D's hardware report is where
 that stops being an assumption.
+
+**The compatibility format carries eight bits of destination id** (address bits 19:12), while
+`Irq::id()` returns the full 32-bit x2APIC id. So `msi_message(vector, cpu)` narrows, and it
+should say so at the seam rather than have it discovered. The bound is not new: `hw_apic_id`
+already reads the 8-bit initial xAPIC id and documents "sufficient while `MAX_CPUS <= 255`". The
+two assumptions are the same one and they fail together, which is the argument for stating it
+once where the truncation happens. Harmless on a 4-thread i5-7200U and under QEMU.
 
 ### Left alone
 
