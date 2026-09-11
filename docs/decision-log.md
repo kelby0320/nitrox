@@ -25197,3 +25197,53 @@ deliberately broken line is the method every finding on this branch was establis
 this module was the only one in the kernel where that did not work. Swept the rest by running
 each module alone; the detector was positive-controlled against the four that failed before the
 fix.
+
+---
+
+## 2026-09-11 — Part A's detail pass: the emulator tests the path the laptop does not take
+
+Phase 5 Part A was one line of intent — "MSI (and MSI-X where a device offers it) for PCI
+devices" — against Parts B–H that were already at implementable grain. The pass that fixed that
+was worth more than the writing: it settled a scope question with evidence, and found two things
+the plan had assumed away.
+
+**The method was a throwaway probe, not a datasheet.** A capability-list walk went into
+`pci::probe_function`, ran under `test-qemu`, was read, and was reverted; the laptop's half came
+from the `lspci -vv` capture of 2026-09-10. "QEMU-testable in full" had been a claim nothing ran.
+
+**The finding that justifies the pass: the laptop's AHCI is 32-bit MSI and QEMU's is 64-bit.**
+Message Control bit 7 does not select a wider address — it selects a different structure.
+Message Data sits at `+0x0C` in the 64-bit form and at `+0x08` in the 32-bit one, where the
+64-bit form keeps Mask Bits. A driver written against QEMU writes Data into the mask register on
+the laptop, leaves Data zero, and the device signals vector 0: no completion interrupt, a boot
+that hangs on the first read, and every gate green. **No QEMU boot can catch it**, which inverts
+the usual relationship — the 32-bit form is the one that must be under *host* test, against the
+`FakeCfg` that `pci/mod.rs` already has, precisely because the emulator exercises the other one.
+
+**MSI-X is dropped from Part A on evidence, not on effort.** Neither the laptop's AHCI nor its
+xHCI advertises MSI-X; the xHCI's eight vectors are plain MSI. The only MSI-X device in either
+machine is QEMU's e1000e, which has no driver until Phase 8. Building it in Part A would be
+building at the zeroth consumer, against this project's own rule — and **Phase 6 will not need
+it either**, which is the part that was not obvious before the probe. The deferral splits: MSI
+closes with Part A, MSI-X keeps its own entry and gets its own trigger.
+
+**Nothing in Nitrox has ever enabled PCI bus mastering.** Enumeration clears and restores the
+decode bits to size BARs and never touches bit 2; the AHCI driver does not read the command
+register at all. A positive-controlled sweep found two mentions of bus mastering in `kernel/`: a
+doc comment in `mm/dma.rs`, and the *test fixture* in `pci/mod.rs`, which presets `0x0007` and
+labels it "bus-master enabled". DMA works because the firmware hands every function over with
+BME already set. That is exactly the shape this phase exists to find — the emulator's firmware
+doing something for us that we have therefore never done for ourselves — and it is a one-line
+fix now against "the disk does nothing" at Part F. Its neighbour is the same class: MSI Enable
+without Interrupt Disable leaves a device free to deliver both, with the IOAPIC entry still live.
+
+**The arch seam is decided before the code, because `check-arch` will enforce whichever shape
+ships.** Message address and data are x86; the capability write is PCI-SIG and neutral. So
+`arch` exposes `msi_message(vector, cpu)` and neutral PCI code writes the capability — mirroring
+the existing `IrqRouter` / `Platform` split, and keeping the walk host-testable, which is where
+the 32-bit form gets its coverage.
+
+**The gate is specified with its negative control**, because a passing `test-qemu` is equally
+consistent with a driver that silently fell back to INTx. The adjudication is on *which path was
+taken*, and the control is to make the capability walk find nothing: the boot must still pass,
+and the adjudicated line must change.

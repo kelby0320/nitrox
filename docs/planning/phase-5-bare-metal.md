@@ -79,8 +79,7 @@ i8042 is on the IOAPIC. See Part A.
 
 ## Part A — MSI, because INTx may not be routable at all ⬜
 
-- [ ] **MSI (and MSI-X where a device offers it) for PCI devices**, replacing the IOAPIC path
-      for AHCI.
+- [ ] **MSI for PCI devices**, replacing the IOAPIC path for AHCI.
 
 **This is the part most likely to decide whether the disk works.** The AHCI driver currently
 takes its interrupt line straight from the PCI Interrupt Line register
@@ -102,10 +101,150 @@ anything MSI-capable, because MSI vectors are never shared.
 - [ ] The device-interrupt install family gains its **second member**, which is the trigger the
       existing deferral names for promoting `install_pci_irq` into an `ArchIrqInstall` trait.
       Build the abstraction now, at the second consumer, not before.
-- [ ] Keep the IOAPIC path: the i8042 is on GSI 1 on this machine and is not going anywhere.
+- [ ] Keep the IOAPIC path: the i8042 is on GSI 1 on this machine and is not going anywhere
+      (`interrupts.txt`: `1: … IR-IO-APIC 1-edge i8042`).
 
-**QEMU-testable in full.** QEMU's ICH9 AHCI advertises MSI; the gate is that `test-qemu`
-passes with the driver taking the MSI path, and a probe that forces INTx still works.
+### What the emulator and the machine actually report
+
+**Detail pass, 2026-09-11.** A throwaway capability-list walk was added to `pci::probe_function`,
+run under `cargo xtask test-qemu`, read, and reverted. The laptop's side comes from `lspci -vv`
+in `~/Documents/Acer Laptop HW Info/`. Part A's claim to be testable before the machine is
+plugged in rests on this rather than on a datasheet.
+
+| Function | MSI capability | MSI-X |
+|---|---|---|
+| QEMU q35 `00:1f.2` ICH9 AHCI `8086:2922` | at `0x80`, **64-bit**, 1 vector, non-maskable | none (SATA cap at `0xa8`) |
+| Laptop `00:17.0` Sunrise Point-LP AHCI `8086:9d03` | at `0x80`, **32-bit**, 1 vector, non-maskable | none (SATA cap at `0xa8`) |
+| Laptop `00:14.0` Sunrise Point-LP xHCI `8086:9d2f` | at `0x80`, 64-bit, **8 vectors** | none |
+| QEMU `00:02.0` e1000e `8086:10d3` | at `0xd0`, 64-bit | at `0xa0`, 5 vectors, BIR 3 |
+
+QEMU's AHCI HBA reports `CAP 0xc0141f05` — `S64A` set, 32 command slots, 6 ports.
+
+**The gate exists**: QEMU's AHCI offers exactly the capability Part A programs. But the table
+also contains the one divergence that matters, and it is not the one the plan expected.
+
+### The divergence QEMU structurally cannot catch
+
+**The laptop's AHCI is 32-bit MSI; QEMU's is 64-bit.** That is not a detail of degree — it
+changes the capability structure's *layout*. Message Control bit 7 selects between two:
+
+| Offset | 64-bit form (QEMU) | 32-bit form (the laptop) |
+|---|---|---|
+| `+0x04` | Message Address | Message Address |
+| `+0x08` | Message Upper Address | **Message Data** |
+| `+0x0C` | **Message Data** | Mask Bits |
+
+A driver that writes Data at `+0x0C` because that is what worked under QEMU writes into the
+**Mask Bits** register on the laptop and leaves Data at zero. The device then signals vector 0 —
+not a device vector at all — and the disk's completion interrupt never arrives. The boot hangs
+on the first read, on the machine, with every gate green.
+
+- [ ] **Both forms are written from the start**, and the **32-bit form is the one under host
+      test**. `pci/mod.rs`'s existing `FakeCfg` can model a 32-bit-only capability, so the
+      laptop's shape is covered by `cargo xtask test` even though no QEMU boot can exercise it.
+      This is the inversion worth keeping: the emulator tests the path the target does *not*
+      take, so the host test is not a nicety here.
+
+### Scope: MSI, not MSI-X
+
+The plan's first draft said "and MSI-X where a device offers it". **Drop that.** MSI is a
+config-space capability and nothing more; MSI-X is a vector table and a pending-bit array living
+in a device BAR, which means mapping a BAR, an allocation policy for the table, and per-vector
+masking rules — a distinct mechanism wearing a similar name.
+
+The evidence is that it has **no consumer on the target machine at all**: neither its AHCI nor
+its xHCI advertises MSI-X, and the xHCI's eight vectors are plain MSI. The only MSI-X device in
+either machine is QEMU's e1000e, which has no driver until [Phase 8](phase-8-networking.md). So
+MSI-X here would be built at its *zeroth* consumer — and [Phase 6](phase-6-usb.md) will not need
+it either.
+
+### The pieces, in dependency order
+
+- [ ] **Config-space access that outlives enumeration.** This does not exist today.
+      `kernel/src/pci/mod.rs` reserves *one* vmap page and repoints it per function inside
+      `enumerate()`; when that returns, no driver can read its own config space. MSI is entirely
+      config-space writes, so this is the first deliverable rather than a detail of a later one.
+      `ResourceDescriptor` already carries `seg`/`bus`/`dev`/`func`, so the address is
+      re-derivable. What needs deciding is the mapping's **lifetime**: a page per claimed device,
+      or one shared window behind a lock. The shared window is a mutual-exclusion problem the
+      enumeration-time code never had, because it ran before the scheduler existed.
+- [ ] **A capability-list walk** in the neutral PCI module: Status bit 4, the pointer at `0x34`,
+      the `id`/`next` chain, with a cycle bound. Capability *layout* is PCI-SIG and identical on
+      every architecture, so this is neutral kernel code by the same argument that puts ECAM
+      enumeration there.
+- [ ] **The arch seam, chosen before the code is written.** The MSI message *layout* is
+      x86-specific: the address encodes a LAPIC destination (`0xFEE0_0000 | dest << 12`) and the
+      data encodes a vector and delivery mode. The capability *write* is not. Two shapes are
+      available and they are not equivalent — (1) `arch` exposes `msi_message(vector, cpu) ->
+      (addr, data)` and neutral PCI code writes the capability, or (2)
+      `ArchIrqInstall::install_msi(cfg, handler)` takes a config-space accessor and does the
+      whole thing inside `arch/`. **Prefer (1):** it keeps PCI knowledge out of `arch/`,
+      mirroring the split already made between `IrqRouter` (routing) and `Platform` (firmware
+      facts), and it leaves the capability walk host-testable against `FakeCfg`, which is where
+      the 32-bit form above gets its coverage. `cargo xtask check-arch` enforces whichever is
+      picked, so picking after the code is written is the expensive order.
+- [ ] **The trait promotion.** `install_pci_irq` is a neutral free function carrying a
+      `TODO(msi)` that names exactly this moment. The family gains its second member, so it
+      becomes `ArchIrqInstall` with the INTx and MSI installs side by side.
+- [ ] **The driver switch, with INTx kept as the fallback.** AHCI prefers MSI when the capability
+      is present and falls back to the interrupt-line GSI when it is not. Keeping both is not a
+      test accommodation: it is what a device with no MSI capability needs, and the i8042 stays
+      on the IOAPIC regardless.
+
+### Two things the plan did not account for
+
+**Nothing in Nitrox enables PCI bus mastering.** Enumeration clears and restores the I/O and
+memory decode bits to size BARs and never touches bit 2; the AHCI driver never reads the command
+register at all. A positive-controlled sweep of `kernel/` finds two mentions of bus mastering: a
+doc comment in `kernel/src/mm/dma.rs`, and the *test fixture* in `kernel/src/pci/mod.rs`, which
+presets `0x0007` and labels it "bus-master enabled". The probe explains why everything works
+anyway — **the firmware hands every function over with BME already set**, host bridge included.
+
+That is the class of assumption this phase exists to find: something the emulator's firmware did
+for us that we have therefore never done for ourselves. It is the same config-space plumbing MSI
+needs, so it costs almost nothing here; met at Part F instead, it presents as "the disk does
+nothing" with the entire boot as the suspect list.
+
+- [ ] The driver sets bus-master enable explicitly rather than inheriting it.
+
+**Enabling MSI means disabling INTx.** The Interrupt Disable bit (command bit 10) is clear on
+every function at handoff. A device left able to deliver both, with the IOAPIC entry we routed
+still live, is a spurious-interrupt source that would present as a driver bug.
+
+- [ ] Setting MSI Enable also sets Interrupt Disable; taking the INTx fallback leaves it clear.
+
+### The gate, and the control that makes it mean something
+
+**`test-qemu` passing on the MSI path proves nothing on its own** — the identical transcript is
+produced by a driver that silently fell back to INTx, which is this part's most likely real
+failure. So the adjudication is on *which path was taken*, not on the boot succeeding:
+
+- [ ] The driver says which path it took — it already prints `ahci: INTx GSI10 -> vec 0x31` — and
+      an `xtask` check reads that line. PR #293 spent a branch on self-tests nobody read; this
+      one is written with its reader.
+- [ ] A **forced-INTx probe** still boots, since that path stays as the fallback.
+- [ ] **The negative control to run before calling it done:** make the capability walk fail to
+      find MSI. The boot must still pass *and* the adjudicated line must change. A gate that
+      reports the same thing either way is the defect, not the test.
+- [ ] The **`CAP.S64A` assert** belongs in this change (flagged in PR #293). The HBA reports
+      `S64A` under QEMU and the decision log treats 64-bit DMA as a considered call, but the
+      kernel reads `CAP` and only prints it — a violated assumption is silent corruption rather
+      than a refusal. Same shape as the rest of Part A: read a capability register and act on it.
+
+### Assumed, and worth confirming at Part D
+
+Linux drives this machine through **interrupt remapping** (`IR-PCI-MSI`), which is Linux's own
+doing: it enables VT-d and writes remappable-format MSI addresses. Nitrox will write
+compatibility-format addresses straight to `0xFEE0_0000`, which is correct **provided nothing
+has enabled remapping before us**. Firmware normally has not. Part D's hardware report is where
+that stops being an assumption.
+
+### Left alone
+
+The device-vector pool is eight vectors (`DEVICE_IRQ_BASE = 0x30`, `DEVICE_IRQ_COUNT = 8` in
+`kernel/src/arch/x86_64/idt.rs`), and `register_device_handler` panics when it runs out. One MSI
+vector for AHCI fits with room to spare. The laptop's xHCI advertises eight, so Phase 6 will want
+more — and the comment there already says the fix is to add stubs.
 
 ## Part B — the machine can tell you why it failed ⬜
 

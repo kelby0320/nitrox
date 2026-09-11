@@ -39,7 +39,13 @@ Ordered by dependency, not yet sliced into parts:
 - [ ] **xHCI host controller driver** — the controller at `00:14.0` on the target machine.
       Rings, TRBs, the event ring, port status and enumeration. MSI from
       [Phase 5](phase-5-bare-metal.md) Part A is the interrupt path; Linux uses MSI for
-      `xhci_hcd` on this machine.
+      `xhci_hcd` on this machine. Its capability was read during Part A's detail pass: **plain
+      MSI, 64-bit, eight vectors, and no MSI-X** — so nothing here needs the MSI-X mechanism
+      that Phase 5 deliberately left deferred.
+- [ ] **Grow the device-interrupt vector pool.** It holds eight in total
+      (`DEVICE_IRQ_BASE = 0x30`, `DEVICE_IRQ_COUNT = 8`) and `register_device_handler` panics
+      when it runs out — the xHCI alone advertises eight. The comment there says the fix is to
+      add stubs; this is the phase that makes it necessary.
 - [ ] **USB core** — device enumeration, descriptor parsing, address assignment, configuration
       selection, endpoint management, and hot-plug as an event rather than a boot-time scan.
 - [ ] **HID class + report-descriptor parser** — boot protocol first (it is a fixed layout and
