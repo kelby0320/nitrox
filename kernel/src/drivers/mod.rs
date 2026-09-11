@@ -66,6 +66,12 @@ pub fn self_test() {
         return; // no block device (no AHCI disk) — nothing to test
     };
 
+    // **First, because it shares nothing with the read below but the handle.** It used to be
+    // the last statement of this function, so any earlier failure — a dispatch error, a bad
+    // status — skipped it silently, and the gate that reads its absence then blamed the wrong
+    // thing (PR #293 review, 2).
+    oversize_refused(disk);
+
     let buffer = match MemoryObject::try_new(512) {
         Ok(mo) => adopt(mo, KObjectType::MemoryObject),
         Err(_) => return,
@@ -121,6 +127,67 @@ pub fn self_test() {
             how,
             sig
         );
+    }
+
+}
+
+/// Boot self-test: a transfer needing more fragments than the device can describe in one
+/// command is **refused**, not attempted.
+///
+/// **This is the only test of that guard that goes through the real path.** The host tests
+/// beside it check the two halves — that `build_frags` emits one fragment per page with no
+/// ceiling of its own, and that AHCI's PRDT capacity is what fits in its command table — and
+/// every one of them passes with the check in `dispatch_block_irp` deleted. What cannot be
+/// host-tested is the dispatch itself: it needs a live `DeviceNode`, `MemoryObject` and
+/// `PendingOperation`, which is what this function has and a unit test does not.
+///
+/// Before 2026-09-11 this read was attempted: the driver zeroed and wrote PRDT entries past
+/// the one-page command table it owns, and the controller then read descriptors out of
+/// whatever followed and DMAed to the addresses it found there.
+///
+/// **Runs before the sector-0 read**, not after it: the two share only the disk handle, and
+/// ordering this second made every failure of the first silently skip it.
+fn oversize_refused(disk: &ObjectRef) {
+    // SAFETY: `disk` pins a live `DeviceNode` (found by class above).
+    let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
+    let Some(backend) = dn.block_backend() else {
+        return;
+    };
+    // **Ask the device what it can do, then ask for one fragment more.** Taking the bound
+    // from the backend rather than from a constant is what makes this a test of the
+    // *plumbing*: a driver that published the wrong `max_frags`, or a dispatch that read it
+    // from somewhere else, fails here. A backend with no limit (the ramdisk) has nothing to
+    // exceed, so there is nothing to prove.
+    if backend.max_frags == u32::MAX {
+        return;
+    }
+    let pages = backend.max_frags as usize + 1;
+    let bytes = pages * crate::mm::PAGE_SIZE;
+    let big = match MemoryObject::try_new(bytes) {
+        Ok(mo) => adopt(mo, KObjectType::MemoryObject),
+        // Not enough memory to build the probe is not a failure of the guard.
+        Err(_) => return,
+    };
+    let po = match PendingOperation::try_new() {
+        Ok(po) => adopt(po, KObjectType::PendingOperation),
+        Err(_) => return,
+    };
+    match dispatch_block_irp(disk, &big, &po, IoOpcode::Read, 0, 0, bytes as u64) {
+        Err(crate::syscall::error::KError::InvalidArgument) => crate::kprintln!(
+            "ahci: oversize self-test OK ({} frags > {} refused)",
+            pages,
+            backend.max_frags
+        ),
+        Err(e) => crate::kprintln!(
+            "ahci: oversize self-test FAIL (refused, but with {:?} not InvalidArgument)",
+            e
+        ),
+        // It was accepted: the command was built past the end of its table.
+        Ok(()) => crate::kprintln!(
+            "ahci: oversize self-test FAIL ({} frags accepted, table holds {})",
+            pages,
+            backend.max_frags
+        ),
     }
 }
 

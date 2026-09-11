@@ -42,8 +42,9 @@ resource-agnostic so future resource kinds (char devices, sockets) reuse them.
   one lacking the required right, a malformed `IoOp` (unknown opcode, reserved
   flag set, misaligned `offset`/`length` for a block device, a `length` below one
   record for a **record-stream** char device), a `buffer` that is not a
-  `MemoryObject` or is too small for `buf_offset + length`, or PO/handle
-  exhaustion. *Device/medium* failures (the disk NAKs, a bad sector) are
+  `MemoryObject` or is too small for `buf_offset + length`, **a block request
+  needing more physical fragments than the device can describe in one command**
+  (see `length` below), or PO/handle exhaustion. *Device/medium* failures (the disk NAKs, a bad sector) are
   **operation** outcomes and are delivered through the PO, not synchronously —
   the same split the namespace lookup uses (`syscall-abi.md` § Namespace).
 
@@ -96,6 +97,22 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   pre-signalled PO with `result = 0` (lets a caller probe a resource's
   readiness/rights cheaply). The per-call ceiling is `MAX_USER_COPY_SIZE`
   (16 MiB), matching the rest of the syscall surface.
+
+  **A block device has a second, lower ceiling: what one command can describe.**
+  The transfer DMAs directly into the buffer's frames, so the kernel hands the
+  device a scatter-gather list with **one entry per page the range touches**, and
+  every device has a limit on how many entries one command carries. A request over
+  that limit is refused synchronously with `InvalidArgument` — it is not split, and
+  not truncated. For the AHCI driver the limit is **248 fragments**, its command
+  table's PRDT capacity, so ≈ **992 KiB** of page-aligned transfer.
+
+  **It is a fragment count, not a byte count**, which matters at the boundary: a
+  `buf_offset` that is not page-aligned makes the first page a partial fragment and
+  costs one extra entry, so the largest accepted `length` is one page smaller than
+  for an aligned start. A caller wanting more than this must issue several requests.
+  Splitting them in the kernel instead is `TODO(block-transfer-split)`
+  (`../rationale/deferred-decisions.md`); nothing is waiting on it —
+  `fs-server-ext4` transfers one 4 KiB block per call.
 
 ## Device classes (block vs. char)
 

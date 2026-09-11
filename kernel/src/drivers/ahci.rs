@@ -75,6 +75,35 @@ const ATA_IDENTIFY: u8 = 0xEC;
 const ATA_READ_DMA_EXT: u8 = 0x25;
 
 const SECTOR_SIZE: u32 = 512;
+
+// --- Command-table geometry -------------------------------------------------
+//
+// A command table is a 64-byte command FIS, a 16-byte ATAPI command and 48 bytes
+// reserved, then the PRDT: 16 bytes per entry, one entry per physical fragment.
+// **The three constants below are one fact stated once**, because the capacity
+// derived from them (`MAX_PRDT_ENTRIES`) has to be the same number
+// `build_command` writes within — an overflow here is the HBA reading PRDT
+// entries out of memory the table does not own, and DMAing to whatever addresses
+// it finds there.
+
+/// Byte offset of the PRDT within a command table (past the CFIS + ATAPI +
+/// reserved area).
+const PRDT_OFFSET: usize = 128;
+/// Size of one PRDT entry: base low, base high, reserved, and the byte count.
+const PRDT_ENTRY: usize = 16;
+/// How much memory one command table gets. **This is the allocation**, used by `probe`
+/// and by the capacity below — the point is that they cannot be separately edited.
+///
+/// An earlier version wrote `PAGE_SIZE` at the allocation and derived the capacity from
+/// `PAGE_SIZE` too, and called that "derived, not chosen". It was not: shrinking the
+/// allocation left the capacity untouched and the test still passed, which a reviewer
+/// demonstrated (PR #293 review, 4). Two expressions of one size are two things to keep
+/// equal; this is one.
+const CMD_TABLE_BYTES: usize = crate::mm::PAGE_SIZE;
+/// How many fragments one command can describe: whatever fits in a command table after
+/// the FIS area. Derived from [`CMD_TABLE_BYTES`] — shrink the allocation and this
+/// follows, which is now a property rather than a claim.
+const MAX_PRDT_ENTRIES: u32 = ((CMD_TABLE_BYTES - PRDT_OFFSET) / PRDT_ENTRY) as u32;
 /// Bounded poll for command completion / port readiness (~1 s of monotonic time).
 const POLL_TIMEOUT_NS: u64 = 1_000_000_000;
 
@@ -237,7 +266,7 @@ pub fn init(controller: &ObjectRef) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    let cmd_table = match DmaBuffer::alloc(crate::mm::PAGE_SIZE) {
+    let cmd_table = match DmaBuffer::alloc(CMD_TABLE_BYTES) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -383,8 +412,16 @@ unsafe fn identify(disk: &mut AhciDisk) -> Option<u64> {
 fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[PhysFrag], write: bool) {
     let ct = disk.cmd_table.virt();
     // Zero the command FIS + PRDT region we touch.
-    // SAFETY: `ct` is our owned page-sized command-table buffer.
-    unsafe { core::ptr::write_bytes(ct, 0, 128 + frags.len() * 16) };
+    //
+    // SAFETY: `ct` is our owned page-sized command-table buffer, and `frags.len()` is
+    // `<= MAX_PRDT_ENTRIES` — refused by [`submit`] below before the port lock is taken,
+    // and again by `dispatch_block_irp` against the `max_frags` this driver publishes.
+    // **The check is in `submit` rather than here** because here is under the port lock,
+    // where there is no way to report: a `debug_assert!` in this spot panics on a
+    // *lock-order violation* while formatting its own message, which says nothing about
+    // PRDTs, and compiles out in release besides. (Found by deleting the dispatch guard
+    // and reading what the boot self-test actually printed.)
+    unsafe { core::ptr::write_bytes(ct, 0, PRDT_OFFSET + frags.len() * PRDT_ENTRY) };
 
     // Command FIS — H2D Register FIS (type 0x27), command set.
     // SAFETY: `ct` addresses the 64-byte CFIS area.
@@ -403,9 +440,9 @@ fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[Ph
         ct.add(13).write((count >> 8) as u8);
     }
 
-    // PRDT entries (16 bytes each) at offset 128.
+    // PRDT entries at `PRDT_OFFSET`.
     for (i, f) in frags.iter().enumerate() {
-        let e = (ct as u64 + 128 + (i as u64) * 16) as *mut u32;
+        let e = (ct as u64 + PRDT_OFFSET as u64 + (i as u64) * PRDT_ENTRY as u64) as *mut u32;
         // SAFETY: `e` is within the owned command-table page (frags bounded).
         unsafe {
             e.add(0).write(f.base as u32);
@@ -461,6 +498,8 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, disk: *mut AhciDisk) -> bo
         submit,
         poll: ahci_poll,
         ctx: disk as *mut (),
+        // One command table, one page, so one command describes this many fragments.
+        max_frags: MAX_PRDT_ENTRIES,
     };
     let geometry = BlockGeometry {
         logical_block_size: SECTOR_SIZE,
@@ -508,6 +547,24 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     let disk = ctx as *mut AhciDisk;
     // SAFETY: `disk` is the live published disk.
     let d = unsafe { &*disk };
+
+    // **More fragments than one command table can describe: refuse, before the lock.**
+    // `dispatch_block_irp` already rejects this against the `max_frags` we publish, so
+    // nothing in the tree reaches here — this is the backstop that makes the overflow
+    // unreachable rather than merely unreached, for a future caller that submits an IRP
+    // by some other route. It sits *before* the port lock deliberately: failing an IRP
+    // means completing it, and completion from under the lock is not available.
+    // SAFETY: `irp` is a live block IRP during submit.
+    if unsafe { (*irp).buffer.count } as usize > MAX_PRDT_ENTRIES as usize {
+        // SAFETY: `irp` is uniquely owned during submit; complete it with an error so
+        // its waiter is released rather than parked forever.
+        unsafe {
+            (*irp).set_completion(crate::syscall::error::KError::InvalidArgument as i32, 0);
+            crate::dpc::enqueue(&(*irp).dpc);
+        }
+        return;
+    }
+
     // Take the port lock: it masks interrupts, so the completion ISR cannot run on
     // this CPU while we decide whether slot 0 is free — `inflight` is stable here.
     let mut q = d.pending.lock();
@@ -689,4 +746,34 @@ pub fn poll_complete_inflight() -> bool {
     drain_queue(d);
     crate::dpc::run_pending();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The PRDT capacity is exactly what fits in a command table after the FIS area.
+    ///
+    /// **Against `CMD_TABLE_BYTES`, which is the allocation** — `probe` passes that same
+    /// constant to `DmaBuffer::alloc`, so shrinking the table shrinks the capacity and this
+    /// test moves with both. The earlier version compared against `PAGE_SIZE` while the
+    /// allocation separately said `PAGE_SIZE`, and a reviewer showed it passed with the
+    /// allocation cut to 512 bytes (PR #293 review, 4).
+    #[test]
+    fn the_prdt_capacity_is_what_fits_in_a_command_table() {
+        assert_eq!(MAX_PRDT_ENTRIES, 248);
+        // Every entry fits…
+        assert!(PRDT_OFFSET + MAX_PRDT_ENTRIES as usize * PRDT_ENTRY <= CMD_TABLE_BYTES);
+        // …and one more would not, which is the property that matters.
+        assert!(PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize + 1) * PRDT_ENTRY > CMD_TABLE_BYTES);
+    }
+
+    /// What that capacity is worth as a transfer, stated so the number in
+    /// `deferred-decisions.md` has something that fails when it goes stale.
+    #[test]
+    fn one_command_covers_just_under_a_megabyte() {
+        let bytes = MAX_PRDT_ENTRIES as usize * crate::mm::PAGE_SIZE;
+        assert_eq!(bytes, 1_015_808);
+        assert_eq!(bytes / 1024, 992);
+    }
 }

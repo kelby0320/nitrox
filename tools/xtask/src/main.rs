@@ -7717,6 +7717,8 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_login_chain(&transcript)?;
             check_demo_chain(&transcript)?;
             check_display_selftest(&transcript)?;
+            check_block_read_selftest(&transcript)?;
+            check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
@@ -7726,6 +7728,79 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
+}
+
+/// Assert that the block driver **refused** a transfer larger than one command can describe.
+///
+/// **The same hole `check_display_selftest` documents, met again.** `drivers::self_test` prints
+/// a verdict and does not call `SYS_TEST_EXIT`, so with the guard in `dispatch_block_irp`
+/// deleted the guest printed `ahci: oversize self-test FAIL (249 frags accepted, table holds
+/// 248)` and `test-qemu` exited **0**. A self-test whose failure nobody reads is not a test —
+/// which is precisely what the comment on `check_display_selftest` had already worked out, one
+/// declaration over.
+///
+/// Requiring the `OK` line rather than merely rejecting `FAIL` is deliberate: it also catches
+/// the check not running at all, which is what a refactor that dropped the call would produce.
+///
+/// **The skip arm names every cause, because an earlier version named one and it was the
+/// unlikeliest.** It said the check is skipped "only when the first block device publishes no
+/// fragment limit" — but `oversize_refused` was then the *last* statement of
+/// `drivers::self_test`, so a regression in the sector-0 read path skipped it too, and this
+/// message would have sent the author to `max_frags` for a fault three functions away
+/// (PR #293 review, 2). The call has moved above those returns, and
+/// [`check_block_read_selftest`] adjudicates the read separately — so a read regression now
+/// fails on its own check, with its own message, before this one is consulted.
+fn check_oversize_refused(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if text.contains("ahci: oversize self-test OK") {
+        println!("xtask: an oversized block transfer was refused ✓");
+        return Ok(());
+    }
+    if text.contains("ahci: oversize self-test FAIL") {
+        return Err("a block transfer needing more fragments than the device's command table \
+             holds was NOT refused — the driver would write PRDT entries past the table it \
+             owns, and the controller would DMA to whatever followed. See \
+             `dispatch_block_irp`'s `max_frags` check and `TODO(block-transfer-split)`."
+            .into());
+    }
+    Err("the oversize block self-test did not run — expected \
+         \"ahci: oversize self-test OK\" in the transcript. It is skipped when no block device \
+         was discovered at all, when the first one publishes no fragment limit (the ramdisk's \
+         `u32::MAX`), or when the probe's own allocation failed. An AHCI disk that came up is \
+         none of those."
+        .into())
+}
+
+/// Assert that the block driver's **sector-0 read** self-test passed.
+///
+/// **The hole this branch is about, closed for its neighbour too.** `drivers::self_test` prints
+/// a verdict and never calls `SYS_TEST_EXIT`, so before this every outcome of the real AHCI read
+/// path — a dispatch error, a non-zero status, a short transfer — printed `ahci: read self-test
+/// FAIL …` and `test-qemu` exited 0. `grep "read self-test" tools/xtask/src/main.rs` returned
+/// nothing (PR #293 review, 2).
+///
+/// **Accepts either success line.** `read self-test OK` is the read plus a `0x55AA` boot
+/// signature; `read self-test: sector 0 read OK … but sig` is the read succeeding on an image
+/// whose sector 0 carries something else. Only the first appears today (the image has a
+/// protective MBR), but requiring it would fail this gate for a change to the *image* rather
+/// than to the driver, and what this checks is the driver.
+fn check_block_read_selftest(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if text.contains("ahci: read self-test FAIL") {
+        return Err("the AHCI sector-0 read self-test FAILED — the real block read path \
+             (dispatch → controller DMA → completion) did not deliver. The transcript line \
+             says which half: `(dispatch err …)` is a refusal to start, `(status … result …)` \
+             is a completed request that errored or came up short."
+            .into());
+    }
+    if text.contains("ahci: read self-test OK") || text.contains("sector 0 read OK") {
+        println!("xtask: the block read self-test passed ✓");
+        return Ok(());
+    }
+    Err("the AHCI read self-test did not run — expected an \"ahci: read self-test\" line in \
+         the transcript. It is skipped when no block device was discovered, or when the probe \
+         could not allocate its buffer."
+        .into())
 }
 
 /// Assert that the display self-test **passed**.
