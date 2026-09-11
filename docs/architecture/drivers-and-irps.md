@@ -257,6 +257,14 @@ than of the machine, so the driver no longer inherits it. It reports which
 happened, because "already enabled by firmware" and "enabled by the driver" are
 different facts about a new machine.
 
+**It has to be set before the driver's own bring-up DMAs**, which is narrower than
+it sounds: AHCI starts FIS receive and runs `IDENTIFY DEVICE` before it has a disk
+to publish, and both are bus-master transactions. Setting the bit after them works
+on every machine whose firmware had already set it and on no other — so it would
+pass every gate we own and lose the disk on the first machine that needed it. It
+is set immediately after the controller's port is chosen, ahead of every
+allocation and every register write that starts the port.
+
 **A `DmaBuffer` is for the driver's own structures, not for the data.** The transfer
 itself DMAs straight into the client's `MemoryObject` frames: `io::block::build_frags`
 describes the requested byte range as a physical fragment list, one fragment per page

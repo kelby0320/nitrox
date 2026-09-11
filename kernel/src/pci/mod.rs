@@ -65,8 +65,11 @@ struct MmioCfg {
 
 impl Cfg for MmioCfg {
     fn read32(&self, off: u16) -> u32 {
-        // SAFETY: `base` is a live uncached 4 KiB config window; `off` is a
-        // dword-aligned offset within it (all callers pass `< 0x100`).
+        // SAFETY: `base` is a live uncached 4 KiB config window and `off` is a
+        // dword-aligned offset inside it. The bound that matters is the
+        // window's, not the 256-byte header's: enumeration reads `< 0x100`, and
+        // `read_msi` refuses a capability whose structure would run past `0x100`,
+        // but either way every offset any caller forms stays well under 4 KiB.
         unsafe { core::ptr::read_volatile(self.base.add(off as usize) as *const u32) }
     }
 
@@ -128,7 +131,7 @@ fn read_interrupt<C: Cfg>(cfg: &C) -> InterruptSpec {
 fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
     let mut bars = [BarWindow::ZERO; 6];
     let cmd = cfg.read32(REG_COMMAND);
-    cfg.write32(REG_COMMAND, cmd & !CMD_DECODE_BITS);
+    write_command(cfg, (cmd & !CMD_DECODE_BITS) as u16);
 
     let mut i = 0usize;
     while i < 6 {
@@ -192,7 +195,7 @@ fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
         }
     }
 
-    cfg.write32(REG_COMMAND, cmd);
+    write_command(cfg, cmd as u16);
     bars
 }
 
@@ -494,12 +497,22 @@ pub(crate) fn msi_data_offset(cap: &MsiCap) -> u16 {
 pub(crate) fn read_msi<C: Cfg>(cfg: &C) -> Option<MsiCap> {
     let off = find_capability(cfg, CAP_ID_MSI)?;
     let ctl = (cfg.read32(off) >> 16) as u16;
-    Some(MsiCap {
+    let cap = MsiCap {
         off,
         addr64: ctl & MSI_CTL_ADDR64 != 0,
         per_vector_mask: ctl & MSI_CTL_PVM != 0,
         multi_message_capable: ((ctl >> MSI_CTL_MMC_SHIFT) & 0b111) as u8,
-    })
+    };
+    // **The structure has to fit inside the 256-byte header.** `CAP_LAST` bounds
+    // where a capability may *start*, not where it may end, so a function
+    // advertising MSI at `0xF4` or above — malformed; the 64-bit form needs 14
+    // bytes and the 32-bit form 10 — would have `program_msi` writing into
+    // extended configuration space and over whatever capability begins at
+    // `0x100`. Refuse it, and the caller falls back to INTx.
+    if msi_data_offset(&cap) as u32 + 4 > 0x100 {
+        return None;
+    }
+    Some(cap)
 }
 
 /// Point the function's MSI capability at `addr`/`data` and enable it with
@@ -508,12 +521,23 @@ pub(crate) fn read_msi<C: Cfg>(cfg: &C) -> Option<MsiCap> {
 /// `addr` and `data` are the architecture's business — see
 /// [`crate::arch::msi_message`] — and the layout is this module's.
 ///
+/// Returns `false` without writing anything if `addr` does not fit the
+/// capability's form, leaving the caller to fall back to INTx.
+///
 /// # Safety
-/// Ring-0, boot-time. On return the device may write `data` to `addr` at any
-/// time, so the vector's handler must already be registered and the driver ready
-/// to receive it. The caller is also responsible for disabling the function's
-/// INTx (see [`set_intx_disabled`]), which MSI does not do by itself.
-pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data: u16) {
+/// Ring-0, boot-time. On a `true` return the device may write `data` to `addr` at
+/// any time, so the vector's handler must already be registered and the driver
+/// ready to receive it. The caller is also responsible for disabling the
+/// function's INTx (see [`set_intx_disabled`]), which MSI does not do by itself.
+pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data: u16) -> bool {
+    // **Refuse rather than truncate.** A 32-bit capability has nowhere to put the
+    // upper half, and writing only the low one would point the device at a
+    // different address than the caller was told it had. `install_msi` makes the
+    // same choice about a destination that will not fit, and a silent truncation
+    // is the exact shape of the bug this part exists to prevent.
+    if !cap.addr64 && addr > u32::MAX as u64 {
+        return false;
+    }
     // Message Address: dword-aligned, its low two bits reserved-zero.
     cfg.write32(cap.off + 0x04, (addr & 0xFFFF_FFFC) as u32);
     if cap.addr64 {
@@ -529,6 +553,7 @@ pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data:
     let hdr = cfg.read32(cap.off);
     let ctl = ((hdr >> 16) as u16 & !MSI_CTL_MME_MASK) | MSI_CTL_ENABLE;
     cfg.write32(cap.off, (hdr & 0xFFFF) | ((ctl as u32) << 16));
+    true
 }
 
 // --- The command register ---------------------------------------------------
@@ -537,6 +562,18 @@ pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data:
 const CMD_BUS_MASTER: u32 = 1 << 2;
 /// `command` bit 10: the function's INTx assertion is suppressed.
 const CMD_INTX_DISABLE: u32 = 1 << 10;
+
+/// Write the 16-bit `command` register **without disturbing `status`**, which
+/// shares its dword.
+///
+/// `status`'s error bits (Master Abort, Target Abort, Parity Error, Signalled
+/// System Error) are **write-1-to-clear**, so reading the dword and writing it
+/// back silently clears whatever the function had latched — exactly the
+/// diagnostics that matter on a machine we have not met. Writing zeros there
+/// clears nothing, so the whole dword is written with the status half zeroed.
+fn write_command<C: Cfg>(cfg: &C, command: u16) {
+    cfg.write32(REG_COMMAND, command as u32);
+}
 
 /// Let the function act as a DMA bus master, returning whether it already could.
 ///
@@ -548,7 +585,7 @@ pub(crate) fn enable_bus_master<C: Cfg>(cfg: &C) -> bool {
     let cs = cfg.read32(REG_COMMAND);
     let was = cs & CMD_BUS_MASTER != 0;
     if !was {
-        cfg.write32(REG_COMMAND, cs | CMD_BUS_MASTER);
+        write_command(cfg, (cs | CMD_BUS_MASTER) as u16);
     }
     was
 }
@@ -565,7 +602,7 @@ pub(crate) fn set_intx_disabled<C: Cfg>(cfg: &C, disabled: bool) {
         cs & !CMD_INTX_DISABLE
     };
     if next != cs {
-        cfg.write32(REG_COMMAND, next);
+        write_command(cfg, next as u16);
     }
 }
 
@@ -686,8 +723,36 @@ mod tests {
     fn the_capability_walk_rejects_a_pointer_outside_the_capability_region() {
         let mut c = FakeCfg::new();
         c.set(REG_COMMAND, STATUS_CAP_LIST << 16);
-        c.set(REG_CAP_PTR, 0x10); // inside the header, not a capability
+        c.set(REG_CAP_PTR, 0x10); // inside the header — that is BAR0, not a capability
+        // **Decodable on purpose, so the range check is the only thing that can
+        // refuse it.** Written first without this line, where the walk stopped on
+        // the zero `next` pointer instead and the test passed with the bound
+        // deleted (PR #295 review, 2). A BAR whose low byte is `0x05` is not
+        // far-fetched, and without the bound `read_msi` returns a capability at
+        // `0x10` — after which `program_msi` writes the message address over BAR1
+        // and the data over BAR2.
+        c.set(0x10, CAP_ID_MSI as u32);
         assert_eq!(find_capability(&c, CAP_ID_MSI), None);
+    }
+
+    #[test]
+    fn an_msi_capability_that_would_run_past_the_header_is_refused() {
+        // Malformed: a 64-bit structure needs 14 bytes, so it cannot legally
+        // start above 0xF0. `CAP_LAST` bounds where a capability may *start*, not
+        // where it may end, so the walk finds this one and `read_msi` is what has
+        // to decline it — otherwise Message Data lands at 0x100, in extended
+        // configuration space, over whatever capability begins there.
+        let c = with_msi(0xF4, 0x0080, 0);
+        assert_eq!(find_capability(&c, CAP_ID_MSI), Some(0xF4), "the walk finds it");
+        assert_eq!(read_msi(&c), None, "and read_msi refuses it");
+
+        // The last offset that does fit, so the bound is not simply off-by-wide.
+        let ok = with_msi(0xF0, 0x0080, 0);
+        assert!(read_msi(&ok).is_some(), "0xF0 leaves exactly enough room");
+
+        // The 32-bit form needs ten bytes and so fits four higher.
+        let narrow = with_msi(0xF4, 0x0000, 0);
+        assert!(read_msi(&narrow).is_some(), "0xF4 fits a 32-bit structure");
     }
 
     #[test]
@@ -715,7 +780,7 @@ mod tests {
         let cap = read_msi(&c).unwrap();
         assert_eq!(msi_data_offset(&cap), 0x88);
         // SAFETY: a synthetic config space; nothing is armed by this write.
-        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) };
+        assert!(unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) });
 
         assert_eq!(c.read32(0x84), 0xFEE0_0000, "message address");
         assert_eq!(c.read32(0x88) & 0xFFFF, 0x0031, "message data, at +0x08");
@@ -734,7 +799,7 @@ mod tests {
         let cap = read_msi(&c).unwrap();
         assert_eq!(msi_data_offset(&cap), 0x8C);
         // SAFETY: a synthetic config space.
-        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) };
+        assert!(unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) });
 
         assert_eq!(c.read32(0x84), 0xFEE0_0000, "message address, low half");
         assert_eq!(c.read32(0x88), 0, "message address, upper half");
@@ -747,18 +812,27 @@ mod tests {
         c.set(0x88, 0xDEAD_0000); // reserved upper half, arbitrarily non-zero
         let cap = read_msi(&c).unwrap();
         // SAFETY: a synthetic config space.
-        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) };
+        assert!(unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0031) });
         assert_eq!(c.read32(0x88), 0xDEAD_0031, "16-bit field, read-modify-write");
     }
 
     #[test]
     fn programming_msi_enables_exactly_one_vector() {
-        // A function that could take eight (MMC = 3) still gets one.
-        let c = with_msi(0x80, 0x0086, 0);
+        // **Message Control arrives with MME already 3**, so clearing it is work
+        // the write has to do rather than a property the fixture came with. The
+        // first version of this test used 0x0086, whose MME is already zero, and
+        // passed with `& !MSI_CTL_MME_MASK` deleted (PR #295 review, 3).
+        // 0x00B6 = bit 7 (64-bit), bits 6:4 = 3 (enabled for eight), bits 3:1 = 3.
+        let c = with_msi(0x80, 0x00B6, 0);
         let cap = read_msi(&c).unwrap();
         assert_eq!(cap.multi_message_capable, 3, "capable of 8");
+        assert_ne!(
+            (c.read32(0x80) >> 16) as u16 & MSI_CTL_MME_MASK,
+            0,
+            "precondition: the fixture has multiple messages enabled"
+        );
         // SAFETY: a synthetic config space.
-        unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0030) };
+        assert!(unsafe { program_msi(&c, &cap, 0xFEE0_0000, 0x0030) });
 
         let ctl = (c.read32(0x80) >> 16) as u16;
         assert_ne!(ctl & MSI_CTL_ENABLE, 0, "enabled");
@@ -767,7 +841,57 @@ mod tests {
         assert_eq!((c.read32(0x80) >> 8) & 0xFF, 0, "next pointer preserved");
     }
 
+    #[test]
+    fn a_32_bit_capability_refuses_an_address_it_cannot_hold_and_writes_nothing() {
+        let c = laptop_ahci_msi();
+        let cap = read_msi(&c).unwrap();
+        // SAFETY: a synthetic config space.
+        let wrote = unsafe { program_msi(&c, &cap, 0x1_FEE0_0000, 0x0031) };
+        assert!(!wrote, "refused rather than truncated to 0xFEE0_0000");
+        assert_eq!(c.read32(0x84), 0, "message address untouched");
+        assert_eq!(c.read32(0x88), 0, "message data untouched");
+        assert_eq!((c.read32(0x80) >> 16) as u16 & MSI_CTL_ENABLE, 0, "and not enabled");
+
+        // The same address is fine on a capability that has room for it.
+        let wide = qemu_ahci_msi();
+        let wide_cap = read_msi(&wide).unwrap();
+        // SAFETY: a synthetic config space.
+        assert!(unsafe { program_msi(&wide, &wide_cap, 0x1_FEE0_0000, 0x0031) });
+        assert_eq!(wide.read32(0x88), 1, "upper half of the address");
+    }
+
     // --- The command register ------------------------------------------------
+
+    #[test]
+    fn writing_the_command_register_never_writes_ones_into_the_status_half() {
+        // `status` shares the dword and its error bits are write-1-to-clear, so
+        // a read-modify-write of the whole dword clears whatever the function had
+        // latched. Every write goes through `write_command`, which puts zeros
+        // there — and zeros clear nothing on hardware.
+        //
+        // `FakeCfg` has no write-1-to-clear semantics, so what this asserts is the
+        // property that matters: the *value we write* carries no ones above bit 15.
+        const LATCHED: u32 = (1 << 13) | (1 << 15); // target abort, parity error
+        for (what, run) in [
+            ("enable_bus_master", &(|c: &FakeCfg| {
+                enable_bus_master(c);
+            }) as &dyn Fn(&FakeCfg)),
+            ("set_intx_disabled", &(|c: &FakeCfg| set_intx_disabled(c, true))),
+            ("size_bars", &(|c: &FakeCfg| {
+                size_bars(c);
+            })),
+        ] {
+            let mut c = FakeCfg::new();
+            c.set(REG_COMMAND, 0x0003 | (LATCHED << 16));
+            run(&c);
+            assert_eq!(
+                c.read32(REG_COMMAND) >> 16,
+                0,
+                "{what} wrote the status half back; on hardware that clears the \
+                 abort and parity bits a first bring-up is diagnosed from"
+            );
+        }
+    }
 
     #[test]
     fn enabling_bus_master_reports_whether_the_firmware_had_already_done_it() {

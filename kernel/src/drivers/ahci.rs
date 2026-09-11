@@ -271,6 +271,38 @@ pub fn init(controller: &ObjectRef) -> bool {
     }
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
 
+    // Configuration space, for the command register and the MSI capability.
+    // Enumeration's scan window is long gone by now (see `pci::Config`).
+    let cfg = match crate::pci::Config::map(desc) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            crate::kprintln!(
+                "ahci: config space unreachable ({:?}) — INTx, and DMA is left relying on \
+                 whatever the firmware set",
+                e
+            );
+            None
+        }
+    };
+
+    // **Bus mastering, and it has to be here — before anything DMAs.** `start_port`
+    // below sets FRE, after which the HBA writes received FISes into memory, and
+    // `identify` has it fetch a command list and a PRDT and write 512 bytes back.
+    // All three are bus-master transactions. This call sat after `identify` until
+    // the PR #295 review: on a machine whose firmware left the bit clear — the one
+    // case it exists for — `identify` would have timed out, `init` returned at
+    // "IDENTIFY failed", and the enable never been reached at all.
+    //
+    // Every firmware we have booted under leaves it on, which is a property of
+    // those firmwares rather than of the machine, so say which happened.
+    if let Some(cfg) = &cfg {
+        if crate::pci::enable_bus_master(cfg) {
+            crate::kprintln!("ahci: bus master already enabled by firmware");
+        } else {
+            crate::kprintln!("ahci: bus master enabled by the driver");
+        }
+    }
+
     // Allocate the per-port DMA structures (zeroed, contiguous, page-aligned).
     let cmd_list = match DmaBuffer::alloc(1024) {
         Ok(b) => b,
@@ -345,31 +377,6 @@ pub fn init(controller: &ObjectRef) -> bool {
         sectors * SECTOR_SIZE as u64 / (1024 * 1024)
     );
 
-    // Configuration space, for the command register and the MSI capability.
-    // Enumeration's scan window is long gone by now (see `pci::Config`).
-    let cfg = match crate::pci::Config::map(desc) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            crate::kprintln!(
-                "ahci: config space unreachable ({:?}) — INTx, and DMA is left relying on \
-                 whatever the firmware set",
-                e
-            );
-            None
-        }
-    };
-
-    // Bus mastering, without which the controller cannot DMA at all. Every
-    // firmware we have booted under leaves it on, which is a property of those
-    // firmwares rather than of the machine — so say which happened.
-    if let Some(cfg) = &cfg {
-        if crate::pci::enable_bus_master(cfg) {
-            crate::kprintln!("ahci: bus master already enabled by firmware");
-        } else {
-            crate::kprintln!("ahci: bus master enabled by the driver");
-        }
-    }
-
     // Prefer MSI: the device is told a vector and raises the interrupt itself,
     // so nothing depends on the PCI interrupt-line register — which QEMU's
     // firmware programs and real UEFI often leaves meaningless. INTx stays as
@@ -380,10 +387,9 @@ pub fn init(controller: &ObjectRef) -> bool {
             // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
             // lifetime, and nothing can be delivered until the message is written.
             match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
-                Some(msg) => {
-                    // SAFETY: the handler for `msg.vector` was just registered,
-                    // so the device may write the message from here on.
-                    unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) };
+                // SAFETY: the handler for `msg.vector` was just registered, so
+                // the device may write the message from here on.
+                Some(msg) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
                     // MSI does not suppress INTx, and a device able to do both
                     // would assert a line nothing is listening on.
                     crate::pci::set_intx_disabled(cfg, true);
@@ -397,6 +403,10 @@ pub fn init(controller: &ObjectRef) -> bool {
                     );
                     installed = true;
                 }
+                Some(_) => crate::kprintln!(
+                    "ahci: MSI declined — the capability cannot hold the message address; \
+                     falling back"
+                ),
                 None => crate::kprintln!(
                     "ahci: MSI declined — this CPU cannot be named in a message; falling back"
                 ),

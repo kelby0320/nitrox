@@ -98,11 +98,18 @@ pub struct ResourceDescriptor {
   the kernel sizes each BAR (write-all-ones / read-back) and records its physical
   base, length, and kind. A 64-bit BAR consumes two adjacent slots; the upper
   slot is recorded as absent.
-- **The interrupt** is the device's routed GSI. Phase 2 uses IOAPIC-routed,
-  non-shared line interrupts: the kernel resolves the PCI interrupt pin to a GSI
-  (from the legacy line in config space, refined by the ACPI `_PRT` when AML
-  parsing exists — deferred; the QEMU AHCI line is sufficient meanwhile) and the
-  AHCI driver routes it via [`arch::IrqRouter`](../../kernel/src/arch/irq_router.rs).
+- **The interrupt** descriptor records the device's legacy line and pin, and
+  since Phase 5 Part A that is the **fallback** rather than the path. A driver
+  prefers **MSI** wherever the function advertises the capability: the device is
+  handed an address and a value and raises the interrupt by writing them itself,
+  so no GSI is resolved and nothing is routed. Where there is no MSI capability,
+  the kernel resolves the interrupt pin to a GSI — from the legacy line in config
+  space, refined by the ACPI `_PRT` when AML parsing exists (deferred) — and
+  routes it via [`arch::IrqRouter`](../../kernel/src/arch/irq_router.rs). Both
+  installs are reached through
+  [`arch::IrqInstall`](../../kernel/src/arch/irq_install.rs). **`InterruptSpec`
+  is unchanged either way**: its `gsi`/`trigger`/`polarity` stay zero until
+  something routes a pin, and on the MSI path nothing ever does.
 - A driver maps a BAR into **kernel** space (uncached, via the
   `PageFlags::NO_CACHE` path the arch paging layer already supports) to reach the
   controller's registers — there is no userspace MMIO mapping in Phase 2.

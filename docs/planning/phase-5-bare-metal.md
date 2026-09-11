@@ -208,9 +208,10 @@ function *was* walked, the only MSI-X device is the e1000e, which has no driver 
       facts), and it leaves the capability walk host-testable against `FakeCfg`, which is where
       the 32-bit form above gets its coverage. `cargo xtask check-arch` enforces whichever is
       picked, so picking after the code is written is the expensive order.
-- [x] **The trait promotion.** `install_pci_irq` is a neutral free function carrying a
-      `TODO(msi)` that names exactly this moment. The family gains its second member, so it
-      becomes `ArchIrqInstall` with the INTx and MSI installs side by side.
+- [x] **The trait promotion.** `install_pci_irq` was a neutral free function carrying a
+      `TODO(msi)` that named exactly this moment. The family gained its second member, so it
+      became `ArchIrqInstall` with the INTx and MSI installs side by side; both the function
+      and the marker are gone.
 - [x] **The driver switch, with INTx kept as the fallback.** AHCI prefers MSI when the capability
       is present and falls back to the interrupt-line GSI when it is not. Keeping both is not a
       test accommodation: it is what a device with no MSI capability needs, and the i8042 stays

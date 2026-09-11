@@ -2187,6 +2187,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("xtask: graphical login gate — booting the release image…\n");
     let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock)?;
 
+    // 0. **The AHCI controller took the MSI path in a *release* image.** `test-qemu` already
+    //    adjudicates this (`check_ahci_msi_path`), but only for the selftest build — and the
+    //    image that will be carried to the laptop is this one. It costs one expectation
+    //    because the driver binds long before anything draws.
+    //
+    //    Ordered **first**, before the greeter lines, because `expect` consumes what it scans
+    //    past: asserting it after them would find nothing and hang. It is also why this reads
+    //    the path token rather than the vector — the vector differs between this image and the
+    //    selftest one (0x30 here, 0x31 there), since the selftest build's `IrqRouter::self_test`
+    //    takes a device vector for the PIT and never releases it.
+    session.expect("ahci: irq via MSI")?;
+
     // 1. The greeter is up before anyone has authenticated. That is the claim Part D's second
     //    box makes, and in a release image nothing else has drawn anything.
     // The redraw is logged inside `present`, so it precedes the line that announces the
