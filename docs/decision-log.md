@@ -25082,3 +25082,72 @@ and it is not ambiguous — a checkbox in `planning/` means **built**.
 Worth recording because it is the same failure mode as versioned filenames: a heading is an
 address, and renaming one rots every link to it. The gate exists; the habit of running it
 before pushing is what makes the gate useful.
+
+
+---
+
+## 2026-09-11 — a PRDT with no ceiling, and a self-test nobody read
+
+Asked how DMA works — and whether it works — while looking at `DmaBuffer` before Phase 5. It
+works, `ArchDma` is deliberately absent (x86 DMA to write-back HHDM memory is snoop-coherent;
+the hook is for a non-coherent arch), and the question turned up something else.
+
+**The command table had no bound and the caller had no limit to respect.** `AhciDisk::cmd_table`
+is one page. AHCI puts 128 bytes of command FIS first and 16 bytes per PRDT entry, so it holds
+**248** entries. `io::block::build_frags` emits **one fragment per page touched** with no
+ceiling — faithfully describing whatever range it is handed — and `sys_io_submit` bounds
+`buf_offset + length` against the buffer's size and nothing else. Nothing in between knew what
+the hardware could describe.
+
+So a transfer over ~992 KiB made `build_command` zero and write PRDT entries past its own
+page, and then the **controller** read descriptors out of whatever followed and DMAed to the
+addresses it found there. A userspace process holding a block `DeviceNode` handle and a large
+enough `MemoryObject` could reach it. It was never reached in practice — `fs-server-ext4`
+issues one 4 KiB block per submit, three orders of magnitude below the threshold — which is
+exactly why it survived: the only caller that exists needs one fragment.
+
+**The `SAFETY` comment on the loop said `(frags bounded)`.** It was not. That is the same shape
+as yesterday's entry about comments that argue rather than explain, found the next morning in
+code four milestones old.
+
+### The fix, and where the bound belongs
+
+`BlockBackend` publishes `max_frags` and `dispatch_block_irp` refuses anything larger. The
+device declares its own constraint because only the driver knows it; a partition **inherits**
+its disk's rather than restating it; the ramdisk declares none, having nothing fixed-size to
+overrun. AHCI's is *derived* from the layout constants `build_command` writes with, so the
+capacity and the code that relies on it are one number.
+
+**Fragments, not bytes.** The hardware limit is a count of descriptors, and the same `length`
+yields a different count depending on whether it starts page-aligned — so a byte ceiling would
+force the caller to reproduce how a range splits into pages, which is a second copy of
+arithmetic that already exists.
+
+### Two things the negative control taught, which the test alone would not have
+
+**A `debug_assert!` in `build_command` was the wrong backstop, and running the control is what
+showed it.** Deleting the dispatch guard did not print "PRDT overflow" — it panicked on a
+**lock-order violation**, because `build_command` runs under the port lock and the assert's
+message formatting takes the Klog lock. A backstop whose only way to report is to deadlock is
+not one; and `debug_assert!` compiles out in release besides. The check moved to `submit`,
+*before* the lock, where failing an IRP means completing it with an error — which is available
+there and is not available under the lock. With the dispatch guard removed the kernel now
+survives with zero panics and the boot completes, which is the backstop doing its job rather
+than decorating it.
+
+**And the self-test's verdict was not adjudicated.** With the guard gone the guest printed
+`ahci: oversize self-test FAIL (249 frags accepted, table holds 248)` and `test-qemu` exited
+**0**. `drivers::self_test` prints a line and does not call `SYS_TEST_EXIT` — which is precisely
+what the comment on `check_display_selftest` had already worked out, one declaration over:
+*"Forcing its hash comparison to fail produces `display-selftest: FAILED` … and `integration
+tests PASSED`."* The same hole, met a second time in the same file. `check_oversize_refused`
+now requires the `OK` line, so the check not running at all fails too — and publishing a wrong
+`max_frags` fails with a different message than deleting the guard.
+
+**The host tests cannot cover this and are honest about it.** Four of them pin the two halves —
+that `build_frags` has no ceiling of its own, that an unaligned start costs an extra fragment,
+that the PRDT capacity is what fits in one page — and **every one passes with the guard
+deleted**. What they cannot do is build a live `DeviceNode`, `MemoryObject` and
+`PendingOperation`; the boot self-test is the only thing that goes through the real path, and it
+asks the device for its own limit rather than a constant, so the plumbing is under test and not
+just the number.

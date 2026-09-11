@@ -7717,6 +7717,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_login_chain(&transcript)?;
             check_demo_chain(&transcript)?;
             check_display_selftest(&transcript)?;
+            check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
@@ -7726,6 +7727,40 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
+}
+
+/// Assert that the block driver **refused** a transfer larger than one command can describe.
+///
+/// **The same hole `check_display_selftest` documents, met again.** `drivers::self_test` prints
+/// a verdict and does not call `SYS_TEST_EXIT`, so with the guard in `dispatch_block_irp`
+/// deleted the guest printed `ahci: oversize self-test FAIL (249 frags accepted, table holds
+/// 248)` and `test-qemu` exited **0**. A self-test whose failure nobody reads is not a test —
+/// which is precisely what the comment on `check_display_selftest` had already worked out, one
+/// declaration over.
+///
+/// Requiring the `OK` line rather than merely rejecting `FAIL` is deliberate: it also catches
+/// the check not running at all, which is what a refactor that dropped the call would produce.
+///
+/// The self-test skips when the device has no fragment limit (the ramdisk publishes
+/// `u32::MAX`), so a build whose first block device is a ramdisk prints neither line — hence
+/// the `no line at all` arm below rather than a bare `contains`.
+fn check_oversize_refused(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if text.contains("ahci: oversize self-test OK") {
+        println!("xtask: an oversized block transfer was refused ✓");
+        return Ok(());
+    }
+    if text.contains("ahci: oversize self-test FAIL") {
+        return Err("a block transfer needing more fragments than the device's command table \
+             holds was NOT refused — the driver would write PRDT entries past the table it \
+             owns, and the controller would DMA to whatever followed. See \
+             `dispatch_block_irp`'s `max_frags` check and `TODO(block-transfer-split)`."
+            .into());
+    }
+    Err("the oversize block self-test did not run — expected \
+         \"ahci: oversize self-test OK\" in the transcript. It is skipped only when the first \
+         block device publishes no fragment limit, which the AHCI disk does not."
+        .into())
 }
 
 /// Assert that the display self-test **passed**.

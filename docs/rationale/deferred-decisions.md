@@ -148,6 +148,25 @@ the first filter use case (encrypted root / LVM, both already deferred under
 **NVMe.** Phase 2's first storage driver is AHCI (simpler than NVMe). The `nvme`
 Tier 1 feature follows. Trigger: NVMe hardware or a faster boot device matters.
 
+**Splitting a block transfer across several commands — `TODO(block-transfer-split)`.** A
+transfer needing more physical fragments than one command can describe is **refused**
+(`KError::InvalidArgument`) rather than split. The bound is the device's own:
+`BlockBackend::max_frags`, which for AHCI is its command table's PRDT capacity — one page, so
+248 entries, so ~992 KiB of page-aligned transfer.
+
+**This replaced a hole rather than a limitation.** `sys_io_submit` bounds `buf_offset + length`
+against the buffer's size and nothing else, and `build_frags` emits one fragment per page with
+no cap — so before 2026-09-11 a caller holding a block `DeviceNode` handle and a large enough
+`MemoryObject` made the driver write PRDT entries past the table it owns, and the controller
+then DMAed to whatever addresses followed. Nothing in the tree reached it (`fs-server-ext4`
+issues one 4 KiB block per submit), which is why it survived.
+
+Splitting is the better answer and is real work: one `PendingOperation` has to outlive several
+IRPs, with partial-failure semantics — a second command failing after the first succeeded is a
+state the completion path has no way to express today. Trigger: a consumer that wants transfers
+larger than a megabyte. `fs-server-ext4`'s 4 KiB blocks are three orders of magnitude below it,
+so nothing is waiting.
+
 **AHCI driver scope.** The Phase 2 AHCI driver (Part 3) supports a **single
 controller, single SATA disk, one command *issued* at a time** (slot 0). Multi-port /
 multi-disk, multiple controllers, and port multipliers are deferred to when a

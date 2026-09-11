@@ -34,6 +34,19 @@ pub struct BlockBackend {
     pub poll: fn(ctx: *mut ()),
     /// Device context passed back to `submit`/`poll` (e.g. the controller).
     pub ctx: *mut (),
+    /// The most physical fragments this device can describe in **one** command.
+    ///
+    /// **A device constraint, published by the device**, because only the driver
+    /// knows it: AHCI's is its command table's PRDT capacity, and a ramdisk has
+    /// none. [`dispatch_block_irp`] refuses a transfer that would need more,
+    /// which is what keeps a driver from writing past the structure it programs.
+    ///
+    /// Expressed in fragments rather than bytes on purpose. The hardware limit is
+    /// a *count of descriptors*; converting it to a byte ceiling would need the
+    /// caller to reproduce how a byte range splits into pages, and a second copy
+    /// of that arithmetic is a second thing to get wrong. The exact count is what
+    /// `build_frags` already returns.
+    pub max_frags: u32,
 }
 
 // SAFETY: a `BlockBackend`'s raw `ctx` points at a device structure that lives
@@ -121,6 +134,19 @@ pub fn dispatch_block_irp(
     // SAFETY: `buffer` pins a live `MemoryObject` (type checked by the caller).
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
     let frags = build_frags(mo.frames(), buf_offset, length)?;
+    // **The device's own limit, checked against the exact fragment count.** A
+    // transfer larger than one command can describe is refused here rather than
+    // truncated or split: `sys_io_submit` bounds `buf_offset + length` against the
+    // buffer's size and nothing else, so without this a caller holding a block
+    // device handle could make the driver write PRDT entries past the table it
+    // owns — and the controller would then DMA to whatever addresses followed it.
+    //
+    // Splitting a large transfer across several commands is the better answer and
+    // is not this fix: it needs one `PendingOperation` to outlive several IRPs.
+    // `TODO(block-transfer-split)`.
+    if frags.len() > backend.max_frags as usize {
+        return Err(KError::InvalidArgument);
+    }
 
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
@@ -453,6 +479,11 @@ pub fn partition_backend(partition: &'static Partition) -> BlockBackend {
         submit: partition_submit,
         poll: partition_poll,
         ctx: partition as *const Partition as *mut (),
+        // **Inherited, not restated.** A partition is a window that re-bases an
+        // offset and forwards the same IRP to the same hardware, so it is subject
+        // to exactly the disk's limit — and a partition that published its own
+        // would be a second number free to disagree with the one that matters.
+        max_frags: partition.disk.max_frags,
     }
 }
 
@@ -534,5 +565,50 @@ mod tests {
         assert_eq!(frags.len(), 2);
         assert_eq!(frags[0], PhysFrag { base: 0x1000 + PAGE_SIZE as u64 - 100, len: 100 });
         assert_eq!(frags[1], PhysFrag { base: 0x2000, len: 100 });
+    }
+
+    /// One fragment per page, with **no ceiling of its own** — which is why the
+    /// device's ceiling has to be checked by the caller.
+    ///
+    /// This is the half that made the overflow reachable: `build_frags` is a faithful
+    /// description of whatever range it is given, and `sys_io_submit` bounds that range
+    /// only against the buffer's size. Nothing between them knew what the hardware could
+    /// describe.
+    #[test]
+    fn the_fragment_count_grows_with_the_transfer_and_is_never_clamped() {
+        let frames: KVec<PhysAddr> = {
+            let mut v = KVec::new();
+            v.try_reserve(600).unwrap();
+            for i in 0..600u64 {
+                v.try_push(PhysAddr(0x10_0000 + i * PAGE_SIZE as u64)).unwrap();
+            }
+            v
+        };
+        for pages in [1usize, 248, 249, 600] {
+            let frags = build_frags(&frames, 0, pages as u64 * PAGE_SIZE as u64).unwrap();
+            assert_eq!(frags.len(), pages, "{pages} pages should be {pages} fragments");
+        }
+    }
+
+    /// An unaligned start costs **one extra fragment**, so a transfer that fits when
+    /// page-aligned can fail to fit when it is not.
+    ///
+    /// Worth pinning because it is the reason the dispatch check counts *fragments*
+    /// rather than deriving a byte ceiling: the same `length` yields a different count
+    /// depending on where it starts, and a byte limit would have to reproduce that
+    /// arithmetic to be right.
+    #[test]
+    fn an_unaligned_start_costs_an_extra_fragment() {
+        let frames: KVec<PhysAddr> = {
+            let mut v = KVec::new();
+            v.try_reserve(4).unwrap();
+            for i in 0..4u64 {
+                v.try_push(PhysAddr(0x10_0000 + i * PAGE_SIZE as u64)).unwrap();
+            }
+            v
+        };
+        let two_pages = 2 * PAGE_SIZE as u64;
+        assert_eq!(build_frags(&frames, 0, two_pages).unwrap().len(), 2);
+        assert_eq!(build_frags(&frames, 1, two_pages).unwrap().len(), 3);
     }
 }

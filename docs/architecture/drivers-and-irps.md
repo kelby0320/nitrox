@@ -23,7 +23,8 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > which carries real block I/O for `fs-server-ext4`. Individual deferrals — IRP
 > cancellation, the module loader, driver-process `Handle<DeviceNode>` — are marked
 > inline and in `deferred-decisions.md`. The § "Phase 2 scope" table at the end is a
-> record of the original plan. Verified 2026-08-05.
+> record of the original plan. Verified 2026-08-05; the DMA section below re-checked
+> 2026-09-11, when `BlockBackend` gained `max_frags`.
 
 ## Three concepts, kept distinct
 
@@ -231,6 +232,27 @@ buddy allocator that exposes both a CPU (HHDM) pointer and `phys()`. (x86 DMA is
 snoop-coherent, so no cache maintenance; a non-coherent arch will add an `ArchDma`
 clean/invalidate hook.) IOMMU-constrained DMA (so a userspace driver can only
 touch memory it legitimately holds) is **deferred** with userspace drivers.
+
+**A `DmaBuffer` is for the driver's own structures, not for the data.** The transfer
+itself DMAs straight into the client's `MemoryObject` frames: `io::block::build_frags`
+describes the requested byte range as a physical fragment list, one fragment per page
+touched, and the driver turns that into the device's scatter-gather form (for AHCI, a
+PRDT). No bounce buffer, no copy.
+
+**How many fragments one command can describe is a device property, and the device
+publishes it** — [`BlockBackend::max_frags`](../../kernel/src/io/block.rs). AHCI's is
+its command table's PRDT capacity: one page, 128 bytes of command FIS, 16 bytes per
+entry, so **248** entries ≈ 992 KiB of page-aligned transfer. `dispatch_block_irp`
+refuses a larger request with `InvalidArgument`; a partition inherits its disk's limit
+rather than declaring one; the ramdisk declares none (`u32::MAX`), having nothing
+fixed-size to overrun.
+
+**This is a bound, not a policy, and it was once absent.** `sys_io_submit` bounds
+`buf_offset + length` against the buffer's size and nothing else, so before 2026-09-11
+a caller holding a block `DeviceNode` handle could make the driver write PRDT entries
+past its own command table — after which the controller read descriptors from whatever
+followed and DMAed to the addresses it found there. Splitting a large transfer across
+several commands is the better answer and is `TODO(block-transfer-split)`.
 
 ## Module tiers
 

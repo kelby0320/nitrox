@@ -145,6 +145,11 @@ pub fn try_new_device(rd: &'static RamDisk) -> Result<KBox<DeviceNode>, AllocErr
         submit: ramdisk_submit,
         poll: ramdisk_poll,
         ctx: rd as *const RamDisk as *mut (),
+        // **No hardware limit to inherit.** The ramdisk copies fragment by fragment
+        // in a loop with nothing fixed-size to overrun, so it declines to impose a
+        // ceiling rather than borrowing a plausible-looking one from a real
+        // controller — a limit nothing enforces would be a number to maintain.
+        max_frags: u32::MAX,
     };
     let geometry = BlockGeometry {
         logical_block_size: rd.block_size(),
