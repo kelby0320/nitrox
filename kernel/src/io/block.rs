@@ -116,8 +116,14 @@ fn build_frags(
 /// bytes between device offset `dev_offset` and the `buffer` `MemoryObject`'s
 /// byte range `[buf_offset, ...)`, completing `po` when done. The three handles'
 /// types/rights/bounds are the caller's responsibility (the syscall validates
-/// them synchronously; the boot self-test passes valid ones). Returns `Err` only
-/// on allocation failure — the caller rolls back the `po` handle.
+/// them synchronously; the boot self-test passes valid ones).
+///
+/// Returns `Err` **before the operation starts**, so the caller rolls back the `po`
+/// handle: `OutOfMemory` if the fragment list or the IRP cannot be allocated,
+/// `Unsupported` if the node carries no block backend, and `InvalidArgument` if the
+/// transfer needs more fragments than the device can describe in one command.
+/// *(Distinct from [`dispatch_block_irp_into_frame`], whose `Err` really is allocation
+/// failure alone — a single page is always one fragment.)*
 pub fn dispatch_block_irp(
     device: &ObjectRef,
     buffer: &ObjectRef,
@@ -522,6 +528,7 @@ impl Partition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mm::test_support::init_global_heap;
 
     #[test]
     fn partition_rebase_maps_relative_to_absolute() {
@@ -545,6 +552,7 @@ mod tests {
 
     #[test]
     fn frags_cover_aligned_range_one_per_page() {
+        init_global_heap();
         let frames = [PhysAddr(0x1000), PhysAddr(0x5000), PhysAddr(0x9000)];
         let frags = build_frags(&frames, 0, 3 * PAGE_SIZE as u64).unwrap();
         assert_eq!(frags.len(), 3);
@@ -555,6 +563,7 @@ mod tests {
 
     #[test]
     fn frags_split_unaligned_head_and_tail() {
+        init_global_heap();
         let frames = [PhysAddr(0x1000), PhysAddr(0x2000)];
         // 512 bytes starting 256 into the first page: one fragment.
         let frags = build_frags(&frames, 256, 512).unwrap();
@@ -576,6 +585,7 @@ mod tests {
     /// describe.
     #[test]
     fn the_fragment_count_grows_with_the_transfer_and_is_never_clamped() {
+        init_global_heap();
         let frames: KVec<PhysAddr> = {
             let mut v = KVec::new();
             v.try_reserve(600).unwrap();
@@ -599,6 +609,7 @@ mod tests {
     /// arithmetic to be right.
     #[test]
     fn an_unaligned_start_costs_an_extra_fragment() {
+        init_global_heap();
         let frames: KVec<PhysAddr> = {
             let mut v = KVec::new();
             v.try_reserve(4).unwrap();

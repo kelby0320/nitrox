@@ -25151,3 +25151,49 @@ deleted**. What they cannot do is build a live `DeviceNode`, `MemoryObject` and
 `PendingOperation`; the boot self-test is the only thing that goes through the real path, and it
 asks the device for its own limit rather than a constant, so the plumbing is under test and not
 just the number.
+
+
+---
+
+## 2026-09-11 — the gate that blamed the wrong thing (PR #293 review)
+
+Five findings, and the blocking one is the same lesson as yesterday's: **the class of a
+documented claim is every document that states it.** The DMA bound went into
+`drivers-and-irps.md`, which is what a kernel reader consults — and not into
+`spec/io-operation.md`, which is the ABI contract a `libos` or fs-server author reads. A
+userspace author writing a 4 MiB block read, a quarter of the documented 16 MiB ceiling, would
+have got `InvalidArgument` for a reason no spec stated. Both spec docs say it now, and
+`io-operation.md` says the part that is easy to get wrong: the ceiling is a **fragment** count,
+so an unaligned `buf_offset` lowers it by a page.
+
+**The finding worth keeping is the second one, because the fix created it.** `oversize_refused`
+was the last statement of `drivers::self_test`, reached only if the sector-0 read had already
+succeeded. So a regression in the read path skipped the bound check silently, and the new gate's
+"did not run" message then asserted the only possible cause was a device publishing no fragment
+limit — sending the author to `max_frags` for a fault three functions away. A message that names
+one cause is a message that is wrong whenever a different cause fires.
+
+The call moved above the read's early returns; the skip arm names every cause; and the
+neighbouring self-test got the adjudication this branch exists to add. **That was the deeper
+half**: `grep "read self-test" tools/xtask/src/main.rs` returned nothing. The entry beside this
+one is titled "a self-test nobody read", and the self-test *directly above the one it fixed* was
+still nobody's — read, after this branch, only indirectly and through a wrong message on a
+different check. Controlled by breaking the read path: the oversize check runs and passes, and
+`check_block_read_selftest` names the read path.
+
+**"Derived, not chosen" was unfalsifiable, and the reviewer proved it** by cutting the command
+table's allocation to 512 bytes and watching the capacity test still pass. Both sides said
+`PAGE_SIZE` independently, which is two expressions of one size rather than a derivation. They
+share a `CMD_TABLE_BYTES` now, the allocation uses it, and the same control fails. The rule this
+repo keeps re-learning has a third form: *a comment that argues* is unchecked, *a test that
+compares a constant to itself* is vacuous, and **a derivation that reads the same input twice is
+neither derived nor checked.**
+
+Also: `dispatch_block_irp`'s rustdoc still said `Err` meant allocation failure, which the new
+guard made plainly false — and the block tests could not be run in isolation, because none
+called `init_global_heap()`; they passed only because an alphabetically earlier module happened
+to initialise the heap first. That matters more than it looks: running *one* test against a
+deliberately broken line is the method every finding on this branch was established with, and
+this module was the only one in the kernel where that did not work. Swept the rest by running
+each module alone; the detector was positive-controlled against the four that failed before the
+fix.

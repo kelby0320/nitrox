@@ -66,6 +66,12 @@ pub fn self_test() {
         return; // no block device (no AHCI disk) — nothing to test
     };
 
+    // **First, because it shares nothing with the read below but the handle.** It used to be
+    // the last statement of this function, so any earlier failure — a dispatch error, a bad
+    // status — skipped it silently, and the gate that reads its absence then blamed the wrong
+    // thing (PR #293 review, 2).
+    oversize_refused(disk);
+
     let buffer = match MemoryObject::try_new(512) {
         Ok(mo) => adopt(mo, KObjectType::MemoryObject),
         Err(_) => return,
@@ -123,7 +129,6 @@ pub fn self_test() {
         );
     }
 
-    oversize_refused(disk);
 }
 
 /// Boot self-test: a transfer needing more fragments than the device can describe in one
@@ -139,6 +144,9 @@ pub fn self_test() {
 /// Before 2026-09-11 this read was attempted: the driver zeroed and wrote PRDT entries past
 /// the one-page command table it owns, and the controller then read descriptors out of
 /// whatever followed and DMAed to the addresses it found there.
+///
+/// **Runs before the sector-0 read**, not after it: the two share only the disk handle, and
+/// ordering this second made every failure of the first silently skip it.
 fn oversize_refused(disk: &ObjectRef) {
     // SAFETY: `disk` pins a live `DeviceNode` (found by class above).
     let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };

@@ -91,9 +91,19 @@ const SECTOR_SIZE: u32 = 512;
 const PRDT_OFFSET: usize = 128;
 /// Size of one PRDT entry: base low, base high, reserved, and the byte count.
 const PRDT_ENTRY: usize = 16;
-/// The command table is one page, so this is how many fragments one command can
-/// describe. **Derived, not chosen** — change the allocation and this follows.
-const MAX_PRDT_ENTRIES: u32 = ((crate::mm::PAGE_SIZE - PRDT_OFFSET) / PRDT_ENTRY) as u32;
+/// How much memory one command table gets. **This is the allocation**, used by `probe`
+/// and by the capacity below — the point is that they cannot be separately edited.
+///
+/// An earlier version wrote `PAGE_SIZE` at the allocation and derived the capacity from
+/// `PAGE_SIZE` too, and called that "derived, not chosen". It was not: shrinking the
+/// allocation left the capacity untouched and the test still passed, which a reviewer
+/// demonstrated (PR #293 review, 4). Two expressions of one size are two things to keep
+/// equal; this is one.
+const CMD_TABLE_BYTES: usize = crate::mm::PAGE_SIZE;
+/// How many fragments one command can describe: whatever fits in a command table after
+/// the FIS area. Derived from [`CMD_TABLE_BYTES`] — shrink the allocation and this
+/// follows, which is now a property rather than a claim.
+const MAX_PRDT_ENTRIES: u32 = ((CMD_TABLE_BYTES - PRDT_OFFSET) / PRDT_ENTRY) as u32;
 /// Bounded poll for command completion / port readiness (~1 s of monotonic time).
 const POLL_TIMEOUT_NS: u64 = 1_000_000_000;
 
@@ -256,7 +266,7 @@ pub fn init(controller: &ObjectRef) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    let cmd_table = match DmaBuffer::alloc(crate::mm::PAGE_SIZE) {
+    let cmd_table = match DmaBuffer::alloc(CMD_TABLE_BYTES) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -742,21 +752,20 @@ pub fn poll_complete_inflight() -> bool {
 mod tests {
     use super::*;
 
-    /// The PRDT capacity is derived from the table's own size, and the table is a page.
+    /// The PRDT capacity is exactly what fits in a command table after the FIS area.
     ///
-    /// **The number and the allocation have to move together.** `probe` allocates
-    /// `DmaBuffer::alloc(PAGE_SIZE)` for the command table and `build_command` writes
-    /// `PRDT_OFFSET + n * PRDT_ENTRY` bytes into it; `MAX_PRDT_ENTRIES` is what makes
-    /// those two agree, and it is published as the device's `max_frags` so the dispatch
-    /// path refuses anything larger. This test fails if the allocation shrinks, if the
-    /// layout constants change, or if somebody writes the capacity as a literal.
+    /// **Against `CMD_TABLE_BYTES`, which is the allocation** — `probe` passes that same
+    /// constant to `DmaBuffer::alloc`, so shrinking the table shrinks the capacity and this
+    /// test moves with both. The earlier version compared against `PAGE_SIZE` while the
+    /// allocation separately said `PAGE_SIZE`, and a reviewer showed it passed with the
+    /// allocation cut to 512 bytes (PR #293 review, 4).
     #[test]
-    fn the_prdt_capacity_is_what_fits_in_one_page() {
+    fn the_prdt_capacity_is_what_fits_in_a_command_table() {
         assert_eq!(MAX_PRDT_ENTRIES, 248);
         // Every entry fits…
-        assert!(PRDT_OFFSET + MAX_PRDT_ENTRIES as usize * PRDT_ENTRY <= crate::mm::PAGE_SIZE);
+        assert!(PRDT_OFFSET + MAX_PRDT_ENTRIES as usize * PRDT_ENTRY <= CMD_TABLE_BYTES);
         // …and one more would not, which is the property that matters.
-        assert!(PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize + 1) * PRDT_ENTRY > crate::mm::PAGE_SIZE);
+        assert!(PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize + 1) * PRDT_ENTRY > CMD_TABLE_BYTES);
     }
 
     /// What that capacity is worth as a transfer, stated so the number in

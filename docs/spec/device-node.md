@@ -129,6 +129,13 @@ pub struct BlockGeometry {
 `offset + length` must lie within `block_count * logical_block_size`, else the
 operation completes `InvalidArgument` (see [`io-operation.md`](io-operation.md)).
 
+**`length` is also bounded by what one command can describe** — the device's
+scatter-gather capacity, counted in the pages the buffer range touches rather than
+in bytes, and refused **synchronously** rather than completed. That limit is not in
+`BlockGeometry`: it is a property of the driver's command structures rather than of
+the medium, and a device node does not publish it. See
+[`io-operation.md`](io-operation.md) § `length` for the rule and the AHCI figure.
+
 ## Naming and namespace resolution
 
 Discovered devices are **dynamic** — count and identity are known only at
