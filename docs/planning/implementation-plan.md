@@ -290,6 +290,11 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
   - The order is **MSI → an on-screen kernel console → a live image → a hardware report → the
     laptop's own resolution → the first boot → cache attributes → the installer**, and all but
     the last three land under existing gates before the machine is plugged in.
+  - **Part A (MSI) is complete, 2026-09-11.** AHCI acquires its interrupt over MSI with INTx
+    kept as the fallback; `install_pci_irq` became the `ArchIrqInstall` trait at its second
+    consumer; PCI gained a capability walk, a config-space window that outlives enumeration,
+    and the bus-master and INTx-disable bits nothing had ever set. `test-qemu` adjudicates
+    which path the driver took, because the boot passes either way.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

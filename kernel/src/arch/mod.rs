@@ -27,6 +27,7 @@
 pub mod cpu;
 pub mod entropy;
 pub mod irq;
+pub mod irq_install;
 pub mod irq_router;
 pub mod paging;
 pub mod platform;
@@ -66,12 +67,14 @@ pub use x86_64::apic::XApic as Irq;
 // distinct from `Irq`, the per-CPU local controller. See `arch/irq_router.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::ioapic::X86IoApic as IrqRouter;
-/// Install a PCI INTx interrupt (register an ISR + route a GSI) for an in-kernel
-/// driver — a composite helper, not a router method. See
-/// [`x86_64::ioapic::install_pci_irq`] (and the TODO there to promote the
-/// device-interrupt family into its own trait when MSI/teardown land).
+// Device-interrupt **installation** — acquiring an interrupt for a driver, by
+// either of the two ways a PCI function can deliver one (a routed INTx line, or
+// an MSI the device raises itself). A composite over the handler registry, the
+// local controller and the router, so it is its own trait rather than a method
+// on any of them. See `arch/irq_install.rs`; it was a free function until MSI
+// gave the family a second member (Phase 5 Part A).
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::ioapic::install_pci_irq;
+pub use x86_64::irq_install::X86IrqInstall as IrqInstall;
 // Legacy *ISA* interrupt installation is **not** re-exported neutrally: "ISA" is an
 // x86-only concept (ARM has no ISA IRQs), so surfacing it here would leak arch
 // jargon (`docs/conventions/arch-boundary.md`). A fixed legacy platform device wires

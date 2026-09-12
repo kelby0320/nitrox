@@ -24,7 +24,9 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > cancellation, the module loader, driver-process `Handle<DeviceNode>` — are marked
 > inline and in `deferred-decisions.md`. The § "Phase 2 scope" table at the end is a
 > record of the original plan. Verified 2026-08-05; the DMA section below re-checked
-> 2026-09-11, when `BlockBackend` gained `max_frags`.
+> 2026-09-11, when `BlockBackend` gained `max_frags`, and § "Interrupts" rewritten the
+> same day, when Phase 5 Part A made **MSI** the path a PCI driver takes and left INTx
+> as the fallback.
 
 ## Three concepts, kept distinct
 
@@ -82,16 +84,30 @@ IRQ/DPC context is forbidden.
 
 ### Routing: GSI → vector → ISR
 
-On x86_64, the local APIC handles the per-CPU timer (Phase 1), but **device**
-interrupts arrive through the **IOAPIC**, which must be located and configured
-from the ACPI **MADT**. The IOAPIC routes a hardware *Global System Interrupt*
-(GSI) to an IDT vector on a chosen CPU; the vector's stub enters a registered
-kernel ISR. (`phase-2/ioapic`, building on `phase-2/acpi-tables`.)
+On x86_64 the local APIC handles the per-CPU timer (Phase 1). A **device**
+interrupt reaches a CPU by one of two routes, and a Tier 1 driver asks for one
+through [`ArchIrqInstall`](../../kernel/src/arch/irq_install.rs) — a facility of
+its own rather than a method on the router or the local controller, because
+installing an interrupt spans both plus the handler registry.
 
-Phase 2 uses **IOAPIC-routed, non-shared** interrupts — enough for the QEMU AHCI
-controller. **Deferred:** MSI / MSI-X (message-signalled interrupts) and shared
-PCI INTx (the "chain of handlers, each returns *mine* / *not mine*" model);
-MSI/MSI-X are never shared.
+- **MSI**, preferred wherever a PCI function advertises the capability. The
+  device is handed an address and a value and raises the interrupt by writing
+  them itself, so nothing routes it: no IOAPIC entry, no ACPI `_PRT`, and no
+  two devices sharing a vector. The **capability's layout** is PCI-SIG and lives
+  in [`pci`](../../kernel/src/pci/mod.rs) (`read_msi`, `program_msi`); the
+  **message's contents** are architectural and come from `install_msi`. That
+  split is why the arch half yields a message rather than programming a device.
+- **INTx**, the fallback for a function advertising no MSI capability. The
+  **IOAPIC**, located and configured from the ACPI **MADT**, routes a hardware
+  *Global System Interrupt* (GSI) to an IDT vector on a chosen CPU; the vector's
+  stub enters a registered kernel ISR. (`phase-2/ioapic`, building on
+  `phase-2/acpi-tables`.) The GSI comes from the PCI interrupt-line register,
+  which is the part that does not survive contact with real hardware — and the
+  reason MSI is preferred.
+
+**Deferred:** MSI-X, and shared PCI INTx (the "chain of handlers, each returns
+*mine* / *not mine*" model). Neither MSI nor MSI-X is ever shared, so the second
+matters only for a device that has neither.
 
 ### `InterruptObject` — an IRQ source as a waitable
 
@@ -232,6 +248,22 @@ buddy allocator that exposes both a CPU (HHDM) pointer and `phys()`. (x86 DMA is
 snoop-coherent, so no cache maintenance; a non-coherent arch will add an `ArchDma`
 clean/invalidate hook.) IOMMU-constrained DMA (so a userspace driver can only
 touch memory it legitimately holds) is **deferred** with userspace drivers.
+
+**A bus-mastering device has to be *told* it may master the bus** — PCI command
+register bit 2 — and the driver sets it ([`pci::enable_bus_master`](../../kernel/src/pci/mod.rs)).
+Until Phase 5 Part A nothing did, and DMA worked anyway because every firmware we
+had booted under leaves the bit set; that is a property of those firmwares rather
+than of the machine, so the driver no longer inherits it. It reports which
+happened, because "already enabled by firmware" and "enabled by the driver" are
+different facts about a new machine.
+
+**It has to be set before the driver's own bring-up DMAs**, which is narrower than
+it sounds: AHCI starts FIS receive and runs `IDENTIFY DEVICE` before it has a disk
+to publish, and both are bus-master transactions. Setting the bit after them works
+on every machine whose firmware had already set it and on no other — so it would
+pass every gate we own and lose the disk on the first machine that needed it. It
+is set immediately after the controller's port is chosen, ahead of every
+allocation and every register write that starts the port.
 
 **A `DmaBuffer` is for the driver's own structures, not for the data.** The transfer
 itself DMAs straight into the client's `MemoryObject` frames: `io::block::build_frags`

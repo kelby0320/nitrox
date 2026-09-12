@@ -25254,3 +25254,63 @@ the 32-bit form gets its coverage.
 consistent with a driver that silently fell back to INTx. The adjudication is on *which path was
 taken*, and the control is to make the capability walk find nothing: the boot must still pass,
 and the adjudicated line must change.
+
+---
+
+## 2026-09-11 — Phase 5 Part A: MSI, and two things the firmware had been doing for us
+
+Part A shipped in three commits against the detail pass written the same day, and the pass
+earned its keep: every decision it recorded was taken as written, and the two hazards it named
+were both real.
+
+**The interrupt.** `ArchIrqInstall` now carries `install_intx` — the old neutral
+`install_pci_irq`, moved verbatim — and `install_msi`. The family became a trait at its second
+member, which is exactly the trigger its own deferral named. The x86 half is its own module
+rather than more of `ioapic.rs`, because only one of the two routes is the IOAPIC's business:
+an MSI device writes to the **local** APIC and the sole shared piece is the device-vector
+registry.
+
+**The seam went where the pass said.** `install_msi` yields a *message*; `pci::program_msi`
+writes it into the capability. Address and data are architectural, the capability's layout is
+PCI-SIG, and separating them is what makes the layout host-testable — which matters more here
+than anywhere else, because **the branch the target machine takes is the one no QEMU boot can
+reach**. QEMU's ICH9 AHCI is 64-bit MSI and the laptop's Sunrise Point-LP is 32-bit, and
+Message Control bit 7 selects a structure rather than an address width. Both shapes are under
+host test, built from the real captures, and the control is to force `msi_data_offset` to
+return `+0x0C` unconditionally — the driver the emulator alone would have produced. It fails
+the 32-bit tests with `left: 140, right: 136` and leaves the 64-bit one green, which is the
+asymmetry stated precisely.
+
+**Nothing had ever enabled bus mastering, and the detail pass was right about why it worked
+anyway**: the firmware hands every function over with the bit set. The driver now sets it and
+says which happened, because "already enabled by firmware" and "enabled by the driver" are
+different facts about a machine we have not booted yet. Its neighbour shipped with it — MSI
+Enable does not suppress INTx, so the driver sets Interrupt Disable on the MSI path and leaves
+it clear on the fallback.
+
+**The gate is the part that took the most care, because the boot passes either way.** QEMU's
+firmware programs the interrupt-line register, so a silent fallback to INTx produces an
+identical transcript, an identical verdict and a machine that will not boot. `check_ahci_msi_path`
+adjudicates the path **token** and never the vector: the vector is not stable across builds,
+since the selftest image's `IrqRouter::self_test` takes `0x30` for the PIT and never gives it
+back. Controlled by making the capability walk find nothing — the boot still passes every other
+check, the driver prints `irq via INTx`, the read self-test still says `via IRQ` (so the
+fallback is real, not merely compiled), and only the new gate fails.
+
+**Closing the deferral found a hole in `check-deferrals` itself.** The last `TODO(msi)` marker
+in the tree was the gate's own doc comment illustrating the tag syntax — so the entry was backed
+by an *example* rather than by a code site, and would have stayed green with its real marker
+deleted, which is the precise failure the reverse direction was added in August to catch. The
+illustration is a placeholder now, and with it fixed the gate correctly fails on the
+still-open entry, which is how the teeth were confirmed rather than assumed. Swept the other two
+open tags whose only marker lives in `tools/xtask`: both are genuine cross-references from code
+that relates to them, not illustrations, so they stay. **The general lesson is narrower than
+"don't write tags in the tool":** a tag naming the deferral a piece of code *relates to* is the
+mechanism working; a tag naming a deferral chosen only to demonstrate the syntax is a forgery,
+and the two are indistinguishable to a grep.
+
+Also: an HBA with `CAP.S64A` clear is now declined rather than driven. The driver writes 64-bit
+addresses into the command list, the FIS base and every PRDT entry, and one that took only the
+low half would DMA somewhere else silently. No disk is diagnosable; a corrupted one is not.
+That assert was flagged in the PR #293 review and is the same shape as the rest of Part A —
+read a capability register and act on it, rather than print it.

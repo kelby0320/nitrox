@@ -9,9 +9,11 @@
 //! the completion IRQ → [`isr`] → the IRP's completion DPC → its
 //! `PendingOperation`.
 //!
-//! Phase 2 scope: a **single controller, single SATA disk**, IOAPIC-routed INTx,
-//! one outstanding command (slot 0). Multi-port/multi-controller, NCQ, port
-//! multipliers, and MSI are deferred (`docs/rationale/deferred-decisions.md`).
+//! Scope: a **single controller, single SATA disk**, one outstanding command
+//! (slot 0). The interrupt is **MSI** where the controller advertises the
+//! capability, with IOAPIC-routed INTx as the fallback for one that does not
+//! (Phase 5 Part A). Multi-port/multi-controller, NCQ, port multipliers and
+//! MSI-X are deferred (`docs/rationale/deferred-decisions.md`).
 //! See `docs/architecture/drivers-and-irps.md`.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -23,6 +25,7 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{IrqSpinLock, KBox};
 use crate::mm::dma::DmaBuffer;
 use crate::mm::{PhysAddr, kvmap};
+use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
@@ -36,6 +39,7 @@ const HBA_CAP: u64 = 0x00;
 const HBA_GHC: u64 = 0x04;
 const HBA_IS: u64 = 0x08;
 const HBA_PI: u64 = 0x0C;
+const CAP_S64A: u32 = 1 << 31; // HBA supports 64-bit addressing
 const GHC_AE: u32 = 1 << 31; // AHCI enable
 const GHC_IE: u32 = 1 << 1; // global interrupt enable
 
@@ -240,6 +244,16 @@ pub fn init(controller: &ObjectRef) -> bool {
     let cap = read32(abar, HBA_CAP);
     crate::kprintln!("ahci: HBA up (CAP {:#010x}, PI {:#010x})", cap, pi);
 
+    // The driver writes 64-bit addresses into the command list, the FIS base and
+    // every PRDT entry, and the frames it is handed can sit anywhere in physical
+    // memory. An HBA without `S64A` would take the low half and silently DMA to
+    // the wrong place, so decline it instead: no disk is a diagnosable failure
+    // and a corrupted one is not. Both target controllers set it.
+    if cap & CAP_S64A == 0 {
+        crate::kprintln!("ahci: HBA lacks 64-bit addressing (CAP.S64A clear) — declining");
+        return false;
+    }
+
     let mut port = u32::MAX;
     for p in 0..32u32 {
         if pi & (1 << p) == 0 {
@@ -256,6 +270,38 @@ pub fn init(controller: &ObjectRef) -> bool {
         return false;
     }
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
+
+    // Configuration space, for the command register and the MSI capability.
+    // Enumeration's scan window is long gone by now (see `pci::Config`).
+    let cfg = match crate::pci::Config::map(desc) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            crate::kprintln!(
+                "ahci: config space unreachable ({:?}) — INTx, and DMA is left relying on \
+                 whatever the firmware set",
+                e
+            );
+            None
+        }
+    };
+
+    // **Bus mastering, and it has to be here — before anything DMAs.** `start_port`
+    // below sets FRE, after which the HBA writes received FISes into memory, and
+    // `identify` has it fetch a command list and a PRDT and write 512 bytes back.
+    // All three are bus-master transactions. This call sat after `identify` until
+    // the PR #295 review: on a machine whose firmware left the bit clear — the one
+    // case it exists for — `identify` would have timed out, `init` returned at
+    // "IDENTIFY failed", and the enable never been reached at all.
+    //
+    // Every firmware we have booted under leaves it on, which is a property of
+    // those firmwares rather than of the machine, so say which happened.
+    if let Some(cfg) = &cfg {
+        if crate::pci::enable_bus_master(cfg) {
+            crate::kprintln!("ahci: bus master already enabled by firmware");
+        } else {
+            crate::kprintln!("ahci: bus master enabled by the driver");
+        }
+    }
 
     // Allocate the per-port DMA structures (zeroed, contiguous, page-aligned).
     let cmd_list = match DmaBuffer::alloc(1024) {
@@ -331,17 +377,58 @@ pub fn init(controller: &ObjectRef) -> bool {
         sectors * SECTOR_SIZE as u64 / (1024 * 1024)
     );
 
-    // Route the controller's INTx and install the completion ISR. The GSI comes
-    // from the PCI interrupt line register (firmware-programmed on QEMU; ACPI
-    // _PRT routing is deferred).
-    let gsi = desc.interrupt.line as u32;
-    // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the kernel's
-    // lifetime.
-    let vec = unsafe { crate::arch::install_pci_irq(gsi, isr) };
+    // Prefer MSI: the device is told a vector and raises the interrupt itself,
+    // so nothing depends on the PCI interrupt-line register — which QEMU's
+    // firmware programs and real UEFI often leaves meaningless. INTx stays as
+    // the fallback for a function that advertises no MSI capability.
+    let mut installed = false;
+    if let Some(cfg) = &cfg {
+        if let Some(msi) = crate::pci::read_msi(cfg) {
+            // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
+            // lifetime, and nothing can be delivered until the message is written.
+            match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
+                // SAFETY: the handler for `msg.vector` was just registered, so
+                // the device may write the message from here on.
+                Some(msg) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
+                    // MSI does not suppress INTx, and a device able to do both
+                    // would assert a line nothing is listening on.
+                    crate::pci::set_intx_disabled(cfg, true);
+                    crate::kprintln!(
+                        "ahci: irq via MSI (vec {:#04x}, addr {:#x}, data {:#06x}, {}-bit cap at {:#04x})",
+                        msg.vector,
+                        msg.address,
+                        msg.data,
+                        if msi.addr64 { 64 } else { 32 },
+                        msi.off
+                    );
+                    installed = true;
+                }
+                Some(_) => crate::kprintln!(
+                    "ahci: MSI declined — the capability cannot hold the message address; \
+                     falling back"
+                ),
+                None => crate::kprintln!(
+                    "ahci: MSI declined — this CPU cannot be named in a message; falling back"
+                ),
+            }
+        }
+    }
+    if !installed {
+        // The GSI comes from the PCI interrupt-line register (firmware-programmed
+        // on QEMU; ACPI `_PRT` routing is deferred).
+        let gsi = desc.interrupt.line as u32;
+        // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the
+        // kernel's lifetime.
+        let vec = unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) };
+        if let Some(cfg) = &cfg {
+            crate::pci::set_intx_disabled(cfg, false);
+        }
+        crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
+    }
+
     // Enable HBA-level interrupt delivery.
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
     write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
-    crate::kprintln!("ahci: INTx GSI{} -> vec {:#x}", gsi, vec);
 
     publish_disk(controller, sectors, disk)
 }

@@ -2187,6 +2187,18 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     println!("xtask: graphical login gate — booting the release image…\n");
     let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock)?;
 
+    // 0. **The AHCI controller took the MSI path in a *release* image.** `test-qemu` already
+    //    adjudicates this (`check_ahci_msi_path`), but only for the selftest build — and the
+    //    image that will be carried to the laptop is this one. It costs one expectation
+    //    because the driver binds long before anything draws.
+    //
+    //    Ordered **first**, before the greeter lines, because `expect` consumes what it scans
+    //    past: asserting it after them would find nothing and hang. It is also why this reads
+    //    the path token rather than the vector — the vector differs between this image and the
+    //    selftest one (0x30 here, 0x31 there), since the selftest build's `IrqRouter::self_test`
+    //    takes a device vector for the PIT and never releases it.
+    session.expect("ahci: irq via MSI")?;
+
     // 1. The greeter is up before anyone has authenticated. That is the claim Part D's second
     //    box makes, and in a release image nothing else has drawn anything.
     // The redraw is logged inside `present`, so it precedes the line that announces the
@@ -7717,6 +7729,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_login_chain(&transcript)?;
             check_demo_chain(&transcript)?;
             check_display_selftest(&transcript)?;
+            check_ahci_msi_path(&transcript)?;
             check_block_read_selftest(&transcript)?;
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
@@ -7768,6 +7781,53 @@ fn check_oversize_refused(transcript: &[u8]) -> R<()> {
          was discovered at all, when the first one publishes no fragment limit (the ramdisk's \
          `u32::MAX`), or when the probe's own allocation failed. An AHCI disk that came up is \
          none of those."
+        .into())
+}
+
+/// Assert that the AHCI driver acquired its interrupt over **MSI**, not by falling back to
+/// INTx.
+///
+/// **A passing `test-qemu` proves nothing about this on its own**, which is the whole reason
+/// the check exists. QEMU's firmware programs the PCI interrupt-line register to match the
+/// IOAPIC, so the INTx fallback works perfectly here — the boot, the block read self-test and
+/// the verdict are identical either way. Real UEFI frequently leaves that register
+/// meaningless, so a silent fallback is a bug only the target machine would report, by not
+/// booting.
+///
+/// **Matches the path token and never the vector**, deliberately. The vector is not stable
+/// across builds: the selftest image's `IrqRouter::self_test` registers `pit_tick` and never
+/// releases the slot, so AHCI lands on `0x31` there and `0x30` in a release image, and every
+/// captured transcript in `tools/build-cache` splits on exactly that line. A matcher written
+/// against the literal would pass this gate — `test-qemu` is a selftest image — and fail the
+/// first time it were pointed at `check-login` or `test-interactive`. Part A's own switch
+/// moved the number again.
+///
+/// The INTx arm is a **failure, not a skip**: every AHCI controller on either target machine
+/// advertises MSI (capability at `0x80` on both), so taking the fallback under QEMU means the
+/// capability walk, the message composition or the capability write went wrong — not that the
+/// hardware lacked the feature.
+fn check_ahci_msi_path(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if text.contains("ahci: irq via MSI") {
+        println!("xtask: the AHCI controller took the MSI interrupt path ✓");
+        return Ok(());
+    }
+    if text.contains("ahci: irq via INTx") {
+        return Err("the AHCI driver fell back to INTx. QEMU's ICH9 AHCI advertises MSI at \
+             capability 0x80, so the fallback firing here means the driver did not find it or \
+             could not program it — `pci::find_capability`, `pci::read_msi`, \
+             `ArchIrqInstall::install_msi` (which declines a destination wider than eight \
+             bits), or `pci::Config::map`, whose failure logs its own line just above. The \
+             boot still passes, because QEMU's firmware programs the interrupt-line register \
+             and real UEFI often does not — which is the bug this gate exists to catch before \
+             the laptop does."
+            .into());
+    }
+    Err("the AHCI driver printed no interrupt-path line — expected \"ahci: irq via MSI\" or \
+         \"ahci: irq via INTx\". Both arms print one, so its absence means the controller \
+         never reached interrupt installation at all: no ABAR, no SATA disk on an implemented \
+         port, a failed DMA allocation, or an HBA declined for lacking CAP.S64A. Each of those \
+         logs its own line above this point."
         .into())
 }
 
@@ -8378,10 +8438,19 @@ fn cmd_check_nightly() -> R<()> {
 /// ever reviewed, and each surfaced only when a consumer tripped over it (audit,
 /// 2026-07-24). A `TODO` is a deferral; this makes the code half of that mechanical.
 ///
-/// The document must name the tag **literally** — `TODO(msi)`, not just the word "msi" —
-/// because a bare short tag (`mm`) matches half the prose in any technical document, which
-/// would make the check pass without recording anything. Naming it also makes the entry
-/// searchable from the code and vice versa.
+/// The document must name the tag **literally** — the whole `TODO(<tag>)` form, not just the
+/// bare word inside it — because a short tag on its own (`mm`) matches half the prose in any
+/// technical document, which would make the check pass without recording anything. Naming it
+/// also makes the entry searchable from the code and vice versa.
+///
+/// **The illustration above is a placeholder on purpose.** This file is one of the three roots
+/// the reverse check scans, so spelling a real tag here makes this comment count as that
+/// deferral's code marker. Until 2026-09-11 the line read the MSI tag literally, and it had
+/// been the *only* marker backing that entry since the real one was written — so the entry
+/// stayed green when its marker was deleted, which is the exact failure the reverse check was
+/// added to catch. Sibling comments in this file name real tags deliberately, as
+/// cross-references from code that relates to them; an example of the *syntax* relates to
+/// nothing and must not name one.
 /// One family of ABI constants mirrored between the kernel and `userspace/libkern`.
 ///
 /// `pattern` is matched per line on both sides; capture group semantics are handled by
