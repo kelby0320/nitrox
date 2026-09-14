@@ -31,6 +31,7 @@ pub mod kstring;
 pub mod kvec;
 pub mod memory;
 pub mod notification;
+pub mod printable;
 pub mod spawn;
 pub mod spinlock;
 pub mod syscaps;

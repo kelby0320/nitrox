@@ -51,6 +51,15 @@ impl BaseRevision {
         // optimiser caching the original value from before Limine zeroed it.
         unsafe { ptr::read_volatile(&self.revision) == 0 }
     }
+
+    /// The base revision the bootloader says it loaded the kernel under, or `None` from a
+    /// bootloader too old to say (`LIMINE_LOADED_BASE_REVISION`: it overwrites the second
+    /// magic, which is therefore only a revision once it no longer reads as the magic).
+    pub fn loaded(&self) -> Option<u64> {
+        // SAFETY: as `supported` — a plain `u64` Limine may have written before `_start`.
+        let v = unsafe { ptr::read_volatile(&self.magic_1) };
+        (v != 0x6a7b384944536bdc).then_some(v)
+    }
 }
 
 /// Start-of-requests marker (4 × u64). Lives in `.limine_requests_start`.
@@ -166,6 +175,8 @@ pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
 pub const MEMMAP_KERNEL_AND_MODULES: u64 = 6;
 /// Linear framebuffer backing store.
 pub const MEMMAP_FRAMEBUFFER: u64 = 7;
+/// Reserved, but mapped in the HHDM anyway (`LIMINE_MEMMAP_RESERVED_MAPPED`).
+pub const MEMMAP_RESERVED_MAPPED: u64 = 8;
 
 #[repr(C)]
 pub struct MemoryMapRequest {
@@ -400,4 +411,153 @@ pub struct RsdpResponse {
     /// Address of the RSDP. Physical on recent Limine revisions (translate via
     /// the HHDM); may be an HHDM-virtual pointer on older bootloaders.
     pub address: u64,
+}
+
+// --- Bootloader info request ---------------------------------------------
+//
+// Which bootloader loaded us, and its version — the first line of a hardware report, since
+// every other handoff value is that bootloader's reading of the machine.
+
+const BOOTLOADER_INFO_ID_2: u64 = 0xf55038d8e2a1202f;
+const BOOTLOADER_INFO_ID_3: u64 = 0x279426fcf5f59740;
+
+#[repr(C)]
+pub struct BootloaderInfoRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut BootloaderInfoResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests
+// in this file.
+unsafe impl Sync for BootloaderInfoRequest {}
+
+impl BootloaderInfoRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, BOOTLOADER_INFO_ID_2, BOOTLOADER_INFO_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct BootloaderInfoResponse {
+    pub revision: u64,
+    /// NUL-terminated bootloader name.
+    pub name: *const u8,
+    /// NUL-terminated bootloader version.
+    pub version: *const u8,
+}
+
+// --- Firmware type request -----------------------------------------------
+
+const FIRMWARE_TYPE_ID_2: u64 = 0x8c2f75d90bef28a8;
+const FIRMWARE_TYPE_ID_3: u64 = 0x7045a4688eac00c3;
+
+/// Booted by legacy x86 BIOS.
+pub const FIRMWARE_X86_BIOS: u64 = 0;
+/// Booted by 32-bit UEFI.
+pub const FIRMWARE_EFI32: u64 = 1;
+/// Booted by 64-bit UEFI.
+pub const FIRMWARE_EFI64: u64 = 2;
+/// Booted by a RISC-V SBI implementation.
+pub const FIRMWARE_SBI: u64 = 3;
+
+#[repr(C)]
+pub struct FirmwareTypeRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut FirmwareTypeResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests
+// in this file.
+unsafe impl Sync for FirmwareTypeRequest {}
+
+impl FirmwareTypeRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, FIRMWARE_TYPE_ID_2, FIRMWARE_TYPE_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct FirmwareTypeResponse {
+    pub revision: u64,
+    /// One of the `FIRMWARE_*` constants.
+    pub firmware_type: u64,
+}
+
+// --- Date at boot request ------------------------------------------------
+
+const DATE_AT_BOOT_ID_2: u64 = 0x502746e184c088aa;
+const DATE_AT_BOOT_ID_3: u64 = 0xfbc5ec83e6327893;
+
+#[repr(C)]
+pub struct DateAtBootRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut DateAtBootResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests
+// in this file.
+unsafe impl Sync for DateAtBootRequest {}
+
+impl DateAtBootRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, DATE_AT_BOOT_ID_2, DATE_AT_BOOT_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct DateAtBootResponse {
+    pub revision: u64,
+    /// Seconds since the Unix epoch, as the firmware's clock read at boot.
+    pub timestamp: i64,
+}
+
+// --- Executable command line request -------------------------------------
+//
+// The `cmdline:` of the boot entry Limine booted, which is how a boot-menu entry selects a
+// kernel mode (Phase 5 Part D's `hwreport`).
+
+const EXECUTABLE_CMDLINE_ID_2: u64 = 0x4b161536e598651e;
+const EXECUTABLE_CMDLINE_ID_3: u64 = 0xb390ad4a2f1f303a;
+
+#[repr(C)]
+pub struct ExecutableCmdlineRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut ExecutableCmdlineResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests
+// in this file.
+unsafe impl Sync for ExecutableCmdlineRequest {}
+
+impl ExecutableCmdlineRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, EXECUTABLE_CMDLINE_ID_2, EXECUTABLE_CMDLINE_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct ExecutableCmdlineResponse {
+    pub revision: u64,
+    /// NUL-terminated command line; empty (not null) when the entry sets none.
+    pub cmdline: *const u8,
 }

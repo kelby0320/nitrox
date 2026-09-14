@@ -661,21 +661,21 @@ drawing the menu, which is why the live image needs a nonzero one.
 
 **D.1 — the missing facts, logged on every boot**
 
-- [ ] **The handoff**: the bootloader's name and version and the firmware type (Limine's
+- [x] **The handoff**: the bootloader's name and version and the firmware type (Limine's
       bootloader-info and firmware-type requests), the base revision accepted, the HHDM offset, the
       date at boot, the executable command line, and the memory map summarised by type (entries,
       and bytes usable / reclaimable / reserved / ACPI / framebuffer).
-- [ ] **The CPU**: CPUID vendor, brand string, family/model/stepping, logical CPU count, and three
+- [x] **The CPU**: CPUID vendor, brand string, family/model/stepping, logical CPU count, and three
       groups of feature bits — what the kernel **requires** (x2APIC, RDTSCP, NX, SMEP/SMAP), what it
       **uses when present** (XSAVE/AVX, RDRAND/RDSEED), and what it **warns about** (invariant TSC).
       TSC-deadline is reported as present or absent and **not** as used: the LAPIC timer runs in
       count-down mode (`kernel/src/arch/x86_64/timer.rs`), and a line implying otherwise would
       mislead Part F. The hypervisor bit, since a transcript should say which it came from.
-- [ ] **Compact**: one line per table, per MADT entry, per PCI function — not one per field. Every
+- [x] **Compact**: one line per table, per MADT entry, per PCI function — not one per field. Every
       line the console draws costs screen time before the compositor, and on the laptop, whose
       framebuffer has no write-combining until Part G, more than under QEMU. D.1 measures `check-fbcon`'s
       first-line-to-handout time before and after, under TCG.
-- [ ] **ACPI**: every table the XSDT lists — signature, OEM ID, OEM table ID, revision, length,
+- [x] **ACPI**: every table the XSDT lists — signature, OEM ID, OEM table ID, revision, length,
       physical address. The MADT's entries individually: each local APIC / x2APIC (processor UID,
       APIC id, enabled or online-capable), each IOAPIC, each source override, each LAPIC NMI entry.
       **Today's parser reads less than it looks** (`parse_madt`): it matches only type-0 local APIC
@@ -684,7 +684,7 @@ drawing the menu, which is why the live image needs a nonzero one.
       as type-9 entries the existing summary would read `0 CPU` while these new lines show every
       entry; D.1 extends the parser to both types and both flags, and the summary counts from the
       same walk.
-- [ ] **PCI**: each function's capabilities as the walk Part A added finds them (MSI with its form,
+- [x] **PCI**: each function's capabilities as the walk Part A added finds them (MSI with its form,
       MSI-X, PCI Express), and — after `drivers::probe` — a line per function saying what became of
       it, in **three states** (PR #299 review):
   - **claimed**, and how — `ahci, MSI vec 0x30`;
@@ -696,14 +696,14 @@ drawing the menu, which is why the live image needs a nonzero one.
   - **none** — no driver in the table matched.
 
   The device table records none of this today; drivers report their outcome into it.
-- [ ] **The framebuffer's padding, as a number.** The laptop reports pitch 5504 for 1366 × 4 =
+- [x] **The framebuffer's padding, as a number.** The laptop reports pitch 5504 for 1366 × 4 =
       5464; the line should say `padding 40` rather than leave the reader to subtract.
-- [ ] **COM1 is reported as present or absent**, not as a failing test. `console::init` prints
+- [x] **COM1 is reported as present or absent**, not as a failing test. `console::init` prints
       `console: RX loopback self-test FAIL` for any failure today, which is what a machine with no
       UART produces. Detect the UART first — the 16550 scratch register holds what is written to it,
       and a floating bus reads back `0xFF` — and log `console: no UART at COM1` when there is none,
       keeping `FAIL` for a UART that exists and fails.
-- [ ] Parsers that can be host-tested are: the ACPI table list and MADT decoding (against captured
+- [x] Parsers that can be host-tested are: the ACPI table list and MADT decoding (against captured
       bytes, as Part A tested MSI), the memory-map summary, and the command line.
 
 **D.2 — the kernel command line, and the live image's menu**

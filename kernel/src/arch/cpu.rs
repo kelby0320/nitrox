@@ -118,4 +118,15 @@ pub trait ArchCpu {
     /// # Safety
     /// Ring-0 only.
     unsafe fn interrupts_restore(prev: bool);
+
+    /// Log what this processor is and which of the features the kernel depends on it has
+    /// (Phase 5 Part D.1): the vendor, model and brand, and the features in three groups —
+    /// those the kernel **requires**, those it **uses when present**, and those whose absence
+    /// it **warns about** — each marked present (`+`) or absent (`-`).
+    ///
+    /// Read-only and allocation-free, so the boot calls it before anything that could fail on
+    /// an unfamiliar machine — in particular before [`init_protections`](Self::init_protections),
+    /// which panics on a missing required feature, so that the line naming what is missing is
+    /// already on the screen when it does.
+    fn log_identity();
 }

@@ -21,6 +21,7 @@ pub mod entropy;
 pub mod fbcon;
 pub mod framebuffer;
 pub mod handle;
+pub mod handoff;
 pub mod initramfs;
 pub mod io;
 pub mod klog;

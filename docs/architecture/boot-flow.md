@@ -1,6 +1,6 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-14, when the framebuffer console took the first line of `kernel_main`). Describes the boot as it runs today — UEFI →
+**Status:** Current (last checked 2026-09-14, when the framebuffer console took the first line of `kernel_main`, and again the same day when Phase 5 Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -121,12 +121,15 @@ and the bindings together.
 
 ## 3. Kernel `_start` → `kernel_main`
 
-`kernel/src/main.rs` declares six request statics plus the two bracketing markers, linked
-into `.limine_requests*` by `kernel/linker.ld`:
+`kernel/src/main.rs` declares ten request statics plus the two bracketing markers, linked
+into `.limine_requests*` by `kernel/linker.ld` (the ACPI RSDP request is the arch layer's, in
+`kernel/src/arch/x86_64/acpi.rs`, and the linker collects it all the same):
 
 - `BASE_REVISION` — `BaseRevision::new(6)`, the protocol revision we require. Checked
   before anything else is trusted.
 - `FRAMEBUFFER_REQUEST`, `MEMMAP_REQUEST`, `HHDM_REQUEST`, `MODULE_REQUEST`, `SMP_REQUEST`
+- `BOOTLOADER_INFO_REQUEST`, `FIRMWARE_TYPE_REQUEST`, `DATE_AT_BOOT_REQUEST`, `CMDLINE_REQUEST`
+  — facts the boot reports (step 3) and nothing else reads.
 - `REQUESTS_START` / `REQUESTS_END` — mandatory under base revision 6.
 
 All but `BASE_REVISION` are `static mut`: Limine writes their `response` field after the
@@ -144,29 +147,39 @@ each step's rationale is in the source comments:
    until a client is handed `/dev/framebuffer`, which on a machine with no serial port is the only
    diagnosis there is. See [the framebuffer console](framebuffer-console.md). (Serial came first,
    before the CPU tables, until Phase 5 Part B, 2026-09-14.)
-3. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
+3. **What was handed over, and what this CPU is** (Phase 5 Part D, 2026-09-14). `log_handoff`
+   prints the bootloader and its version, the firmware type and base revision, the HHDM offset,
+   the firmware's date, the boot entry's command line, and the memory map summed by kind;
+   `arch::Cpu::log_identity` prints the vendor, family/model/stepping and brand, and the
+   features the kernel requires, uses when present, and warns about, each `+` or `-`. Both only
+   read, and both run before the step that panics on a missing required feature
+   (`init_protections`), so the line naming what is missing is on the screen first. Later steps
+   add their own facts the same way — every ACPI table and MADT entry, each PCI function's
+   capabilities and what its driver did with it, the framebuffer's row padding, whether a UART
+   answers at COM1 — so every boot's log is a hardware report of the machine it ran on.
+4. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
    it. This is the first code to walk firmware structures and the first place a fault can
    happen, which is why the IDT is already live.
-4. **Paging** — `paging_init` enables NX and captures the kernel-half PML4 template every
+5. **Paging** — `paging_init` enables NX and captures the kernel-half PML4 template every
    future `AddressSpace::new` inherits. Must precede any address-space construction.
-5. **initramfs** — register the first Limine module so the `/initramfs` resource server
+6. **initramfs** — register the first Limine module so the `/initramfs` resource server
    can serve it, and record every further module as a disk to publish at device probe (the live
    image's `root.img`). Needs the HHDM.
-6. **Platform discovery** — ACPI on x86_64: the PCIe ECAM window and the interrupt-routing
+7. **Platform discovery** — ACPI on x86_64: the PCIe ECAM window and the interrupt-routing
    topology. Missing or malformed tables are logged, not fatal.
-7. **Local APIC** (x2APIC), then **TSC + LAPIC timer calibration** against the legacy PIT.
-8. **DPC queue**, then the **interrupt router** (IOAPIC).
-9. **Global handle table.**
-10. **Scheduler** (`sched_bringup`), then **AP bring-up** (`bring_up_aps`) via Limine's SMP
+8. **Local APIC** (x2APIC), then **TSC + LAPIC timer calibration** against the legacy PIT.
+9. **DPC queue**, then the **interrupt router** (IOAPIC).
+10. **Global handle table.**
+11. **Scheduler** (`sched_bringup`), then **AP bring-up** (`bring_up_aps`) via Limine's SMP
     response — capped at `MAX_CPUS`, extras left parked (a supported configuration, not a
     failure). Absent an SMP response the system stays single-CPU. **Fatal** since 2026-08-19
     if a CPU we launched fails to come online within 5 s, whether it faulted on the way in or
     never reached our code: the kernel's view of the machine must match the machine, so it
     stops rather than booting a topology nobody chose. See `docs/decision-log.md`.
-11. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
+12. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
     layout) so `/dev/framebuffer` can serve it. Must precede the next step, which binds
     that path into init's namespace.
-12. **The first userspace process**, then the boot thread retires. (A boot banner was drawn
+13. **The first userspace process**, then the boot thread retires. (A boot banner was drawn
     here until Phase 5 Part B, clearing the screen with nothing ordering it against the first
     client's frame.)
 
@@ -179,7 +192,7 @@ one process nothing else can construct:
 - Allocate the process and a notification channel, and a handle to it.
 - Allocate a namespace and bind the initial set: `/dev/entropy`, `/dev/console`,
   `/dev/log`, `/proc/self/*`, `/proc/sched/stats`, `/initramfs`, `/dev/blk`, and
-  `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 11 of
+  `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 12 of
   § 3).
 - Spawn with exactly two handles — the notification channel and the namespace root.
 

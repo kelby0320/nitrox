@@ -32,7 +32,7 @@ pub fn probe() {
         let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
         let id = &dn.descriptor().identity;
         if (id.class, id.subclass, id.prog_if) == PCI_CLASS_AHCI {
-            ahci::init(node);
+            crate::device::record_outcome(dn.descriptor(), ahci::init(node));
         }
     }
 
@@ -51,6 +51,9 @@ pub fn probe() {
             gpt::init(node);
         }
     }
+
+    // What became of every enumerated function, now that every driver has had its turn.
+    crate::device::log_outcomes();
 }
 
 /// Boot self-test: read sector 0 of the first block device and verify the boot

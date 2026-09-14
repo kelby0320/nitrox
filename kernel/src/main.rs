@@ -36,8 +36,10 @@ use nitrox_kernel::dpc;
 use nitrox_kernel::fbcon;
 use nitrox_kernel::framebuffer;
 use nitrox_kernel::kprintln;
+use nitrox_kernel::libkern::printable::{Printable, c_bytes};
 use nitrox_kernel::limine::{
-    BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
+    BaseRevision, BootloaderInfoRequest, DateAtBootRequest, ExecutableCmdlineRequest,
+    FirmwareTypeRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
     Framebuffer, RequestsEndMarker, RequestsStartMarker, SmpInfo, SmpRequest,
 };
 use nitrox_kernel::mm;
@@ -58,9 +60,12 @@ mod boot_selftest;
 // the attribute also stops rustc from inlining the static away before the
 // linker sees it.
 
+/// The Limine base revision this kernel is written against.
+const BASE_REVISION_WANTED: u64 = 6;
+
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::new(6);
+static BASE_REVISION: BaseRevision = BaseRevision::new(BASE_REVISION_WANTED);
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
@@ -93,6 +98,25 @@ static mut MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut SMP_REQUEST: SmpRequest = SmpRequest::new();
+
+// The handoff facts a boot reports and nothing else reads (Phase 5 Part D.1): which bootloader,
+// on which firmware, on what date, with which command line. `static mut` — Limine writes
+// `response`.
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut BOOTLOADER_INFO_REQUEST: BootloaderInfoRequest = BootloaderInfoRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut DATE_AT_BOOT_REQUEST: DateAtBootRequest = DateAtBootRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -145,6 +169,12 @@ fn kernel_main() {
         Err(why) => kprintln!("fbcon: no console on screen — {why}"),
     }
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
+
+    // What was handed over and what this processor is (Phase 5 Part D.1), before anything that
+    // can fail on an unfamiliar machine: a boot that stops at the next step has already said
+    // what it stopped on. Both only read — Limine's responses, and CPUID.
+    log_handoff();
+    arch::Cpu::log_identity();
 
     // Bring up the physical-memory buddy allocator and the slab on top of
     // it. This walks Limine's memory map and pokes the allocator — a likely
@@ -615,6 +645,102 @@ fn bring_up_aps() {
     kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);
 }
 
+/// Log what Limine handed over, in three lines: the bootloader, its firmware and the base
+/// revision it loaded the kernel under; the HHDM offset, the firmware's date and the boot
+/// entry's command line; and the memory map, summarised by kind.
+///
+/// Reads nothing but Limine's responses, so it runs before the allocators. A response the
+/// bootloader did not provide is said, not skipped — on a new machine an absence is a fact.
+fn log_handoff() {
+    // SAFETY (every request read below): the statics are written by Limine before `_start` and
+    // only read afterwards; reading through a raw-pointer copy stops the optimiser folding the
+    // pre-Limine null. A non-null response is a valid response of its type, and its strings
+    // live in bootloader-reclaimable memory, which this kernel never reclaims.
+    let info = unsafe { (&raw const BOOTLOADER_INFO_REQUEST).read().response };
+    let (name, version) = if info.is_null() {
+        (&b"unidentified bootloader"[..], &b""[..])
+    } else {
+        // SAFETY: as above; both strings are NUL-terminated.
+        unsafe { (c_bytes((*info).name, 64), c_bytes((*info).version, 64)) }
+    };
+    // SAFETY: as above.
+    let firmware = unsafe { (&raw const FIRMWARE_TYPE_REQUEST).read().response };
+    let firmware = if firmware.is_null() {
+        "unreported firmware"
+    } else {
+        // SAFETY: as above.
+        nitrox_kernel::handoff::firmware_name(unsafe { (*firmware).firmware_type })
+    };
+    match BASE_REVISION.loaded() {
+        Some(rev) => kprintln!(
+            "boot: {} {} on {}, base revision {}",
+            Printable(name),
+            Printable(version),
+            firmware,
+            rev
+        ),
+        None => kprintln!(
+            "boot: {} {} on {}, base revision {} (loaded revision unreported)",
+            Printable(name),
+            Printable(version),
+            firmware,
+            BASE_REVISION_WANTED
+        ),
+    }
+
+    // SAFETY: as above.
+    let hhdm = unsafe { (&raw const HHDM_REQUEST).read().response };
+    let hhdm = if hhdm.is_null() { 0 } else { unsafe { (*hhdm).offset } };
+    // SAFETY: as above.
+    let date = unsafe { (&raw const DATE_AT_BOOT_REQUEST).read().response };
+    // SAFETY: as above.
+    let date = (!date.is_null()).then(|| unsafe { (*date).timestamp });
+    // SAFETY: as above.
+    let cmdline = unsafe { (&raw const CMDLINE_REQUEST).read().response };
+    let cmdline = if cmdline.is_null() {
+        None
+    } else {
+        // SAFETY: as above; the command line is NUL-terminated.
+        Some(unsafe { c_bytes((*cmdline).cmdline, 1024) })
+    };
+    match (date, cmdline) {
+        (Some(d), Some(c)) => {
+            kprintln!("boot: HHDM {:#x}, date {}, cmdline \"{}\"", hhdm, d, CmdlineShown(c))
+        }
+        (None, Some(c)) => {
+            kprintln!("boot: HHDM {:#x}, date unreported, cmdline \"{}\"", hhdm, CmdlineShown(c))
+        }
+        (Some(d), None) => kprintln!("boot: HHDM {:#x}, date {}, cmdline unreported", hhdm, d),
+        (None, None) => kprintln!("boot: HHDM {:#x}, date unreported, cmdline unreported", hhdm),
+    }
+
+    // SAFETY: as above.
+    let memmap = unsafe { (&raw const MEMMAP_REQUEST).read().response };
+    if memmap.is_null() {
+        kprintln!("memmap: no Limine memory map");
+        return;
+    }
+    // SAFETY: as above.
+    let memmap = unsafe { &*memmap };
+    let mut tally = nitrox_kernel::handoff::MemoryTally::default();
+    for i in 0..memmap.entry_count as usize {
+        // SAFETY: `entries` is an array of `entry_count` pointers to valid entries.
+        let e = unsafe { &**memmap.entries.add(i) };
+        tally.add(e.kind, e.length);
+    }
+    kprintln!("memmap: {}", tally);
+}
+
+/// A command line as a log line shows it: [`Printable`], except that an empty one stays empty
+/// rather than printing `-`, since it is quoted and `""` already says so.
+struct CmdlineShown<'a>(&'a [u8]);
+
+impl core::fmt::Display for CmdlineShown<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() { Ok(()) } else { write!(f, "{}", Printable(self.0)) }
+    }
+}
+
 /// Limine's framebuffer descriptor, or why there is none.
 fn limine_framebuffer() -> Result<&'static Framebuffer, &'static str> {
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before jumping to
@@ -655,11 +781,15 @@ fn record_framebuffer() {
     // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
     // reported for this boot, so `address - offset` is the aperture's physical base.
     if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset()) } {
+        // **The padding, as a number** (Phase 5 Part D.1): the bytes each row carries past its
+        // last pixel. The laptop's is 40, and a reader should not have to subtract to see it.
+        let padding = fb.pitch as i64 - (fb.width * (fb.bpp as u64).div_ceil(8)) as i64;
         kprintln!(
-            "framebuffer: {}x{} pitch {} bpp {} — /dev/framebuffer available",
+            "framebuffer: {}x{} pitch {} padding {} bpp {} — /dev/framebuffer available",
             fb.width,
             fb.height,
             fb.pitch,
+            padding,
             fb.bpp
         );
     } else {

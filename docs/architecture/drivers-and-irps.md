@@ -27,7 +27,8 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > 2026-09-11, when `BlockBackend` gained `max_frags`, and § "Interrupts" rewritten the
 > same day, when Phase 5 Part A made **MSI** the path a PCI driver takes and left INTx
 > as the fallback. § "Interrupts" and the ramdisk re-checked 2026-09-14, when Phase 5 Part C
-> made a Limine module a block device and gave it a completion interrupt of its own.
+> made a Limine module a block device and gave it a completion interrupt of its own; § "Device
+> discovery" the same day, when Part D made drivers report what they did with each function.
 
 ## Three concepts, kept distinct
 
@@ -235,6 +236,25 @@ Hardware is discovered through firmware tables and represented uniformly:
 the node. The userspace **driver manager** — matching nodes to Tier 2 modules
 and handing a driver process a `Handle<DeviceNode>` — is **deferred** (it needs
 the Tier 2 loader).
+
+**A matched driver reports what it did, and the device table keeps it** (Phase 5 Part D,
+2026-09-14). A driver's bring-up returns a
+[`device::Outcome`](../../kernel/src/device.rs) — **claimed**, with how its interrupts arrive,
+or **declined**, with why — which `drivers::probe` records against the function, and once
+every driver has run it logs a line per enumerated function in one of three states:
+
+```
+drivers: 00:1f.2 claimed by ahci, MSI vec 0x32
+drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port
+drivers: 00:14.0 no driver
+```
+
+Three, not two, because a controller that matched and was given up is a different finding
+from one nothing matched: on a machine whose disk does not appear, the first points at port
+detection and the second at the match table. `ahci::init` returns an `Outcome` from every exit,
+so a matched controller cannot read as having no driver. The enumeration line for each function
+also names its capabilities (`caps msi64 msix pcie +1`: MSI's form, MSI-X, PCI Express, and a
+count of the rest), from the same capability walk `find_capability` uses.
 
 **MMIO mapping.** A driver maps a device's register window with
 
