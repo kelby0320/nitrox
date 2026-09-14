@@ -181,9 +181,12 @@ pub struct AhciDisk {
     intr: *mut (),
 }
 
-// SAFETY: the disk state is set up once at boot and thereafter accessed only on
-// the single CPU that services the controller (the backend and the ISR);
-// `inflight` is the only mutable cross-context field and is atomic.
+// SAFETY: the disk state is set up once at boot and is immutable thereafter except
+// for `pending` and `inflight`. `submit` runs on whichever CPU submits and the ISR on
+// whichever CPU takes the interrupt; both take `pending` — the port lock, an
+// `IrqSpinLock` — before touching slot 0, and `inflight` is atomic. (This said
+// "accessed only on the single CPU that services the controller" until 2026-09-14,
+// which a root disk submitting from every CPU makes plainly false — PR #298 review.)
 unsafe impl Send for AhciDisk {}
 unsafe impl Sync for AhciDisk {}
 

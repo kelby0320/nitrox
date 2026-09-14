@@ -25501,3 +25501,57 @@ The review also caught two gate controls that could not fail the step they were 
 GPT pass never logs a label, and a dropped module stops the gate before the mount), a
 `check-images` comparison that could have compared one function with itself, a RAM disk with no
 concurrency model, and an `init` that retains only the root mount's endpoint; each is in the plan.
+
+---
+
+## 2026-09-14 — Phase 5 Part C: the live image, and the last `cfg` leaves `init`
+
+Part C shipped in the four pieces its detail pass (#297) laid out, and the design held; what moved
+were measurements and two gate assertions.
+
+**C.1 — `[[bind]]` in `init.toml`.** A bind gives a mount a second name scoped to a subtree, sharing
+the server's registration. The test image's manifest binds `/subtreetest` and `/scratch`, which were
+`init`'s last `#[cfg(feature = "selftest")]`, and `init` now takes no cargo feature in any mode — so
+`sbin/init` is byte-identical between test and release images and left `check-images`' allow-list.
+That closes the test-path retrofit, 2026-08-21 to here. Control: without the binds, `test-qemu`
+fails at `boot-probe: subtree resolve FAIL`. `init` grew 13 KB, all of it inlining (`_start` absorbed
+the mount and bind passes, and the mount sort's instantiation grew); it is 97 KB against a 384 KB
+initramfs ceiling.
+
+**C.2 — a Limine module after the initramfs is a RAM-backed block device.** Published over the
+module's own memory before the GPT pass, with a lock per transfer, and completing through **its own
+interrupt**: `ArchIrqInstall::install_software` registers a vector nothing routes and
+`ArchIrq::raise_on_self` fires it through the x2APIC SELF IPI register, so the completion DPC drains
+at `device_irq_dispatch`'s tail and `resched_if_idle` runs, as for AHCI. Measured through the gate
+with the interrupt deleted: mount to greeter 3,082–3,311 ms under KVM and 4,363 ms under TCG, against
+39 ms and 180 ms with it — the #297 review's AHCI stand-in, reproduced on the real thing. Module
+memory reached through the HHDM takes writes under QEMU; the laptop's firmware is Part F's to show.
+
+**C.3 — `cargo xtask image --live`.** `stage_rootfs` came out of `assemble_image` so both builders
+stage the root with one function, and the ESP population is shared too. `root.img` is sized to what
+is staged (7.9 MB) plus 16 MiB for writes, under a 64 MiB ceiling whose reason is the firmware: it is
+read off the stick before the kernel runs. The stick is 50 MiB.
+
+**C.4 — the gates, and what their controls changed.**
+
+- **`check-images` checks outputs, not the staging function.** The live initramfs may differ from the
+  release one in `etc/init.toml` alone, and the filesystem read back out of the built stick's
+  `root.img` with `debugfs` must match the release image's root partition entry for entry. Controls:
+  a file staged only in the live build fails naming it; a live-only line in the declarations fails
+  naming `etc/services.toml`.
+- **`check-live`'s step 3 needed a read, because "mounted" does not mean there is a filesystem.** The
+  control for step 3 — a `nitrox-live` partition holding only zeros — still printed
+  `init: mounted fs-server-ext4 at /`, because **`fs-server-ext4` sends Ready before it reads the
+  superblock** and checks the magic only when a lookup arrives. The step now also requires
+  `/system/current-generation` read through the new root. The other control the pass named for step 3,
+  the wrong label, fails at step 2 instead, since step 2 asserts the label.
+- **The bound is timed by arrival.** Measuring between `expect` returns read 0 ms under KVM, both lines
+  having arrived in one burst; the Session stamps each chunk of serial output as it arrives, and the
+  1.5 s bound is set from those figures. A first guess of 3 s would have passed the no-interrupt
+  control by 311 ms.
+
+**Noticed and not fixed here: an fs-server that says Ready over a device with no filesystem.** On the
+laptop that turns "the disk read garbage" into `image not found: /bin/auth-service`, three steps from
+the cause — the kind of misdirection Phase 5 exists to remove. Validating the superblock before Ready,
+and failing the handshake with a reason `init` can print, is small; it is outside Part C's plan and
+left for a decision.

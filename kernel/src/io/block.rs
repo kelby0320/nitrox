@@ -50,9 +50,14 @@ pub struct BlockBackend {
 }
 
 // SAFETY: a `BlockBackend`'s raw `ctx` points at a device structure that lives
-// for the kernel's lifetime; it is only ever dereferenced on the single CPU that
-// services the device. These impls let a `DeviceNode` holding one be `Send`/`Sync`
-// like the rest of the type-erased object graph.
+// for the kernel's lifetime. `submit` and `poll` dereference it on **whichever CPU
+// submits** — a root disk takes I/O from the fs-server and from page-cache fills on
+// any CPU — so each device synchronises its own mutable state: AHCI through its port
+// lock and single in-flight slot, the RAM disk through its per-transfer lock, and a
+// partition by being an immutable window onto its disk's backend. (This said "only
+// on the single CPU that services the device" until 2026-09-14, which was never
+// true of AHCI either — PR #298 review.) These impls let a `DeviceNode` holding one
+// be `Send`/`Sync` like the rest of the type-erased object graph.
 unsafe impl Send for BlockBackend {}
 unsafe impl Sync for BlockBackend {}
 

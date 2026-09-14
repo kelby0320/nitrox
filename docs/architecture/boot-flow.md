@@ -62,6 +62,25 @@ nitrox.hdd (128 MiB raw, GPT — two partitions)
     └── the root filesystem: /system, /home, /store
 ```
 
+**The live image** (`cargo xtask image --live`, Phase 5 Part C) is the same boot with its root in
+RAM, for a machine whose storage the kernel cannot reach — a USB stick, before there is a USB
+driver:
+
+```
+nitrox-live.img (GPT — one partition)
+└── partition 1 (EFI System, FAT32, "NITROX_ESP")
+    ├── /EFI/BOOT/BOOTX64.EFI, /boot/kernel, /boot/LICENSE-Terminus.txt   ← as above
+    ├── /boot/limine/limine.conf      ← the release one, plus a second module_path
+    ├── /boot/initramfs               ← the release one, but init.toml names nitrox-live
+    └── /boot/root.img                ← GPT image, one ext4 partition "nitrox-live":
+                                          the release root, built by the same staging
+```
+
+Limine loads `root.img` through the firmware as the second module; the kernel publishes it as a
+RAM-backed block device (`kernel/src/io/ramdisk.rs`), and `init` mounts it as it would a disk.
+`cargo xtask check-images` holds the live initramfs to the release one but for `etc/init.toml`,
+and the filesystem inside `root.img` to the release root partition's, file for file.
+
 The initramfs holds **four programs and two manifests**, and the rule is narrow: a program is
 in the boot image only if it cannot come from a filesystem. `init` (the kernel boot-loads it),
 `fs-server-ext4` (it *is* the root mount), `eshell` (the recovery path *for a failed mount*),
@@ -130,8 +149,9 @@ each step's rationale is in the source comments:
    happen, which is why the IDT is already live.
 4. **Paging** — `paging_init` enables NX and captures the kernel-half PML4 template every
    future `AddressSpace::new` inherits. Must precede any address-space construction.
-5. **initramfs** — register the Limine-loaded module so the `/initramfs` resource server
-   can serve it. Needs the HHDM.
+5. **initramfs** — register the first Limine module so the `/initramfs` resource server
+   can serve it, and record every further module as a disk to publish at device probe (the live
+   image's `root.img`). Needs the HHDM.
 6. **Platform discovery** — ACPI on x86_64: the PCIe ECAM window and the interrupt-routing
    topology. Missing or malformed tables are logged, not fatal.
 7. **Local APIC** (x2APIC), then **TSC + LAPIC timer calibration** against the legacy PIT.
@@ -211,9 +231,9 @@ child instead and PID 1's restart-on-death was code no gate could reach.
 read, overwrite, grow, create and subtree-bind checks moved to `boot-probe`, a declared
 service `service-mgr` starts, so they run *after* the step-5 handoff rather than between
 steps 2 and 3. They also gate the boot verdict now, which they never did here — every failure
-path in init was a bare `return` after a `FAIL` print. `init` keeps one thing they need: the
-`/subtreetest` binding in `mount_one`, which cannot become declaration data because nothing
-in a declaration can express a namespace bind.
+path in init was a bare `return` after a `FAIL` print. The one thing they need from init — a
+second name on the root, `/subtreetest` scoped to `/system` — is data too since Phase 5 Part C.1:
+a `[[bind]]` in the test image's `init.toml`, where it was `init`'s last build-mode `cfg`.
 
 **Who fires the verdict** is `boot-probe`, not init; init only ever fires FAIL, and now only
 for a critical-path boot failure — a demo chain that dies partway is caught by `test-qemu`'s
@@ -263,6 +283,7 @@ tty server: its whole precondition is that the normal path failed. See
 | `cargo xtask test-qemu` | The whole boot to userspace, headless; the guest writes a verdict to `isa-debug-exit` and a hang is caught by a wall-clock timeout. Runs under **KVM** — the kernel is x2APIC-only and QEMU 8.2's TCG does not emulate x2APIC. |
 | `cargo xtask test-interactive` | The login chain end to end over the serial console, expect-driven: the login prompt, a rejected password, a successful login, and shell behaviour after it. |
 | `cargo xtask check-fbcon` | The same boot with **no serial port at all** (`-serial none`), read back off the screen: the kernel's first and last lines, userspace's up to the compositor, the hand-over, and a panic taking the screen back. |
+| `cargo xtask check-live` | The **live image** booted as a USB stick with no disk: the root module becomes a RAM disk, `init` mounts and reads through it, the greeter comes up within a bound a tick-bound RAM disk cannot meet, and a serial login writes under `/home`. |
 
 See [qemu integration tests](../conventions/qemu-integration-tests.md).
 

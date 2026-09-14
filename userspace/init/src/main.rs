@@ -25,7 +25,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::arch::asm;
-use init::manifest::{self, Mode, MountSpec};
+use init::manifest::{self, BindSpec, Manifest, Mode, MountSpec};
 use libkern::debug::Line;
 use libkern::*;
 use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
@@ -332,7 +332,7 @@ unsafe fn spawn_program(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> i64 
 /// return the mounts (shallowest-first) for [`mount_all`] to process. `None` on any
 /// failure (missing / unmappable / malformed manifest) — init would drop to the
 /// emergency shell (slice 9); for now it logs and skips mounting.
-fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
+fn read_manifest(root_ns: u64) -> Option<Manifest> {
     let (st, mem) = ns_lookup_wait(root_ns, b"/initramfs/etc/init.toml", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
         kprint(b"init: /initramfs/etc/init.toml not found (would drop to eshell)\n");
@@ -354,13 +354,15 @@ fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     let result = match core::str::from_utf8(&bytes[..len]) {
         Ok(text) => match manifest::parse(text) {
-            Ok(mounts) => {
+            Ok(parsed) => {
                 Line::new()
                     .s(b"init: init.toml OK, ")
-                    .u(mounts.len() as u64)
-                    .s(b" mount(s) (shallowest first):")
+                    .u(parsed.mounts.len() as u64)
+                    .s(b" mount(s) (shallowest first), ")
+                    .u(parsed.binds.len() as u64)
+                    .s(b" bind(s):")
                     .end();
-                for m in &mounts {
+                for m in &parsed.mounts {
                     Line::new()
                         .s(b"init:   ")
                         .s(m.mount_point.as_bytes())
@@ -376,7 +378,17 @@ fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
                         .s(b")")
                         .end();
                 }
-                Some(mounts)
+                for b in &parsed.binds {
+                    Line::new()
+                        .s(b"init:   ")
+                        .s(b.path.as_bytes())
+                        .s(b": bind of ")
+                        .s(b.source.as_bytes())
+                        .s(b" scoped to ")
+                        .s(b.subtree.as_bytes())
+                        .end();
+                }
+                Some(parsed)
             }
             Err(_) => {
                 kprint(b"init: init.toml parse error (would drop to eshell)\n");
@@ -394,31 +406,92 @@ fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
     result
 }
 
-/// Process the manifest's mounts in order (shallowest-first): for each, resolve
-/// the device, spawn an `fs-server-ext4`, hand it the device, await Ready, and bind
-/// its endpoint at the mount point. A failed mount is logged and skipped (the
-/// eshell handoff is slice 9).
-/// Mount every manifest entry; returns `true` iff all succeeded. A failure is
-/// critical-path (the entries are all `required_for = boot`) and routes init to the
-/// emergency shell.
-fn mount_all(root_ns: u64, mounts: &[MountSpec]) -> bool {
+/// Process the manifest: every mount in order (shallowest first), then every bind over them.
+/// Returns `true` iff all succeeded. A failure is critical-path — the mounts are all
+/// `required_for = boot`, and a bind that silently did not happen is how a later lookup fails
+/// for a reason nobody can see — and routes init to the emergency shell.
+///
+/// **Every mount's forwarding endpoint is held until the binds are done**, since a bind's
+/// source may be any mount. Then the root's is kept (handed on to `service-mgr`, which gives
+/// it to `session-mgr` for each login's `/home`) and the rest are closed — each binding took
+/// its own reference.
+fn mount_all(root_ns: u64, manifest: &Manifest) -> bool {
     let mut ok = true;
-    for m in mounts {
-        if !mount_one(root_ns, m) {
-            Line::new().s(b"init: mount FAILED for ").s(m.mount_point.as_bytes()).end();
+    let mut endpoints: Vec<(&str, u64)> = Vec::new();
+    for m in &manifest.mounts {
+        match mount_one(root_ns, m) {
+            Some(endpoint) => endpoints.push((m.mount_point.as_str(), endpoint)),
+            None => {
+                Line::new().s(b"init: mount FAILED for ").s(m.mount_point.as_bytes()).end();
+                ok = false;
+            }
+        }
+    }
+    for b in &manifest.binds {
+        if !bind_one(root_ns, b, &endpoints) {
+            Line::new().s(b"init: bind FAILED for ").s(b.path.as_bytes()).end();
             ok = false;
+        }
+    }
+    for (mount_point, endpoint) in endpoints {
+        if mount_point == "/" {
+            // SAFETY: single-threaded init; the global takes ownership of `endpoint`.
+            unsafe { FS_ENDPOINT = endpoint };
+        } else {
+            // SAFETY: closing our own handle; the binding holds its own reference.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
         }
     }
     ok
 }
 
+/// Bind one `[[bind]]`: the source mount's forwarding endpoint again at `b.path`, scoped to
+/// `b.subtree`. The kernel shares the source's server registration across both names rather
+/// than minting a rival that would take its replies — the same thing `session-mgr` does for
+/// each login's `/home`. Returns `true` on success.
+fn bind_one(root_ns: u64, b: &BindSpec, endpoints: &[(&str, u64)]) -> bool {
+    // The parser checked the source names a mount; it is absent here only if that mount failed,
+    // which `mount_all` has already reported.
+    let Some(&(_, endpoint)) = endpoints.iter().find(|(point, _)| *point == b.source) else {
+        return false;
+    };
+    // `/` scopes to the whole tree, which the kernel spells as no base at all.
+    let base: &[u8] = if b.subtree == "/" { b"" } else { b.subtree.as_bytes() };
+    // SAFETY: valid namespace handle, path/base pointers and lengths, and an endpoint handle
+    // init holds.
+    let r = unsafe {
+        syscall6(
+            SYS_NS_BIND,
+            root_ns,
+            b.path.as_ptr() as u64,
+            b.path.len() as u64,
+            endpoint,
+            base.as_ptr() as u64,
+            base.len() as u64,
+        )
+    };
+    if r != 0 {
+        return false;
+    }
+    Line::new()
+        .s(b"init: bound ")
+        .s(b.path.as_bytes())
+        .s(b" to ")
+        .s(b.source.as_bytes())
+        .s(b" scoped to ")
+        .s(b.subtree.as_bytes())
+        .end();
+    true
+}
+
 /// Mount one `[[mount]]`: the Resource Server Startup Protocol from init's side.
-/// Returns `true` on success (the fs-server is bound at `m.mount_point`).
-fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
+/// Returns the server's forwarding endpoint on success (the fs-server is bound at
+/// `m.mount_point`); the caller owns it.
+fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     // Only `fs-server-ext4` exists in slice 7.
     if m.fs_server != "fs-server-ext4" {
         Line::new().s(b"init: unknown fs_server '").s(m.fs_server.as_bytes()).s(b"'").end();
-        return false;
+        return None;
     }
     // 1. Resolve the block-device handle: READ (for the server's `sys_io_submit`)
     //    + TRANSFER (to hand it to the server).
@@ -430,7 +503,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
                 .s(m.device.as_bytes())
                 .s(b"'")
                 .end();
-            return false;
+            return None;
         }
     };
     // READ+WRITE (the RW fs-server writes filesystem metadata) + TRANSFER (hand it to the
@@ -442,7 +515,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
     );
     if st != 0 || device == 0 {
         Line::new().s(b"init: device ").s(dev_path.as_bytes()).s(b" not found").end();
-        return false;
+        return None;
     }
 
     // 2. Create the control channel (init keeps end 0, the server gets end 1).
@@ -450,7 +523,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
     if cr != 0 {
         unsafe { syscall1(SYS_HANDLE_CLOSE, device) };
-        return false;
+        return None;
     }
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
@@ -467,7 +540,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             syscall1(SYS_HANDLE_CLOSE, device);
             syscall1(SYS_HANDLE_CLOSE, ctrl_init);
         }
-        return false;
+        return None;
     }
 
     // 4. Setup message: transfer the device handle to the server (an empty payload;
@@ -491,7 +564,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             syscall1(SYS_HANDLE_CLOSE, device);
             syscall1(SYS_HANDLE_CLOSE, ctrl_init);
         }
-        return false;
+        return None;
     }
     // The device handle has moved to the server; init no longer owns it.
 
@@ -501,7 +574,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
         None => {
             kprint(b"init: fs-server Ready timeout/invalid\n");
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
-            return false;
+            return None;
         }
     };
     // The handshake is done; the control channel is no longer needed.
@@ -509,7 +582,8 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
 
     // 6. Bind the forwarding endpoint at the mount point. The kernel sees an
     //    IpcChannel and adopts it as a Userspace Server (slice-7 forwarding). The
-    //    binding takes its own reference, so init closes its endpoint handle after.
+    //    binding takes its own reference; the endpoint goes back to `mount_all`, which
+    //    may bind it again for a `[[bind]]` before closing it or handing it on.
     // SAFETY: valid namespace handle + path pointer + endpoint handle.
     let br = unsafe {
         syscall4(
@@ -520,99 +594,17 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             endpoint,
         )
     };
-    // **The one cfg retrofit Part C1 could not remove, and the only one here that "data, not
-    // code" cannot express.** (The file still has others — the demo chain, the four graphical
-    // spawns, the `cfg(not(selftest))` service-mgr supervision — and those are ordinary code
-    // that Part C2 turns into service declarations.) This *binding* is different: there is no
-    // way to put a namespace bind in a declaration, because `[handles].namespace` is unparsed
-    // and a declared service is spawned with `namespace: 0` — an inherited LOOKUP-only root —
-    // rather than a constructed namespace.
-    //
-    // Two things in the test image resolve it: `boot-probe`'s `subtree_bind_test`, and the
-    // demo harness's case 8, which needs a binding that is *also* an openable directory to
-    // prove `move` refuses to recurse through a mount. Removing it without checking broke the
-    // second. Closing this needs a mechanism, not an edit — see
-    // `docs/planning/test-path-retrofit.md` Part C.
-    //
-    // auth+session Part B smoke test (selftest): bind the *same* fs endpoint a second
-    // time as a **subtree** scoped to `/system` at `/subtreetest`, so a later lookup of
-    // `/subtreetest/current-generation` forwards `system/current-generation` to the
-    // server. This shares the server's registration (bind-mount semantics) — the kernel
-    // reuses it rather than minting a rival that would hijack replies. `sys_ns_bind`
-    // holds its own reference, so `endpoint` stays valid for the close below. Root mount
-    // only (it owns `/system`).
-    #[cfg(feature = "selftest")]
-    if m.mount_point.as_bytes() == b"/" {
-        let sub = b"/subtreetest";
-        let base = b"/system";
-        // SAFETY: valid namespace handle, path/base pointers, and endpoint handle.
-        let r = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                root_ns,
-                sub.as_ptr() as u64,
-                sub.len() as u64,
-                endpoint,
-                base.as_ptr() as u64,
-                base.len() as u64,
-            )
-        };
-        if r != 0 {
-            kprint(b"init: subtree test bind FAIL\n");
-        }
-        // A **second writable mount**, for the cross-mount half of `move`
-        // (the `cross-mount-move` deferral, closed 2026-07-30). Same endpoint again, scoped
-        // to base `/scratch`, so
-        // the kernel's rename test — same server *and* same subtree base — calls
-        // `/system/x → /scratch/y` cross-filesystem while both sides remain writable.
-        //
-        // Two bindings of one server rather than a second filesystem: the kernel already
-        // shares one registration across many names (bind-mount semantics, as
-        // `/subtreetest` above relies on), and what `move`'s fallback needs is a
-        // destination the kernel *classifies* as another mount, which this is. A real
-        // second ext4 would add an image partition and a second server process without
-        // exercising one further line of the path under test.
-        //
-        // Selftest-only: it is a fixture, not a system mount. The backing `/scratch`
-        // directory is staged into the image unconditionally (harmless when empty).
-        let scratch = b"/scratch";
-        // SAFETY: valid namespace handle, path/base pointers, and endpoint handle.
-        let r = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                root_ns,
-                scratch.as_ptr() as u64,
-                scratch.len() as u64,
-                endpoint,
-                scratch.as_ptr() as u64,
-                scratch.len() as u64,
-            )
-        };
-        if r != 0 {
-            kprint(b"init: scratch mount bind FAIL\n");
-        }
-    }
-    // The root fs-server's forwarding endpoint is handed down to service-mgr (→
-    // session-mgr, which binds it as each login's `/home` subtree — bind-mount
-    // sharing, Part B.2). `sys_ns_bind` cloned its own reference above, so keeping
-    // this handle open is fine; stash it (transfer ownership to the global) instead
-    // of closing. Non-root mounts have no consumer yet → close as before.
-    if m.mount_point.as_bytes() == b"/" {
-        // SAFETY: single-threaded init; the global takes ownership of `endpoint`.
-        unsafe { FS_ENDPOINT = endpoint };
-    } else {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-    }
     if br != 0 {
         Line::new().s(b"init: bind FAIL at ").s(m.mount_point.as_bytes()).end();
-        return false;
+        // SAFETY: closing our own handle; nothing was bound with it.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+        return None;
     }
 
     Line::new().s(b"init: mounted fs-server-ext4 at ").s(m.mount_point.as_bytes()).end();
     // init keeps `fs_h` (the long-lived server's process handle).
     let _ = fs_h;
-    true
+    Some(endpoint)
 }
 
 /// Wait (bounded) for an fs-server's `Meta::Ready` on `ctrl`, validate it
@@ -1578,7 +1570,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // system). On success, prove the stack end to end (the slice-7/8 milestones) and
     // enter the normal supervise path.
     let booted = match read_manifest(root_ns) {
-        Some(mounts) => mount_all(root_ns, &mounts),
+        Some(manifest) => mount_all(root_ns, &manifest),
         None => {
             kprint(b"init: no usable boot manifest\n");
             false

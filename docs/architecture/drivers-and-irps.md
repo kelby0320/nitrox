@@ -26,7 +26,8 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > record of the original plan. Verified 2026-08-05; the DMA section below re-checked
 > 2026-09-11, when `BlockBackend` gained `max_frags`, and § "Interrupts" rewritten the
 > same day, when Phase 5 Part A made **MSI** the path a PCI driver takes and left INTx
-> as the fallback.
+> as the fallback. § "Interrupts" and the ramdisk re-checked 2026-09-14, when Phase 5 Part C
+> made a Limine module a block device and gave it a completion interrupt of its own.
 
 ## Three concepts, kept distinct
 
@@ -104,6 +105,12 @@ installing an interrupt spans both plus the handler registry.
   `phase-2/acpi-tables`.) The GSI comes from the PCI interrupt-line register,
   which is the part that does not survive contact with real hardware — and the
   reason MSI is preferred.
+
+- **A software vector**, for a backend with no hardware of its own whose completions must still
+  run where a device's do. `install_software` registers a handler for a fresh device vector that
+  nothing routes, and `ArchIrq::raise_on_self` raises it on the current CPU (the x2APIC SELF IPI
+  register). The one user is the RAM disk (§ "The RAM disk"): a completion DPC drains only at an
+  interrupt tail, so without an interrupt it waited for the timer tick.
 
 **Deferred:** MSI-X, and shared PCI INTx (the "chain of handlers, each returns
 *mine* / *not mine*" model). Neither MSI nor MSI-X is ever shared, so the second
@@ -278,6 +285,24 @@ entry, so **248** entries ≈ 992 KiB of page-aligned transfer. `dispatch_block_
 refuses a larger request with `InvalidArgument`; a partition inherits its disk's limit
 rather than declaring one; the ramdisk declares none (`u32::MAX`), having nothing
 fixed-size to overrun.
+
+### The RAM disk
+
+[`io::ramdisk`](../../kernel/src/io/ramdisk.rs) began as bring-up scaffolding — a 64 KiB
+pattern-filled buffer the I/O self-test reads back — and since Phase 5 Part C it is also a real
+block device: **every Limine module after the initramfs is published as one**, over the module's
+own memory with no copy, before `drivers::probe`'s GPT pass, so its partitions get
+`/dev/disk/by-partlabel/` names from the same code as a SATA disk's. The live image's root arrives
+this way.
+
+- **Completion.** `submit` performs the transfer and queues the IRP's completion DPC, then raises
+  the RAM disk's software vector on its own CPU, so the DPC drains at the device-interrupt tail and
+  `resched_if_idle` runs — exactly AHCI's path. Without the interrupt every completion waited for
+  the 10 ms tick: mount to greeter on the live image took 3,082 ms under KVM against 39 ms with it
+  (`cargo xtask check-live` bounds it).
+- **Concurrency.** A lock around each transfer, so a read racing a write of the same block sees one
+  or the other and never a torn block.
+- **Writes** land in the module's memory and are gone at power-off.
 
 **This is a bound, not a policy, and it was once absent.** `sys_io_submit` bounds
 `buf_offset + length` against the buffer's size and nothing else, so before 2026-09-11

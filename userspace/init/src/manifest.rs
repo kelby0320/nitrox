@@ -1,9 +1,11 @@
-//! `init.toml` → an ordered list of [`MountSpec`]s.
+//! `init.toml` → a [`Manifest`]: an ordered list of [`MountSpec`]s and the [`BindSpec`]s
+//! that re-bind them.
 //!
 //! Parses the bootstrap mount manifest (`docs/spec/init-toml-schema.md`) via
 //! [`crate::toml_lite`], validates the required fields and their types, and
 //! topologically sorts the mounts by mount-point depth (shallowest first, so a
-//! parent path is bound before its children). The mount *processing* loop (spawn
+//! parent path is bound before its children). Binds are validated against the mounts —
+//! each names one as its source — and kept in file order. The mount *processing* loop (spawn
 //! fs-server → Ready handshake → `sys_ns_bind`) is slice-4 Part 5 / slice 7; this
 //! module is the pure, host-testable front half.
 
@@ -32,6 +34,30 @@ pub struct MountSpec {
     pub options: Option<Table>,
 }
 
+/// One validated `[[bind]]` entry: the forwarding endpoint of the mount at `source`, bound a
+/// second time at `path` and scoped to `subtree` — `mount --bind` for a resource server.
+///
+/// It shares the source's server registration rather than spawning a rival server for the
+/// same device, which is what a second `[[mount]]` of that device would do. `session-mgr`
+/// binds each login's `/home` the same way, from the same endpoint (Phase 5 Part C.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindSpec {
+    /// Where the binding appears. Absolute.
+    pub path: alloc::string::String,
+    /// The `mount_point` of a `[[mount]]` in the same manifest.
+    pub source: alloc::string::String,
+    /// The path on the source's server that lookups through `path` are scoped to. Absolute;
+    /// `/` means the whole tree.
+    pub subtree: alloc::string::String,
+}
+
+/// A parsed `init.toml`: the mounts (shallowest first) and the binds over them (file order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    pub mounts: Vec<MountSpec>,
+    pub binds: Vec<BindSpec>,
+}
+
 /// Why an `init.toml` manifest was rejected. Init logs this and drops to the
 /// emergency shell (Part 5); the `line`/field detail aids the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,10 +76,19 @@ pub enum ManifestError {
     UnsupportedRequiredFor { index: usize },
     /// `mount_point` was not an absolute path.
     NonAbsoluteMountPoint { index: usize },
+    /// A required field was missing on the `index`-th bind.
+    BindMissingField { index: usize, field: &'static str },
+    /// A bind field was the wrong type.
+    BindNotAString { index: usize, field: &'static str },
+    /// A bind's `path` or `subtree` was not an absolute path.
+    BindNotAbsolute { index: usize, field: &'static str },
+    /// A bind's `source` is not the `mount_point` of any mount in the manifest.
+    BindUnknownSource { index: usize },
 }
 
-/// Parse + validate `init.toml`, returning the mounts in shallowest-first order.
-pub fn parse(input: &str) -> Result<Vec<MountSpec>, ManifestError> {
+/// Parse + validate `init.toml`: the mounts in shallowest-first order, and the binds in file
+/// order, each checked to name a mount as its source.
+pub fn parse(input: &str) -> Result<Manifest, ManifestError> {
     let doc = toml_lite::parse(input).map_err(ManifestError::Toml)?;
     let entries = doc.array("mount");
     if entries.is_empty() {
@@ -93,7 +128,28 @@ pub fn parse(input: &str) -> Result<Vec<MountSpec>, ManifestError> {
     // Topologically sort by mount-point depth (shallowest first). Stable, so
     // equal-depth mounts keep file order.
     mounts.sort_by_key(|m| depth(&m.mount_point));
-    Ok(mounts)
+
+    let mut binds: Vec<BindSpec> = Vec::new();
+    for (index, entry) in doc.array("bind").iter().enumerate() {
+        let t = &entry.table;
+        let field = |name: &'static str| match t.get(name) {
+            None => Err(ManifestError::BindMissingField { index, field: name }),
+            Some(v) => v.as_str().ok_or(ManifestError::BindNotAString { index, field: name }),
+        };
+        let path = field("path")?;
+        let source = field("source")?;
+        let subtree = field("subtree")?;
+        for (name, value) in [("path", path), ("subtree", subtree)] {
+            if !value.starts_with('/') {
+                return Err(ManifestError::BindNotAbsolute { index, field: name });
+            }
+        }
+        if !mounts.iter().any(|m| m.mount_point == source) {
+            return Err(ManifestError::BindUnknownSource { index });
+        }
+        binds.push(BindSpec { path: path.into(), source: source.into(), subtree: subtree.into() });
+    }
+    Ok(Manifest { mounts, binds })
 }
 
 /// Fetch a required string field, distinguishing "absent" from "present but not
@@ -151,7 +207,7 @@ required_for = \"boot\"
 
     #[test]
     fn parses_single_root() {
-        let m = parse(SINGLE_ROOT).unwrap();
+        let m = parse(SINGLE_ROOT).unwrap().mounts;
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].fs_server, "fs-server-ext4");
         assert_eq!(m[0].mount_point, "/");
@@ -182,7 +238,7 @@ mount_point=\"/\"
 mode=\"rw\"
 required_for=\"boot\"
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src).unwrap().mounts;
         let points: Vec<&str> = m.iter().map(|s| s.mount_point.as_str()).collect();
         assert_eq!(points, ["/", "/store", "/store/data"]);
     }
@@ -203,7 +259,7 @@ mount_point=\"/store\"
 mode=\"ro\"
 required_for=\"boot\"
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src).unwrap().mounts;
         let points: Vec<&str> = m.iter().map(|s| s.mount_point.as_str()).collect();
         assert_eq!(points, ["/home", "/store"]); // both depth 1, file order kept
     }
@@ -220,7 +276,7 @@ required_for=\"boot\"
 [mount.options]
 data_journal = true
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src).unwrap().mounts;
         let opts = m[0].options.as_ref().unwrap();
         assert_eq!(opts.get_str("fs_server"), None);
         assert_eq!(
@@ -264,6 +320,55 @@ required_for=\"boot\"
             parse(&bad),
             Err(ManifestError::NonAbsoluteMountPoint { index: 0 })
         );
+    }
+
+    /// The test image's shape: the root mount, and two binds over it (Part C.1).
+    const ROOT_AND_BINDS: &str = "\
+[[mount]]
+fs_server    = \"fs-server-ext4\"
+device       = \"gpt-partlabel:nitrox-root\"
+mount_point  = \"/\"
+mode         = \"rw\"
+required_for = \"boot\"
+
+[[bind]]
+path    = \"/subtreetest\"
+source  = \"/\"
+subtree = \"/system\"
+
+[[bind]]
+path    = \"/scratch\"
+source  = \"/\"
+subtree = \"/scratch\"
+";
+
+    #[test]
+    fn binds_parse_in_file_order_after_the_mounts() {
+        let m = parse(ROOT_AND_BINDS).unwrap();
+        assert_eq!(m.mounts.len(), 1);
+        assert_eq!(
+            m.binds,
+            [
+                BindSpec { path: "/subtreetest".into(), source: "/".into(), subtree: "/system".into() },
+                BindSpec { path: "/scratch".into(), source: "/".into(), subtree: "/scratch".into() },
+            ]
+        );
+        assert!(parse(SINGLE_ROOT).unwrap().binds.is_empty(), "binds are optional");
+    }
+
+    #[test]
+    fn a_bind_must_name_a_mount_and_use_absolute_paths() {
+        let unknown = ROOT_AND_BINDS.replacen("source  = \"/\"", "source  = \"/store\"", 1);
+        assert_eq!(parse(&unknown), Err(ManifestError::BindUnknownSource { index: 0 }));
+
+        let relative = ROOT_AND_BINDS.replace("subtree = \"/system\"", "subtree = \"system\"");
+        assert_eq!(parse(&relative), Err(ManifestError::BindNotAbsolute { index: 0, field: "subtree" }));
+
+        let relative_path = ROOT_AND_BINDS.replace("path    = \"/scratch\"", "path    = \"scratch\"");
+        assert_eq!(parse(&relative_path), Err(ManifestError::BindNotAbsolute { index: 1, field: "path" }));
+
+        let missing = ROOT_AND_BINDS.replace("subtree = \"/scratch\"\n", "");
+        assert_eq!(parse(&missing), Err(ManifestError::BindMissingField { index: 1, field: "subtree" }));
     }
 
     #[test]

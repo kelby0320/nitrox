@@ -62,6 +62,8 @@ cargo xtask check-input    # inject a key + a click over QMP; check they reach a
 cargo xtask check-images   # test vs release initramfs: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
 cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
+cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
+cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
@@ -98,16 +100,16 @@ every build and zero test cfgs, and its login proof lives here as steps 5a–5c.
 
 **Prefer this shape for anything user-facing**: a service should behave in a test image the way
 it behaves in a release one. `docs/planning/test-path-retrofit.md` is the plan that made that
-true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to one — and
-it is complete. The one left is `init`'s `/subtreetest` binding, which needs a **bind-mount
-concept in `init.toml`**; it was deferred past that plan as capability work and is **scheduled
-as Phase 5 Part C.1** (`docs/planning/phase-5-bare-metal.md`). It was put there because the live
-image was going to need the same mechanism; Part C's detail pass found the live image does not
-(its root is an ext4 RAM disk, not a bind of `/initramfs`), and the bind concept stayed in Part C
-anyway, to close the retrofit.
+true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to zero — and
+it is complete. The last was `init`'s `/subtreetest` binding, which needed a **bind-mount concept
+in `init.toml`** and got one in Phase 5 Part C.1: a `[[bind]]` in the test image's manifest
+(`docs/spec/init-toml-schema.md`). `init` takes no cargo feature in any mode, so a test image and
+a release image carry the same `init`.
 
 `cargo xtask check-images` is what keeps the property: it fails if a test image and a release
-image start differing in anything new.
+image start differing in anything new. It holds the **live image** to the same rule: its initramfs
+may differ from the release one only in `etc/init.toml`, and the filesystem inside its `root.img`
+must be the release root partition's, file for file.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
@@ -137,6 +139,15 @@ for a second** after the timer and at the handout — a sampled scrolling consol
 flake, since a line may be up for milliseconds — and **panics on F10**, the only way to stop a
 working machine after the desktop is up (QEMU's `inject-nmi` does not reach this kernel). It runs
 in CI's QEMU job.
+
+`cargo xtask check-live` boots the **live image** (`tools/build-cache/nitrox-live.img`, Phase 5
+Part C) — the release kernel and initramfs with the release root filesystem riding along as a
+second Limine module, which the kernel publishes as a RAM disk — attached as a **USB stick** with
+the AHCI controller empty, so no storage driver is involved: the laptop's first boot, before there
+is a USB driver. It asserts the module became a disk named `nitrox-live`, that `init` mounted and
+read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
+timer tick instead of its own interrupt takes 3 s or more), and that a serial login writes under
+`/home`. It runs in CI's QEMU job.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
 release image and driving it to five moments — the greeter, the bare desktop, the applications

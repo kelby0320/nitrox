@@ -14,7 +14,7 @@ Standard TOML. UTF-8 encoded. No external imports or includes.
 
 ## Top-level structure
 
-The file is an array of `[[mount]]` tables, one per critical-path mount. Order in the file does not matter for processing; init topologically sorts mounts by mount point depth (shallower paths processed first).
+The file is an array of `[[mount]]` tables, one per critical-path mount, optionally followed by `[[bind]]` tables that give a mount a second name. Order in the file does not matter for mounts; init topologically sorts them by mount point depth (shallower paths processed first). Binds are processed after every mount, in file order.
 
 ```toml
 [[mount]]
@@ -115,6 +115,31 @@ discard      = true
 
 Init passes the `options` table verbatim to the fs-server via its control channel during the Ready handshake. The fs-server interprets the options. Unknown options are an fs-server-defined error (typically logged-and-ignored or reported via the Ready exchange).
 
+## Bind table fields
+
+A `[[bind]]` binds the forwarding endpoint of a mount **a second time**, at another path, scoped to a subtree of that mount's server — `mount --bind` for a resource server. It shares the mount's server registration; a second `[[mount]]` of the same device would instead spawn a rival fs-server for it. `session-mgr` gives each login its `/home` the same way, from the root mount's endpoint. Added with Phase 5 Part C.1.
+
+```toml
+[[bind]]
+path    = "/subtreetest"
+source  = "/"
+subtree = "/system"
+```
+
+A lookup of `/subtreetest/current-generation` is then forwarded to the root's fs-server as `/system/current-generation`.
+
+### `path` (required, string)
+
+Where the binding appears. Absolute.
+
+### `source` (required, string)
+
+The `mount_point` of a `[[mount]]` in the same file. A source naming no mount is a manifest error.
+
+### `subtree` (required, string)
+
+The path on the source's server that lookups through `path` are scoped to. Absolute; `/` binds the whole tree.
+
 ## Processing semantics
 
 Init processes the manifest as follows:
@@ -129,8 +154,9 @@ Init processes the manifest as follows:
    e. Wait on the control channel for a `Meta::Ready` message.
    f. Extract the endpoint handle from the Ready message.
    g. Call `sys_ns_bind(system_namespace, mount_point, endpoint, derived_rights)`.
-4. If all mounts succeed, proceed to read `/system/current-generation` and continue normal boot.
-5. If any mount fails, log the failure to the kernel log and spawn the emergency shell. Wait for eshell exit (typically a reboot).
+4. For each bind, in file order, call `sys_ns_bind(system_namespace, path, source_endpoint, subtree)` with the source mount's endpoint. Init holds every mount's endpoint until the binds are done; then it keeps the root's (handed on to the service manager) and closes the rest, since each binding holds its own reference.
+5. If all mounts and binds succeed, proceed to read `/system/current-generation` and continue normal boot.
+6. If any mount or bind fails, log the failure to the kernel log and spawn the emergency shell. Wait for eshell exit (typically a reboot).
 
 ## Failure modes and emergency mode
 
@@ -142,6 +168,8 @@ A mount fails if any of these occur:
 - The fs-server doesn't send a Ready message within the timeout (default 30 seconds)
 - The fs-server sends an error reply instead of Ready
 - The `sys_ns_bind` call fails (rights mismatch, naming conflict, etc.)
+
+A bind fails if its source mount failed, or if its `sys_ns_bind` call fails. It is critical-path like a mount: a binding that silently did not happen surfaces later as a lookup failing for no visible reason.
 
 On any failure, init writes a structured error message to the kernel log indicating which mount failed and why, then spawns eshell with a pre-populated context describing the failure. The user can inspect the situation, edit `init.toml` from within eshell, and reboot.
 

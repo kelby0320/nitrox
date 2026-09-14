@@ -48,4 +48,18 @@ pub trait ArchIrq {
 
     /// This CPU's local-controller identifier.
     fn id() -> u32;
+
+    /// Raise `vector` on **this** CPU, as a device would: the interrupt is taken through the
+    /// ordinary device-interrupt path as soon as this CPU has interrupts enabled — at once if it
+    /// has, otherwise when it next unmasks.
+    ///
+    /// For work that finishes synchronously but must *complete* where a device's completion
+    /// does, at an interrupt tail: a RAM disk (`crate::io::ramdisk`), whose copy is done inside
+    /// `submit` but whose completion DPC drains only at a tail. The vector comes from
+    /// [`ArchIrqInstall::install_software`](crate::arch::irq_install::ArchIrqInstall::install_software).
+    ///
+    /// # Safety
+    /// Ring-0, after [`init`](ArchIrq::init) on this CPU; `vector` must have a handler
+    /// registered.
+    unsafe fn raise_on_self(vector: u8);
 }

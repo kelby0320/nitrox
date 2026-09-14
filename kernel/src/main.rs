@@ -1036,8 +1036,26 @@ fn init_initramfs() {
         kprintln!("initramfs: no module loaded");
         return;
     }
+    // Every module after the first is a disk (Phase 5 Part C — the live image's root). Recorded
+    // here, while the responses are fresh; published by `drivers::probe`, once the device table and
+    // the interrupt table exist.
+    for index in 1..resp.module_count as usize {
+        // SAFETY: `modules` points at `module_count` non-null `*mut LimineFile`s, in
+        // never-reclaimed memory.
+        let file = unsafe { &**resp.modules.add(index) };
+        // SAFETY: Limine's `path` is a NUL-terminated string in bootloader memory the kernel never
+        // reclaims.
+        let path = unsafe { core::ffi::CStr::from_ptr(file.path as *const core::ffi::c_char) };
+        // SAFETY: the module's `address..address + size` is HHDM-mapped, never reclaimed, and
+        // nothing else uses it — this kernel reads modules through nothing but these two paths.
+        if !unsafe {
+            nitrox_kernel::io::ramdisk::record_module(index, file.address, file.size as usize, path.to_bytes())
+        } {
+            kprintln!("initramfs: module {} ignored — more modules than disks the kernel keeps", index);
+        }
+    }
     // SAFETY: `modules` points at an array of `module_count` `*mut LimineFile`;
-    // we take the first (Nitrox configures exactly one module).
+    // the first is the initramfs.
     let file = unsafe { &**resp.modules };
     let (addr, size) = (file.address, file.size as usize);
     if addr.is_null() || size == 0 {
