@@ -333,62 +333,185 @@ the boot banner it replaced is gone.
 
 ## Part C — the live image ⬜
 
-- [ ] **A third image mode whose root filesystem is the initramfs**, so the first boot on real
-      hardware needs no storage driver and no partitioning.
+- [ ] **A third image mode whose root filesystem arrives with the kernel**, so the first boot on
+      real hardware needs no storage driver and no partitioning.
 
 **Why it exists.** Booting from a USB stick does not give us a root filesystem on that stick.
-Limine reads the kernel and the initramfs through **UEFI Boot Services** — the firmware's own
-USB stack — and then exits boot services before entering the kernel. From that moment we have
-no USB driver, so an ext4 partition on the stick is unreachable. A live image sidesteps
-storage entirely: Limine loads roughly 5 MB (the release program set plus the fonts) into
-memory as a module, and 6 GB of RAM makes that a non-issue.
+Limine reads the kernel and its modules through **UEFI Boot Services** — the firmware's own USB
+stack — and then exits boot services before entering the kernel. From that moment we have no USB
+driver, so an ext4 partition on the stick is unreachable. A live image sidesteps storage
+entirely: everything the release root holds travels as a Limine module, and 6 GB of RAM makes
+that a non-issue.
 
-**It is a diagnostic instrument, not a product.** Its whole value is that it removes storage
-from the equation for the first attempt: if the screen stays black, "did AHCI work?" is not one
-of the variables. Once Part F has booted the machine, Part G installs to the disk and the live
-mode has done its job.
+**It is a diagnostic instrument, not a product.** Its whole value is that it removes storage from
+the equation for the first attempt: if the screen stays black, "did AHCI work?" is not one of the
+variables. Once Part F has booted the machine, Part H installs to the disk and the live mode has
+done its job.
+
+> **Detail pass, 2026-09-14.** Written before any code, like Part A's, and it changed the design:
+> the first draft below assumed the in-kernel `/initramfs` server could stand in for the root, and
+> it cannot. The sections from here to Part D are the corrected plan. Decisions marked
+> *(maintainer's call)* were put to the maintainer with the alternatives.
+
+### The first draft's root does not boot
+
+The first draft made `/bin` "a subtree bind of the in-kernel `/initramfs` endpoint" and put the
+rest of the root in a fatter initramfs. **That server answers one question — "give me this file"
+— with a copied `MemoryObject`** (`initramfs_server`, `kernel/src/object/kernel_server.rs`). It
+has no directory listing, no file metadata beyond a mapping's size, and no writes. What the
+release root is used for needs all three, starting on the critical path:
+
+- **`profile-server` lists `/store/<package>/bin/`** to build the `/bin` index (`build_index`,
+  `userspace/profile-server/src/main.rs`). `init` treats a failed `/bin` as critical-path, so a
+  root without directories drops to `eshell` before a single service starts.
+- **`libfs::list_dir`** — `nxfiles`, `nxsh`'s `list` and completion, the file chooser — opens a
+  directory by resolving it to a **session endpoint the serving process mints**
+  (`librsproto::session::Dir::open`) and speaks the directory protocol over that. The initramfs
+  server returns a `MemoryObject` or `NotFound`; it has no session to mint.
+- **Anything that writes** — a saved file, a theme change — has nowhere to go.
+
+Building those into a new server would be a read-only cpio filesystem that only the live image
+runs: exactly the "code for one mode" the discipline below rules out, with a second
+implementation of the filesystem protocol to keep in step with the first.
+
+### The root is the release root, in RAM *(maintainer's call)*
+
+**The live image carries the release root filesystem as an ext4 disk image, loaded by Limine as a
+second module; the kernel exposes that module as a RAM-backed block device; and the same
+`fs-server-ext4` mounts `/` from it.** Every program, every path and every protocol is the one the
+release image runs. What differs is three pieces of data:
+
+| | Release image | Live image |
+|---|---|---|
+| `boot/limine/limine.conf` | one `module_path` (the initramfs) | a second: `boot():/boot/root.img` |
+| `etc/init.toml` (in the initramfs) | `device = "gpt-partlabel:nitrox-root"` | `device = "gpt-partlabel:nitrox-live"` |
+| where the root partition is | the disk's second partition | inside `root.img`, a GPT image with one partition |
+
+**A distinct label, not a reused one.** Labelling the live partition `nitrox-root` would make the
+live initramfs byte-identical to the release one, but a live stick booted on a machine that has
+Nitrox installed would then find two partitions answering to the same name. `nitrox-live` costs
+one line of manifest and is never ambiguous; `check-images` proves that line is the whole
+difference.
+
+**Consequence for the limitations below:** `/home` is **writable**, in RAM. The first draft's "no
+writable `/home`" was a property of the initramfs design, not of a live boot. What remains is no
+persistence.
+
+**Measured against the emulator before any code (2026-09-14).** The current release image,
+attached to QEMU as a USB stick (`qemu-xhci` + `usb-storage`) with nothing on the AHCI controller:
+OVMF boots Limine from the stick, Limine loads the kernel and the 234,648-byte initramfs through
+the firmware, the kernel enumerates the xHCI controller (`class 0c.03.30`) and has no driver for
+it, AHCI reports `no SATA disk on any implemented port`, and `init` fails
+`/dev/disk/by-partlabel/nitrox-root not found` and drops to `eshell`. That is the laptop's live
+boot today, reproduced — and it is the shape the gate below boots.
 
 ### The discipline: the live-ness is data, not code
 
 **This is the constraint that makes a temporary stage safe** (maintainer's call, 2026-09-10):
-*no production code may change to enable it.* No `#[cfg(feature = "live")]` anywhere in
-`kernel/` or `userspace/`. The live configuration is a different `init.toml`, a different
-`services.toml`, and a fatter initramfs — all of which are build-tool concerns.
+*no production code may change for the live mode alone.* No `#[cfg(feature = "live")]` anywhere
+in `kernel/` or `userspace/`. The live configuration is a different `limine.conf`, a one-line
+different `init.toml`, and a root image — all build-tool concerns.
 
 That is the same rule [`test-path-retrofit.md`](test-path-retrofit.md) established and proved:
 *the software under test is the software that ships*. It took `session-mgr` from 31 build-mode
 `cfg` sites to zero on exactly this argument, and `cargo xtask check-images` is what keeps it
 true.
 
-- [ ] **`check-images` learns the third mode**, and the claim it enforces is that the live
-      image's **programs are byte-identical** to the release image's; only the data differs. A
-      live-only `cfg` then fails the build rather than surviving to be forgotten.
-- [ ] `INITRAMFS_MAX_BYTES` (384 KB) becomes per-mode. The ceiling exists to catch drift in a
-      *boot* image and must not be silently raised for it — an image deliberately carrying
-      everything needs its own, larger number and its own reason.
+**What the rule permits** is general mechanism the live image happens to be the first to use.
+The one kernel change below qualifies: a module after the first becoming a block device is what
+an initrd has always been, and nothing in it names the live image.
 
-### What it needs from `init`, and why that is not throwaway either
+### The pieces, in dependency order
 
-- [ ] **A bind-mount concept in `init.toml`** — "bind an already-available endpoint at another
-      path, scoped to a subtree" — so `/bin` can be `/initramfs/bin`.
+**C.1 — a bind-mount concept in `init.toml`, and the last `cfg` leaves `init`** *(maintainer's
+call: kept in Part C although the live image no longer needs it)*
 
-**This is a feature the project already owes.** It is the blocker on `/subtreetest`, the last
-build-mode `cfg` in `init`, deferred from the test-path retrofit on 2026-08-24. That box says
-it plainly: *"the manifest needs 'bind an already-mounted server's endpoint at another path,
-with a subtree base' — which is not a test accommodation: `session-mgr` does exactly that for
-`/home` on every login, and it is what `mount --bind` is everywhere else."*
+- [ ] `[[bind]]` entries: `path` (where to bind), `source` (the `mount_point` of a `[[mount]]` in
+      the same manifest) and `subtree` (the base the lookups are scoped to). Processed after every
+      mount, with the source mount's retained forwarding endpoint and `sys_ns_bind`'s existing
+      base argument. A `source` naming no mount is a manifest error; a failed bind is
+      critical-path, as a failed mount is — a missing bind is how a later test fails for a reason
+      nobody can see.
+- [ ] `/subtreetest` (subtree `/system`) and `/scratch` (subtree `/scratch`) become `[[bind]]`
+      entries in the **test** image's `init.toml`, and the `#[cfg(feature = "selftest")]` block in
+      `mount_one` is deleted.
+- [ ] **`init` is built with no features in any mode.** Deleting the last `cfg` is not enough on
+      its own: `cmd_build` passes `--features test-harness` to `init`, and the retrofit's own note
+      says most byte-identity is cargo not rebuilding a crate whose feature set did not change. So
+      the features go from `userspace/init/Cargo.toml` and from the build, and "is this a test
+      image" becomes a build-mode predicate rather than `mode.features().is_some()`.
+- [ ] `check-images`' allow-list loses `sbin/init` and gains `etc/init.toml`. The list is
+      one-directional, so this prune is by hand.
+- [ ] `docs/spec/init-toml-schema.md` gains the table; the retrofit's box and the `init` line in
+      `CLAUDE.md` close.
 
-So the live image does not want temporary code; it wants a general mechanism we want anyway,
-and building it **closes** an open item. Doing it here also finishes the retrofit.
+**Why first:** it touches `init`'s manifest, which C.3 also changes, and it is independently
+verifiable — `test-qemu`'s `subtree_bind_test` and the demo harness's case 8 are what consume the
+binding, so they are its gate.
 
-Nothing else is needed from the kernel: `init` already spawns from `/initramfs/sbin/…`, and the
-in-kernel `/initramfs` server is already namespace-visible.
+**C.2 — a Limine module after the first is a RAM-backed block device**
+
+- [ ] `init_initramfs` keeps module 0 as the initramfs. Every further module is published as a
+      block `DeviceNode` over the module's own memory — no copy — before `drivers::probe` runs its
+      GPT pass, so the partition scan and the `/dev/disk/by-partlabel/` names come from the code
+      AHCI disks already use. The kernel logs the module's path and size.
+- [ ] The backing generalises the existing bring-up `RamDisk` (`kernel/src/io/ramdisk.rs`), which
+      today owns a 64 KiB pattern-filled `KVec` for the I/O spine self-test; that self-test keeps
+      working unchanged.
+- [ ] **Writable.** The module lives in `MEMMAP_KERNEL_AND_MODULES` memory, which the kernel never
+      reclaims and reaches through the HHDM like the initramfs. To confirm in C.2 rather than
+      assumed here: that the HHDM mapping of module memory is writable on both targets. If it is
+      not, the fallback is to copy the module into buddy frames at boot, which costs its size in
+      RAM once.
+- [ ] Host tests for the backing's bounds and block arithmetic; the in-guest proof is C.4's gate.
+
+**C.3 — the live image, built by `cargo xtask image --live`**
+
+- [ ] A separate file (`tools/build-cache/nitrox-live.img`), so a live build never clobbers the
+      image every other gate boots. One GPT partition — an ESP sized to its contents — holding
+      Limine, the **release** kernel, the release initramfs with the live `init.toml`, the
+      Terminus licence, and `boot/root.img`.
+- [ ] `root.img` is a GPT image with one partition, `nitrox-live`, holding an ext4 filesystem
+      built from **the release root's staging tree** — the same function, not a copy of its steps.
+      Sized to its contents plus slack for writes, and under a ceiling of its own with its own
+      reason: it is what firmware reads off a USB stick before the kernel runs.
+- [ ] `INITRAMFS_MAX_BYTES` stays one number. The first draft made it per-mode because the live
+      initramfs was going to carry the whole system; in this design it is the release initramfs
+      with one manifest line changed, so the release ceiling still describes it.
+
+**C.4 — the gates**
+
+- [ ] **`check-images` learns the third mode**: the live initramfs may differ from the release
+      one in `etc/init.toml` and nothing else, and the live root's staging tree must be identical
+      to the release root's, file for file. A live-only `cfg` or a live-only staging step then
+      fails the build rather than surviving to be forgotten.
+- [ ] **`cargo xtask check-live`** boots `nitrox-live.img` as a **USB stick**, with nothing on the
+      AHCI controller, and asserts over serial:
+  1. `ahci: no SATA disk on any implemented port` — no storage driver carried the boot;
+  2. the module became a block device and `gpt: 1 partition(s)` found `nitrox-live` on it;
+  3. `init` mounted `/` from `gpt-partlabel:nitrox-live`, and the greeter was presented;
+  4. a login on the serial column can **write a file under `/home` and read it back** — the claim
+     the first draft could not make.
+- [ ] **Its controls**, run before it is trusted: drop the second `module_path` (step 3 must
+      fail, at the mount); attach the image on AHCI as well (step 1 must fail — the gate would
+      notice a boot that had a disk after all).
+- [ ] In CI's QEMU job, unconditionally: the image exists for Part F, and a live image that
+      stopped booting in the meantime is the failure this gate is for.
 
 ### Accepted limitations of the live mode
 
-Stated so they are not mistaken for bugs: **no writable `/home`**, so nothing can be saved, and
-no persistence across a reboot. Both are properties of the configuration and disappear the
-moment root is on a disk.
+Stated so they are not mistaken for bugs: **no persistence** — `/home` is writable, in RAM, and
+forgotten at power-off — and a longer firmware stage, since `root.img` is read off the stick
+before the kernel starts. Both disappear the moment root is on a disk.
+
+### Left alone
+
+- **The in-kernel `/initramfs` server.** Still the bootstrap path for `init`, `eshell` and the
+  fs-server, and still file lookups only. Nothing here asks more of it.
+- **A USB driver.** The whole point. Phase 6.
+- **Choosing the root by anything but `init.toml`.** A kernel command line naming the root, or a
+  scan that prefers whichever label it finds, would make the live-ness something the kernel
+  decides; one line of manifest keeps it data.
 
 ## Part D — the hardware report ⬜
 

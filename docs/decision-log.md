@@ -25449,3 +25449,43 @@ guest, F10 now panics with the driver's lock held **on purpose**, so `check-fbco
 fix's regression test: it passes with the fix and fails with the old rule restored — "the panic
 reached the screen without its message".
 
+
+---
+
+## 2026-09-14 — Part C's detail pass: the live root is the release root, in RAM
+
+Phase 5 Part C was written on 2026-09-10 around one mechanism: the live image's root would be the
+in-kernel `/initramfs` server, with `/bin` "a subtree bind of the in-kernel `/initramfs`
+endpoint". The detail pass, done before any code as Part A's was, found that root cannot boot.
+
+**The server answers file lookups and nothing else.** `initramfs_server` returns a copied
+`MemoryObject` or `NotFound`: no directory listing, no metadata beyond a mapping, no writes.
+`profile-server` builds `/bin` by listing `/store/<package>/bin/`, and `init` treats a failed
+`/bin` as critical-path, so that root would drop to `eshell` before any service started;
+`libfs::list_dir` opens a directory by resolving it to a session endpoint the serving process
+mints, which a kernel server has no way to do. Making it work would have meant a read-only cpio
+filesystem server that only the live image runs — a second implementation of the filesystem
+protocol, for one mode, which is the discipline this part states in its own first paragraph.
+
+**Chosen instead (maintainer's call): an ext4 image of the release root, loaded by Limine as a
+second module, exposed by the kernel as a RAM-backed block device, and mounted by the same
+`fs-server-ext4`.** The programs, paths and protocols are the release image's; the data that
+differs is a second `module_path` in `limine.conf` and a `nitrox-live` partition label in
+`init.toml`. The label is distinct from `nitrox-root` on purpose — a stick booted on a machine
+with Nitrox installed must not find two roots answering to one name. The kernel change is general:
+a module after the first becomes a block device over its own memory, and the existing GPT pass
+names its partitions. It also removes the first draft's "no writable `/home`": the RAM disk takes
+writes; only persistence is gone.
+
+**Measured before any of it was written.** The current release image attached to QEMU as a USB
+stick, with the AHCI controller empty: OVMF boots Limine off the stick, the kernel sees the xHCI
+controller and has no driver for it, AHCI finds no disk, and `init` fails to find `nitrox-root` and
+drops to `eshell`. That is the laptop's live boot today, and it is what `check-live` will boot.
+
+**The bind-mount concept stays in Part C (maintainer's call), as C.1, although nothing in the live
+image needs it now.** It closes the retrofit's last box, and the pass found one more thing that
+closing requires: deleting the `/subtreetest` `cfg` does not make `init` byte-identical across
+images while `cmd_build` still passes it `--features test-harness`, so the features go too.
+
+**Process (maintainer's call):** the corrected plan is its own PR, reviewed before Part C's code
+begins, as Part A's was.
