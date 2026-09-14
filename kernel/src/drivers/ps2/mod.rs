@@ -308,11 +308,13 @@ fn drain_controller() -> bool {
                 if let scancode::Decoded::Key { code, pressed } = g.keys.feed(byte) {
                     #[cfg(feature = "crash-key")]
                     if pressed && code == CRASH_KEY {
-                        // Released first. Panicking with this leaf lock held trips the rank
-                        // tracker when the panic tees into the log ring, and the screen then
-                        // shows `lock-order violation: acquiring Klog (rank 72) while holding
-                        // Leaf (rank 90)` instead of this message (measured 2026-09-14).
-                        drop(g);
+                        // **With this leaf lock held, deliberately**: a driver that panics
+                        // usually holds its own lock, and the panic's message must still reach
+                        // the screen. Until the rank tracker stopped ordering `try_lock`, the
+                        // panic path's tee into the log ring tripped it here and the screen
+                        // showed `lock-order violation: acquiring Klog (rank 72) while holding
+                        // Leaf (rank 90)` instead — so `check-fbcon` is that fix's regression
+                        // test as well as the console's.
                         panic!("crash-key: F10 pressed, and this kernel was built to stop on it");
                     }
                     let value = if pressed {

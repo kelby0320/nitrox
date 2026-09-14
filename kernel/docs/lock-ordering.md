@@ -15,6 +15,16 @@ longer the only line of defence, which matters because it already missed three
 deadlocks (F1, F2, F12 — decision log 2026-07-21), each found by hand or by
 bisecting a boot loop that hung one time in three.
 
+**The order binds acquisitions that wait, not `try_lock`** (since 2026-09-14). A deadlock
+is a cycle of threads each waiting for a lock another holds; a `try_lock` takes a free
+lock or gives up, so it is never an edge of that cycle. The tracker still *records* a
+`try_lock` hold, so anything later waited for underneath it is checked — the deadlock it
+could be half of is reported at that wait. The shootdown lock's no-other-lock contract
+binds both kinds. This is what lets the panic and fault paths tee into `KLOG` and the
+framebuffer console from under any lock: checked, a panic raised while holding a `Leaf`
+lock printed a lock-order violation about its own tee instead of its message. See
+`kernel/src/libkern/lockrank.rs` § Only an acquisition that waits is ordered.
+
 The rank is a **mandatory** constructor argument rather than an optional
 annotation: a lock with no declared position is a lock nobody has reasoned about.
 Requiring it is what surfaced the six live locks that were missing from the table

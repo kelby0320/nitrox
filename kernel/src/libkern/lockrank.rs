@@ -17,6 +17,25 @@
 //! without an exception, and if a legitimate one exists the tracker will find it rather
 //! than the next reader having to.
 //!
+//! ### Only an acquisition that waits is ordered
+//!
+//! **A `try_lock` is recorded but not checked** ([`Taken::WithoutWaiting`]). A deadlock is a
+//! cycle of threads each *waiting* for a lock another holds, and a `try_lock` never waits — it
+//! takes a free lock or gives up — so it can never be an edge of that cycle, however it sits
+//! against the order. Every edge is a `lock()`, and every `lock()` is checked against
+//! everything held, `try_lock` holds included: taking `A` without waiting and then waiting for
+//! `B` below it is still reported, at the wait, which is where the deadlock would be. Linux's
+//! lockdep draws the same line and adds no dependency for a trylock.
+//!
+//! Checking them anyway was not merely conservative. The panic and fault paths tee into the
+//! log ring and the framebuffer console with `try_lock`, from whatever context faulted, so a
+//! panic raised while holding a `Leaf` lock reported `lock-order violation: acquiring Klog
+//! (rank 72) while holding Leaf (rank 90)` in place of its own message — every driver panic
+//! under its lock lost its diagnosis to a report about the diagnosis being printed (found
+//! 2026-09-14, by the framebuffer console's gate). The shootdown lock's contract still applies
+//! to both kinds of acquisition: its hazard is holding other locks while it spins, not waiting
+//! to take it.
+//!
 //! ## Interrupt scopes
 //!
 //! **The acquisition order restarts at every interrupt entry**, and modelling that is not
@@ -148,6 +167,19 @@ pub enum LockRank {
     Leaf = 90,
 }
 
+/// How a lock was acquired, which decides whether the order applies to it at all.
+///
+/// See the module docs § Only an acquisition that waits is ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// `lock()`: spun until the lock was free. The only kind of acquisition that can be part
+    /// of a deadlock, so the only kind checked against the order.
+    Waiting,
+    /// `try_lock()`: taken because it was free at that instant, or not taken. Recorded as held,
+    /// so what is waited for afterwards is checked against it; never itself checked.
+    WithoutWaiting,
+}
+
 /// What acquiring `rank` means, given what this CPU already holds **in the current
 /// interrupt scope**.
 #[derive(Debug, PartialEq, Eq)]
@@ -172,8 +204,9 @@ pub enum Acquisition {
 /// express had no test on either side (found by the kernel audit, 2026-08-14).
 ///
 /// `held` is the scope's slice — entries below the floor belong to an interrupted context
-/// and are not the caller's to violate.
-pub fn classify(rank: LockRank, held: &[u8]) -> Acquisition {
+/// and are not the caller's to violate. `taken` is how the lock was acquired: only a
+/// [`Taken::Waiting`] acquisition can invert the order.
+pub fn classify(rank: LockRank, held: &[u8], taken: Taken) -> Acquisition {
     for &h in held {
         if h == 0 {
             continue;
@@ -181,7 +214,7 @@ pub fn classify(rank: LockRank, held: &[u8]) -> Acquisition {
         if matches!(rank, LockRank::TlbShootdown) {
             return Acquisition::ContractBroken { held: h };
         }
-        if (rank as u8) <= h {
+        if taken == Taken::Waiting && (rank as u8) <= h {
             return Acquisition::Inverted { held: h };
         }
     }
@@ -205,7 +238,7 @@ mod inert {
     pub struct IrqScope;
 
     #[inline(always)]
-    pub fn acquired(_rank: LockRank) {}
+    pub fn acquired(_rank: LockRank, _taken: super::Taken) {}
     #[inline(always)]
     pub fn releasing(_rank: LockRank) {}
     #[inline(always)]
@@ -289,11 +322,12 @@ mod tracker {
     }
 
     /// Record that `rank` has just been acquired on this CPU, and panic if doing so
-    /// inverted the order.
+    /// inverted the order — which only a [`Taken::Waiting`](super::Taken::Waiting)
+    /// acquisition can.
     ///
     /// Called *after* the lock is held, so the report can name a real acquisition rather
     /// than a speculative one — and so a failed `try_lock` records nothing.
-    pub fn acquired(rank: LockRank) {
+    pub fn acquired(rank: LockRank, taken: super::Taken) {
         let irq = mask();
         let cpu = this_cpu();
         let floor = FLOOR[cpu].load(Ordering::Relaxed);
@@ -311,7 +345,7 @@ mod tracker {
             scope[k] = HELD[cpu][floor + k].load(Ordering::Relaxed);
         }
         let (mut violation, mut contract) = (None, None);
-        match super::classify(rank, &scope[..n]) {
+        match super::classify(rank, &scope[..n], taken) {
             super::Acquisition::Ok => {}
             super::Acquisition::ContractBroken { held } => contract = Some(held),
             super::Acquisition::Inverted { held } => violation = Some(held),
@@ -574,9 +608,14 @@ mod tests {
         /// used to reimplement the rule too, and the reimplementation had silently lost the
         /// `TlbShootdown` contract branch.
         fn acquired(&mut self, rank: LockRank) -> Result<(), u8> {
+            self.taken(rank, super::Taken::Waiting)
+        }
+
+        /// [`acquired`](Self::acquired), for either kind of acquisition.
+        fn taken(&mut self, rank: LockRank, taken: super::Taken) -> Result<(), u8> {
             let hi = self.depth.min(MAX_HELD);
             let scope = if hi > self.floor { &self.held[self.floor..hi] } else { &[][..] };
-            let verdict = super::classify(rank, scope);
+            let verdict = super::classify(rank, scope, taken);
             if self.depth < MAX_HELD {
                 self.held[self.depth] = rank as u8;
             }
@@ -622,11 +661,11 @@ mod tests {
     /// drift was invisible because the tests exercised the copy.
     #[test]
     fn the_shootdown_lock_refuses_any_held_lock_even_one_it_outranks() {
-        use super::{Acquisition, LockRank, classify};
+        use super::{Acquisition, LockRank, Taken::Waiting, classify};
 
         // Nothing held: fine.
-        assert_eq!(classify(LockRank::TlbShootdown, &[]), Acquisition::Ok);
-        assert_eq!(classify(LockRank::TlbShootdown, &[0, 0]), Acquisition::Ok);
+        assert_eq!(classify(LockRank::TlbShootdown, &[], Waiting), Acquisition::Ok);
+        assert_eq!(classify(LockRank::TlbShootdown, &[0, 0], Waiting), Acquisition::Ok);
 
         // Holding a *lower* rank would pass the inversion test — and must still be refused.
         let sched = LockRank::Sched as u8;
@@ -635,16 +674,70 @@ mod tests {
             "the premise: this is not a rank inversion, which is why the branch exists"
         );
         assert_eq!(
-            classify(LockRank::TlbShootdown, &[sched]),
+            classify(LockRank::TlbShootdown, &[sched], Waiting),
             Acquisition::ContractBroken { held: sched }
         );
 
         // A different lock over `Sched` is an ordinary inversion, not a contract break —
         // so the branch is specific to the shootdown lock rather than to a held stack.
         assert_eq!(
-            classify(LockRank::Sched, &[sched]),
+            classify(LockRank::Sched, &[sched], Waiting),
             Acquisition::Inverted { held: sched }
         );
+    }
+
+    /// The panic path's shape: a driver panics holding its `Leaf` lock, and the panic tees
+    /// into the log ring (rank 72) with `try_lock`. Checked, that reported a lock-order
+    /// violation in place of the panic's own message.
+    #[test]
+    fn an_acquisition_that_does_not_wait_is_not_ordered() {
+        use super::{Acquisition, LockRank, Taken, classify};
+        let leaf = LockRank::Leaf as u8;
+        assert_eq!(
+            classify(LockRank::Klog, &[leaf], Taken::WithoutWaiting),
+            Acquisition::Ok,
+            "a try_lock cannot be an edge of a deadlock cycle"
+        );
+        assert_eq!(
+            classify(LockRank::Klog, &[leaf], Taken::Waiting),
+            Acquisition::Inverted { held: leaf },
+            "the same acquisition, waiting, still is"
+        );
+        let klog = LockRank::Klog as u8;
+        assert_eq!(
+            classify(LockRank::Klog, &[klog], Taken::WithoutWaiting),
+            Acquisition::Ok,
+            "nor is a same-rank try_lock"
+        );
+        // The shootdown lock's contract is about what is held while it spins, not about
+        // waiting to take it, so it binds a try_lock too.
+        let sched = LockRank::Sched as u8;
+        assert_eq!(
+            classify(LockRank::TlbShootdown, &[sched], Taken::WithoutWaiting),
+            Acquisition::ContractBroken { held: sched }
+        );
+    }
+
+    /// Not checking a `try_lock` must not mean not *recording* it: the deadlock it could be
+    /// half of is completed by a later wait, and that wait is checked against it.
+    #[test]
+    fn a_lock_taken_without_waiting_still_orders_what_is_waited_for_under_it() {
+        use super::Taken::WithoutWaiting;
+        let mut s = State::default();
+        s.acquired(LockRank::Leaf).unwrap();
+        assert_eq!(s.taken(LockRank::Klog, WithoutWaiting), Ok(()));
+        assert_eq!(s.depth, 2, "recorded");
+        assert_eq!(
+            s.acquired(LockRank::Serial),
+            Err(LockRank::Leaf as u8),
+            "waiting for Serial under either hold is still an inversion"
+        );
+        s.releasing();
+        s.releasing();
+        s.releasing();
+        // Held alone, the try-taken lock is what the wait breaks against.
+        s.taken(LockRank::Klog, WithoutWaiting).unwrap();
+        assert_eq!(s.acquired(LockRank::Serial), Err(LockRank::Klog as u8));
     }
 
     #[test]

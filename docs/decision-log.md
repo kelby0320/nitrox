@@ -25370,9 +25370,8 @@ desktop; then that a panic takes the screen back and keeps it.
 **The panic needed a kernel feature.** QEMU's `inject-nmi` delivers through the local APIC's LINT1,
 which this kernel leaves masked: tried under TCG and KVM, with serial captured, and nothing happened.
 Nothing else stops a working kernel on demand, so `crash-key` panics on F10 from inside the i8042
-driver, compiled only into this gate's image — the `no-ps2-irq` pattern. The panic drops the
-driver's leaf lock first: with it held, the screen showed `lock-order violation: acquiring Klog (rank
-72) while holding Leaf (rank 90)` and never the panic's own message.
+driver, compiled only into this gate's image — the `no-ps2-irq` pattern. It panics with the driver's
+leaf lock held, on purpose, which is how the next entry was found.
 
 **Every claim was failed on purpose, and one failed to fail.** Removing the `sys_kprint` tee never
 showed `compositor: up`; removing the yield put 344 glyph cells over the desktop; removing the reclaim
@@ -25386,3 +25385,40 @@ own controls (a paint that stops recording what it drew, a reclaim that skips th
 **Noticed and not fixed here.** With no UART the console driver's loopback self-test reports `FAIL` and
 arms an interrupt for a device that is not there; harmless under QEMU, and Part D's hardware report is
 where it belongs.
+
+---
+
+## 2026-09-14 — The rank tracker orders acquisitions that wait, and not `try_lock`
+
+**Found by Part B's gate.** A panic raised while holding a `Leaf` lock never printed its message.
+The panic path tees every line into the log ring with `try_lock`; the tracker checked that
+acquisition like any other, found rank 72 taken under rank 90, and panicked with
+`lock-order violation: acquiring Klog (rank 72) while holding Leaf (rank 90)` from inside the first
+line of the original panic, so the original message was never written. Measured by pressing
+`crash-key`'s F10 with the i8042 driver's lock held: that line on the screen, and not the crash
+message. The drivers' own locks are `Leaf` — the i8042's, the AHCI pending ring, the serial
+console's input buffer — so this was the shape of a driver panic taken under its lock, in the dev
+kernels every image boots: on the laptop, a wrong diagnosis at exactly the moment Part B exists for.
+
+**The fix is the rule, not the panic path.** A deadlock is a cycle of threads each waiting for a
+lock another holds, and a `try_lock` never waits: it takes a free lock or gives up. So it cannot be
+an edge of any cycle, however it sits against the order, and checking it only ever produced false
+reports. `classify` now takes how the lock was acquired (`Taken::Waiting` / `Taken::WithoutWaiting`)
+and only a waiting acquisition can be `Inverted`. **The hold is still recorded**, so the deadlock a
+`try_lock` could be half of is still caught — at the later wait underneath it, which is where it
+would happen. Linux's lockdep draws the same line and adds no dependency for a trylock. The
+shootdown lock's contract binds both kinds, because its hazard is what is held while it spins.
+
+Rejected: **standing the tracker down once a panic starts.** It would have fixed this symptom and
+hidden the class — the rule would still be wrong for any `try_lock` outside a panic — and nothing on
+the panic or fault path takes a waiting lock (the stack scan walks page tables without one, and the
+stop uses atomics and MSRs), so there was nothing further for it to cover. Also rejected: dropping
+the lock before panicking, which is what the crash key did first; every driver would have to know.
+
+**Proof.** Host tests pin the rule through `classify` itself (a try-taken `Klog` under `Leaf` is
+`Ok`, the same acquisition waiting is `Inverted`, the shootdown contract still binds) and the
+bookkeeping (a try-taken hold orders a later wait); both fail with the old rule restored. In the
+guest, `crash-key` now panics with the driver's lock held **on purpose**, so `check-fbcon` is this
+fix's regression test: it passes with the fix and fails with the old rule restored — "the panic
+reached the screen without its message".
+
