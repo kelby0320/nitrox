@@ -667,19 +667,42 @@ drawing the menu, which is why the live image needs a nonzero one.
       and bytes usable / reclaimable / reserved / ACPI / framebuffer).
 - [ ] **The CPU**: CPUID vendor, brand string, family/model/stepping, logical CPU count, and three
       groups of feature bits — what the kernel **requires** (x2APIC, RDTSCP, NX, SMEP/SMAP), what it
-      **uses when present** (XSAVE/AVX, RDRAND/RDSEED, TSC-deadline), and what it **warns about**
-      (invariant TSC). The hypervisor bit, since a transcript should say which it came from.
+      **uses when present** (XSAVE/AVX, RDRAND/RDSEED), and what it **warns about** (invariant TSC).
+      TSC-deadline is reported as present or absent and **not** as used: the LAPIC timer runs in
+      count-down mode (`kernel/src/arch/x86_64/timer.rs`), and a line implying otherwise would
+      mislead Part F. The hypervisor bit, since a transcript should say which it came from.
+- [ ] **Compact**: one line per table, per MADT entry, per PCI function — not one per field. Every
+      line the console draws costs screen time before the compositor, and on the laptop, whose
+      framebuffer has no write-combining until Part G, more than under QEMU. D.1 measures `check-fbcon`'s
+      first-line-to-handout time before and after, under TCG.
 - [ ] **ACPI**: every table the XSDT lists — signature, OEM ID, OEM table ID, revision, length,
       physical address. The MADT's entries individually: each local APIC / x2APIC (processor UID,
       APIC id, enabled or online-capable), each IOAPIC, each source override, each LAPIC NMI entry.
-      **The parser keeps APIC ids as `u8` today** (`cpu_apic_ids`), which an x2APIC entry above 255
-      does not fit; the logged line shows the entry as the table states it.
+      **Today's parser reads less than it looks** (`parse_madt`): it matches only type-0 local APIC
+      entries with the *enabled* bit set, skips type-9 x2APIC entries and online-capable ones
+      entirely, and the `cpu_apic_ids()` it fills has no caller. So on firmware that lists its CPUs
+      as type-9 entries the existing summary would read `0 CPU` while these new lines show every
+      entry; D.1 extends the parser to both types and both flags, and the summary counts from the
+      same walk.
 - [ ] **PCI**: each function's capabilities as the walk Part A added finds them (MSI with its form,
-      MSI-X, PCI Express), and — after `drivers::probe` — a line per function naming the driver that
-      claimed it or saying none did. That needs the device table to record a claim, which it does
-      not today.
+      MSI-X, PCI Express), and — after `drivers::probe` — a line per function saying what became of
+      it, in **three states** (PR #299 review):
+  - **claimed**, and how — `ahci, MSI vec 0x30`;
+  - **matched but declined**, and why — `ahci declined: no SATA disk on any implemented port`.
+    `ahci::init` returns before it maps config space, enables bus mastering or takes MSI when no
+    port answers, and `drivers::probe` ignores its result; recorded only on success, that function
+    would read "no driver", exactly like the xHCI — and on the laptop an undetected disk would point
+    away from AHCI port detection, which is the "the disk does nothing" case Part A exists for;
+  - **none** — no driver in the table matched.
+
+  The device table records none of this today; drivers report their outcome into it.
 - [ ] **The framebuffer's padding, as a number.** The laptop reports pitch 5504 for 1366 × 4 =
       5464; the line should say `padding 40` rather than leave the reader to subtract.
+- [ ] **COM1 is reported as present or absent**, not as a failing test. `console::init` prints
+      `console: RX loopback self-test FAIL` for any failure today, which is what a machine with no
+      UART produces. Detect the UART first — the 16550 scratch register holds what is written to it,
+      and a floating bus reads back `0xFF` — and log `console: no UART at COM1` when there is none,
+      keeping `FAIL` for a UART that exists and fails.
 - [ ] Parsers that can be host-tested are: the ACPI table list and MADT decoding (against captured
       bytes, as Part A tested MSI), the memory-map summary, and the command line.
 
@@ -703,25 +726,54 @@ drawing the menu, which is why the live image needs a nonzero one.
       counterpart to `copy_into_frames`), paged to the console's rows: clear, draw a page, a prompt
       line (`— page 2/3 — any key —`). Drawn on the framebuffer console only; COM1 already has every
       line. With no framebuffer console there is nothing to hold, and the boot does not wait.
+- [ ] **The read walks `Klog::runs`** — prefix, elision notice, ring, in order — which is the one
+      definition of the snapshot's layout. The laptop's longer log can spill past the 8 KiB prefix
+      into the ring; nothing is lost before 16 KiB, and an elision notice on a page is worth seeing.
+- [ ] **A held page is not painted over.** The console paints every write at once while the kernel
+      owns the screen, and a line at the bottom row jumps the grid a quarter — which would scroll a
+      page's top rows, the handoff facts, off the photograph. Kernel lines do arrive here: in five of
+      nine transcripts an `smp: cpu N online (AP)` line follows `smp: 4 CPU(s) online`, because an AP
+      counts itself online before it prints (PR #299 review). So the pager holds the console in a
+      state of its own, like `Owner::Userspace`: writes still reach the grid, COM1 and `klog`, and
+      nothing is drawn until the report ends and the console repaints.
 - [ ] **Held until a key**: the i8042 driver counts key presses as it decodes them; the pager waits
       for the count to move. **The keys that paged the report are drained from the keyboard's ring
-      before userspace starts**, so a greeter never sees a stray Enter.
-- [ ] **A page gives up after 120 s** and moves on, so a machine whose keyboard does not work still
-      finishes booting rather than waiting forever — which would read as a hang.
+      before userspace starts.** That is defence in depth rather than a gated guarantee: from reading
+      `input-server`, events it takes before any client subscribes go nowhere, so a control that
+      skipped the drain would likely pass too, and the plan does not claim a gate for it. (A release
+      of the last key can arrive after the drain; the greeter acts only on presses.)
+- [ ] **A timeout ends the report, not a page.** If a page waits 120 s with no key, the remaining
+      pages are not held — a dead keyboard otherwise costs 120 s per page, minutes on the laptop's
+      longer log, which reads as the hang the bound exists to prevent. **With no i8042 device
+      answering** (`ps2::init` already knows) the report is not held at all, and says so on COM1.
+- [ ] **The bound is data**: `hwreport=<seconds>` overrides the 120 s, so a gate control can run the
+      timeout path in seconds; a bare `hwreport` means the default.
 
 **D.4 — the gates**
 
-- [ ] **`test-qemu` asserts the answers we know**, from the D.1 lines on serial: ECAM
-      `0xe0000000` bus 0–255; four MADT CPU entries with APIC ids 0–3; the IOAPIC at `0xfec00000`;
-      the framebuffer at 1280×800, pitch 5120, padding 0; `00:1f.2` `8086:2922` claimed by `ahci`
-      over MSI. The ACPI table list is pinned from the first run rather than guessed here.
-- [ ] **`cargo xtask check-report`** boots the live image with **`-serial none`**, finds the Limine
-      menu in a screendump, presses Down and Enter, reads each report page off the screen with
-      Part B's decoder, asserts the same facts on the pages, presses a key per page, and asserts the
-      boot then reaches the handover to the compositor.
+- [ ] **`test-qemu` asserts the answers we know**, from the D.1 lines on serial, on its disk image
+      with the disk on AHCI: ECAM `0xe0000000` bus 0–255; four MADT CPU entries with APIC ids 0–3;
+      the IOAPIC at `0xfec00000`; the framebuffer at 1280×800, pitch 5120, padding 0; `00:1f.2`
+      `8086:2922` **claimed** by `ahci` over MSI; COM1 present. The ACPI table list is pinned from
+      the first run rather than guessed here.
+- [ ] **`cargo xtask check-report`** boots the **live image as a USB stick with the AHCI controller
+      empty** — the only way the live image boots, and the laptop's shape — with **`-serial none`**.
+      It finds the Limine menu, presses Down and Enter, reads each report page off the screen with
+      Part B's decoder, and asserts the facts that boot has: the same ECAM, MADT, IOAPIC and
+      framebuffer lines; `00:1f.2` **matched but declined** by `ahci` with `no SATA disk`; the module
+      disk and its `nitrox-live` partition; and **`console: no UART at COM1`**, since `-serial none`
+      is exactly that machine. It presses a key per page and asserts the boot reaches the handover.
+      Between them the two gates cover a claimed and a declined function, and COM1 both ways.
+- [ ] **Finding the menu needs a detector of its own.** Part B's decoder reads only the kernel
+      console's cells — its glyphs, its palette, its grid — and Limine draws its menu in its own font,
+      grey, cyan and green on black, centred. The detector is calibrated on the menu screenshot this
+      pass captured (the title's cyan, the highlighted entry's grey bar), with a control that a
+      firmware screen and a kernel console screen never match. Pressing Down on a timer instead is
+      the blind sampling `check-fbcon` already paid for once.
 - [ ] **Its controls**: boot the default entry instead — no report page appears and the boot does
-      not hold; withhold the key — a page is still on the screen well past the time a page takes to
-      draw; drop one fact's line from the log — the page assertion names it.
+      not hold; withhold the key with `hwreport=5` — the page stays up past the draw time and the
+      report ends after five seconds, without holding the next page; drop one fact's line from the
+      log — the page assertion names it.
 
 ### What to compare on the day
 
@@ -729,8 +781,9 @@ The laptop's answers, from the Debian capture of 2026-09-10, so Part F reads the
 differences: ECAM `0xe0000000` bus 00–ff; x2APIC enabled; 2 cores / 4 threads; framebuffer
 1366×768, pitch 5504, **padding 40**; AHCI at `00:17.0` claimed by `ahci` over **32-bit** MSI; xHCI
 at `00:14.0`, the Designware I²C controller at `00:15.0` and the RTL8111 with **no driver**; **no
-COM1** — so the loopback self-test fails, which the report should say as "no UART" rather than as a
-test failure.
+COM1**, which D.1 reports as `console: no UART at COM1` rather than as a failing self-test. An AHCI
+line reading **matched but declined** is the one to stop at: the controller was found and no port
+answered.
 
 ### Left alone
 

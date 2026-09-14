@@ -25588,3 +25588,13 @@ drive the real menu and read the pages off the screen with no serial port, as `c
 boot.
 
 **Process (maintainer's call):** the plan is its own PR, reviewed before Part D's code, as for A and C.
+
+**The review of that PR (#299) tightened four places the pass had left loose.** A driver that
+*matches* a function and then declines it — AHCI with no disk answering, which is how the live image
+always boots — needs its own state, or the report calls it "no driver" and points away from the one
+controller that matters. A held page must keep its own screen state, since kernel lines still arrive
+(an AP prints after it has counted itself online) and a write at the bottom row scrolls the page's top
+off. A timeout ends the report rather than one page, no keyboard means no hold, and the bound is data
+(`hwreport=<seconds>`) so a control can run it. And "no UART" needed a piece that delivers it: the
+scratch-register test before the loopback one. It also caught the plan misdescribing today's MADT
+parser (it skips type-9 entries entirely) and listing TSC-deadline as used when the timer counts down.
