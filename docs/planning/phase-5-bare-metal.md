@@ -604,6 +604,143 @@ only way to learn anything from a boot that gets partway. It is deliberately Par
 Part F's first task: **it must be built and read under QEMU first**, where we know what the
 right answers look like, so that on the laptop the *differences* stand out.
 
+> **Detail pass, 2026-09-14.** Written before any code, as Parts A and C were. Decisions marked
+> *(maintainer's call)* were put to the maintainer with the alternatives.
+
+### What a boot already says, and why that is not a report
+
+More of the list is logged today than the one-line box suggests. Read off a release boot's serial
+transcript:
+
+| The box asks for | Logged today | Missing |
+|---|---|---|
+| Firmware handoff values | the initramfs size | the bootloader and its version, the firmware type, the HHDM offset, the memory map, the command line |
+| ACPI tables located | a one-line summary (`RSDP rev 2 (XSDT); 1 IOAPIC, 5 src-override, 4 CPU; 1 ECAM region`) | the tables themselves — signature, OEM, revision, length, address |
+| ECAM windows | ✓ `acpi: ECAM0 @0xe0000000 seg 0 bus 0-255` | — |
+| Every PCI function, class and BARs | ✓ one line per function, one per BAR | each function's capabilities (MSI 32/64-bit, MSI-X) |
+| Framebuffer geometry including pitch | ✓ `framebuffer: 1280x800 pitch 5120 bpp 32` | the padding, stated (`pitch − width × 4`) — the laptop's is 40 bytes |
+| CPU features | two incidental lines (vector width, an invariant-TSC warning) | vendor, brand, family/model/stepping; the features the kernel requires and uses |
+| The MADT's CPUs and IOAPICs | ✓ IOAPICs; a CPU **count** | each CPU entry (processor UID, APIC id, enabled / online-capable); the LAPIC NMI entries |
+| Which drivers bound | AHCI's own lines; COM1's loopback self-test; the i8042 | a line per function saying which driver claimed it, or that none did |
+
+**The facts are the smaller half of the problem.** Under QEMU the kernel's log to the start of
+`init` is 2,195 bytes, about sixty lines; the laptop's screen holds 48 rows and scrolls a quarter at
+a time as userspace starts printing, and the compositor takes the screen within a second. On the
+machine this is for, nobody can read even the lines that exist.
+
+### The shape *(maintainer's calls)*
+
+**The facts go in the kernel log, on every boot; a report boot holds that log on the screen.**
+
+- **Every boot logs the missing facts** (D.1). Then every CI transcript *is* a hardware report of
+  the emulator, `test-qemu` can assert the answers we know, and the report boot has nothing of its
+  own to gather. The rejected alternative is a separate renderer that re-queries every subsystem at
+  report time — a second statement of each fact, and some (the COM1 loopback result, the MSI vector
+  a driver got) exist only during bring-up.
+- **The report is selected from the boot menu** (D.2, maintainer's call): a second Limine entry,
+  `Nitrox — hardware report`, passes `cmdline: hwreport`. Selection is data in `limine.conf`, which
+  is the discipline Part C kept. **Only the live image carries the menu** — `timeout: 5` and two
+  entries — because it is the stick a person boots a machine with; the release and test images keep
+  `timeout: 0` and one entry, so no gate but the live ones pays for a countdown.
+- **A report boot stops before `init`, pages the kernel log on the framebuffer console, holds each
+  page until a key, then boots on** (D.3, maintainer's call). The same boot then shows whether
+  userspace comes up. The keys that page it are consumed and never reach userspace.
+
+**Measured before any of this was written (2026-09-14).** A copy of the release image given a
+two-entry `limine.conf` (`timeout: 10`, the second entry pointing at a kernel path that does not
+exist), booted under OVMF with `-display none`: Limine 12.2.0 draws the menu with its countdown,
+QMP `screendump` captures it, and injecting **Down** then **Enter** over QMP selects the second
+entry — Limine panics on the missing path. So a gate can drive the real menu. The protocol's
+command-line request is `LIMINE_EXECUTABLE_CMDLINE_REQUEST`
+(`0x4b161536e598651e, 0xb390ad4a2f1f303a`, response `{ revision, cmdline }`) and the configuration
+key is `cmdline:`, both read off Limine's upstream protocol specification (the limine-protocol
+repository) and its v12.x configuration reference; `timeout: 0` boots without
+drawing the menu, which is why the live image needs a nonzero one.
+
+### The pieces, in dependency order
+
+**D.1 — the missing facts, logged on every boot**
+
+- [ ] **The handoff**: the bootloader's name and version and the firmware type (Limine's
+      bootloader-info and firmware-type requests), the base revision accepted, the HHDM offset, the
+      date at boot, the executable command line, and the memory map summarised by type (entries,
+      and bytes usable / reclaimable / reserved / ACPI / framebuffer).
+- [ ] **The CPU**: CPUID vendor, brand string, family/model/stepping, logical CPU count, and three
+      groups of feature bits — what the kernel **requires** (x2APIC, RDTSCP, NX, SMEP/SMAP), what it
+      **uses when present** (XSAVE/AVX, RDRAND/RDSEED, TSC-deadline), and what it **warns about**
+      (invariant TSC). The hypervisor bit, since a transcript should say which it came from.
+- [ ] **ACPI**: every table the XSDT lists — signature, OEM ID, OEM table ID, revision, length,
+      physical address. The MADT's entries individually: each local APIC / x2APIC (processor UID,
+      APIC id, enabled or online-capable), each IOAPIC, each source override, each LAPIC NMI entry.
+      **The parser keeps APIC ids as `u8` today** (`cpu_apic_ids`), which an x2APIC entry above 255
+      does not fit; the logged line shows the entry as the table states it.
+- [ ] **PCI**: each function's capabilities as the walk Part A added finds them (MSI with its form,
+      MSI-X, PCI Express), and — after `drivers::probe` — a line per function naming the driver that
+      claimed it or saying none did. That needs the device table to record a claim, which it does
+      not today.
+- [ ] **The framebuffer's padding, as a number.** The laptop reports pitch 5504 for 1366 × 4 =
+      5464; the line should say `padding 40` rather than leave the reader to subtract.
+- [ ] Parsers that can be host-tested are: the ACPI table list and MADT decoding (against captured
+      bytes, as Part A tested MSI), the memory-map summary, and the command line.
+
+**D.2 — the kernel command line, and the live image's menu**
+
+- [ ] The executable command-line request, read once at boot and parsed into flags; unknown words
+      are logged and ignored, never fatal. `hwreport` is the only flag.
+- [ ] The live image's `limine.conf` gains the menu: `timeout: 5`, the default `Nitrox` entry, and
+      `Nitrox — hardware report` with `cmdline: hwreport`. Generated by `image --live`, beside the
+      second `module_path` it already adds — `limine.conf` is live-image data today and
+      `check-images` does not compare it, so nothing there changes. `check-live` then waits out the
+      five-second countdown and boots the default entry, which is also a check that the default is
+      still the ordinary boot.
+
+**D.3 — report mode**
+
+- [ ] **Where**: after `drivers::probe`, AP bring-up and `record_framebuffer` — so drivers have
+      bound, every CPU has come online or failed to, and the framebuffer facts exist — and before
+      `run_first_userspace`.
+- [ ] **What**: the kernel log so far, read back out of `klog` (which needs a read-into-a-buffer
+      counterpart to `copy_into_frames`), paged to the console's rows: clear, draw a page, a prompt
+      line (`— page 2/3 — any key —`). Drawn on the framebuffer console only; COM1 already has every
+      line. With no framebuffer console there is nothing to hold, and the boot does not wait.
+- [ ] **Held until a key**: the i8042 driver counts key presses as it decodes them; the pager waits
+      for the count to move. **The keys that paged the report are drained from the keyboard's ring
+      before userspace starts**, so a greeter never sees a stray Enter.
+- [ ] **A page gives up after 120 s** and moves on, so a machine whose keyboard does not work still
+      finishes booting rather than waiting forever — which would read as a hang.
+
+**D.4 — the gates**
+
+- [ ] **`test-qemu` asserts the answers we know**, from the D.1 lines on serial: ECAM
+      `0xe0000000` bus 0–255; four MADT CPU entries with APIC ids 0–3; the IOAPIC at `0xfec00000`;
+      the framebuffer at 1280×800, pitch 5120, padding 0; `00:1f.2` `8086:2922` claimed by `ahci`
+      over MSI. The ACPI table list is pinned from the first run rather than guessed here.
+- [ ] **`cargo xtask check-report`** boots the live image with **`-serial none`**, finds the Limine
+      menu in a screendump, presses Down and Enter, reads each report page off the screen with
+      Part B's decoder, asserts the same facts on the pages, presses a key per page, and asserts the
+      boot then reaches the handover to the compositor.
+- [ ] **Its controls**: boot the default entry instead — no report page appears and the boot does
+      not hold; withhold the key — a page is still on the screen well past the time a page takes to
+      draw; drop one fact's line from the log — the page assertion names it.
+
+### What to compare on the day
+
+The laptop's answers, from the Debian capture of 2026-09-10, so Part F reads the report for
+differences: ECAM `0xe0000000` bus 00–ff; x2APIC enabled; 2 cores / 4 threads; framebuffer
+1366×768, pitch 5504, **padding 40**; AHCI at `00:17.0` claimed by `ahci` over **32-bit** MSI; xHCI
+at `00:14.0`, the Designware I²C controller at `00:15.0` and the RTL8111 with **no driver**; **no
+COM1** — so the loopback self-test fails, which the report should say as "no UART" rather than as a
+test failure.
+
+### Left alone
+
+- **Names for PCI IDs.** A vendor/device database is a large table for a readability gain a phone
+  search covers.
+- **Keeping the report.** The photograph is the record; the live root is writable but forgotten at
+  power-off.
+- **ACPI beyond the static tables.** No AML, no `_PRT`: Part A made them unnecessary for the disk.
+- **SMBIOS.** Useful, not on the list, and a table walk of its own.
+
 ## Part E — the resolution this machine actually has ⬜
 
 - [ ] Boot QEMU at **1366×768 with a padded pitch** and pass every display gate.
