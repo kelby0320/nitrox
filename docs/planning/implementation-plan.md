@@ -300,6 +300,12 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     `kernel_main`, in an embedded Terminus face, until the first `/dev/framebuffer` handout; a
     panic or fatal fault takes the screen back. `cargo xtask check-fbcon` boots with
     `-serial none` and reads the boot, the hand-over and a panic back off the screen as text.
+  - **Part C (the live image) is complete, 2026-09-14.** `init.toml` grew `[[bind]]`, which took
+    the last build-mode `cfg` out of `init` and closed the test-path retrofit; a Limine module after
+    the initramfs is a RAM-backed block device with its own completion interrupt; and
+    `cargo xtask image --live` carries the release root as `root.img`, mounted by the same
+    `fs-server-ext4`. `check-live` boots it as a USB stick with no disk; `check-images` holds it to
+    the release image but for one manifest line.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

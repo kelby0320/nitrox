@@ -180,8 +180,11 @@ jobs:
 
       # **The test image and the release image may differ only on a short allow-list.** Builds both
       # initramfs archives and compares them file by file: four of the seven are
-      # byte-identical, and the three that are not are the two declaration files plus
-      # `sbin/init`, which still carries one `#[cfg(feature = "selftest")]`. A new divergence
+      # byte-identical, and the three that are not are data — the two declaration files and the
+      # mount manifest (every program has matched since Phase 5 Part C.1). **And the live image**
+      # (Part C): its initramfs may differ from the release one in `etc/init.toml` alone, and the
+      # filesystem inside its `root.img` must be the release root partition's, read back out of
+      # both with `debugfs` — which is why this step now builds both full images. A new divergence
       # fails here — wiring `mode.features()` into a build that does not take one, the shape
       # Part B removed from `session-mgr`, makes that program's ELF differ with nothing else in
       # CI to notice. (A bare `#[cfg]` does not: those crates declare no features, so it is inert
@@ -252,6 +255,15 @@ jobs:
       # so none of them would notice the console drawing nothing. Added with Phase 5 Part B.
       - name: cargo xtask check-fbcon --kvm
         run: cargo xtask check-fbcon --kvm
+
+      # **The live image boots a machine with no storage driver** (Phase 5 Part C): attached as a
+      # USB stick with the AHCI controller empty, the release root arrives as a Limine module the
+      # kernel publishes as a RAM disk, `init` mounts it, the greeter comes up within a bound a
+      # tick-bound RAM disk cannot meet, and a login writes under /home. The image exists for the
+      # laptop's first boot (Part F); a live image that stopped booting in the meantime is the
+      # failure this is for.
+      - name: cargo xtask check-live --kvm
+        run: cargo xtask check-live --kvm
 
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a

@@ -15,6 +15,7 @@
 //!   check-terminal  boot + type into the GUI terminal; assert the shell answered
 //!   check-login     boot the release image + drive the graphical greeter to a session
 //!   check-fbcon     boot with no serial port; read the boot, the handover and a panic off the screen
+//!   check-live      boot the live image as a USB stick with no disk; mount, greeter, and a write
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -217,6 +218,8 @@ fn main() -> ExitCode {
     // keyboard. See `cmd_qemu`: without a grab the guest cursor and the host pointer are two
     // different cursors, and the host desktop keeps `Super` for itself.
     let grab = rest.iter().any(|a| a == "--grab");
+    // `--live` (`image` only): build the live image instead — see `cmd_image_live`.
+    let live = rest.iter().any(|a| a == "--live");
     // **Rejected before dispatch, not in a match arm.** A flag that exists to make an
     // invisible path visible must not be silently ignored: someone reproducing a sweep bug
     // interactively would otherwise get a boot with the i8042's IRQs *on* and nothing said
@@ -227,6 +230,13 @@ fn main() -> ExitCode {
         eprintln!(
             "xtask: `--grab` is only meaningful for `qemu`/`qemu-debug` — it is about a person \
              using the window, and every other command drives the guest over QMP"
+        );
+        return ExitCode::FAILURE;
+    }
+    if live && cmd.as_deref() != Some("image") {
+        eprintln!(
+            "xtask: `--live` is only meaningful for `image` — `check-live` builds the live image \
+             itself, and `check-images` compares it"
         );
         return ExitCode::FAILURE;
     }
@@ -246,7 +256,7 @@ fn main() -> ExitCode {
     let qargs: Vec<String> = rest
         .iter()
         .filter(|a| {
-            *a != "--selftest" && *a != "--kvm" && *a != "--no-ps2-irq" && *a != "--grab"
+            *a != "--selftest" && *a != "--kvm" && *a != "--no-ps2-irq" && *a != "--grab" && *a != "--live"
         })
         .cloned()
         .collect();
@@ -258,6 +268,7 @@ fn main() -> ExitCode {
 
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
+        Some("image") if live => cmd_image_live(),
         Some("image") => cmd_image(mode),
         Some("qemu") => cmd_qemu(false, mode, accel, grab, &qargs),
         Some("qemu-debug") => cmd_qemu(true, mode, accel, grab, &qargs),
@@ -287,6 +298,7 @@ fn main() -> ExitCode {
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
         Some("check-fbcon") => cmd_check_fbcon(accel),
+        Some("check-live") => cmd_check_live(accel),
         Some("bench-compose") => cmd_bench_compose(accel),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq),
         Some("check-irq-scope") => cmd_check_irq_scope(),
@@ -326,6 +338,7 @@ fn print_help() {
            check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
            check-login       type a wrong then a right password at the graphical greeter\n  \
            check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
+           check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
@@ -2182,6 +2195,138 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
     v.sort_unstable();
     let idx = (v.len() * p).div_ceil(100).saturating_sub(1).min(v.len() - 1);
     v[idx]
+}
+
+/// `cargo xtask check-live` — **the live image boots a machine with no storage driver** (Phase 5
+/// Part C).
+///
+/// Boots `nitrox-live.img` attached as a **USB stick** (`qemu-xhci` + `usb-storage`) with nothing
+/// on the AHCI controller: the laptop's situation, where the firmware's USB stack reads the stick
+/// and the kernel, which has no USB driver, never sees it again. Asserts over serial, in order:
+///
+/// 1. no SATA disk — no storage driver carried the boot;
+/// 2. the second Limine module became a block device, and the GPT pass found a partition labelled
+///    `nitrox-live` on it;
+/// 3. `init` mounted `/` from that partition, and the greeter was presented **within
+///    [`LIVE_MOUNT_TO_GREETER`]** — a RAM disk that completed on the timer tick instead of on its
+///    own interrupt does not make it;
+/// 4. a login on the serial column writes a file under `/home` and reads it back — the root is
+///    writable, in RAM.
+fn cmd_check_live(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image_live()?;
+    let ovmf = locate_ovmf()?;
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: live image gate — booting a USB stick, with no disk…\n");
+    let mut session = Session::spawn(cmd, "check-live")?;
+    let result = run_live_steps(&mut session);
+    let transcript = session.finish();
+    match result {
+        Ok(()) => {
+            println!("\nxtask: the live image booted from RAM with no disk, and its root takes writes ✓");
+            Ok(())
+        }
+        Err(e) => {
+            println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+            Err(e)
+        }
+    }
+}
+
+/// Mount to greeter, at most, on the live image.
+///
+/// **Set from measurement, 2026-09-14**, between the two ways a RAM-disk completion can arrive,
+/// timed by when the serial lines reached the host:
+///
+/// | | completion interrupt (shipped) | deleted — completion on the tick |
+/// |---|---|---|
+/// | TCG | 180 ms | 4,363 ms |
+/// | KVM | 39 ms | 3,082–3,311 ms |
+///
+/// 1.5 s is eight times the slower good path and under half the fastest bad one. A first guess of
+/// 3 s would have passed the deleted-interrupt control by 311 ms under KVM. (The TCG bad-path
+/// figure is from before the gate timed arrivals; that path's lines arrive seconds apart, so the
+/// two timings agree there.)
+const LIVE_MOUNT_TO_GREETER: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn run_live_steps(s: &mut Session) -> R<()> {
+    // 1. No disk. QEMU's q35 AHCI controller is present and empty, as a laptop's would be of
+    //    anything Nitrox could boot from.
+    s.expect("ahci: no SATA disk on any implemented port")?;
+
+    // 2. The module is a disk, and its partition is named.
+    s.expect("ramdisk: module 1 (/boot/root.img)")?;
+    s.expect(&format!("label \"{LIVE_ROOT_PARTLABEL}\" -> block node"))?;
+
+    // 3. The root is that partition, and the desktop comes up off it without waiting on a tick.
+    s.expect(&format!("init:   /: fs-server-ext4 on gpt-partlabel:{LIVE_ROOT_PARTLABEL} (rw)"))?;
+    s.expect("init: mounted fs-server-ext4 at /")?;
+    // Timed by **when the lines arrived**, not when `expect` returned: under KVM both land in one
+    // burst, and timing the returns measured 0 ms — the harness, not the guest.
+    let mounted = s.matched_at();
+    // **And read through it.** `mounted` is not enough on its own: `fs-server-ext4` sends Ready
+    // before it reads the superblock, so a partition holding no filesystem at all still prints
+    // it (measured 2026-09-14, by zeroing the partition). `init`'s first lookup through the new
+    // root is the first thing that needs a real filesystem.
+    s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
+    s.expect("desktop-session-mgr: greeter presented")?;
+    let took = s.matched_at().saturating_duration_since(mounted);
+    if took > LIVE_MOUNT_TO_GREETER {
+        return Err(format!(
+            "the greeter took {} ms from the mount, over the {} ms bound — block I/O on the RAM \
+             disk is completing on the timer tick rather than on its own interrupt \
+             (kernel/src/io/ramdisk.rs § Completing where a device completes)",
+            took.as_millis(),
+            LIVE_MOUNT_TO_GREETER.as_millis()
+        )
+        .into());
+    }
+    println!(
+        "  ok: mount to greeter in {} ms, within {} ms",
+        took.as_millis(),
+        LIVE_MOUNT_TO_GREETER.as_millis()
+    );
+
+    // 4. A login writes, and reads back. **Wait for the prompt by searching the whole
+    //    transcript**, not with `expect`: the serial column's `nitrox login:` and the greeter start
+    //    together, and in the runs measured the prompt came first — so an `expect` after the
+    //    greeter would be waiting for a line it had already scanned past.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while !s.transcript().contains("nitrox login:") {
+        if std::time::Instant::now() > deadline {
+            return Err("no `nitrox login:` prompt on the serial column".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    s.send("alice")?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    s.send("[7, 8, 9] | save ./live-proof.txt")?;
+    s.expect("/home>")?;
+    s.send("format(\"live-rows={}\", (open ./live-proof.txt | count))")?;
+    s.expect("live-rows=3")?;
+    println!("  ok: a file written under /home read back from the RAM disk");
+    Ok(())
 }
 
 /// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right
@@ -7596,6 +7741,10 @@ struct Session {
     gate: &'static str,
     /// Everything the guest has printed, accumulated by a reader thread.
     out: std::sync::Arc<std::sync::Mutex<String>>,
+    /// When each chunk of `out` arrived: `(end offset, instant)`, in order. For a gate that times
+    /// the guest, which the moments `expect` returns cannot do — two lines that arrive in one
+    /// burst are both buffered by the time the first `expect` sees either.
+    arrivals: std::sync::Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
     /// How far `expect` has already matched, so each step scans only new output and a
     /// pattern cannot be satisfied by an earlier occurrence of itself.
     cursor: usize,
@@ -7633,7 +7782,9 @@ impl Session {
         let mut child = cmd.spawn().map_err(|e| format!("spawn qemu: {e}"))?;
         let stdout = child.stdout.take().ok_or("qemu stdout")?;
         let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = out.clone();
+        let clock = arrivals.clone();
         std::thread::spawn(move || {
             use std::io::Read;
             let mut r = stdout;
@@ -7642,12 +7793,16 @@ impl Session {
                 if n == 0 {
                     break;
                 }
+                let now = std::time::Instant::now();
                 if let Ok(mut g) = sink.lock() {
                     g.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if let Ok(mut a) = clock.lock() {
+                        a.push((g.len(), now));
+                    }
                 }
             }
         });
-        Ok(Session { child, out, cursor: 0, gate, sent_since_match: Vec::new() })
+        Ok(Session { child, out, arrivals, cursor: 0, gate, sent_since_match: Vec::new() })
     }
 
     /// The rest of the line the last [`expect`](Self::expect) matched on.
@@ -7895,6 +8050,17 @@ impl Session {
     /// For a failure message that has to say *what did* happen rather than only what did not —
     /// [`finish`](Self::finish) takes the session, which a `return Err` in the middle of a gate
     /// cannot do.
+    /// When the text just matched by the last [`expect`](Self::expect) reached the host — the
+    /// arrival of the chunk holding its final byte.
+    fn matched_at(&self) -> std::time::Instant {
+        let end = self.cursor.saturating_sub(1);
+        self.arrivals
+            .lock()
+            .ok()
+            .and_then(|a| a.iter().find(|(chunk_end, _)| *chunk_end > end).map(|(_, t)| *t))
+            .unwrap_or_else(std::time::Instant::now)
+    }
+
     fn transcript(&self) -> String {
         self.out.lock().map(|g| g.clone()).unwrap_or_default()
     }
@@ -9272,6 +9438,145 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// `check-images`' live half: the live image differs from the release image **only in data**.
+///
+/// Two claims, each checked against what the builds produced rather than against the functions that
+/// produced them — a live build that called `stage_rootfs` and then wrote one file more would pass
+/// a check on the function (PR #297 review):
+///
+/// 1. the live initramfs carries the release initramfs's files, byte-identical except
+///    `etc/init.toml`, which must differ — it names `nitrox-live`;
+/// 2. the ext4 filesystem inside the built stick's `root.img` holds the same entries as the
+///    release image's root partition — names, kinds, sizes and contents — read back out of both
+///    with `debugfs`.
+fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
+    let live_cpio = dir.join("live.cpio");
+    build_initramfs_for(&live_cpio, BuildMode::Normal, RootDevice::Live)?;
+    let r = cpio_entries(&fs::read(release_cpio)?);
+    let l = cpio_entries(&fs::read(&live_cpio)?);
+    let mut names: Vec<&String> = r.keys().chain(l.keys()).collect();
+    names.sort();
+    names.dedup();
+    let differ: Vec<&String> = names.into_iter().filter(|k| r.get(*k) != l.get(*k)).collect();
+    if differ != ["etc/init.toml"] {
+        return Err(format!(
+            "the live initramfs must differ from the release one in `etc/init.toml` alone — the \
+             root's partition label — and it differs in {differ:?}. A live image is the release \
+             image with its root in RAM; a program or a declaration that differs is a live-only \
+             build, which Part C's discipline rules out."
+        )
+        .into());
+    }
+    println!(
+        "check-images: the live initramfs is the release one but for etc/init.toml ({} files) ✓",
+        r.len()
+    );
+
+    require_tool("debugfs")?;
+    cmd_image(BuildMode::Normal)?;
+    cmd_image_live()?;
+    let release_fs = dir.join("release-root.ext4");
+    carve_partition(&image_path(), 2, &release_fs)?;
+    let esp = dir.join("live-esp.img");
+    carve_partition(&live_image_path(), 1, &esp)?;
+    let root_img = dir.join("live-root.img");
+    let _ = fs::remove_file(&root_img);
+    run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/root.img").arg(&root_img))?;
+    let live_fs = dir.join("live-root.ext4");
+    carve_partition(&root_img, 1, &live_fs)?;
+
+    let release_tree = ext4_tree(&release_fs, &dir.join("release-root"))?;
+    let live_tree = ext4_tree(&live_fs, &dir.join("live-root"))?;
+    let mut problems: Vec<String> = Vec::new();
+    for (path, entry) in &release_tree {
+        match live_tree.get(path) {
+            None => problems.push(format!("{path}: missing from the live root")),
+            Some(e) if e != entry => problems.push(format!("{path}: differs")),
+            Some(_) => {}
+        }
+    }
+    for path in live_tree.keys().filter(|p| !release_tree.contains_key(*p)) {
+        problems.push(format!("{path}: only in the live root"));
+    }
+    if !problems.is_empty() {
+        return Err(format!(
+            "the filesystem inside the live image's root.img is not the release root: {problems:?}. \
+             The live root is built from `stage_rootfs` for a release image and nothing else."
+        )
+        .into());
+    }
+    println!(
+        "check-images: the live root.img holds the release root's {} entries, byte for byte ✓",
+        release_tree.len()
+    );
+    Ok(())
+}
+
+/// Copy partition `n` of the GPT disk image `disk` into a file of its own.
+fn carve_partition(disk: &Path, n: u32, out: &Path) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (lba, sectors) = partition_extent(disk, n)?;
+    let mut f = fs::File::open(disk)?;
+    f.seek(SeekFrom::Start(lba * 512))?;
+    let mut buf = vec![0u8; (sectors * 512) as usize];
+    f.read_exact(&mut buf)?;
+    fs::write(out, buf)?;
+    Ok(())
+}
+
+/// One entry of a filesystem tree: a directory, or a file's size and a hash of its bytes.
+#[derive(PartialEq, Debug)]
+enum TreeEntry {
+    Dir,
+    File { size: u64, hash: u64 },
+}
+
+/// Extract the ext4 filesystem image `fs_img` into `out` with `debugfs`, and describe every entry
+/// under it by path relative to the root.
+fn ext4_tree(fs_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
+    if out.exists() {
+        fs::remove_dir_all(out)?;
+    }
+    fs::create_dir_all(out)?;
+    // `rdump` complains that it cannot chown what it writes when not run as root, and extracts
+    // everything anyway; the tree below is what is checked, and an empty one fails.
+    let status = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("rdump / {}", out.display()))
+        .arg(fs_img)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("run debugfs: {e}"))?;
+    if !status.success() {
+        return Err(format!("debugfs could not read {}", fs_img.display()).into());
+    }
+    let mut tree = BTreeMap::new();
+    fn walk(root: &Path, dir: &Path, tree: &mut BTreeMap<String, TreeEntry>) -> R<()> {
+        use std::hash::{Hash, Hasher};
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = path.strip_prefix(root)?.display().to_string();
+            if entry.file_type()?.is_dir() {
+                tree.insert(rel, TreeEntry::Dir);
+                walk(root, &path, tree)?;
+            } else {
+                let bytes = fs::read(&path)?;
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                tree.insert(rel, TreeEntry::File { size: bytes.len() as u64, hash: h.finish() });
+            }
+        }
+        Ok(())
+    }
+    walk(out, out, &mut tree)?;
+    if tree.is_empty() {
+        return Err(format!("debugfs extracted nothing from {}", fs_img.display()).into());
+    }
+    Ok(tree)
+}
+
 /// The initramfs files a **test** image is allowed to differ from a **release** image in.
 ///
 /// **All three are data**: the extra service declarations, the profile manifest that lists the
@@ -9317,10 +9622,15 @@ fn cmd_check_images() -> R<()> {
     let release = dir.join("release.cpio");
     let test = dir.join("test.cpio");
 
-    // `cmd_build` first: `build_initramfs` packs ELFs that must already exist, and the two
-    // modes produce different `init` bytes.
+    // `cmd_build` first: `build_initramfs` packs ELFs that must already exist.
     cmd_build(BuildMode::Normal)?;
     build_initramfs(&release, BuildMode::Normal)?;
+
+    // **The third mode, the live image** (Phase 5 Part C), while the release programs are the
+    // ones built: its initramfs may differ from the release one in the root's label and nothing
+    // else, and the filesystem inside its `root.img` must be the release root's.
+    check_live_image(&dir, &release)?;
+
     cmd_build(BuildMode::TestHarness)?;
     build_initramfs(&test, BuildMode::TestHarness)?;
 
@@ -10547,6 +10857,34 @@ fn initramfs_path() -> PathBuf {
     build_cache().join("initramfs.cpio")
 }
 
+/// The live image (Phase 5 Part C) — a separate file, so a live build never clobbers the image
+/// every other gate boots.
+fn live_image_path() -> PathBuf {
+    build_cache().join("nitrox-live.img")
+}
+
+/// The live image's initramfs.
+fn live_initramfs_path() -> PathBuf {
+    build_cache().join("initramfs-live.cpio")
+}
+
+/// The root partition's label on a disk.
+const ROOT_PARTLABEL: &str = "nitrox-root";
+
+/// The root partition's label inside the live image's `root.img`. **Distinct on purpose**: a stick
+/// booted on a machine with Nitrox installed must not find two partitions answering to one name.
+const LIVE_ROOT_PARTLABEL: &str = "nitrox-live";
+
+/// Room the live root filesystem gets beyond what is staged on it, for what a session writes.
+/// The RAM disk takes writes; they are gone at power-off.
+const LIVE_ROOT_SLACK_MIB: u64 = 16;
+
+/// Ceiling on `root.img`. **Its reason is the firmware**: the whole file is read off a USB stick
+/// by UEFI Boot Services before the kernel runs, on a laptop whose USB stack is the firmware's.
+/// Today's release root stages about 8 MiB; an image near this size means something large got
+/// staged, and it should be a decision rather than a slower boot nobody chose.
+const LIVE_ROOT_MAX_MIB: u64 = 64;
+
 /// The programs in the boot image, each with **the reason it cannot come from the filesystem**.
 ///
 /// A pair rather than a bare name, because the reason is the whole rule and a list of names
@@ -10696,10 +11034,33 @@ const GRAPHICAL_APPLICATIONS: [(&str, &str); 3] =
 /// ELF (the kernel boot-loads `/sbin/init` from here — retiring the embedded copy),
 /// and the mandatory `TRAILER!!!`. Built by `cmd_build` before this runs.
 fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
+    build_initramfs_for(out, mode, RootDevice::Disk)
+}
+
+/// Where an image's root filesystem is, as `init.toml` names it.
+#[derive(Clone, Copy, PartialEq)]
+enum RootDevice {
+    /// The `nitrox-root` partition on the boot disk.
+    Disk,
+    /// The `nitrox-live` partition inside `root.img`, a Limine module the kernel publishes as a RAM
+    /// disk (Phase 5 Part C).
+    Live,
+}
+
+/// [`build_initramfs`], for either kind of root. The live image's initramfs is the release one
+/// with a single manifest line changed — `check-images` holds it to exactly that.
+fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
     let mut buf = Vec::new();
     // The mount manifest. A test image's also re-binds the root for the two fixtures that need
     // a second name on it — data, where it was `init`'s last build-mode `cfg` until Part C.1.
     let mut init_toml = String::from(INIT_TOML);
+    if root == RootDevice::Live {
+        let disk = format!("device = \"gpt-partlabel:{ROOT_PARTLABEL}\"");
+        if init_toml.matches(&disk).count() != 1 {
+            return Err(format!("INIT_TOML no longer names its root as {disk:?} exactly once").into());
+        }
+        init_toml = init_toml.replace(&disk, &format!("device = \"gpt-partlabel:{LIVE_ROOT_PARTLABEL}\""));
+    }
     if mode.stages_test_data() {
         init_toml.push_str(TEST_BINDS_TOML);
     }
@@ -10846,9 +11207,47 @@ fn assemble_image(
     //    FAT is bounded to the partition), then splice it in. mformat on a plain
     //    file formats the whole file; no `@@offset` games.
     let esp = work.join("esp.img");
+    build_esp(&esp, esp_sectors, bootx64, conf, kernel, initramfs, &[])?;
+    splice_into(out, esp_lba * 512, &esp)?;
+
+    // 4. Build the ext4 `nitrox-root` filesystem as a separate, partition-sized
+    //    image populated at creation (`mke2fs -d`, no root/mount), then splice it
+    //    in. The feature set matches the fs-server-ext4 reader's support (the
+    //    Part-2 fixture uses the same flags). The staging tree holds the milestone
+    //    file the Part-6 init loop reads.
+    let staging = work.join("rootfs");
+    stage_rootfs(&staging, mode)?;
+
+    let rootfs = work.join("rootfs.ext4");
+    let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-d").arg(&staging)
+        .arg(&rootfs)
+        .arg(blocks.to_string()))?;
+    splice_into(out, root_lba * 512, &rootfs)?;
+
+    // Leave `work/` in place for inspection; `cmd_image` rebuilds it each run.
+    Ok(())
+}
+
+/// Build an ESP image of `sectors` sectors: Limine, its configuration, the kernel and its font
+/// licence, the initramfs, and any `extra` `(source, ESP path)` files — the live image's
+/// `root.img`. Shared by both image builders so neither can forget a file the other ships.
+fn build_esp(
+    esp: &Path,
+    sectors: u64,
+    bootx64: &Path,
+    conf: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    extra: &[(&Path, &str)],
+) -> R<()> {
     {
-        let f = fs::File::create(&esp)?;
-        f.set_len(esp_sectors * 512)?;
+        let f = fs::File::create(esp)?;
+        f.set_len(sectors * 512)?;
     }
     let espf = esp.display().to_string();
     run(Command::new("mformat").arg("-i").arg(&espf).arg("-F").arg("-v").arg("NITROX_ESP"))?;
@@ -10869,14 +11268,135 @@ fn assemble_image(
         .arg(repo_root().join("assets/fonts/LICENSE-Terminus.txt"))
         .arg("::/boot/LICENSE-Terminus.txt"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(initramfs).arg("::/boot/initramfs"))?;
-    splice_into(out, esp_lba * 512, &esp)?;
+    for (from, to) in extra {
+        run(Command::new("mcopy").arg("-i").arg(&espf).arg(from).arg(format!("::{to}")))?;
+    }
+    Ok(())
+}
 
-    // 4. Build the ext4 `nitrox-root` filesystem as a separate, partition-sized
-    //    image populated at creation (`mke2fs -d`, no root/mount), then splice it
-    //    in. The feature set matches the fs-server-ext4 reader's support (the
-    //    Part-2 fixture uses the same flags). The staging tree holds the milestone
-    //    file the Part-6 init loop reads.
+/// `cargo xtask image --live` — the live image (Phase 5 Part C): the release kernel and initramfs,
+/// with the release root filesystem riding along as a second Limine module, so a machine boots to
+/// a desktop without a storage driver.
+fn cmd_image_live() -> R<()> {
+    let mode = BuildMode::Normal;
+    cmd_build(mode)?;
+    let limine_root = cmd_fetch_limine()?;
+    let bootx64 = find_bootx64(&limine_root)?;
+    let initramfs = live_initramfs_path();
+    build_initramfs_for(&initramfs, mode, RootDevice::Live)?;
+    assemble_live_image(&bootx64, &kernel_elf(), &initramfs, &live_image_path())?;
+    println!("xtask: live image at {}", live_image_path().display());
+    Ok(())
+}
+
+/// Assemble the live image at `out`: a GPT disk with one ESP holding everything, `root.img`
+/// included. `root.img` is itself a GPT image with one `nitrox-live` partition, whose ext4
+/// filesystem is built from [`stage_rootfs`] for a release image — the release root, in RAM.
+fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Path) -> R<()> {
+    const MIB: u64 = 1024 * 1024;
+    require_tool("sgdisk")?;
+    require_tool("mformat")?;
+    require_tool("mcopy")?;
+    require_tool("mmd")?;
+    require_tool("mke2fs")?;
+
+    let work = out.with_extension("partbuild");
+    if work.exists() {
+        fs::remove_dir_all(&work)?;
+    }
+    fs::create_dir_all(&work)?;
+
+    // 1. `root.img`: a partition sized to the staged tree plus room to write, under its ceiling.
     let staging = work.join("rootfs");
+    stage_rootfs(&staging, BuildMode::Normal)?;
+    let staged = tree_bytes(&staging)?;
+    let part_mib = staged.div_ceil(MIB) + LIVE_ROOT_SLACK_MIB;
+    let root_img_mib = part_mib + 2; // a MiB before the partition, room for the backup GPT after
+    if root_img_mib > LIVE_ROOT_MAX_MIB {
+        return Err(format!(
+            "root.img would be {root_img_mib} MiB, over the {LIVE_ROOT_MAX_MIB} MiB ceiling — the \
+             root stages {staged} bytes. The firmware reads all of it off a USB stick before the \
+             kernel runs; see LIVE_ROOT_MAX_MIB before raising it."
+        )
+        .into());
+    }
+    let root_img = work.join("root.img");
+    fs::File::create(&root_img)?.set_len(root_img_mib * MIB)?;
+    run(Command::new("sgdisk")
+        .arg("--clear")
+        .arg("-n").arg("1:2048:0")
+        .arg("-t").arg("1:8300")
+        .arg("-c").arg(format!("1:{LIVE_ROOT_PARTLABEL}"))
+        .arg(&root_img))?;
+    let (root_lba, root_sectors) = partition_extent(&root_img, 1)?;
+    let rootfs = work.join("rootfs.ext4");
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-d").arg(&staging)
+        .arg(&rootfs)
+        .arg(((root_sectors * 512) / 4096).to_string()))?;
+    splice_into(&root_img, root_lba * 512, &rootfs)?;
+
+    // 2. Limine's configuration: the release one, with `root.img` as the second module.
+    let base = fs::read_to_string(limine_conf())?;
+    let initramfs_line = "module_path: boot():/boot/initramfs";
+    if base.matches(initramfs_line).count() != 1 {
+        return Err(format!("boot/limine.conf no longer has {initramfs_line:?} exactly once").into());
+    }
+    let conf = work.join("limine.conf");
+    fs::write(
+        &conf,
+        base.replace(initramfs_line, &format!("{initramfs_line}\n    module_path: boot():/boot/root.img")),
+    )?;
+
+    // 3. The stick: one ESP big enough for all of it.
+    let payload = [bootx64, kernel, initramfs, root_img.as_path()]
+        .iter()
+        .map(|p| fs::metadata(p).map(|m| m.len()))
+        .sum::<Result<u64, _>>()?;
+    let esp_mib = ESP_SIZE_MIB.max(payload.div_ceil(MIB) + 8);
+    if out.exists() {
+        fs::remove_file(out)?;
+    }
+    fs::File::create(out)?.set_len((esp_mib + 2) * MIB)?;
+    run(Command::new("sgdisk")
+        .arg("--clear")
+        .arg("-n").arg(format!("1:2048:+{esp_mib}M"))
+        .arg("-t").arg("1:ef00")
+        .arg("-c").arg("1:NITROX_ESP")
+        .arg(out))?;
+    let (esp_lba, esp_sectors) = partition_extent(out, 1)?;
+    let esp = work.join("esp.img");
+    build_esp(&esp, esp_sectors, bootx64, &conf, kernel, initramfs, &[(root_img.as_path(), "/boot/root.img")])?;
+    splice_into(out, esp_lba * 512, &esp)?;
+    println!(
+        "xtask: live root.img {root_img_mib} MiB ({staged} bytes staged), stick {} MiB",
+        esp_mib + 2
+    );
+    Ok(())
+}
+
+/// Total bytes of the regular files under `dir`.
+fn tree_bytes(dir: &Path) -> R<u64> {
+    let mut total = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        total += if meta.is_dir() { tree_bytes(&entry.path())? } else { meta.len() };
+    }
+    Ok(total)
+}
+
+/// Stage the root filesystem's tree for `mode` into `staging` — everything `mke2fs -d` puts on
+/// `nitrox-root`: `/system`, the store, the demo home, the fonts.
+///
+/// **One function for every image that carries a root**, extracted from `assemble_image` in
+/// Phase 5 Part C so the live image's `root.img` is built from the release root's staging rather
+/// than a copy of its steps. `check-images` does not trust that and compares the built filesystems
+/// anyway — see `check_live_root`.
+fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     fs::create_dir_all(staging.join("system"))?;
     // `/scratch` — the backing directory for the **second writable mount**. The kernel
     // calls a rename cross-filesystem when the two paths resolve to a different (server,
@@ -11128,19 +11648,6 @@ fn assemble_image(
         }
         println!("xtask: seeded /system/fonts ({} files, {total} bytes)", faces.len());
     }
-
-    let rootfs = work.join("rootfs.ext4");
-    let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
-    run(Command::new("mke2fs")
-        .arg("-q").arg("-F").arg("-t").arg("ext4")
-        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
-        .arg("-b").arg("4096")
-        .arg("-d").arg(&staging)
-        .arg(&rootfs)
-        .arg(blocks.to_string()))?;
-    splice_into(out, root_lba * 512, &rootfs)?;
-
-    // Leave `work/` in place for inspection; `cmd_image` rebuilds it each run.
     Ok(())
 }
 

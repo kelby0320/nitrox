@@ -331,10 +331,15 @@ the boot banner it replaced is gone.
   F10 for the third claim, since QEMU's `inject-nmi` arrives through LINT1 and does nothing to this
   kernel under TCG or KVM. Every claim was failed on purpose first.
 
-## Part C — the live image ⬜
+## Part C — the live image ✅
 
-- [ ] **A third image mode whose root filesystem arrives with the kernel**, so the first boot on
+- [x] **A third image mode whose root filesystem arrives with the kernel**, so the first boot on
       real hardware needs no storage driver and no partitioning.
+
+> **Landed 2026-09-14**, in the four pieces below and against the detail pass unchanged in design.
+> `cargo xtask image --live` writes `tools/build-cache/nitrox-live.img`; `cargo xtask check-live`
+> boots it as a USB stick with no disk. The notes under C.2 and C.4 record where the measurements
+> and the controls came out differently from what the pass predicted.
 
 **Why it exists.** Booting from a USB stick does not give us a root filesystem on that stick.
 Limine reads the kernel and its modules through **UEFI Boot Services** — the firmware's own USB
@@ -455,14 +460,14 @@ binding, so they are its gate.
 
 **C.2 — a Limine module after the first is a RAM-backed block device**
 
-- [ ] `init_initramfs` keeps module 0 as the initramfs. Every further module is published as a
+- [x] `init_initramfs` keeps module 0 as the initramfs. Every further module is published as a
       block `DeviceNode` over the module's own memory — no copy — before `drivers::probe` runs its
       GPT pass, so the partition scan and the `/dev/disk/by-partlabel/` names come from the code
       AHCI disks already use. The kernel logs the module's path and size.
-- [ ] The backing generalises the existing bring-up `RamDisk` (`kernel/src/io/ramdisk.rs`), which
+- [x] The backing generalises the existing bring-up `RamDisk` (`kernel/src/io/ramdisk.rs`), which
       today owns a 64 KiB pattern-filled `KVec` for the I/O spine self-test; that self-test keeps
       working unchanged.
-- [ ] **A completion must not wait for the tick** (PR #297 review, measured). Today's
+- [x] **A completion must not wait for the tick** (PR #297 review, measured). Today's
       `ramdisk_submit` copies, then `dpc::enqueue`s the completion — and DPCs drain only at an
       interrupt tail. A RAM disk raises no interrupt, so every completion would wait for the next
       10 ms timer tick: the waiter parks (`block_on_po` for page-cache fills, `sys_wait` for the
@@ -473,7 +478,7 @@ binding, so they are its gate.
       **8.43 s** at `-smp 1`, under KVM. That is the fs-server "I/O hang" of 2026-07-23 again, and
       on a laptop with no serial port it is a long silent stall right after the mount — the
       ambiguity the live image exists to remove.
-- [ ] **So the RAM disk raises its own completion interrupt.** It registers a device vector like
+- [x] **So the RAM disk raises its own completion interrupt.** It registers a device vector like
       any driver and, after the copy and the enqueue, sends that vector to its own CPU. The
       completion then runs where AHCI's does: `device_irq_dispatch` drains the DPC in a fresh
       interrupt lock scope and calls `resched_if_idle`, the scheduling point that fixed the I/O
@@ -481,48 +486,57 @@ binding, so they are its gate.
       takes `SCHED` and `submit` runs in whatever lock context its caller holds, which the
       interrupt tail's fresh scope never has to reason about. A self-IPI needs a neutral way to
       raise a vector on the current CPU; `send_ipi` is arch-internal today.
-- [ ] **A concurrency model, stated.** The bring-up `RamDisk`'s `Sync` rests on "accessed only on
+- [x] **A concurrency model, stated.** The bring-up `RamDisk`'s `Sync` rests on "accessed only on
       the single CPU that services it", which a root disk breaks — the fs-server and page-cache
       fills submit from any CPU. AHCI serialises through its port lock and one in-flight slot. The
       RAM disk takes a lock around each transfer, so a read racing a write of the same block sees
       one or the other, never a torn block, which is what a real disk guarantees.
-- [ ] **The GPT pass names what it found.** `gpt::init` logs `N partition(s)` and each partition's
+- [x] **The GPT pass names what it found.** `gpt::init` logs `N partition(s)` and each partition's
       index and LBAs, never its label, so no serial line can say `nitrox-live` was found. It logs
       the label too — the gate needs it here, and Part D's hardware report wants it on the
       laptop's own disk.
-- [ ] **Writable.** The module lives in `MEMMAP_KERNEL_AND_MODULES` memory, which the kernel never
+- [x] **Writable.** The module lives in `MEMMAP_KERNEL_AND_MODULES` memory, which the kernel never
       reclaims and reaches through the HHDM like the initramfs. To confirm in C.2 rather than
       assumed here: that the HHDM mapping of module memory is writable on both targets. If it is
       not, the fallback is to copy the module into buddy frames at boot, which costs its size in
       RAM once.
-- [ ] Host tests for the backing's bounds and block arithmetic; the in-guest proof is C.4's gate.
+      **Confirmed under QEMU (TCG and KVM), 2026-09-14**: `check-live` writes a file under `/home`
+      and reads it back off the module's memory. The laptop's firmware is Part F's to confirm.
+- [x] Host tests for the backing's bounds and block arithmetic; the in-guest proof is C.4's gate.
+
+> **Landed 2026-09-14.** Measured through C.4's gate with the self-interrupt deleted: mount to
+> greeter 3,082–3,311 ms under KVM and 4,363 ms under TCG, against 39 ms and 180 ms with it —
+> the review's stand-in, reproduced on the RAM disk itself. The self-interrupt needed two neutral
+> operations, `ArchIrqInstall::install_software` and `ArchIrq::raise_on_self` (the x2APIC SELF IPI
+> register). Limine reports a module's path without the `boot():` prefix, so the kernel logs
+> `module 1 (/boot/root.img)`.
 
 **C.3 — the live image, built by `cargo xtask image --live`**
 
-- [ ] A separate file (`tools/build-cache/nitrox-live.img`), so a live build never clobbers the
+- [x] A separate file (`tools/build-cache/nitrox-live.img`), so a live build never clobbers the
       image every other gate boots. One GPT partition — an ESP sized to its contents — holding
       Limine, the **release** kernel, the release initramfs with the live `init.toml`, the
       Terminus licence, and `boot/root.img`.
-- [ ] `root.img` is a GPT image with one partition, `nitrox-live`, holding an ext4 filesystem
+- [x] `root.img` is a GPT image with one partition, `nitrox-live`, holding an ext4 filesystem
       built from **the release root's staging tree** — the same function, not a copy of its steps.
       Sized to its contents plus slack for writes, and under a ceiling of its own with its own
       reason: it is what firmware reads off a USB stick before the kernel runs.
-- [ ] `INITRAMFS_MAX_BYTES` stays one number. The first draft made it per-mode because the live
+- [x] `INITRAMFS_MAX_BYTES` stays one number. The first draft made it per-mode because the live
       initramfs was going to carry the whole system; in this design it is the release initramfs
       with one manifest line changed, so the release ceiling still describes it.
 
 **C.4 — the gates**
 
-- [ ] **`check-images` learns the third mode**: the live initramfs may differ from the release
+- [x] **`check-images` learns the third mode**: the live initramfs may differ from the release
       one in `etc/init.toml` and nothing else, and **the files inside the built `root.img` must be
       the files inside the release root partition** — names, kinds, sizes and contents, read back
       out of both ext4 images with `debugfs` (e2fsprogs, which already provides `mke2fs`). Compared
       at the output, not at the staging function (PR #297 review): C.3 has to extract that function
       from `assemble_image` anyway, and a check that compared its output for release against its
       output for live would miss a live build that called it and then wrote one file more.
-- [ ] **Its control is exactly that file**: have `image --live` add one to the staging tree before
+- [x] **Its control is exactly that file**: have `image --live` add one to the staging tree before
       `mke2fs`, and the check must fail naming it.
-- [ ] **`cargo xtask check-live`** boots `nitrox-live.img` as a **USB stick**, with nothing on the
+- [x] **`cargo xtask check-live`** boots `nitrox-live.img` as a **USB stick**, with nothing on the
       AHCI controller, and asserts over serial:
   1. `ahci: no SATA disk on any implemented port` — no storage driver carried the boot;
   2. the module became a block device — its log line, with `boot():/boot/root.img` — and the GPT
@@ -532,7 +546,7 @@ binding, so they are its gate.
      below what a tick-bound completion can reach (4.85 s under KVM in the review's stand-in);
   4. a login on the serial column can **write a file under `/home` and read it back** — the claim
      the first draft could not make.
-- [ ] **Its controls**, run before it is trusted, each aimed at the step it must fail:
+- [x] **Its controls**, run before it is trusted, each aimed at the step it must fail:
   - drop the second `module_path` — **step 2** fails, since with AHCI empty there is then no block
     device for the GPT pass to scan (the first draft predicted step 3, which this never reaches);
   - keep the module but label its partition `nitrox-root` — **step 3** fails at the mount, which is
@@ -541,8 +555,28 @@ binding, so they are its gate.
     the completion path above;
   - attach the image on AHCI as well — **step 1** fails, since the gate would notice a boot that
     had a disk after all.
-- [ ] In CI's QEMU job, unconditionally: the image exists for Part F, and a live image that
+- [x] In CI's QEMU job, unconditionally: the image exists for Part F, and a live image that
       stopped booting in the meantime is the failure this gate is for.
+
+> **Landed 2026-09-14, and the controls moved two assertions.**
+>
+> - **The `nitrox-root`-labelled module failed step 2, not step 3**, because step 2 asserts the label
+>   and so sees it first. The control the pass wanted for step 3 is a partition that is found and
+>   named but **holds no filesystem** — and that exposed something the gate had assumed: with the
+>   partition zeroed, `init: mounted fs-server-ext4 at /` still printed. `fs-server-ext4` sends Ready
+>   before it reads the superblock, and checks the ext4 magic only when a lookup arrives; the boot then
+>   fails three steps later as `image not found: /bin/auth-service`. So step 3 also requires `init`'s
+>   first read through the new root, `/system/current-generation`, and the zeroed partition fails
+>   there. The server's behaviour is unchanged here — it predates Part C and is recorded in the
+>   decision log.
+> - **The time bound is 1.5 s, timed by when lines reach the host.** Timing `expect` returns read 0 ms
+>   under KVM, because both lines arrive in one burst; the Session now stamps each chunk on arrival.
+>   Good path 39 ms (KVM) and 180 ms (TCG); with the self-interrupt deleted, 3,082–3,311 ms (KVM) and
+>   4,363 ms (TCG). A first guess of 3 s would have passed that control by 311 ms.
+> - Every control failed its step: no module (step 2), the wrong label (step 2), no filesystem
+>   (step 3), no completion interrupt (the bound), a disk on AHCI as well (step 1). `check-images`'
+>   live half failed on a file staged only in the live build (`system/live-only: only in the live
+>   root`) and on a live-only line in the service declarations.
 
 ### Accepted limitations of the live mode
 
@@ -581,7 +615,8 @@ conditions under which a compositor's damage arithmetic goes wrong by a few pixe
 
 ## Part F — the first boot ⬜
 
-- [ ] Write the live image to a USB stick, boot the laptop, and fix what breaks.
+- [ ] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
+      USB stick, boot the laptop, and fix what breaks.
 
 The honest content of this part is unknown, which is why it is a part and not a checklist. What
 is known is the order to look in: firmware handoff → framebuffer → ACPI tables → CPU/APIC
