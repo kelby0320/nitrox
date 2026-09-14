@@ -24,6 +24,13 @@
 //!   interrupt by writing them itself. Nothing routes it, so there is nothing
 //!   for firmware to get wrong, and two devices can never share a vector.
 //!
+//! A third member arrived with Phase 5 Part C, and it is the odd one out:
+//! **a vector no device raises** ([`ArchIrqInstall::install_software`]). A RAM
+//! disk finishes its copy inside `submit`, but its completion must still run
+//! where a device's does — at the device-interrupt tail, which drains the DPC and
+//! reschedules — or every block I/O waits for the timer tick. So it installs a
+//! handler like any driver and raises the vector on itself.
+//!
 //! The message's *contents* are architectural: on x86 the address names a local
 //! APIC and the data names a vector. The PCI capability the message is written
 //! into is not architectural at all, and lives in [`crate::pci`]. That split is
@@ -74,4 +81,17 @@ pub trait ArchIrqInstall {
     /// the kernel's lifetime, and the caller must be ready to receive the
     /// interrupt from the moment it writes the message into the device.
     unsafe fn install_msi(handler: extern "C" fn()) -> Option<MsiMessage>;
+
+    /// Register `handler` for a fresh device vector that **no device raises**: the kernel raises
+    /// it on the current CPU with
+    /// [`ArchIrq::raise_on_self`](crate::arch::irq::ArchIrq::raise_on_self). Returns the vector.
+    ///
+    /// For a backend with no hardware of its own whose completions must still run at a
+    /// device-interrupt tail — a RAM disk. Without one, a completion DPC waits for the next timer
+    /// tick, which serialises every block I/O on it (Phase 5 Part C, PR #297 review).
+    ///
+    /// # Safety
+    /// Ring-0, after the interrupt table is installed. `handler` must stay valid for the kernel's
+    /// lifetime.
+    unsafe fn install_software(handler: extern "C" fn()) -> u8;
 }

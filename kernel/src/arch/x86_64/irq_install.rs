@@ -86,6 +86,12 @@ impl ArchIrqInstall for X86IrqInstall {
         let vector = idt::register_device_handler(handler);
         compose(vector, dest)
     }
+
+    unsafe fn install_software(handler: extern "C" fn()) -> u8 {
+        // Nothing to route or program: the vector is raised by the kernel, on the CPU that wants
+        // it, through the SELF IPI register.
+        idt::register_device_handler(handler)
+    }
 }
 
 #[cfg(test)]

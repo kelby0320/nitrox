@@ -135,6 +135,22 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
 
     let by_partuuid = format_partuuid(&e[16..32]);
     let by_partlabel = decode_partlabel(&e[56..128]);
+    // **The label, by name.** A partition is found by its label (`init.toml`'s
+    // `gpt-partlabel:`), and until Phase 5 Part C no line said which labels a disk carried — so a
+    // live boot could not show it had found `nitrox-live`, and the laptop's hardware report could
+    // not list what is on its own disk.
+    let label = by_partlabel
+        .as_ref()
+        .and_then(|p| core::str::from_utf8(&p[PARTLABEL_PREFIX.len()..]).ok())
+        .unwrap_or("");
+    crate::kprintln!(
+        "gpt:  partition {} lba {}..{} ({} sectors) label \"{}\" -> block node",
+        index,
+        first_lba,
+        first_lba + count - 1,
+        count,
+        label
+    );
     if let Some(uuid) = by_partuuid {
         record(PartEntry {
             node: node_ref.clone(),
@@ -142,13 +158,6 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
             by_partlabel,
         });
     }
-    crate::kprintln!(
-        "gpt:  partition {} lba {}..{} ({} sectors) -> block node",
-        index,
-        first_lba,
-        first_lba + count - 1,
-        count
-    );
     // The device table owns the node (it now also resolves at /dev/blk/<n>).
     crate::device::register(node_ref);
     true
@@ -251,12 +260,15 @@ fn hex_lo(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
+/// The namespace directory a partition's label is bound under.
+const PARTLABEL_PREFIX: &[u8] = b"/dev/disk/by-partlabel/";
+
 /// Decode a GPT partition name (72 bytes UTF-16LE) into
 /// `/dev/disk/by-partlabel/<label>`. ASCII-only; `None` if empty, non-ASCII, or
 /// containing a path separator (not a usable component).
 fn decode_partlabel(name: &[u8]) -> Option<KVec<u8>> {
     let mut p = KVec::new();
-    p.try_extend_from_slice(b"/dev/disk/by-partlabel/").ok()?;
+    p.try_extend_from_slice(PARTLABEL_PREFIX).ok()?;
     let mut any = false;
     let mut i = 0;
     while i + 1 < name.len() {

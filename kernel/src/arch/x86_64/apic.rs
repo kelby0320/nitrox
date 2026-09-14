@@ -35,6 +35,9 @@ const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
 const X2APIC_MSR_BASE: u32 = 0x800;
 /// The Interrupt Command Register as a single 64-bit MSR (= `0x800 + 0x300>>4`).
 const MSR_X2APIC_ICR: u32 = 0x830;
+/// The x2APIC **SELF IPI** register: writing a vector sends that vector, fixed delivery and
+/// edge-triggered, to this CPU alone — no destination to compute and no ICR to compose.
+const MSR_X2APIC_SELF_IPI: u32 = 0x83F;
 
 // --- Local-APIC register offsets (Intel SDM Vol.3 Table 11-1; xAPIC MMIO offsets,
 //     reused here as `0x800 + offset>>4` MSR indices) ------------------------
@@ -245,5 +248,12 @@ impl ArchIrq for XApic {
         // SAFETY: the ID register MSR is readable once x2APIC is enabled; the read
         // has no side effects. In x2APIC the value is the full 32-bit id.
         unsafe { read_reg(REG_APICID) }
+    }
+
+    unsafe fn raise_on_self(vector: u8) {
+        // SAFETY: writing the SELF IPI MSR is the architected way to interrupt this CPU; valid
+        // in ring 0 once x2APIC is enabled here (the caller's contract), and the caller
+        // guarantees `vector` has a handler.
+        unsafe { regs::wrmsr(MSR_X2APIC_SELF_IPI, vector as u64) };
     }
 }

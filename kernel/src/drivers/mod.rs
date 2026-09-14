@@ -36,6 +36,10 @@ pub fn probe() {
         }
     }
 
+    // Limine modules after the initramfs are disks too (Phase 5 Part C): publish them now, so the
+    // GPT pass below scans them exactly as it scans a SATA disk.
+    crate::io::ramdisk::publish_modules();
+
     // Controllers have published their disks; parse each disk's GPT and publish
     // its partitions. Re-snapshot *now* so the (block-class) disks are visible but
     // the partitions gpt::init creates are not re-scanned.
