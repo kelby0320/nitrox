@@ -25489,3 +25489,15 @@ images while `cmd_build` still passes it `--features test-harness`, so the featu
 
 **Process (maintainer's call):** the corrected plan is its own PR, reviewed before Part C's code
 begins, as Part A's was.
+
+**The review of that PR (#297) found the design's one timing hazard, and measured it.** A RAM disk
+raises no interrupt, and a block completion is a DPC that drains only at an interrupt tail — so,
+built on today's `RamDisk`, every live-root I/O would wait for the 10 ms tick. Standing in with
+AHCI's device-tail drain deleted, mount-to-greeter went from 0.10 s to 4.85 s under KVM: the
+2026-07-23 "I/O hang" again, as a silent stall on a machine with no serial port. The plan now has
+the RAM disk raise its own completion interrupt, so it completes through the same device-IRQ tail
+AHCI does, and `check-live` bounds mount-to-greeter with deleting that interrupt as the control.
+The review also caught two gate controls that could not fail the step they were written for (the
+GPT pass never logs a label, and a dropped module stops the gate before the mount), a
+`check-images` comparison that could have compared one function with itself, a RAM disk with no
+concurrency model, and an `init` that retains only the root mount's endpoint; each is in the plan.

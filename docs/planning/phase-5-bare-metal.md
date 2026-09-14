@@ -428,10 +428,14 @@ call: kept in Part C although the live image no longer needs it)*
 
 - [ ] `[[bind]]` entries: `path` (where to bind), `source` (the `mount_point` of a `[[mount]]` in
       the same manifest) and `subtree` (the base the lookups are scoped to). Processed after every
-      mount, with the source mount's retained forwarding endpoint and `sys_ns_bind`'s existing
-      base argument. A `source` naming no mount is a manifest error; a failed bind is
-      critical-path, as a failed mount is — a missing bind is how a later test fails for a reason
-      nobody can see.
+      mount, with the source mount's forwarding endpoint and `sys_ns_bind`'s existing base
+      argument. A `source` naming no mount is a manifest error; a failed bind is critical-path, as
+      a failed mount is — a missing bind is how a later test fails for a reason nobody can see.
+- [ ] **`init` retains every mount's endpoint until the binds are done.** Today it keeps only the
+      root's (`FS_ENDPOINT`, handed on to `service-mgr`) and closes each other mount's the moment
+      it is bound, so "the source mount's endpoint" exists only for `/`. The non-root endpoints
+      are closed after the bind pass instead; the root's is still handed on. (Restricting `source`
+      to `/` was the alternative, and would be a rule nothing needs.)
 - [ ] `/subtreetest` (subtree `/system`) and `/scratch` (subtree `/scratch`) become `[[bind]]`
       entries in the **test** image's `init.toml`, and the `#[cfg(feature = "selftest")]` block in
       `mount_one` is deleted.
@@ -458,6 +462,34 @@ binding, so they are its gate.
 - [ ] The backing generalises the existing bring-up `RamDisk` (`kernel/src/io/ramdisk.rs`), which
       today owns a 64 KiB pattern-filled `KVec` for the I/O spine self-test; that self-test keeps
       working unchanged.
+- [ ] **A completion must not wait for the tick** (PR #297 review, measured). Today's
+      `ramdisk_submit` copies, then `dpc::enqueue`s the completion — and DPCs drain only at an
+      interrupt tail. A RAM disk raises no interrupt, so every completion would wait for the next
+      10 ms timer tick: the waiter parks (`block_on_po` for page-cache fills, `sys_wait` for the
+      fs-server's metadata I/O), the CPU `hlt`s, and the tick wakes it. The bring-up disk never
+      showed this because `io::self_test` drains synchronously. The review measured the same wait
+      on AHCI, by deleting the device-tail drain: `init: mounted fs-server-ext4 at /` to
+      `desktop-session-mgr: greeter presented` went from **0.10 s to 4.85 s** at `-smp 4` and to
+      **8.43 s** at `-smp 1`, under KVM. That is the fs-server "I/O hang" of 2026-07-23 again, and
+      on a laptop with no serial port it is a long silent stall right after the mount — the
+      ambiguity the live image exists to remove.
+- [ ] **So the RAM disk raises its own completion interrupt.** It registers a device vector like
+      any driver and, after the copy and the enqueue, sends that vector to its own CPU. The
+      completion then runs where AHCI's does: `device_irq_dispatch` drains the DPC in a fresh
+      interrupt lock scope and calls `resched_if_idle`, the scheduling point that fixed the I/O
+      hang. **Completing inline in `submit` was the alternative, and is rejected:** the completion
+      takes `SCHED` and `submit` runs in whatever lock context its caller holds, which the
+      interrupt tail's fresh scope never has to reason about. A self-IPI needs a neutral way to
+      raise a vector on the current CPU; `send_ipi` is arch-internal today.
+- [ ] **A concurrency model, stated.** The bring-up `RamDisk`'s `Sync` rests on "accessed only on
+      the single CPU that services it", which a root disk breaks — the fs-server and page-cache
+      fills submit from any CPU. AHCI serialises through its port lock and one in-flight slot. The
+      RAM disk takes a lock around each transfer, so a read racing a write of the same block sees
+      one or the other, never a torn block, which is what a real disk guarantees.
+- [ ] **The GPT pass names what it found.** `gpt::init` logs `N partition(s)` and each partition's
+      index and LBAs, never its label, so no serial line can say `nitrox-live` was found. It logs
+      the label too — the gate needs it here, and Part D's hardware report wants it on the
+      laptop's own disk.
 - [ ] **Writable.** The module lives in `MEMMAP_KERNEL_AND_MODULES` memory, which the kernel never
       reclaims and reaches through the HHDM like the initramfs. To confirm in C.2 rather than
       assumed here: that the HHDM mapping of module memory is writable on both targets. If it is
@@ -482,19 +514,33 @@ binding, so they are its gate.
 **C.4 — the gates**
 
 - [ ] **`check-images` learns the third mode**: the live initramfs may differ from the release
-      one in `etc/init.toml` and nothing else, and the live root's staging tree must be identical
-      to the release root's, file for file. A live-only `cfg` or a live-only staging step then
-      fails the build rather than surviving to be forgotten.
+      one in `etc/init.toml` and nothing else, and **the files inside the built `root.img` must be
+      the files inside the release root partition** — names, kinds, sizes and contents, read back
+      out of both ext4 images with `debugfs` (e2fsprogs, which already provides `mke2fs`). Compared
+      at the output, not at the staging function (PR #297 review): C.3 has to extract that function
+      from `assemble_image` anyway, and a check that compared its output for release against its
+      output for live would miss a live build that called it and then wrote one file more.
+- [ ] **Its control is exactly that file**: have `image --live` add one to the staging tree before
+      `mke2fs`, and the check must fail naming it.
 - [ ] **`cargo xtask check-live`** boots `nitrox-live.img` as a **USB stick**, with nothing on the
       AHCI controller, and asserts over serial:
   1. `ahci: no SATA disk on any implemented port` — no storage driver carried the boot;
-  2. the module became a block device and `gpt: 1 partition(s)` found `nitrox-live` on it;
-  3. `init` mounted `/` from `gpt-partlabel:nitrox-live`, and the greeter was presented;
+  2. the module became a block device — its log line, with `boot():/boot/root.img` — and the GPT
+     pass found a partition **labelled** `nitrox-live` on it (the label line C.2 adds);
+  3. `init` mounted `/` from `gpt-partlabel:nitrox-live`, and the greeter was presented **within a
+     time bound** from the mount — set in C.4 from measurements under both accelerators, and
+     below what a tick-bound completion can reach (4.85 s under KVM in the review's stand-in);
   4. a login on the serial column can **write a file under `/home` and read it back** — the claim
      the first draft could not make.
-- [ ] **Its controls**, run before it is trusted: drop the second `module_path` (step 3 must
-      fail, at the mount); attach the image on AHCI as well (step 1 must fail — the gate would
-      notice a boot that had a disk after all).
+- [ ] **Its controls**, run before it is trusted, each aimed at the step it must fail:
+  - drop the second `module_path` — **step 2** fails, since with AHCI empty there is then no block
+    device for the GPT pass to scan (the first draft predicted step 3, which this never reaches);
+  - keep the module but label its partition `nitrox-root` — **step 3** fails at the mount, which is
+    the control that shows the mount assertion can fail at all;
+  - delete the RAM disk's self-interrupt — **step 3's time bound** fails, which is the control for
+    the completion path above;
+  - attach the image on AHCI as well — **step 1** fails, since the gate would notice a boot that
+    had a disk after all.
 - [ ] In CI's QEMU job, unconditionally: the image exists for Part F, and a live image that
       stopped booting in the meantime is the failure this gate is for.
 
