@@ -5,14 +5,15 @@
 //!   2. Limine parses our ELF, locates our request statics (the
 //!      `.limine_requests` bracket below), sets up long mode + paging +
 //!      a framebuffer, and jumps to [`_start`].
-//!   3. We verify the bootloader honoured base revision 6, bring up the
-//!      serial console, install the kernel's GDT/TSS/IDT, bring up the
-//!      buddy and slab allocators from Limine's memory map and HHDM,
-//!      then render the boot screen.
+//!   3. We verify the bootloader honoured base revision 6, install the kernel's
+//!      GDT/TSS/IDT, put the console on the framebuffer and COM1, and bring the
+//!      machine up in the order `kernel_main` spells out — memory, platform
+//!      discovery, interrupts and timers, devices, the scheduler and the APs —
+//!      before loading `init` from the initramfs as pid 1.
 //!
-//! After `kernel_main` returns, [`_start`] enters [`arch::Cpu::halt_loop`]
-//! forever. The kernel does no further work in this slice; Phase 1's
-//! remaining items (paging, scheduler, syscalls, userspace) land next.
+//! The boot thread then retires into the idle thread; it does not return to
+//! [`_start`], whose [`arch::Cpu::halt_loop`] is only reached by an early
+//! failure. `docs/architecture/boot-flow.md` is the long form.
 
 #![no_std]
 #![no_main]
@@ -32,11 +33,12 @@ use nitrox_kernel::arch::platform::ArchPlatform;
 use nitrox_kernel::arch::smp::ArchSmp;
 use nitrox_kernel::arch::timer::ArchTimer;
 use nitrox_kernel::dpc;
-use nitrox_kernel::framebuffer::{self, FbWriter, Rgb};
+use nitrox_kernel::fbcon;
+use nitrox_kernel::framebuffer;
 use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
     BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
-    RequestsEndMarker, RequestsStartMarker, SmpInfo, SmpRequest,
+    Framebuffer, RequestsEndMarker, RequestsStartMarker, SmpInfo, SmpRequest,
 };
 use nitrox_kernel::mm;
 use nitrox_kernel::sched;
@@ -118,22 +120,36 @@ fn kernel_main() {
         return;
     }
 
-    // Serial first: it touches only fixed I/O ports — no dependency on
-    // the allocator or the IDT — so every step after this can report its
-    // progress, and its failures, to the console.
-    arch::serial::init();
-    kprintln!("Nitrox kernel — diagnostics online");
-
     // Install the architecture's CPU control tables (on x86_64: GDT + TSS,
     // then IDT). The ordering dependency between them lives in the arch
-    // layer, not here.
+    // layer, not here. **First**, because it prints nothing and needs nothing, and
+    // everything after it can fault: with the IDT live, a bad framebuffer descriptor below
+    // produces a register dump rather than a silent triple fault (PR #296 review).
     arch::Cpu::init_tables();
+
+    // The screen, then serial — both need nothing but what Limine handed over, and
+    // everything after them can report its progress and its failures to both. The screen goes
+    // first so that the first line is on it: on a machine with no serial port it is the only
+    // place a boot that dies from here on can say why (Phase 5 Part B).
+    let console = limine_framebuffer().and_then(|fb| {
+        // SAFETY: Limine's live descriptor; it maps the framebuffer into the higher half before
+        // jumping here and the kernel never unmaps it.
+        unsafe { fbcon::init(fb) }.ok_or("the framebuffer is not a 32-bit layout the console can draw")
+    });
+    arch::serial::init();
+    kprintln!("Nitrox kernel — diagnostics online");
+    match console {
+        Ok(g) => {
+            kprintln!("fbcon: on the framebuffer, {}x{} cells at scale {}", g.cols, g.rows, g.scale)
+        }
+        Err(why) => kprintln!("fbcon: no console on screen — {why}"),
+    }
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
 
     // Bring up the physical-memory buddy allocator and the slab on top of
-    // it. This is the first code that walks Limine's structures and pokes
-    // the allocator — the first place a bug can fault — so the IDT is
-    // live before we reach it. Returns false if Limine didn't populate a
+    // it. This walks Limine's memory map and pokes the allocator — a likely
+    // place for a bug to fault — so the IDT is live before we reach it (as it is
+    // for the framebuffer walk above). Returns false if Limine didn't populate a
     // required response, in which case there is nothing useful to do.
     if !init_memory() {
         kprintln!("init_memory failed — halting");
@@ -192,6 +208,11 @@ fn kernel_main() {
         arch::Timer::timer_hz() / 1_000_000,
         arch::Timer::read_ns(),
     );
+    // The first gate hold (`fbcon-gate` only): the lines so far — the first, with its em dash,
+    // through the timer — stay on screen for a second so `check-fbcon` reads them every run.
+    // After the timer, because the hold needs a calibrated clock.
+    #[cfg(feature = "fbcon-gate")]
+    fbcon::hold_for_gate();
 
     // Anchor the wall clock from the hardware RTC, now that the monotonic source
     // it offsets from is calibrated. Read **once**: every later `CLOCK_REALTIME`
@@ -311,30 +332,24 @@ fn kernel_main() {
     #[cfg(feature = "selftest")]
     boot_selftest::post_smp();
 
-    // Arm the syscall fast path and prove it end-to-end by dropping to
-    // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
-    // (Throwaway harness — replaced next slice by an ELF-loaded process.)
     // Record the display aperture **before** userspace exists, because
     // `run_first_userspace` binds `/dev/framebuffer` into init's namespace and init may
-    // look it up as soon as it is scheduled. An earlier version folded this into
-    // `draw_boot_screen`, which runs *after* this line — the binding resolved to
-    // "no aperture recorded" every time, and the boot still passed because the demo is
-    // non-fatal.
+    // look it up as soon as it is scheduled. An earlier version folded this into the boot
+    // screen's drawing, which ran *after* this line — the binding resolved to "no aperture
+    // recorded" every time, and the boot still passed because the demo is non-fatal.
     record_framebuffer();
 
     run_first_userspace();
 
-    // Best-effort boot screen. **It clears the whole framebuffer**, and nothing
-    // synchronises that against `display-selftest`'s presentation, which happens much
-    // later on another CPU — init does the manifest, the mounts and several selftests
-    // first, so the margin is large, but it is a margin rather than a guarantee. If
-    // `check-display` ever flakes with a blank or partially-cleared capture, this is why.
+    // Retire the boot thread into the idle thread. We must NOT fall through to `_start`'s
+    // `halt_loop` (it `cli`s, which would freeze preemption): `exit` switches to the idle
+    // thread, which `hlt`s with interrupts enabled so the periodic tick keeps running.
     //
-    // Best-effort boot screen, then retire the boot thread into the idle
-    // thread. We must NOT fall through to `_start`'s `halt_loop` (it `cli`s,
-    // which would freeze preemption): `exit` switches to the idle thread, which
-    // `hlt`s with interrupts enabled so the periodic tick keeps running.
-    draw_boot_screen();
+    // (A boot screen used to be drawn here, clearing the whole framebuffer with nothing
+    // synchronising it against `display-selftest`'s first frame. The console that replaced it
+    // stops drawing under its own lock when the aperture is handed out, which is that
+    // synchronisation.)
+    //
     // The boot thread has no owning process; exit with a benign status (no
     // `ChildExited` is produced for a process-less thread).
     sched::exit_thread(nitrox_kernel::libkern::ExitStatus {
@@ -600,36 +615,42 @@ fn bring_up_aps() {
     kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);
 }
 
-/// Capture Limine's framebuffer as a userspace-mappable aperture.
-///
-/// Separate from [`draw_boot_screen`] on purpose: recording a system resource is not the
-/// same job as painting a banner, and the two have different deadlines. This must run
-/// before `run_first_userspace` binds `/dev/framebuffer`; the banner is best-effort and
-/// runs last.
-///
-/// Requires the HHDM, since Limine reports the framebuffer at a higher-half virtual
-/// address and a `MemoryObject` needs the physical base.
-fn record_framebuffer() {
+/// Limine's framebuffer descriptor, or why there is none.
+fn limine_framebuffer() -> Result<&'static Framebuffer, &'static str> {
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before jumping to
-    // `_start`; we are the sole reader.
+    // `_start`; the kernel only ever reads it.
     let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
     if response.is_null() {
-        kprintln!("framebuffer: no Limine response — /dev/framebuffer will be unavailable");
-        return;
+        return Err("no Limine framebuffer response");
     }
     // SAFETY: a non-null response pointer guarantees a valid `FramebufferResponse`.
     let response = unsafe { &*response };
     if response.framebuffer_count == 0 || response.framebuffers.is_null() {
-        kprintln!("framebuffer: none reported — /dev/framebuffer will be unavailable");
-        return;
+        return Err("Limine reported no framebuffer");
     }
     // SAFETY: the array is dense; slot 0 is present when `framebuffer_count > 0`.
     let fb_ptr = unsafe { *response.framebuffers };
     if fb_ptr.is_null() {
-        return;
+        return Err("Limine reported no framebuffer");
     }
-    // SAFETY: Limine guarantees the descriptor outlives the kernel's use of it here.
-    let fb = unsafe { &*fb_ptr };
+    // SAFETY: Limine's descriptors stay valid until bootloader-reclaimable memory is
+    // reclaimed, which this kernel never does.
+    Ok(unsafe { &*fb_ptr })
+}
+
+/// Capture Limine's framebuffer as a userspace-mappable aperture.
+///
+/// Must run before `run_first_userspace` binds `/dev/framebuffer`. Requires the HHDM, since
+/// Limine reports the framebuffer at a higher-half virtual address and a `MemoryObject` needs
+/// the physical base.
+fn record_framebuffer() {
+    let fb = match limine_framebuffer() {
+        Ok(fb) => fb,
+        Err(why) => {
+            kprintln!("framebuffer: {why} — /dev/framebuffer will be unavailable");
+            return;
+        }
+    };
 
     // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
     // reported for this boot, so `address - offset` is the aperture's physical base.
@@ -645,43 +666,6 @@ fn record_framebuffer() {
         kprintln!("framebuffer: unsupported depth ({} bpp) — /dev/framebuffer unavailable", fb.bpp);
     }
 }
-
-/// Draw the boot screen to Limine's framebuffer, if one is present. Best-effort:
-/// any missing piece simply skips the draw. Runs in the boot thread.
-fn draw_boot_screen() {
-    // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
-    // jumping to `_start`. We are the sole reader.
-    let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
-    if response.is_null() {
-        return;
-    }
-    // SAFETY: A non-null response pointer guarantees Limine populated a
-    // valid `FramebufferResponse`.
-    let response = unsafe { &*response };
-    if response.framebuffer_count == 0 || response.framebuffers.is_null() {
-        return;
-    }
-    // SAFETY: The framebuffer array is dense; the first slot is always
-    // present when `framebuffer_count > 0`.
-    let fb_ptr = unsafe { *response.framebuffers };
-    if fb_ptr.is_null() {
-        return;
-    }
-    // SAFETY: Limine guarantees this pointer outlives the kernel (the
-    // framebuffer descriptor lives in bootloader-reclaimable memory which
-    // we have not reclaimed in Phase 0).
-    let fb = unsafe { &*fb_ptr };
-
-    // SAFETY: We trust Limine's framebuffer descriptor — its `address`,
-    // `pitch`, and `height` describe a writable linear region.
-    let mut writer = match unsafe { FbWriter::from_limine(fb) } {
-        Some(w) => w,
-        None => return,
-    };
-
-    draw_nitrox_band(&mut writer);
-}
-
 
 // --- First userspace process --------------------------------------------
 //
@@ -1131,72 +1115,6 @@ fn paging_init() {
         mm::kvmap::init();
         arch::Paging::init_kernel_template(arch::Paging::active_root());
     }
-}
-
-/// Render the boot screen as a scuba Nitrox tank decal: a yellow band
-/// bordered by dark-green bands with `NITROX` lettered in green across
-/// the centre, plus a phase indicator below.
-fn draw_nitrox_band(writer: &mut FbWriter) {
-    writer.clear(Rgb::BG);
-
-    let width = writer.width();
-    let height = writer.height();
-
-    // Band geometry. The yellow stripe carries the title; the two green
-    // stripes sandwich it the way they do on a real tank decal.
-    let yellow_h: usize = 160;
-    let green_h: usize = 28;
-    let total_h: usize = yellow_h + green_h * 2;
-    let band_top = height.saturating_sub(total_h) / 2;
-
-    writer.fill_rect(0, band_top, width, green_h, Rgb::NITROX_GREEN);
-    writer.fill_rect(0, band_top + green_h, width, yellow_h, Rgb::NITROX_YELLOW);
-    writer.fill_rect(
-        0,
-        band_top + green_h + yellow_h,
-        width,
-        green_h,
-        Rgb::NITROX_GREEN,
-    );
-
-    // "NITROX" centred on the yellow band, in dark green. Pick the
-    // largest integer scale that still leaves a margin inside the band.
-    let text = b"NITROX";
-    let scale = pick_scale(text, width, yellow_h);
-    let text_w = FbWriter::text_width(text, scale);
-    let text_h = FbWriter::text_height(scale);
-    let text_x = (width - text_w) / 2;
-    let text_y = band_top + green_h + (yellow_h - text_h) / 2;
-    writer.draw_text_at(text_x, text_y, text, Rgb::NITROX_GREEN, scale);
-
-    // Phase indicator below the band, slightly dimmer so the eye reads
-    // the tank decal first.
-    let status = b"PHASE 4: WINDOWED DESKTOP";
-    let status_scale = 2;
-    let status_w = FbWriter::text_width(status, status_scale);
-    let status_x = (width - status_w) / 2;
-    let status_y = band_top + total_h + 32;
-    writer.draw_text_at(status_x, status_y, status, Rgb::FG, status_scale);
-}
-
-/// Choose the largest integer scale such that the text fits within
-/// `max_w` and `max_h` with reasonable margins on both axes.
-fn pick_scale(text: &[u8], max_w: usize, max_h: usize) -> usize {
-    let w_margin = 64;
-    let h_margin = 24;
-    let available_w = max_w.saturating_sub(w_margin);
-    let available_h = max_h.saturating_sub(h_margin);
-    let mut scale: usize = 1;
-    while scale < 16 {
-        let next = scale + 1;
-        if FbWriter::text_width(text, next) > available_w
-            || FbWriter::text_height(next) > available_h
-        {
-            return scale;
-        }
-        scale = next;
-    }
-    scale
 }
 
 #[panic_handler]

@@ -125,7 +125,7 @@ thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
    **least-loaded** core (§6), so userspace starts on an AP as readily as the BSP.
    init mounts the ext4 fs-server, reads `/system/current-generation`, and spawns
    `eshell`; those are more user threads, likewise distributed.
-6. **Boot thread retires** — the BSP boot thread draws the boot screen and calls
+6. **Boot thread retires** — the BSP boot thread calls
    `sched::exit_thread` (`main.rs`). It must *not* fall through to `_start`'s
    `halt_loop` (which `cli`s and would freeze preemption); `exit_thread` switches
    to the idle thread, which `hlt`s with interrupts enabled so the tick keeps

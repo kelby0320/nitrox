@@ -197,7 +197,7 @@ impl PixelFormat {
 
     /// Build a format from Limine's framebuffer response fields.
     ///
-    /// Returns `None` for any depth other than 32. The kernel's own `FbWriter` takes
+    /// Returns `None` for any depth other than 32. The kernel's console (`fbcon::init`) takes
     /// the same position, and refusing loudly is better than rendering garbage into a
     /// 16- or 24-bit buffer: an unsupported depth is a boot-time diagnosis, not a
     /// visual artefact to puzzle over later.

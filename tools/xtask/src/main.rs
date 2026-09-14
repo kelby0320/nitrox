@@ -14,6 +14,7 @@
 //!   check-display   boot + screendump; compare the screen against a libdraw render
 //!   check-terminal  boot + type into the GUI terminal; assert the shell answered
 //!   check-login     boot the release image + drive the graphical greeter to a session
+//!   check-fbcon     boot with no serial port; read the boot, the handover and a panic off the screen
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -33,6 +34,17 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+/// The kernel console's glyphs and layout, compiled here by path so that `check-fbcon` reads a
+/// screendump back into text with the code the kernel drew it with — the same face, palette and
+/// geometry, not a copy of them. The pair names nothing outside itself: `text` reaches `glyphs`
+/// as `super::glyphs`, which is this crate's root here and `crate::fbcon` in the kernel.
+#[path = "../../../kernel/src/fbcon/glyphs.rs"]
+#[allow(dead_code)]
+mod glyphs;
+#[path = "../../../kernel/src/fbcon/text.rs"]
+#[allow(dead_code)]
+mod text;
 
 /// Limine version we build against. Bump this together with any changes
 /// to `kernel/src/limine.rs`.
@@ -121,6 +133,11 @@ enum BuildMode {
     /// it needs to be the thing that ends the boot, because `boot-probe` fires the verdict and
     /// a bench declared after it would never run.
     Bench,
+    /// `check-fbcon`: [`Normal`](Self::Normal) — the release userspace, unchanged — over a kernel
+    /// built with `fbcon-gate`, which holds the screen still at two moments and panics when F10
+    /// is pressed. A sampling gate needs frames that hold, and a machine that stops *after*
+    /// userspace has drawn; a working kernel offers neither.
+    FbconGate,
 }
 
 impl BuildMode {
@@ -131,7 +148,7 @@ impl BuildMode {
     /// is a different value and is passed separately.
     fn features(self) -> Option<&'static str> {
         match self {
-            BuildMode::Normal => None,
+            BuildMode::Normal | BuildMode::FbconGate => None,
             BuildMode::Selftest => Some("selftest"),
             BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench => {
                 Some("test-harness")
@@ -165,6 +182,7 @@ impl BuildMode {
     fn kernel_features(self) -> Option<&'static str> {
         match self {
             BuildMode::TestHarnessNoPs2Irq => Some("test-harness,no-ps2-irq"),
+            BuildMode::FbconGate => Some("fbcon-gate"),
             other => other.features(),
         }
     }
@@ -259,6 +277,7 @@ fn main() -> ExitCode {
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-login") => cmd_check_login(accel),
+        Some("check-fbcon") => cmd_check_fbcon(accel),
         Some("bench-compose") => cmd_bench_compose(accel),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq),
         Some("check-irq-scope") => cmd_check_irq_scope(),
@@ -297,6 +316,7 @@ fn print_help() {
            test-interactive  boot the release image and drive a real login + shell\n  \
            check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
            check-login       type a wrong then a right password at the graphical greeter\n  \
+           check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
@@ -2171,6 +2191,292 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
 /// gate agree with the build by construction and assert nothing; a literal is a second statement
 /// of the same fact, which is what an assertion is for.
 const STAGED_APPLICATIONS: usize = 3;
+
+/// `cargo xtask check-fbcon` — **the boot is legible with no serial port at all** (Phase 5
+/// Part B).
+///
+/// Boots the release userspace with `-serial none` and reads the screen back into text with the
+/// kernel console's own glyphs, palette and geometry (`glyphs` and `text`, compiled here by path).
+/// Nothing is learned from COM1, because on the machine this is for there is no COM1. Three claims:
+///
+/// 1. **The boot is on the screen**: the kernel's first and last lines, and userspace's lines up to
+///    the compositor — the last thing printed before a client takes the screen.
+/// 2. **The console lets go**: once the compositor has drawn, no console text reappears over it,
+///    although every service goes on printing.
+/// 3. **A stop takes the screen back**: a panic after the desktop is up repaints the console with
+///    the diagnosis at the bottom, and nothing draws over it afterwards.
+///
+/// All three rest on the `fbcon-gate` kernel feature, which is why this gate builds
+/// [`BuildMode::FbconGate`] rather than booting `check-login`'s image.
+///
+/// **Held frames, not lucky samples.** A dump costs 4–18 ms depending on the host, and a
+/// scrolling console does not wait for it: the first version of this gate required
+/// `compositor: up` to be *seen*, and that line is on screen only from its own paint to the
+/// compositor's first frame — one dump in 1640 on a fast host, and missed 3 runs in 5 with a
+/// dump slowed to CI's rate (PR #296 review). So the kernel holds the screen still for a second
+/// after the timer is calibrated and again at the handout, and each claim below is read off one
+/// of those frames — **all of its lines together, in a single frame**, which a hold guarantees
+/// and no run of transient sightings can imitate.
+fn cmd_check_fbcon(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::FbconGate)?;
+
+    let work = build_cache();
+    fs::create_dir_all(&work).ok();
+    let qmp_sock = work.join("qmp-fbcon.sock");
+    let dump = work.join("fbcon.ppm");
+    let _ = fs::remove_file(&qmp_sock);
+    let ovmf = locate_ovmf()?;
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        // **The point of the gate.** No UART is created, so nothing the guest writes to COM1
+        // goes anywhere, and the port reads back as a floating bus.
+        .arg("-serial")
+        .arg("none")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: console gate — booting with no serial port…\n");
+    let _session = Session::spawn(cmd, "check-fbcon")?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    let look = |qmp: &mut Qmp, seen: &mut std::collections::BTreeSet<String>| -> R<Frame> {
+        qmp.screendump(&dump)?;
+        let (w, h, rgb) = parse_ppm(&fs::read(&dump)?)?;
+        let frame = Frame::read(w, h, &rgb);
+        for row in frame.lines() {
+            if !row.is_empty() {
+                seen.insert(row.to_string());
+            }
+        }
+        Ok(frame)
+    };
+
+    // 1. The boot, read off the two held frames. Each group must appear whole in one frame.
+    const EARLY: &[&str] = &["Nitrox kernel — diagnostics online", "allocators up"];
+    const HANDOUT: &[&str] = &[
+        "init: spawned init (pid 1); handing off to userspace",
+        "init: mounted fs-server-ext4 at /",
+        "compositor: up",
+    ];
+    let (mut early, mut handout, mut console_seen) = (false, false, false);
+    let mut rows = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let frame = look(&mut qmp, &mut seen)?;
+        if frame.is_console() {
+            console_seen = true;
+            rows = frame.rows.len();
+        }
+        early |= frame.has_all(EARLY);
+        handout |= frame.has_all(HANDOUT);
+        // The handover: a frame that is not the console and has no console glyph anywhere on it,
+        // after the console has been seen. Not "after a given line", which is what made the
+        // first version of this loop wait on a sighting.
+        if console_seen && frame.text_cells == 0 && !frame.is_console() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "no console handover within 120s — {} distinct row(s) read off the screen, {}",
+                seen.len(),
+                if console_seen { "and the console never left it" } else { "and never a whole console frame" }
+            )
+            .into());
+        }
+    }
+    if !early {
+        return Err(format!(
+            "no single frame showed {EARLY:?} — the kernel's first line (with its em dash, from the \
+             face's table) and a line from before PCI. The `fbcon-gate` hold after the timer keeps \
+             them up for a second. Read {} distinct row(s); the last dump is {}",
+            seen.len(),
+            dump.display()
+        )
+        .into());
+    }
+    println!("  ok: held after the timer, with no serial port — the kernel's first line, em dash and all, before PCI");
+    if !handout {
+        return Err(format!(
+            "no single frame showed {HANDOUT:?} together — the kernel's last line, a userspace line \
+             and the last before the handout. The hold at the handout keeps that frame up for a \
+             second, and it shows at least the last {} lines ({rows} rows less a quarter-screen \
+             jump), so a boot that now prints more than that after the kernel's last line needs a \
+             nearer one here. Read {} distinct row(s)",
+            rows - rows / 4,
+            seen.len()
+        )
+        .into());
+    }
+    println!("  ok: held at the handout — the kernel's last line, a line userspace printed, and \"compositor: up\", on one screen");
+
+    // 2. The console let go. Every service keeps printing through all of this — the greeter's
+    //    redraws, the heartbeat — so a console still drawing would put text over the desktop.
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(6);
+    let until = std::time::Instant::now() + SETTLE;
+    let mut dumps = 0;
+    while std::time::Instant::now() < until {
+        let frame = look(&mut qmp, &mut seen)?;
+        dumps += 1;
+        if frame.text_cells > 0 {
+            return Err(format!(
+                "console text reappeared over the desktop after the handover: {} cell(s) read as \
+                 ink-on-paper glyphs, e.g. {:?} (dump at {})",
+                frame.text_cells,
+                frame.cells_sample(),
+                dump.display()
+            )
+            .into());
+        }
+    }
+    println!("  ok: the compositor has the screen, and {dumps} dumps over {}s found no console text on it", SETTLE.as_secs());
+
+    // 3. A stop takes it back.
+    qmp.send_key("f10", true)?;
+    qmp.send_key("f10", false)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let panic_frame = loop {
+        let frame = look(&mut qmp, &mut seen)?;
+        if frame.is_console() && frame.lines().iter().any(|l| l.contains("*** KERNEL PANIC ***")) {
+            break frame;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "no panic on the screen within 30s of F10 — the last dump ({}) {}",
+                dump.display(),
+                if frame.is_console() { "is console text without a panic in it" } else { "is not the console" }
+            )
+            .into());
+        }
+    };
+    let message = "fbcon-gate: F10 pressed, and this kernel was built to stop on it";
+    if !panic_frame.lines().iter().any(|l| l.contains(message)) {
+        return Err(format!("the panic reached the screen without its message {message:?}").into());
+    }
+    println!("  ok: the panic took the screen back from the desktop, message and all");
+    // Held, not merely drawn: the other CPUs were told to halt before the repaint, so nothing —
+    // least of all the compositor — draws over it. **The pointer is moved to give something a
+    // reason to.** An idle greeter draws nothing for seconds on end, so without the motion this
+    // check passed with the stop's NMIs deleted and the compositor still running (measured
+    // 2026-09-14). A running machine answers motion with a cursor, drawn over the text; a stopped
+    // one does not answer — the PS/2 bytes sit in the controller, since every CPU that would
+    // drain them, by interrupt or by its tick, is halted.
+    for _ in 0..6 {
+        qmp.send_motion(60, 40)?;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let later = look(&mut qmp, &mut seen)?;
+    if later.lines() != panic_frame.lines() || !later.is_console() {
+        return Err(format!(
+            "something drew over the panic within 2s of it reaching the screen (dump at {})",
+            dump.display()
+        )
+        .into());
+    }
+    println!("  ok: and it is still there 2s later, untouched");
+
+    let _ = fs::remove_file(&qmp_sock);
+    println!("\nxtask: the boot, the handover and a stop are all legible with no serial port ✓");
+    Ok(())
+}
+
+/// One screendump, read as the kernel console would have drawn it.
+struct Frame {
+    /// Per row: its text when every cell is exactly one glyph in ink on paper, trailing blanks
+    /// trimmed; `None` otherwise.
+    rows: Vec<Option<String>>,
+    /// Cells anywhere that read as a glyph other than a blank — the measure of "console text on
+    /// the screen", which a row-level test would miss when a stray paint covers part of a row.
+    text_cells: usize,
+    /// A few of those cells' characters, for a failure message.
+    sample: String,
+}
+
+impl Frame {
+    /// Read a screendump. A screen the console has no geometry for reads as no rows at all.
+    fn read(w: u32, h: u32, rgb: &[u8]) -> Frame {
+        let (w, h) = (w as usize, h as usize);
+        let mut frame = Frame { rows: Vec::new(), text_cells: 0, sample: String::new() };
+        let Some(g) = text::Geometry::for_screen(w, h) else { return frame };
+        if rgb.len() < w * h * 3 {
+            return frame;
+        }
+        let (cw, ch) = (g.cell_w(), g.cell_h());
+        for row in 0..g.rows {
+            let mut line = Some(String::new());
+            for col in 0..g.cols {
+                let mut bitmap = [0u8; glyphs::GLYPH_H];
+                let mut clean = true;
+                'cell: for y in 0..ch {
+                    for x in 0..cw {
+                        let i = ((row * ch + y) * w + col * cw + x) * 3;
+                        let px = [rgb[i], rgb[i + 1], rgb[i + 2]];
+                        // At scale > 1, a glyph pixel is a block, and it reads as one only if the
+                        // whole block is one colour — OR-ing it would pass a quarter-painted cell.
+                        let b = ((row * ch + y / g.scale * g.scale) * w + col * cw + x / g.scale * g.scale) * 3;
+                        if px != [rgb[b], rgb[b + 1], rgb[b + 2]] {
+                            clean = false;
+                            break 'cell;
+                        }
+                        if px == text::INK {
+                            bitmap[y / g.scale] |= 0x80 >> (x / g.scale);
+                        } else if px != text::PAPER {
+                            clean = false;
+                            break 'cell;
+                        }
+                    }
+                }
+                let c = if clean { glyphs::identify(&bitmap).and_then(glyphs::char_of) } else { None };
+                match (c, line.as_mut()) {
+                    (Some(c), l) => {
+                        if c != ' ' {
+                            frame.text_cells += 1;
+                            if frame.sample.chars().count() < 40 {
+                                frame.sample.push(c);
+                            }
+                        }
+                        if let Some(l) = l {
+                            l.push(c);
+                        }
+                    }
+                    (None, _) => line = None,
+                }
+            }
+            frame.rows.push(line.map(|l| l.trim_end().to_string()));
+        }
+        frame
+    }
+
+    /// Whether the whole screen is console: every row decodes.
+    fn is_console(&self) -> bool {
+        !self.rows.is_empty() && self.rows.iter().all(Option::is_some)
+    }
+
+    /// Whether every one of `wanted` is a row of this frame.
+    fn has_all(&self, wanted: &[&str]) -> bool {
+        let lines = self.lines();
+        wanted.iter().all(|w| lines.contains(w))
+    }
+
+    /// The rows that decode, as text.
+    fn lines(&self) -> Vec<&str> {
+        self.rows.iter().flatten().map(String::as_str).collect()
+    }
+
+    fn cells_sample(&self) -> &str {
+        &self.sample
+    }
+}
+
 
 /// **Paced on the greeter's redraw counter**, because a greeter has no echo. What was typed is
 /// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
@@ -10510,6 +10816,16 @@ fn assemble_image(
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(bootx64).arg("::/EFI/BOOT/BOOTX64.EFI"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(conf).arg("::/boot/limine/limine.conf"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(kernel).arg("::/boot/kernel"))?;
+    // **The kernel carries a font, so its licence travels with it.** `kernel/src/fbcon/glyphs.rs`
+    // embeds Terminus Font, and the SIL OFL lets a bundled copy ship only if "each copy contains
+    // the above copyright notice and this license" — the same reason `LICENSE-DejaVu.txt` is
+    // staged beside the TrueType faces in `/system/fonts`. Beside the kernel, because that is the
+    // file the face is inside (PR #296 review).
+    run(Command::new("mcopy")
+        .arg("-i")
+        .arg(&espf)
+        .arg(repo_root().join("assets/fonts/LICENSE-Terminus.txt"))
+        .arg("::/boot/LICENSE-Terminus.txt"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(initramfs).arg("::/boot/initramfs"))?;
     splice_into(out, esp_lba * 512, &esp)?;
 

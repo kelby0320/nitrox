@@ -289,9 +289,9 @@ The device-vector pool is eight vectors (`DEVICE_IRQ_BASE = 0x30`, `DEVICE_IRQ_C
 vector for AHCI fits with room to spare. The laptop's xHCI advertises eight, so Phase 6 will want
 more — and the comment there already says the fix is to add stubs.
 
-## Part B — the machine can tell you why it failed ⬜
+## Part B — the machine can tell you why it failed ✅
 
-- [ ] **An early framebuffer console**: `kprint` renders to the screen as well as to COM1.
+- [x] **An early framebuffer console**: `kprint` renders to the screen as well as to COM1.
 
 **Without this the first boot is undiagnosable.** `kprint` writes to the serial port and tees
 into an in-memory ring (`klog.rs`) that a userspace reader can map. The laptop **has no serial
@@ -299,15 +299,37 @@ port**, and the ring is only reachable once userspace is running — so a boot t
 `init` produces a black screen and nothing else. Every gate we own drives the guest over
 COM1; none of that survives contact with this machine.
 
-The pieces exist: `kernel/src/font.rs` and `kernel/src/framebuffer.rs` already draw text. What
+The pieces exist: `kernel/src/font.rs` and `kernel/src/framebuffer.rs` already draw text. What <!-- check-docs: allow-missing -->
 is needed is a scrolling character console over the Limine framebuffer, live from the moment
 the framebuffer request is answered — i.e. before ACPI, PCI, or anything that can fail.
 
-- [ ] It must survive the compositor taking the framebuffer over. Simplest rule: the kernel
+- [x] It must survive the compositor taking the framebuffer over. Simplest rule: the kernel
       console owns the screen until userspace first commits a frame, and a later panic takes it
       back.
-- [ ] Gate it under QEMU with `-serial none`, so the assertion is "the boot is legible with no
+- [x] Gate it under QEMU with `-serial none`, so the assertion is "the boot is legible with no
       serial port at all" rather than "the code compiles".
+
+### What shipped, and where it differs from the above (2026-09-14)
+
+`kernel/src/fbcon/`, described in [`framebuffer-console.md`](../architecture/framebuffer-console.md);
+the boot banner it replaced is gone.
+
+- **The pieces did not exist.** The font had uppercase letters, digits and four punctuation
+  marks, and every kernel message is lowercase. The console draws Terminus Font, embedded as the
+  PSF1 file console-setup ships and read in place (SIL OFL, licence beside it), picked from a
+  rendered comparison of four candidates.
+- **It mirrors COM1, not just `kprint`.** `sys_kprint` is teed too: a laptop whose `init` fails
+  to mount a root says so through userspace's syscall, and a kernel-only console would stop at
+  the hand-off to `init`.
+- **The hand-over is the first `/dev/framebuffer` handout, not the first committed frame**, which
+  the kernel cannot see. The yield happens under the console's lock before the handle exists, so
+  no kernel paint can race a client's first frame. The take-back is in `stop_the_machine`, after
+  the stop NMIs, so it covers a fatal fault as well as a panic.
+- **The gate is `cargo xtask check-fbcon`**, and it reads the screen back into *text* with the
+  kernel's own glyph and layout code, off frames a gate-only `fbcon-gate` kernel feature holds
+  still — sampling a scrolling console was a flake (PR #296 review). The same feature panics on
+  F10 for the third claim, since QEMU's `inject-nmi` arrives through LINT1 and does nothing to this
+  kernel under TCG or KVM. Every claim was failed on purpose first.
 
 ## Part C — the live image ⬜
 

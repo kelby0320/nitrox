@@ -27,7 +27,7 @@
 //! kernel is `#![no_std]`. A spin lock is also a better fit for a
 //! single-CPU bring-up where blocking has no scheduler to yield to.
 
-use crate::libkern::lockrank::LockRank;
+use crate::libkern::lockrank::{LockRank, Taken};
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -96,7 +96,7 @@ impl<T> SpinLock<T> {
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                crate::libkern::lockrank::acquired(self.rank);
+                crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
                 return SpinLockGuard { lock: self };
             }
             // Spin without bus-locking the cacheline: a relaxed read plus
@@ -290,7 +290,7 @@ impl<T> IrqSpinLock<T> {
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                crate::libkern::lockrank::acquired(self.rank);
+                crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
                 return IrqSpinLockGuard { lock: self, prev_if };
             }
             while self.locked.load(Ordering::Relaxed) {
@@ -304,6 +304,10 @@ impl<T> IrqSpinLock<T> {
     /// the prior interrupt state and returns `None`. Used by `klog::push` so teeing
     /// kernel output into the log ring can never deadlock against a fault that
     /// strikes while the ring lock is held (the panic/exception path tees too).
+    ///
+    /// **Recorded by the rank tracker but not checked against the order**, because an
+    /// acquisition that cannot wait cannot deadlock — see `lockrank` § Only an acquisition
+    /// that waits is ordered. That is what lets the panic path tee from under any lock.
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         let prev_if = irq_backend::disable();
         if self
@@ -311,7 +315,7 @@ impl<T> IrqSpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            crate::libkern::lockrank::acquired(self.rank);
+            crate::libkern::lockrank::acquired(self.rank, Taken::WithoutWaiting);
             Some(IrqSpinLockGuard { lock: self, prev_if })
         } else {
             // Contended: restore the interrupt state we masked above and give up.

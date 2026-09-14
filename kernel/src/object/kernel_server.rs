@@ -365,7 +365,14 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
             match unsafe {
                 MemoryObject::try_new_borrowed(phys_base, info.byte_len as usize)
             } {
-                Ok(obj) => complete_with_memobj(obj),
+                Ok(obj) => {
+                    // **The screen changes hands here**, before the handle exists: the console
+                    // stops painting under its own lock, so nothing it draws can land on a frame
+                    // this client has started. Only on success — a refused handout leaves the
+                    // console as the only thing drawing, which is better than nothing drawing.
+                    crate::fbcon::yield_to_userspace();
+                    complete_with_memobj(obj)
+                }
                 Err(_) => OpStatus::Rejected(KError::OutOfMemory),
             }
         }

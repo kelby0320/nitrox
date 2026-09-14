@@ -15,6 +15,16 @@ longer the only line of defence, which matters because it already missed three
 deadlocks (F1, F2, F12 — decision log 2026-07-21), each found by hand or by
 bisecting a boot loop that hung one time in three.
 
+**The order binds acquisitions that wait, not `try_lock`** (since 2026-09-14). A deadlock
+is a cycle of threads each waiting for a lock another holds; a `try_lock` takes a free
+lock or gives up, so it is never an edge of that cycle. The tracker still *records* a
+`try_lock` hold, so anything later waited for underneath it is checked — the deadlock it
+could be half of is reported at that wait. The shootdown lock's no-other-lock contract
+binds both kinds. This is what lets the panic and fault paths tee into `KLOG` and the
+framebuffer console from under any lock: checked, a panic raised while holding a `Leaf`
+lock printed a lock-order violation about its own tee instead of its message. See
+`kernel/src/libkern/lockrank.rs` § Only an acquisition that waits is ordered.
+
 The rank is a **mandatory** constructor argument rather than an optional
 annotation: a lock with no declared position is a lock nobody has reasoned about.
 Requiring it is what surfaced the six live locks that were missing from the table
@@ -36,6 +46,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`, **`IrqSpinLock`**)    | live as of Phase 1 slice 4 (diagnostics) |
 | 7.5  | Kernel log ring (`KLOG`, **`IrqSpinLock`**)  | live as of Phase 2; **below `SERIAL`** — it is teed from inside the serial `write_str`, so `SERIAL` is held when it is taken. (Its `try_lock` is for a different hazard: re-entry from a fault that strikes mid-push.) |
+| 7.6  | Framebuffer console (`fbcon::CONSOLE`, **`IrqSpinLock`**) | live as of Phase 5 Part B; **below `KLOG`** — teed from the same `write_str` (and from `sys_kprint`) with `SERIAL` held, after `KLOG` is released. Taken with a bounded `try_lock` for the fault path's sake, and a CPU already inside it returns at once rather than waiting for itself — see `kernel/src/fbcon/mod.rs` § Locking |
 | leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); see § The DPC queue lock |
 | leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); see § The entropy lock |
 | 8    | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. Held with interrupts *enabled* (the F1 fix), so interrupt work runs beneath it — which is ordinary now that the tracker scopes interrupts (§ Interrupt context restarts the order) and no longer needs the exemption it carried when it first landed. It additionally has a contract the rank cannot express — **no other lock held when taken** — which is asserted separately in debug builds |
