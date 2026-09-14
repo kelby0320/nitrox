@@ -25555,3 +25555,46 @@ laptop that turns "the disk read garbage" into `image not found: /bin/auth-servi
 the cause — the kind of misdirection Phase 5 exists to remove. Validating the superblock before Ready,
 and failing the handshake with a reason `init` can print, is small; it is outside Part C's plan and
 left for a decision.
+
+---
+
+## 2026-09-14 — Part D's detail pass: the facts go in the log, and a report boot holds the log still
+
+Phase 5 Part D was one line of intent — "a boot mode that says what it found" — and a list of
+facts. The pass, done before code as Parts A and C were, found that most of the list is already
+logged and that the real gap is somewhere else.
+
+**What exists.** The ECAM windows, every PCI function and BAR, the IOAPICs, the framebuffer geometry
+and AHCI's bring-up are all in today's boot log. Missing are the handoff (bootloader, firmware type,
+HHDM, memory map, command line), the ACPI table list, the MADT's entries one by one, CPUID, the
+framebuffer's padding as a number, and a record of which driver claimed which PCI function.
+
+**What does not.** A way to read any of it on the laptop. The kernel's log to `init` is about sixty
+lines under QEMU; the laptop's screen holds 48 rows and scrolls as userspace starts, and the
+compositor takes the screen within a second. So the design is two halves:
+
+- **The missing facts are logged on every boot** (D.1). Every CI transcript becomes a report of the
+  emulator, `test-qemu` can assert the answers already known, and the report needs no renderer of
+  its own — a second statement of each fact, and some exist only during bring-up.
+- **A report boot holds the log on the screen** (D.3, maintainer's call): after drivers and APs,
+  before `init`, the kernel pages its own log on the framebuffer console, each page held until a key
+  (or 120 s), then boots on; the paging keys are drained before userspace.
+
+**Selected from Limine's menu (maintainer's call).** A second entry passes `cmdline: hwreport`, so
+selection is data. Only the live image carries the menu, with a five-second countdown; the release
+and test images keep `timeout: 0`. Measured first: a two-entry menu under OVMF with `-display none`
+is visible to `screendump`, and QMP Down and Enter select the second entry — so `check-report` can
+drive the real menu and read the pages off the screen with no serial port, as `check-fbcon` reads the
+boot.
+
+**Process (maintainer's call):** the plan is its own PR, reviewed before Part D's code, as for A and C.
+
+**The review of that PR (#299) tightened four places the pass had left loose.** A driver that
+*matches* a function and then declines it — AHCI with no disk answering, which is how the live image
+always boots — needs its own state, or the report calls it "no driver" and points away from the one
+controller that matters. A held page must keep its own screen state, since kernel lines still arrive
+(an AP prints after it has counted itself online) and a write at the bottom row scrolls the page's top
+off. A timeout ends the report rather than one page, no keyboard means no hold, and the bound is data
+(`hwreport=<seconds>`) so a control can run it. And "no UART" needed a piece that delivers it: the
+scratch-register test before the loopback one. It also caught the plan misdescribing today's MADT
+parser (it skips type-9 entries entirely) and listing TSC-deadline as used when the timer counts down.
