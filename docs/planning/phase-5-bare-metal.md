@@ -326,9 +326,10 @@ the boot banner it replaced is gone.
   no kernel paint can race a client's first frame. The take-back is in `stop_the_machine`, after
   the stop NMIs, so it covers a fatal fault as well as a panic.
 - **The gate is `cargo xtask check-fbcon`**, and it reads the screen back into *text* with the
-  kernel's own glyph and layout code. Its third claim — a stop takes the screen back — needed a
-  gate-only `crash-key` kernel feature, since QEMU's `inject-nmi` arrives through LINT1 and does
-  nothing to this kernel under TCG or KVM. All three claims were failed on purpose first.
+  kernel's own glyph and layout code, off frames a gate-only `fbcon-gate` kernel feature holds
+  still — sampling a scrolling console was a flake (PR #296 review). The same feature panics on
+  F10 for the third claim, since QEMU's `inject-nmi` arrives through LINT1 and does nothing to this
+  kernel under TCG or KVM. Every claim was failed on purpose first.
 
 ## Part C — the live image ⬜
 

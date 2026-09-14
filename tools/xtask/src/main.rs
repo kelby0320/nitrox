@@ -134,9 +134,10 @@ enum BuildMode {
     /// a bench declared after it would never run.
     Bench,
     /// `check-fbcon`: [`Normal`](Self::Normal) — the release userspace, unchanged — over a kernel
-    /// built with `crash-key`, which panics when F10 is pressed. The gate needs a machine that
-    /// stops *after* userspace has drawn, and nothing in a working kernel offers one.
-    CrashKey,
+    /// built with `fbcon-gate`, which holds the screen still at two moments and panics when F10
+    /// is pressed. A sampling gate needs frames that hold, and a machine that stops *after*
+    /// userspace has drawn; a working kernel offers neither.
+    FbconGate,
 }
 
 impl BuildMode {
@@ -147,7 +148,7 @@ impl BuildMode {
     /// is a different value and is passed separately.
     fn features(self) -> Option<&'static str> {
         match self {
-            BuildMode::Normal | BuildMode::CrashKey => None,
+            BuildMode::Normal | BuildMode::FbconGate => None,
             BuildMode::Selftest => Some("selftest"),
             BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench => {
                 Some("test-harness")
@@ -181,7 +182,7 @@ impl BuildMode {
     fn kernel_features(self) -> Option<&'static str> {
         match self {
             BuildMode::TestHarnessNoPs2Irq => Some("test-harness,no-ps2-irq"),
-            BuildMode::CrashKey => Some("crash-key"),
+            BuildMode::FbconGate => Some("fbcon-gate"),
             other => other.features(),
         }
     }
@@ -2205,18 +2206,20 @@ const STAGED_APPLICATIONS: usize = 3;
 /// 3. **A stop takes the screen back**: a panic after the desktop is up repaints the console with
 ///    the diagnosis at the bottom, and nothing draws over it afterwards.
 ///
-/// The third needs a panic on demand in a working kernel, which is what the `crash-key` kernel
-/// feature is, and why this gate builds [`BuildMode::CrashKey`] rather than booting `check-login`'s
-/// image.
+/// All three rest on the `fbcon-gate` kernel feature, which is why this gate builds
+/// [`BuildMode::FbconGate`] rather than booting `check-login`'s image.
 ///
-/// **Seen, not merely present.** The screen is sampled as fast as QEMU will dump it and every row
-/// ever read is kept, so a line counts only if it was drawn legibly at some moment. Measured
-/// 2026-09-14: each dump takes about 10 ms, and every one of the ~90 lines from the first to
-/// `compositor: up` was caught under both TCG and KVM — a line stays up until at least a
-/// quarter-screen jump has scrolled past it.
+/// **Held frames, not lucky samples.** A dump costs 4–18 ms depending on the host, and a
+/// scrolling console does not wait for it: the first version of this gate required
+/// `compositor: up` to be *seen*, and that line is on screen only from its own paint to the
+/// compositor's first frame — one dump in 1640 on a fast host, and missed 3 runs in 5 with a
+/// dump slowed to CI's rate (PR #296 review). So the kernel holds the screen still for a second
+/// after the timer is calibrated and again at the handout, and each claim below is read off one
+/// of those frames — **all of its lines together, in a single frame**, which a hold guarantees
+/// and no run of transient sightings can imitate.
 fn cmd_check_fbcon(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
-    cmd_image(BuildMode::CrashKey)?;
+    cmd_image(BuildMode::FbconGate)?;
 
     let work = build_cache();
     fs::create_dir_all(&work).ok();
@@ -2258,44 +2261,63 @@ fn cmd_check_fbcon(accel: Accel) -> R<()> {
         Ok(frame)
     };
 
-    // 1. The boot, from the first line to the handout.
-    const LAST_BEFORE_HANDOUT: &str = "compositor: up";
+    // 1. The boot, read off the two held frames. Each group must appear whole in one frame.
+    const EARLY: &[&str] = &["Nitrox kernel — diagnostics online", "allocators up"];
+    const HANDOUT: &[&str] = &[
+        "init: spawned init (pid 1); handing off to userspace",
+        "init: mounted fs-server-ext4 at /",
+        "compositor: up",
+    ];
+    let (mut early, mut handout, mut console_seen) = (false, false, false);
+    let mut rows = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let frame = look(&mut qmp, &mut seen)?;
-        if seen.contains(LAST_BEFORE_HANDOUT) && frame.text_cells == 0 && !frame.is_console() {
+        if frame.is_console() {
+            console_seen = true;
+            rows = frame.rows.len();
+        }
+        early |= frame.has_all(EARLY);
+        handout |= frame.has_all(HANDOUT);
+        // The handover: a frame that is not the console and has no console glyph anywhere on it,
+        // after the console has been seen. Not "after a given line", which is what made the
+        // first version of this loop wait on a sighting.
+        if console_seen && frame.text_cells == 0 && !frame.is_console() {
             break;
         }
         if std::time::Instant::now() > deadline {
             return Err(format!(
-                "no console handover within 120s — {} distinct row(s) read off the screen{}",
+                "no console handover within 120s — {} distinct row(s) read off the screen, {}",
                 seen.len(),
-                if seen.contains(LAST_BEFORE_HANDOUT) {
-                    format!(", including {LAST_BEFORE_HANDOUT:?}, but the console never left the screen")
-                } else {
-                    format!(", never {LAST_BEFORE_HANDOUT:?}")
-                }
+                if console_seen { "and the console never left it" } else { "and never a whole console frame" }
             )
             .into());
         }
     }
-    for (line, what) in [
-        ("Nitrox kernel — diagnostics online", "the kernel's first line, before ACPI or PCI — and its em dash, drawn from the face's table"),
-        ("init: spawned init (pid 1); handing off to userspace", "the kernel's last line"),
-        ("init: mounted fs-server-ext4 at /", "a line from userspace, which reaches COM1 by another syscall"),
-        (LAST_BEFORE_HANDOUT, "the last line before the compositor took the screen"),
-    ] {
-        if !seen.contains(line) {
-            return Err(format!(
-                "{line:?} — {what} — was never read off the screen. Read {} distinct row(s); the \
-                 last dump is {}",
-                seen.len(),
-                dump.display()
-            )
-            .into());
-        }
-        println!("  ok: on screen with no serial port — {what}: {line:?}");
+    if !early {
+        return Err(format!(
+            "no single frame showed {EARLY:?} — the kernel's first line (with its em dash, from the \
+             face's table) and a line from before PCI. The `fbcon-gate` hold after the timer keeps \
+             them up for a second. Read {} distinct row(s); the last dump is {}",
+            seen.len(),
+            dump.display()
+        )
+        .into());
     }
+    println!("  ok: held after the timer, with no serial port — the kernel's first line, em dash and all, before PCI");
+    if !handout {
+        return Err(format!(
+            "no single frame showed {HANDOUT:?} together — the kernel's last line, a userspace line \
+             and the last before the handout. The hold at the handout keeps that frame up for a \
+             second, and it shows at least the last {} lines ({rows} rows less a quarter-screen \
+             jump), so a boot that now prints more than that after the kernel's last line needs a \
+             nearer one here. Read {} distinct row(s)",
+            rows - rows / 4,
+            seen.len()
+        )
+        .into());
+    }
+    println!("  ok: held at the handout — the kernel's last line, a line userspace printed, and \"compositor: up\", on one screen");
 
     // 2. The console let go. Every service keeps printing through all of this — the greeter's
     //    redraws, the heartbeat — so a console still drawing would put text over the desktop.
@@ -2336,7 +2358,7 @@ fn cmd_check_fbcon(accel: Accel) -> R<()> {
             .into());
         }
     };
-    let message = "crash-key: F10 pressed, and this kernel was built to stop on it";
+    let message = "fbcon-gate: F10 pressed, and this kernel was built to stop on it";
     if !panic_frame.lines().iter().any(|l| l.contains(message)) {
         return Err(format!("the panic reached the screen without its message {message:?}").into());
     }
@@ -2398,6 +2420,13 @@ impl Frame {
                     for x in 0..cw {
                         let i = ((row * ch + y) * w + col * cw + x) * 3;
                         let px = [rgb[i], rgb[i + 1], rgb[i + 2]];
+                        // At scale > 1, a glyph pixel is a block, and it reads as one only if the
+                        // whole block is one colour — OR-ing it would pass a quarter-painted cell.
+                        let b = ((row * ch + y / g.scale * g.scale) * w + col * cw + x / g.scale * g.scale) * 3;
+                        if px != [rgb[b], rgb[b + 1], rgb[b + 2]] {
+                            clean = false;
+                            break 'cell;
+                        }
                         if px == text::INK {
                             bitmap[y / g.scale] |= 0x80 >> (x / g.scale);
                         } else if px != text::PAPER {
@@ -2430,6 +2459,12 @@ impl Frame {
     /// Whether the whole screen is console: every row decodes.
     fn is_console(&self) -> bool {
         !self.rows.is_empty() && self.rows.iter().all(Option::is_some)
+    }
+
+    /// Whether every one of `wanted` is a row of this frame.
+    fn has_all(&self, wanted: &[&str]) -> bool {
+        let lines = self.lines();
+        wanted.iter().all(|w| lines.contains(w))
     }
 
     /// The rows that decode, as text.
@@ -10781,6 +10816,16 @@ fn assemble_image(
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(bootx64).arg("::/EFI/BOOT/BOOTX64.EFI"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(conf).arg("::/boot/limine/limine.conf"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(kernel).arg("::/boot/kernel"))?;
+    // **The kernel carries a font, so its licence travels with it.** `kernel/src/fbcon/glyphs.rs`
+    // embeds Terminus Font, and the SIL OFL lets a bundled copy ship only if "each copy contains
+    // the above copyright notice and this license" — the same reason `LICENSE-DejaVu.txt` is
+    // staged beside the TrueType faces in `/system/fonts`. Beside the kernel, because that is the
+    // file the face is inside (PR #296 review).
+    run(Command::new("mcopy")
+        .arg("-i")
+        .arg(&espf)
+        .arg(repo_root().join("assets/fonts/LICENSE-Terminus.txt"))
+        .arg("::/boot/LICENSE-Terminus.txt"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(initramfs).arg("::/boot/initramfs"))?;
     splice_into(out, esp_lba * 512, &esp)?;
 

@@ -245,9 +245,10 @@ jobs:
         run: cargo xtask check-login --kvm
 
       # **No serial port**, which is what the laptop Phase 5 targets has: the boot is read back
-      # off the screen with the kernel console's own glyphs, the console is checked to let go of
-      # the screen when the compositor takes it, and a panic (a gate-only `crash-key` kernel
-      # feature, pressed over QMP) is checked to take it back. Every other gate here reads COM1,
+      # off the screen with the kernel console's own glyphs (from frames the gate-only
+      # `fbcon-gate` kernel feature holds still, so sampling speed does not matter), the console
+      # is checked to let go of the screen when the compositor takes it, and a panic (F10 under
+      # the same feature, pressed over QMP) is checked to take it back. Every other gate here reads COM1,
       # so none of them would notice the console drawing nothing. Added with Phase 5 Part B.
       - name: cargo xtask check-fbcon --kvm
         run: cargo xtask check-fbcon --kvm
@@ -262,5 +263,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nitrox-kernel
-          path: kernel/target/x86_64-unknown-none/debug/nitrox-kernel
+          # The licence goes with the ELF: the kernel embeds Terminus Font (SIL OFL), whose
+          # terms require the notice to accompany every copy.
+          path: |
+            kernel/target/x86_64-unknown-none/debug/nitrox-kernel
+            assets/fonts/LICENSE-Terminus.txt
           if-no-files-found: warn

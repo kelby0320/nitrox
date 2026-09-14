@@ -299,6 +299,9 @@ pub fn push(bytes: &[u8]) {
 /// the bounded wait exists for can reach it: it is ordinary syscall context, never inside the
 /// console, and a machine that is stopping halts this CPU whether or not it waits.
 pub fn yield_to_userspace() {
+    // The gate reads the frame the handout would otherwise replace within milliseconds.
+    #[cfg(feature = "fbcon-gate")]
+    hold_for_gate();
     let me = crate::arch::Smp::current_cpu().wrapping_add(1);
     let yielded = {
         let mut console = CONSOLE.lock();
@@ -314,6 +317,23 @@ pub fn yield_to_userspace() {
     }
 }
 
+/// **Under the `fbcon-gate` feature only**: keep the screen as it is for a second, so
+/// `cargo xtask check-fbcon` reads this frame on every run rather than when a screendump happens
+/// to land inside it.
+///
+/// Called with no lock held — after the timer is calibrated in `kernel_main`, and before the
+/// first handout yields the screen. The handout's caller is the compositor, and nothing else
+/// prints while it waits: `init` is blocked on the compositor binding `/dev/draw`.
+#[cfg(feature = "fbcon-gate")]
+pub fn hold_for_gate() {
+    use crate::arch::timer::ArchTimer;
+    const HOLD_NS: u64 = 1_000_000_000;
+    let until = crate::arch::Timer::read_ns().saturating_add(HOLD_NS);
+    while crate::arch::Timer::read_ns() < until {
+        core::hint::spin_loop();
+    }
+}
+
 /// Take the screen back for a machine that is stopping, repainted with the last rows written.
 /// Once per boot; called by `stop_the_machine` after every other CPU has been told to halt.
 pub fn reclaim_for_stop() {
@@ -325,6 +345,11 @@ pub fn reclaim_for_stop() {
 
 /// Run `f` on the console, unless this CPU is inside it already or the lock does not come free
 /// within [`PATIENCE`]. Returns whether `f` ran.
+///
+/// **A retried `try_lock` is a wait**, which the rank tracker cannot see — it records each
+/// attempt as an acquisition that did not wait, and orders none of them. That is sound here only
+/// because the retry gives up: it can delay a CPU, never deadlock one. Making it unbounded would
+/// need `lock()` instead (`lockrank` § Only an acquisition that waits is ordered).
 fn with_console(f: impl FnOnce(&mut Console)) -> bool {
     let me = crate::arch::Smp::current_cpu().wrapping_add(1);
     if HOLDER.load(Ordering::Acquire) == me {
@@ -377,7 +402,7 @@ mod tests {
         }
 
         /// Read the screen back into text the way the gate does: every cell must be exactly ink
-        /// and paper, and its bitmap must be a glyph.
+        /// and paper, every `scale`×`scale` block one colour, and its bitmap a glyph.
         fn read(&self, g: Geometry) -> Vec<String> {
             let ink = pack(INK);
             let paper = pack(PAPER);
@@ -385,11 +410,16 @@ mod tests {
                 .map(|row| {
                     let s: String = (0..g.cols)
                         .map(|col| {
+                            let (x0, y0) = (col * g.cell_w(), row * g.cell_h());
                             let mut bitmap = [0u8; GLYPH_H];
                             for y in 0..g.cell_h() {
                                 for x in 0..g.cell_w() {
-                                    let p = self.at(col * g.cell_w() + x, row * g.cell_h() + y);
+                                    let p = self.at(x0 + x, y0 + y);
                                     assert!(p == ink || p == paper, "cell ({row},{col}) has a stray pixel {p:#x}");
+                                    // A block reads as one glyph pixel only if it is one colour:
+                                    // OR-ing it would pass a painter that filled a quarter of it.
+                                    let block = self.at(x0 + x / g.scale * g.scale, y0 + y / g.scale * g.scale);
+                                    assert_eq!(p, block, "cell ({row},{col}) has a block of two colours");
                                     if p == ink {
                                         bitmap[y / g.scale] |= 0x80 >> (x / g.scale);
                                     }
@@ -438,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_repaints_only_what_changed_and_still_reads_back_exactly() {
+    fn a_scroll_still_reads_back_exactly() {
         let mut fake = Fake::new(80, 64, 0);
         let mut console = Box::new(Console::new());
         let g = console.attach(fake.screen()).unwrap();
@@ -457,6 +487,32 @@ mod tests {
         assert_eq!(expect, ["xxxxxx20", "21", "x22", ""], "and the grid holds what was written");
     }
 
+    /// What the `shown` comparison buys: a paint touches only the cells whose glyph changed,
+    /// even inside a row it repaints. Cells that do not change are marked after they were drawn;
+    /// a painter that repainted every cell of a damaged row would paint over the marks.
+    #[test]
+    fn a_cell_whose_glyph_did_not_change_is_not_repainted() {
+        let mut fake = Fake::new(80, 64, 0);
+        let mut console = Box::new(Console::new());
+        let g = console.attach(fake.screen()).unwrap();
+        let mark = 0x0012_3456;
+        let last_col = (g.cols - 1) * g.cell_w();
+
+        console.write(b"keep");
+        fake.pixels[0] = mark; // cell (0, 0): `k`, in the row about to be written again
+        console.write(b"ing\n");
+        assert_eq!(fake.pixels[0], mark, "appending to row 0 repainted its unchanged `k`");
+
+        // A scroll damages every row. Row 0's last cell is blank before and after, so it is
+        // left alone; its first cell goes from `k` to the next line's first glyph, so it is not.
+        fake.pixels[last_col] = mark;
+        for _ in 0..g.rows {
+            console.write(b"x\n");
+        }
+        assert_eq!(fake.pixels[last_col], mark, "a scroll repainted a cell that stayed blank");
+        assert_ne!(fake.pixels[0], mark, "a scroll that changed the cell must repaint it");
+    }
+
     #[test]
     fn scale_two_paints_every_glyph_pixel_as_a_block() {
         let mut fake = Fake::new(2056, 1600, 0);
@@ -469,7 +525,9 @@ mod tests {
 
     #[test]
     fn after_the_yield_nothing_is_painted_and_the_reclaim_repaints_everything() {
-        let mut fake = Fake::new(96, 48, 0);
+        // 102×50 leaves a 6-pixel margin right and 2 below, as 1366×768 does on the laptop: the
+        // reclaim has to clear what userspace drew there too.
+        let mut fake = Fake::new(102, 50, 0);
         let mut console = Box::new(Console::new());
         let g = console.attach(fake.screen()).unwrap();
         console.write(b"booting\n");

@@ -5,14 +5,15 @@
 //!   2. Limine parses our ELF, locates our request statics (the
 //!      `.limine_requests` bracket below), sets up long mode + paging +
 //!      a framebuffer, and jumps to [`_start`].
-//!   3. We verify the bootloader honoured base revision 6, bring up the
-//!      serial console, install the kernel's GDT/TSS/IDT, bring up the
-//!      buddy and slab allocators from Limine's memory map and HHDM,
-//!      then render the boot screen.
+//!   3. We verify the bootloader honoured base revision 6, install the kernel's
+//!      GDT/TSS/IDT, put the console on the framebuffer and COM1, and bring the
+//!      machine up in the order `kernel_main` spells out — memory, platform
+//!      discovery, interrupts and timers, devices, the scheduler and the APs —
+//!      before loading `init` from the initramfs as pid 1.
 //!
-//! After `kernel_main` returns, [`_start`] enters [`arch::Cpu::halt_loop`]
-//! forever. The kernel does no further work in this slice; Phase 1's
-//! remaining items (paging, scheduler, syscalls, userspace) land next.
+//! The boot thread then retires into the idle thread; it does not return to
+//! [`_start`], whose [`arch::Cpu::halt_loop`] is only reached by an early
+//! failure. `docs/architecture/boot-flow.md` is the long form.
 
 #![no_std]
 #![no_main]
@@ -119,7 +120,14 @@ fn kernel_main() {
         return;
     }
 
-    // The screen first, then serial — both need nothing but what Limine handed over, and
+    // Install the architecture's CPU control tables (on x86_64: GDT + TSS,
+    // then IDT). The ordering dependency between them lives in the arch
+    // layer, not here. **First**, because it prints nothing and needs nothing, and
+    // everything after it can fault: with the IDT live, a bad framebuffer descriptor below
+    // produces a register dump rather than a silent triple fault (PR #296 review).
+    arch::Cpu::init_tables();
+
+    // The screen, then serial — both need nothing but what Limine handed over, and
     // everything after them can report its progress and its failures to both. The screen goes
     // first so that the first line is on it: on a machine with no serial port it is the only
     // place a boot that dies from here on can say why (Phase 5 Part B).
@@ -136,17 +144,12 @@ fn kernel_main() {
         }
         Err(why) => kprintln!("fbcon: no console on screen — {why}"),
     }
-
-    // Install the architecture's CPU control tables (on x86_64: GDT + TSS,
-    // then IDT). The ordering dependency between them lives in the arch
-    // layer, not here.
-    arch::Cpu::init_tables();
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
 
     // Bring up the physical-memory buddy allocator and the slab on top of
-    // it. This is the first code that walks Limine's structures and pokes
-    // the allocator — the first place a bug can fault — so the IDT is
-    // live before we reach it. Returns false if Limine didn't populate a
+    // it. This walks Limine's memory map and pokes the allocator — a likely
+    // place for a bug to fault — so the IDT is live before we reach it (as it is
+    // for the framebuffer walk above). Returns false if Limine didn't populate a
     // required response, in which case there is nothing useful to do.
     if !init_memory() {
         kprintln!("init_memory failed — halting");
@@ -205,6 +208,11 @@ fn kernel_main() {
         arch::Timer::timer_hz() / 1_000_000,
         arch::Timer::read_ns(),
     );
+    // The first gate hold (`fbcon-gate` only): the lines so far — the first, with its em dash,
+    // through the timer — stay on screen for a second so `check-fbcon` reads them every run.
+    // After the timer, because the hold needs a calibrated clock.
+    #[cfg(feature = "fbcon-gate")]
+    fbcon::hold_for_gate();
 
     // Anchor the wall clock from the hardware RTC, now that the monotonic source
     // it offsets from is calibrated. Read **once**: every later `CLOCK_REALTIME`

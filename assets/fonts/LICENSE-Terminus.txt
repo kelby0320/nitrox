@@ -1,13 +1,16 @@
 Lat15-Terminus16.psf
 ====================
 
-The kernel's boot console font (`kernel/src/font.rs` embeds this file). It is the
-8x16 normal-weight Terminus Font face in PSF1 form, exactly as Debian/Ubuntu's
-console-setup package distributes it (`/usr/share/consolefonts/Lat15-Terminus16.psf.gz`,
-console-setup-linux 1.226ubuntu1.1), decompressed and otherwise unmodified.
+The kernel's framebuffer console font (`kernel/src/fbcon/glyphs.rs` embeds this file in
+the kernel image). It is the 8x16 normal-weight Terminus Font face in PSF1 form, exactly
+as Debian/Ubuntu's console-setup package distributes it
+(`/usr/share/consolefonts/Lat15-Terminus16.psf.gz`, console-setup-linux 1.226ubuntu1.1),
+decompressed and otherwise unmodified.
 
-The kernel reads glyphs out of it at build time and draws a subset (the characters the
-console is asked to show); it presents no font name to anyone.
+The file's shape is checked when the kernel compiles; the kernel reads glyphs out of it at
+run time and draws those the console is asked to show. It presents no font name to anyone.
+Every image carries this notice beside the kernel, at `/boot/LICENSE-Terminus.txt` on the
+EFI System Partition.
 
 Terminus Font is licensed under the SIL Open Font License, Version 1.1.
 

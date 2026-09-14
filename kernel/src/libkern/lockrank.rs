@@ -27,6 +27,12 @@
 //! `B` below it is still reported, at the wait, which is where the deadlock would be. Linux's
 //! lockdep draws the same line and adds no dependency for a trylock.
 //!
+//! **The rule keys on the call, so it is only as good as the call's honesty.** A `try_lock`
+//! retried in a loop *is* waiting, and the tracker cannot tell. A bounded retry that gives up —
+//! `fbcon::with_console`, the one there is — can delay but not deadlock, so it may stay a
+//! `try_lock`. An unbounded one must be a `lock()`, or it takes itself out of the ordering check
+//! while doing exactly what the check exists for (PR #296 review).
+//!
 //! Checking them anyway was not merely conservative. The panic and fault paths tee into the
 //! log ring and the framebuffer console with `try_lock`, from whatever context faulted, so a
 //! panic raised while holding a `Leaf` lock reported `lock-order violation: acquiring Klog

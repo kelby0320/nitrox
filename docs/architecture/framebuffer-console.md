@@ -44,7 +44,9 @@ normal weight, in the PSF1 form Debian's `console-setup` ships — whole, and re
 in place. There is no generated table: the file's shape (256 glyphs, 16 rows, a Unicode table,
 printable ASCII at its own index) is asserted when the kernel compiles, and ASCII is looked up by
 index while anything else searches the table. The licence is SIL OFL 1.1, in
-`assets/fonts/LICENSE-Terminus.txt` with where the file came from.
+`assets/fonts/LICENSE-Terminus.txt` with where the file came from — and because the face is inside
+the kernel, **every image carries that notice beside it**, at `/boot/LICENSE-Terminus.txt` on the
+ESP, as the OFL requires of a bundled copy (and CI's failure artifact uploads it with the ELF).
 
 A bitmap, in a project whose userspace draws only TrueType, because this has to draw before there
 is an allocator or a filesystem. The face was chosen from a rendered comparison with the other
@@ -75,7 +77,7 @@ newest line is on the screen before the write that produced it returns either wa
 
 | From | Owner | What a write does |
 |---|---|---|
-| `fbcon::init`, the first thing `kernel_main` does after checking Limine's base revision — before serial, the CPU tables, ACPI or PCI | the kernel | updates the grid and paints what changed |
+| `fbcon::init`, right after the CPU tables — before serial, memory, ACPI or PCI | the kernel | updates the grid and paints what changed |
 | the first `/dev/framebuffer` handout (`framebuffer_server`, `kernel/src/object/kernel_server.rs`) | userspace | updates the grid; paints nothing |
 | `stop_the_machine`, for a panic and a fatal fault alike | the kernel, for good | nothing more is written; the reclaim repaints the grid once |
 
@@ -110,31 +112,45 @@ over the desktop, and none of the three can reach it.
 
 ## The gate
 
-`cargo xtask check-fbcon` boots the release userspace over a kernel built with the `crash-key`
+`cargo xtask check-fbcon` boots the release userspace over a kernel built with the `fbcon-gate`
 feature, with **`-serial none`**, and reads every screendump back into text with `glyphs.rs` and
-`text.rs` compiled into `xtask` by path — the same face, palette and geometry. It claims:
+`text.rs` compiled into `xtask` by path — the same face, palette and geometry. A cell counts only
+if every pixel is ink or paper and, at a scale above one, every block is a single colour.
 
-1. **The boot is on the screen**: `Nitrox kernel — diagnostics online` (the first line, and an em
-   dash from the Unicode table), `init: spawned init (pid 1); handing off to userspace`,
-   `init: mounted fs-server-ext4 at /` (a `sys_kprint` line) and `compositor: up`, the last before
-   the handout. Every row read in any dump is kept; measured on the day it landed, every line
-   from the first to the handout was caught under both TCG and KVM.
-2. **The console lets go**: for six seconds after the compositor draws, while every service keeps
-   printing, no screendump contains a single ink-on-paper glyph cell.
-3. **A stop takes the screen back**: F10 panics the `crash-key` kernel from inside the i8042
-   driver; the screen becomes console text ending in `*** KERNEL PANIC ***` and the message, and
-   after the pointer is moved it is unchanged two seconds later.
+**It reads held frames, not lucky samples.** A dump costs 4–18 ms depending on the host, and the
+console does not wait for it. The first version required lines to be *seen* in passing, and
+`compositor: up` is on screen only from its own paint to the compositor's first frame: one dump in
+1640 on a fast host, and missed in 3 runs of 5 with dumps slowed to CI's rate (PR #296 review).
+So `fbcon-gate` holds the screen still for a second **after the timer is calibrated** and **at the
+`/dev/framebuffer` handout** (`fbcon::hold_for_gate`), and each group of lines below has to appear
+whole in a single frame. Measured with dumps slowed to about 34 ms, twice CI's interval: 5 of 5
+runs passed; with both holds removed, 2 of 3 failed the handout group.
 
-**Why a kernel feature for the third.** QEMU's `inject-nmi` reaches the guest through LINT1,
-which nothing unmasks; it had no effect under TCG or KVM. Nothing in a working kernel stops on
-demand, so the key is compiled in only for this gate, as `no-ps2-irq` is for `check-input`.
+1. **The boot is on the screen.** Held after the timer: `Nitrox kernel — diagnostics online` (the
+   first line, and an em dash from the Unicode table) with `allocators up`, both before PCI. Held
+   at the handout: `init: spawned init (pid 1); handing off to userspace` (the kernel's last line),
+   `init: mounted fs-server-ext4 at /` (a `sys_kprint` line) and `compositor: up`. The handout
+   frame shows at least the last 38 lines — 50 rows less a quarter-screen jump — and the kernel's
+   last line is 29 lines before the handout today, so a boot that grows past that fails this
+   group deterministically and says why.
+2. **The console lets go**: once a frame with no console glyph anywhere appears, six seconds of
+   screendumps — while every service keeps printing — contain not one ink-on-paper glyph cell.
+3. **A stop takes the screen back**: F10 panics the kernel from inside the i8042 driver, **with its
+   lock held**; the screen becomes console text ending in `*** KERNEL PANIC ***` and the message,
+   and after the pointer is moved it is unchanged two seconds later. Panicking under the lock is
+   deliberate — it is also the regression test for the rank tracker's `try_lock` rule
+   (`kernel/src/libkern/lockrank.rs`).
 
-**Each claim was failed on purpose before it was trusted**: removing the `sys_kprint` tee
-(claim 1: `compositor: up` never appears), removing the yield (claim 2: 344 glyph cells reappeared
-over the desktop), removing the reclaim (claim 3: no panic on screen), and breaking the table
-lookup (claim 1: the em-dash line never matches). Claim 3's last check did **not** fail at first
-with the stop's NMIs deleted, since an idle greeter draws nothing for seconds; the pointer motion
-is what makes a still-running compositor show itself.
+**Why kernel hooks at all.** Nothing in a working kernel holds the screen or stops on demand, and
+QEMU's `inject-nmi` reaches the guest through LINT1, which nothing unmasks: it had no effect under
+TCG or KVM. So both are compiled in only for this gate, as `no-ps2-irq` is for `check-input`.
+
+**Each claim was failed on purpose before it was trusted**: removing the `sys_kprint` tee (the
+handout group is never whole), removing the yield (the console never leaves the screen), removing
+the reclaim (no panic on screen), breaking the table lookup (the held early frame never matches),
+and removing the holds (above). Claim 3's last check did **not** fail at first with the stop's NMIs
+deleted, since an idle greeter draws nothing for seconds; the pointer motion is what makes a
+still-running compositor show itself.
 
 ## Not built
 
@@ -144,3 +160,9 @@ is what makes a still-running compositor show itself.
   so on COM1, which on such a machine nobody reads.
 - **Cache attributes for the aperture.** The console writes through Limine's higher-half mapping
   as it stands; Phase 5 Part G is what decides what that mapping should be on real hardware.
+- **A display that fails after the handout.** From the yield until a stop, nothing is painted, so
+  a compositor that acquires the aperture and then dies — `obj.map` failing, or a panic before its
+  first frame — leaves the screen frozen on `compositor: up` with its reason in the grid and on
+  COM1 only. That is the cost of handing over at the handout rather than at a first frame the
+  kernel cannot see. The kernel does see the borrowed aperture object released, which would be the
+  trigger for taking the screen back if that case ever needs a diagnosis on the machine.

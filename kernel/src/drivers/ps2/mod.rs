@@ -272,8 +272,8 @@ pub fn reclaim_completed() {
     }
 }
 
-/// The key the `crash-key` feature panics on: F10, the tenth of the consecutive function keys.
-#[cfg(feature = "crash-key")]
+/// The key the `fbcon-gate` feature panics on: F10, the tenth of the consecutive function keys.
+#[cfg(feature = "fbcon-gate")]
 const CRASH_KEY: u16 = crate::libkern::input::KEY_F1 + 9;
 
 /// Drain the controller into the rings. Shared by both ISRs, because **both ports deliver
@@ -306,7 +306,7 @@ fn drain_controller() -> bool {
         match port {
             Port::Keyboard => {
                 if let scancode::Decoded::Key { code, pressed } = g.keys.feed(byte) {
-                    #[cfg(feature = "crash-key")]
+                    #[cfg(feature = "fbcon-gate")]
                     if pressed && code == CRASH_KEY {
                         // **With this leaf lock held, deliberately**: a driver that panics
                         // usually holds its own lock, and the panic's message must still reach
@@ -315,7 +315,7 @@ fn drain_controller() -> bool {
                         // showed `lock-order violation: acquiring Klog (rank 72) while holding
                         // Leaf (rank 90)` instead — so `check-fbcon` is that fix's regression
                         // test as well as the console's.
-                        panic!("crash-key: F10 pressed, and this kernel was built to stop on it");
+                        panic!("fbcon-gate: F10 pressed, and this kernel was built to stop on it");
                     }
                     let value = if pressed {
                         crate::libkern::input::KEY_PRESS

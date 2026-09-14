@@ -130,9 +130,11 @@ handed `/dev/framebuffer`, and again when the machine stops (`kernel/src/fbcon/`
 `docs/architecture/framebuffer-console.md`). The gate boots with `-serial none` and **reads the
 screen back into text** with the kernel's own glyph and layout code, compiled into `xtask` by
 path — so it asserts on lines, not pixels, and learns nothing from serial. It boots the release
-userspace over a kernel built with `crash-key`, a gate-only feature that panics on F10, because
-that is the only way to stop a working machine after the desktop is up; QEMU's `inject-nmi` does
-not reach this kernel. It runs in CI's QEMU job.
+userspace over a kernel built with `fbcon-gate`, a gate-only feature that **holds the screen still
+for a second** after the timer and at the handout — a sampled scrolling console is otherwise a
+flake, since a line may be up for milliseconds — and **panics on F10**, the only way to stop a
+working machine after the desktop is up (QEMU's `inject-nmi` does not reach this kernel). It runs
+in CI's QEMU job.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
 release image and driving it to five moments — the greeter, the bare desktop, the applications

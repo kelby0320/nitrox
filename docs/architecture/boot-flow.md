@@ -116,14 +116,15 @@ binary is loaded, and a plain `static` would let rustc constant-fold the read.
 `kernel_main` then brings the system up in this order — the ordering is load-bearing, and
 each step's rationale is in the source comments:
 
-1. **The screen, then serial.** Neither needs anything but what Limine handed over, so every
-   later step can report progress *and failure* before anything else exists. The screen goes
-   first so that the first line is on it: `fbcon::init` takes Limine's framebuffer and draws
-   everything COM1 receives from here until a client is handed `/dev/framebuffer`, which on a
-   machine with no serial port is the only diagnosis there is. See
-   [the framebuffer console](framebuffer-console.md). (Serial alone was first until Phase 5
-   Part B, 2026-09-14.)
-2. **CPU tables** — GDT + TSS, then IDT (`arch::Cpu::init_tables`).
+1. **CPU tables** — GDT + TSS, then IDT (`arch::Cpu::init_tables`). First because it prints
+   nothing and needs nothing, and everything after it can fault: with the IDT live, a bad
+   framebuffer descriptor produces a register dump rather than a silent triple fault.
+2. **The screen, then serial.** Neither needs anything but what Limine handed over, so every
+   later step can report progress *and failure*. The screen goes first so that the first line is
+   on it: `fbcon::init` takes Limine's framebuffer and draws everything COM1 receives from here
+   until a client is handed `/dev/framebuffer`, which on a machine with no serial port is the only
+   diagnosis there is. See [the framebuffer console](framebuffer-console.md). (Serial came first,
+   before the CPU tables, until Phase 5 Part B, 2026-09-14.)
 3. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
    it. This is the first code to walk firmware structures and the first place a fault can
    happen, which is why the IDT is already live.
