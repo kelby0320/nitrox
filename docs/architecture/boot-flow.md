@@ -211,9 +211,9 @@ child instead and PID 1's restart-on-death was code no gate could reach.
 read, overwrite, grow, create and subtree-bind checks moved to `boot-probe`, a declared
 service `service-mgr` starts, so they run *after* the step-5 handoff rather than between
 steps 2 and 3. They also gate the boot verdict now, which they never did here — every failure
-path in init was a bare `return` after a `FAIL` print. `init` keeps one thing they need: the
-`/subtreetest` binding in `mount_one`, which cannot become declaration data because nothing
-in a declaration can express a namespace bind.
+path in init was a bare `return` after a `FAIL` print. The one thing they need from init — a
+second name on the root, `/subtreetest` scoped to `/system` — is data too since Phase 5 Part C.1:
+a `[[bind]]` in the test image's `init.toml`, where it was `init`'s last build-mode `cfg`.
 
 **Who fires the verdict** is `boot-probe`, not init; init only ever fires FAIL, and now only
 for a critical-path boot failure — a demo chain that dies partway is caught by `test-qemu`'s

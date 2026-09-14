@@ -145,16 +145,20 @@ not boot the **release** image, which is its whole justification.
 
 That justification survives the retrofit, and the measurement is `cargo xtask check-images`: of
 the initramfs's seven files, four are byte-identical between the two images, and the three that
-differ are two declaration files and `sbin/init`. The kernel differs too (`test-harness`),
+differ are all data: two declaration files and the mount manifest, whose test copy adds two
+`[[bind]]`s. Every program is byte-identical (`sbin/init` differed until Phase 5 Part C.1). The
+kernel differs (`test-harness`),
 and the store carries a package a release image does not. The gates also assert different
 things: `test-qemu` adjudicates the substrate, `test-interactive` drives the path a person
 takes.
 
 ## The `test-harness` feature
 
-`test-qemu` builds the kernel and `init` with the **`test-harness`** cargo feature
-(`= ["selftest"]`), which is distinct from `selftest` because it changes *terminal*
-behavior:
+`test-qemu` builds the kernel with the **`test-harness`** cargo feature (`= ["selftest"]`),
+which is distinct from `selftest` because it changes *terminal* behavior. No userspace program
+takes either: `init` was the last, until Phase 5 Part C.1 turned its one test-only branch into
+manifest data. What a test image's userspace does differently comes from its data — declarations,
+the mount manifest, and the `test` store package. The two modes differ in:
 
 |  | `selftest` (`xtask qemu --selftest`) | `test-harness` (`xtask test-qemu`) |
 |---|---|---|
@@ -203,9 +207,10 @@ lifecycle is a KVM boot loop (0/60 has been the bar) on top of a single
 ## Adding coverage
 
 Today: add an assertion to the existing self-test payload — a kernel check in
-`kernel/src/boot_selftest.rs`, or a userspace exercise in init's `selftest` block.
-A check that fails should `panic!` (kernel) or drive init to a non-zero verdict
-(userspace); either fails the run. Keep additions deterministic and free of
+`kernel/src/boot_selftest.rs`, or a userspace check in the `test-harness` crate (`boot-probe`'s
+gates, or the demo chain `check_demo_chain` adjudicates). A check that fails should `panic!`
+(kernel) or fail the verdict `boot-probe` fires (userspace); either fails the run. (This said
+"init's `selftest` block" until 2026-09-14; init has had none since the retrofit.) Keep additions deterministic and free of
 wall-clock/timing assumptions (TCG timing is not real hardware).
 
 ## Deferred

@@ -98,13 +98,11 @@ every build and zero test cfgs, and its login proof lives here as steps 5a–5c.
 
 **Prefer this shape for anything user-facing**: a service should behave in a test image the way
 it behaves in a release one. `docs/planning/test-path-retrofit.md` is the plan that made that
-true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to one — and
-it is complete. The one left is `init`'s `/subtreetest` binding, which needs a **bind-mount
-concept in `init.toml`**; it was deferred past that plan as capability work and is **scheduled
-as Phase 5 Part C.1** (`docs/planning/phase-5-bare-metal.md`). It was put there because the live
-image was going to need the same mechanism; Part C's detail pass found the live image does not
-(its root is an ext4 RAM disk, not a bind of `/initramfs`), and the bind concept stayed in Part C
-anyway, to close the retrofit.
+true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to zero — and
+it is complete. The last was `init`'s `/subtreetest` binding, which needed a **bind-mount concept
+in `init.toml`** and got one in Phase 5 Part C.1: a `[[bind]]` in the test image's manifest
+(`docs/spec/init-toml-schema.md`). `init` takes no cargo feature in any mode, so a test image and
+a release image carry the same `init`.
 
 `cargo xtask check-images` is what keeps the property: it fails if a test image and a release
 image start differing in anything new.

@@ -141,11 +141,12 @@ enum BuildMode {
 }
 
 impl BuildMode {
-    /// The cargo `--features` value for the **userspace** build of `init` (`None` = no flag).
+    /// The mode's test feature (`None` = none), as the **kernel** takes it — see
+    /// [`kernel_features`](Self::kernel_features).
     ///
-    /// `init` is the only userspace crate that takes it. `session-mgr` did until the retrofit
-    /// moved the boot verdict out of it (Part B); `nxterm` takes `test-harness` alone, which
-    /// is a different value and is passed separately.
+    /// **No userspace crate takes it any more.** `init` was the last, until Phase 5 Part C.1
+    /// made its `/subtreetest` binding manifest data; `session-mgr` stopped at retrofit Part B.
+    /// `nxterm` takes `test-harness` alone, which is a different value and passed separately.
     fn features(self) -> Option<&'static str> {
         match self {
             BuildMode::Normal | BuildMode::FbconGate => None,
@@ -154,6 +155,14 @@ impl BuildMode {
                 Some("test-harness")
             }
         }
+    }
+
+    /// Whether the image carries **test data**: the `test` store package, the boot probe's
+    /// declaration, and the test manifest's binds. True of every mode with a test feature —
+    /// `--selftest` as much as the harness — and the one question the image build asks, now
+    /// that no userspace program is built differently for it.
+    fn stages_test_data(self) -> bool {
+        self.features().is_some()
     }
 
     /// Whether this is a harness build — the images that carry the guest-side gates.
@@ -456,10 +465,14 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The integration smoke-test harness (bins `test-harness`, `test-stage` and
     // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
-    if mode.features().is_some() {
+    if mode.stages_test_data() {
         build_userspace_crate("test-harness", TEST_PROGRAMS, None)?;
     }
-    build_userspace_bin("init", mode.features())?;
+    // **`None` in every mode** (Phase 5 Part C.1), like `session-mgr` below. The last
+    // test-only branch in `init` — the `/subtreetest` and `/scratch` binds — is a `[[bind]]` in
+    // the test image's `init.toml` now, and a feature flag nothing reads would still make the
+    // two builds' bytes differ.
+    build_userspace_bin("init", None)?;
     build_userspace_bin("fs-server-ext4", None)?;
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
@@ -492,8 +505,8 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("compositor", None)?;
     // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
     // the update are host-tested, the bin is the window and the event pump.
-    // **`test-harness` only**, not `mode.features()` — which is what `init` takes, and would
-    // hand this `selftest` as well. The feature makes the terminal report each
+    // **`test-harness` only**, not `mode.features()` — which is the kernel's, and would hand
+    // this `selftest` as well. The feature makes the terminal report each
     // completed grid line on the debug console for `check-terminal` to assert on; a real build
     // must not have it, because a terminal narrating itself to the kernel log undoes the point
     // of the tty server owning output. A first version passed it unconditionally, so every
@@ -9261,18 +9274,18 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
 
 /// The initramfs files a **test** image is allowed to differ from a **release** image in.
 ///
-/// Two are data — the extra service declarations, and the profile manifest that lists the
-/// test-harness store package. One is code: `sbin/init`, for the single `#[cfg(feature =
-/// "selftest")]` that makes the `/subtreetest` binding, which cannot be expressed as manifest
-/// data until `init.toml` grows a bind-mount concept (`test-path-retrofit.md` Part C).
+/// **All three are data**: the extra service declarations, the profile manifest that lists the
+/// test-harness store package, and the mount manifest's two extra binds. The last code
+/// difference — `sbin/init`, for the `#[cfg(feature = "selftest")]` that made those binds —
+/// went with Phase 5 Part C.1, which made them `[[bind]]` entries and stopped passing `init`
+/// a feature at all.
 ///
 /// **Everything else must be byte-identical**, and that is the whole claim of the retrofit:
-/// the software under test is the software that ships. Five of the eight entries are, today.
+/// the software under test is the software that ships. Every program is, today.
 const IMAGE_DIVERGENCE_ALLOWED: &[&str] =
-    &["etc/profiles/system.toml", "etc/services.toml", "sbin/init"];
+    &["etc/init.toml", "etc/profiles/system.toml", "etc/services.toml"];
 
-/// `cargo xtask check-images` — a test image may differ from a release image only in **data**,
-/// plus the one code difference still on the books.
+/// `cargo xtask check-images` — a test image may differ from a release image only in **data**.
 ///
 /// Builds both initramfs archives and compares them file by file. A new divergence fails,
 /// which is what makes the retrofit's result a wall rather than a measurement.
@@ -9293,9 +9306,9 @@ const IMAGE_DIVERGENCE_ALLOWED: &[&str] =
 /// the allowed three change size whenever a declaration is added, and pinning sizes would make
 /// this fail for the right reason at the wrong time.
 ///
-/// **It is one-directional.** A file that *stops* differing — `sbin/init`, when the
-/// `/subtreetest` binding finally becomes manifest data — leaves the allow-list stale with
-/// nothing to say so. That is the harmless direction, and tightening it would mean failing a
+/// **It is one-directional.** A file that *stops* differing — as `sbin/init` did when the
+/// `/subtreetest` binding became manifest data — leaves the allow-list stale with nothing to
+/// say so. That is the harmless direction, and tightening it would mean failing a
 /// build for getting *better*; the cost is that the list needs pruning by hand when a box in
 /// `test-path-retrofit.md` closes.
 fn cmd_check_images() -> R<()> {
@@ -10390,6 +10403,29 @@ mount_point = \"/\"\n\
 mode = \"rw\"\n\
 required_for = \"boot\"\n";
 
+/// The binds a **test** image's `init.toml` adds: two more names for the root mount.
+///
+/// - `/subtreetest`, scoped to `/system`, which `boot-probe`'s `subtree_bind_test` resolves and
+///   the demo harness's case 8 needs as a binding that is also an openable directory, to prove
+///   `move` refuses to recurse through a mount.
+/// - `/scratch`, scoped to `/scratch`: a second writable mount for the cross-mount half of
+///   `move`. Same server, different subtree base, which is what the kernel classifies as
+///   another mount.
+///
+/// Both were a `#[cfg(feature = "selftest")]` block in `init`'s `mount_one` — the last build-mode
+/// branch in PID 1 — until `init.toml` grew `[[bind]]` (Phase 5 Part C.1).
+const TEST_BINDS_TOML: &str = "\
+\n\
+[[bind]]\n\
+path = \"/subtreetest\"\n\
+source = \"/\"\n\
+subtree = \"/system\"\n\
+\n\
+[[bind]]\n\
+path = \"/scratch\"\n\
+source = \"/\"\n\
+subtree = \"/scratch\"\n";
+
 /// The service declarations, read by `service-mgr` from `/initramfs/etc/services.toml`.
 ///
 /// **One file, many `[service.<name>]` tables** — the 2026-08-21 change to
@@ -10661,11 +10697,17 @@ const GRAPHICAL_APPLICATIONS: [(&str, &str); 3] =
 /// and the mandatory `TRAILER!!!`. Built by `cmd_build` before this runs.
 fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     let mut buf = Vec::new();
-    cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
+    // The mount manifest. A test image's also re-binds the root for the two fixtures that need
+    // a second name on it — data, where it was `init`'s last build-mode `cfg` until Part C.1.
+    let mut init_toml = String::from(INIT_TOML);
+    if mode.stages_test_data() {
+        init_toml.push_str(TEST_BINDS_TOML);
+    }
+    cpio_entry(&mut buf, 1, "etc/init.toml", init_toml.as_bytes());
     // The declarations file. Its **content** is what differs between a test image and a
     // release image — see `BOOT_PROBE_TOML`. The programs below do not differ.
     let mut services = String::from(SERVICES_TOML);
-    if mode.features().is_some() {
+    if mode.stages_test_data() {
         services.push_str(BOOT_PROBE_TOML);
     }
     // **`compose-bench` instead of `boot-probe`, not beside it.** `boot-probe` fires the boot
@@ -10717,7 +10759,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     // The test package, in selftest/test-harness builds only. Projected into `/bin` like any
     // other package, so `init` spawns `/bin/ui-testclient` by exactly the path it spawns
     // `/bin/logging-service` by — one mechanism, not a test-only one.
-    if mode.features().is_some() {
+    if mode.stages_test_data() {
         let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
         system_profile.push_str(&format!(
             "\n[[package]]\n\
@@ -11039,7 +11081,7 @@ fn assemble_image(
 
     // The `test` package: the guest-side gates and the programs they drive. Absent from a
     // release image — `cmd_build` does not even build them outside selftest modes.
-    if mode.features().is_some() {
+    if mode.stages_test_data() {
         let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
         let test_bin = staging.join(test_store.trim_start_matches('/')).join("bin");
         fs::create_dir_all(&test_bin)?;

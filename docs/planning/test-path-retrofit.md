@@ -1,6 +1,7 @@
 # Nitrox Test-Path Retrofit — Subproject Plan
 
-**Status:** ✅ complete (2026-08-24), bar one open box named in Part C. Planned 2026-08-21;
+**Status:** ✅ complete (2026-08-24); its last open box, the `/subtreetest` binding, closed
+2026-09-14 with Phase 5 Part C.1. Planned 2026-08-21;
 Parts A, B and C1 landed that day, C2 and D on 2026-08-24. What it did:
 `parse_all` and the schema change under it, `boot-probe` started from a declaration,
 `service-mgr` holding more than one service, `session-mgr` down to **zero** test cfgs with the
@@ -270,8 +271,12 @@ ordering box below real rather than theoretical.
       **Found by `check-terminal`, not `test-qemu`**, for the reason Part B recorded: the probe
       writes the verdict, so under `test-qemu` the machine stops before it can exit.
 
-- [ ] **The `/subtreetest` binding is the one cfg left in `init`, and the blocker is narrower
-      than this box first said.** It read "data cannot express a namespace bind", which is true
+- [x] **The `/subtreetest` binding is the one cfg left in `init`, and the blocker is narrower
+      than this box first said.** ✅ **Closed 2026-09-14 by Phase 5 Part C.1**: `init.toml` has
+      `[[bind]]`, the test image's manifest binds `/subtreetest` and `/scratch`, the cfg is gone,
+      and `init` takes no cargo feature in any mode — so `sbin/init` is byte-identical across
+      images and left `check-images`' allow-list. Deleting the binds from the test manifest fails
+      `test-qemu` at `boot-probe: subtree resolve FAIL`. It read "data cannot express a namespace bind", which is true
       of *service* declarations — `[handles].namespace` is unparsed and a declared service gets
       `namespace: 0`, an inherited LOOKUP-only root — and was over-generalised. `init` reads a
       manifest too, `/initramfs/etc/init.toml`, and `MountSpec` already carries an
@@ -408,14 +413,15 @@ this by one everywhere it appeared — PR #230 review, finding 6.)
 Measured 2026-08-24. Three of four met; the fourth is one binding short, and the box for it is
 open above rather than reworded.
 
-- ✅ `session-mgr` has **zero** cfg sites (was 31). `init` has **one** (was 41) — the
-  `/subtreetest` binding, which needs a bind-mount concept in `init.toml`.
+- ✅ `session-mgr` has **zero** cfg sites (was 31). `init` had **one** (was 41) — the
+  `/subtreetest` binding — and has zero since Phase 5 Part C.1 gave `init.toml` a `[[bind]]`.
 - ✅ Everything else is `nxterm`'s observation prints (9) and the `test-harness` crate itself.
 - ✅ `test-qemu`, `test-interactive`, `check-display`, `check-terminal`, `check-input`,
   `check-input --no-ps2-irq` and `check-images` all pass, and the boot verdict is written by one
   program — `boot-probe`, which did not exist when this plan was written.
-- ⚠️ The two images build the same `session-mgr` and **not** the same `init`. Four of the
-  initramfs's seven files are byte-identical; of the three that differ, two are data.
+- ✅ The two images build the same `session-mgr` and, since Phase 5 Part C.1, the same `init`.
+  Four of the initramfs's seven files are byte-identical, and the three that differ are all data.
+  (Until then this read ⚠️: "not the same `init`".)
 
 **And a thing worth recording that was not a criterion.** Three separate times, moving a program
 out of a supervisor silently moved its *verdict* nowhere — the demo chain, the display self-test,

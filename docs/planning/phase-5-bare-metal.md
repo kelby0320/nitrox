@@ -426,27 +426,27 @@ an initrd has always been, and nothing in it names the live image.
 **C.1 — a bind-mount concept in `init.toml`, and the last `cfg` leaves `init`** *(maintainer's
 call: kept in Part C although the live image no longer needs it)*
 
-- [ ] `[[bind]]` entries: `path` (where to bind), `source` (the `mount_point` of a `[[mount]]` in
+- [x] `[[bind]]` entries: `path` (where to bind), `source` (the `mount_point` of a `[[mount]]` in
       the same manifest) and `subtree` (the base the lookups are scoped to). Processed after every
       mount, with the source mount's forwarding endpoint and `sys_ns_bind`'s existing base
       argument. A `source` naming no mount is a manifest error; a failed bind is critical-path, as
       a failed mount is — a missing bind is how a later test fails for a reason nobody can see.
-- [ ] **`init` retains every mount's endpoint until the binds are done.** Today it keeps only the
+- [x] **`init` retains every mount's endpoint until the binds are done.** Today it keeps only the
       root's (`FS_ENDPOINT`, handed on to `service-mgr`) and closes each other mount's the moment
       it is bound, so "the source mount's endpoint" exists only for `/`. The non-root endpoints
       are closed after the bind pass instead; the root's is still handed on. (Restricting `source`
       to `/` was the alternative, and would be a rule nothing needs.)
-- [ ] `/subtreetest` (subtree `/system`) and `/scratch` (subtree `/scratch`) become `[[bind]]`
+- [x] `/subtreetest` (subtree `/system`) and `/scratch` (subtree `/scratch`) become `[[bind]]`
       entries in the **test** image's `init.toml`, and the `#[cfg(feature = "selftest")]` block in
       `mount_one` is deleted.
-- [ ] **`init` is built with no features in any mode.** Deleting the last `cfg` is not enough on
+- [x] **`init` is built with no features in any mode.** Deleting the last `cfg` is not enough on
       its own: `cmd_build` passes `--features test-harness` to `init`, and the retrofit's own note
       says most byte-identity is cargo not rebuilding a crate whose feature set did not change. So
       the features go from `userspace/init/Cargo.toml` and from the build, and "is this a test
       image" becomes a build-mode predicate rather than `mode.features().is_some()`.
-- [ ] `check-images`' allow-list loses `sbin/init` and gains `etc/init.toml`. The list is
+- [x] `check-images`' allow-list loses `sbin/init` and gains `etc/init.toml`. The list is
       one-directional, so this prune is by hand.
-- [ ] `docs/spec/init-toml-schema.md` gains the table; the retrofit's box and the `init` line in
+- [x] `docs/spec/init-toml-schema.md` gains the table; the retrofit's box and the `init` line in
       `CLAUDE.md` close.
 
 **Why first:** it touches `init`'s manifest, which C.3 also changes, and it is independently

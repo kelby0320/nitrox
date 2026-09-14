@@ -470,8 +470,10 @@ in the system — is a *session-mgr* policy and does not apply to a caller that 
 database is *already* readable by anything that could reach the oracle. An online guess is
 strictly weaker than the offline attack already available, and both have the same fix: a
 supervisor that gets a **constructed** namespace instead of an inherited one. That is the same
-work that closed `manage-ungated` in M7 Part E, and the same work `init`'s `/subtreetest`
-binding waits on — a bind-mount concept in `init.toml`. The precedent is now concrete: a
+work that closed `manage-ungated` in M7 Part E. (This also named `init`'s `/subtreetest` binding
+as waiting on the same work; that binding closed with Phase 5 Part C.1's `[[bind]]`, which lets
+the boot manifest express a bind but constructs no supervisor's namespace — so this entry's fix
+is still open.) The precedent is now concrete: a
 *constructed* namespace is what made a capability withholdable.
 
 **Availability is the other half, and it is the nearer one.** `open_auth_session` applies no
