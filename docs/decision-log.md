@@ -25314,3 +25314,75 @@ addresses into the command list, the FIS base and every PRDT entry, and one that
 low half would DMA somewhere else silently. No disk is diagnosable; a corrupted one is not.
 That assert was flagged in the PR #293 review and is the same shape as the rest of Part A —
 read a capability register and act on it, rather than print it.
+
+---
+
+## 2026-09-14 — Phase 5 Part B: the screen says what COM1 hears
+
+The laptop has no serial port, so Part B puts the kernel's diagnostics on its screen:
+`kernel/src/fbcon/`, described in `docs/architecture/framebuffer-console.md`. The boot banner
+(`draw_nitrox_band`) is deleted — it flashed for a moment after userspace was spawned and said
+nothing about a boot that failed.
+
+**The plan said the pieces existed, and they did not.** `font.rs` had uppercase letters, digits and
+four punctuation marks; every kernel message is lowercase. The choice of face was put to a rendered
+comparison of the three console-setup 8×16 faces (Terminus, Fixed, VGA) and DejaVu Sans Mono
+thresholded to one bit — the last being the option with no new asset, and visibly the worst at this
+size (broken asterisks, uneven strokes). **Terminus** was chosen for legibility (`0`/`O`, `l`/`1`/`I`/`|`
+all distinct). It is embedded as the PSF1 file console-setup ships, unmodified, and read in place:
+the shape is a compile-time assertion, ASCII is looked up by index and everything else through the
+file's Unicode table. No generator, no generated table. SIL OFL 1.1 — the licence and provenance
+sit beside the file, and nothing presents the name to a user, which is the one thing a modified
+version may not do.
+
+**It mirrors COM1, including `sys_kprint`.** The plan said `kprint`. But the likeliest failure on new
+hardware short of a panic is `init` failing to mount a root, and `init` says so through userspace's
+syscall; a console carrying only the kernel's lines would stop at the hand-off to `init`. The log
+ring keeps its narrower definition (the kernel's messages), since that is what `/dev/log` means.
+
+**The hand-over is the first `/dev/framebuffer` handout, not the first committed frame.** The kernel
+cannot observe a commit into an aperture mapped straight into a client. It does perform the handout,
+and yielding there under the console's lock — before the handle exists — means no kernel paint can
+be in flight when a client could first draw. That is the synchronisation the old banner lacked: its
+comment in `main.rs` had named the unsynchronised clear as a likely cause of any future
+`check-display` flake. **The take-back** is in `stop_the_machine`, on both branches, after the
+diagnosis and after the stop NMIs, so a fatal fault gets it as well as a panic.
+
+**Three hazards on the path that most needs to finish**, each handled rather than argued away: a fault
+inside the console re-entering it (a holder CPU is recorded, and a re-entry returns at once); a
+stopping machine whose halted CPUs may hold the lock (writes stop at `arch::stopping()`, the reclaim
+waits a bounded spin count); and a fault dump teed during a long write elsewhere (bounded, then the
+line is dropped from the screen and never from COM1). **The yield alone waits without a bound** — it
+first shared the bounded wait, and a yield that gave up would leave the console drawing over the
+desktop on exactly the uncached framebuffer the laptop will have.
+
+**It scrolls a quarter of the screen at a time.** Measured under TCG from the first line on screen to
+`compositor: up`, about 90 lines: 536 and 568 ms jumping a quarter, 773 and 814 ms a line at a time.
+Painting compares against what each cell already shows, so a scroll repaints only the cells whose glyph
+moved; the grid's rows are a ring, so after the yield a scroll copies nothing.
+
+**The gate reads text, not pixels.** `cargo xtask check-fbcon` boots with `-serial none` and decodes
+every screendump with `glyphs.rs` and `text.rs` compiled into `xtask` by path — the face, palette and
+geometry the kernel drew with, not copies. It asserts the kernel's first line (with its em dash) and
+last, a `sys_kprint` line, and `compositor: up`; then six seconds of no console glyph over the
+desktop; then that a panic takes the screen back and keeps it.
+
+**The panic needed a kernel feature.** QEMU's `inject-nmi` delivers through the local APIC's LINT1,
+which this kernel leaves masked: tried under TCG and KVM, with serial captured, and nothing happened.
+Nothing else stops a working kernel on demand, so `crash-key` panics on F10 from inside the i8042
+driver, compiled only into this gate's image — the `no-ps2-irq` pattern. The panic drops the
+driver's leaf lock first: with it held, the screen showed `lock-order violation: acquiring Klog (rank
+72) while holding Leaf (rank 90)` and never the panic's own message.
+
+**Every claim was failed on purpose, and one failed to fail.** Removing the `sys_kprint` tee never
+showed `compositor: up`; removing the yield put 344 glyph cells over the desktop; removing the reclaim
+left no panic on screen; breaking the Unicode-table lookup lost the em-dash line. But deleting the stop
+NMIs — leaving the compositor running — still passed the "nothing draws over the panic" check, because
+an idle greeter draws nothing in two seconds. The gate now moves the pointer after the panic appears: a
+running compositor answers with a cursor over the text, a stopped machine cannot. With that, the same
+control fails. Host tests cover the grid, the decoder and the painter against a host buffer, with their
+own controls (a paint that stops recording what it drew, a reclaim that skips the full repaint).
+
+**Noticed and not fixed here.** With no UART the console driver's loopback self-test reports `FAIL` and
+arms an interrupt for a device that is not there; harmless under QEMU, and Part D's hardware report is
+where it belongs.

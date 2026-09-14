@@ -121,6 +121,11 @@ pub enum LockRank {
     /// among the leaves. (It uses `try_lock` for a different reason — re-entry from a
     /// fault that strikes mid-push.)
     Klog = 72,
+    /// Below the log ring, for the same reason it is below the serial port: the framebuffer
+    /// console (`crate::fbcon`) is teed from the serial `write_str` with `SERIAL` held, after
+    /// `KLOG` has been released. Its `try_lock` is for faults that strike mid-paint, as the
+    /// log ring's is for faults mid-push.
+    Fbcon = 74,
     /// The TLB-shootdown serialiser (`tlb::LOCK`), which is held with **interrupts
     /// enabled** — the F1 fix (decision log 2026-07-21): an initiator spinning for
     /// acknowledgements must keep taking incoming shootdown IPIs, or two initiators
@@ -442,6 +447,7 @@ mod tracker {
             66 => "KernelVmap",
             70 => "Serial",
             72 => "Klog",
+            74 => "Fbcon",
             85 => "TlbShootdown",
             90 => "Leaf",
             _ => "unknown",

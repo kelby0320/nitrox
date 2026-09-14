@@ -18,7 +18,7 @@ pub mod device;
 pub mod dpc;
 pub mod drivers;
 pub mod entropy;
-pub mod font;
+pub mod fbcon;
 pub mod framebuffer;
 pub mod handle;
 pub mod initramfs;

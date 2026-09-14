@@ -150,6 +150,10 @@ impl fmt::Write for SerialPort {
         // uses `try_lock`, so it can never deadlock the panic path. Newlines stay
         // bare `\n` here (the log reader's `sys_kprint` translates for the terminal).
         crate::klog::push(s.as_bytes());
+        // And onto the screen, while the kernel has it (`crate::fbcon`). Same locking story as
+        // the log ring: a bounded `try_lock`, and a return at once on re-entry from a fault
+        // inside the console, so the emergency writer cannot hang on it either.
+        crate::fbcon::push(s.as_bytes());
         for &byte in s.as_bytes() {
             if byte == b'\n' {
                 self.write_byte(b'\r');

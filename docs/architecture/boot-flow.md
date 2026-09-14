@@ -1,6 +1,6 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-10). Describes the boot as it runs today — UEFI →
+**Status:** Current (last checked 2026-09-14, when the framebuffer console took the first line of `kernel_main`). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -87,7 +87,8 @@ bracketed region — see `kernel/linker.ld` and `kernel/src/main.rs`), and sets 
 - 64-bit long mode, with 4-level paging
 - A higher-half kernel mapping anchored at `0xffffffff80000000`
 - A higher-half direct map of physical memory (HHDM)
-- The framebuffer (linear, 32 bpp, driven by Limine's response struct)
+- The framebuffer (linear, 32 bpp, driven by Limine's response struct), mapped in the higher
+  half — the console draws through that mapping from the first line of `kernel_main`
 - A 64 KiB stack in bootloader-reclaimable memory
 - A bootloader GDT with `CS=0x28`, `DS=0x30`
 - `RFLAGS.IF = 0` (interrupts disabled)
@@ -115,8 +116,13 @@ binary is loaded, and a plain `static` would let rustc constant-fold the read.
 `kernel_main` then brings the system up in this order — the ordering is load-bearing, and
 each step's rationale is in the source comments:
 
-1. **Serial first.** It touches only fixed I/O ports, so every later step can report
-   progress *and failure* to the console before anything else exists.
+1. **The screen, then serial.** Neither needs anything but what Limine handed over, so every
+   later step can report progress *and failure* before anything else exists. The screen goes
+   first so that the first line is on it: `fbcon::init` takes Limine's framebuffer and draws
+   everything COM1 receives from here until a client is handed `/dev/framebuffer`, which on a
+   machine with no serial port is the only diagnosis there is. See
+   [the framebuffer console](framebuffer-console.md). (Serial alone was first until Phase 5
+   Part B, 2026-09-14.)
 2. **CPU tables** — GDT + TSS, then IDT (`arch::Cpu::init_tables`).
 3. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
    it. This is the first code to walk firmware structures and the first place a fault can
@@ -139,7 +145,9 @@ each step's rationale is in the source comments:
 11. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
     layout) so `/dev/framebuffer` can serve it. Must precede the next step, which binds
     that path into init's namespace.
-12. **Boot screen**, then the first userspace process.
+12. **The first userspace process**, then the boot thread retires. (A boot banner was drawn
+    here until Phase 5 Part B, clearing the screen with nothing ordering it against the first
+    client's frame.)
 
 ## 4. The first userspace process
 
@@ -253,6 +261,7 @@ tty server: its whole precondition is that the normal path failed. See
 |---|---|
 | `cargo xtask test-qemu` | The whole boot to userspace, headless; the guest writes a verdict to `isa-debug-exit` and a hang is caught by a wall-clock timeout. Runs under **KVM** — the kernel is x2APIC-only and QEMU 8.2's TCG does not emulate x2APIC. |
 | `cargo xtask test-interactive` | The login chain end to end over the serial console, expect-driven: the login prompt, a rejected password, a successful login, and shell behaviour after it. |
+| `cargo xtask check-fbcon` | The same boot with **no serial port at all** (`-serial none`), read back off the screen: the kernel's first and last lines, userspace's up to the compositor, the hand-over, and a panic taking the screen back. |
 
 See [qemu integration tests](../conventions/qemu-integration-tests.md).
 

@@ -103,6 +103,12 @@ impl ArchCpu for X86Cpu {
                 unsafe { super::apic::send_nmi(apic) };
             }
         }
+        // **The screen comes back last**, on both branches: after every other CPU has been told
+        // to halt, so a compositor stops drawing over it, and after the diagnosis was printed —
+        // its lines are the grid's last rows. Early in boot the kernel never gave the screen up
+        // and this only finishes a paint; the fallback branch above is precisely where a panic
+        // before `init` lands, which is the case the console exists for.
+        crate::fbcon::reclaim_for_stop();
         <Self as ArchCpu>::halt_loop()
     }
 

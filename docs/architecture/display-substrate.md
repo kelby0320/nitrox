@@ -52,8 +52,11 @@ load-bearing for the decisions further down, which is why they are still here:
 
 - **`kernel/src/framebuffer.rs`** draws the boot screen into Limine's linear framebuffer —
   base pointer, width, height, pitch, and channel shifts — and is then **idle**. Nothing owns
-  those pixels after boot; the console is serial.
-- **`kernel/src/font.rs`** carries a hand-coded **8×16 bitmap font**, used by that boot screen.
+  those pixels after boot; the console is serial. (Both halves changed in Phase 5 Part B: the
+  kernel's drawing is now [the framebuffer console](framebuffer-console.md), which owns the
+  screen until the first `/dev/framebuffer` handout.)
+- **`kernel/src/font.rs`** carries a hand-coded **8×16 bitmap font**, used by that boot screen. <!-- check-docs: allow-missing -->
+  (Deleted in Phase 5 Part B for an embedded Terminus face, `kernel/src/fbcon/glyphs.rs`.)
 - **No input driver of any kind.** No PS/2, no USB HID. Keyboard input reaches the system only
   as bytes on the serial console.
 - **`DeviceNode` models char and block devices** (`try_new_char`, `try_new_block`). A
@@ -107,6 +110,12 @@ rather than ordinary RAM.
 (bytes per row, which is not width × bpp), and the channel layout. Limine reports all four to
 the kernel; they cross to userspace as an attribute of the resource rather than a second
 protocol.
+
+**Handing it out is also when the kernel stops drawing on it** (since Phase 5 Part B). Until
+then the kernel's [framebuffer console](framebuffer-console.md) owns the pixels; the first
+`/dev/framebuffer` handout yields them under the console's lock, before the handle exists, so a
+client's first frame cannot race a kernel paint. The kernel takes the screen back only when the
+machine stops.
 
 ## 4. Surfaces
 

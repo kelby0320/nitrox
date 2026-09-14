@@ -854,6 +854,10 @@ pub fn sys_kprint(ptr: u64, len: usize) -> SysResult {
     // (the terminal convention, as the kernel's own `kprint!` does) so userspace
     // output — eshell, `cat`, init — renders correctly on a real serial terminal.
     let serial = crate::arch::serial::SERIAL.lock();
+    // The screen shows what COM1 receives, userspace's lines included: on a machine with no
+    // serial port, `init` failing to mount a root would otherwise say so to nobody. Not the log
+    // ring — `/dev/log` is the kernel's messages, and `sys_kprint` is userspace stdout.
+    crate::fbcon::push(dst);
     for &b in dst.iter() {
         if b == b'\n' {
             serial.write_byte(b'\r');

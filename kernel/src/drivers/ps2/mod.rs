@@ -272,6 +272,10 @@ pub fn reclaim_completed() {
     }
 }
 
+/// The key the `crash-key` feature panics on: F10, the tenth of the consecutive function keys.
+#[cfg(feature = "crash-key")]
+const CRASH_KEY: u16 = crate::libkern::input::KEY_F1 + 9;
+
 /// Drain the controller into the rings. Shared by both ISRs, because **both ports deliver
 /// through the same data port**: whichever line fires, the byte waiting might belong to
 /// either device, and the status bit is the only discriminator. Draining everything from
@@ -302,6 +306,15 @@ fn drain_controller() -> bool {
         match port {
             Port::Keyboard => {
                 if let scancode::Decoded::Key { code, pressed } = g.keys.feed(byte) {
+                    #[cfg(feature = "crash-key")]
+                    if pressed && code == CRASH_KEY {
+                        // Released first. Panicking with this leaf lock held trips the rank
+                        // tracker when the panic tees into the log ring, and the screen then
+                        // shows `lock-order violation: acquiring Klog (rank 72) while holding
+                        // Leaf (rank 90)` instead of this message (measured 2026-09-14).
+                        drop(g);
+                        panic!("crash-key: F10 pressed, and this kernel was built to stop on it");
+                    }
                     let value = if pressed {
                         crate::libkern::input::KEY_PRESS
                     } else {

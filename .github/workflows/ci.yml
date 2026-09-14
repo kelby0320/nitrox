@@ -244,6 +244,14 @@ jobs:
       - name: cargo xtask check-login --kvm
         run: cargo xtask check-login --kvm
 
+      # **No serial port**, which is what the laptop Phase 5 targets has: the boot is read back
+      # off the screen with the kernel console's own glyphs, the console is checked to let go of
+      # the screen when the compositor takes it, and a panic (a gate-only `crash-key` kernel
+      # feature, pressed over QMP) is checked to take it back. Every other gate here reads COM1,
+      # so none of them would notice the console drawing nothing. Added with Phase 5 Part B.
+      - name: cargo xtask check-fbcon --kvm
+        run: cargo xtask check-fbcon --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve

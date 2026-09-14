@@ -295,6 +295,11 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     consumer; PCI gained a capability walk, a config-space window that outlives enumeration,
     and the bus-master and INTx-disable bits nothing had ever set. `test-qemu` adjudicates
     which path the driver took, because the boot passes either way.
+  - **Part B (the on-screen console) is complete, 2026-09-14.** Everything COM1 receives —
+    `kprint` and `sys_kprint` alike — is drawn on the framebuffer from the first line of
+    `kernel_main`, in an embedded Terminus face, until the first `/dev/framebuffer` handout; a
+    panic or fatal fault takes the screen back. `cargo xtask check-fbcon` boots with
+    `-serial none` and reads the boot, the hand-over and a panic back off the screen as text.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

@@ -61,6 +61,7 @@ cargo xtask check-terminal # click into nxterm, type, and check the shell's answ
 cargo xtask check-input    # inject a key + a click over QMP; check they reach a window
 cargo xtask check-images   # test vs release initramfs: differ only on a short allow-list
 cargo xtask check-login    # boot the RELEASE image and drive the graphical greeter to a session
+cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
@@ -122,6 +123,16 @@ display arm exists for a person rather than for a test: everything else display-
 bottom-most — `service-mgr` brings the login chain up before declared services, which is what
 keeps `check-display`'s reference windows undisturbed — so it holds no keyboard and nothing
 typed reaches it.
+
+`cargo xtask check-fbcon` is the **no-serial-port gate** (Phase 5 Part B): the laptop Phase 5
+targets has no COM1, so the kernel draws everything COM1 receives on the screen until a client is
+handed `/dev/framebuffer`, and again when the machine stops (`kernel/src/fbcon/`,
+`docs/architecture/framebuffer-console.md`). The gate boots with `-serial none` and **reads the
+screen back into text** with the kernel's own glyph and layout code, compiled into `xtask` by
+path — so it asserts on lines, not pixels, and learns nothing from serial. It boots the release
+userspace over a kernel built with `crash-key`, a gate-only feature that panics on F10, because
+that is the only way to stop a working machine after the desktop is up; QEMU's `inject-nmi` does
+not reach this kernel. It runs in CI's QEMU job.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
 release image and driving it to five moments — the greeter, the bare desktop, the applications

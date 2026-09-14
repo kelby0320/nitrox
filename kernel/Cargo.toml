@@ -25,6 +25,13 @@ selftest = []
 # deleted — no pass count can, because on healthy hardware the interrupt path carries every
 # byte and the sweep never runs. Never in a production kernel.
 no-ps2-irq = []
+# **Panic on an F10 press**, from inside the i8042 driver. The console's third promise — a
+# machine that stops takes the screen back from whatever userspace drew there — needs a stop
+# *after* the desktop is up, and nothing in a working kernel provides one: QEMU's `inject-nmi`
+# reaches the guest through LINT1, which nothing unmasks, under TCG and KVM alike. Exists so
+# `cargo xtask check-fbcon` can press the key over QMP and read the panic off the screen.
+# Never in a production kernel.
+crash-key = []
 # Integration-test build (`cargo xtask test-qemu`): everything `selftest` runs,
 # plus the `isa-debug-exit` primitive + `SYS_DEBUG_EXIT` gated syscall, and boot
 # failures/panics terminate QEMU with a fail verdict instead of dropping to eshell
