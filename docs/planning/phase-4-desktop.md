@@ -44,8 +44,7 @@ carried three *subsequent* north stars in its own task list, which have now move
 - **The typed shell and coreutils** — [`shell-coreutils-plan.md`](shell-coreutils-plan.md),
   Milestones 1–5.
 - **The test-path retrofit** — [`test-path-retrofit.md`](test-path-retrofit.md), complete bar
-  the `/subtreetest` binding, which [Phase 5](phase-5-bare-metal.md) Part C now carries because
-  the live image needs the same mechanism.
+  the `/subtreetest` binding, which [Phase 5](phase-5-bare-metal.md) Part C.1 now carries.
 
 **North star (scoped now): a usable windowed desktop.** A compositor on the boot
 framebuffer, one shared GUI toolkit, and three flagship apps — a **GUI terminal**, a **GUI

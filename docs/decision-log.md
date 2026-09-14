@@ -25449,3 +25449,55 @@ guest, F10 now panics with the driver's lock held **on purpose**, so `check-fbco
 fix's regression test: it passes with the fix and fails with the old rule restored — "the panic
 reached the screen without its message".
 
+
+---
+
+## 2026-09-14 — Part C's detail pass: the live root is the release root, in RAM
+
+Phase 5 Part C was written on 2026-09-10 around one mechanism: the live image's root would be the
+in-kernel `/initramfs` server, with `/bin` "a subtree bind of the in-kernel `/initramfs`
+endpoint". The detail pass, done before any code as Part A's was, found that root cannot boot.
+
+**The server answers file lookups and nothing else.** `initramfs_server` returns a copied
+`MemoryObject` or `NotFound`: no directory listing, no metadata beyond a mapping, no writes.
+`profile-server` builds `/bin` by listing `/store/<package>/bin/`, and `init` treats a failed
+`/bin` as critical-path, so that root would drop to `eshell` before any service started;
+`libfs::list_dir` opens a directory by resolving it to a session endpoint the serving process
+mints, which a kernel server has no way to do. Making it work would have meant a read-only cpio
+filesystem server that only the live image runs — a second implementation of the filesystem
+protocol, for one mode, which is the discipline this part states in its own first paragraph.
+
+**Chosen instead (maintainer's call): an ext4 image of the release root, loaded by Limine as a
+second module, exposed by the kernel as a RAM-backed block device, and mounted by the same
+`fs-server-ext4`.** The programs, paths and protocols are the release image's; the data that
+differs is a second `module_path` in `limine.conf` and a `nitrox-live` partition label in
+`init.toml`. The label is distinct from `nitrox-root` on purpose — a stick booted on a machine
+with Nitrox installed must not find two roots answering to one name. The kernel change is general:
+a module after the first becomes a block device over its own memory, and the existing GPT pass
+names its partitions. It also removes the first draft's "no writable `/home`": the RAM disk takes
+writes; only persistence is gone.
+
+**Measured before any of it was written.** The current release image attached to QEMU as a USB
+stick, with the AHCI controller empty: OVMF boots Limine off the stick, the kernel sees the xHCI
+controller and has no driver for it, AHCI finds no disk, and `init` fails to find `nitrox-root` and
+drops to `eshell`. That is the laptop's live boot today, and it is what `check-live` will boot.
+
+**The bind-mount concept stays in Part C (maintainer's call), as C.1, although nothing in the live
+image needs it now.** It closes the retrofit's last box, and the pass found one more thing that
+closing requires: deleting the `/subtreetest` `cfg` does not make `init` byte-identical across
+images while `cmd_build` still passes it `--features test-harness`, so the features go too.
+
+**Process (maintainer's call):** the corrected plan is its own PR, reviewed before Part C's code
+begins, as Part A's was.
+
+**The review of that PR (#297) found the design's one timing hazard, and measured it.** A RAM disk
+raises no interrupt, and a block completion is a DPC that drains only at an interrupt tail — so,
+built on today's `RamDisk`, every live-root I/O would wait for the 10 ms tick. Standing in with
+AHCI's device-tail drain deleted, mount-to-greeter went from 0.10 s to 4.85 s under KVM: the
+2026-07-23 "I/O hang" again, as a silent stall on a machine with no serial port. The plan now has
+the RAM disk raise its own completion interrupt, so it completes through the same device-IRQ tail
+AHCI does, and `check-live` bounds mount-to-greeter with deleting that interrupt as the control.
+The review also caught two gate controls that could not fail the step they were written for (the
+GPT pass never logs a label, and a dropped module stops the gate before the mount), a
+`check-images` comparison that could have compared one function with itself, a RAM disk with no
+concurrency model, and an `init` that retains only the root mount's endpoint; each is in the plan.

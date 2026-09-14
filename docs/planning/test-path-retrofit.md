@@ -300,6 +300,12 @@ ordering box below real rather than theoretical.
       second consumer, which is when this project builds things. Closing it there closes this
       plan's last box as a side effect.
 
+      **The second consumer did not survive Part C's detail pass (2026-09-14)**: the in-kernel
+      `/initramfs` server cannot list a directory, so the live root became an ext4 RAM disk
+      mounted like any other, and nothing in it binds `/initramfs`. The box stays scheduled — as
+      Part C.1, first — because closing it was worth doing on its own, and the maintainer kept it
+      there.
+
       **`init` still has 20 `selftest` cfgs**, and they are C2's, not this one's: the demo
       chain (`run_test_harness`), the four `run_*` graphical spawns, and the
       `cfg(not(selftest))` supervision of `service-mgr` — ordinary code that becomes service

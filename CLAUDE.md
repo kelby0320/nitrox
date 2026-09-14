@@ -101,8 +101,10 @@ it behaves in a release one. `docs/planning/test-path-retrofit.md` is the plan t
 true — `session-mgr` went from 31 build-mode `cfg` sites to zero and `init` from 41 to one — and
 it is complete. The one left is `init`'s `/subtreetest` binding, which needs a **bind-mount
 concept in `init.toml`**; it was deferred past that plan as capability work and is **scheduled
-as Phase 5 Part C** (`docs/planning/phase-5-bare-metal.md`), because the live image needs the
-same mechanism — its `/bin` is a subtree bind of the in-kernel `/initramfs` endpoint.
+as Phase 5 Part C.1** (`docs/planning/phase-5-bare-metal.md`). It was put there because the live
+image was going to need the same mechanism; Part C's detail pass found the live image does not
+(its root is an ext4 RAM disk, not a bind of `/initramfs`), and the bind concept stayed in Part C
+anyway, to close the retrofit.
 
 `cargo xtask check-images` is what keeps the property: it fails if a test image and a release
 image start differing in anything new.
