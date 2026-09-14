@@ -184,11 +184,12 @@ impl BuildMode {
 
     /// The same, for the **kernel**, which has one feature userspace does not.
     ///
-    /// Split rather than appended to [`features`](Self::features) because that value also
-    /// reaches `init`, and `no-ps2-irq` is a statement about the i8042 that has no meaning in
-    /// a userspace crate. Declaring it there as a no-op would make `--features` valid at the
-    /// cost of putting a hardware setting in a crate that cannot act on it — the same trade
-    /// `session-mgr` used to make with `selftest`, and the reason its features are gone.
+    /// Split rather than appended to [`features`](Self::features) because that value once also
+    /// reached `init`, and `no-ps2-irq` is a statement about the i8042 that has no meaning in a
+    /// userspace crate. **No userspace crate takes `features()` since Phase 5 Part C.1** — wiring it
+    /// back into one would make that program differ between images, which `check-images` fails. The
+    /// split stays because it is still the right shape: the kernel's feature set is a superset of
+    /// the test mode's, and `stages_test_data` reads the test mode's.
     fn kernel_features(self) -> Option<&'static str> {
         match self {
             BuildMode::TestHarnessNoPs2Irq => Some("test-harness,no-ps2-irq"),
@@ -473,7 +474,8 @@ const TEST_PROGRAMS: &[&str] = &[
 fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
-    // time. Only `init` (and the kernel) carry the selftest / test-harness feature.
+    // time. Only the kernel carries the selftest / test-harness feature — `init` did until Phase 5
+    // Part C.1, and `nxterm`'s `test-harness` is its own, passed below.
     cmd_build_hello()?;
     // The integration smoke-test harness (bins `test-harness`, `test-stage` and
     // `display-selftest`) is built
@@ -8045,13 +8047,12 @@ impl Session {
         Ok(())
     }
 
-    /// Everything the guest has said so far, without consuming any of it.
-    ///
-    /// For a failure message that has to say *what did* happen rather than only what did not —
-    /// [`finish`](Self::finish) takes the session, which a `return Err` in the middle of a gate
-    /// cannot do.
     /// When the text just matched by the last [`expect`](Self::expect) reached the host — the
     /// arrival of the chunk holding its final byte.
+    ///
+    /// **Resolution is a chunk**: the reader's `read` sizes set the boundaries, so two lines in one
+    /// chunk read as simultaneous. Enough for `check-live`'s 1.5 s bound against a 3 s failure; not
+    /// a precise measurement.
     fn matched_at(&self) -> std::time::Instant {
         let end = self.cursor.saturating_sub(1);
         self.arrivals
@@ -8061,6 +8062,11 @@ impl Session {
             .unwrap_or_else(std::time::Instant::now)
     }
 
+    /// Everything the guest has said so far, without consuming any of it.
+    ///
+    /// For a failure message that has to say *what did* happen rather than only what did not —
+    /// [`finish`](Self::finish) takes the session, which a `return Err` in the middle of a gate
+    /// cannot do.
     fn transcript(&self) -> String {
         self.out.lock().map(|g| g.clone()).unwrap_or_default()
     }
@@ -11395,7 +11401,7 @@ fn tree_bytes(dir: &Path) -> R<u64> {
 /// **One function for every image that carries a root**, extracted from `assemble_image` in
 /// Phase 5 Part C so the live image's `root.img` is built from the release root's staging rather
 /// than a copy of its steps. `check-images` does not trust that and compares the built filesystems
-/// anyway — see `check_live_root`.
+/// anyway — see `check_live_image`.
 fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     fs::create_dir_all(staging.join("system"))?;
     // `/scratch` — the backing directory for the **second writable mount**. The kernel
@@ -11404,7 +11410,8 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // yields a destination that is genuinely cross-mount to `/system` while staying
     // writable. That combination did not exist before (2026-07-30): `/initramfs` is
     // cross-mount but read-only, so only the *detection* half of `move`'s fallback could
-    // ever run. Empty here; init binds it under `selftest` and the harness populates it.
+    // ever run. Empty here; a test image's `init.toml` binds it (`TEST_BINDS_TOML`) and the harness
+    // populates it.
     fs::create_dir_all(staging.join("scratch"))?;
     fs::write(
         staging.join("system").join("current-generation"),

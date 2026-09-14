@@ -28,6 +28,15 @@
 //! A root disk takes submits from the fs-server and from page-cache fills on any CPU. Each
 //! transfer runs under the disk's lock, so a read racing a write of the same block sees one or the
 //! other — never a torn block, which a real disk never returns either.
+//!
+//! **Do not `kprintln!` inside `transfer`** while debugging: the lock is `Leaf` and the serial
+//! port ranks above it, so the rank tracker panics with `acquiring Serial (rank 70) while holding
+//! Leaf (rank 90)` — correctly — before the line prints (PR #298 review). Print before or after the
+//! lock is taken.
+//!
+//! **The completion vector is one of eight device vectors** (`DEVICE_IRQ_COUNT`), shared by every
+//! ramdisk. A release boot uses five (AHCI, COM1, the i8042's two, this); `register_device_handler`
+//! asserts on exhaustion, which a machine with more controllers could reach.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -201,8 +210,13 @@ fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
     crate::dpc::enqueue(unsafe { &(*irp).dpc });
     let vector = COMPLETION_VECTOR.load(Ordering::Acquire);
     if vector != 0 {
-        // SAFETY: ring 0, on a CPU that is running kernel threads and so has its local controller
-        // up; `vector` was installed with `ramdisk_completion_isr` by `try_new_device`.
+        // SAFETY: ring 0, and this CPU's local controller is up — for two different reasons
+        // depending on the caller. The first submits come from `drivers::probe`'s GPT pass on the
+        // BSP, before the scheduler, and that is sound **only because `kernel_main` runs
+        // `Irq::init` before `drivers::probe`**: move the probe earlier (to reach a disk sooner on
+        // new hardware, say) and this MSR write `#GP`s with x2APIC off. Every later submit runs on
+        // a CPU executing threads, which `ap_cpu_init` or `Irq::init` has already brought up.
+        // `vector` was installed with `ramdisk_completion_isr` by `try_new_device`.
         unsafe { crate::arch::Irq::raise_on_self(vector) };
     }
 }
