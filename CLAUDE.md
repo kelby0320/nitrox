@@ -77,8 +77,10 @@ window, and stops producing motion, before the guest's cursor reaches the edge. 
 `Super`-something, and GNOME, KDE and COSMIC all bind `Super` at the host compositor, so those
 keystrokes are your desktop's rather than the guest's. `--grab` confines the pointer and takes
 the keyboard (Ctrl-Alt-G releases it); on a Wayland session it also runs the window through
-XWayland, because a grab is an X operation. `Super` alone is deliberately unbound in the guest —
-the chords are `Super+H`, `Super+1..4`, `Super+Shift+1..4`, `Super+R`.
+XWayland, because a grab is an X operation. The chords are `Super+A`
+(the applications modal, and a second one closes it), `Super+H`, `Super+1..4`,
+`Super+Shift+1..4`, `Super+R`. `Super` alone is unbound and **reserved for a full launcher**,
+should one be built.
 
 When a chord seems dead, the debug console says which half is at fault: the compositor logs
 `Super down` / `Super up` per transition (the modifier only — never the key beside it, which at a

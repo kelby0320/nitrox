@@ -61,6 +61,10 @@ const HOTKEY_MINIMIZE: u32 = 1;
 const KEY_R: u16 = 19;
 /// The shell's id for its rename chord.
 const HOTKEY_RENAME: u32 = 2;
+/// `EV_KEY` code for `a`, the applications chord's key.
+const KEY_A: u16 = 30;
+/// The shell's id for the chord that opens the applications modal.
+const HOTKEY_APPS: u32 = 3;
 /// How many desktops the number chords reach.
 ///
 /// **Four, not nine.** `MAX_HOTKEYS` is sixteen and each desktop costs two chords — one to
@@ -2416,6 +2420,35 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                     continue;
                 }
+                if id == HOTKEY_APPS {
+                    // **The keyboard's way in, and the only way in on a machine with no
+                    // pointer** (Phase 5). The applications button lives on a `panel`, which
+                    // takes no keyboard focus, so it can only be *clicked* — and the laptop this
+                    // phase targets has no working pointing device until USB lands in Phase 6.
+                    // Everything past this point was already keyboard-driven: the modal is a
+                    // popup and takes the keyboard, typing filters, Enter launches the top hit.
+                    //
+                    // **A second press puts it away**, which the button itself cannot do — its
+                    // handler is gated on `modal.is_none()`, since a press aimed at the bar
+                    // while the modal is up is dismissed by the modal instead. A chord has no
+                    // such ambiguity, and a key that only opens is a key you cannot undo.
+                    if modal.is_some() {
+                        rename = false;
+                        close_modal(
+                            &mut session, &mut modal, &mut query, "applications modal",
+                            &mut modal_addrs,
+                        );
+                    } else {
+                        modal = open_modal(
+                            &mut session, window, &theme, &font, &programs, &mut modal_addrs,
+                            &query, &mut modal_tree, &mut modal_list,
+                        );
+                        if let Some(id) = modal {
+                            stick(m, id, b"the applications modal");
+                        }
+                    }
+                    continue;
+                }
                 // **Bounded by what the bar is *showing*, which since Part D is not the first
                 // `max_entries` of the global list but the first `max_entries` on the current
                 // desktop.** With seven windows on another desktop and one here, the one here
@@ -2489,10 +2522,23 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     kprint(b"desktop-shell: registering Super+R was refused\n");
                 }
             }
+            // **`Super+A`, and not a tap of `Super`.** A bare modifier is what a full launcher
+            // will want — one field that searches applications, files and settings — and this
+            // modal is the applications menu, so it takes a letter and leaves the tap unspent
+            // (maintainer, 2026-09-15). A tap would also have to be told from the start of
+            // every chord here, all of which begin with `Super` going down.
+            let apps_hk = MgrHotkey { id: HOTKEY_APPS, mods: MOD_META, code: KEY_A };
+            let mut ab = [0u8; core::mem::size_of::<MgrHotkey>()];
+            if apps_hk.write(&mut ab).is_some() {
+                let mut reply = [0u8; 64];
+                if m.request(OP_MGR_REGISTER_HOTKEY, &ab, None, &mut reply).is_err() {
+                    kprint(b"desktop-shell: registering Super+A was refused\n");
+                }
+            }
             Line::new()
                 .s(b"desktop-shell: Super+1..")
                 .u(CHORD_DESKTOPS as u64)
-                .s(b" switches, Super+Shift+N moves, Super+R names")
+                .s(b" switches, Super+Shift+N moves, Super+R names, Super+A opens applications")
                 .end();
 
             let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];

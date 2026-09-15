@@ -201,8 +201,15 @@ compositor. That is the cheap option kept open rather than exercised.
 
 ## 4. The applications modal
 
-**One modal, two triggers**: the applications button in the top bar, and the Super key. They open
-the same thing, because they are the same intent.
+**One modal, two triggers**: the applications button in the top bar, and `Super+A`. They open the
+same thing, because they are the same intent; a second `Super+A` closes it, which the button
+cannot, since its handler is inert while a modal is up.
+
+**`Super+A`, not a tap of `Super`** (Phase 5). A bare modifier is the chord a *launcher* wants —
+one field over applications, files and settings — and this is the applications menu, so the tap is
+left unspent for that. It is also what makes the modal reachable at all on a machine with no
+pointer: the button sits on a `panel`, panels take no keyboard focus, and the laptop Phase 5
+targets has no pointing device until USB (Phase 6).
 
 **Its entries are desktop entries** (M14 Part H) — one TOML file per graphical application,
 projected at `/applications` the way `/bin` is projected, carrying a display name and the program
@@ -217,8 +224,9 @@ people using this system are as likely to type `nxedit` as "editor". (An earlier
 were cut in composition revision 3.) "Open the code-editor desktop" is a launcher entry, not a
 feature.
 
-The Super key means the shell receives a keystroke **regardless of focus** — see §8's global
-hotkey requirement, which is a capability rather than an ambient grab.
+The chord means the shell receives a keystroke **regardless of focus** — see §8's global hotkey
+requirement, which is a capability rather than an ambient grab. The shell registers it through the
+manager channel (`Manage::RegisterHotkey`), so an application cannot take it.
 
 ### 4a. Opening a path, which is launching asked for by somebody else
 
@@ -330,7 +338,7 @@ several are not in `display-substrate.md` yet:
 |---|---|---|
 | **Window roles** — `normal`, `panel`, `popup`, `dialog` | Bars are panels; menus and the modal are popups | Sketched in composition v2 for dialogs; panels and popups make it load-bearing |
 | **Panel struts** — reserved edge space | A maximised window must not cover the bars | **Not in the substrate doc** |
-| **Global hotkey registration** | Super opens the modal regardless of focus | **Not in the substrate doc**; must be capability-gated, or any application could impersonate the launcher |
+| **Global hotkey registration** | `Super+A` opens the modal regardless of focus | **Built** (M8): `Manage::RegisterHotkey` on the manager channel, which only the shell holds |
 | **Window thumbnail capture** | The overview (§6) | **Not in the substrate doc**; capability-gated |
 | **Window list, focus and title notifications** | The bottom bar's window list | Implied, never specified |
 | **Window placement** | Templates already need it | Already required |

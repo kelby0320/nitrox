@@ -981,8 +981,8 @@ fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel, screen: Opt
 /// reach the left side of the screen", and a scaled window makes it arbitrarily worse.
 ///
 /// **And the host desktop keeps `Super` for itself.** Every chord this system binds is
-/// `Super`-something (`Super+H`, `Super+1`, `Super+Shift+1`, `Super+R`), and GNOME, KDE and
-/// COSMIC all bind `Super` at the compositor. Ungrabbed, those keystrokes are the *host's*,
+/// `Super`-something (`Super+A`, `Super+H`, `Super+1`, `Super+Shift+1`, `Super+R`), and GNOME,
+/// KDE and COSMIC all bind `Super` at the compositor. Ungrabbed, those keystrokes are the *host's*,
 /// and the guest is never told they happened.
 ///
 /// A grab fixes both: the pointer is confined to the window, so movement keeps arriving and
@@ -3353,12 +3353,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // After it, because the chord is registered on the loop's first pass and the entries
     // are read before the loop. `expect` scans forward, so asserting these out of order times
     // out on a line already behind the cursor.
+    session.expect("Super+R names, Super+A opens applications")?;
     session.expect("desktop-shell: Super+H minimizes the focused window")?;
 
-    // 4. **The applications modal.** `desktop-shell.md` §4 gives it two triggers — this button
-    //    and the Super key — and only the button can exist yet: the Super key is a *global
-    //    hotkey*, which §8 makes a capability the compositor does not have, and a `panel` takes
-    //    no keyboard focus so a key would never reach the shell at all.
+    // 4. **The applications modal, by both of its triggers** — `desktop-shell.md` §4's button
+    //    and its chord. The chord is `Super+A` since Phase 5, because the button is on a
+    //    `panel` and a panel can only be clicked: on the laptop Phase 5 targets there is no
+    //    pointing device until USB (Phase 6), so without a chord a session could be logged into
+    //    and never used.
     //
     //    The bar spans the screen at y=0 and the button is its left 120px, so a press at
     //    (60, 12) lands inside it. Asserted through the compositor's own `press at` line
@@ -3366,6 +3368,23 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    there" from "the pointer was there and nothing happened".
     const APPS_CLICK: (i32, i32) = (60, 12);
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    session.expect("desktop-shell: applications modal open")?;
+
+    //    **And the chord, closing what the button opened, then opening it again.** Closing
+    //    first is deliberate: it is the half the button cannot do — its handler is gated on no
+    //    modal being up — and it leaves the launch below driven entirely by the keyboard, which
+    //    is the path the laptop has. A chord that only ever opened would pass this gate while
+    //    leaving a person no way out of the modal but Escape.
+    let apps_chord = |qmp: &mut Qmp| -> R<()> {
+        qmp.send_key("meta_l", true)?;
+        qmp.send_key("a", true)?;
+        qmp.send_key("a", false)?;
+        qmp.send_key("meta_l", false)?;
+        Ok(())
+    };
+    apps_chord(&mut qmp)?;
+    session.expect("desktop-shell: applications modal closed")?;
+    apps_chord(&mut qmp)?;
     session.expect("desktop-shell: applications modal open")?;
 
     // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —

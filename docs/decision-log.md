@@ -25870,3 +25870,42 @@ failing `check-live` at `init: mounted fs-server-ext4 at /`, where the old boot 
 
 `check-live` keeps its read through the new root (`/system/current-generation`): the check reads
 three blocks, and the lookup is still the first read of a file.
+
+---
+
+## 2026-09-15 — Super+A opens the applications modal, because the laptop has no pointer
+
+**The desktop could be logged into and not used.** The applications modal had one trigger, the
+button at the left of the top bar, and that button is on a `panel` — a role that takes no keyboard
+focus, so it can only be clicked. Phase 5's laptop has no pointing device: its trackpad is I²C-HID,
+which is Phase 6, and no USB mouse works until then either. A first boot could therefore reach the
+greeter, log in, show a desktop, and offer no way to start a terminal — which is the phase's own
+definition of done. Everything past the modal was already keyboard-driven: it is a `popup` and holds
+the keyboard, typing filters the list, Enter launches the top hit.
+
+**`Super+A`, not a tap of `Super`** *(maintainer's call)*. A bare modifier is the chord a **full
+launcher** wants — one field searching applications, files and settings — and what exists today is
+the applications menu, so the tap is left unspent for the launcher if one is ever built. `CLAUDE.md`
+had said `Super` alone was "deliberately unbound"; that line recorded the state, not a decision, and
+now records the reservation. A tap would also have cost the compositor a new kind of registration
+and a rule telling a tap from the start of every chord here, all of which begin with `Super` going
+down.
+
+**A second `Super+A` closes it**, which the button cannot: the button's handler is gated on no modal
+being up, since a press aimed at the bar while the modal is open is dismissed by the modal instead.
+A key that only opens is a key you cannot undo. Nothing else changes — the chord opens exactly what
+the button opens, through the same `open_modal`, and registers through `Manage::RegisterHotkey` on
+the manager channel, which only the shell holds, so an application cannot take the chord.
+
+`desktop-shell.md` §4 said the second trigger was "the Super key" and §8 listed global hotkeys as a
+capability the substrate did not have. The capability has existed since M8; both now say what is
+built.
+
+**Verified.** `check-login` drives both triggers: the button opens the modal, `Super+A` closes what
+the button opened, a second `Super+A` opens it again, and the launch that follows — typing `nxterm`,
+then Enter — is entirely from the keyboard, which is the path the laptop has. Closing *first* is
+deliberate: it leaves the launch keyboard-driven end to end, and covers the half the button cannot
+do. Controls, each failing at `applications modal closed`: the shell registering some other chord
+instead of `Super+A`, and the chord opening but never closing. `Super+H` cannot fire it — the
+compositor matches code and modifiers exactly, which `modifiers_must_match_exactly` pins. Also
+`check-login --kvm`, `test-qemu`, `check-display`, `check-terminal` and the host suite.
