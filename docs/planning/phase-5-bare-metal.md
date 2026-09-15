@@ -965,13 +965,13 @@ What stays unseen until Part F is the laptop's own padding and its width that is
 
 **E.3 — the gates stop knowing the size, and CI's move**
 
-- [ ] **One place says what size a gate's screen is**: `qemu_display_args(size)` adds
+- [x] **One place says what size a gate's screen is**: `qemu_display_args(size)` adds
       `-vga none -device VGA,xres=…,yres=…`, and every gate that boots a screen — `check-display`,
       `check-input`, `check-terminal`, `check-login`, `check-fbcon`, `check-live`, `check-report`,
       and the `shot` and `bench-compose` tools — takes a size that defaults to 1360×768. A size
       whose width is not a multiple of 8 is refused with the reason, since QEMU would shear it.
       `test-qemu` and `test-interactive` keep QEMU's default.
-- [ ] **Every coordinate a gate uses comes from the size or from the guest**: the window list's
+- [x] **Every coordinate a gate uses comes from the size or from the guest**: the window list's
       and its right-hand click points and the desktop's centre from the screen size; the bottom
       bar's placement line from the size; the pointer's pin corner from the size; the wallpaper line
       computed with `scale::fill` on the host — one source for the expected answer, as
@@ -979,16 +979,16 @@ What stays unseen until Part F is the laptop's own padding and its width that is
       are the ones § What QEMU can show lists, and a search for `1280`, `800`, `1279`, `799`, `788`,
       `776`, `1200`, `640` and `400` as substrings, not words, finds any others; each hit left is
       one somebody read.
-- [ ] **The framebuffer fact splits**: `test-qemu` keeps `1280x800 pitch 5120`, `check-report`
+- [x] **The framebuffer fact splits**: `test-qemu` keeps `1280x800 pitch 5120`, `check-report`
       asserts `1360x768 pitch 5440 padding 0`.
-- [ ] **`check-fbcon`'s handout frame is re-measured**: at 48 rows it shows at least the last 36
+- [x] **`check-fbcon`'s handout frame is re-measured**: at 48 rows it shows at least the last 36
       lines, and the kernel's last line was 29 lines before the handout when Part B measured it.
-- [ ] **`check-report`'s page count is read from the gate**: two pages at 1360×768 in the
+- [x] **`check-report`'s page count is read from the gate**: two pages at 1360×768 in the
       measurement above, pinned from the first real run.
-- [ ] **`check-login` asserts the layout it can now see**: the greeter's logged origin is centred
+- [x] **`check-login` asserts the layout it can now see**: the greeter's logged origin is centred
       for the size, the window-list click lands on the bottom bar, and the wallpaper line matches
       the host's `fill`.
-- [ ] Controls, each at 1360×768: the window list placed from the old height fails `check-login` at
+- [x] Controls, each at 1360×768: the window list placed from the old height fails `check-login` at
       its click; the greeter's old centring fails its assertion; the leaf's resolve refused makes the
       greeter log its fallback and fail the same assertion; `wallpaper_mode` put back to `fit` fails
       the wallpaper line.

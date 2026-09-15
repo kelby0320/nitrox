@@ -221,6 +221,23 @@ fn main() -> ExitCode {
     let grab = rest.iter().any(|a| a == "--grab");
     // `--live` (`image` only): build the live image instead — see `cmd_image_live`.
     let live = rest.iter().any(|a| a == "--live");
+    // `--size WxH` (the gates that boot a screen, and `qemu`): the screen QEMU gives the guest —
+    // `DisplaySize::GATE` for a gate without it, QEMU's own default for `qemu`. See `DisplaySize`.
+    let size_flag = rest.iter().position(|a| a == "--size");
+    let size = match size_flag.map(|i| rest.get(i + 1)) {
+        None => None,
+        Some(None) => {
+            eprintln!("xtask: `--size` wants a size, WxH");
+            return ExitCode::FAILURE;
+        }
+        Some(Some(text)) => match DisplaySize::parse(text) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     // **Rejected before dispatch, not in a match arm.** A flag that exists to make an
     // invisible path visible must not be silently ignored: someone reproducing a sweep bug
     // interactively would otherwise get a boot with the i8042's IRQs *on* and nothing said
@@ -241,6 +258,28 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    const SIZED: &[&str] = &[
+        "check-display",
+        "check-input",
+        "check-terminal",
+        "check-login",
+        "check-fbcon",
+        "check-live",
+        "check-report",
+        "shot",
+        "bench-compose",
+        "qemu",
+        "qemu-debug",
+    ];
+    if size.is_some() && !cmd.as_deref().is_some_and(|c| SIZED.contains(&c)) {
+        eprintln!(
+            "xtask: `--size` is only meaningful for a command that boots a screen ({}) — \
+             `test-qemu` and `test-interactive` keep QEMU's default, so every CI run boots two sizes",
+            SIZED.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
+    let gate_size = size.unwrap_or(DisplaySize::GATE);
     if no_ps2_irq && cmd.as_deref() != Some("check-input") {
         eprintln!(
             "xtask: `--no-ps2-irq` is only meaningful for `check-input` — it boots a kernel \
@@ -256,10 +295,17 @@ fn main() -> ExitCode {
     };
     let qargs: Vec<String> = rest
         .iter()
-        .filter(|a| {
-            *a != "--selftest" && *a != "--kvm" && *a != "--no-ps2-irq" && *a != "--grab" && *a != "--live"
+        .enumerate()
+        .filter(|&(i, a)| {
+            *a != "--selftest"
+                && *a != "--kvm"
+                && *a != "--no-ps2-irq"
+                && *a != "--grab"
+                && *a != "--live"
+                && Some(i) != size_flag
+                && Some(i) != size_flag.map(|f| f + 1)
         })
-        .cloned()
+        .map(|(_, a)| a.clone())
         .collect();
     let mode = if selftest {
         BuildMode::Selftest
@@ -271,8 +317,8 @@ fn main() -> ExitCode {
         Some("build") => cmd_build(mode),
         Some("image") if live => cmd_image_live(),
         Some("image") => cmd_image(mode),
-        Some("qemu") => cmd_qemu(false, mode, accel, grab, &qargs),
-        Some("qemu-debug") => cmd_qemu(true, mode, accel, grab, &qargs),
+        Some("qemu") => cmd_qemu(false, mode, accel, grab, size, &qargs),
+        Some("qemu-debug") => cmd_qemu(true, mode, accel, grab, size, &qargs),
         Some("test") => cmd_test(),
         Some("test-qemu") => cmd_test_qemu(accel),
         Some("test-interactive") => cmd_test_interactive(accel),
@@ -294,15 +340,16 @@ fn main() -> ExitCode {
         Some("shot") => cmd_shot(
             qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
             accel,
+            gate_size,
         ),
-        Some("check-display") => cmd_check_display(accel),
-        Some("check-terminal") => cmd_check_terminal(accel),
-        Some("check-login") => cmd_check_login(accel),
-        Some("check-fbcon") => cmd_check_fbcon(accel),
-        Some("check-live") => cmd_check_live(accel),
-        Some("check-report") => cmd_check_report(accel),
-        Some("bench-compose") => cmd_bench_compose(accel),
-        Some("check-input") => cmd_check_input(accel, no_ps2_irq),
+        Some("check-display") => cmd_check_display(accel, gate_size),
+        Some("check-terminal") => cmd_check_terminal(accel, gate_size),
+        Some("check-login") => cmd_check_login(accel, gate_size),
+        Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
+        Some("check-live") => cmd_check_live(accel, gate_size),
+        Some("check-report") => cmd_check_report(accel, gate_size),
+        Some("bench-compose") => cmd_bench_compose(accel, gate_size),
+        Some("check-input") => cmd_check_input(accel, no_ps2_irq, gate_size),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -773,7 +820,100 @@ fn preflight_accel(accel: Accel) -> R<()> {
     Ok(())
 }
 
-fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel) -> R<()> {
+/// The size of the screen QEMU gives the guest (Phase 5 Part E).
+///
+/// **QEMU's EDID prefers the mode, and nothing in the image changes**: `-vga none -device
+/// VGA,xres=…,yres=…` makes OVMF add the mode and boot into it, and Limine hands it over. What
+/// QEMU cannot show is a width that is not a multiple of 8 — its standard VGA rounds `XRES` down
+/// while OVMF's GOP reports the width it asked for, so the guest draws rows QEMU scans out
+/// shorter and the picture shears — which is why the laptop's 1366 is refused here, and why the
+/// gates boot [`DisplaySize::GATE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplaySize {
+    w: u32,
+    h: u32,
+}
+
+impl DisplaySize {
+    /// The laptop's screen as near as QEMU shows it: its 768 rows and its 170×48 console, six
+    /// pixels narrower. Every gate that boots a screen boots this unless told otherwise.
+    const GATE: DisplaySize = DisplaySize { w: 1360, h: 768 };
+
+    /// The height of the shell's bars — `desktop_shell::BAR_H`, **written down a second time on
+    /// purpose**: a gate that read the shell's layout to know where to aim could agree with a shell
+    /// that had stopped drawing where it says (M11 decision 2).
+    const BAR_H: i32 = 24;
+    /// The desktop indicator's width at the bottom bar's right-hand end — `desktop_shell::INDICATOR_W`,
+    /// for the same reason.
+    const INDICATOR_W: i32 = 160;
+    /// The overview sidebar's width — `desktop_shell::SIDE_W`, for the same reason.
+    const SIDE_W: i32 = 200;
+
+    /// Parse `WxH`, refusing a size QEMU cannot show or a guest cannot use.
+    fn parse(text: &str) -> R<DisplaySize> {
+        let (w, h) = text
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+            .ok_or_else(|| format!("`{text}` is not a size — write WxH, e.g. 1360x768"))?;
+        if w % 8 != 0 {
+            return Err(format!(
+                "a {w}-pixel width is not a multiple of 8: QEMU's VGA would scan out {} while the \
+                 guest draws {w}, and every row would shear — the reason the gates boot 1360, not \
+                 the laptop's 1366",
+                w & !7
+            )
+            .into());
+        }
+        if !(640..=4096).contains(&w) || !(480..=2160).contains(&h) {
+            return Err(format!("{w}x{h} is outside 640x480 to 4096x2160").into());
+        }
+        Ok(DisplaySize { w, h })
+    }
+
+    /// The pixel the pointer pins to when it is driven into the bottom-right clamp.
+    fn corner(self) -> (i32, i32) {
+        (self.w as i32 - 1, self.h as i32 - 1)
+    }
+
+    /// The middle of the screen.
+    fn centre(self) -> (i32, i32) {
+        (self.w as i32 / 2, self.h as i32 / 2)
+    }
+
+    /// The y the shell places its bottom bar at, and the `bottom bar placed at 0,<y>` it logs.
+    fn bottom_bar_y(self) -> i32 {
+        self.h as i32 - Self::BAR_H
+    }
+
+    /// A y halfway down the bottom bar, where a click on it is aimed.
+    fn bottom_bar_click_y(self) -> i32 {
+        self.bottom_bar_y() + Self::BAR_H / 2
+    }
+
+    /// The middle of the desktop indicator, which opens the overview.
+    fn indicator_click(self) -> (i32, i32) {
+        (self.w as i32 - Self::INDICATOR_W / 2, self.bottom_bar_click_y())
+    }
+
+    /// The middle of the overview sidebar's width.
+    fn sidebar_x(self) -> i32 {
+        self.w as i32 - Self::SIDE_W / 2
+    }
+}
+
+impl std::fmt::Display for DisplaySize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{}", self.w, self.h)
+    }
+}
+
+/// QEMU's machine, CPU, memory and firmware — and the screen, which every caller states:
+/// `Some(size)` for a mode of that size, `None` for QEMU's own default (`test-qemu` and
+/// `test-interactive`, so every CI run boots two sizes).
+fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel, screen: Option<DisplaySize>) -> R<()> {
+    if let Some(size) = screen {
+        qemu.arg("-vga").arg("none").arg("-device").arg(format!("VGA,xres={},yres={}", size.w, size.h));
+    }
     qemu.arg("-M")
         .arg("q35")
         // CPU model = QEMU's `max`: every feature the emulator can provide,
@@ -844,13 +984,14 @@ fn cmd_qemu(
     mode: BuildMode,
     accel: Accel,
     grab: bool,
+    size: Option<DisplaySize>,
     extra_args: &[String],
 ) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(mode)?;
     let ovmf = locate_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut qemu, &ovmf, accel)?;
+    qemu_base_args(&mut qemu, &ovmf, accel, size)?;
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-serial")
@@ -920,7 +1061,7 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
     let ovmf = locate_ovmf()?;
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, None)?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
@@ -1399,7 +1540,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 /// an event produced before the consumer channel exists is one the server has nowhere to
 /// send, so injecting on a timer would make this flaky in exactly the way a test of a rare
 /// path must not be.
-fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
+fn cmd_check_input(accel: Accel, no_ps2_irq: bool, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     // **`--no-ps2-irq` boots the same image with the i8042's interrupt generation left off**,
     // so every byte has to be recovered by the tick-driven `ps2::poll` sweep rather than
@@ -1425,7 +1566,7 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     let _ = fs::remove_file(&qmp_sock);
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
@@ -1446,6 +1587,7 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     println!("xtask: input gate — booting and injecting…\n");
     let mut session = Session::spawn(cmd, "check-input")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
+    qmp.screen = Some(size);
 
     // The compositor is a consumer of the same merged stream — it resolves `/dev/input/new`
     // during startup, which is why init binds the input server first. Asserted *before* the
@@ -2000,8 +2142,12 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
     let from = match qmp.pointer {
         Some(p) => p,
         None => {
+            let corner = qmp
+                .screen
+                .ok_or("move_pointer_to: this gate never said what size its screen is, so the corner a pin lands in is unknown")?
+                .corner();
             for _ in 0..20 {
-                qmp.send_motion(100, 100)?; // pin to (1279, 799)
+                qmp.send_motion(100, 100)?; // pin to the bottom-right corner
             }
             // **Let the pin drain before walking, because the two are not equally forgiving.**
             // The pin is over-driven — twenty motions to cross thirteen hundred pixels — so a
@@ -2014,7 +2160,7 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
             // landed at (495, 351), exactly one step of (-98, -56) short. The same drain, for
             // the same reason, as the one `burst_holds_its_position` takes after its own pin.
             std::thread::sleep(std::time::Duration::from_millis(500));
-            (1279, 799)
+            corner
         }
     };
     let (mut dx, mut dy) = (x - from.0, y - from.1);
@@ -2047,13 +2193,13 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
 /// measures instruction count — the shadow arm should be strictly slower there by about one copy,
 /// which is the *control*. KVM is where the real answer is, and if the two agree this is not
 /// measuring what it claims to.
-fn cmd_bench_compose(accel: Accel) -> R<()> {
+fn cmd_bench_compose(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Bench)?;
     let ovmf = locate_ovmf()?;
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-device")
@@ -2216,12 +2362,12 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
 ///    own interrupt does not make it;
 /// 4. a login on the serial column writes a file under `/home` and reads it back — the root is
 ///    writable, in RAM.
-fn cmd_check_live(accel: Accel) -> R<()> {
+fn cmd_check_live(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image_live()?;
     let ovmf = locate_ovmf()?;
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
         .arg("qemu-xhci,id=xhci")
         .arg("-drive")
@@ -2364,7 +2510,7 @@ const REPORT_FACTS: &[&[&str]] = &[
 /// 4. **The boot goes on**: the console hands the screen to the compositor.
 ///
 /// Between them, this and `test-qemu` cover a claimed and a declined function, and COM1 both ways.
-fn cmd_check_report(accel: Accel) -> R<()> {
+fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image_live()?;
 
@@ -2375,7 +2521,7 @@ fn cmd_check_report(accel: Accel) -> R<()> {
     let _ = fs::remove_file(&qmp_sock);
     let ovmf = locate_ovmf()?;
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-device")
         .arg("qemu-xhci,id=xhci")
         .arg("-drive")
@@ -2487,9 +2633,16 @@ fn cmd_check_report(accel: Accel) -> R<()> {
     let n = pages.len();
     println!("  ok: read {n} report page(s) off the screen, pressing a key for each");
 
-    // 3. The facts, from the pages alone.
+    // 3. The facts, from the pages alone — the framebuffer's at the size this gate booted, with no
+    //    padding, which is all QEMU can give (`DisplaySize`).
     let lines: Vec<&str> = pages.iter().flatten().map(String::as_str).collect();
-    let missing = missing_facts(&lines, EMULATED_MACHINE_FACTS.iter().chain(REPORT_FACTS).copied());
+    let framebuffer =
+        format!("framebuffer: {}x{} pitch {} padding 0 bpp 32", size.w, size.h, size.w * 4);
+    let framebuffer: &[&str] = &[&framebuffer];
+    let missing = missing_facts(
+        &lines,
+        EMULATED_MACHINE_FACTS.iter().chain(REPORT_FACTS).copied().chain([framebuffer]),
+    );
     if !missing.is_empty() {
         let read: Vec<String> =
             pages.iter().enumerate().map(|(i, p)| format!("--- page {} ---\n{}", i + 1, p.join("\n"))).collect();
@@ -2628,7 +2781,7 @@ const STAGED_APPLICATIONS: usize = 3;
 /// after the timer is calibrated and again at the handout, and each claim below is read off one
 /// of those frames — **all of its lines together, in a single frame**, which a hold guarantees
 /// and no run of transient sightings can imitate.
-fn cmd_check_fbcon(accel: Accel) -> R<()> {
+fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::FbconGate)?;
 
@@ -2639,7 +2792,7 @@ fn cmd_check_fbcon(accel: Accel) -> R<()> {
     let _ = fs::remove_file(&qmp_sock);
     let ovmf = locate_ovmf()?;
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
@@ -2893,7 +3046,7 @@ impl Frame {
 /// on screen and nowhere else, and this window repaints 420×200 per keystroke — the cost
 /// `check-terminal` types one character at a time to stay behind. Waiting for the redraw is
 /// the same discipline against a different receipt.
-fn cmd_check_login(accel: Accel) -> R<()> {
+fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
 
@@ -2902,7 +3055,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     let qmp_sock = work.join("qmp-login.sock");
 
     println!("xtask: graphical login gate — booting the release image…\n");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "check-login", &qmp_sock, size)?;
 
     // 0. **The AHCI controller took the MSI path in a *release* image.** `test-qemu` already
     //    adjudicates this (`check_ahci_msi_path`), but only for the selftest build — and the
@@ -2915,6 +3068,21 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //    selftest one (0x30 here, 0x31 there), since the selftest build's `IrqRouter::self_test`
     //    takes a device vector for the PIT and never releases it.
     session.expect("ahci: irq via MSI")?;
+
+    // 0b. **The greeter is centred on the screen this gate booted** (Phase 5 Part E). It centred
+    //     on a written-down 1280×800 until then, which on the laptop put it 43 px left and 16 px
+    //     low of centre. Its size is `desktop-session-mgr`'s `GREETER_W`×`GREETER_H`, written down
+    //     here a second time for the reason every chrome metric in this file is (M11 decision 2).
+    //     **Before the first redraw**, because the greeter reads the screen before it opens its
+    //     window, and `expect` consumes what it scans past.
+    const GREETER: (u32, u32) = (420, 200);
+    session.expect(&format!(
+        "desktop-session-mgr: greeter centred at {},{} on a {} screen",
+        (size.w - GREETER.0) / 2,
+        (size.h - GREETER.1) / 2,
+        size
+    ))?;
+    println!("  ok: the greeter centred itself on the {size} screen");
 
     // 1. The greeter is up before anyone has authenticated. That is the claim Part D's second
     //    box makes, and in a release image nothing else has drawn anything.
@@ -2977,25 +3145,28 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // size, so a shell that decoded nothing cannot report it, exactly as `THEME_FONT_PX` is
     // deliberately not the built-in 16.
     //
-    // **The drawn size no longer tells fit from fill**, and that changed when the shipped
-    // wallpaper became a real photograph cropped to the screen's shape: 16:10 into 16:10 is
-    // `1280x800 at 0,0` under either rule. It was `1280x720 at 0,40` while the fixture was a
-    // 16:9 gradient, which discriminated — and cost 107 pixels of bare desktop down each side of
-    // a real picture, which is not what a desktop should look like. What pins fit-versus-fill is
-    // `libdraw::scale`'s own stretch control, where it belongs: it fails six tests in a second
-    // rather than one gate in three minutes. See [`WALLPAPER_W`].
+    // **The drawn size tells fit from fill again, at the gates' screen** (Phase 5 Part E). On the
+    // 1280×800 screen every gate booted until then, 16:10 into 16:10 is `1280x800 at 0,0` under
+    // either rule; on 1360×768 a fill is `1360x850 at 0,-41` and a fit `1228x768 at 66,0`. The
+    // expected line is computed here with `libdraw::scale::fill` — the staged theme's mode — on
+    // the size this gate booted, so the arithmetic has one source and its own tests pin it.
     //
     // A picture is pixels a release-image boot has no reference for, which is what the plan says
     // about this gate; the dimensions are what can be asserted, and they pin the whole chain —
-    // the theme naming a file, `libfs` reading it, `libdraw::png` decoding it, and
-    // `libdraw::scale::fit` placing it.
+    // the theme naming a file and a mode, `libfs` reading it, `libdraw::png` decoding it, and
+    // `libdraw::scale::fill` placing it.
     // **And the line is printed after the window is committed**, which the first version of
     // this step was not: it asserted a line emitted as soon as the picture had been placed, so
     // it passed while `CreateWindow` failed and the desktop showed its bare ground colour. The
     // `window N` on the end is what makes this an assertion about a picture on screen rather
     // than about arithmetic.
+    let drawn = libdraw::scale::fill(
+        libdraw::geom::Size::new(WALLPAPER_W, WALLPAPER_H),
+        libdraw::geom::Size::new(size.w, size.h),
+    );
     session.expect(&format!(
-        "desktop-shell: wallpaper {WALLPAPER_W}x{WALLPAPER_H} drawn 1280x800 at 0,0 window "
+        "desktop-shell: wallpaper {WALLPAPER_W}x{WALLPAPER_H} drawn {}x{} at {},{} window ",
+        drawn.size.w, drawn.size.h, drawn.origin.x, drawn.origin.y
     ))?;
     // **Kept, because stickiness is asserted against this id** further down: a press on an empty
     // desktop has to name *this* window, and `win=none` is what a wallpaper stamped with
@@ -3070,7 +3241,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // not move the window. Without this the bar's placement was only covered by proxy — the
     // list click at (90, 788) landing on nothing — which says the bar is not *there* rather
     // than where it is (PR #242 review, optional 9).
-    session.expect("desktop-shell: bottom bar placed at 0,776")?;
+    session.expect(&format!("desktop-shell: bottom bar placed at 0,{}", size.bottom_bar_y()))?;
     // **The count, not just the prefix** (PR #279 review, finding 7). This is the one line that
     // distinguishes desktop entries from the `/bin` listing they replaced: a regression to
     // listing every program would still open a modal, still match `nxterm`, and still launch it,
@@ -3143,8 +3314,9 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // And it is listed, focused, because it has the keyboard.
     session.expect("desktop-shell: window list on ")?;
 
-    // Where a window-list entry sits: the first slot on the bottom bar.
-    const LIST_CLICK: (i32, i32) = (90, 788);
+    // Where a window-list entry sits: the first slot on the bottom bar, whose height comes from the
+    // screen this gate booted.
+    let list_click: (i32, i32) = (90, size.bottom_bar_click_y());
     // How wide one is — `desktop-shell::ENTRY_W`, so slot `i`'s centre is `ENTRY_W * i + 90`.
     // Hardcoded like every other chrome metric this gate aims at, and for the same reason: a
     // gate that read the shell's layout to know where to click could agree with a shell that
@@ -3215,7 +3387,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
 
     // Restore it from the list, which is where a minimized window comes back from, so the steps
     // below have a window to work with.
-    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
 
     // **And minimise it a second time**, which is the step that was missing. The compositor drops
@@ -3228,7 +3400,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("nxterm: asked the shell for window state 1")?;
     session.expect(&format!("desktop-shell: client asked to minimize window {term_id}"))?;
     println!("  ok: the minimise button still works after the taskbar restored the window");
-    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
 
     // 6a3. **The taskbar asks, and the client is what closes** (M9 Part C). Middle-click is the
@@ -3242,7 +3414,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //      away by its own hand. A shell that destroyed it instead would produce neither line —
     //      and the window would be gone all the same, which is why the client's side is the only
     //      place the difference is visible.
-    middle_click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    middle_click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     // **Only the ordered half is an `expect`.** The compositor logs before it replies, so it
     // leads; the client then wakes and answers. The *shell's* own line comes after its request
     // returns, which is a race against the client it just woke — observed on both sides of the
@@ -3330,7 +3502,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // change *whatever else is on screen* — which is what makes it the honest test. Aiming at
     // bare desktop instead would depend on the terminal not being maximised at this point in the
     // gate, and it is.
-    click_at(&mut qmp, &mut session, 600, 788)?;
+    click_at(&mut qmp, &mut session, 600, size.bottom_bar_click_y())?;
     session.expect("desktop-shell: applications modal closed")?;
     // **That the compositor *said* so is checked against the whole transcript below**, not here.
     // The dismissal is logged while the press is being routed and the `press at` line is logged
@@ -3339,7 +3511,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // whose order is an implementation detail rather than a claim.
 
 
-    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: minimized window ")?;
     // **The marker, not just a non-empty list.** The list still holds it — minimizing is not
     // closing, and a taskbar that dropped the entry would leave no way to get the window back —
@@ -3348,7 +3520,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     session.expect("desktop-shell: window list on ")?;
     session.expect(":_ nxterm")?;
 
-    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
     // Restored and focused. Focus arrives one iteration after the raise, so this is the second
     // list line the click produces, not the first.
@@ -3396,7 +3568,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // focused — so `Super+Shift+N`, which moves *the focused window*, would correctly find
     // nothing to move and this block would assert against a gesture that did nothing. Clicking
     // its list entry restores and raises it, which is the gesture Part C added for exactly this.
-    click_at(&mut qmp, &mut session, LIST_CLICK.0, LIST_CLICK.1)?;
+    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
     session.expect(":> nxterm")?;
 
@@ -3453,7 +3625,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     overview of nothing has no thumbnail to drag.
     chord(&mut qmp, false, "1")?;
     session.expect("desktop-shell: switched to work")?;
-    click_at(&mut qmp, &mut session, 1200, 788)?;
+    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
     // **The compositor's own line first, and it comes first in the guest too**: the shell
     // captures every visible window *before* it creates the overview to show them in. Asserted
     // rather than inferred, because an overview that opened with no thumbnails would satisfy
@@ -3473,10 +3645,10 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
     // padding — and this is the second place that number lives. Half a row down, so the aim is
     // clear of both edges.
-    let side_row = |i: i32| (1180, 24 + i * 72 + 36);
+    let side_row = |i: i32| (size.sidebar_x(), 24 + i * 72 + 36);
     // **The drag starts from a position already verified — by the click that opened this.** A
     // drag cannot check its own start: there is no press receipt until the button goes down, and
-    // by then it has begun. `click_at(1200, 788)` above asserted where it landed and left the
+    // by then it has begun. The indicator's `click_at` above asserted where it landed and left the
     // pointer there, and opening the overview does not move it, so the walk to the thumbnail is
     // the same arithmetic every other step here does.
     //
@@ -3561,7 +3733,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // always specified — Part D made it advance to the next desktop only because there was no
     // overview to open. Escape closes it again so the serial login below is not typing at a
     // popup that holds the keyboard.
-    click_at(&mut qmp, &mut session, 1200, 788)?;
+    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
     // **Before the "overview open" line, because that is where it is** — `open_overview` reports
     // its ground and the caller announces the window afterwards. An expectation placed beside
     // its *topic* rather than beside its position in the stream scans past output that was
@@ -3606,7 +3778,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // run.) Returned rather than read here, because `click_at` now also waits for the *release*
     // and that wait moves the cursor past the press line — a `rest_of_line` here would read the
     // release's `win=`, which is `none` by construction.
-    let hit = click_at(&mut qmp, &mut session, 640, 400)?;
+    let hit = click_at(&mut qmp, &mut session, size.centre().0, size.centre().1)?;
     if !hit.contains(&format!("win={wallpaper_id}")) {
         return Err(format!(
             "a press on an empty desktop reported '{}' — the wallpaper (window {wallpaper_id}) \
@@ -3628,7 +3800,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     //     Reported from a real session, which is the part worth keeping: the drag was gated and
     //     the click was not, and a gate that drives only the gesture it was written for cannot
     //     tell the difference between "unimplemented" and "untested".
-    click_at(&mut qmp, &mut session, 1200, 788)?;
+    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
 
     // The chord path first: an overview left showing the desktop you just switched away from is
@@ -3643,7 +3815,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
     // padding — and this is the second place that number lives. Half a row down, so the aim is
     // clear of both edges.
-    let side_row = |i: i32| (1180, 24 + i * 72 + 36);
+    let side_row = |i: i32| (size.sidebar_x(), 24 + i * 72 + 36);
     let (sx, sy) = side_row(1);
     click_at(&mut qmp, &mut session, sx, sy)?;
     session.expect("desktop-shell: switched to cli")?;
@@ -3658,14 +3830,14 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // **And a click on its background dismisses**, the way clicking outside a menu does. That
     // also makes the indicator a toggle: the overview covers the bar, so a second click where
     // the indicator is lands on background.
-    click_at(&mut qmp, &mut session, 1200, 788)?;
+    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     click_at(&mut qmp, &mut session, 600, 700)?;
     session.expect("desktop-shell: overview closed")?;
 
     // And a click on a thumbnail activates its window, which is the third way out and the one
     // that takes you somewhere. `raise_window` is the same call the window list's entries make.
-    click_at(&mut qmp, &mut session, 1200, 788)?;
+    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     click_at(&mut qmp, &mut session, 100, 100)?;
     session.expect("desktop-shell: overview raised window ")?;
@@ -5198,7 +5370,7 @@ fn cmd_check_login(accel: Accel) -> R<()> {
     // Its taskbar slot came off the shell's own list above: a slot is a *position*, and windows
     // have been closed since the last time anything here counted, so `id * ENTRY_W` would land
     // on somebody else's entry.
-    let entry = (ENTRY_W * slot as i32 + ENTRY_W / 2, LIST_CLICK.1);
+    let entry = (ENTRY_W * slot as i32 + ENTRY_W / 2, list_click.1);
 
     // **`middle_click_at` verifies the pointer with a left click first**, which on a taskbar
     // entry is a gesture in its own right — it raises the window, or minimises it if it already
@@ -5636,10 +5808,11 @@ fn burst_holds_its_position(
     // arrives. A confirming click would be worse than redundant here: the bottom-right corner is
     // the desktop indicator's hit region, so it opens the overview, which then takes the chord
     // below instead of the shell.
+    let corner = qmp.screen.ok_or("burst_holds_its_position: the screen's size is unset")?.corner();
     for _ in 0..20 {
         qmp.send_motion(100, 100)?;
     }
-    qmp.pointer = Some((1279, 799));
+    qmp.pointer = Some(corner);
     // Let that drain before anything else is injected. **The chord below is a key, and a key is
     // exactly what this fix does not recover**: `SYN_DROPPED` asks a consumer to resynchronise
     // state it can re-derive, and motion is the half it cannot. Flooding the ring and then
@@ -5652,7 +5825,7 @@ fn burst_holds_its_position(
     const K: i32 = 120;
     const DX: i32 = -6;
     const DY: i32 = -3;
-    let want = (1279 + K * DX, 799 + K * DY);
+    let want = (corner.0 + K * DX, corner.1 + K * DY);
 
     // **To desktop 1, because the session is on desktop 2 by now** and switching to the desktop
     // already showing is a no-op the shell correctly says nothing about — the first version of
@@ -5691,7 +5864,7 @@ fn burst_holds_its_position(
     }
     qmp.pointer = None;
     Err(format!(
-        "input gate FAILED: {K} injected motions of ({DX}, {DY}) from (1279, 799) did not put \
+        "input gate FAILED: {K} injected motions of ({DX}, {DY}) from {corner:?} did not put \
          the cursor at ({}, {}). A relative delta that does not arrive cannot be recovered — \
          `input-server` must carry the motion of an undeliverable batch forward and re-emit it, \
          rather than counting it as a `SYN_DROPPED` gap. Look for `input batch DROPPED` in the \
@@ -5773,7 +5946,9 @@ fn type_at_greeter(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
             '-' => "minus".to_string(),
             other => {
                 return Err(format!(
-                    "check-login cannot type {other:?}: add its qcode to `type_at_greeter`.                      The demo credentials are lowercase, digits, space and hyphen; a new one                      outside that set needs a mapping rather than a silent skip"
+                    "check-login cannot type {other:?}: add its qcode to `type_at_greeter`. \
+                     The demo credentials are lowercase, digits, space and hyphen; a new one \
+                     outside that set needs a mapping rather than a silent skip"
                 )
                 .into());
             }
@@ -5834,7 +6009,7 @@ fn type_at_greeter(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
 /// recurrence reports coordinates rather than a bare timeout. That failure is still
 /// unexplained. The deferral entry that used to hold this record has moved to the resolved
 /// table; the live record is now `docs/decision-log.md`, 2026-08-18.
-fn cmd_check_terminal(accel: Accel) -> R<()> {
+fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
     let ovmf = locate_ovmf()?;
@@ -5845,7 +6020,7 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     let _ = fs::remove_file(&qmp_sock);
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
@@ -5866,6 +6041,7 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     println!("xtask: terminal gate — booting and typing…\n");
     let mut session = Session::spawn(cmd, "check-terminal")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
+    qmp.screen = Some(size);
 
     // **The grid's cell, recomputed on the host from the same file** (M11 Part D). Since the
     // desktop's font became proportional, `nxterm` is the one program that loads two — and
@@ -6145,7 +6321,8 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     if fx2 == ex || fh == eh {
         let _ = session.child.kill();
         return Err(format!(
-            "arrowing to the other menu did not rebuild the popup: Edit was {reopened:?},              File is {other:?} — the window should move to File's word and shrink to its rows"
+            "arrowing to the other menu did not rebuild the popup: Edit was {reopened:?}, \
+             File is {other:?} — the window should move to File's word and shrink to its rows"
         )
         .into());
     }
@@ -6399,15 +6576,18 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let ground_alpha = num("--ground", 210)?.min(255) as u8;
     let side_alpha = num("--side", 150)?.min(255) as u8;
 
-    let (sw, sh) = (1280u32, 800u32);
-    let g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
     let dir = build_cache();
     fs::create_dir_all(&dir).ok();
+    // **The size of the screen that was photographed**, when one was — it is the real desktop an
+    // opacity is judged over — and the gates' size for the mock scene otherwise. It was a fixed
+    // 1280×800 until Phase 5 Part E, which silently ignored a screendump of any other size.
+    let shot = dir.join("shot-windows.png");
+    let from_shot = read_rgb_png(&shot).ok();
+    let (sw, sh) = from_shot.as_ref().map_or((DisplaySize::GATE.w, DisplaySize::GATE.h), |(w, h, _)| (*w, *h));
+    let g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
 
     // --- the desktop underneath: the real screen if one has been photographed ---
     let mut desktop = MemFramebuffer::new(g);
-    let shot = dir.join("shot-windows.png");
-    let from_shot = read_rgb_png(&shot).ok().filter(|(w, h, _)| *w == sw && *h == sh);
     match &from_shot {
         Some((_, _, rgb)) => {
             for y in 0..sh {
@@ -6521,10 +6701,17 @@ fn wallpaper_for_screen(
             src[off..off + 4].copy_from_slice(&src_g.format.encode(c).to_le_bytes());
         }
     }
+    // **Placed as the shell places it** — filled, the staged theme's mode — rather than stretched to
+    // the screen, which is what this did until Phase 5 Part E and what no desktop ever showed.
     let dst_g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
     let mut dst = vec![0u8; dst_g.byte_len()];
-    if !libdraw::scale::box_downscale(&src, src_g, &mut dst, dst_g) {
-        return Err("the wallpaper would not scale to the preview screen".into());
+    let plan = libdraw::theme::WallpaperMode::Fill.plan(
+        libdraw::geom::Size::new(src_g.width, src_g.height),
+        libdraw::geom::Size::new(sw, sh),
+    );
+    let ground = libdraw::theme::Theme::light().desktop;
+    if !libdraw::scale::place(&src, src_g, plan, ground, &mut dst, dst_g) {
+        return Err("the wallpaper would not place on the preview screen".into());
     }
     Ok((dst, dst_g))
 }
@@ -6586,7 +6773,7 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
 /// It is a tool and not a gate: it asserts only enough to know the picture is of a working
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be
 /// mistaken for a design opinion.
-fn cmd_shot(what: &str, accel: Accel) -> R<()> {
+fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     const MOMENTS: [&str; 5] = ["greeter", "desktop", "apps", "windows", "overview"];
     if what != "all" && !MOMENTS.contains(&what) {
         return Err(format!(
@@ -6602,7 +6789,7 @@ fn cmd_shot(what: &str, accel: Accel) -> R<()> {
     fs::create_dir_all(&work).ok();
     let dump = work.join("shot.ppm");
     let qmp_sock = work.join("qmp-shot.sock");
-    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock)?;
+    let (mut session, mut qmp) = spawn_release_guest(accel, "shot", &qmp_sock, size)?;
 
     // A closure would borrow both halves for the rest of the function, so the capture is a
     // statement each time — four lines, and no plumbing to read past.
@@ -6624,7 +6811,7 @@ fn cmd_shot(what: &str, accel: Accel) -> R<()> {
     session.expect("desktop-session-mgr: greeter presented")?;
     // The pointer somewhere a person would leave it, so the cursor is in the picture. Without
     // this it sits whereever QEMU starts it, which is the top-left corner and under the window.
-    move_pointer_to(&mut qmp, 640, 400)?;
+    move_pointer_to(&mut qmp, size.centre().0, size.centre().1)?;
     capture!("greeter");
 
     // 2. **A session.** No wrong password here — that is `check-login`'s claim to make, and a
@@ -6644,7 +6831,7 @@ fn cmd_shot(what: &str, accel: Accel) -> R<()> {
     // failed to draw one — and the *formatting* is a host test in `libtime`, where it belongs.
     session.expect("desktop-shell: clock ")?;
     session.expect("desktop-shell: top bar presented, window ")?;
-    session.expect("desktop-shell: bottom bar placed at 0,776")?;
+    session.expect(&format!("desktop-shell: bottom bar placed at 0,{}", size.bottom_bar_y()))?;
     capture!("desktop");
 
     // 3. **The applications modal**, the one piece of chrome with no window of its own: a popup
@@ -6684,12 +6871,12 @@ fn cmd_shot(what: &str, accel: Accel) -> R<()> {
     //    routed record — so the open comes first, and `click_at`'s own position assertion scans
     //    past it. Nothing is lost: a press that misses simply does not open the overview, and the
     //    wait below fails.
-    const OVERVIEW_AT: (i32, i32) = (1200, 788);
-    move_pointer_to(&mut qmp, OVERVIEW_AT.0, OVERVIEW_AT.1)?;
+    let overview_at = size.indicator_click();
+    move_pointer_to(&mut qmp, overview_at.0, overview_at.1)?;
     qmp.send_button("left", true)?;
     qmp.send_button("left", false)?;
     session.expect("desktop-shell: overview open, window ")?;
-    qmp.pointer = Some(OVERVIEW_AT);
+    qmp.pointer = Some(overview_at);
     capture!("overview");
 
     let _ = fs::remove_file(&qmp_sock);
@@ -6725,7 +6912,12 @@ fn launch_from_modal(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<(
 /// would actually use — every other gate boots `--selftest`. The three that do build this
 /// command themselves and differ from each other in the image mode and the flags; these two are
 /// identical, and two identical copies of a boot are how the second one quietly stops matching.
-fn spawn_release_guest(accel: Accel, gate: &'static str, qmp_sock: &Path) -> R<(Session, Qmp)> {
+fn spawn_release_guest(
+    accel: Accel,
+    gate: &'static str,
+    qmp_sock: &Path,
+    size: DisplaySize,
+) -> R<(Session, Qmp)> {
     let ovmf = locate_ovmf()?;
     // Removed rather than reused: a socket left by a killed run is a file `Qmp::connect` will
     // open and never get an answer from. The *caller* owns the path, because it is also what
@@ -6733,7 +6925,7 @@ fn spawn_release_guest(accel: Accel, gate: &'static str, qmp_sock: &Path) -> R<(
     let _ = fs::remove_file(qmp_sock);
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
@@ -6752,7 +6944,8 @@ fn spawn_release_guest(accel: Accel, gate: &'static str, qmp_sock: &Path) -> R<(
         .stderr(std::process::Stdio::null());
 
     let session = Session::spawn(cmd, gate)?;
-    let qmp = Qmp::connect(qmp_sock)?;
+    let mut qmp = Qmp::connect(qmp_sock)?;
+    qmp.screen = Some(size);
     Ok((session, qmp))
 }
 
@@ -6944,7 +7137,7 @@ fn wallpaper_png() -> R<Vec<u8>> {
 
 /// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
 /// so the plan runs it once per display-arm change.
-fn cmd_check_display(accel: Accel) -> R<()> {
+fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
     let ovmf = locate_ovmf()?;
@@ -6957,7 +7150,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     let _ = fs::remove_file(&shot);
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
@@ -7540,6 +7733,10 @@ struct Qmp {
     /// (PR #243 review, finding 3). Cleared whenever an attempt does not land, because then it
     /// is not known any more.
     pointer: Option<(i32, i32)>,
+    /// The size of the screen the guest was booted with, which is where the pointer's clamp is.
+    /// A gate that moves the pointer sets it; [`move_pointer_to`] refuses to pin without it
+    /// rather than assume a corner (Phase 5 Part E: it assumed `(1279, 799)`).
+    screen: Option<DisplaySize>,
 }
 
 impl Qmp {
@@ -7561,7 +7758,7 @@ impl Qmp {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("qmp read timeout: {e}"))?;
-        let mut q = Qmp { stream, buf: Vec::new(), pointer: None };
+        let mut q = Qmp { stream, buf: Vec::new(), pointer: None, screen: None };
         // The greeting arrives unsolicited; then capabilities must be negotiated before
         // any other command is accepted.
         let greeting = q.read_line()?;
@@ -8357,7 +8554,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
     let _ = fs::remove_file(&qmp_sock);
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    qemu_base_args(&mut cmd, &ovmf, accel, None)?;
     cmd.arg("-qmp").arg(format!("unix:{},server,nowait", qmp_sock.display()));
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
@@ -8487,8 +8684,9 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
 }
 
 /// Facts about the machine QEMU emulates that every boot now logs (Phase 5 Part D.1), and that
-/// both boots below know the answer to: q35's ECAM window, its four MADT CPUs and one IOAPIC, and
-/// the framebuffer at OVMF's default mode. Each fact is fragments that must all appear in **one**
+/// both boots below know the answer to: q35's ECAM window and its four MADT CPUs and one IOAPIC.
+/// The framebuffer is not among them since Phase 5 Part E: `test-qemu` boots QEMU's default mode
+/// and `check-report` the gates' size, so each states its own. Each fact is fragments that must all appear in **one**
 /// line.
 ///
 /// **Written down here, not derived** — a second statement of each answer, which is what makes it
@@ -8502,7 +8700,6 @@ const EMULATED_MACHINE_FACTS: &[&[&str]] = &[
     &["madt: lapic uid 3 apic 3 enabled"],
     &["madt: ioapic 0 @0xfec00000 gsi 0"],
     &["acpi: 1 IOAPIC, 5 src-override, 4 CPU; 1 ECAM region"],
-    &["framebuffer: 1280x800 pitch 5120 padding 0 bpp 32"],
 ];
 
 /// The facts `test-qemu`'s boot adds to [`EMULATED_MACHINE_FACTS`]: its disk is on AHCI, so the
@@ -8523,6 +8720,8 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["drivers: 00:1f.2 claimed by ahci, MSI vec "],
     &["console: RX loopback self-test OK"],
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
+    // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.
+    &["framebuffer: 1280x800 pitch 5120 padding 0 bpp 32"],
 ];
 
 /// The facts in `wanted` that no single line of `lines` carries every fragment of, each joined
@@ -12632,6 +12831,30 @@ LLVM version: 22.1.2
 #[cfg(test)]
 mod diag_tests {
     use super::*;
+
+    #[test]
+    fn the_derived_click_points_at_the_old_size_are_the_literals_they_replaced() {
+        // The gates aimed at these by hand at 1280x800; deriving them from the size must give the
+        // same answer there, or the move to 1360x768 changed what a gate clicks and not just where.
+        let old = DisplaySize::parse("1280x800").unwrap();
+        assert_eq!(old.corner(), (1279, 799));
+        assert_eq!(old.centre(), (640, 400));
+        assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (776, 788));
+        assert_eq!(old.indicator_click(), (1200, 788));
+        assert_eq!(old.sidebar_x(), 1180);
+        let gate = DisplaySize::GATE;
+        assert_eq!((gate.bottom_bar_y(), gate.indicator_click(), gate.sidebar_x()), (744, (1280, 756), 1260));
+    }
+
+    #[test]
+    fn a_width_qemu_would_shear_is_refused_and_says_what_it_would_show() {
+        let e = DisplaySize::parse("1366x768").unwrap_err().to_string();
+        assert!(e.contains("1360"), "the refusal names what QEMU would scan out: {e}");
+        assert!(DisplaySize::parse("1360x768").is_ok(), "control: a multiple of 8 is taken");
+        for bad in ["1360", "x768", "1360x", "wide", "13 60x768", "320x200", "8192x768"] {
+            assert!(DisplaySize::parse(bad).is_err(), "{bad} was accepted");
+        }
+    }
 
     #[test]
     fn the_live_menu_boots_the_release_entry_by_default_and_offers_the_report() {

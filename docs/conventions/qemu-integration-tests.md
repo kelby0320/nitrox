@@ -192,6 +192,27 @@ distribution/affinity self-tests are meaningful), `-display none`,
 `-serial stdio`, `-no-reboot`, and the `isa-debug-exit` device, all under a
 `timeout(1)` ceiling.
 
+### The screen a gate boots
+
+**`test-qemu` and `test-interactive` boot QEMU's default screen, 1280×800; every gate that looks
+at or clicks on a screen boots 1360×768** — `check-display`, `check-input`, `check-terminal`,
+`check-login`, `check-fbcon`, `check-live`, `check-report`, and the `shot` and `bench-compose`
+tools (Phase 5 Part E). So every CI run boots two sizes, and a size written back into a client
+fails somewhere. `--size WxH` boots one of those at another size; `qemu_base_args` takes the
+screen from every caller, so a new boot cannot forget to say.
+
+- **The size is QEMU's, not the image's**: `-vga none -device VGA,xres=…,yres=…` makes QEMU's
+  EDID prefer the mode, and OVMF and Limine boot into it.
+- **The width must be a multiple of 8.** QEMU's VGA rounds the width down while OVMF reports the
+  one it asked for, so the guest's rows and QEMU's disagree and the picture shears — while the
+  guest's own `framebuffer:` line and the self-test verdict, which a wrong stride cannot fail, still
+  read correct. `DisplaySize::parse` refuses such a width. 1360×768 is the laptop's 1366×768 as near
+  as QEMU shows it.
+- **A gate aims at a size it derives, not one it reads.** The bottom bar's click height, the
+  indicator, the sidebar, the pointer's pin corner and the screen's centre are `DisplaySize`
+  methods over the chrome metrics the gate writes down a second time (M11 decision 2); the
+  expected wallpaper line is `libdraw::scale::fill` at the size.
+
 ### Host requirement: x2APIC
 
 The kernel is **x2APIC-only** (decision log, 2026-06-26 — the ≈2014 baseline

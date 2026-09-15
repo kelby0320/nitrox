@@ -162,6 +162,12 @@ and `console: no UART at COM1`. `test-qemu` asserts the other half on its own bo
 **claimed** over MSI, COM1 present — so between them both outcomes and both kinds of COM1 are
 gated. It runs in CI's QEMU job.
 
+**Every gate that boots a screen boots 1360×768** (Phase 5 Part E) — the laptop's 1366×768 as near
+as QEMU can show it, since its VGA shears any width that is not a multiple of 8 — while `test-qemu`
+and `test-interactive` keep QEMU's 1280×800, so every CI run boots two sizes. `--size WxH` boots a
+screen gate at another size. The clients take the size from `/dev/draw/screen` and the gates from
+`DisplaySize`; neither writes one down. See `docs/conventions/qemu-integration-tests.md`.
+
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
 release image and driving it to five moments — the greeter, the bare desktop, the applications
 modal, two real windows, and the overview — then writing what QEMU says is on the display to

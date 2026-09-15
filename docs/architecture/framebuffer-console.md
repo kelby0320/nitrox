@@ -150,9 +150,10 @@ runs passed; with both holds removed, 2 of 3 failed the handout group.
    first line, and an em dash from the Unicode table) with `allocators up`, both before PCI. Held
    at the handout: `init: spawned init (pid 1); handing off to userspace` (the kernel's last line),
    `init: mounted fs-server-ext4 at /` (a `sys_kprint` line) and `compositor: up`. The handout
-   frame shows at least the last 38 lines — 50 rows less a quarter-screen jump — and the kernel's
-   last line is 29 lines before the handout today, so a boot that grows past that fails this
-   group deterministically and says why.
+   frame shows at least the last 36 lines at the gates' 1360×768 — 48 rows less a quarter-screen
+   jump; 38 of 50 at QEMU's 1280×800, where the gate ran until Phase 5 Part E — and the kernel's
+   last line was 29 lines before the handout when that part re-counted it, so a boot that grows
+   past that fails this group deterministically and says why.
 2. **The console lets go**: once a frame with no console glyph anywhere appears, six seconds of
    screendumps — while every service keeps printing — contain not one ink-on-paper glyph cell.
 3. **A stop takes the screen back**: F10 panics the kernel from inside the i8042 driver, **with its

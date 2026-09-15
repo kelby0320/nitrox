@@ -1493,8 +1493,9 @@ fn open_wallpaper(
     // picture on it. A line has to be printed where the thing it claims has happened.
     //
     // **Both sizes, because they answer different questions.** The decoded size can only have
-    // come from an `IHDR` that was read; the drawn size can only have come from the fit
-    // arithmetic having run on it. A gate asserting one proves less than a gate asserting both.
+    // come from an `IHDR` that was read; the drawn size can only have come from the placement
+    // arithmetic — fit or fill — having run on it. A gate asserting one proves less than a gate
+    // asserting both.
     Line::new()
         .s(b"desktop-shell: wallpaper ")
         .u(image.width() as u64)
