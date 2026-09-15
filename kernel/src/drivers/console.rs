@@ -257,8 +257,12 @@ pub fn device_ref() -> Option<ObjectRef> {
 /// loopback self-test polls, so it must run before RX IRQs are armed). Logs a
 /// one-line result; not a `panic!` path.
 pub fn init() {
-    // 1. Prove the RX register path deterministically (interrupts still masked).
-    if crate::arch::serial::console_rx_loopback_selftest() {
+    // 1. Prove the RX register path deterministically (interrupts still masked) — once a UART
+    // is known to be there. Without one the self-test fails as surely as on a broken UART, and
+    // the laptop has none (Phase 5 Part D.1): say which it is.
+    if !crate::arch::serial::console_present() {
+        crate::kprintln!("console: no UART at COM1");
+    } else if crate::arch::serial::console_rx_loopback_selftest() {
         crate::kprintln!("console: RX loopback self-test OK");
     } else {
         crate::kprintln!("console: RX loopback self-test FAIL");

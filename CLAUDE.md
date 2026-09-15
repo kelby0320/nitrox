@@ -64,6 +64,7 @@ cargo xtask check-login    # boot the RELEASE image and drive the graphical gree
 cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic off the screen
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
+cargo xtask check-report   # choose the live menu's hardware report, no serial port; read its pages
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
@@ -148,6 +149,18 @@ is a USB driver. It asserts the module became a disk named `nitrox-live`, that `
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
 timer tick instead of its own interrupt takes 3 s or more), and that a serial login writes under
 `/home`. It runs in CI's QEMU job.
+
+`cargo xtask check-report` is the **hardware report gate** (Phase 5 Part D). Every boot logs what it
+found — the bootloader handoff, the CPU, every ACPI table and MADT entry, each PCI function's
+capabilities and what its driver did with it — and the live image's boot menu has a second entry,
+`Nitrox — hardware report`, whose `cmdline: hwreport` makes the kernel hold that log on the screen a
+page at a time before `init`, turning a page per key press (`kernel/src/report.rs`). The gate boots
+the live image as `check-live` does but with `-serial none`, finds Limine's menu with a colour
+detector of its own, chooses the report, reads every page with the console's decoder, and asserts
+the facts that machine has: an AHCI controller **declined** for having no disk, the module disk,
+and `console: no UART at COM1`. `test-qemu` asserts the other half on its own boot — the controller
+**claimed** over MSI, COM1 present — so between them both outcomes and both kinds of COM1 are
+gated. It runs in CI's QEMU job.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
 release image and driving it to five moments — the greeter, the bare desktop, the applications

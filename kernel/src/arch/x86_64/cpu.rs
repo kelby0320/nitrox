@@ -191,6 +191,10 @@ impl ArchCpu for X86Cpu {
             unsafe { regs::cli() };
         }
     }
+
+    fn log_identity() {
+        log_identity();
+    }
 }
 
 /// Enable the no-execute (NX) paging extension by setting `EFER.NXE`.
@@ -243,5 +247,169 @@ fn ensure_smap_smep() {
     unsafe {
         let cr4 = regs::read_cr4();
         regs::write_cr4(cr4 | CR4_SMEP | CR4_SMAP);
+    }
+}
+
+// --- What this processor is (Phase 5 Part D.1) --------------------------------
+
+/// `(family, model, stepping)` from `CPUID.01H:EAX`, with the extended fields folded in as the
+/// SDM specifies: the extended family is added only when the base family is `0xF`, and the
+/// extended model is prefixed only for base families `0x6` and `0xF`. Reading the base fields
+/// alone names every modern Intel part "model 0xe".
+fn decode_signature(eax: u32) -> (u32, u32, u32) {
+    let stepping = eax & 0xF;
+    let base_model = (eax >> 4) & 0xF;
+    let base_family = (eax >> 8) & 0xF;
+    let family = if base_family == 0xF { base_family + ((eax >> 20) & 0xFF) } else { base_family };
+    let model = if base_family == 0x6 || base_family == 0xF {
+        ((eax >> 16) & 0xF) << 4 | base_model
+    } else {
+        base_model
+    };
+    (family, model, stepping)
+}
+
+/// The brand string's 48 bytes from the three `CPUID.8000_0002H..=8000_0004H` results, each
+/// register little-endian in `EAX, EBX, ECX, EDX` order.
+fn brand_bytes(leaves: [(u32, u32, u32, u32); 3]) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    for (i, (a, b, c, d)) in leaves.into_iter().enumerate() {
+        for (j, reg) in [a, b, c, d].into_iter().enumerate() {
+            let at = (i * 4 + j) * 4;
+            out[at..at + 4].copy_from_slice(&reg.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The brand string without the leading spaces some Intel parts right-justify it with.
+/// Trailing padding and the NUL are [`Printable`](crate::libkern::printable::Printable)'s.
+fn brand_trimmed(brand: &[u8; 48]) -> &[u8] {
+    let start = brand.iter().position(|&b| b != b' ').unwrap_or(brand.len());
+    &brand[start..]
+}
+
+/// A group of features as a log line shows it: ` +name` present, ` -name` absent.
+struct Features<'a>(&'a [(&'static str, bool)]);
+
+impl core::fmt::Display for Features<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for &(name, present) in self.0 {
+            write!(f, " {}{}", if present { '+' } else { '-' }, name)?;
+        }
+        Ok(())
+    }
+}
+
+/// Logical processors in this CPU's package: the core level of `CPUID.0BH` where the part has
+/// one, else `CPUID.01H:EBX[23:16]` when HTT says that field is meaningful, else one.
+fn logical_per_package(max_leaf: u32, ebx1: u32, edx1: u32) -> u32 {
+    const CPUID_0B_LEVEL_CORE: u32 = 2;
+    if max_leaf >= 0xB {
+        for sub in 0..8 {
+            let (_, ebx, ecx, _) = regs::cpuid(0xB, sub);
+            match (ecx >> 8) & 0xFF {
+                0 => break,
+                CPUID_0B_LEVEL_CORE => return ebx & 0xFFFF,
+                _ => {}
+            }
+        }
+    }
+    if edx1 & (1 << 28) != 0 { (ebx1 >> 16) & 0xFF } else { 1 }
+}
+
+/// [`ArchCpu::log_identity`] for x86_64: two lines, identity then features. Every leaf is read
+/// only when the maximum-leaf query says it exists, so a part without leaf 7 or the extended
+/// leaves reports those features absent rather than reading garbage as present.
+fn log_identity() {
+    let (max_leaf, vb, vc, vd) = regs::cpuid(0, 0);
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&vb.to_le_bytes());
+    vendor[4..8].copy_from_slice(&vd.to_le_bytes());
+    vendor[8..12].copy_from_slice(&vc.to_le_bytes());
+    let (eax1, ebx1, ecx1, edx1) = regs::cpuid(1, 0);
+    let (family, model, stepping) = decode_signature(eax1);
+    let ebx7 = if max_leaf >= 7 { regs::cpuid(7, 0).1 } else { 0 };
+    let (max_ext, _, _, _) = regs::cpuid(0x8000_0000, 0);
+    let edx_ext1 = if max_ext >= 0x8000_0001 { regs::cpuid(0x8000_0001, 0).3 } else { 0 };
+    let edx_ext7 = if max_ext >= 0x8000_0007 { regs::cpuid(0x8000_0007, 0).3 } else { 0 };
+    let brand = if max_ext >= 0x8000_0004 {
+        brand_bytes([
+            regs::cpuid(0x8000_0002, 0),
+            regs::cpuid(0x8000_0003, 0),
+            regs::cpuid(0x8000_0004, 0),
+        ])
+    } else {
+        [0u8; 48]
+    };
+    let hypervisor = ecx1 & (1 << 31) != 0;
+
+    crate::kprintln!(
+        "cpu: {} family {:#x} model {:#x} stepping {}, {} logical per package, \"{}\"{}",
+        crate::libkern::printable::Printable(&vendor),
+        family,
+        model,
+        stepping,
+        logical_per_package(max_leaf, ebx1, edx1),
+        crate::libkern::printable::Printable(brand_trimmed(&brand)),
+        if hypervisor { ", under a hypervisor" } else { "" },
+    );
+    crate::kprintln!(
+        "cpu: requires{}; uses{}; warns{}; reports{} (unused: the timer counts down)",
+        Features(&[
+            ("x2apic", ecx1 & (1 << 21) != 0),
+            ("rdtscp", edx_ext1 & (1 << 27) != 0),
+            ("nx", edx_ext1 & (1 << 20) != 0),
+            ("smep", ebx7 & CPUID_7_0_EBX_SMEP != 0),
+            ("smap", ebx7 & CPUID_7_0_EBX_SMAP != 0),
+        ]),
+        Features(&[
+            ("xsave", ecx1 & (1 << 26) != 0),
+            ("avx", ecx1 & (1 << 28) != 0),
+            ("rdrand", ecx1 & (1 << 30) != 0),
+            ("rdseed", ebx7 & (1 << 18) != 0),
+        ]),
+        Features(&[("invariant-tsc", edx_ext7 & (1 << 8) != 0)]),
+        Features(&[("tsc-deadline", ecx1 & (1 << 24) != 0)]),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_laptops_signature_needs_the_extended_model() {
+        // The laptop's i5-7200U (Kaby Lake-U): CPUID.01H:EAX = 0x000806E9. Base fields alone say
+        // model 0xe.
+        assert_eq!(decode_signature(0x0008_06E9), (6, 0x8E, 9));
+    }
+
+    #[test]
+    fn family_0xf_adds_the_extended_family_and_others_ignore_it() {
+        // AMD Zen+ (family 0x17): base family 0xF + extended 0x8.
+        assert_eq!(decode_signature(0x0080_0F82), (0x17, 0x08, 2));
+        // A base family below 0xF with junk in the extended-family field keeps its own.
+        assert_eq!(decode_signature(0x0FF0_0663), (6, 6, 3));
+        // A family-5 part does not get the extended model prefixed.
+        assert_eq!(decode_signature(0x000F_0543), (5, 4, 3));
+    }
+
+    #[test]
+    fn the_brand_string_reads_across_leaves_and_registers_in_order() {
+        let text = *b"  Intel(R) Core(TM) i5-7200U CPU @ 2.50GHz\0\0\0\0\0\0";
+        let reg = |at: usize| u32::from_le_bytes(text[at..at + 4].try_into().unwrap());
+        let leaf = |i: usize| (reg(i * 16), reg(i * 16 + 4), reg(i * 16 + 8), reg(i * 16 + 12));
+        let brand = brand_bytes([leaf(0), leaf(1), leaf(2)]);
+        assert_eq!(brand, text);
+        assert_eq!(
+            format!("{}", crate::libkern::printable::Printable(brand_trimmed(&brand))),
+            "Intel(R) Core(TM) i5-7200U CPU @ 2.50GHz"
+        );
+    }
+
+    #[test]
+    fn a_feature_group_marks_each_name_present_or_absent() {
+        assert_eq!(format!("{}", Features(&[("nx", true), ("smap", false)])), " +nx -smap");
     }
 }

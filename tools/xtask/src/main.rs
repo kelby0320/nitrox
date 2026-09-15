@@ -300,6 +300,7 @@ fn main() -> ExitCode {
         Some("check-login") => cmd_check_login(accel),
         Some("check-fbcon") => cmd_check_fbcon(accel),
         Some("check-live") => cmd_check_live(accel),
+        Some("check-report") => cmd_check_report(accel),
         Some("bench-compose") => cmd_bench_compose(accel),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq),
         Some("check-irq-scope") => cmd_check_irq_scope(),
@@ -340,6 +341,7 @@ fn print_help() {
            check-login       type a wrong then a right password at the graphical greeter\n  \
            check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
            check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
+           check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
@@ -2271,6 +2273,11 @@ fn cmd_check_live(accel: Accel) -> R<()> {
 const LIVE_MOUNT_TO_GREETER: std::time::Duration = std::time::Duration::from_millis(1500);
 
 fn run_live_steps(s: &mut Session) -> R<()> {
+    // 0. The live image has a menu (Phase 5 Part D.2), and nothing here touches it: the countdown
+    //    runs out and boots the first entry, which must still be the ordinary boot — no command
+    //    line, so no hardware report holding the screen.
+    s.expect(", cmdline \"\"")?;
+
     // 1. No disk. QEMU's q35 AHCI controller is present and empty, as a laptop's would be of
     //    anything Nitrox could boot from.
     s.expect("ahci: no SATA disk on any implemented port")?;
@@ -2329,6 +2336,250 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     s.expect("live-rows=3")?;
     println!("  ok: a file written under /home read back from the RAM disk");
     Ok(())
+}
+
+/// The facts `check-report`'s boot adds to [`EMULATED_MACHINE_FACTS`]: the laptop's shape — a USB
+/// stick, an **empty** AHCI controller that is therefore declined, and no UART — and the command
+/// line the menu entry passed.
+const REPORT_FACTS: &[&[&str]] = &[
+    &["boot: HHDM ", ", cmdline \"hwreport\""],
+    &["drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port"],
+    &["ramdisk: module 1 (/boot/root.img)"],
+    &["label \"nitrox-live\" -> block node"],
+    &["console: no UART at COM1"],
+];
+
+/// `cargo xtask check-report` — **the hardware report, read the way it will be read on the
+/// laptop** (Phase 5 Part D.4).
+///
+/// Boots the live image as a USB stick with the AHCI controller empty and **`-serial none`**, so
+/// nothing comes from COM1: the machine this is for has none. Then, off the screen alone:
+///
+/// 1. **The menu.** Finds Limine's menu with a detector of its own — the kernel console's decoder
+///    reads only the console's cells — presses Down, sees the highlight move, and presses Enter.
+/// 2. **The pages.** Reads each report page with the console's decoder, whole off one frame, by
+///    its prompt row, and presses a key for the next; the last key ends the report.
+/// 3. **The facts.** The pages together carry [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`]: a
+///    declined AHCI controller, the module disk and its partition, no COM1.
+/// 4. **The boot goes on**: the console hands the screen to the compositor.
+///
+/// Between them, this and `test-qemu` cover a claimed and a declined function, and COM1 both ways.
+fn cmd_check_report(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image_live()?;
+
+    let work = build_cache();
+    fs::create_dir_all(&work).ok();
+    let qmp_sock = work.join("qmp-report.sock");
+    let dump = work.join("report.ppm");
+    let _ = fs::remove_file(&qmp_sock);
+    let ovmf = locate_ovmf()?;
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        // No UART at all: the report has to say so, and nothing here could read one.
+        .arg("-serial")
+        .arg("none")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: hardware report gate — choosing the live image's report entry, with no serial port…\n");
+    let _session = Session::spawn(cmd, "check-report")?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+    let look = |qmp: &mut Qmp| -> R<(u32, u32, Vec<u8>)> {
+        qmp.screendump(&dump)?;
+        parse_ppm(&fs::read(&dump)?)
+    };
+
+    // 1. The menu, and its second entry chosen.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let first = loop {
+        let (w, h, rgb) = look(&mut qmp)?;
+        if let Some(highlight) = limine_menu(w, h, &rgb) {
+            break highlight;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("no Limine menu on the screen within 120s (last dump {})", dump.display()).into());
+        }
+    };
+    press(&mut qmp, "down")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (w, h, rgb) = look(&mut qmp)?;
+        match limine_menu(w, h, &rgb) {
+            Some(highlight) if highlight > first => break,
+            _ if std::time::Instant::now() > deadline => {
+                return Err(format!(
+                    "Down did not move the menu's highlight below the first entry's (y {first}) \
+                     within 10s — the countdown may have booted it (last dump {})",
+                    dump.display()
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
+    press(&mut qmp, "ret")?;
+    println!("  ok: found Limine's menu, moved to its second entry, and chose it");
+
+    // 2. The pages, each read whole off one frame by its prompt, and a key for the next.
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut total: Option<usize> = None;
+    let mut console_seen = false;
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while total.is_none_or(|n| pages.len() < n) {
+        let (w, h, rgb) = look(&mut qmp)?;
+        let frame = Frame::read(w, h, &rgb);
+        if frame.is_console() {
+            console_seen = true;
+            // The menu detector's control, on every console frame read here: the kernel's screen
+            // is never taken for Limine's.
+            if limine_menu(w, h, &rgb).is_some() {
+                return Err(format!("the menu detector matched a kernel console frame ({})", dump.display()).into());
+            }
+            if let Some((index, of)) = frame.rows.last().and_then(|r| r.as_deref()).and_then(report_prompt) {
+                let expected = *total.get_or_insert(of);
+                if of != expected {
+                    return Err(format!("page {index} says there are {of} pages; the first said {expected}").into());
+                }
+                if index == pages.len() + 1 {
+                    let lines = frame.lines();
+                    pages.push(lines[..lines.len() - 1].iter().map(|l| l.to_string()).collect());
+                    press(&mut qmp, "spc")?;
+                    deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                } else if index > pages.len() + 1 {
+                    return Err(format!("page {index}/{of} came up after page {} — one went by unread", pages.len()).into());
+                }
+            }
+        } else if console_seen && frame.text_cells == 0 {
+            return Err(format!(
+                "the boot went on to the desktop after {} of {} report page(s) — the report did \
+                 not hold (last dump {})",
+                pages.len(),
+                total.map_or("?".to_string(), |n| n.to_string()),
+                dump.display()
+            )
+            .into());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "no report page {} on the screen in time — {} read so far{} (last dump {})",
+                pages.len() + 1,
+                pages.len(),
+                if console_seen { "" } else { ", and never a whole console frame" },
+                dump.display()
+            )
+            .into());
+        }
+    }
+    let n = pages.len();
+    println!("  ok: read {n} report page(s) off the screen, pressing a key for each");
+
+    // 3. The facts, from the pages alone.
+    let lines: Vec<&str> = pages.iter().flatten().map(String::as_str).collect();
+    let missing = missing_facts(&lines, EMULATED_MACHINE_FACTS.iter().chain(REPORT_FACTS).copied());
+    if !missing.is_empty() {
+        let read: Vec<String> =
+            pages.iter().enumerate().map(|(i, p)| format!("--- page {} ---\n{}", i + 1, p.join("\n"))).collect();
+        return Err(format!("the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}", read.join("\n")).into());
+    }
+    println!("  ok: the pages say what this machine is — a declined AHCI controller, the module disk, no COM1");
+
+    // 4. The boot goes on, and the console hands the screen over.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (w, h, rgb) = look(&mut qmp)?;
+        let frame = Frame::read(w, h, &rgb);
+        if !frame.is_console() && frame.text_cells == 0 {
+            break;
+        }
+        if let Some((index, of)) = frame.rows.last().and_then(|r| r.as_deref()).and_then(report_prompt) {
+            if index > n {
+                return Err(format!("page {index}/{of} came up after the last page's key").into());
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "the console did not hand the screen over within 120s of the last page (last dump {})",
+                dump.display()
+            )
+            .into());
+        }
+    }
+    println!("  ok: after the last page the boot went on, and the console handed the screen over");
+
+    let _ = fs::remove_file(&qmp_sock);
+    println!("\nxtask: the hardware report is chosen from the menu, held a page at a time, and read with no serial port ✓");
+    Ok(())
+}
+
+/// `(page, of)` from a report page's prompt row, `— page 2/3 — any key —` (`kernel/src/report.rs`).
+fn report_prompt(row: &str) -> Option<(usize, usize)> {
+    let rest = row.strip_prefix("— page ")?.strip_suffix(" — any key —")?;
+    let (index, of) = rest.split_once('/')?;
+    let (index, of): (usize, usize) = (index.parse().ok()?, of.parse().ok()?);
+    (index >= 1 && index <= of).then_some((index, of))
+}
+
+/// Limine's boot menu, as Limine 12.2.0 draws it on OVMF's framebuffer: `Some(y)` — the first pixel
+/// row of the highlighted entry's bar — when `rgb` is that menu, `None` otherwise.
+///
+/// **A detector of its own**, because the console's decoder reads only the console's cells.
+/// Calibrated on screendumps of the menu (2026-09-14): a black ground, grey entries and help text,
+/// the title in cyan along the top, green key names and countdown, a bright-green countdown digit,
+/// and the highlighted entry drawn black on a grey bar. All three of these must hold:
+///
+/// - **Every pixel is one of those five colours.** OVMF's screens carry its logo's colours and the
+///   kernel console draws ink on slate, so neither passes this alone.
+/// - **The title's cyan, and only along the top**: a line of text's worth, none of it below the
+///   top tenth of the screen.
+/// - **A highlight bar**: a row with a run of grey wider than any glyph stroke. Its `y` is how the
+///   gate sees that Down moved the selection.
+fn limine_menu(w: u32, h: u32, rgb: &[u8]) -> Option<usize> {
+    const BLACK: [u8; 3] = [0, 0, 0];
+    const GREY: [u8; 3] = [170, 170, 170];
+    const GREEN: [u8; 3] = [0, 170, 0];
+    const CYAN: [u8; 3] = [0, 170, 170];
+    const BRIGHT_GREEN: [u8; 3] = [85, 255, 85];
+    // Wider than any stroke of Limine's 8-pixel glyphs; the narrowest bar, behind `Nitrox`, is 72.
+    const BAR_RUN: usize = 32;
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || rgb.len() < w * h * 3 {
+        return None;
+    }
+    let (mut cyan, mut highlight) = (0usize, None);
+    for y in 0..h {
+        let mut run = 0usize;
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            let px = [rgb[i], rgb[i + 1], rgb[i + 2]];
+            if px == CYAN {
+                if y > h / 10 {
+                    return None;
+                }
+                cyan += 1;
+            } else if px != BLACK && px != GREY && px != GREEN && px != BRIGHT_GREEN {
+                return None;
+            }
+            run = if px == GREY { run + 1 } else { 0 };
+            if run >= BAR_RUN && highlight.is_none() {
+                highlight = Some(y);
+            }
+        }
+    }
+    if cyan >= 200 { highlight } else { None }
 }
 
 /// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right
@@ -8224,6 +8475,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_block_read_selftest(&transcript)?;
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
+            check_hardware_facts(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -8232,6 +8484,81 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
+}
+
+/// Facts about the machine QEMU emulates that every boot now logs (Phase 5 Part D.1), and that
+/// both boots below know the answer to: q35's ECAM window, its four MADT CPUs and one IOAPIC, and
+/// the framebuffer at OVMF's default mode. Each fact is fragments that must all appear in **one**
+/// line.
+///
+/// **Written down here, not derived** — a second statement of each answer, which is what makes it
+/// an assertion. On the laptop these are the lines to compare (the plan's § What to compare on
+/// the day).
+const EMULATED_MACHINE_FACTS: &[&[&str]] = &[
+    &["acpi: ECAM @0xe0000000 seg 0 bus 0-255"],
+    &["madt: lapic uid 0 apic 0 enabled"],
+    &["madt: lapic uid 1 apic 1 enabled"],
+    &["madt: lapic uid 2 apic 2 enabled"],
+    &["madt: lapic uid 3 apic 3 enabled"],
+    &["madt: ioapic 0 @0xfec00000 gsi 0"],
+    &["acpi: 1 IOAPIC, 5 src-override, 4 CPU; 1 ECAM region"],
+    &["framebuffer: 1280x800 pitch 5120 padding 0 bpp 32"],
+];
+
+/// The facts `test-qemu`'s boot adds to [`EMULATED_MACHINE_FACTS`]: its disk is on AHCI, so the
+/// controller is **claimed**, and it has a UART, so COM1 is **present**.
+///
+/// **The ACPI tables are pinned by signature and OEM, not address or length.** Read off the
+/// first run (2026-09-14): QEMU's FACP, APIC, HPET, MCFG and WAET, each `BOCHS BXPC`, plus a BGRT
+/// that is OVMF's (`INTEL EDK2`, the boot logo) and so not QEMU's to promise. The addresses are
+/// wherever this OVMF build put them, and CI's OVMF is another build.
+const TEST_QEMU_FACTS: &[&[&str]] = &[
+    &["acpi: FACP @", "oem BOCHS BXPC"],
+    &["acpi: APIC @", "oem BOCHS BXPC"],
+    &["acpi: HPET @", "oem BOCHS BXPC"],
+    &["acpi: MCFG @", "oem BOCHS BXPC"],
+    &["acpi: WAET @", "oem BOCHS BXPC"],
+    &["madt: lapic-nmi uid 0xff lint 1 flags 0x0"],
+    &["pci 00:1f.2 8086:2922 class 01.06.01 pin 1 caps msi64"],
+    &["drivers: 00:1f.2 claimed by ahci, MSI vec "],
+    &["console: RX loopback self-test OK"],
+    &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
+];
+
+/// The facts in `wanted` that no single line of `lines` carries every fragment of, each joined
+/// for a message. Empty when every fact is there.
+fn missing_facts<'a>(lines: &[&str], wanted: impl IntoIterator<Item = &'a [&'a str]>) -> Vec<String> {
+    wanted
+        .into_iter()
+        .filter(|fact| !lines.iter().any(|line| fact.iter().all(|frag| line.contains(frag))))
+        .map(|fact| fact.join(" … "))
+        .collect()
+}
+
+/// Assert what the boot says about the machine (Phase 5 Part D.4): [`EMULATED_MACHINE_FACTS`],
+/// [`TEST_QEMU_FACTS`], and the bootloader — this build's pinned Limine, on 64-bit UEFI.
+fn check_hardware_facts(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    let lines: Vec<&str> = text.lines().collect();
+    let limine = format!(
+        "boot: Limine {} on UEFI (64-bit), base revision 6",
+        LIMINE_VERSION.trim_start_matches('v')
+    );
+    let bootloader: &[&str] = &[&limine];
+    let missing = missing_facts(
+        &lines,
+        EMULATED_MACHINE_FACTS.iter().chain(TEST_QEMU_FACTS).copied().chain([bootloader]),
+    );
+    if !missing.is_empty() {
+        return Err(format!(
+            "the boot did not report what QEMU's machine is — no line says: {missing:?}. Each is \
+             one line of the hardware report every boot logs (kernel_main's handoff, the ACPI \
+             walk, PCI enumeration, the driver outcomes, the framebuffer record)"
+        )
+        .into());
+    }
+    println!("xtask: the boot reported QEMU's machine as it is — tables, CPUs, IOAPIC, framebuffer, a claimed AHCI, COM1 ✓");
+    Ok(())
 }
 
 /// Assert that the block driver **refused** a transfer larger than one command can describe.
@@ -11345,17 +11672,10 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
         .arg(((root_sectors * 512) / 4096).to_string()))?;
     splice_into(&root_img, root_lba * 512, &rootfs)?;
 
-    // 2. Limine's configuration: the release one, with `root.img` as the second module.
-    let base = fs::read_to_string(limine_conf())?;
-    let initramfs_line = "module_path: boot():/boot/initramfs";
-    if base.matches(initramfs_line).count() != 1 {
-        return Err(format!("boot/limine.conf no longer has {initramfs_line:?} exactly once").into());
-    }
+    // 2. Limine's configuration: the release one, with `root.img` as the second module and a
+    //    menu with a hardware-report entry.
     let conf = work.join("limine.conf");
-    fs::write(
-        &conf,
-        base.replace(initramfs_line, &format!("{initramfs_line}\n    module_path: boot():/boot/root.img")),
-    )?;
+    fs::write(&conf, live_limine_conf(&fs::read_to_string(limine_conf())?)?)?;
 
     // 3. The stick: one ESP big enough for all of it.
     let payload = [bootx64, kernel, initramfs, root_img.as_path()]
@@ -11382,6 +11702,54 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
         esp_mib + 2
     );
     Ok(())
+}
+
+/// How long the live image's boot menu counts down before booting its default entry.
+const LIVE_MENU_TIMEOUT_SECS: u32 = 5;
+
+/// The live image's boot-menu entry that boots into the hardware report (Phase 5 Part D.2).
+const LIVE_REPORT_ENTRY: &str = "Nitrox — hardware report";
+
+/// The live image's `limine.conf`, from the release one (`base`): `root.img` as a second module,
+/// and **a menu** — a countdown, the release entry first as the default, and a second entry that
+/// passes `cmdline: hwreport`.
+///
+/// Only the live image carries the menu: it is the stick a person boots a machine with, and the
+/// release and test images keep `timeout: 0` so no other gate pays for a countdown. A nonzero
+/// timeout is also what makes Limine draw the menu at all.
+fn live_limine_conf(base: &str) -> R<String> {
+    let exactly_once = |line: &str| {
+        if base.matches(line).count() == 1 {
+            Ok(())
+        } else {
+            Err(format!("boot/limine.conf no longer has {line:?} exactly once"))
+        }
+    };
+    let (timeout_line, entry_line, initramfs_line) =
+        ("timeout: 0", "/Nitrox\n", "    module_path: boot():/boot/initramfs\n");
+    exactly_once(timeout_line)?;
+    exactly_once(entry_line)?;
+    exactly_once(initramfs_line)?;
+    let entry_start = base.find(entry_line).expect("checked above");
+    if base[entry_start + entry_line.len()..].contains("\n/") {
+        return Err("boot/limine.conf has a second entry; the live menu adds its own".into());
+    }
+    let with_root = base.replacen(
+        initramfs_line,
+        &format!("{initramfs_line}    module_path: boot():/boot/root.img\n"),
+        1,
+    );
+    let with_timeout =
+        with_root.replacen(timeout_line, &format!("timeout: {LIVE_MENU_TIMEOUT_SECS}"), 1);
+    let entry_start = with_timeout.find(entry_line).expect("checked above");
+    let default_entry = with_timeout[entry_start..].trim_end().to_string();
+    let report_entry = default_entry
+        .replacen("/Nitrox", &format!("/{LIVE_REPORT_ENTRY}"), 1)
+        .replacen("\n    path:", "\n    cmdline: hwreport\n    path:", 1);
+    if !report_entry.contains("cmdline: hwreport") {
+        return Err("boot/limine.conf's entry has no `path:` line to put the command line beside".into());
+    }
+    Ok(format!("{}\n\n{report_entry}\n", with_timeout.trim_end()))
 }
 
 /// Total bytes of the regular files under `dir`.
@@ -12247,6 +12615,38 @@ LLVM version: 22.1.2
 #[cfg(test)]
 mod diag_tests {
     use super::*;
+
+    #[test]
+    fn the_live_menu_boots_the_release_entry_by_default_and_offers_the_report() {
+        let base = fs::read_to_string(limine_conf()).expect("boot/limine.conf is readable");
+        let conf = live_limine_conf(&base).expect("the shipped limine.conf is one entry");
+        assert_eq!(
+            conf,
+            "timeout: 5\n\
+             \n\
+             /Nitrox\n\
+             \x20   protocol: limine\n\
+             \x20   path: boot():/boot/kernel\n\
+             \x20   module_path: boot():/boot/initramfs\n\
+             \x20   module_path: boot():/boot/root.img\n\
+             \n\
+             /Nitrox — hardware report\n\
+             \x20   protocol: limine\n\
+             \x20   cmdline: hwreport\n\
+             \x20   path: boot():/boot/kernel\n\
+             \x20   module_path: boot():/boot/initramfs\n\
+             \x20   module_path: boot():/boot/root.img\n"
+        );
+    }
+
+    #[test]
+    fn the_live_menu_refuses_a_base_it_would_have_to_guess_about() {
+        let one = "timeout: 0\n\n/Nitrox\n    protocol: limine\n    path: boot():/boot/kernel\n    module_path: boot():/boot/initramfs\n";
+        assert!(live_limine_conf(one).is_ok(), "control: the one-entry shape is accepted");
+        assert!(live_limine_conf(&one.replace("timeout: 0", "timeout: 3")).is_err());
+        assert!(live_limine_conf(&format!("{one}\n/Other\n    protocol: limine\n")).is_err());
+        assert!(live_limine_conf(&one.replace("    module_path: boot():/boot/initramfs\n", "")).is_err());
+    }
 
     #[test]
     fn a_qmp_return_string_is_unescaped() {

@@ -27,6 +27,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::platform::{ArchPlatform, EcamRegion};
 use crate::libkern::AllocError;
+use crate::libkern::printable::Printable;
 use crate::mm::{PhysAddr, heap};
 
 // --- Limine RSDP request (x86 firmware detail; owned here so `init` is arg-free) ---
@@ -91,7 +92,7 @@ static mut IOAPICS: [IoApic; MAX_IOAPIC] = [IoApic::ZERO; MAX_IOAPIC];
 static OVERRIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static mut OVERRIDES: [SourceOverride; MAX_OVERRIDE] = [SourceOverride::ZERO; MAX_OVERRIDE];
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
-static mut CPU_APIC_IDS: [u8; MAX_CPU] = [0; MAX_CPU];
+static mut CPU_APIC_IDS: [u32; MAX_CPU] = [0; MAX_CPU];
 
 // --- Little-endian field readers (callers guarantee `off + width <= b.len()`) ---
 #[inline]
@@ -183,58 +184,217 @@ fn sdt_pointers(sdt: &[u8], use_xsdt: bool) -> impl Iterator<Item = PhysAddr> + 
     })
 }
 
-/// Parse a MADT ("APIC" table) into the caller's buffers, truncating at each
-/// buffer's capacity. Returns `(n_ioapic, n_override, n_cpu)`.
+/// Whether a processor entry's CPU is usable, from its flags (ACPI 6.3 §5.2.12.2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CpuState {
+    /// Bit 0: the processor is ready for use.
+    Enabled,
+    /// Bit 1 with bit 0 clear: not present at boot, but the platform can bring it online.
+    OnlineCapable,
+    /// Neither: the entry describes a processor the OS must not use.
+    Disabled,
+}
+
+impl CpuState {
+    fn from_flags(flags: u32) -> CpuState {
+        if flags & 1 != 0 {
+            CpuState::Enabled
+        } else if flags & 2 != 0 {
+            CpuState::OnlineCapable
+        } else {
+            CpuState::Disabled
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            CpuState::Enabled => "enabled",
+            CpuState::OnlineCapable => "online-capable",
+            CpuState::Disabled => "disabled",
+        }
+    }
+}
+
+/// One MADT interrupt-controller structure, decoded as far as a report needs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MadtEntry {
+    /// Type 0 (Processor Local APIC, 8-bit ids) or type 9 (Processor Local x2APIC, 32-bit).
+    /// Both are CPUs: type 9 is required for an APIC id of 255 or above, and a machine whose ids
+    /// are all lower may still list its CPUs that way. **But some firmware lists a CPU both
+    /// ways**, and ACPI 6.5 §5.2.12.12 says that where both kinds of entry are present an x2APIC
+    /// entry's id is 255 or above — see [`not_counted`].
+    Cpu { x2apic: bool, uid: u32, apic_id: u32, state: CpuState },
+    /// Type 1.
+    IoApic(IoApic),
+    /// Type 2.
+    Override(SourceOverride),
+    /// Type 4 (Local APIC NMI, 8-bit uid; `0xFF` means every CPU) or type 0xA (Local x2APIC
+    /// NMI, 32-bit uid; `0xFFFF_FFFF` means every CPU).
+    Nmi { x2apic: bool, uid: u32, lint: u8, flags: u16 },
+    /// Any other type, or a known type too short to decode.
+    Other { etype: u8, len: u8 },
+}
+
+/// The MADT's header fields after the SDT header: the local APIC address and the flags
+/// (bit 0: dual 8259s are installed). `None` for a table too short to have them.
+fn madt_header(madt: &[u8]) -> Option<(u32, u32)> {
+    (madt.len() >= 44).then(|| (rd_u32(madt, 36), rd_u32(madt, 40)))
+}
+
+/// Iterate a MADT's entries in table order. Stops at the first entry whose length is shorter
+/// than its own two-byte header or runs past the table, since nothing after it can be located.
+fn madt_entries(madt: &[u8]) -> impl Iterator<Item = MadtEntry> + '_ {
+    // Entries begin after the 36-byte SDT header + 8 bytes (local-APIC address u32 + flags u32).
+    let mut off = 44;
+    core::iter::from_fn(move || {
+        if off + 2 > madt.len() {
+            return None;
+        }
+        let etype = madt[off];
+        let elen = madt[off + 1] as usize;
+        if elen < 2 || off + elen > madt.len() {
+            return None;
+        }
+        let e = &madt[off..off + elen];
+        off += elen;
+        Some(match etype {
+            0 if elen >= 8 => MadtEntry::Cpu {
+                x2apic: false,
+                uid: e[2] as u32,
+                apic_id: e[3] as u32,
+                state: CpuState::from_flags(rd_u32(e, 4)),
+            },
+            1 if elen >= 12 => MadtEntry::IoApic(IoApic {
+                id: e[2],
+                addr: PhysAddr(rd_u32(e, 4) as u64),
+                gsi_base: rd_u32(e, 8),
+            }),
+            2 if elen >= 10 => MadtEntry::Override(SourceOverride {
+                source_irq: e[3],
+                gsi: rd_u32(e, 4),
+                flags: rd_u16(e, 8),
+            }),
+            4 if elen >= 6 => {
+                MadtEntry::Nmi { x2apic: false, uid: e[2] as u32, flags: rd_u16(e, 3), lint: e[5] }
+            }
+            9 if elen >= 16 => MadtEntry::Cpu {
+                x2apic: true,
+                apic_id: rd_u32(e, 4),
+                state: CpuState::from_flags(rd_u32(e, 8)),
+                uid: rd_u32(e, 12),
+            },
+            0xA if elen >= 12 => {
+                MadtEntry::Nmi { x2apic: true, flags: rd_u16(e, 2), uid: rd_u32(e, 4), lint: e[8] }
+            }
+            _ => MadtEntry::Other { etype, len: elen as u8 },
+        })
+    })
+}
+
+/// Whether the MADT has a usable type-0 CPU entry: one whose id is not `0xFF` (no CPU) and that
+/// is enabled or online-capable. What [`not_counted`] asks of a low x2APIC id.
+fn has_lapic_cpus(madt: &[u8]) -> bool {
+    madt_entries(madt).any(|entry| {
+        matches!(
+            entry,
+            MadtEntry::Cpu { x2apic: false, apic_id, state: CpuState::Enabled | CpuState::OnlineCapable, .. }
+                if apic_id != 0xFF
+        )
+    })
+}
+
+/// Why a CPU entry is not a CPU of its own, or `None` when it is (or `entry` is not a CPU entry).
+/// `has_lapic_cpus` is [`has_lapic_cpus`] for the same table. Two reasons, both the ones Linux
+/// applies (`acpi_check_lapic`, `acpi_parse_x2apic`):
+///
+/// - **An id that names no CPU**: `0xFF` in a type-0 entry, `0xFFFF_FFFF` in a type-9 one.
+/// - **A low x2APIC id where type-0 entries list the CPUs.** ACPI 6.5 §5.2.12.12: where both kinds
+///   are present, an x2APIC entry's id is 255 or above. Some firmware lists each CPU both ways
+///   regardless, and counting both reads eight CPUs on a four-thread machine.
+///
+/// Such an entry is still logged, with the reason, so a report shows what the firmware listed.
+fn not_counted(entry: &MadtEntry, has_lapic_cpus: bool) -> Option<&'static str> {
+    match *entry {
+        MadtEntry::Cpu { x2apic: false, apic_id: 0xFF, .. }
+        | MadtEntry::Cpu { x2apic: true, apic_id: 0xFFFF_FFFF, .. } => Some("no CPU has this id"),
+        MadtEntry::Cpu { x2apic: true, apic_id, .. } if has_lapic_cpus && apic_id < 0xFF => {
+            Some("below 255, and lapic entries list the CPUs")
+        }
+        _ => None,
+    }
+}
+
+/// Parse a MADT ("APIC" table) into the caller's buffers, truncating at each buffer's
+/// capacity. Returns `(n_ioapic, n_override, n_cpu)`, where a CPU is an **enabled** entry of
+/// either processor type — online-capable ones are not present at boot — that [`not_counted`]
+/// has no reason to leave out.
 fn parse_madt(
     madt: &[u8],
     ioapics: &mut [IoApic],
     overrides: &mut [SourceOverride],
-    cpus: &mut [u8],
+    cpus: &mut [u32],
 ) -> (usize, usize, usize) {
     let (mut ni, mut no, mut nc) = (0, 0, 0);
-    // Entries begin after the 36-byte SDT header + 8 bytes (local-APIC address
-    // u32 + flags u32).
-    let mut off = 44;
-    while off + 2 <= madt.len() {
-        let etype = madt[off];
-        let elen = madt[off + 1] as usize;
-        if elen < 2 || off + elen > madt.len() {
-            break;
+    let has_lapic = has_lapic_cpus(madt);
+    for entry in madt_entries(madt) {
+        if not_counted(&entry, has_lapic).is_some() {
+            continue;
         }
-        let e = &madt[off..off + elen];
-        match etype {
-            // Processor Local APIC: collect the APIC id of each *enabled* CPU.
-            0 if elen >= 8 => {
-                let apic_id = e[3];
-                let flags = rd_u32(e, 4);
-                if flags & 1 != 0 && nc < cpus.len() {
-                    cpus[nc] = apic_id;
-                    nc += 1;
-                }
+        match entry {
+            MadtEntry::Cpu { apic_id, state: CpuState::Enabled, .. } if nc < cpus.len() => {
+                cpus[nc] = apic_id;
+                nc += 1;
             }
-            // I/O APIC.
-            1 if elen >= 12 && ni < ioapics.len() => {
-                ioapics[ni] = IoApic {
-                    id: e[2],
-                    addr: PhysAddr(rd_u32(e, 4) as u64),
-                    gsi_base: rd_u32(e, 8),
-                };
+            MadtEntry::IoApic(io) if ni < ioapics.len() => {
+                ioapics[ni] = io;
                 ni += 1;
             }
-            // Interrupt Source Override.
-            2 if elen >= 10 && no < overrides.len() => {
-                overrides[no] = SourceOverride {
-                    source_irq: e[3],
-                    gsi: rd_u32(e, 4),
-                    flags: rd_u16(e, 8),
-                };
+            MadtEntry::Override(ov) if no < overrides.len() => {
+                overrides[no] = ov;
                 no += 1;
             }
             _ => {}
         }
-        off += elen;
     }
     (ni, no, nc)
+}
+
+/// Log one MADT entry on one line, a CPU entry the count leaves out marked with why
+/// ([`not_counted`]; `has_lapic_cpus` is [`has_lapic_cpus`] for the same table).
+fn log_madt_entry(entry: &MadtEntry, has_lapic_cpus: bool) {
+    match *entry {
+        MadtEntry::Cpu { x2apic, uid, apic_id, state } => crate::kprintln!(
+            "madt: {} uid {} apic {} {}{}{}",
+            if x2apic { "x2apic" } else { "lapic" },
+            uid,
+            apic_id,
+            state.name(),
+            if not_counted(entry, has_lapic_cpus).is_some() { " — not counted: " } else { "" },
+            not_counted(entry, has_lapic_cpus).unwrap_or("")
+        ),
+        MadtEntry::IoApic(io) => crate::kprintln!(
+            "madt: ioapic {} @{:#x} gsi {}",
+            io.id,
+            io.addr.as_u64(),
+            io.gsi_base
+        ),
+        MadtEntry::Override(ov) => crate::kprintln!(
+            "madt: override irq {} -> gsi {} flags {:#x}",
+            ov.source_irq,
+            ov.gsi,
+            ov.flags
+        ),
+        MadtEntry::Nmi { x2apic, uid, lint, flags } => crate::kprintln!(
+            "madt: {} uid {:#x} lint {} flags {:#x}",
+            if x2apic { "x2apic-nmi" } else { "lapic-nmi" },
+            uid,
+            lint,
+            flags
+        ),
+        MadtEntry::Other { etype, len } => {
+            crate::kprintln!("madt: type {:#x} len {}", etype, len)
+        }
+    }
 }
 
 /// Parse an MCFG into the caller's buffer, truncating at its capacity. Returns
@@ -311,15 +471,24 @@ impl ArchPlatform for X86Platform {
         let sdt_len = sdt_length(sdt_hdr).min(MAX_TABLE_BYTES);
         // SAFETY: as above, for the capped full length.
         let sdt = unsafe { phys_slice(info.sdt_phys, sdt_len) };
+        crate::kprintln!(
+            "acpi: RSDP rev {} oem {}; {} @{:#x}",
+            info.revision,
+            Printable(&rsdp[9..15]),
+            if info.use_xsdt { "XSDT" } else { "RSDT" },
+            info.sdt_phys.as_u64(),
+        );
 
-        // 3. Walk the SDT pointers, parsing the first MADT and first MCFG into
-        // local buffers.
+        // 3. Walk the SDT pointers: one line per table, then parse the first MADT and first
+        // MCFG into local buffers. The MADT's entries are logged after the table list, so the
+        // list reads as one block on the screen.
         let mut ioapics = [IoApic::ZERO; MAX_IOAPIC];
         let mut overrides = [SourceOverride::ZERO; MAX_OVERRIDE];
-        let mut cpus = [0u8; MAX_CPU];
+        let mut cpus = [0u32; MAX_CPU];
         let mut ecam = [EcamRegion::ZERO; MAX_ECAM];
         let (mut ni, mut no, mut nc, mut ne) = (0usize, 0usize, 0usize, 0usize);
-        let (mut have_madt, mut have_mcfg) = (false, false);
+        let mut madt: Option<&[u8]> = None;
+        let mut have_mcfg = false;
 
         for tphys in sdt_pointers(sdt, info.use_xsdt) {
             // SAFETY: each pointer is from the validated root table; read 36
@@ -332,16 +501,27 @@ impl ArchPlatform for X86Platform {
             let tlen = sdt_length(hdr).min(MAX_TABLE_BYTES);
             // SAFETY: as above, for the capped full length.
             let table = unsafe { phys_slice(tphys, tlen) };
-            if !checksum_ok(table) {
+            let valid = checksum_ok(table);
+            crate::kprintln!(
+                "acpi: {} @{:#x} rev {} len {} oem {} {}{}",
+                Printable(&sig),
+                tphys.as_u64(),
+                hdr[8],
+                sdt_length(hdr),
+                Printable(&hdr[10..16]),
+                Printable(&hdr[16..24]),
+                if valid { "" } else { " — bad checksum, ignored" },
+            );
+            if !valid {
                 continue;
             }
             match &sig {
-                b"APIC" if !have_madt => {
+                b"APIC" if madt.is_none() => {
                     let (a, b, c) = parse_madt(table, &mut ioapics, &mut overrides, &mut cpus);
                     ni = a;
                     no = b;
                     nc = c;
-                    have_madt = true;
+                    madt = Some(table);
                 }
                 b"MCFG" if !have_mcfg => {
                     ne = parse_mcfg(table, &mut ecam);
@@ -365,26 +545,27 @@ impl ArchPlatform for X86Platform {
         CPU_COUNT.store(nc, Ordering::Release);
         ECAM_COUNT.store(ne, Ordering::Release);
 
-        // 5. Log a one-line summary, plus the first IOAPIC and ECAM region.
+        // 5. The MADT entry by entry, then the summary counted from the same walk, then every
+        // ECAM window.
+        if let Some(madt) = madt {
+            if let Some((lapic, flags)) = madt_header(madt) {
+                crate::kprintln!("madt: local APIC @{:#x} flags {:#x}", lapic, flags);
+            }
+            let has_lapic = has_lapic_cpus(madt);
+            for entry in madt_entries(madt) {
+                log_madt_entry(&entry, has_lapic);
+            }
+        }
         crate::kprintln!(
-            "acpi: RSDP rev {} ({}); {} IOAPIC, {} src-override, {} CPU; {} ECAM region",
-            info.revision,
-            if info.use_xsdt { "XSDT" } else { "RSDT" },
+            "acpi: {} IOAPIC, {} src-override, {} CPU; {} ECAM region",
             ni,
             no,
             nc,
             ne,
         );
-        if let Some(io) = ioapics[..ni].first() {
+        for e in &ecam[..ne] {
             crate::kprintln!(
-                "acpi: IOAPIC0 @{:#x} gsi_base {}",
-                io.addr.as_u64(),
-                io.gsi_base
-            );
-        }
-        if let Some(e) = ecam[..ne].first() {
-            crate::kprintln!(
-                "acpi: ECAM0 @{:#x} seg {} bus {}-{}",
+                "acpi: ECAM @{:#x} seg {} bus {}-{}",
                 e.base.as_u64(),
                 e.segment,
                 e.bus_start,
@@ -421,12 +602,13 @@ pub(crate) fn source_overrides() -> &'static [SourceOverride] {
     unsafe { core::slice::from_raw_parts((&raw const OVERRIDES) as *const SourceOverride, n) }
 }
 
-/// The enabled CPUs' local-APIC ids from the MADT (arch-internal; SMP bring-up).
+/// The enabled CPUs' APIC ids from the MADT, from type-0 and type-9 entries alike
+/// (arch-internal; SMP bring-up).
 #[allow(dead_code)]
-pub(crate) fn cpu_apic_ids() -> &'static [u8] {
+pub(crate) fn cpu_apic_ids() -> &'static [u32] {
     let n = CPU_COUNT.load(Ordering::Acquire);
     // SAFETY: as `pcie_ecam_regions`.
-    unsafe { core::slice::from_raw_parts((&raw const CPU_APIC_IDS) as *const u8, n) }
+    unsafe { core::slice::from_raw_parts((&raw const CPU_APIC_IDS) as *const u32, n) }
 }
 
 #[cfg(test)]
@@ -535,7 +717,7 @@ mod tests {
 
         let mut ioapics = [IoApic::ZERO; 4];
         let mut overrides = [SourceOverride::ZERO; 4];
-        let mut cpus = [0u8; 4];
+        let mut cpus = [0u32; 4];
         let (ni, no, nc) = parse_madt(&madt, &mut ioapics, &mut overrides, &mut cpus);
         assert_eq!((ni, no, nc), (1, 1, 1));
         assert_eq!(
@@ -544,6 +726,172 @@ mod tests {
         );
         assert_eq!(overrides[0], SourceOverride { source_irq: 0, gsi: 2, flags: 0 });
         assert_eq!(cpus[0], 5); // only the enabled CPU
+    }
+
+    /// QEMU q35's MADT at `-smp 4`, as the kernel read it (captured 2026-09-14 by a
+    /// temporary hex dump in `X86Platform::init` under `cargo xtask test-qemu`, then removed).
+    /// Checksum-valid as captured.
+    const QEMU_MADT: [u8; 144] = [
+        0x41, 0x50, 0x49, 0x43, 0x90, 0x00, 0x00, 0x00, 0x03, 0x49, 0x42, 0x4f,
+        0x43, 0x48, 0x53, 0x20, 0x42, 0x58, 0x50, 0x43, 0x20, 0x20, 0x20, 0x20,
+        0x01, 0x00, 0x00, 0x00, 0x42, 0x58, 0x50, 0x43, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xe0, 0xfe, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x08, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x03, 0x03,
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xfe,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x0a, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x02, 0x0a, 0x00, 0x05, 0x05, 0x00, 0x00, 0x00, 0x0d, 0x00,
+        0x02, 0x0a, 0x00, 0x09, 0x09, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x02, 0x0a,
+        0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x02, 0x0a, 0x00, 0x0b,
+        0x0b, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x04, 0x06, 0xff, 0x00, 0x00, 0x01,
+    ];
+
+    #[test]
+    fn qemus_captured_madt_decodes_entry_by_entry() {
+        assert!(checksum_ok(&QEMU_MADT), "the capture is a whole, valid table");
+        assert_eq!(madt_header(&QEMU_MADT), Some((0xFEE0_0000, 1)));
+        let cpu = |n: u32| MadtEntry::Cpu { x2apic: false, uid: n, apic_id: n, state: CpuState::Enabled };
+        let level_high = |irq: u8| {
+            MadtEntry::Override(SourceOverride { source_irq: irq, gsi: irq as u32, flags: 0xD })
+        };
+        let got: Vec<MadtEntry> = madt_entries(&QEMU_MADT).collect();
+        assert_eq!(
+            got,
+            vec![
+                cpu(0),
+                cpu(1),
+                cpu(2),
+                cpu(3),
+                MadtEntry::IoApic(IoApic { id: 0, addr: PhysAddr(0xFEC0_0000), gsi_base: 0 }),
+                MadtEntry::Override(SourceOverride { source_irq: 0, gsi: 2, flags: 0 }),
+                level_high(5),
+                level_high(9),
+                level_high(10),
+                level_high(11),
+                MadtEntry::Nmi { x2apic: false, uid: 0xFF, lint: 1, flags: 0 },
+            ]
+        );
+        let mut io = [IoApic::ZERO; 8];
+        let mut ov = [SourceOverride::ZERO; 8];
+        let mut cp = [0u32; 8];
+        assert_eq!(parse_madt(&QEMU_MADT, &mut io, &mut ov, &mut cp), (1, 5, 4));
+        assert_eq!(&cp[..4], &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn x2apic_cpus_count_and_online_capable_ones_are_listed_but_not_counted() {
+        // Firmware that describes its CPUs only as type-9 entries: the parser before Part D
+        // matched type 0 alone and would have counted none of these.
+        let mut madt = sdt_header(b"APIC", 0);
+        madt.extend_from_slice(&0xFEE0_0000u32.to_le_bytes());
+        madt.extend_from_slice(&0u32.to_le_bytes());
+        let x2apic = |madt: &mut Vec<u8>, apic: u32, flags: u32, uid: u32| {
+            madt.extend_from_slice(&[9, 16, 0, 0]);
+            madt.extend_from_slice(&apic.to_le_bytes());
+            madt.extend_from_slice(&flags.to_le_bytes());
+            madt.extend_from_slice(&uid.to_le_bytes());
+        };
+        x2apic(&mut madt, 0x100, 1, 7); // enabled, an id no type-0 entry can hold
+        x2apic(&mut madt, 0x102, 2, 8); // online-capable: not present at boot
+        x2apic(&mut madt, 0x104, 0, 9); // disabled
+        // type 0 online-capable
+        madt.extend_from_slice(&[0, 8, 3, 3]);
+        madt.extend_from_slice(&2u32.to_le_bytes());
+        // type 0xA Local x2APIC NMI: flags 0x5, every CPU, LINT1
+        madt.extend_from_slice(&[0xA, 12]);
+        madt.extend_from_slice(&5u16.to_le_bytes());
+        madt.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        madt.extend_from_slice(&[1, 0, 0, 0]);
+        // an entry type this parser has no name for
+        madt.extend_from_slice(&[0x7F, 4, 0, 0]);
+
+        let got: Vec<MadtEntry> = madt_entries(&madt).collect();
+        assert_eq!(
+            got,
+            vec![
+                MadtEntry::Cpu { x2apic: true, uid: 7, apic_id: 0x100, state: CpuState::Enabled },
+                MadtEntry::Cpu { x2apic: true, uid: 8, apic_id: 0x102, state: CpuState::OnlineCapable },
+                MadtEntry::Cpu { x2apic: true, uid: 9, apic_id: 0x104, state: CpuState::Disabled },
+                MadtEntry::Cpu { x2apic: false, uid: 3, apic_id: 3, state: CpuState::OnlineCapable },
+                MadtEntry::Nmi { x2apic: true, uid: 0xFFFF_FFFF, lint: 1, flags: 5 },
+                MadtEntry::Other { etype: 0x7F, len: 4 },
+            ]
+        );
+        let mut io = [IoApic::ZERO; 2];
+        let mut ov = [SourceOverride::ZERO; 2];
+        let mut cp = [0u32; 4];
+        assert_eq!(parse_madt(&madt, &mut io, &mut ov, &mut cp), (0, 0, 1));
+        assert_eq!(cp[0], 0x100);
+    }
+
+    #[test]
+    fn a_cpu_listed_both_ways_counts_once_and_a_low_x2apic_id_alone_still_counts() {
+        let header = || {
+            let mut madt = sdt_header(b"APIC", 0);
+            madt.extend_from_slice(&0xFEE0_0000u32.to_le_bytes());
+            madt.extend_from_slice(&0u32.to_le_bytes());
+            madt
+        };
+        let lapic = |madt: &mut Vec<u8>, id: u8, flags: u32| {
+            madt.extend_from_slice(&[0, 8, id, id]);
+            madt.extend_from_slice(&flags.to_le_bytes());
+        };
+        let x2apic = |madt: &mut Vec<u8>, id: u32| {
+            madt.extend_from_slice(&[9, 16, 0, 0]);
+            madt.extend_from_slice(&id.to_le_bytes());
+            madt.extend_from_slice(&1u32.to_le_bytes());
+            madt.extend_from_slice(&id.to_le_bytes());
+        };
+        let count = |madt: &[u8]| {
+            let mut cp = [0u32; 16];
+            parse_madt(madt, &mut [IoApic::ZERO; 1], &mut [SourceOverride::ZERO; 1], &mut cp).2
+        };
+
+        // Four threads listed both ways — the x2APIC half first, which the rule must not depend
+        // on — plus one CPU only an x2APIC entry can describe.
+        let mut both = header();
+        for id in 0..4 {
+            x2apic(&mut both, id);
+        }
+        for id in 0..4 {
+            lapic(&mut both, id as u8, 1);
+        }
+        x2apic(&mut both, 0x100);
+        assert!(has_lapic_cpus(&both));
+        assert_eq!(count(&both), 5, "each low id once, and the id only type 9 can hold");
+        let superseded = madt_entries(&both).filter(|e| not_counted(e, true).is_some()).count();
+        assert_eq!(superseded, 4, "the four low-id x2APIC entries, and not the high one");
+
+        // No type-0 entries: a low x2APIC id is the only description of that CPU.
+        let mut alone = header();
+        for id in 0..4 {
+            x2apic(&mut alone, id);
+        }
+        assert!(!has_lapic_cpus(&alone));
+        assert_eq!(count(&alone), 4);
+
+        // Type-0 entries that describe no usable CPU — id 0xFF, or disabled — supersede nothing,
+        // and neither they nor an x2APIC entry naming no CPU is counted.
+        let mut unusable = header();
+        lapic(&mut unusable, 0xFF, 1);
+        lapic(&mut unusable, 1, 0);
+        x2apic(&mut unusable, 0);
+        x2apic(&mut unusable, 0xFFFF_FFFF);
+        assert!(!has_lapic_cpus(&unusable));
+        assert_eq!(count(&unusable), 1, "only the x2APIC entry with id 0");
+    }
+
+    #[test]
+    fn a_known_entry_type_too_short_to_decode_is_other_and_a_bad_length_ends_the_walk() {
+        let mut madt = sdt_header(b"APIC", 0);
+        madt.extend_from_slice(&[0u8; 8]);
+        // A type-9 entry claiming 8 bytes: too short for its fields, but locatable.
+        madt.extend_from_slice(&[9, 8, 0, 0, 1, 0, 0, 0]);
+        // A length of 1 cannot even cover its own header; nothing after it is reachable.
+        madt.extend_from_slice(&[0, 1]);
+        madt.extend_from_slice(&[0, 8, 0, 0, 1, 0, 0, 0]);
+        let got: Vec<MadtEntry> = madt_entries(&madt).collect();
+        assert_eq!(got, vec![MadtEntry::Other { etype: 9, len: 8 }]);
     }
 
     #[test]
@@ -558,7 +906,7 @@ mod tests {
         }
         let mut ioapics = [IoApic::ZERO; 2]; // capacity 2 < 4 entries
         let mut overrides = [SourceOverride::ZERO; 4];
-        let mut cpus = [0u8; 4];
+        let mut cpus = [0u32; 4];
         let (ni, _, _) = parse_madt(&madt, &mut ioapics, &mut overrides, &mut cpus);
         assert_eq!(ni, 2, "must truncate at buffer capacity, not overrun");
     }
@@ -591,7 +939,7 @@ mod tests {
         assert_eq!(sdt_pointers(&[0u8; 10], true).count(), 0);
         let mut io = [IoApic::ZERO; 2];
         let mut ov = [SourceOverride::ZERO; 2];
-        let mut cp = [0u8; 2];
+        let mut cp = [0u32; 2];
         assert_eq!(parse_madt(&[0u8; 10], &mut io, &mut ov, &mut cp), (0, 0, 0));
         assert_eq!(parse_mcfg(&[0u8; 10], &mut [EcamRegion::ZERO; 2]), 0);
     }

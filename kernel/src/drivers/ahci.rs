@@ -18,6 +18,7 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
@@ -218,9 +219,11 @@ fn write32(base: u64, off: u64, val: u32) {
 
 /// Probe and initialise an AHCI controller `DeviceNode`. On success, publishes
 /// the first SATA disk found as a block `DeviceNode` (registered in the device
-/// table) and installs the completion ISR. Logs progress; returns whether a disk
-/// was published.
-pub fn init(controller: &ObjectRef) -> bool {
+/// table) and installs the completion ISR. Logs progress, and returns what became of the
+/// controller — claimed, with how its interrupts arrive, or declined, with why — for the
+/// caller to record in the device table (Phase 5 Part D.1). Every return is one or the
+/// other, so a controller that matched can never be reported as having no driver.
+pub fn init(controller: &ObjectRef) -> Outcome {
     // SAFETY: `controller` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
     let desc = dn.descriptor();
@@ -229,7 +232,7 @@ pub fn init(controller: &ObjectRef) -> bool {
     let bar = desc.bars[5];
     if bar.size == 0 {
         crate::kprintln!("ahci: controller has no ABAR (BAR5)");
-        return false;
+        return declined("the controller has no ABAR (BAR5)");
     }
     let pages = bar.size.div_ceil(crate::mm::PAGE_SIZE as u64).max(1);
     // SAFETY: `bar.base` is the controller's MMIO ABAR from PCI BAR sizing.
@@ -237,7 +240,7 @@ pub fn init(controller: &ObjectRef) -> bool {
         Ok(va) => va.as_u64() + (bar.base & (crate::mm::PAGE_SIZE as u64 - 1)),
         Err(_) => {
             crate::kprintln!("ahci: ABAR map failed");
-            return false;
+            return declined("its ABAR could not be mapped");
         }
     };
 
@@ -254,7 +257,7 @@ pub fn init(controller: &ObjectRef) -> bool {
     // and a corrupted one is not. Both target controllers set it.
     if cap & CAP_S64A == 0 {
         crate::kprintln!("ahci: HBA lacks 64-bit addressing (CAP.S64A clear) — declining");
-        return false;
+        return declined("no 64-bit addressing (CAP.S64A clear)");
     }
 
     let mut port = u32::MAX;
@@ -270,7 +273,7 @@ pub fn init(controller: &ObjectRef) -> bool {
     }
     if port == u32::MAX {
         crate::kprintln!("ahci: no SATA disk on any implemented port");
-        return false;
+        return declined(NO_SATA_DISK);
     }
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
 
@@ -309,15 +312,15 @@ pub fn init(controller: &ObjectRef) -> bool {
     // Allocate the per-port DMA structures (zeroed, contiguous, page-aligned).
     let cmd_list = match DmaBuffer::alloc(1024) {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(_) => return declined(OUT_OF_MEMORY),
     };
     let fis = match DmaBuffer::alloc(256) {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(_) => return declined(OUT_OF_MEMORY),
     };
     let cmd_table = match DmaBuffer::alloc(CMD_TABLE_BYTES) {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(_) => return declined(OUT_OF_MEMORY),
     };
 
     // Stop the port, point it at our structures, clear errors, restart.
@@ -338,7 +341,7 @@ pub fn init(controller: &ObjectRef) -> bool {
                 KObjectType::InterruptObject,
             )
         },
-        Err(_) => return false,
+        Err(_) => return declined(OUT_OF_MEMORY),
     };
     let intr_ptr = intr.as_ptr();
     // Leak the IRQ object: the controller holds it for the kernel's lifetime.
@@ -358,7 +361,7 @@ pub fn init(controller: &ObjectRef) -> bool {
     };
     let disk = match KBox::try_new(disk) {
         Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static
-        Err(_) => return false,
+        Err(_) => return declined(OUT_OF_MEMORY),
     };
     AHCI.store(disk, Ordering::Release);
 
@@ -368,7 +371,7 @@ pub fn init(controller: &ObjectRef) -> bool {
         Some(s) => s,
         None => {
             crate::kprintln!("ahci: IDENTIFY failed on port {}", port);
-            return false;
+            return declined("IDENTIFY failed");
         }
     };
     // SAFETY: exclusive at bring-up (no IRQ, no other CPU).
@@ -384,7 +387,7 @@ pub fn init(controller: &ObjectRef) -> bool {
     // so nothing depends on the PCI interrupt-line register — which QEMU's
     // firmware programs and real UEFI often leaves meaningless. INTx stays as
     // the fallback for a function that advertises no MSI capability.
-    let mut installed = false;
+    let mut signal = None;
     if let Some(cfg) = &cfg {
         if let Some(msi) = crate::pci::read_msi(cfg) {
             // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
@@ -404,7 +407,7 @@ pub fn init(controller: &ObjectRef) -> bool {
                         if msi.addr64 { 64 } else { 32 },
                         msi.off
                     );
-                    installed = true;
+                    signal = Some(Signal::Msi { vector: msg.vector });
                 }
                 Some(_) => crate::kprintln!(
                     "ahci: MSI declined — the capability cannot hold the message address; \
@@ -416,24 +419,47 @@ pub fn init(controller: &ObjectRef) -> bool {
             }
         }
     }
-    if !installed {
-        // The GSI comes from the PCI interrupt-line register (firmware-programmed
-        // on QEMU; ACPI `_PRT` routing is deferred).
-        let gsi = desc.interrupt.line as u32;
-        // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the
-        // kernel's lifetime.
-        let vec = unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) };
-        if let Some(cfg) = &cfg {
-            crate::pci::set_intx_disabled(cfg, false);
+    let signal = match signal {
+        Some(signal) => signal,
+        None => {
+            // The GSI comes from the PCI interrupt-line register (firmware-programmed
+            // on QEMU; ACPI `_PRT` routing is deferred).
+            let gsi = desc.interrupt.line as u32;
+            // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the
+            // kernel's lifetime.
+            let vec = unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) };
+            if let Some(cfg) = &cfg {
+                crate::pci::set_intx_disabled(cfg, false);
+            }
+            crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
+            Signal::Intx { gsi, vector: vec }
         }
-        crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
-    }
+    };
 
     // Enable HBA-level interrupt delivery.
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
     write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
 
-    publish_disk(controller, sectors, disk)
+    if publish_disk(controller, sectors, disk) {
+        Outcome::Claimed { driver: DRIVER, signal }
+    } else {
+        declined("the disk's device node could not be allocated")
+    }
+}
+
+/// This driver's name in the device table's outcome lines.
+const DRIVER: &str = "ahci";
+
+/// The reason a controller with no disk attached is declined: the live image's case, booted
+/// from a USB stick with the AHCI controller empty, and the one to stop at on a new machine.
+const NO_SATA_DISK: &str = "no SATA disk on any implemented port";
+
+/// The reason for any allocation this bring-up could not make.
+const OUT_OF_MEMORY: &str = "out of memory";
+
+/// `init`'s outcome when it gives the controller up.
+fn declined(why: &'static str) -> Outcome {
+    Outcome::Declined { driver: DRIVER, why }
 }
 
 /// Stop the port: clear ST then FRE, waiting for CR/FR to clear.

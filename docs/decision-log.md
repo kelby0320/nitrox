@@ -25598,3 +25598,82 @@ off. A timeout ends the report rather than one page, no keyboard means no hold, 
 (`hwreport=<seconds>`) so a control can run it. And "no UART" needed a piece that delivers it: the
 scratch-register test before the loopback one. It also caught the plan misdescribing today's MADT
 parser (it skips type-9 entries entirely) and listing TSC-deadline as used when the timer counts down.
+
+---
+
+## 2026-09-14 — Phase 5 Part D: every boot is a hardware report, and a report boot holds it still
+
+Part D shipped in the four pieces its detail pass (#299) laid out, against that design unchanged.
+What moved were two assertions the pass had pinned too tightly, and the measurements.
+
+**D.1 — the facts, on every boot.** The handoff (Limine's name and version, firmware type, loaded
+base revision, HHDM, date at boot, command line, the memory map summed by kind), the CPU (vendor,
+family/model/stepping with the extended fields folded in, logical CPUs per package, brand, the
+hypervisor bit, and the required / used / warned-about features as `+`/`-`, logged before
+`init_protections` so a missing SMAP is named on screen before the panic), one line per XSDT table
+and per MADT entry, each PCI function's capabilities on its enumeration line, the framebuffer's
+padding, and COM1 detected by its scratch register. Three things behind those lines changed shape:
+
+- **`parse_madt` walks an entry iterator** covering types 0, 1, 2, 4, 9 and 0xA with enabled /
+  online-capable / disabled, and enabled type-9 CPUs now count. Host-tested against QEMU's MADT
+  captured from a boot by a temporary hex dump; control: counting type 0 alone fails the type-9 test.
+  **Two kinds of entry are listed and not counted** (PR #300 review): an id that names no CPU
+  (`0xFF`, `0xFFFF_FFFF`), and a type-9 id below 255 where usable type-0 entries exist — ACPI 6.5
+  §5.2.12.12 says both kinds together means x2APIC ids of 255 and up, some firmware lists each CPU
+  both ways anyway, and Linux's `acpi_parse_x2apic` skips the same entries. Counting them would have
+  read `8 CPU` beside `smp: 4 CPU(s) online` on such firmware, a false difference in the list Part F
+  compares. The line says why it was not counted. Controls: dropping either rule fails its test.
+- **A driver returns what it did.** `ahci::init` returns a `device::Outcome` from every exit —
+  claimed with its MSI or INTx signal, or declined with why — and `drivers::probe` records it and
+  logs one line per enumerated function: claimed, declined, or no driver. The type makes "matched
+  but reported as no driver" unrepresentable rather than tested for.
+- **`find_capability` and the report share one capability walk**, `capability_list`.
+
+Screen cost under TCG, `check-fbcon`'s first text to the handout: 1466 / 1373 ms before, 1554 / 1520 /
+1506 ms after — about a tenth of a second for some thirty lines. The scratch-register test read an
+empty port as `0xff` and reported it absent under a temporary probe; `check-report` then exercises it
+on a machine with no UART at all.
+
+**D.2 — the command line and the menu.** `cmdline::parse` knows one flag, `hwreport[=<seconds>]`;
+an unknown word is logged and ignored, and an unreadable value keeps the 120 s default and says so.
+`image --live` generates the menu from the release `limine.conf` (`timeout: 5`, the release entry
+first, then `Nitrox — hardware report`), refusing a base it would have to guess about; `check-live`
+now requires `cmdline ""`, so the countdown booting the ordinary entry is asserted, not assumed.
+
+**D.3 — report mode.** After `record_framebuffer`, before `run_first_userspace`: copy the log out of
+the ring (`klog::copy_into`, which walks the same `Klog::runs` as `/dev/log`), hold the console, and
+show a page per key press.
+
+- **A page is not written into the grid.** `Console` keeps a second `Grid` for it and paints from
+  that while `Owner::Report` holds the screen; writes meanwhile reach the real grid and COM1, and
+  `end_report` repaints from the grid. Host test: a late write — and the scroll it causes — changes
+  nothing on screen until the end, then appears.
+- **`text::Pages` guarantees a page cannot scroll**, counting rows with the grid's own decoder and
+  wrap rule, cutting at the newline that would start a row past the last (which belongs to no page)
+  or between characters within a too-long line. Controls: keeping that newline, or dropping the
+  glyph-wrap cut, each fails the tests that write every page into a grid of exactly its height.
+- **The wait halts between looks** (`idle_halt`, woken by the tick or the key) on a count of presses
+  the i8042 driver keeps, and never looks at which key. The keyboard's ring is drained afterwards.
+
+**D.4 — the gates, and their controls.**
+
+- **`test-qemu`'s `check_hardware_facts`** asserts QEMU's answers from the transcript. Two were
+  loosened from the pass after the first run: **the AHCI vector is not pinned** (the test image's is
+  `0x32`, not the pass's `0x30`), and **the ACPI tables are pinned by signature and OEM** — QEMU's
+  FACP, APIC, HPET, MCFG and WAET as `BOCHS BXPC`, but not the BGRT beside them, which is OVMF's boot
+  logo, nor any address, which is whichever OVMF build runs. Control: a padding computed from three
+  bytes a pixel fails naming the framebuffer line.
+- **`cargo xtask check-report`** chooses the report from the live image's menu with `-serial none`,
+  reads both pages off the screen and presses a key for each, asserts the declined AHCI controller,
+  the module disk and `console: no UART at COM1`, then waits for the hand-over. Its controls:
+  - **the default entry** (Enter without Down): fails with "the boot went on to the desktop after 0
+    of ? report page(s)";
+  - **the key withheld, with `hwreport=5`**: page 1 stood for 5.05 s, no page 2 was held, and the
+    gate failed at the hand-over after 1 of 2 pages — the timeout ends the report, not the page;
+  - **one fact's line dropped** (the no-UART line reworded): fails naming `console: no UART at COM1`;
+  - **the menu detector** returned nothing for OVMF's own screen (BdsDxe text and the TianoCore
+    logo), a `check-fbcon` console frame and both report pages, and the highlight's row for two menu
+    screenshots; in the gate it is also asserted false on every console frame it reads.
+
+**One cosmetic difference from the pass:** Limine draws the entry's em dash as a hyphen. It is
+legible, and the detector reads colours rather than text.

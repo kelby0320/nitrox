@@ -220,11 +220,12 @@ fn decode_function<C: Cfg>(cfg: &C, seg: u16, bus: u8, dev: u8, func: u8) -> Res
     }
 }
 
-/// Log a discovered function.
-fn log_function(desc: &ResourceDescriptor) {
+/// Log a discovered function: one line for the function and its capabilities, then one per
+/// BAR.
+fn log_function(desc: &ResourceDescriptor, caps: &Capabilities) {
     let id = &desc.identity;
     crate::kprintln!(
-        "pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}.{:02x}.{:02x} pin {}",
+        "pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}.{:02x}.{:02x} pin {} {}",
         desc.bus,
         desc.dev,
         desc.func,
@@ -233,7 +234,8 @@ fn log_function(desc: &ResourceDescriptor) {
         id.class,
         id.subclass,
         id.prog_if,
-        desc.interrupt.pin
+        desc.interrupt.pin,
+        caps
     );
     let mut i = 0;
     while i < desc.bars.len() {
@@ -276,9 +278,10 @@ fn probe_function(
     }
     let multifunction = header_type_raw(&cfg) & HEADER_MULTIFUNCTION != 0;
     let desc = decode_function(&cfg, region.segment, bus, dev, func);
+    let caps = Capabilities::read(&cfg);
     match DeviceNode::try_new(DeviceClass::Other, desc, BlockGeometry::ZERO) {
         Ok(node) => {
-            log_function(&desc);
+            log_function(&desc, &caps);
             // SAFETY: `into_raw` yields the single creation reference; adopt it
             // as an `ObjectRef` of the matching type.
             let r = unsafe {
@@ -429,21 +432,102 @@ pub(crate) const CAP_ID_MSI: u8 = 0x05;
 /// occupy**, so a device that reports a circular or malformed chain terminates
 /// the search instead of hanging the boot.
 pub(crate) fn find_capability<C: Cfg>(cfg: &C, id: u8) -> Option<u16> {
-    if cfg.read32(REG_COMMAND) & (STATUS_CAP_LIST << 16) == 0 {
-        return None;
-    }
-    let mut off = (cfg.read32(REG_CAP_PTR) & 0xFC) as u16;
-    for _ in 0..=((CAP_LAST - CAP_FIRST) / 4) {
-        if !(CAP_FIRST..=CAP_LAST).contains(&off) {
-            return None; // the chain ended (next = 0) or pointed out of range
+    capability_list(cfg).find(|&(cap, _)| cap == id).map(|(_, off)| off)
+}
+
+/// Every capability in the function's list as `(id, offset)`, in chain order — the one walk
+/// [`find_capability`] and the enumeration report share.
+///
+/// Ends where the chain does (a next pointer of zero), at a pointer outside the capability
+/// region, or after as many entries as the region has dword-aligned slots, so a circular chain
+/// terminates.
+fn capability_list<C: Cfg>(cfg: &C) -> impl Iterator<Item = (u8, u16)> + '_ {
+    let mut off = if cfg.read32(REG_COMMAND) & (STATUS_CAP_LIST << 16) == 0 {
+        0 // no list: an offset outside the region ends the walk before it reads anything
+    } else {
+        (cfg.read32(REG_CAP_PTR) & 0xFC) as u16
+    };
+    let mut slots = (CAP_LAST - CAP_FIRST) / 4 + 1;
+    core::iter::from_fn(move || {
+        if slots == 0 || !(CAP_FIRST..=CAP_LAST).contains(&off) {
+            return None;
         }
-        let hdr = cfg.read32(off);
-        if (hdr & 0xFF) as u8 == id {
-            return Some(off);
-        }
+        slots -= 1;
+        let here = off;
+        let hdr = cfg.read32(here);
         off = ((hdr >> 8) & 0xFC) as u16;
+        Some(((hdr & 0xFF) as u8, here))
+    })
+}
+
+/// Capability ID: PCI Express (PCIe base spec §7.5.3).
+const CAP_ID_PCIE: u8 = 0x10;
+/// Capability ID: MSI-X (PCI 3.0 §6.8.2).
+const CAP_ID_MSIX: u8 = 0x11;
+
+/// What a function's capability list holds, as far as a hardware report names it (Phase 5
+/// Part D.1): its MSI capability's form, whether it has MSI-X and a PCI Express capability,
+/// and how many entries of any other kind.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Capabilities {
+    /// `None` without an MSI capability, `Some(None)` with one [`read_msi`] refuses.
+    msi: Option<Option<MsiCap>>,
+    msix: bool,
+    pcie: bool,
+    other: u32,
+}
+
+impl Capabilities {
+    fn read<C: Cfg>(cfg: &C) -> Capabilities {
+        let mut caps = Capabilities { msi: None, msix: false, pcie: false, other: 0 };
+        for (id, _) in capability_list(cfg) {
+            match id {
+                CAP_ID_MSI => caps.msi = Some(read_msi(cfg)),
+                CAP_ID_MSIX => caps.msix = true,
+                CAP_ID_PCIE => caps.pcie = true,
+                _ => caps.other += 1,
+            }
+        }
+        caps
     }
-    None
+}
+
+impl core::fmt::Display for Capabilities {
+    /// `caps msi64 pcie +2`: the MSI form (`msi32`/`msi64`, `/mask` with per-vector masking,
+    /// `msi-malformed` for one the driver would refuse), `msix`, `pcie`, then `+N` other
+    /// entries — or `caps none`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("caps")?;
+        let mut any = false;
+        match self.msi {
+            Some(Some(m)) => {
+                let width = if m.addr64 { 64 } else { 32 };
+                write!(f, " msi{width}{}", if m.per_vector_mask { "/mask" } else { "" })?;
+                any = true;
+            }
+            Some(None) => {
+                f.write_str(" msi-malformed")?;
+                any = true;
+            }
+            None => {}
+        }
+        if self.msix {
+            f.write_str(" msix")?;
+            any = true;
+        }
+        if self.pcie {
+            f.write_str(" pcie")?;
+            any = true;
+        }
+        if self.other > 0 {
+            write!(f, " +{}", self.other)?;
+            any = true;
+        }
+        if !any {
+            f.write_str(" none")?;
+        }
+        Ok(())
+    }
 }
 
 // --- MSI --------------------------------------------------------------------
@@ -678,6 +762,46 @@ mod tests {
     /// `Count=1/1 Maskable- 64bit-` — so Message Control is `0x0000`.
     fn laptop_ahci_msi() -> FakeCfg {
         with_msi(0x80, 0x0000, 0xA8)
+    }
+
+    #[test]
+    fn the_report_names_each_ahci_controllers_msi_form() {
+        // The laptop's chain as `lspci -vv` lists it: power management at 0x70, MSI at 0x80,
+        // SATA at 0xA8.
+        let mut laptop = laptop_ahci_msi();
+        laptop.set(REG_CAP_PTR, 0x70);
+        laptop.set(0x70, 0x01 | (0x80 << 8));
+        laptop.set(0xA8, 0x12);
+        assert_eq!(format!("{}", Capabilities::read(&laptop)), "caps msi32 +2");
+
+        let mut qemu = qemu_ahci_msi();
+        qemu.set(0xA8, 0x12);
+        assert_eq!(format!("{}", Capabilities::read(&qemu)), "caps msi64 +1");
+    }
+
+    #[test]
+    fn the_report_names_msix_pcie_and_masking_and_counts_the_rest() {
+        let mut c = FakeCfg::new();
+        c.set(REG_COMMAND, STATUS_CAP_LIST << 16);
+        c.set(REG_CAP_PTR, 0x50);
+        c.set(0x50, 0x01 | (0x70 << 8)); // power management
+        c.set(0x70, CAP_ID_MSI as u32 | (0x90 << 8) | (0x0180 << 16)); // 64-bit, per-vector mask
+        c.set(0x90, CAP_ID_MSIX as u32 | (0xA0 << 8));
+        c.set(0xA0, CAP_ID_PCIE as u32);
+        assert_eq!(format!("{}", Capabilities::read(&c)), "caps msi64/mask msix pcie +1");
+    }
+
+    #[test]
+    fn the_report_says_none_without_a_list_and_flags_an_msi_the_driver_would_refuse() {
+        let mut none = qemu_ahci_msi();
+        none.set(REG_COMMAND, 0x0006);
+        assert_eq!(format!("{}", Capabilities::read(&none)), "caps none");
+
+        // 64-bit MSI at 0xF4 would end past the header; `read_msi` refuses it, and the report
+        // must not print it as a usable form.
+        let malformed = with_msi(0xF4, 0x0080, 0);
+        assert_eq!(read_msi(&malformed), None);
+        assert_eq!(format!("{}", Capabilities::read(&malformed)), "caps msi-malformed");
     }
 
     #[test]

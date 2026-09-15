@@ -593,11 +593,33 @@ before the kernel starts. Both disappear the moment root is on a disk.
   scan that prefers whichever label it finds, would make the live-ness something the kernel
   decides; one line of manifest keeps it data.
 
-## Part D — the hardware report ⬜
+## Part D — the hardware report ✅
 
-- [ ] **A boot mode that says what it found**: firmware handoff values, the ACPI tables located,
+- [x] **A boot mode that says what it found**: firmware handoff values, the ACPI tables located,
       the ECAM windows, every PCI function with class and BAR layout, the framebuffer geometry
       including pitch, CPU features, the MADT's CPUs and IOAPICs, and which drivers bound.
+
+> **Landed 2026-09-14**, in the four pieces below and against the detail pass unchanged in design.
+> Every boot logs the report; the live image's menu has `Nitrox — hardware report`;
+> `cargo xtask check-report` chooses it with no serial port and reads the pages back, and
+> `test-qemu` asserts the facts its own boot has. Where the result differed from the pass:
+>
+> - **The screen cost is about a tenth of a second under TCG**: `check-fbcon`'s first text to the
+>   handout went from 1466 / 1373 ms to 1554 / 1520 / 1506 ms for about thirty new lines.
+> - **The AHCI vector is not pinned.** The pass wrote `ahci, MSI vec 0x30`; the test image's is
+>   `0x32` (its PIT self-test keeps a vector), so `test-qemu` asserts the claim and the path.
+> - **The ACPI list is pinned by signature and OEM**: QEMU's FACP, APIC, HPET, MCFG and WAET as
+>   `BOCHS BXPC`. The BGRT beside them is OVMF's boot logo, not QEMU's to promise, and the
+>   addresses belong to whichever OVMF build runs.
+> - **The logical CPU count is CPUID's, per package**; the MADT lines and `smp:` already count what
+>   the boot launched.
+> - **The MADT count leaves out a CPU listed twice** — a type-9 entry below id 255 beside usable
+>   type-0 entries, as Linux does — and entries whose id names no CPU; their lines say why (PR #300
+>   review).
+> - **Limine draws the entry's em dash as a hyphen.** Legible, and the detector reads colours, not
+>   text.
+> - **The report fits QEMU's boot in two pages** at 160×49 rows; page 2 ends at the framebuffer
+>   line, the last before the report.
 
 Under QEMU this is a convenience. On a machine with no serial port and no debugger it is the
 only way to learn anything from a boot that gets partway. It is deliberately Part D rather than
@@ -661,21 +683,21 @@ drawing the menu, which is why the live image needs a nonzero one.
 
 **D.1 — the missing facts, logged on every boot**
 
-- [ ] **The handoff**: the bootloader's name and version and the firmware type (Limine's
+- [x] **The handoff**: the bootloader's name and version and the firmware type (Limine's
       bootloader-info and firmware-type requests), the base revision accepted, the HHDM offset, the
       date at boot, the executable command line, and the memory map summarised by type (entries,
       and bytes usable / reclaimable / reserved / ACPI / framebuffer).
-- [ ] **The CPU**: CPUID vendor, brand string, family/model/stepping, logical CPU count, and three
+- [x] **The CPU**: CPUID vendor, brand string, family/model/stepping, logical CPU count, and three
       groups of feature bits — what the kernel **requires** (x2APIC, RDTSCP, NX, SMEP/SMAP), what it
       **uses when present** (XSAVE/AVX, RDRAND/RDSEED), and what it **warns about** (invariant TSC).
       TSC-deadline is reported as present or absent and **not** as used: the LAPIC timer runs in
       count-down mode (`kernel/src/arch/x86_64/timer.rs`), and a line implying otherwise would
       mislead Part F. The hypervisor bit, since a transcript should say which it came from.
-- [ ] **Compact**: one line per table, per MADT entry, per PCI function — not one per field. Every
+- [x] **Compact**: one line per table, per MADT entry, per PCI function — not one per field. Every
       line the console draws costs screen time before the compositor, and on the laptop, whose
       framebuffer has no write-combining until Part G, more than under QEMU. D.1 measures `check-fbcon`'s
       first-line-to-handout time before and after, under TCG.
-- [ ] **ACPI**: every table the XSDT lists — signature, OEM ID, OEM table ID, revision, length,
+- [x] **ACPI**: every table the XSDT lists — signature, OEM ID, OEM table ID, revision, length,
       physical address. The MADT's entries individually: each local APIC / x2APIC (processor UID,
       APIC id, enabled or online-capable), each IOAPIC, each source override, each LAPIC NMI entry.
       **Today's parser reads less than it looks** (`parse_madt`): it matches only type-0 local APIC
@@ -684,7 +706,7 @@ drawing the menu, which is why the live image needs a nonzero one.
       as type-9 entries the existing summary would read `0 CPU` while these new lines show every
       entry; D.1 extends the parser to both types and both flags, and the summary counts from the
       same walk.
-- [ ] **PCI**: each function's capabilities as the walk Part A added finds them (MSI with its form,
+- [x] **PCI**: each function's capabilities as the walk Part A added finds them (MSI with its form,
       MSI-X, PCI Express), and — after `drivers::probe` — a line per function saying what became of
       it, in **three states** (PR #299 review):
   - **claimed**, and how — `ahci, MSI vec 0x30`;
@@ -696,21 +718,21 @@ drawing the menu, which is why the live image needs a nonzero one.
   - **none** — no driver in the table matched.
 
   The device table records none of this today; drivers report their outcome into it.
-- [ ] **The framebuffer's padding, as a number.** The laptop reports pitch 5504 for 1366 × 4 =
+- [x] **The framebuffer's padding, as a number.** The laptop reports pitch 5504 for 1366 × 4 =
       5464; the line should say `padding 40` rather than leave the reader to subtract.
-- [ ] **COM1 is reported as present or absent**, not as a failing test. `console::init` prints
+- [x] **COM1 is reported as present or absent**, not as a failing test. `console::init` prints
       `console: RX loopback self-test FAIL` for any failure today, which is what a machine with no
       UART produces. Detect the UART first — the 16550 scratch register holds what is written to it,
       and a floating bus reads back `0xFF` — and log `console: no UART at COM1` when there is none,
       keeping `FAIL` for a UART that exists and fails.
-- [ ] Parsers that can be host-tested are: the ACPI table list and MADT decoding (against captured
+- [x] Parsers that can be host-tested are: the ACPI table list and MADT decoding (against captured
       bytes, as Part A tested MSI), the memory-map summary, and the command line.
 
 **D.2 — the kernel command line, and the live image's menu**
 
-- [ ] The executable command-line request, read once at boot and parsed into flags; unknown words
+- [x] The executable command-line request, read once at boot and parsed into flags; unknown words
       are logged and ignored, never fatal. `hwreport` is the only flag.
-- [ ] The live image's `limine.conf` gains the menu: `timeout: 5`, the default `Nitrox` entry, and
+- [x] The live image's `limine.conf` gains the menu: `timeout: 5`, the default `Nitrox` entry, and
       `Nitrox — hardware report` with `cmdline: hwreport`. Generated by `image --live`, beside the
       second `module_path` it already adds — `limine.conf` is live-image data today and
       `check-images` does not compare it, so nothing there changes. `check-live` then waits out the
@@ -719,44 +741,44 @@ drawing the menu, which is why the live image needs a nonzero one.
 
 **D.3 — report mode**
 
-- [ ] **Where**: after `drivers::probe`, AP bring-up and `record_framebuffer` — so drivers have
+- [x] **Where**: after `drivers::probe`, AP bring-up and `record_framebuffer` — so drivers have
       bound, every CPU has come online or failed to, and the framebuffer facts exist — and before
       `run_first_userspace`.
-- [ ] **What**: the kernel log so far, read back out of `klog` (which needs a read-into-a-buffer
+- [x] **What**: the kernel log so far, read back out of `klog` (which needs a read-into-a-buffer
       counterpart to `copy_into_frames`), paged to the console's rows: clear, draw a page, a prompt
       line (`— page 2/3 — any key —`). Drawn on the framebuffer console only; COM1 already has every
       line. With no framebuffer console there is nothing to hold, and the boot does not wait.
-- [ ] **The read walks `Klog::runs`** — prefix, elision notice, ring, in order — which is the one
+- [x] **The read walks `Klog::runs`** — prefix, elision notice, ring, in order — which is the one
       definition of the snapshot's layout. The laptop's longer log can spill past the 8 KiB prefix
       into the ring; nothing is lost before 16 KiB, and an elision notice on a page is worth seeing.
-- [ ] **A held page is not painted over.** The console paints every write at once while the kernel
+- [x] **A held page is not painted over.** The console paints every write at once while the kernel
       owns the screen, and a line at the bottom row jumps the grid a quarter — which would scroll a
       page's top rows, the handoff facts, off the photograph. Kernel lines do arrive here: in five of
       nine transcripts an `smp: cpu N online (AP)` line follows `smp: 4 CPU(s) online`, because an AP
       counts itself online before it prints (PR #299 review). So the pager holds the console in a
       state of its own, like `Owner::Userspace`: writes still reach the grid, COM1 and `klog`, and
       nothing is drawn until the report ends and the console repaints.
-- [ ] **Held until a key**: the i8042 driver counts key presses as it decodes them; the pager waits
+- [x] **Held until a key**: the i8042 driver counts key presses as it decodes them; the pager waits
       for the count to move. **The keys that paged the report are drained from the keyboard's ring
       before userspace starts.** That is defence in depth rather than a gated guarantee: from reading
       `input-server`, events it takes before any client subscribes go nowhere, so a control that
       skipped the drain would likely pass too, and the plan does not claim a gate for it. (A release
       of the last key can arrive after the drain; the greeter acts only on presses.)
-- [ ] **A timeout ends the report, not a page.** If a page waits 120 s with no key, the remaining
+- [x] **A timeout ends the report, not a page.** If a page waits 120 s with no key, the remaining
       pages are not held — a dead keyboard otherwise costs 120 s per page, minutes on the laptop's
       longer log, which reads as the hang the bound exists to prevent. **With no i8042 device
       answering** (`ps2::init` already knows) the report is not held at all, and says so on COM1.
-- [ ] **The bound is data**: `hwreport=<seconds>` overrides the 120 s, so a gate control can run the
+- [x] **The bound is data**: `hwreport=<seconds>` overrides the 120 s, so a gate control can run the
       timeout path in seconds; a bare `hwreport` means the default.
 
 **D.4 — the gates**
 
-- [ ] **`test-qemu` asserts the answers we know**, from the D.1 lines on serial, on its disk image
+- [x] **`test-qemu` asserts the answers we know**, from the D.1 lines on serial, on its disk image
       with the disk on AHCI: ECAM `0xe0000000` bus 0–255; four MADT CPU entries with APIC ids 0–3;
       the IOAPIC at `0xfec00000`; the framebuffer at 1280×800, pitch 5120, padding 0; `00:1f.2`
       `8086:2922` **claimed** by `ahci` over MSI; COM1 present. The ACPI table list is pinned from
       the first run rather than guessed here.
-- [ ] **`cargo xtask check-report`** boots the **live image as a USB stick with the AHCI controller
+- [x] **`cargo xtask check-report`** boots the **live image as a USB stick with the AHCI controller
       empty** — the only way the live image boots, and the laptop's shape — with **`-serial none`**.
       It finds the Limine menu, presses Down and Enter, reads each report page off the screen with
       Part B's decoder, and asserts the facts that boot has: the same ECAM, MADT, IOAPIC and
@@ -764,13 +786,13 @@ drawing the menu, which is why the live image needs a nonzero one.
       disk and its `nitrox-live` partition; and **`console: no UART at COM1`**, since `-serial none`
       is exactly that machine. It presses a key per page and asserts the boot reaches the handover.
       Between them the two gates cover a claimed and a declined function, and COM1 both ways.
-- [ ] **Finding the menu needs a detector of its own.** Part B's decoder reads only the kernel
+- [x] **Finding the menu needs a detector of its own.** Part B's decoder reads only the kernel
       console's cells — its glyphs, its palette, its grid — and Limine draws its menu in its own font,
       grey, cyan and green on black, centred. The detector is calibrated on the menu screenshot this
       pass captured (the title's cyan, the highlighted entry's grey bar), with a control that a
       firmware screen and a kernel console screen never match. Pressing Down on a timer instead is
       the blind sampling `check-fbcon` already paid for once.
-- [ ] **Its controls**: boot the default entry instead — no report page appears and the boot does
+- [x] **Its controls**: boot the default entry instead — no report page appears and the boot does
       not hold; withhold the key with `hwreport=5` — the page stays up past the draw time and the
       report ends after five seconds, without holding the next page; drop one fact's line from the
       log — the page assertion names it.

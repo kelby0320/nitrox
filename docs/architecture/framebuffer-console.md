@@ -1,9 +1,11 @@
 # The framebuffer console
 
-**Status: built with Phase 5 Part B; last checked 2026-09-14.** Everything COM1 receives is also
+**Status: built with Phase 5 Part B; last checked 2026-09-14, when Part D gave the hardware report
+an owner state of its own.** Everything COM1 receives is also
 drawn on the screen from the first line of `kernel_main` until a client is handed
 `/dev/framebuffer`, and again when the machine stops. Gated by `cargo xtask check-fbcon`, which
-boots with no serial port and reads the screen back as text. Not built: colour, scrollback, any
+boots with no serial port and reads the screen back as text, and by `cargo xtask check-report`,
+which reads the hardware report's pages the same way. Not built: colour, scrollback, any
 input, and a console for a machine whose firmware leaves no linear framebuffer.
 
 ## Why it exists
@@ -78,6 +80,8 @@ newest line is on the screen before the write that produced it returns either wa
 | From | Owner | What a write does |
 |---|---|---|
 | `fbcon::init`, right after the CPU tables — before serial, memory, ACPI or PCI | the kernel | updates the grid and paints what changed |
+| `fbcon::hold_for_report`, on a boot whose command line has `hwreport`, before userspace (`kernel/src/report.rs`) | the hardware report | updates the grid; the screen shows the report's page, painted by `show_page` |
+| `fbcon::end_report` | the kernel | updates the grid and paints what changed; the end repaints the grid over the last page |
 | the first `/dev/framebuffer` handout (`framebuffer_server`, `kernel/src/object/kernel_server.rs`) | userspace | updates the grid; paints nothing |
 | `stop_the_machine`, for a panic and a fatal fault alike | the kernel, for good | nothing more is written; the reclaim repaints the grid once |
 
@@ -108,7 +112,23 @@ ordinary lock on a path whose job is to reach the halt:
   dropped from the screen — never from COM1.
 
 The yield waits without a bound, because a yield that gave up would leave the console drawing
-over the desktop, and none of the three can reach it.
+over the desktop, and none of the three can reach it. The report's three calls wait without one too,
+for the same reasons: the boot thread, before userspace, never inside the console.
+
+## The hardware report's pages
+
+A report boot (Phase 5 Part D) shows the kernel log a page at a time before `init`. **The page is
+not written into the grid**, which would scroll: a `Console` keeps a second `Grid` for it, and while
+the report holds the screen, painting reads that one instead. Everything written meanwhile — an AP
+announcing itself after `smp: 4 CPU(s) online`, the report's own lines — still goes to the real
+grid and to COM1, and `end_report` repaints from the grid, so nothing written during a report is
+lost from the screen either.
+
+**A page must fit without scrolling**, and `text::Pages` is what guarantees it: it counts rows with
+the grid's own decoder and wrap rule, cuts a page at the newline that would start a row past the
+last (a newline that belongs to neither page, since in the grid it is what scrolls), and cuts a
+line too long for the rows left between characters, never inside a UTF-8 sequence. The last row is
+the prompt's — `— page 2/3 — any key —` — and is cut to one row the same way.
 
 ## The gate
 

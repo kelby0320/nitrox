@@ -40,6 +40,9 @@ const REG_FCR: u16 = 2;
 const REG_LCR: u16 = 3;
 const REG_MCR: u16 = 4;
 const REG_LSR: u16 = 5;
+/// The scratch register: eight bits of storage with no function, which is what makes it a
+/// presence test.
+const REG_SCRATCH: u16 = 7;
 
 /// Line-status bit: transmit-holding register empty — the UART can accept
 /// another byte.
@@ -219,6 +222,27 @@ pub unsafe fn console_arm_rx(handler: extern "C" fn()) -> u8 {
     let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) };
     SerialPort::new(COM1_BASE).enable_rx_interrupt();
     vector
+}
+
+/// `true` if a UART answers at COM1.
+///
+/// A 16550's scratch register holds whatever is written to it; with nothing decoding the port
+/// the bus floats and every read is `0xFF`. Two complementary patterns, so neither a floating
+/// bus nor a port that happens to latch one value passes. The register has no other function,
+/// so writing it disturbs nothing on a UART that is there.
+///
+/// This is what tells "no UART" from "a UART whose self-test failed": on a machine without one
+/// the loopback test fails too, and used to be reported as exactly that (Phase 5 Part D.1).
+pub fn console_present() -> bool {
+    let probe = |value: u8| {
+        // SAFETY: the scratch register of the COM1 16550, owned by this driver; on a machine
+        // with no UART the port decodes to nothing and the write is lost.
+        unsafe {
+            regs::outb(COM1_BASE + REG_SCRATCH, value);
+            regs::inb(COM1_BASE + REG_SCRATCH) == value
+        }
+    };
+    probe(0x5A) && probe(0xA5)
 }
 
 /// Self-test the COM1 receive path with **internal loopback**: enable loopback,

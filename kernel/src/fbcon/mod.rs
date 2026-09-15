@@ -21,6 +21,10 @@
 //! - **The kernel again when the machine stops** ([`reclaim_for_stop`], called by
 //!   `stop_the_machine` for a panic and a fatal fault alike). The screen is repainted from the
 //!   grid, whose last rows are the diagnosis just written.
+//! - **The hardware report, before userspace, on a boot that asked for one** ([`hold_for_report`]
+//!   to [`end_report`], Phase 5 Part D.3). Writes still land in the grid and none is drawn: the
+//!   screen shows the page the report put there, so a line printed while a person reads it — an
+//!   AP announcing itself late — cannot scroll the page's top rows away. The end repaints the grid.
 //!
 //! ## Locking, and the three ways a lock could hang the path that most needs to finish
 //!
@@ -35,7 +39,7 @@
 //! - **Neither, but a long repaint on another CPU while a fault dump is being teed.** A bounded
 //!   wait, then that line is dropped — from the screen, never from COM1.
 //!
-//! The yield alone waits without a bound; [`yield_to_userspace`] says why.
+//! The yield and the report's three calls wait without a bound; [`yield_to_userspace`] says why.
 
 pub mod glyphs;
 pub mod text;
@@ -145,12 +149,17 @@ pub enum Owner {
     Kernel,
     /// A client holds `/dev/framebuffer`: writes reach the grid and nothing is painted.
     Userspace,
+    /// The hardware report holds the screen: writes reach the grid, and what is painted is the
+    /// report's page.
+    Report,
 }
 
 /// The text grid and, when there is one, the screen it is drawn on.
 pub struct Console {
     screen: Option<Screen>,
     grid: Grid,
+    /// The page on screen while [`Owner::Report`] holds it; blank otherwise.
+    page: Grid,
     /// The glyph each on-screen cell shows, `MAX_COLS` to a row — what a paint compares against,
     /// so a scroll repaints the cells that changed rather than all of them.
     shown: [u8; CELLS],
@@ -160,7 +169,13 @@ pub struct Console {
 impl Console {
     /// A console with no screen.
     pub const fn new() -> Self {
-        Self { screen: None, grid: Grid::new(), shown: [BLANK; CELLS], owner: Owner::Kernel }
+        Self {
+            screen: None,
+            grid: Grid::new(),
+            page: Grid::new(),
+            shown: [BLANK; CELLS],
+            owner: Owner::Kernel,
+        }
     }
 
     /// Start drawing on `screen`, clearing it. `None`, and no screen, when not one cell fits.
@@ -200,6 +215,57 @@ impl Console {
         had
     }
 
+    /// Hold the screen for the hardware report. `None`, and no change, unless the kernel has the
+    /// screen now: there is no report on a console with no screen, or after userspace took it.
+    pub fn hold_for_report(&mut self) -> Option<Geometry> {
+        self.screen.as_ref()?;
+        if self.owner != Owner::Kernel {
+            return None;
+        }
+        self.owner = Owner::Report;
+        Some(self.grid.geometry())
+    }
+
+    /// Show `page` — which must fit the rows above the last without scrolling ([`text::Pages`]
+    /// cuts it so) — with `prompt` on the last row. Painted only while the report holds the
+    /// screen; the cells that already show the right glyph are left alone.
+    pub fn show_page(&mut self, page: &[u8], prompt: &[u8]) {
+        if self.owner != Owner::Report {
+            return;
+        }
+        let g = self.grid.geometry();
+        if g.rows == 0 {
+            return;
+        }
+        self.page.reset(g);
+        self.page.write(page);
+        // To the start of the last row. The page occupies the rows above it at most, so each of
+        // these newlines has a row to move to and none scrolls.
+        while self.page.cursor().0 + 1 < g.rows {
+            self.page.write(b"\n");
+        }
+        if self.page.cursor().1 != 0 {
+            self.page.write(b"\r");
+        }
+        // At most one row of it, cut between characters, so it cannot wrap off the bottom.
+        self.page.write(text::Pages::new(prompt, g.cols, 1).next().unwrap_or(&[]));
+        self.paint(0, g.rows - 1, false);
+    }
+
+    /// The report is over: the kernel draws again, and the screen goes back to the grid — with
+    /// every line written while the report held it.
+    pub fn end_report(&mut self) {
+        if self.owner != Owner::Report {
+            return;
+        }
+        self.owner = Owner::Kernel;
+        self.page.reset(Geometry { scale: 1, cols: 0, rows: 0 });
+        let rows = self.grid.geometry().rows;
+        if rows > 0 {
+            self.paint(0, rows - 1, false);
+        }
+    }
+
     /// Paint again. Taken back from userspace, that is every cell and the margins beyond them,
     /// since nothing about what is on the screen is known any more.
     pub fn reclaim(&mut self) {
@@ -218,12 +284,16 @@ impl Console {
         self.paint(0, g.rows - 1, everything);
     }
 
+    /// Paint rows `first..=last` from what the screen should show — the report's page while it
+    /// holds the screen, the grid otherwise — skipping cells [`shown`](Self::shown) says are
+    /// already right unless `everything`.
     fn paint(&mut self, first: usize, last: usize, everything: bool) {
         let Some(screen) = &self.screen else { return };
         let g = self.grid.geometry();
+        let source = if self.owner == Owner::Report { &self.page } else { &self.grid };
         for row in first..=last.min(g.rows.saturating_sub(1)) {
             for col in 0..g.cols {
-                let glyph = self.grid.glyph_at(row, col);
+                let glyph = source.glyph_at(row, col);
                 let at = row * MAX_COLS + col;
                 if everything || self.shown[at] != glyph {
                     screen.paint_cell(g, row, col, glyph);
@@ -315,6 +385,38 @@ pub fn yield_to_userspace() {
         // would refuse — and so, like everything from here on, it is on COM1 and not on screen.
         crate::kprintln!("fbcon: /dev/framebuffer handed out; the console stops drawing");
     }
+}
+
+/// Hold the screen for the hardware report (Phase 5 Part D.3): from here until [`end_report`],
+/// writes reach the grid and are not drawn, and the screen shows what [`show_page`] puts there.
+///
+/// `None` when there is no console on screen or the kernel no longer has it. Waits for the lock
+/// without a bound, as [`yield_to_userspace`] does and for the same reasons: ordinary thread
+/// context, never inside the console, before userspace.
+pub fn hold_for_report() -> Option<Geometry> {
+    let mut geometry = None;
+    with_console_waiting(|c| geometry = c.hold_for_report());
+    geometry
+}
+
+/// Show one page of the report, `prompt` on the last row. See [`Console::show_page`].
+pub fn show_page(page: &[u8], prompt: &[u8]) {
+    with_console_waiting(|c| c.show_page(page, prompt));
+}
+
+/// End the report: the console draws again, from the grid.
+pub fn end_report() {
+    with_console_waiting(|c| c.end_report());
+}
+
+/// Run `f` on the console, waiting for the lock as long as it takes, with [`HOLDER`] naming this
+/// CPU while it runs so a fault inside `f` does not wait for itself.
+fn with_console_waiting(f: impl FnOnce(&mut Console)) {
+    let me = crate::arch::Smp::current_cpu().wrapping_add(1);
+    let mut console = CONSOLE.lock();
+    HOLDER.store(me, Ordering::Release);
+    f(&mut console);
+    HOLDER.store(0, Ordering::Release);
 }
 
 /// **Under the `fbcon-gate` feature only**: keep the screen as it is for a second, so
@@ -521,6 +623,51 @@ mod tests {
         assert_eq!(g.scale, 2);
         console.write(b"Scaled");
         assert_eq!(fake.read(g)[0], "Scaled");
+    }
+
+    #[test]
+    fn a_report_page_is_what_the_screen_shows_until_the_report_ends() {
+        let mut fake = Fake::new(80, 64, 0); // 10x4 cells
+        let mut console = Box::new(Console::new());
+        let g = console.attach(fake.screen()).unwrap();
+        console.write(b"boot 1\nboot 2\n");
+        assert_eq!(console.hold_for_report(), Some(g));
+        assert_eq!(console.hold_for_report(), None, "the report cannot be held twice");
+        console.show_page(b"page one\nsecond", "— 1/2 —".as_bytes());
+        assert_eq!(fake.read(g), ["page one", "second", "", "— 1/2 —"]);
+
+        // A late kernel line reaches the grid and is not drawn over the page — not even the
+        // scroll it causes.
+        console.write(b"late 3\nlate 4\nlate 5\n");
+        assert_eq!(fake.read(g), ["page one", "second", "", "— 1/2 —"]);
+
+        console.show_page(b"two", b"end");
+        assert_eq!(fake.read(g), ["two", "", "", "end"], "nothing of the first page survives");
+
+        console.end_report();
+        assert_eq!(console.owner(), Owner::Kernel);
+        let grid: Vec<String> = (0..g.rows)
+            .map(|r| {
+                let s: String = (0..g.cols).map(|c| glyphs::char_of(console.grid().glyph_at(r, c)).unwrap()).collect();
+                s.trim_end().to_string()
+            })
+            .collect();
+        assert_eq!(fake.read(g), grid, "the end repaints the grid, late lines and all");
+        assert!(grid.iter().any(|l| l == "late 5"));
+        console.write(b"after");
+        assert!(fake.read(g).iter().any(|l| l == "after"), "and the kernel draws again");
+    }
+
+    #[test]
+    fn there_is_no_report_on_a_screen_userspace_has() {
+        let mut fake = Fake::new(80, 64, 0);
+        let mut console = Box::new(Console::new());
+        console.attach(fake.screen()).unwrap();
+        assert!(console.yield_screen());
+        assert_eq!(console.hold_for_report(), None);
+        assert_eq!(console.owner(), Owner::Userspace, "a refused hold changes nothing");
+        let mut bare = Box::new(Console::new());
+        assert_eq!(bare.hold_for_report(), None, "nor on no screen at all");
     }
 
     #[test]

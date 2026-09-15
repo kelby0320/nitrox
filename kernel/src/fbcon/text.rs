@@ -308,6 +308,101 @@ impl Grid {
     }
 }
 
+impl Decoder {
+    /// `true` between characters: the next byte starts something rather than continuing a UTF-8
+    /// sequence or an escape.
+    pub const fn at_boundary(&self) -> bool {
+        matches!(self.state, State::Ground)
+    }
+}
+
+/// A byte stream cut into pages that each fit `rows` rows `cols` wide **without scrolling** — the
+/// hardware report's pages (Phase 5 Part D.3).
+///
+/// Rows are counted by the same [`Decoder`] and the same wrap rule as [`Grid`] — a glyph past the
+/// last column starts a row, a tab stops at the edge — so a page written into a freshly reset grid
+/// of at least `rows` rows lands entirely on screen. A page ends:
+///
+/// - at the newline that would start a row past the last, **which is left out of both pages** (in
+///   a grid that newline is what scrolls), or
+/// - for a line too long for the rows left, just before the character that would start that row.
+///
+/// Each page decodes from a fresh decoder, as a reset grid does, and every cut is on a character
+/// boundary, so a page never begins partway through a UTF-8 sequence.
+pub struct Pages<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    cols: usize,
+    rows: usize,
+}
+
+impl<'a> Pages<'a> {
+    /// Pages of `bytes` for a `cols`×`rows` area. No pages at all when either is zero.
+    pub const fn new(bytes: &'a [u8], cols: usize, rows: usize) -> Self {
+        let at = if cols == 0 || rows == 0 { bytes.len() } else { 0 };
+        Self { bytes, at, cols, rows }
+    }
+}
+
+impl<'a> Iterator for Pages<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.at >= self.bytes.len() {
+            return None;
+        }
+        let (cols, rows, start) = (self.cols, self.rows, self.at);
+        let mut decoder = Decoder::new();
+        let (mut row, mut col) = (0usize, 0usize);
+        // Where the character now being decoded began: a cut before it goes here.
+        let mut char_start = start;
+        let mut i = start;
+        while i < self.bytes.len() {
+            if decoder.at_boundary() {
+                char_start = i;
+            }
+            // `Some(end, resume)`: the page is `start..end`, and the next one starts at `resume`.
+            let mut cut: Option<(usize, usize)> = None;
+            decoder.feed(self.bytes[i], &mut |action| {
+                if cut.is_some() {
+                    return;
+                }
+                match action {
+                    Action::Glyph(_) => {
+                        if col >= cols {
+                            if row + 1 >= rows {
+                                cut = Some((char_start, char_start));
+                                return;
+                            }
+                            row += 1;
+                            col = 0;
+                        }
+                        col += 1;
+                    }
+                    Action::Newline => {
+                        if row + 1 >= rows {
+                            cut = Some((i, i + 1));
+                            return;
+                        }
+                        row += 1;
+                        col = 0;
+                    }
+                    Action::Return => col = 0,
+                    Action::Tab => col = ((col / 8 + 1) * 8).min(cols),
+                    Action::Backspace => col = col.min(cols).saturating_sub(1),
+                }
+            });
+            if let Some((end, resume)) = cut {
+                self.at = resume;
+                return Some(&self.bytes[start..end]);
+            }
+            i += 1;
+        }
+        self.at = self.bytes.len();
+        Some(&self.bytes[start..])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +529,93 @@ mod tests {
         assert_eq!(g.take_damage(), None, "a newline with a row to spare changes no cell");
         g.write(b"\n");
         assert_eq!(g.take_damage(), Some((0, 7)), "a scroll moves every row");
+    }
+
+    /// Write each page into a fresh grid exactly `rows` tall, as the report draws it, and read it
+    /// back — failing if a page scrolled, which is the property the pager exists for.
+    fn draw_pages(bytes: &[u8], cols: usize, rows: usize) -> Vec<Vec<String>> {
+        Pages::new(bytes, cols, rows).map(|page| drawn_without_scrolling(page, cols, rows)).collect()
+    }
+
+    /// Write `page` into a grid `rows` tall, assert it did not scroll, and return its rows.
+    ///
+    /// The reference is the same page in a grid [`MAX_ROWS`] tall, where a page for `rows` rows
+    /// has room to spare: the short grid must read row for row as the roomy one's top, the roomy
+    /// one must have nothing below that, and both cursors must agree — the last catches a run of
+    /// newlines that scrolls nothing but blank rows. **Not `top == 0`**, which a scroll can leave
+    /// unchanged: at one row a jump is the whole grid, and at three rows three jumps come back
+    /// round (PR #300 review).
+    fn drawn_without_scrolling(page: &[u8], cols: usize, rows: usize) -> Vec<String> {
+        let mut g = grid(cols, rows);
+        g.write(page);
+        let mut roomy = grid(cols, MAX_ROWS);
+        roomy.write(page);
+        let lines: Vec<String> = (0..rows).map(|r| line(&g, r)).collect();
+        let room: Vec<String> = (0..MAX_ROWS).map(|r| line(&roomy, r)).collect();
+        assert!(roomy.cursor().0 < rows, "a page needs more than {rows} rows at {cols} columns: {page:?}");
+        assert!(room[rows..].iter().all(String::is_empty), "a page needs more than {rows} rows: {page:?}");
+        assert_eq!(lines, room[..rows], "a page scrolled a grid {rows} tall: {page:?}");
+        assert_eq!(g.cursor(), roomy.cursor(), "a page scrolled a grid {rows} tall: {page:?}");
+        lines
+    }
+
+    #[test]
+    fn a_log_is_cut_between_lines_and_the_newline_at_a_cut_belongs_to_no_page() {
+        let log = b"one\ntwo\nthree\nfour\nfive\n";
+        let pages: Vec<&[u8]> = Pages::new(log, 10, 2).collect();
+        assert_eq!(pages, [&b"one\ntwo"[..], b"three\nfour", b"five\n"]);
+        assert_eq!(
+            draw_pages(log, 10, 2),
+            [vec!["one", "two"], vec!["three", "four"], vec!["five", ""]]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_line_costs_its_rows_and_a_line_too_long_for_the_rest_is_cut_by_character() {
+        // "abcdefghij" is two rows at 5 columns; with three rows a page, "xy" fits beside it.
+        let log = "abcdefghij\nxy\n—bcdefghijklmnop\n".as_bytes();
+        let drawn = draw_pages(log, 5, 3);
+        assert_eq!(drawn[0], ["abcde", "fghij", "xy"]);
+        // A 16-character line needs four rows: three fit, and the cut falls between characters,
+        // so the dash (three bytes) is never split and the next page starts with "p".
+        assert_eq!(drawn[1], ["—bcde", "fghij", "klmno"]);
+        assert_eq!(drawn[2], ["p", "", ""]);
+        assert_eq!(drawn.len(), 3);
+    }
+
+    #[test]
+    fn every_page_fits_without_scrolling_and_together_they_are_the_whole_log() {
+        // Lines of every length from empty to several rows wide, tabs and a UTF-8 character,
+        // across page sizes down to one row.
+        let mut log = Vec::new();
+        for i in 0..200usize {
+            log.extend(std::iter::repeat_n(b'x', i % 37));
+            if i % 5 == 0 {
+                log.extend_from_slice("\t—".as_bytes());
+            }
+            log.push(b'\n');
+        }
+        for (cols, rows) in [(12, 3), (16, 7), (160, 49), (7, 1)] {
+            let pages: Vec<&[u8]> = Pages::new(&log, cols, rows).collect();
+            let mut offset = 0;
+            for page in &pages {
+                drawn_without_scrolling(page, cols, rows);
+                assert_eq!(&log[offset..offset + page.len()], *page, "a page is not the log's next bytes");
+                offset += page.len();
+                // The only byte a cut may leave out is the newline it was made at.
+                if offset < log.len() && log[offset] == b'\n' {
+                    offset += 1;
+                }
+            }
+            assert_eq!(offset, log.len(), "the pages are not the whole log at {cols}x{rows}");
+        }
+    }
+
+    #[test]
+    fn no_area_means_no_pages() {
+        assert_eq!(Pages::new(b"text\n", 0, 5).count(), 0);
+        assert_eq!(Pages::new(b"text\n", 5, 0).count(), 0);
+        assert_eq!(Pages::new(b"", 5, 5).count(), 0);
     }
 
     #[test]
