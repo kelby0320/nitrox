@@ -25677,3 +25677,47 @@ show a page per key press.
 
 **One cosmetic difference from the pass:** Limine draws the entry's em dash as a hyphen. It is
 legible, and the detector reads colours rather than text.
+
+---
+
+## 2026-09-15 — Part E's detail pass: the laptop's size is QEMU's to give, and its padding is not
+
+Phase 5 Part E was one box: boot QEMU at 1366×768 with a padded pitch and pass every display gate.
+The pass measured before writing, and found one half easy, one half impossible, and the real work
+somewhere the box did not mention.
+
+**The size is a QEMU argument.** `-vga none -device VGA,xres=1366,yres=768` makes QEMU's EDID
+prefer that mode; OVMF adds it and boots into it, and Limine hands it over. `test-qemu`'s boot read
+`framebuffer: 1366x768 pitch 5464 padding 0 bpp 32` and the console `170x48 cells at scale 1` — the
+laptop's — with no image changed. 1376×768, 1024×768 and 2560×1440 boot the same way.
+
+**The padding is not.** OVMF's QEMU video driver sets `PixelsPerScanLine` to the horizontal
+resolution for every mode (edk2 `QemuVideoDxe/Gop.c`), so the pitch under QEMU is always four bytes a
+pixel. A padded stride in the guest would take a kernel word narrowing the reported width on a wider
+mode. **Not built (maintainer's call)**, after tracing where a stride can go wrong: every pixel
+offset is `Geometry::offset_of`, every drawing method is shared between the aperture-backed and the
+host-test framebuffers, the compositor's host tests already draw on padded screens, `copy_damage`
+goes through `offset_of`, `check-display`'s reference scene is padded, and the console's host tests
+check the padding is never written. A knob would run that code again in the guest. The laptop's
+`padding 40` is Part F's to see.
+
+**The real finding: userspace and the gates have 1280×800 written in.** `desktop-shell` sizes its
+bars, wallpaper and entry capacity from constants and puts the window list at `y = 776`, below a
+768-row screen; the greeter centres on the same constants. Both comments say the compositor cannot
+report the screen's size, which a manager could ask since M9 Part B's `QueryLayout` and nothing else
+ever could. The gates click the bar at `y = 788`, pin the pointer to `(1279, 799)`, and share a
+`1280x800` framebuffer fact. On the laptop the window list would not have been on the screen.
+
+**The shape (maintainer's calls):**
+
+- **CI's display gates move to 1366×768; `test-qemu` stays at the default**, so every run boots two
+  sizes and a constant written back fails somewhere, at no extra CI time.
+- **Resolution independence is checked on demand**, by `cargo xtask check-resolutions` over five
+  sizes, not in CI.
+- **A read-only `/dev/draw/screen` leaf** tells any client the size; the greeter has no manager
+  channel, and the size grants no placement.
+- **The wallpaper fills** the 16:9 screen, cropping the 16:10 picture, rather than fitting with bars.
+
+**Seen and not explained:** at 1024×768 `test-qemu`'s dead-log-source check failed in 2 of 3 runs
+(`only 2 of 4 CPUs ever went idle`), against 4 of 4 passing at 1366×768 and 2 of 2 at the default.
+Nothing connects screen size to it; E.4 is where it gets reproduced, and nothing is fixed on a guess.
