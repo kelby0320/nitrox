@@ -25901,6 +25901,17 @@ the manager channel, which only the shell holds, so an application cannot take t
 capability the substrate did not have. The capability has existed since M8; both now say what is
 built.
 
+**Two classes the chord joined rather than created** (PR #304 review). `close_modal` takes the name
+of what it closed, so a dismissed name prompt does not read as a dismissed launcher — and three of
+the five close paths passed the launcher's name whatever was up. All three now name what is open,
+and `check-login` closes the name prompt with `Super+A` and asserts `name prompt closed`, which
+fails if the label is fixed text. The other class is `modal_hover`: a stale hover makes the router
+route the next press against a three-child row where the repaint recorded a two-child one, and the
+press lands on nothing. Two close paths cleared it and three did not; all five do now. The chord is
+what made it reachable — it is the first way to close and reopen with the pointer never moving, so
+nothing resamples the hover in between. **Not demonstrated as a lost click**, and recorded as a
+consistency fix rather than a proven bug.
+
 **Verified.** `check-login` drives both triggers: the button opens the modal, `Super+A` closes what
 the button opened, a second `Super+A` opens it again, and the launch that follows — typing `nxterm`,
 then Enter — is entirely from the keyboard, which is the path the laptop has. Closing *first* is

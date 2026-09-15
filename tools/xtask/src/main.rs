@@ -3375,16 +3375,24 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    modal being up — and it leaves the launch below driven entirely by the keyboard, which
     //    is the path the laptop has. A chord that only ever opened would pass this gate while
     //    leaving a person no way out of the modal but Escape.
-    let apps_chord = |qmp: &mut Qmp| -> R<()> {
+    // Every `Super`-chord this gate presses goes through here, so the four `send_key` calls a
+    // chord is have one spelling rather than one per step.
+    let chord = |qmp: &mut Qmp, shift: bool, code: &str| -> R<()> {
         qmp.send_key("meta_l", true)?;
-        qmp.send_key("a", true)?;
-        qmp.send_key("a", false)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        qmp.send_key(code, true)?;
+        qmp.send_key(code, false)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
         qmp.send_key("meta_l", false)?;
         Ok(())
     };
-    apps_chord(&mut qmp)?;
+    chord(&mut qmp, false, "a")?;
     session.expect("desktop-shell: applications modal closed")?;
-    apps_chord(&mut qmp)?;
+    chord(&mut qmp, false, "a")?;
     session.expect("desktop-shell: applications modal open")?;
 
     // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —
@@ -3652,10 +3660,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
 
     // And the chord, which is the half a taskbar alone does not cover: putting a window away
     // without reaching for its entry. `Super+H`.
-    qmp.send_key("meta_l", true)?;
-    qmp.send_key("h", true)?;
-    qmp.send_key("h", false)?;
-    qmp.send_key("meta_l", false)?;
+    chord(&mut qmp, false, "h")?;
     session.expect("desktop-shell: Super+H minimized window ")?;
 
     // 6c. **The lifecycle rule, which is Part D's whole claim** (M8 Part D).
@@ -3671,20 +3676,6 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     Sequence: name this desktop, move the terminal off it, and show the desktop survived
     //     *because* it is named; then move the terminal back and show the desktop it vacated —
     //     unnamed — is gone.
-    let chord = |qmp: &mut Qmp, shift: bool, code: &str| -> R<()> {
-        qmp.send_key("meta_l", true)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        qmp.send_key(code, true)?;
-        qmp.send_key(code, false)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-        qmp.send_key("meta_l", false)?;
-        Ok(())
-    };
-
     // **Restore the terminal first: 6b left it minimized**, and a minimized window is not
     // focused — so `Super+Shift+N`, which moves *the focused window*, would correctly find
     // nothing to move and this block would assert against a gesture that did nothing. Clicking
@@ -3695,6 +3686,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
 
     // Name it. The prompt is the same popup the launcher uses — a `panel` takes no keyboard
     // focus, so the bar itself could never read a typed name.
+    chord(&mut qmp, false, "r")?;
+    session.expect("desktop-shell: naming this desktop")?;
+    // **`Super+A` closes this too, and says which popup it closed.** One window serves both the
+    // launcher and the name prompt, so a dismissal that read as the launcher's would send a
+    // later gate looking for a line sitting in the transcript under the other name (PR #304
+    // review, finding 1). Then reopen it and carry on naming.
+    chord(&mut qmp, false, "a")?;
+    session.expect("desktop-shell: name prompt closed")?;
     chord(&mut qmp, false, "r")?;
     session.expect("desktop-shell: naming this desktop")?;
     // **One character at a time, waiting for each**, the way `type_at_greeter` does. Injection

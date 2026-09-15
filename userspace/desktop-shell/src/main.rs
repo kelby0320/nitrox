@@ -2433,10 +2433,21 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     // while the modal is up is dismissed by the modal instead. A chord has no
                     // such ambiguity, and a key that only opens is a key you cannot undo.
                     if modal.is_some() {
+                        // **Named by what is actually up.** This chord closes whichever popup
+                        // the modal window is serving, and calling a dismissed name prompt an
+                        // "applications modal" is the line `close_modal`'s `what` exists to
+                        // prevent (PR #243 review, optional 8; PR #304 review, finding 1).
+                        let what = if rename { "name prompt" } else { "applications modal" };
                         rename = false;
+                        // **And the hover goes with it.** A chord can close and reopen with the
+                        // pointer never moving, so nothing would resample it: the router would
+                        // route the next press against a hovered row while `open_modal` recorded
+                        // a quiet one, and a hovered row is a three-child stack where a quiet one
+                        // is two — the id mismatch this file's own note at the router describes,
+                        // where a press lands on a row and nothing happens.
+                        modal_hover = None;
                         close_modal(
-                            &mut session, &mut modal, &mut query, "applications modal",
-                            &mut modal_addrs,
+                            &mut session, &mut modal, &mut query, what, &mut modal_addrs,
                         );
                     } else {
                         modal = open_modal(
@@ -2521,6 +2532,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 if m.request(OP_MGR_REGISTER_HOTKEY, &rb, None, &mut reply).is_err() {
                     kprint(b"desktop-shell: registering Super+R was refused\n");
                 }
+            } else {
+                kprint(b"desktop-shell: the Super+R registration would not serialise\n");
             }
             // **`Super+A`, and not a tap of `Super`.** A bare modifier is what a full launcher
             // will want — one field that searches applications, files and settings — and this
@@ -2534,6 +2547,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 if m.request(OP_MGR_REGISTER_HOTKEY, &ab, None, &mut reply).is_err() {
                     kprint(b"desktop-shell: registering Super+A was refused\n");
                 }
+            } else {
+                // Silence here is what the minimize block below has a paragraph about: a body
+                // that would not serialise skipped both lines, and the only evidence was a gate
+                // waiting for a line nobody printed.
+                kprint(b"desktop-shell: the Super+A registration would not serialise\n");
             }
             Line::new()
                 .s(b"desktop-shell: Super+1..")
@@ -2666,15 +2684,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     event,
                     libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
                 ) {
+                    let what = if rename { "name prompt" } else { "applications modal" };
                     rename = false;
                     modal_hover = None;
-                    close_modal(
-                        &mut session,
-                        &mut modal,
-                        &mut query,
-                        "applications modal",
-                        &mut modal_addrs,
-                    );
+                    close_modal(&mut session, &mut modal, &mut query, what, &mut modal_addrs);
                     continue;
                 }
                 if let libsurface::WindowEvent::Key(k) = event {
@@ -2682,8 +2695,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         if k.keycode == KEY_ESC {
                             // Dismissed without launching. The field declines Escape for
                             // exactly this — see `TextFieldState::apply`.
+                            let what =
+                                if rename { "name prompt" } else { "applications modal" };
                             rename = false;
-                            close_modal(&mut session, &mut modal, &mut query, "applications modal", &mut modal_addrs);
+                            modal_hover = None;
+                            close_modal(&mut session, &mut modal, &mut query, what, &mut modal_addrs);
                         } else if k.keycode == KEY_ENTER && rename {
                             // **Naming is what makes a desktop persist**, so this is the one
                             // gesture that changes the lifecycle rather than the view.
@@ -2713,6 +2729,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 .end();
                             rename = false;
                             list_dirty = true;
+                            modal_hover = None;
                             close_modal(&mut session, &mut modal, &mut query, "name prompt", &mut modal_addrs);
                             // Naming changes which desktops survive, so the rule applies here
                             // too — the one site that used to reach the next iteration by way
@@ -2740,6 +2757,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 // session. There was no second launch and no way back, and
                                 // the gate clicks once so it passed (PR #237 review,
                                 // finding 6).
+                                modal_hover = None;
                                 close_modal(&mut session, &mut modal, &mut query, "applications modal", &mut modal_addrs);
                             } else {
                                 kprint(b"desktop-shell: nothing matches; not launching\n");
