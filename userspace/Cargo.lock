@@ -147,6 +147,7 @@ dependencies = [
  "libheap",
  "libkern",
  "libos",
+ "librsproto",
 ]
 
 [[package]]

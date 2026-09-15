@@ -20,7 +20,7 @@ The startup protocol for a resource server goes:
 
 3. **Resource server creates an endpoint** — an IPC channel end that the kernel will route lookup/submit requests to once this RS is bound into a namespace. Internally this means the RS calls `sys_channel_create` and retains the receive end; the send end becomes the endpoint handle the kernel uses.
 
-4. **Resource server signals "Ready"** on the control channel, including the endpoint handle in the message.
+4. **Resource server signals "Ready"** on the control channel, including the endpoint handle in the message. A server whose initialization found it cannot serve — an fs-server over a device with no filesystem — sends a refusal with its reason instead, and no endpoint: the supervisor reports it rather than binding a server that will fail every request.
 
 5. **Supervisor receives the Ready message** and the endpoint handle.
 

@@ -35,8 +35,9 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
 - **`src/main.rs` — the server `[[bin]]`.** The bare-target `_start` + the syscall
   plumbing only: a `BlockReader` **and `BlockWriter`** over `sys_io_submit` (sector-at-
   a-time into a scratch `MemoryObject`; writes are read-modify-write per sector), the
-  bootstrap (recv the **read-write** device handle via the setup message; forwarding
-  channel; `Meta::Ready`), and the serve loop — a Model A lazy resolve replies the file's
+  bootstrap (recv the **read-write** device handle via the setup message; `check_device` —
+  the superblock and the root directory — and a refusal in place of Ready if it fails;
+  forwarding channel; `Meta::Ready`), and the serve loop — a Model A lazy resolve replies the file's
   `BlockRun` map + transfers a device handle, a `RESOLVE_GROW` request grows the file
   (`maybe_grow` → `grow_file`), and a `RESOLVE_CREATE` request first creates it
   (`maybe_grow` → `create_file`, splitting the suffix into parent-dir + leaf name) before

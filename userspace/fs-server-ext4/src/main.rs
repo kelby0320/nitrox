@@ -11,10 +11,14 @@
 //!    endpoint — which the kernel delivers in `rdx` (`_start`'s third argument).
 //! 2. init sends a **setup message** on that channel transferring the **read-only
 //!    block-device** handle; the server receives it ([`recv_device`]).
-//! 3. The server creates a **forwarding channel** pair, keeps the serving end, and
+//! 3. The server **checks the device holds a filesystem it can serve** — the superblock,
+//!    then the root directory ([`fs_server_ext4::ext4::check_device`]). If not, it sends a
+//!    refusal saying why in place of the Ready ([`send_refusal`]) and exits; init prints the
+//!    reason.
+//! 4. The server creates a **forwarding channel** pair, keeps the serving end, and
 //!    sends `Meta::Ready` on the control channel **transferring the other (kernel)
 //!    end** ([`send_ready`]); init binds that endpoint as a Userspace Server.
-//! 4. The server loops: recv a forwarded `Namespace::Resolve`, read the file, and
+//! 5. The server loops: recv a forwarded `Namespace::Resolve`, read the file, and
 //!    reply transferring a read-only `MemoryObject` of its content ([`serve_loop`]).
 //!
 //! The request→reply logic lives in the host-tested [`fs_server_ext4::serve`]
@@ -346,6 +350,37 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
             (&raw const REPLY_MSG) as u64,
             (&raw const REPLY_HANDLES) as u64,
             1,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    sr == 0
+}
+
+/// Send a refusal in place of `Meta::Ready`: why the device cannot be served, and no handle
+/// ([`fs_server_ext4::serve::encode_refusal`]). `false` on any failure.
+fn send_refusal(control: u64, why: fs_server_ext4::ext4::Unservable) -> bool {
+    // SAFETY: REPLY_MSG is a valid 4 KiB buffer; the rsproto message goes in the IPC payload
+    // region (offset 24), and no handle rides with it.
+    let rs_len = unsafe {
+        match fs_server_ext4::serve::encode_refusal(&mut REPLY_MSG[24..], why) {
+            Some(n) => n,
+            None => return false,
+        }
+    };
+    // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8).
+    unsafe {
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 0;
+    }
+    // SAFETY: valid endpoint + message, no handles. NoBlock: init's control inbox is empty until
+    // this server's first message, as for the Ready this replaces.
+    let sr = unsafe {
+        syscall5(
+            SYS_CHANNEL_SEND,
+            control,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            0,
             SENDMODE_NOBLOCK,
         )
     };
@@ -1196,19 +1231,30 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     }
     let reader = DiskReader { device, scratch, scratch_addr: scratch_addr as u64 };
 
-    // 3. The forwarding channel: keep the serving end, hand the kernel end to init.
+    // 3. **Check there is a filesystem to serve before saying there is** (Phase 5). A Ready
+    //    over a device holding no filesystem mounted it anyway, and the first sign was the first
+    //    program that would not load off it. A device that fails the check gets a refusal in
+    //    place of the Ready, which init prints with the device's name, and this process is done.
+    if let Err(why) = fs_server_ext4::ext4::check_device(&reader) {
+        if !send_refusal(control, why) {
+            fail(b"fs-server: the device failed its check, and the refusal could not be sent\n");
+        }
+        exit(1);
+    }
+
+    // 4. The forwarding channel: keep the serving end, hand the kernel end to init.
     let (kernel_end, serve_end) = match make_channel() {
         Some(p) => p,
         None => fail(b"fs-server: channel create failed\n"),
     };
 
-    // 4. Announce readiness, transferring the kernel forwarding endpoint.
+    // 5. Announce readiness, transferring the kernel forwarding endpoint.
     if !send_ready(control, kernel_end) {
         fail(b"fs-server: ready send failed\n");
     }
     kprint(b"fs-server: ready (ext4, read-write)\n");
 
-    // 5. Serve forwarded Resolve requests forever.
+    // 6. Serve forwarded Resolve requests forever.
     serve_loop(&reader, serve_end, device);
 }
 

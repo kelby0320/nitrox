@@ -250,6 +250,46 @@ pub fn encode_error(reply: &mut [u8], request_id: u64, kerror: i32, op: u16) -> 
     .unwrap_or(0)
 }
 
+/// Longest reason a refusal carries. Every [`ext4::Unservable`] message fits with room to spare;
+/// a longer one is cut here rather than failing the refusal.
+pub const MAX_REASON: usize = 192;
+
+/// Encode the message a server that cannot serve its device sends **in place of** `Meta::Ready`:
+/// the `Ready` op with `RS_FLAG_ERROR`, an `ErrorBody` whose message says why, and no handle
+/// (`docs/spec/rsproto-wire-format.md` § Meta::Ready). Returns its length, or `None` if `out`
+/// cannot hold it.
+///
+/// The supervisor prints the reason with what only it knows — the device and the mount point —
+/// so the server does not print it too.
+pub fn encode_refusal(out: &mut [u8], why: ext4::Unservable) -> Option<usize> {
+    let mut reason = Truncating { buf: [0; MAX_REASON], len: 0 };
+    // `Truncating` never fails a write, so neither does this.
+    let _ = core::fmt::write(&mut reason, format_args!("{why}"));
+    let mut body = [0u8; ERROR_BODY_LEN + MAX_REASON];
+    let body_len = error_body(
+        &mut body,
+        fs_error_to_kerror(why.fs_error()) as i32,
+        0,
+        &reason.buf[..reason.len],
+    )?;
+    encode(out, librsproto::OP_READY, 0, RS_FLAG_ERROR, &body[..body_len], 0)
+}
+
+/// A fixed buffer that keeps what fits and drops the rest.
+struct Truncating {
+    buf: [u8; MAX_REASON],
+    len: usize,
+}
+
+impl core::fmt::Write for Truncating {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(MAX_REASON - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 /// Map a reader [`FsError`] to the [`KError`] the lookup PO completes with.
 fn fs_error_to_kerror(e: FsError) -> KError {
     match e {
@@ -493,5 +533,52 @@ mod tests {
             }
             _ => panic!("expected an Error reply"),
         }
+    }
+
+    // ---- the refusal in place of Ready (Phase 5) ----
+
+    use crate::ext4::Unservable;
+
+    #[test]
+    fn a_refusal_is_a_ready_with_the_error_flag_the_reason_and_no_handle() {
+        let why = Unservable::NoMagic { found: 0 };
+        let mut out = [0u8; 512];
+        let n = encode_refusal(&mut out, why).unwrap();
+        let m = decode(&out[..n]).unwrap();
+        assert_eq!(m.op, librsproto::OP_READY);
+        assert_eq!(m.flags, RS_FLAG_ERROR, "an error, and not a reply to anything");
+        assert_eq!(m.handle_count, 0, "a refusal hands over no endpoint");
+        let e = parse_error(m.body).unwrap();
+        assert_eq!(e.msg, format!("{why}").as_bytes());
+        assert_eq!(e.kerror, KError::IoError as i32);
+    }
+
+    /// `MAX_REASON`'s doc says every reason fits: so no refusal the server sends is cut.
+    #[test]
+    fn every_reason_fits_a_refusal_uncut() {
+        let all = [
+            Unservable::Unreadable,
+            Unservable::NoMagic { found: 0xFFFF },
+            Unservable::Wide64Bit,
+            Unservable::BlockTooLarge { log: u32::MAX },
+            Unservable::ZeroField("s_inodes_per_group"),
+            Unservable::RootUnreadable,
+            Unservable::RootNotDirectory { mode: 0xFFFF },
+        ];
+        for why in all {
+            let text = format!("{why}");
+            assert!(text.len() < MAX_REASON, "{} bytes: {text}", text.len());
+            let mut out = [0u8; 512];
+            let n = encode_refusal(&mut out, why).unwrap();
+            assert_eq!(parse_error(decode(&out[..n]).unwrap().body).unwrap().msg, text.as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_reason_longer_than_the_limit_is_cut_rather_than_refused() {
+        let mut t = Truncating { buf: [0; MAX_REASON], len: 0 };
+        let long = "x".repeat(MAX_REASON + 40);
+        assert!(core::fmt::write(&mut t, format_args!("{long}")).is_ok());
+        assert_eq!(t.len, MAX_REASON);
     }
 }

@@ -39,12 +39,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// One page; init.toml is assumed to fit (true for the bootstrapping manifest).
 const PAGE: u64 = 4096;
 
-/// The resource-server protocol magic (`"RSMG"`) and the `Meta::Ready` op, so init
-/// can **hand-parse** the fs-server's Ready message without depending on
-/// `librsproto` (forbidden in init — see `userspace/init/CLAUDE.md`). The rsproto
-/// envelope sits in the `IpcMsg` payload (offset 24): magic @0, op @6.
-const RS_MAGIC: u32 = 0x5253_4D47;
-const RS_OP_READY: u16 = 0x0004;
 /// Bounded wait for an fs-server's Ready (the CLAUDE.md mount timeout): init must
 /// not wait forever for a server that never reports up.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
@@ -99,8 +93,10 @@ static mut DRAW_ENDPOINT: u64 = 0;
 /// pipeline lives in the serial session as much as the graphical one. `/dev/draw` is the
 /// counter-example — one column has no use for a compositor.
 static mut CLIPBOARD_ENDPOINT: u64 = 0;
+/// The size of an `IpcMsg`: a 24-byte header, then the payload.
+const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
-static mut IPC_MSG: [u8; 4096] = [0; 4096];
+static mut IPC_MSG: [u8; IPC_MSG_LEN] = [0; IPC_MSG_LEN];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
 static mut IPC_COUNT: usize = 0;
 /// Spawn args for an `fs-server-ext4`: one moved handle — the control channel — in
@@ -569,10 +565,10 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     // The device handle has moved to the server; init no longer owns it.
 
     // 5. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init) {
+    let who: [&[u8]; 4] = [b"fs-server-ext4 for ", m.mount_point.as_bytes(), b" on ", m.device.as_bytes()];
+    let endpoint = match wait_ready(ctrl_init, &who) {
         Some(e) => e,
         None => {
-            kprint(b"init: fs-server Ready timeout/invalid\n");
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return None;
         }
@@ -607,11 +603,26 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     Some(endpoint)
 }
 
-/// Wait (bounded) for an fs-server's `Meta::Ready` on `ctrl`, validate it
-/// (`"RSMG"` magic + `Ready` op, hand-parsed — init never speaks `librsproto`), and
-/// return the forwarding endpoint it transfers (`handles[0]`). `None` on timeout, a
-/// recv error, no transferred handle, or an unexpected message.
-fn wait_ready(ctrl: u64) -> Option<u64> {
+/// Wait (bounded) for a resource server's `Meta::Ready` on `ctrl` and return the endpoint it
+/// transfers (`handles[0]`). `None` if there is none — and then **init has already said why**,
+/// naming the server as the `who` pieces spell it.
+///
+/// The message is parsed by [`init::ready`] (hand-parsed, host-tested). The four ways a
+/// handshake fails are four different problems on a machine nobody can attach a debugger to, and
+/// until Phase 5 every caller printed the same `Ready timeout/invalid` for all of them: the server
+/// took too long, it exited first, it sent something else, or it **refused** — a server that
+/// cannot serve what it was given says so in place of the Ready, and its reason is printed here.
+fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
+    let say = |what: &[u8]| {
+        let mut line = Line::new();
+        line.s(b"init: ");
+        for piece in who {
+            line.s(piece);
+        }
+        line.s(what);
+        line
+    };
+
     // Absolute deadline = now + READY_TIMEOUT_NS (monotonic clock).
     let mut now: u64 = 0;
     // SAFETY: `&now` is a valid writable u64 out-param.
@@ -629,8 +640,13 @@ fn wait_ready(ctrl: u64) -> Option<u64> {
             deadline,
         )
     };
+    if waited == KError::TimedOut as i64 {
+        say(b" sent no Ready within ").u(READY_TIMEOUT_NS / 1_000_000_000).s(b" s").end();
+        return None;
+    }
     if waited < 1 {
-        return None; // timed out / error
+        say(b": waiting for its Ready failed, error ").i(waited).end();
+        return None;
     }
     // SAFETY: valid recv out-params; on success the kernel installs handles[0].
     let rr = unsafe {
@@ -642,23 +658,42 @@ fn wait_ready(ctrl: u64) -> Option<u64> {
             (&raw mut IPC_COUNT) as u64,
         )
     };
-    let count = unsafe { (&raw const IPC_COUNT).read() };
-    if rr != 0 || count < 1 {
+    // A queued message is received before the closed peer is: this is a server that exited
+    // without sending anything, not one that refused and then exited.
+    if rr == KError::PeerClosed as i64 {
+        say(b" exited without sending Ready").end();
         return None;
     }
-    // Hand-parse the rsproto envelope in the IpcMsg payload (offset 24): magic @0,
-    // op @6. Confirm it is a Meta::Ready before trusting handles[0].
-    let (magic, op, endpoint) = unsafe {
-        let magic = u32::from_le_bytes([IPC_MSG[24], IPC_MSG[25], IPC_MSG[26], IPC_MSG[27]]);
-        let op = u16::from_le_bytes([IPC_MSG[30], IPC_MSG[31]]);
-        (magic, op, (&raw const IPC_HANDLES[0]).read())
+    if rr != 0 {
+        say(b": its Ready could not be received, error ").i(rr).end();
+        return None;
+    }
+    // SAFETY: the kernel wrote the count, the header, and `count` handles.
+    let (count, payload_len) = unsafe {
+        let count = (&raw const IPC_COUNT).read();
+        let len = u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]) as usize;
+        (count, len.min(IPC_MSG_LEN - 24))
     };
-    if magic != RS_MAGIC || op != RS_OP_READY {
-        // Not the message we expected — drop the transferred endpoint.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
-        return None;
+    // SAFETY: the kernel installed handles[0] if `count` says it did.
+    let endpoint = if count >= 1 { unsafe { (&raw const IPC_HANDLES[0]).read() } } else { 0 };
+    // SAFETY: IPC_MSG is init's own buffer, read after the kernel filled it; single-threaded
+    // init writes it again only at its next receive.
+    let msg = unsafe { &*(&raw const IPC_MSG) };
+    let first = init::ready::parse(&msg[24..24 + payload_len], count);
+    match first {
+        init::ready::First::Ready => return Some(endpoint),
+        init::ready::First::Refused(reason) if !reason.is_empty() => {
+            let mut buf = [0u8; init::ready::MAX_REASON];
+            say(b" refused: ").s(init::ready::printable(reason, &mut buf)).end();
+        }
+        init::ready::First::Refused(_) => say(b" refused, giving no reason init could read").end(),
+        init::ready::First::Unexpected => say(b" sent something other than a Ready").end(),
     }
-    Some(endpoint)
+    if endpoint != 0 {
+        // SAFETY: a handle that came with a message init did not accept; nothing else holds it.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    }
+    None
 }
 
 /// Spawn the system profile server and bind its forwarding endpoint at `/bin`. This is
@@ -695,10 +730,9 @@ fn bind_profile_server(root_ns: u64) -> bool {
     }
 
     // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"profile-server".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: profile-server Ready timeout/invalid\n");
             // SAFETY: closing our own control endpoint.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
@@ -796,10 +830,9 @@ fn bind_logging_service(root_ns: u64) -> bool {
     }
 
     // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"logging-service".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: logging-service Ready timeout/invalid\n");
             // SAFETY: closing our own control endpoint.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
@@ -861,10 +894,9 @@ fn bind_auth_service(root_ns: u64) -> bool {
     }
 
     // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"auth-service".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: auth-service Ready timeout/invalid\n");
             // SAFETY: closing our own control endpoint.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
@@ -928,10 +960,9 @@ fn bind_tty_server(root_ns: u64) -> bool {
     }
 
     // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"tty-server".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: tty-server Ready timeout/invalid\n");
             // SAFETY: closing our own control endpoint.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
@@ -1007,10 +1038,9 @@ fn bind_clipboard_server(root_ns: u64) -> bool {
         return false;
     }
 
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"clipboard-server".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: clipboard-server Ready timeout/invalid\n");
             // SAFETY: done with the control channel either way.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
@@ -1075,10 +1105,9 @@ fn bind_input_server(root_ns: u64) -> bool {
         return false;
     }
 
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"input-server".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: input-server Ready timeout/invalid\n");
             // SAFETY: done with the control channel either way.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
@@ -1136,10 +1165,9 @@ fn bind_compositor(root_ns: u64) -> bool {
     }
 
     // 3. Await Meta::Ready and take the forwarding endpoint it carries.
-    let endpoint = match wait_ready(ctrl_init) {
+    let endpoint = match wait_ready(ctrl_init, &[b"compositor".as_slice()]) {
         Some(e) => e,
         None => {
-            kprint(b"init: compositor Ready timeout/invalid\n");
             // SAFETY: done with the control channel either way.
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;

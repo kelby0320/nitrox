@@ -227,15 +227,20 @@ today (`userspace/init/src/main.rs`), the canonical template:
    service needs to bootstrap (init transfers the block-device handle to
    `fs-server-ext4` this way).
 4. **Await `Meta::Ready`** (bounded by a timeout — init uses 30 s), which carries
-   the service's **forwarding endpoint** handle.
+   the service's **forwarding endpoint** handle — or a **refusal** saying why there is
+   none (`docs/spec/rsproto-wire-format.md` § Meta::Ready), which only
+   `fs-server-ext4` sends today.
 5. **Bind** that endpoint into the namespace at the declared path
    (`SYS_NS_BIND`, requires `BIND_NAMESPACE`) — the kernel adopts the `IpcChannel`
    as a userspace-server binding (slice-7 forwarding). Close the control channel and
    the local endpoint reference (the bind took its own).
 
 The rsproto Ready envelope is `RS_MAGIC = "RSMG"`, op `Meta::Ready = 0x0004`, in the
-`IpcMsg` payload (init hand-parses it to avoid `librsproto`; service-mgr, which is
-*not* under init's no-librsproto constraint, should use `librsproto` properly).
+`IpcMsg` payload (init hand-parses it to avoid `librsproto`, in the host-tested
+`userspace/init/src/ready.rs`; service-mgr, which is *not* under init's no-librsproto
+constraint, should use `librsproto` properly). **init says which way a handshake failed**
+— no Ready within the timeout, the server exited first, something other than a Ready, or
+a refusal and its reason — naming the server, and for a mount the mount point and device.
 
 Non-RS services (a plain daemon with no endpoint to bind) skip steps 3–5: they are
 `running` once spawned, supervised only for exit/restart.

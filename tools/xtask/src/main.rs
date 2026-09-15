@@ -2453,10 +2453,11 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // Timed by **when the lines arrived**, not when `expect` returned: under KVM both land in one
     // burst, and timing the returns measured 0 ms — the harness, not the guest.
     let mounted = s.matched_at();
-    // **And read through it.** `mounted` is not enough on its own: `fs-server-ext4` sends Ready
-    // before it reads the superblock, so a partition holding no filesystem at all still prints
-    // it (measured 2026-09-14, by zeroing the partition). `init`'s first lookup through the new
-    // root is the first thing that needs a real filesystem.
+    // **And read through it.** Until 2026-09-15 `mounted` was not enough on its own:
+    // `fs-server-ext4` sent Ready before it read the superblock, so a zeroed partition still
+    // printed it. The server now checks the superblock and the root directory first and refuses
+    // a device that fails, so a zeroed partition stops at the line above — but the check reads
+    // three blocks, and `init`'s first lookup is still the first read of a file.
     s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
     s.expect("desktop-session-mgr: greeter presented")?;
     let took = s.matched_at().saturating_duration_since(mounted);
