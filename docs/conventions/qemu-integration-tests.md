@@ -212,6 +212,15 @@ screen from every caller, so a new boot cannot forget to say.
   indicator, the sidebar, the pointer's pin corner and the screen's centre are `DisplaySize`
   methods over the chrome metrics the gate writes down a second time (M11 decision 2); the
   expected wallpaper line is `libdraw::scale::fill` at the size.
+- **Pointer travel is sized from the screen too.** A pin over-drives the longer side
+  (`DisplaySize::pin_motions`), and a drag to an edge travels a screen's width, paced. Both were
+  fixed numbers that worked at 1280 and not at 2560 or 1920.
+
+`cargo xtask check-resolutions` runs `check-display`, `check-terminal`, `check-login` and
+`check-fbcon` at five sizes, each as a child with its transcript kept under
+`build-cache/resolutions/`, and prints a table — **by hand, not in CI**. It reports, beside each
+result, whether a boot's demo chain finished, since that is where a size-dependent failure outside
+the gates has shown up (the dead-log-source check at 1024×768, decision log 2026-09-15).
 
 ### Host requirement: x2APIC
 

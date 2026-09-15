@@ -816,15 +816,39 @@ answered.
 - **ACPI beyond the static tables.** No AML, no `_PRT`: Part A made them unnecessary for the disk.
 - **SMBIOS.** Useful, not on the list, and a table walk of its own.
 
-## Part E — the resolution this machine actually has ⬜
+## Part E — the resolution this machine actually has ✅
 
-- [ ] Boot QEMU at **the laptop's screen, as near as QEMU can show it**, and pass every display gate
+- [x] Boot QEMU at **the laptop's screen, as near as QEMU can show it**, and pass every display gate
       there, with every client and every gate taking the screen's size from the screen.
 
 `check-display` compares the guest's screen against a `libdraw` render, and the whole display
 arm has only ever run at the QEMU default. A padded stride and an odd width are exactly the
 conditions under which a compositor's damage arithmetic goes wrong by a few pixels a row.
 `libdraw`'s half is a host test; the guest half is a gate run at the laptop's geometry.
+
+> **Landed 2026-09-15**, in the four pieces below and against the revised detail pass. Clients read
+> `/dev/draw/screen`; the gates that boot a screen boot 1360×768 and aim from `DisplaySize`;
+> `cargo xtask check-resolutions` runs four of them at five sizes. Where the result differed:
+>
+> - **A shell that cannot read the leaf stops**, rather than falling back to `QueryLayout`: the
+>   manager channel is opened only after the bars exist (PR #242's deadlock), and the leaf resolves
+>   through the binding the shell's connection just used. The greeter falls back to the origin as
+>   planned, and its control saw the fallback line.
+> - **`check-report`'s page count is read, not pinned**: two pages at 1360×768, taken from the
+>   prompts, since a pinned count would fail on the next unrelated kernel line.
+> - **The plan's list of gate sites missed two**: check-login's overview sidebar at x = 1180, and
+>   check-input's corner-pinned burst. And `tune` stretched its preview wallpaper to the screen,
+>   which no desktop ever did.
+> - **`desktop-shell`'s library tests had never run in CI**, though its doc said `cargo xtask test`
+>   ran them; the layout arithmetic's tests needed them to.
+> - **`check-resolutions` earned its keep on its first two runs**, all of it gate assumptions sized
+>   for 1280: the pointer's pin (2000 px of travel) could not cross 2560; the right-half snap drag
+>   stopped 176 px short of 1920's edge, and made far enough for 2560 it overran the input ring until
+>   paced; and `touch ./` typed unpaced into a starting terminal lost its batch at 1024×768. Every
+>   gate passed at every size once those were fixed, but one boot:
+> - **The 1024×768 dead-log-source failure reproduced** — `a closed log source left a CPU spinning`,
+>   in one of the tool's two chain-running boots at that size, beside `test-qemu`'s 2 of 3. Still
+>   unexplained, and not fixed on a guess.
 
 > **Detail pass, 2026-09-15.** Written before any code, as Parts A, C and D were. Decisions marked
 > *(maintainer's call)* were put to the maintainer with the alternatives. **Revised in review
@@ -995,10 +1019,10 @@ What stays unseen until Part F is the laptop's own padding and its width that is
 
 **E.4 — `cargo xtask check-resolutions`**, on demand
 
-- [ ] Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each of 1024×768,
+- [x] Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each of 1024×768,
       1280×800, 1360×768, 1920×1080 and 2560×1440 — every width a multiple of 8, for the reason
       above — one boot at a time, and prints a table of which passed. Not in CI.
-- [ ] **What it is allowed to find**: the 1024×768 demo-chain failure above is reproduced or not,
+- [x] **What it is allowed to find**: the 1024×768 demo-chain failure above is reproduced or not,
       with the transcript kept; a size that cannot boot in the guest's 256 MiB says so rather than
       timing out; 2560×1440 draws the wallpaper at its own size, centred, since filling that screen
       needs the upscaler. Anything it finds gets a decision-log entry; a class of failure gets a CI

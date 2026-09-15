@@ -348,6 +348,7 @@ fn main() -> ExitCode {
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, gate_size),
+        Some("check-resolutions") => cmd_check_resolutions(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq, gate_size),
         Some("check-irq-scope") => cmd_check_irq_scope(),
@@ -389,6 +390,7 @@ fn print_help() {
            check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
            check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
            check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
+           check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
@@ -898,6 +900,15 @@ impl DisplaySize {
     /// The middle of the overview sidebar's width.
     fn sidebar_x(self) -> i32 {
         self.w as i32 - Self::SIDE_W / 2
+    }
+
+    /// How many `(100, 100)` motions pin the pointer into the bottom-right corner from anywhere on
+    /// the screen: its longer side over-driven, and never fewer than the twenty the gates used at
+    /// 1280×800. Twenty was 2000 px of travel, which does not cross a 2560-wide screen — the first
+    /// `check-resolutions` run pinned "to (2559, 1439)" from wherever the pointer was, and every
+    /// click after it landed short (Phase 5 Part E.4).
+    fn pin_motions(self) -> usize {
+        (self.w.max(self.h) as usize / 100 + 2).max(20)
     }
 }
 
@@ -2142,11 +2153,12 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
     let from = match qmp.pointer {
         Some(p) => p,
         None => {
-            let corner = qmp
-                .screen
-                .ok_or("move_pointer_to: this gate never said what size its screen is, so the corner a pin lands in is unknown")?
-                .corner();
-            for _ in 0..20 {
+            let screen = qmp.screen.ok_or(
+                "move_pointer_to: this gate never said what size its screen is, so the corner a \
+                 pin lands in is unknown",
+            )?;
+            let corner = screen.corner();
+            for _ in 0..screen.pin_motions() {
                 qmp.send_motion(100, 100)?; // pin to the bottom-right corner
             }
             // **Let the pin drain before walking, because the two are not equally forgiving.**
@@ -2676,6 +2688,91 @@ fn cmd_check_report(accel: Accel, size: DisplaySize) -> R<()> {
     let _ = fs::remove_file(&qmp_sock);
     println!("\nxtask: the hardware report is chosen from the menu, held a page at a time, and read with no serial port ✓");
     Ok(())
+}
+
+/// `cargo xtask check-resolutions` — **resolution independence, checked on demand** (Phase 5
+/// Part E.4). Not in CI, by the maintainer's call: the system should not care what size its screen
+/// is, CI boots two sizes on every run, and this is how the claim gets confirmed across more of them
+/// from time to time without every PR paying for twenty boots.
+///
+/// Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each size — every
+/// width a multiple of 8, for the reason `DisplaySize` gives — **one boot at a time**, each as its
+/// own `cargo xtask <gate> --size WxH` child so a failure is exactly what that gate reports. Keeps
+/// every run's output and transcript under `build-cache/resolutions/`, and prints a table.
+///
+/// **What it is allowed to find** besides a gate failure: whether a boot's demo chain finished —
+/// the check `test-qemu` makes, which at 1024×768 failed its dead-log-source step in 2 runs of 3
+/// on 2026-09-15 with nothing yet connecting size to it — and whether the compositor ran without
+/// its shadow buffer, which is what a screen too large for the guest's memory looks like first.
+fn cmd_check_resolutions(accel: Accel) -> R<()> {
+    const SIZES: &[&str] = &["1024x768", "1280x800", "1360x768", "1920x1080", "2560x1440"];
+    const GATES: &[&str] = &["check-display", "check-terminal", "check-login", "check-fbcon"];
+    let dir = build_cache().join("resolutions");
+    fs::create_dir_all(&dir)?;
+    let exe = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    println!(
+        "xtask: {} gates at {} sizes, one boot at a time, under {} — output in {}\n",
+        GATES.len(),
+        SIZES.len(),
+        if matches!(accel, Accel::Kvm) { "KVM" } else { "TCG" },
+        dir.display()
+    );
+    let mut failed = Vec::new();
+    for size in SIZES {
+        for gate in GATES {
+            let stem = format!("{gate}-{size}");
+            let out_path = dir.join(format!("{stem}.log"));
+            let transcript_path = dir.join(format!("{stem}.transcript.log"));
+            let _ = fs::remove_file(&transcript_path);
+            let out = fs::File::create(&out_path)?;
+            let mut cmd = Command::new(&exe);
+            cmd.arg(gate).arg("--size").arg(size);
+            if matches!(accel, Accel::Kvm) {
+                cmd.arg("--kvm");
+            }
+            cmd.env("NITROX_KEEP_TRANSCRIPT", &transcript_path)
+                .stdout(out.try_clone()?)
+                .stderr(out);
+            let started = std::time::Instant::now();
+            let passed = cmd.status().map_err(|e| format!("run {gate}: {e}"))?.success();
+            let transcript = fs::read_to_string(&transcript_path).unwrap_or_default();
+            let mut notes = Vec::new();
+            if transcript.contains("test-harness:") {
+                if transcript.contains("test-harness: all smoke tests passed") {
+                    notes.push("demo chain finished".to_string());
+                } else {
+                    // **Unfinished, which is not failed**: `check-display` ends its boot once it
+                    // has the screen, and on a large one that can be before the chain is done. A
+                    // failure is one of these lines followed by nothing, in a boot that ran long
+                    // enough — `check-terminal`'s does — so the last line is what to read.
+                    let last = transcript.lines().filter(|l| l.starts_with("test-harness:")).last();
+                    notes.push(format!(
+                        "demo chain unfinished when the boot ended — last: {}",
+                        last.unwrap_or("?").trim()
+                    ));
+                }
+            }
+            if transcript.contains("compositor: no shadow buffer") {
+                notes.push("compositor ran without its shadow buffer".to_string());
+            }
+            println!(
+                "  {size:>9}  {gate:<15} {}  {:>4}s  {}",
+                if passed { "pass" } else { "FAIL" },
+                started.elapsed().as_secs(),
+                notes.join("; ")
+            );
+            if !passed {
+                failed.push(stem);
+            }
+        }
+    }
+    if failed.is_empty() {
+        println!("\nxtask: every gate passed at every size ✓");
+        Ok(())
+    } else {
+        Err(format!("{} run(s) failed: {} — see {}", failed.len(), failed.join(", "), dir.display())
+            .into())
+    }
 }
 
 /// `(page, of)` from a report page's prompt row, `— page 2/3 — any key —` (`kernel/src/report.rs`).
@@ -4591,9 +4688,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         qmp.send_motion(120, 0)?;
     }
     session.expect("compositor: interactive move of window ")?;
-    // To the right edge, which is where the shell registered a snap zone.
-    for _ in 0..6 {
-        qmp.send_motion(120, 0)?;
+    // To the right edge, which is where the shell registered a snap zone — **a screen's width of
+    // travel, into the clamp, and paced**. Six more motions of 120 reached it from here on 1280 and
+    // 1360 and stopped 176 px short on 1920, where the drop snapped nowhere; twenty-three unpaced
+    // ones overran the input ring on 2560, and the dropped batch ended the gesture before the
+    // release — the pacing the left-edge drag above already explains (Phase 5 Part E.4).
+    for _ in 0..(size.w / 240 + 2) {
+        qmp.send_motion(240, 0)?;
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     qmp.send_button("left", false)?;
     qmp.pointer = None;
@@ -4985,7 +5087,16 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // delivered nothing leaves `.clip`; one that delivered the whole line leaves something
     // else again.
     // QMP's own key names, not the characters: `.` is `dot` and `/` is `slash`.
+    //
+    // **Paced, before every key including the first** — `type_at_terminal`'s rule, for its reason:
+    // a release image renders no grid line to wait on per character, and a batch injected while
+    // the compositor recomposes is dropped whole (`input batch DROPPED`). Waiting for `nxsh: up`
+    // above closed the race at 1280×800 and 1360×768; `check-resolutions` lost the whole of
+    // `touch ./` to it at 1024×768, where the window list's redraw lands in the same moment
+    // (Phase 5 Part E.4).
+    const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
     for qcode in ["t", "o", "u", "c", "h", "spc", "dot", "slash"] {
+        std::thread::sleep(PER_KEY);
         press(&mut qmp, qcode)?;
     }
     qmp.send_key("ctrl", true)?;
@@ -4995,6 +5106,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     qmp.send_key("ctrl", false)?;
     session.expect(&format!("nxterm: pasted {} bytes", TYPED.len()))?;
     for qcode in ["dot", "c", "l", "i", "p"] {
+        std::thread::sleep(PER_KEY);
         press(&mut qmp, qcode)?;
     }
     press(&mut qmp, "ret")?;
@@ -5808,8 +5920,9 @@ fn burst_holds_its_position(
     // arrives. A confirming click would be worse than redundant here: the bottom-right corner is
     // the desktop indicator's hit region, so it opens the overview, which then takes the chord
     // below instead of the shell.
-    let corner = qmp.screen.ok_or("burst_holds_its_position: the screen's size is unset")?.corner();
-    for _ in 0..20 {
+    let screen = qmp.screen.ok_or("burst_holds_its_position: the screen's size is unset")?;
+    let corner = screen.corner();
+    for _ in 0..screen.pin_motions() {
         qmp.send_motion(100, 100)?;
     }
     qmp.pointer = Some(corner);
@@ -8224,6 +8337,15 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // **Kept on request, pass or fail**, for `check-resolutions`, which runs each gate as a
+        // child and wants every boot's transcript beside its result. A gate run by hand keeps its
+        // transcript only on a timeout, as it always has — so a passing rerun does not overwrite
+        // the evidence of the failure before it.
+        if let Ok(path) = env::var("NITROX_KEEP_TRANSCRIPT")
+            && let Ok(g) = self.out.lock()
+        {
+            let _ = fs::write(path, g.as_str());
+        }
     }
 }
 
@@ -12842,6 +12964,9 @@ mod diag_tests {
         assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (776, 788));
         assert_eq!(old.indicator_click(), (1200, 788));
         assert_eq!(old.sidebar_x(), 1180);
+        assert_eq!(old.pin_motions(), 20, "the pin the gates always used at this size");
+        let big = DisplaySize::parse("2560x1440").unwrap();
+        assert!(big.pin_motions() * 100 > big.w as usize, "a pin that cannot cross the screen");
         let gate = DisplaySize::GATE;
         assert_eq!((gate.bottom_bar_y(), gate.indicator_click(), gate.sidebar_x()), (744, (1280, 756), 1260));
     }

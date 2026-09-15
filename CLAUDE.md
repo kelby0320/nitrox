@@ -65,6 +65,7 @@ cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
 cargo xtask check-report   # choose the live menu's hardware report, no serial port; read its pages
+cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
 ```
 
 **Use `--grab` whenever you are going to touch the mouse or press a chord.** The guest has a
@@ -167,6 +168,10 @@ as QEMU can show it, since its VGA shears any width that is not a multiple of 8 
 and `test-interactive` keep QEMU's 1280×800, so every CI run boots two sizes. `--size WxH` boots a
 screen gate at another size. The clients take the size from `/dev/draw/screen` and the gates from
 `DisplaySize`; neither writes one down. See `docs/conventions/qemu-integration-tests.md`.
+`cargo xtask check-resolutions` runs `check-display`, `check-terminal`, `check-login` and
+`check-fbcon` at 1024×768, 1280×800, 1360×768, 1920×1080 and 2560×1440 and prints a table — **by
+hand, from time to time, not in CI**: twenty boots is what confirming resolution independence
+costs, and no PR should pay it.
 
 `cargo xtask shot` is the other half of that: it **photographs** rather than renders, booting the
 release image and driving it to five moments — the greeter, the bare desktop, the applications
