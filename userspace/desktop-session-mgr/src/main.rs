@@ -41,9 +41,8 @@ use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The greeter window's size. Fixed rather than screen-relative: the compositor places it at
-/// the origin today, and a greeter that resized itself would be the first client to have a
-/// placement opinion — which is `desktop-shell`'s job from Part E.
+/// The greeter window's size. Fixed rather than screen-relative: only its position follows the
+/// screen, centred on the size `/dev/draw/screen` reports since Phase 5 Part E (see `_start`).
 const GREETER_W: u32 = 420;
 /// See [`GREETER_W`].
 const GREETER_H: u32 = 200;
@@ -475,7 +474,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             (0, 0)
         }
     };
-    // **This window lands at the origin, and it is created before every other client's.**
+    // **This window is created before every other client's**, wherever on the screen it lands.
     // `service-mgr` brings the login chain up before it starts declared services, so the
     // greeter is bottom-most and the reference windows `check-display` and `check-terminal`
     // depend on stack above it. That is load-bearing rather than incidental: a greeter

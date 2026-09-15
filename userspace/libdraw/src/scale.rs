@@ -161,9 +161,12 @@ pub fn fit(image: Size, screen: Size) -> Fit {
 /// is smaller. So a fill never makes a picture bigger than its file, and at worst looks like [`fit`]
 /// of a picture that did not need scaling.
 ///
-/// **The covering size rounds up**, so the screen's last row or column is never left bare by a
-/// truncation, and never past the picture's own size. A zero dimension plans nothing, as [`fit`]
-/// does.
+/// **The overhanging dimension rounds up**, never past the picture's own size. That is a choice,
+/// not what keeps the screen covered: the exact scaled size is at least the screen's, which is a
+/// whole number, so truncating would cover it too. Up draws the picture under a pixel taller (or
+/// wider) than its shape, where down would draw it under a pixel shorter; neither can be seen,
+/// and the tests pin the direction so it does not change unnoticed. A zero dimension plans
+/// nothing, as [`fit`] does.
 pub fn fill(image: Size, screen: Size) -> Fit {
     if image.w == 0 || image.h == 0 || screen.w == 0 || screen.h == 0 {
         return Fit { size: Size::new(0, 0), origin: Point::new(0, 0), scaled: false };
@@ -447,7 +450,7 @@ mod tests {
         let gate = fill(Size::new(1920, 1200), Size::new(1360, 768));
         assert_eq!(gate, Fit { size: Size::new(1360, 850), origin: Point::new(0, -41), scaled: true });
         let laptop = fill(Size::new(1920, 1200), Size::new(1366, 768));
-        assert_eq!(laptop.size, Size::new(1366, 854), "853.75 rounds up, never leaving a bare row");
+        assert_eq!(laptop.size, Size::new(1366, 854), "853.75 rounds up; 853 would cover too");
         assert_eq!(laptop.origin, Point::new(0, -43));
     }
 

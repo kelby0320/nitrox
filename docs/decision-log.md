@@ -25766,10 +25766,13 @@ come too late to size them, and the leaf resolves through the very binding the s
 just used.
 
 `fill` is the second `wallpaper_mode` M12 decision 7 designed the key for: `scale::fill` covers the
-screen by scaling down only, rounds the covering size up so no row is left bare, and draws a picture
-that would need an upscale at its own size; `place` already cropped. `TODO(wallpaper-fill)` narrowed
-to the upscaler. Controls: removing the upscale cap, or truncating instead of rounding up, each fails
-`fill`'s tests.
+screen by scaling down only, rounds the overhanging dimension up, and draws a picture that would need
+an upscale at its own size; `place` already cropped. **Rounding up is a choice, not what keeps the
+screen covered** — the exact size is at least the screen's whole-number size, so truncating covers
+too (PR #302 review) — and the tests pin its direction rather than prove coverage by it.
+`TODO(wallpaper-fill)` narrowed to the upscaler. Controls: removing the upscale cap fails the
+upscale test and the property test that no fill grows a picture; truncating instead of rounding up
+fails only the two tests that pin rounded sizes, and the coverage property passes under it.
 
 **E.3 — every screen gate boots 1360×768 and aims from the size.** `qemu_base_args` takes the screen
 from every caller, so a new boot cannot forget to say; `test-qemu` and `test-interactive` say QEMU's

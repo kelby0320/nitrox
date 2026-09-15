@@ -89,15 +89,14 @@ const WALLPAPER_PATH: &str = "/home/wallpaper.png";
 /// shell that never decoded anything report the right numbers, so the gate would pass with the
 /// decoder gone. 1920x1200 can only have come from an `IHDR` that was actually read.
 ///
-/// **What it no longer distinguishes is fit from fill**, and that is worth stating rather than
-/// leaving for somebody to notice: 16:10 into a 16:10 screen draws at `1280x800 at 0,0` under
-/// either rule, so the *drawn* half of the shell's line stopped carrying weight when the shipped
-/// picture became the screen's shape. The decoded half still does, and what pins fit-versus-fill
-/// is `libdraw::scale`'s own control — the one that stretches to fill and takes six tests down
-/// with it. A gate cannot have both here: a picture whose drawn size discriminates is a picture
-/// with bars down the side, which is not what the desktop should look like.
+/// **The drawn half of the shell's line also tells fit from fill, but only because the gate's
+/// screen is not this picture's shape** (Phase 5 Part E). 16:10 filled into 1360x768 draws
+/// `1360x850 at 0,-41`, cropped top and bottom, where fit would leave bars down the sides — so a
+/// theme staged back to `fit` fails `check-login` at that line. At 1280x800, the size the gates
+/// booted before, the two rules draw the same `1280x800 at 0,0`, and there only the decoded half
+/// carries weight; `check-resolutions` runs `check-login` at that size too.
 const WALLPAPER_W: u32 = 1920;
-/// See [`WALLPAPER_W`]. 16:10, which is the screen's shape.
+/// See [`WALLPAPER_W`]. 16:10, which the gate's 1360x768 is not.
 const WALLPAPER_H: u32 = 1200;
 
 /// The folders staged under the demo home, which `nxfiles::DEFAULT_FOLDERS` names too.
@@ -419,6 +418,10 @@ fn print_help() {
          `--kvm` (any command that boots a guest) runs under hardware virtualisation\n         \
          instead of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG\n         \
          emulates x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
+         `--size WxH` (the screen gates, `shot`, `bench-compose`, `qemu`/`qemu-debug`)\n         \
+         sets the screen QEMU boots. The gates default to 1360x768 and `qemu` to\n         \
+         QEMU's 1280x800. The width must be a multiple of 8, or QEMU shears every row;\n         \
+         `check-resolutions` runs the display gates at five sizes.\n         \
          Other args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
     );
 }
@@ -3336,7 +3339,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
 
     // **And the position, asserted rather than inferred.** A dock edge reserves space; it does
     // not move the window. Without this the bar's placement was only covered by proxy — the
-    // list click at (90, 788) landing on nothing — which says the bar is not *there* rather
+    // window-list click landing on nothing — which says the bar is not *there* rather
     // than where it is (PR #242 review, optional 9).
     session.expect(&format!("desktop-shell: bottom bar placed at 0,{}", size.bottom_bar_y()))?;
     // **The count, not just the prefix** (PR #279 review, finding 7). This is the one line that
@@ -3577,8 +3580,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     compositor state continuously rather than at one moment, so the assertions are about
     //     what the list *says*, not only that a click was received.
     //
-    //     The bar is the bottom 24 rows of an 800-high screen, and entries are 180px wide from
-    //     the left — so (90, 788) is inside the first one.
+    //     The bar is the bottom `DisplaySize::BAR_H` rows of the screen, and entries are 180px
+    //     wide from the left — so `list_click`, x = 90 at half the bar's height, is inside the
+    //     first one at any size.
 
     // Close the modal first: it is a popup on top, and a press meant for the bar would land in
     // it. **By clicking outside it rather than by pressing Escape** (M11 Part E batch 4) —
@@ -12973,8 +12977,14 @@ mod diag_tests {
 
     #[test]
     fn a_width_qemu_would_shear_is_refused_and_says_what_it_would_show() {
-        let e = DisplaySize::parse("1366x768").unwrap_err().to_string();
-        assert!(e.contains("1360"), "the refusal names what QEMU would scan out: {e}");
+        // The number is computed, so it is asserted where it sits in the sentence: the message
+        // also names 1360 in its closing clause, which a bare `contains("1360")` would match
+        // whatever width was computed. 1370 is a second width whose answer appears nowhere else.
+        for (text, scanned, drawn) in [("1366x768", 1360, 1366), ("1370x768", 1368, 1370)] {
+            let e = DisplaySize::parse(text).unwrap_err().to_string();
+            let says = format!("scan out {scanned} while the guest draws {drawn}");
+            assert!(e.contains(&says), "the refusal of {text} names what QEMU would scan out: {e}");
+        }
         assert!(DisplaySize::parse("1360x768").is_ok(), "control: a multiple of 8 is taken");
         for bad in ["1360", "x768", "1360x", "wide", "13 60x768", "320x200", "8192x768"] {
             assert!(DisplaySize::parse(bad).is_err(), "{bad} was accepted");
