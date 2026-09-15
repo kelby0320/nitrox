@@ -818,8 +818,8 @@ answered.
 
 ## Part E — the resolution this machine actually has ⬜
 
-- [ ] Boot QEMU at **1366×768** and pass every display gate there, with no screen size written into
-      a client or a gate.
+- [ ] Boot QEMU at **the laptop's screen, as near as QEMU can show it**, and pass every display gate
+      there, with every client and every gate taking the screen's size from the screen.
 
 `check-display` compares the guest's screen against a `libdraw` render, and the whole display
 arm has only ever run at the QEMU default. A padded stride and an odd width are exactly the
@@ -827,40 +827,63 @@ conditions under which a compositor's damage arithmetic goes wrong by a few pixe
 `libdraw`'s half is a host test; the guest half is a gate run at the laptop's geometry.
 
 > **Detail pass, 2026-09-15.** Written before any code, as Parts A, C and D were. Decisions marked
-> *(maintainer's call)* were put to the maintainer with the alternatives.
+> *(maintainer's call)* were put to the maintainer with the alternatives. **Revised in review
+> (PR #301)**: the first draft measured 1366×768 by the serial line alone, and a screendump showed
+> QEMU cannot display it — § What QEMU can show.
 
-### What a boot at 1366×768 does today (measured 2026-09-15)
+### What QEMU can show (measured 2026-09-15)
 
-**QEMU can give the guest the laptop's size with no change to any image.** `-vga none -device
-VGA,xres=1366,yres=768` makes QEMU's EDID prefer that mode, OVMF adds the EDID's mode to its list
-and boots into it, and Limine hands it over: `test-qemu`'s boot reads
-`framebuffer: 1366x768 pitch 5464 padding 0 bpp 32`, the console `170x48 cells at scale 1` (the
-laptop's), and reaches `verdict PASS`. 1376×768, 1024×768 and 2560×1440 boot the same way, the last
-with the console at scale 2. The display self-test passed at every size tried.
+**A mode chosen by QEMU's command line reaches the guest with no image changed.**
+`-vga none -device VGA,xres=…,yres=…` makes QEMU's EDID prefer that mode; OVMF adds it to its mode
+list and boots into it, and Limine hands it over.
 
-**It cannot give the guest a padded stride.** OVMF's QEMU video driver sets
-`PixelsPerScanLine = HorizontalResolution` for every mode (`OvmfPkg/QemuVideoDxe/Gop.c`,
-edk2-stable202402), and Limine derives the pitch from it — so under QEMU the padding is always 0,
-where the laptop's is 40.
+**But not a width that is not a multiple of 8.** QEMU's standard VGA rounds `XRES` and
+`VIRT_WIDTH` down to a multiple of 8 when they are written (`hw/display/vga.c`, `vbe_fixup_regs`),
+and OVMF's GOP still reports the width it asked for. At `xres=1366` the guest logs
+`framebuffer: 1366x768 pitch 5464`, draws 5464-byte rows, and QEMU scans out 1360-wide 5440-byte
+ones: every row is sheared 6 px further than the last. **The first draft of this pass read the
+`framebuffer:` line and a `verdict PASS` and called that a 1366×768 boot** — but the verdict and
+the display self-test are self-hashes, which a wrong stride cannot fail, as the root `CLAUDE.md`
+says of them. Read off the screen, the draft's claim does not hold: `check-report` at 1366×768 found
+Limine's menu and then never decoded a console frame. `bochs-display`, which stores the width
+unrounded, shears too at 1366×768 (its dump is 1366 wide, the picture drifts about two thirds of a
+pixel a row) and is clean at 1360×768 and 1280×800; why was not found, and nothing here depends on
+it.
 
-**Userspace has 1280×800 written into it.** `desktop-shell` sizes its bars, its wallpaper window
-and its entry capacity from `SCREEN_W` and `SCREEN_H`, and places the bottom bar at `800 − 24`;
-`desktop-session-mgr` centres the greeter on the same constants. Both say the compositor has no
-way to report the screen's size, which stopped being true for a manager when `QueryLayout` arrived
-in M9 Part B, and was never provided to anything else. At 1366×768 the top bar stops 86 px short of
-the right edge, the bottom bar — the window list — is placed at `y = 776`, wholly below the screen's
-last row, the wallpaper window overhangs the bottom by 32 px, and the greeter sits 43 px left of
-centre and 16 px low. **These are the laptop's bugs**, found before the laptop.
+**1360×768 is the laptop's screen as near as QEMU shows it.** The same 768 rows, and a console of
+the laptop's `170x48 cells at scale 1` — without the 6-pixel right margin 1366 leaves. On the
+standard VGA, `check-report` at 1360×768 found the menu and read both report pages off the screen,
+and failed only where it should, on the `framebuffer: 1280x800` fact.
 
-**So do the gates.** `check-login` clicks the bottom bar at `y = 788` and the indicator at
-`x = 1200` and expects `wallpaper 1920x1200 drawn 1280x800 at 0,0`; `move_pointer_to` pins the
-pointer to `(1279, 799)`; `cargo xtask tune` composites at 1280×800; `EMULATED_MACHINE_FACTS`
-holds `framebuffer: 1280x800 …`, shared by `test-qemu` and `check-report`.
+**Nor a padded stride.** OVMF's QEMU video driver sets `PixelsPerScanLine = HorizontalResolution` for
+every mode (`OvmfPkg/QemuVideoDxe/Gop.c`), and Limine derives the pitch from it, so the padding
+under QEMU is always 0 where the laptop's is 40.
+
+**Userspace has 1280×800 written into it.** `desktop-shell` uses `SCREEN_W` and `SCREEN_H` 56 times —
+both bars, the wallpaper window, the entry capacity, the placement bounds, and the overview: its
+full-screen popup, its sidebar at `SCREEN_W − SIDE_W`, the wallpaper miniature, and the scale of
+each window preview — and places the window list at `800 − 24`; `desktop-session-mgr` centres the
+greeter on the same constants. Both say the compositor cannot report the screen's size, which
+stopped being true for a manager with M9 Part B's `QueryLayout` and was never provided to anything
+else. **At 1360×768**, the top bar stops 80 px short of the right edge, the window list is placed at
+`y = 776`, wholly below the last row, the wallpaper window overhangs the bottom by 32 px, the
+overview leaves an undimmed strip on the right with its sidebar 80 px in from the edge, and the
+greeter sits 40 px left of centre and 16 px low. **These are the laptop's bugs**, found before the
+laptop.
+
+**So do the gates**, in `tools/xtask/src/main.rs`: `check-login` clicks the window list at
+`y = 788` and at `x = 1200`, clicks the empty desktop at its centre `(640, 400)`, and expects
+`desktop-shell: bottom bar placed at 0,776` and `wallpaper 1920x1200 drawn 1280x800 at 0,0`; `shot`
+moves to the same centre, expects the same placement line, and clicks the overview at
+`(1200, 788)`; `move_pointer_to` pins the pointer to `(1279, 799)`; `tune` composites at
+`(1280u32, 800u32)` and ignores a screendump of any other size; `EMULATED_MACHINE_FACTS` holds
+`framebuffer: 1280x800 …`, shared by `test-qemu` and `check-report`; and `bench-compose` boots a
+screen too.
 
 **One thing seen and not explained.** At 1024×768 `test-qemu`'s demo chain failed its
 dead-log-source check (`only 2 of 4 CPUs ever went idle`) in 2 runs of 3; at 1366×768 it finished in
-4 of 4 and at the default in 2 of 2. Nothing connects screen size to that check, and nothing here
-is a fix for it — it is written down for E.4, where `check-resolutions` makes it cheap to reproduce.
+4 of 4 and at the default in 2 of 2. Nothing connects screen size to that check, and nothing here is
+a fix for it — it is written down for E.4, where `check-resolutions` makes it cheap to reproduce.
 
 ### The pitch: the host tests, not a kernel knob *(maintainer's call)*
 
@@ -880,12 +903,12 @@ knob would re-run the same code:
 - **The kernel passes Limine's pitch through unchanged**, and `libdraw::acquire` has a test that a
   padded report survives into the geometry.
 
-What stays untested until Part F is the laptop's own padding — which the D.1 line reports as
-`padding 40` on the day.
+What stays unseen until Part F is the laptop's own padding and its width that is not a multiple of
+8 — both of which the D.1 lines report on the day.
 
 ### The shape *(maintainer's calls)*
 
-- **The display gates move to 1366×768 in CI; `test-qemu` stays at QEMU's default.** Every CI run
+- **The display gates move to 1360×768 in CI; `test-qemu` stays at QEMU's default.** Every CI run
   then boots two sizes, so a size written back into a client fails somewhere, and CI's time does
   not change.
 - **Nothing is resolution-specific, and a check across sizes runs on demand, not in CI.**
@@ -895,7 +918,10 @@ What stays untested until Part F is the laptop's own padding — which the D.1 l
   shape as `/dev/draw/<N>/info`. The greeter has no manager channel, and knowing the screen's size
   grants no placement authority.
 - **The wallpaper fills the screen**, cropping the picture's overhang, rather than fitting it with
-  bars down the sides: the shipped picture is 16:10 and the laptop is 16:9.
+  bars down the sides: the shipped picture is 16:10 and the laptop is 16:9. **As a second
+  `wallpaper_mode` value**, which is what M12 decision 7 designed the key for — and **scaling down
+  only**: covering a screen larger than the picture needs the upscaler that decision deferred, so a
+  fill that would have to scale up draws the picture at its own size, centred, and says so.
 
 ### The pieces, in dependency order
 
@@ -906,69 +932,94 @@ What stays untested until Part F is the laptop's own padding — which the D.1 l
       and room reserved for what a later screen may add. A read shorter than the object is refused,
       as `info`'s is.
 - [ ] `docs/spec/rsproto-surface-ops.md` gains the section, beside `/dev/draw/<N>/info`.
-- [ ] Every namespace that can resolve `/dev/draw/new` can resolve `screen` — an application's
-      `/dev/draw/new`-only bind (M7 Part E) is widened to the two leaves, never to `manage`.
 
-**E.2 — the clients ask**
+**E.2 — the clients ask, and the constants go**
 
-- [ ] **`desktop-shell`** reads the leaf before it creates anything, and sizes both bars, the
-      wallpaper window and the placement bounds from it; the bottom bar goes at `height − BAR_H`.
-      `MAX_ENTRIES`' compile-time bound becomes a capacity computed from the width, and the entries
-      that do not fit are not drawn rather than drawn off the edge. The work area still comes from
+- [ ] **`SCREEN_W` and `SCREEN_H` are deleted** from `desktop-shell` and `desktop-session-mgr`, and
+      `BAR_PITCH` and `OVER_PITCH` with them, so every site that used one fails to compile rather
+      than being found by reading. The size is read from the leaf once at startup and passed down.
+- [ ] **`desktop-shell`** sizes both bars, the wallpaper window, the placement bounds and the entry
+      capacity from it, and places the window list at `height − BAR_H`. **The overview** too:
+      `render_overview`'s popup and sidebar, `open_overview`, `present_overview` and
+      `close_overview`'s buffers, `mini_wallpaper`'s reading of the wallpaper buffer — which, left at
+      the old width over a 1360-wide buffer, would read every row 320 bytes (80 px) out of step and
+      log nothing — and `desktop_preview`'s scaling of window origins. The work area still comes from
       `QueryLayout`.
 - [ ] **The greeter** centres on the leaf's size, and logs the origin it asked for, so a gate can
       check the centring rather than look at it.
-- [ ] **`libdraw::scale::fill`** beside `fit` — the smallest scale that covers the screen, centred,
-      the overhang cropped — with host tests at 16:10 into 16:9 and the reverse, and the wallpaper
-      uses it. At 1366×768 the shell's line reads about `drawn 1366x854 at 0,-43`; the rounding is
-      `fill`'s to pin, and the gate computes the line with the same function.
-- [ ] A client that cannot resolve the leaf logs it and falls back to 1280×800, so a broken leaf
-      is a visible wrong rather than a session that does not start.
+- [ ] **No size to fall back on.** A greeter that cannot resolve the leaf logs it and asks for the
+      origin; a shell that cannot logs it and takes the size from `QueryLayout`, and without a
+      manager either, draws no bars. Each is a visible wrong in a session that still starts, and
+      none needs a size written down.
+- [ ] **`fill` becomes a legal `wallpaper_mode`**: `docs/spec/theme-toml-schema.md` names both values,
+      `libdraw::theme` parses it (the refusal test keeps refusing a value that is neither, by name),
+      and the theme `xtask` stages names `fill`.
+- [ ] **`libdraw::scale::fill`** beside `fit`: the smallest scale that covers the screen, capped at
+      1, centred, the overhang cropped. Its plan's origin is signed — `Fit::origin`'s "never
+      negative" stays true of `fit` and is not borrowed. Host tests: 16:10 into 16:9 (at 1360×768,
+      `drawn 1360x850 at 0,-41`), 16:9 into 16:10, and a picture smaller than the screen, drawn at
+      its own size and centred.
+- [ ] **`TODO(wallpaper-fill)` narrows to the upscaler** in `docs/rationale/deferred-decisions.md`:
+      filling by scaling down exists, and a picture that would need scaling up to cover the screen
+      is the trigger that remains.
 
 **E.3 — the gates stop knowing the size, and CI's move**
 
 - [ ] **One place says what size a gate's screen is**: `qemu_display_args(size)` adds
       `-vga none -device VGA,xres=…,yres=…`, and every gate that boots a screen — `check-display`,
       `check-input`, `check-terminal`, `check-login`, `check-fbcon`, `check-live`, `check-report`,
-      and the `shot` tool — takes a size that defaults to 1366×768. `test-qemu` and
-      `test-interactive` keep QEMU's default.
-- [ ] **Every coordinate a gate uses comes from the size or from the guest.** The bottom bar's and
-      the indicator's click points from the screen size and the shell's `work area` line; the pointer's
-      pin corner from the size; the wallpaper line computed with `scale::fill` on the host — one
-      source for the expected answer, as `tools/CLAUDE.md` asks. Each site is found by searching
-      for `1280`, `800`, `1279`, `799`, `788` and `1200` in `xtask`, and the empty search after is
-      the positive control's job (`tune` keeps composing at the size of the screendump it reads).
+      and the `shot` and `bench-compose` tools — takes a size that defaults to 1360×768. A size
+      whose width is not a multiple of 8 is refused with the reason, since QEMU would shear it.
+      `test-qemu` and `test-interactive` keep QEMU's default.
+- [ ] **Every coordinate a gate uses comes from the size or from the guest**: the window list's
+      and its right-hand click points and the desktop's centre from the screen size; the bottom
+      bar's placement line from the size; the pointer's pin corner from the size; the wallpaper line
+      computed with `scale::fill` on the host — one source for the expected answer, as
+      `tools/CLAUDE.md` asks — and `tune` composing at the size of the screendump it reads. The sites
+      are the ones § What QEMU can show lists, and a search for `1280`, `800`, `1279`, `799`, `788`,
+      `776`, `1200`, `640` and `400` as substrings, not words, finds any others; each hit left is
+      one somebody read.
 - [ ] **The framebuffer fact splits**: `test-qemu` keeps `1280x800 pitch 5120`, `check-report`
-      asserts `1366x768 pitch 5464 padding 0`.
+      asserts `1360x768 pitch 5440 padding 0`.
 - [ ] **`check-fbcon`'s handout frame is re-measured**: at 48 rows it shows at least the last 36
       lines, and the kernel's last line was 29 lines before the handout when Part B measured it.
-- [ ] **`check-report` is re-read**: the report's rows are 47 at 1366×768, and its page count is
-      pinned from the first run rather than guessed here.
+- [ ] **`check-report`'s page count is read from the gate**: two pages at 1360×768 in the
+      measurement above, pinned from the first real run.
 - [ ] **`check-login` asserts the layout it can now see**: the greeter's logged origin is centred
-      for the size, and the window-list click lands on the bottom bar.
-- [ ] Controls, each at 1366×768: the shell's bottom bar placed from the old `SCREEN_H` fails
-      `check-login` at the window-list click; the greeter's constants put back fail its centring
-      assertion; the leaf's resolve refused makes the greeter log its fallback and fail the same
-      assertion.
+      for the size, the window-list click lands on the bottom bar, and the wallpaper line matches
+      the host's `fill`.
+- [ ] Controls, each at 1360×768: the window list placed from the old height fails `check-login` at
+      its click; the greeter's old centring fails its assertion; the leaf's resolve refused makes the
+      greeter log its fallback and fail the same assertion; `wallpaper_mode` put back to `fit` fails
+      the wallpaper line.
 
 **E.4 — `cargo xtask check-resolutions`**, on demand
 
 - [ ] Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each of 1024×768,
-      1280×800, 1366×768, 1920×1080 and 2560×1440, one boot at a time, and prints a table of which
-      passed. Not in CI.
+      1280×800, 1360×768, 1920×1080 and 2560×1440 — every width a multiple of 8, for the reason
+      above — one boot at a time, and prints a table of which passed. Not in CI.
 - [ ] **What it is allowed to find**: the 1024×768 demo-chain failure above is reproduced or not,
       with the transcript kept; a size that cannot boot in the guest's 256 MiB says so rather than
-      timing out. Anything it finds gets a decision-log entry; a class of failure gets a CI gate.
+      timing out; 2560×1440 draws the wallpaper at its own size, centred, since filling that screen
+      needs the upscaler. Anything it finds gets a decision-log entry; a class of failure gets a CI
+      gate.
 
 ### What to compare on the day
 
 Part F's laptop, against this: `framebuffer: 1366x768 pitch 5504 padding 40`, the console at
-`170x48 cells at scale 1`, both bars spanning the screen, the greeter centred. The padding is the
-one number QEMU never showed the guest.
+`170x48 cells at scale 1`, both bars spanning the screen, the greeter centred, and the wallpaper
+filling it. Two numbers QEMU never showed the guest — the padding, and a width that is not a
+multiple of 8 — so an error found only there is most likely in the arithmetic they touch.
 
 ### Left alone
 
-- **A padded stride in QEMU** — see § The pitch.
+- **A padded stride, or a 1366-pixel width, in QEMU** — see § What QEMU can show and § The pitch.
+- **The leaf in an application's namespace.** Applications are bound `/dev/draw/new` alone (M7
+  Part E), and no application reads the screen's size, so widening that bind would be unchecked:
+  `verify_app_namespace` checks only that `new` resolves and `manage` does not. It is widened, with a
+  check of its own, when an application first reads the leaf — the reasoning the shell already
+  applies to `/applications`.
+- **Scaling the wallpaper up.** `TODO(wallpaper-fill)`, narrowed above.
 - **Scaling the interface for a dense screen.** At 2560×1440 the desktop is small; that is a
   resolution-*dependent* feature, not the independence this part checks.
 - **Changing modes after boot.** The screen is the size Limine handed over for the life of the
