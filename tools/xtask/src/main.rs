@@ -9147,6 +9147,20 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
 
+    // `desktop-shell`'s library — the desktop-entry parser, the modal's filter, and since Phase 5
+    // Part E the layout arithmetic on the screen's size (entry capacity, the indicator, the window
+    // list's placement). **Its own doc said this ran long before it did**: the three tests it had
+    // were compiled by nothing, so a capacity bug that painted an entry under the indicator would
+    // have passed CI.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("desktop-shell")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
     // `tty-server`'s line discipline — the part with all the behaviour and none of the
     // syscalls. Line editing existed three times before this server and the copies
     // disagreed (the `alicepassword:` prompt bug), so the one implementation is tested
@@ -11862,6 +11876,9 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
             libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
                 .ok_or("the staged wallpaper path does not fit a ThemePath")?,
         );
+        // **Filled, not fitted** (Phase 5 Part E): the picture is 16:10 and the laptop is 16:9, and
+        // a fitted picture leaves bars of bare ground down both sides of the screen.
+        shipped.wallpaper_mode = libdraw::theme::WallpaperMode::Fill;
         text.push_str(&shipped.to_config());
         let path = staging.join(DEMO_HOME.trim_start_matches('/')).join("theme.toml");
         fs::write(&path, text.as_bytes()).map_err(|e| format!("stage {}: {e}", path.display()))?;

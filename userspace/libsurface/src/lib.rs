@@ -45,6 +45,7 @@ use librsproto::surface::{
 
 pub mod buffers;
 pub mod ipc;
+pub mod screen;
 
 /// What went wrong.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

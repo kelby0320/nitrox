@@ -2,7 +2,7 @@
 
 ## Status
 
-**Partly built, and checked 2026-09-04** — Milestone 7 Part E built the shell and M8 Part C
+**Partly built, and checked 2026-09-15** — Milestone 7 Part E built the shell and M8 Part C
 added its second bar; M12 Part A added dialog placement and made the taskbar's insist a second
 click; M12 Part E bound `/dev/clipboard` into every application namespace it constructs, and
 Part F gave it the **wallpaper** — a full-screen bottom-most `Role::Panel` with a zero
@@ -10,8 +10,10 @@ reservation, holding a PNG the theme names and this shell decodes, because the s
 `/home` and a theme where the compositor holds neither; **M13 Part C made the overview a
 translucent `ARGB8888` surface over the live desktop**, replacing the dimmed copy of the wallpaper
 it used to redraw, and **M14 Part H made the applications modal list desktop entries** rather than
-every program in `/bin` (see [`clipboard.md`](clipboard.md) and
-`display-arm-plan.md` M12 decision 2);
+every program in `/bin`; and **Phase 5 Part E laid it out on the screen it is on** — every bar, the
+wallpaper, the overview and the placement cascade sized from `/dev/draw/screen` rather than a
+written-down 1280×800 (see [`clipboard.md`](clipboard.md) and `display-arm-plan.md` M12 decision
+2);
 [`desktop-shell`](../../userspace/desktop-shell) is the code. Graduated from `design/` on
 2026-08-25, revision 2.
 
@@ -137,7 +139,7 @@ GNOME 2 window list; GNOME 3's automatic workspace lifecycle is shelved rather t
 
 | Surface | Persistent? | Contents | Churn |
 |---|---|---|---|
-| **Wallpaper** | yes | the picture the theme names, fitted and centred | **none** — drawn once at startup |
+| **Wallpaper** | yes | the picture the theme names, placed by its `wallpaper_mode`: fitted and centred, or filling the screen with the overhang cropped | **none** — drawn once at startup |
 | **Top bar** | yes | workspaces button (left), applications button, clock (centre), tray (right, v2) | low |
 | **Bottom bar** | yes | window list, desktop indicator | **high** — every open, close, retitle, focus change |
 | **Applications modal** | no | search field, filtered entries | **highest** — the whole list is rebuilt per keystroke |
@@ -153,6 +155,14 @@ cannot take focus, a zero reservation subtracts nothing, and the compositor's st
 creation-ordered so creating it first puts it under everything. Like the bars it is made
 **sticky**, because a picture behind everything belongs to the screen rather than to one desktop.
 It is absent when the theme names no file, which is the shipped default.
+
+**Everything here is sized from the screen, read once** (Phase 5 Part E): `/dev/draw/screen` at
+startup gives the width the bars span, the height the window list sits a bar above, the wallpaper's
+and the overview's full-screen buffers, and the height the placement cascade wraps at. The
+arithmetic — how many window-list entries fit beside the indicator, where the indicator starts,
+how many thumbnail columns fit beside the sidebar — is `desktop_shell::Screen`, host-tested at every
+size rather than asserted at one. A screen the shell cannot read is fatal: the leaf resolves
+through the same binding its connection just did, and bars sized by a guess are what this replaced.
 
 **And the overview sits over it.** The overview is a full-screen **`ARGB8888`** window (M13
 Part C) — the one surface this shell creates that is not opaque. Its ground is a single

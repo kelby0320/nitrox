@@ -76,7 +76,7 @@ the dark theme M11 Part E replaced (PR #265 review, finding 6). The shipped file
 | `font_ui` | `"/path"` | The face labels, buttons and list rows are drawn with — proportional |
 | `font_mono` | `"/path"` | The face a character grid is drawn with — fixed advance |
 | `wallpaper` | `"/path"` or `""` | A PNG to draw behind everything. Empty means none |
-| `wallpaper_mode` | `"fit"` | How it is placed when it is not the screen's size |
+| `wallpaper_mode` | `"fit"` or `"fill"` | How it is placed when it is not the screen's size |
 
 **The six `syntax_*` keys are the one place a colour is not derived from a surface** (M14
 Part G). Every other key here is a ground or its ink, and a widget wanting a third was told to
@@ -97,12 +97,18 @@ holds neither and should not gain a filesystem in order to draw — and puts it 
 bottom-most window it owns. A file that is absent, unreadable, or not a PNG this decoder handles
 leaves the desktop its `desktop` colour and says on the console which of those it was.
 
-**`wallpaper_mode` has exactly one legal value today**, and that is the point of it existing:
-`fit` scales a too-large picture down to fit inside the screen with its aspect ratio kept, and
-centres a smaller one. Filling the screen needs an upscaler and a decision about interpolation —
-`TODO(wallpaper-fill)` — so the *dimension* is in the schema now and a second mode will be a
-value rather than a new key. A file naming `fill` is refused by name rather than quietly fitted,
-which is what makes that deferral observable from the outside.
+**`wallpaper_mode` has two values**, and the key existed before the second so that it would be a
+value rather than a new key (M12 decision 7):
+
+- **`fit`** — the built-in theme's — scales a too-large picture down to fit inside the screen with
+  its aspect ratio kept, and centres a smaller one.
+- **`fill`** — the staged theme's, since Phase 5 Part E put a 16:10 picture on a 16:9 screen —
+  scales the picture down to *cover* the screen and crops the overhang, centred.
+
+**Neither scales up.** A `fill` whose picture is smaller than the screen in either axis draws it at
+its own size, centred, which is what `fit` would have done with it; upscaling needs a decision about
+interpolation and is `TODO(wallpaper-fill)`. Any other value is refused by name rather than quietly
+fitted.
 
 **What the decoder accepts**: bit depth 8, every colour type (greyscale, RGB, palette,
 greyscale+alpha, RGBA), not interlaced, and at most 64 megapixels. An alpha channel is read past

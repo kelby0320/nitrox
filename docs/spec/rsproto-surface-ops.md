@@ -11,8 +11,9 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 extension the `format` word was reserved for, so no envelope or offset changed.
 `CreateWindow`, `AttachBuffer`, `Commit`, `Release`, `DestroyWindow`, `KeyEvent` and
 `PointerEvent` are defined, and
-three paths resolve: `/dev/draw/new` for a session, `/dev/draw/<N>/info` for a window's
-metadata, and `/dev/draw/manage` for the **manager channel** (M6 Part B, 2026-08-19). A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
+four paths resolve: `/dev/draw/new` for a session, `/dev/draw/<N>/info` for a window's
+metadata, `/dev/draw/manage` for the **manager channel** (M6 Part B, 2026-08-19), and
+`/dev/draw/screen` for the screen's size (Phase 5 Part E, 2026-09-15). A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
 capture and window movement are later milestones and will extend this category. Ports are
 **unscheduled**: durable window-to-window wiring was cut on 2026-08-21, and what keeps ports —
 a command line addressing a running window — wants a shape that has not been designed yet
@@ -170,6 +171,34 @@ that precedes every mapping.
 If a future role holds content whose existence or placement must be hidden from a peer that
 already has draw access, **both doors have to change together** — scoping the session
 channel alone would achieve nothing while this path answers freely.
+
+## Reading the screen's size — `/dev/draw/screen`
+
+Resolving **`/dev/draw/screen`** answers, like `info`, with a **`MemoryObject` of exactly 16 bytes**
+(`OBJECT_KIND_MEMOBJ`) holding one `ScreenInfo`:
+
+| Offset | Size | Type | Field |
+|---|---|---|---|
+| 0 | 4 | `u32` | `width` — the screen's visible width in pixels |
+| 4 | 4 | `u32` | `height` — its visible height |
+| 8 | 8 | — | reserved: written as zero, **ignored on read** |
+
+All fields are little-endian. A read of fewer than 16 bytes is **refused, not read short**, and a
+reader treats a zero width or height as malformed rather than as a screen. The reserved half lets a
+later screen fact arrive without a length change, and a reader that ignores it degrades to not
+knowing that fact.
+
+**For a client with no manager channel.** A manager already has the size — `QueryLayout` replies
+with it beside the work area — but a greeter runs before any manager exists, and before Phase 5
+Part E nothing else could learn the size, so the two clients that needed it wrote 1280×800 down.
+On a 768-row screen that put the shell's window list below the last row.
+
+**Any holder of `/dev/draw` may read it.** The size grants nothing: placing a window is still a
+request a manager decides. Like `info`, each resolve mints a fresh snapshot, and the size is fixed
+for the life of the compositor — it is the framebuffer's, and nothing changes the mode after boot.
+
+**Not in an application's namespace.** An application is bound `/dev/draw/new` alone (M7 Part E),
+and none reads the screen's size yet; that bind is widened, with a check of its own, when one does.
 
 ## The buffer lifecycle
 

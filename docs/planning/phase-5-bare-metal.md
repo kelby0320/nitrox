@@ -927,39 +927,39 @@ What stays unseen until Part F is the laptop's own padding and its width that is
 
 **E.1 — the screen leaf**
 
-- [ ] The compositor classifies `screen` beside `new`, `manage` and `<N>/info`, and answers a
+- [x] The compositor classifies `screen` beside `new`, `manage` and `<N>/info`, and answers a
       resolve with a `MemoryObject` holding the screen's `width` and `height` (`u32`, little-endian)
       and room reserved for what a later screen may add. A read shorter than the object is refused,
       as `info`'s is.
-- [ ] `docs/spec/rsproto-surface-ops.md` gains the section, beside `/dev/draw/<N>/info`.
+- [x] `docs/spec/rsproto-surface-ops.md` gains the section, beside `/dev/draw/<N>/info`.
 
 **E.2 — the clients ask, and the constants go**
 
-- [ ] **`SCREEN_W` and `SCREEN_H` are deleted** from `desktop-shell` and `desktop-session-mgr`, and
+- [x] **`SCREEN_W` and `SCREEN_H` are deleted** from `desktop-shell` and `desktop-session-mgr`, and
       `BAR_PITCH` and `OVER_PITCH` with them, so every site that used one fails to compile rather
       than being found by reading. The size is read from the leaf once at startup and passed down.
-- [ ] **`desktop-shell`** sizes both bars, the wallpaper window, the placement bounds and the entry
+- [x] **`desktop-shell`** sizes both bars, the wallpaper window, the placement bounds and the entry
       capacity from it, and places the window list at `height − BAR_H`. **The overview** too:
       `render_overview`'s popup and sidebar, `open_overview`, `present_overview` and
       `close_overview`'s buffers, `mini_wallpaper`'s reading of the wallpaper buffer — which, left at
       the old width over a 1360-wide buffer, would read every row 320 bytes (80 px) out of step and
       log nothing — and `desktop_preview`'s scaling of window origins. The work area still comes from
       `QueryLayout`.
-- [ ] **The greeter** centres on the leaf's size, and logs the origin it asked for, so a gate can
+- [x] **The greeter** centres on the leaf's size, and logs the origin it asked for, so a gate can
       check the centring rather than look at it.
-- [ ] **No size to fall back on.** A greeter that cannot resolve the leaf logs it and asks for the
+- [x] **No size to fall back on.** A greeter that cannot resolve the leaf logs it and asks for the
       origin; a shell that cannot logs it and takes the size from `QueryLayout`, and without a
       manager either, draws no bars. Each is a visible wrong in a session that still starts, and
       none needs a size written down.
-- [ ] **`fill` becomes a legal `wallpaper_mode`**: `docs/spec/theme-toml-schema.md` names both values,
+- [x] **`fill` becomes a legal `wallpaper_mode`**: `docs/spec/theme-toml-schema.md` names both values,
       `libdraw::theme` parses it (the refusal test keeps refusing a value that is neither, by name),
       and the theme `xtask` stages names `fill`.
-- [ ] **`libdraw::scale::fill`** beside `fit`: the smallest scale that covers the screen, capped at
+- [x] **`libdraw::scale::fill`** beside `fit`: the smallest scale that covers the screen, capped at
       1, centred, the overhang cropped. Its plan's origin is signed — `Fit::origin`'s "never
       negative" stays true of `fit` and is not borrowed. Host tests: 16:10 into 16:9 (at 1360×768,
       `drawn 1360x850 at 0,-41`), 16:9 into 16:10, and a picture smaller than the screen, drawn at
       its own size and centred.
-- [ ] **`TODO(wallpaper-fill)` narrows to the upscaler** in `docs/rationale/deferred-decisions.md`:
+- [x] **`TODO(wallpaper-fill)` narrows to the upscaler** in `docs/rationale/deferred-decisions.md`:
       filling by scaling down exists, and a picture that would need scaling up to cover the screen
       is the trigger that remains.
 

@@ -308,6 +308,48 @@ impl WindowInfo {
     }
 }
 
+// --- Screen info ------------------------------------------------------------
+
+/// What `/dev/draw/screen` reports: the size of the screen the compositor draws on.
+///
+/// Served like [`WindowInfo`], as the bytes of a small `MemoryObject` a resolve answers with.
+/// **Readable by anyone holding `/dev/draw`**: the size grants no placement authority, and a
+/// client with no manager channel — a greeter, before any shell runs — has no other way to learn
+/// it. Before Phase 5 Part E nothing did, so the two clients that needed it wrote 1280×800 down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ScreenInfo {
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+}
+
+/// Bytes in a serialised [`ScreenInfo`] — the exact size of a `/dev/draw/screen` object. The last
+/// eight are reserved, written as zero and ignored on read, so a later screen fact costs no growth.
+pub const SCREEN_INFO_LEN: usize = 16;
+
+impl ScreenInfo {
+    /// Serialise into `out`, reserved bytes zeroed; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < SCREEN_INFO_LEN {
+            return None;
+        }
+        put_u32(out, 0, self.width);
+        put_u32(out, 4, self.height);
+        out[8..SCREEN_INFO_LEN].fill(0);
+        Some(SCREEN_INFO_LEN)
+    }
+
+    /// Parse from a mapped `screen` object. `None` for a slice shorter than
+    /// [`SCREEN_INFO_LEN`], which would otherwise read as a screen of zero size.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < SCREEN_INFO_LEN {
+            return None;
+        }
+        Some(Self { width: get_u32(b, 0), height: get_u32(b, 4) })
+    }
+}
+
 // --- CreateWindow -----------------------------------------------------------
 
 /// Body length of a `CreateWindowRequest`.
@@ -2832,6 +2874,28 @@ mod tests {
             assert!(WindowInfo::read(&buf[..short]).is_none(), "len {short}");
         }
         assert!(WindowInfo::read(&buf).is_some());
+    }
+
+    #[test]
+    fn screen_info_sits_at_the_offsets_the_spec_publishes_and_zeroes_the_rest() {
+        let mut buf = [0xAAu8; SCREEN_INFO_LEN];
+        assert_eq!(ScreenInfo { width: 1360, height: 768 }.write(&mut buf), Some(SCREEN_INFO_LEN));
+        assert_eq!(&buf[0..4], &1360u32.to_le_bytes());
+        assert_eq!(&buf[4..8], &768u32.to_le_bytes());
+        assert_eq!(&buf[8..], &[0u8; 8], "the reserved bytes are written, not left as they were");
+        assert_eq!(ScreenInfo::default().write(&mut [0u8; SCREEN_INFO_LEN - 1]), None);
+    }
+
+    #[test]
+    fn a_screen_info_reader_ignores_the_reserved_bytes_and_refuses_a_short_object() {
+        // Bytes this writer never produces: a later compositor's use of the reserved half.
+        let mut bytes = [0xFFu8; SCREEN_INFO_LEN];
+        bytes[0..4].copy_from_slice(&1024u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&768u32.to_le_bytes());
+        assert_eq!(ScreenInfo::read(&bytes), Some(ScreenInfo { width: 1024, height: 768 }));
+        for short in 0..SCREEN_INFO_LEN {
+            assert_eq!(ScreenInfo::read(&bytes[..short]), None, "len {short}");
+        }
     }
 
     #[test]

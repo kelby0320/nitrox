@@ -86,7 +86,10 @@ use libui::element::{
 use libui::diff::Tree;
 use libui::layout::layout;
 use libui::route::Router;
-use desktop_shell::{Application, matches_app, parse_entry};
+use desktop_shell::{
+    Application, BAR_H, ENTRY_W, INDICATOR_W, SIDE_W, Screen, THUMB_PAD, THUMB_W, matches_app,
+    parse_entry,
+};
 use libui::paint::{FontMetrics, Theme, paint, paint_over};
 use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
 
@@ -148,19 +151,6 @@ fn next_minute(now: u64) -> u64 {
     now.saturating_add(MINUTE - nanos % MINUTE)
 }
 
-/// The screen's width, which the top bar spans.
-///
-/// Fixed rather than queried: the compositor has no "what size is the screen" op, and adding
-/// one to draw a bar would be a protocol change made for a stub's convenience. `check-display`
-/// already hardcodes the same 1280×800.
-const SCREEN_W: u32 = 1280;
-/// The top bar's height.
-const BAR_H: u32 = 24;
-/// The screen's height, which bounds the placement cascade. Fixed for the same reason
-/// [`SCREEN_W`] is.
-const SCREEN_H: i32 = 800;
-/// Bytes per row.
-const BAR_PITCH: usize = (SCREEN_W as usize) * 4;
 /// How many buffers the bar attaches.
 const BUFFERS: usize = 2;
 
@@ -341,44 +331,6 @@ fn desktop_label(desktops: &[Desktop], current: u32) -> alloc::string::String {
     s
 }
 
-/// Width of one window-list entry, in pixels.
-const ENTRY_W: u32 = 180;
-
-/// Width of the desktop indicator at the bar's right-hand end.
-const INDICATOR_W: u32 = 160;
-
-/// Where the indicator starts, in bar-local x. Clicks at or past this belong to it.
-///
-/// **Anchored to the screen's right edge, and now actually drawn there.** The first version
-/// asserted this while laying the indicator out *after* the entries, so it was drawn at
-/// `n * ENTRY_W` and the two coincided at exactly one window count — everywhere else the
-/// indicator a user could see did nothing, and at a full bar the region hit-tested as the
-/// indicator was *painted* as the last window entry, so clicking that entry switched desktops
-/// (PR #243 review, blocking 2). A flexible spacer between the entries and the indicator is
-/// what makes the claim true, and `MAX_ENTRIES` reserves the width so the indicator is never
-/// squeezed into what is left.
-const INDICATOR_X: u32 = SCREEN_W - INDICATOR_W;
-
-/// **No window entry may be painted under the indicator's hit region.**
-///
-/// This is the half of the misalignment that is a *correctness* bug rather than a usability
-/// one: with `MAX_ENTRIES` computed from the full screen width, a full bar painted an entry
-/// across x∈[1120,1260) while the hit-test read that range as the indicator, so clicking the
-/// last window switched desktops instead of raising it (PR #243 review, blocking 2).
-///
-/// Tied here rather than left to the two constants agreeing by inspection, because they are
-/// derived in different places and only their *product* is the invariant. It is checked by the
-/// **image** build — `cargo xtask test` does not compile this binary.
-const _: () = assert!(MAX_ENTRIES as u32 * ENTRY_W + INDICATOR_W <= SCREEN_W);
-
-/// How many entries the bottom bar can show.
-///
-/// Bounded because the bar is: past this the row would overflow the screen and later entries
-/// would be laid out off it, which is a window you cannot get back rather than a cosmetic
-/// problem. Entries past the limit are simply not shown — the window is still there, still
-/// raisable by clicking it.
-const MAX_ENTRIES: usize = ((SCREEN_W - INDICATOR_W) / ENTRY_W) as usize;
-
 /// The label an entry shows: its title, marked with what the shell knows about it.
 ///
 /// **Marked rather than styled**, for now. The toolkit can colour a row, but the milestone that
@@ -425,8 +377,10 @@ fn entry_label(e: &WinEntry) -> alloc::string::String {
 /// **The filter Part C could not write.** It listed every `normal` window because nothing
 /// switched desktops yet; now that something does, a bar showing another desktop's windows
 /// would be showing you what you just navigated away from.
-fn visible_entries(entries: &[WinEntry], current: u32) -> alloc::vec::Vec<&WinEntry> {
-    entries.iter().filter(|e| e.desktop == current).take(MAX_ENTRIES).collect()
+///
+/// **At most [`Screen::max_entries`]**, so no entry is painted under the indicator's hit region.
+fn visible_entries(entries: &[WinEntry], current: u32, screen: Screen) -> alloc::vec::Vec<&WinEntry> {
+    entries.iter().filter(|e| e.desktop == current).take(screen.max_entries()).collect()
 }
 
 /// One taskbar entry: a bordered button, marked when its window holds the keyboard.
@@ -481,12 +435,13 @@ fn render_window_bar(
     font: &Font,
     shown: &[&WinEntry],
     label: &str,
+    screen: Screen,
 ) -> MemFramebuffer {
-    let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
+    let geometry = Geometry::with_pitch(screen.width, BAR_H, screen.pitch(), PixelFormat::XRGB8888)
         .unwrap_or_else(|| fail(b"desktop-shell: bad bottom bar geometry\n"));
     let mut fb = MemFramebuffer::new(geometry);
     let ui = window_bar_view(shown, label, theme);
-    let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
+    let bounds = Rect::new(0, 0, screen.width, BAR_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
@@ -718,12 +673,12 @@ fn panel(theme: &Theme) -> Theme {
 }
 
 /// Render the top bar.
-fn render_bar(theme: &Theme, font: &Font, clock: &str) -> MemFramebuffer {
-    let geometry = Geometry::with_pitch(SCREEN_W, BAR_H, BAR_PITCH, PixelFormat::XRGB8888)
+fn render_bar(theme: &Theme, font: &Font, clock: &str, screen: Screen) -> MemFramebuffer {
+    let geometry = Geometry::with_pitch(screen.width, BAR_H, screen.pitch(), PixelFormat::XRGB8888)
         .expect("the bar pitch is wide enough for a row");
     let mut fb = MemFramebuffer::new(geometry);
     let ui = bar_view(clock);
-    let bounds = Rect::new(0, 0, SCREEN_W, BAR_H);
+    let bounds = Rect::new(0, 0, screen.width, BAR_H);
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
@@ -1391,8 +1346,8 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
 struct Wallpaper {
     /// The window it lives in: named among the shell's own, and made sticky.
     window: u32,
-    /// The screen-sized XRGB8888 composition, pitch `SCREEN_W * 4`. Ground, picture and
-    /// letterbox, exactly as committed.
+    /// The screen-sized XRGB8888 composition, pitch [`Screen::pitch`]. Ground and picture,
+    /// exactly as committed.
     picture: alloc::vec::Vec<u8>,
 }
 
@@ -1425,6 +1380,7 @@ fn open_wallpaper(
     ns: u64,
     session: &mut Session<ChannelTransport>,
     theme: &Theme,
+    screen: Screen,
 ) -> Option<Wallpaper> {
     let path = theme.wallpaper.as_ref()?;
     let bytes = match libfs::read_file(ns, path.as_str().as_bytes()) {
@@ -1454,12 +1410,13 @@ fn open_wallpaper(
             return None;
         }
     };
-    let screen = Size::new(SCREEN_W, SCREEN_H as u32);
-    let plan = libdraw::scale::fit(Size::new(image.width(), image.height()), screen);
-    let pitch = SCREEN_W as usize * 4;
-    let len = pitch * SCREEN_H as usize;
+    let size = Size::new(screen.width, screen.height);
+    // **Fit or fill, as the theme says** (M12 decision 7's key; `fill` since Phase 5 Part E).
+    let plan = theme.wallpaper_mode.plan(Size::new(image.width(), image.height()), size);
+    let pitch = screen.pitch();
+    let len = pitch * screen.height as usize;
     let Some(geometry) =
-        Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, pitch, PixelFormat::XRGB8888)
+        Geometry::with_pitch(screen.width, screen.height, pitch, PixelFormat::XRGB8888)
     else {
         kprint(b"desktop-shell: the wallpaper geometry is unusable\n");
         return None;
@@ -1472,7 +1429,7 @@ fn open_wallpaper(
     }
 
     let role = Role::Panel { dock: Edge::Top, reserve: 0 };
-    let id = match session.create(&CreateWindowRequest::new(SCREEN_W, SCREEN_H as u32, role), BUFFERS)
+    let id = match session.create(&CreateWindowRequest::new(screen.width, screen.height, role), BUFFERS)
     {
         Ok(id) => id,
         Err(_) => {
@@ -1502,7 +1459,7 @@ fn open_wallpaper(
             ok = false;
             break;
         };
-        if w.attach(i as u32, SCREEN_W, SCREEN_H as u32, pitch as u32, handle).is_err() {
+        if w.attach(i as u32, screen.width, screen.height, pitch as u32, handle).is_err() {
             kprint(b"desktop-shell: wallpaper AttachBuffer FAILED\n");
             ok = false;
             break;
@@ -1513,7 +1470,7 @@ fn open_wallpaper(
         // `match` arm's condition.
         match session.window(id) {
             Some(mut w) => {
-                if w.commit(0, (0, 0, SCREEN_W, SCREEN_H as u32)).is_err() {
+                if w.commit(0, (0, 0, screen.width, screen.height)).is_err() {
                     kprint(b"desktop-shell: wallpaper Commit FAILED\n");
                     ok = false;
                 }
@@ -1736,10 +1693,30 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     };
     let mut session = Session::new(transport);
 
+    // **The screen's size, asked** (Phase 5 Part E) — every bar, the wallpaper, the overview and
+    // the placement cascade are laid out on it. It was written down as 1280×800 until then, and
+    // on a 768-row screen that put the window list below the last row.
+    //
+    // **Fatal if it cannot be read**, which is narrower than it sounds: the leaf resolves through
+    // the same `/dev/draw` binding the connect above just used, so the one way to reach this is a
+    // compositor that does not serve it. A shell that guessed a size instead would be the bug this
+    // replaced, drawn somewhere a person cannot see.
+    // SAFETY: `session_ns` is live for this process's whole run.
+    let screen = match unsafe { libsurface::screen::read(session_ns) } {
+        Ok(s) => Screen { width: s.width, height: s.height },
+        Err(_) => fail(b"desktop-shell: /dev/draw/screen unreadable; cannot lay out the desktop\n"),
+    };
+    Line::new()
+        .s(b"desktop-shell: screen ")
+        .u(screen.width as u64)
+        .s(b"x")
+        .u(screen.height as u64)
+        .end();
+
     // **The wallpaper, before anything else this shell creates** (M12 Part F). Creation order
     // is bottom-first in the compositor's stack, so making it first is what makes it bottom-most
     // — no `Manage::Lower` needed, and nothing this shell raises later can get underneath it.
-    let wallpaper = open_wallpaper(session_ns, &mut session, &theme);
+    let wallpaper = open_wallpaper(session_ns, &mut session, &theme, screen);
     // Read often enough to be worth naming once. `0` is not a window id, so it is the "none"
     // every `ours`-style check already treats as absent.
     let wallpaper_window = wallpaper.as_ref().map_or(0, |w| w.window);
@@ -1752,7 +1729,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // that deriving it would make a bar that reserves less than it occupies inexpressible.
     // A bar wants them equal.
     let role = Role::Panel { dock: Edge::Top, reserve: BAR_H };
-    let window = match session.create(&CreateWindowRequest::new(SCREEN_W, BAR_H, role), BUFFERS) {
+    let window = match session.create(&CreateWindowRequest::new(screen.width, BAR_H, role), BUFFERS) {
         Ok(id) => id,
         Err(_) => fail(b"desktop-shell: top bar CreateWindow FAILED\n"),
     };
@@ -1776,8 +1753,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
         l.end();
     }
-    let picture = render_bar(&theme, &font, &shown_clock).into_bytes();
-    let len = BAR_PITCH * BAR_H as usize;
+    let picture = render_bar(&theme, &font, &shown_clock, screen).into_bytes();
+    let len = screen.pitch() * BAR_H as usize;
     if picture.len() != len {
         fail(b"desktop-shell: top bar render is not the size it declares\n");
     }
@@ -1792,14 +1769,14 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         let Some(mut w) = session.window(window) else {
             fail(b"desktop-shell: top bar window vanished\n");
         };
-        if w.attach(i as u32, SCREEN_W, BAR_H, BAR_PITCH as u32, handle).is_err() {
+        if w.attach(i as u32, screen.width, BAR_H, screen.pitch() as u32, handle).is_err() {
             fail(b"desktop-shell: top bar AttachBuffer FAILED\n");
         }
     }
     let Some(mut w) = session.window(window) else {
         fail(b"desktop-shell: top bar window vanished\n");
     };
-    if w.commit(0, (0, 0, SCREEN_W, BAR_H)).is_err() {
+    if w.commit(0, (0, 0, screen.width, BAR_H)).is_err() {
         fail(b"desktop-shell: top bar Commit FAILED\n");
     }
 
@@ -1867,7 +1844,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         .s(b"desktop-shell: top bar presented, window ")
         .u(window as u64)
         .s(b" ")
-        .u(SCREEN_W as u64)
+        .u(screen.width as u64)
         .s(b"x")
         .u(BAR_H as u64)
         .end();
@@ -1896,7 +1873,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let mut current_desktop: u32 = 1;
     let mut bottom_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
     let bottom = match session.create(
-        &CreateWindowRequest::new(SCREEN_W, BAR_H, Role::Panel { dock: Edge::Bottom, reserve: BAR_H }),
+        &CreateWindowRequest::new(screen.width, BAR_H, Role::Panel { dock: Edge::Bottom, reserve: BAR_H }),
         BUFFERS,
     ) {
         Ok(id) => {
@@ -1911,7 +1888,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     ok = false;
                     break;
                 };
-                if w.attach(i as u32, SCREEN_W, BAR_H, BAR_PITCH as u32, handle).is_err() {
+                if w.attach(i as u32, screen.width, BAR_H, screen.pitch() as u32, handle).is_err() {
                     ok = false;
                     break;
                 }
@@ -1961,9 +1938,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     };
     // **The work area, from the compositor rather than from arithmetic here.** The shell's own
     // two bars are not the only struts a session can have — any `panel`-role client declares
-    // one — and a maximised window computed from `SCREEN_H - BAR_H * 2` would sit under the next
+    // one — and a maximised window computed from the screen's height less two bars would sit under the next
     // one with nothing able to notice. Kept current by `LayoutChanged` below (M9 Part B).
-    let mut layout = manager.as_mut().and_then(query_layout).unwrap_or(default_layout());
+    let mut layout = manager.as_mut().and_then(query_layout).unwrap_or(default_layout(screen));
     Line::new()
         .s(b"desktop-shell: work area ")
         .i(layout.work_x as i64)
@@ -2075,10 +2052,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     if let Some(id) = bottom
         && let Some(m) = manager.as_mut()
     {
-        place_window(m, id, 0, SCREEN_H - BAR_H as i32);
+        place_window(m, id, 0, screen.window_list_y());
         Line::new()
             .s(b"desktop-shell: bottom bar placed at 0,")
-            .i((SCREEN_H - BAR_H as i32) as i64)
+            .i(screen.window_list_y() as i64)
             .end();
     }
 
@@ -2245,6 +2222,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut dropped,
                 &mut restore,
                 current_desktop,
+                screen,
             );
 
             // **A gesture the user finished, answered with the `Configure` it asked for**
@@ -2345,7 +2323,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut next_desktop_id,
             );
             for id in fired {
-                // **Bounded exactly as the click is**, and the reason is `MAX_ENTRIES`' own:
+                // **Bounded exactly as the click is**, and the reason is `Screen::max_entries`' own:
                 // an entry past it is neither drawn nor clickable, so minimizing one would take
                 // the window off screen with no way to bring it back — "a window you cannot get
                 // back rather than a cosmetic problem", which is what that bound exists to
@@ -2438,13 +2416,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     continue;
                 }
                 // **Bounded by what the bar is *showing*, which since Part D is not the first
-                // `MAX_ENTRIES` of the global list but the first `MAX_ENTRIES` on the current
+                // `max_entries` of the global list but the first `max_entries` on the current
                 // desktop.** With seven windows on another desktop and one here, the one here
                 // is drawn, clickable and focused — and its index in `entries` is 7, so a bound
                 // over the global list never reached it and the chord silently did nothing for
                 // a window the bar was showing (PR #243 review, finding 5).
                 let shown_now: alloc::vec::Vec<u32> =
-                    visible_entries(&entries, current_desktop).iter().map(|e| e.id).collect();
+                    visible_entries(&entries, current_desktop, screen).iter().map(|e| e.id).collect();
                 if id == HOTKEY_MINIMIZE
                     && let Some(e) = entries
                         .iter_mut()
@@ -2764,7 +2742,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     && k.pressed != 0
                     && k.keycode == KEY_ESC
                 {
-                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_addrs);
+                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_addrs, screen);
                     continue;
                 }
                 if let libsurface::WindowEvent::Pointer(p) = event
@@ -2779,7 +2757,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // has nothing to be wrong about. That deferral named this as its second
                         // consumer; it is re-deferred rather than answered, and the reason is
                         // that this drag does not need what it is about.
-                        dragging = thumb_at(p.x, p.y, shots.len()).map(|i| shots[i].0);
+                        dragging = thumb_at(p.x, p.y, shots.len(), screen).map(|i| shots[i].0);
                         if let Some(id) = dragging {
                             Line::new()
                                 .s(b"desktop-shell: dragging window ")
@@ -2806,8 +2784,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // drag was wired up, and only the drag was gated — which is how an
                         // unimplemented affordance passed for a tested one.
                         let picked = dragging.take();
-                        let row = side_row_at(p.x, p.y, desktops.len());
-                        let under = thumb_at(p.x, p.y, shots.len()).map(|i| shots[i].0);
+                        let row = side_row_at(p.x, p.y, desktops.len(), screen);
+                        let under = thumb_at(p.x, p.y, shots.len(), screen).map(|i| shots[i].0);
                         match (picked, row) {
                             (Some(wid), Some(i)) => {
                                 if let Some(m) = manager.as_mut() {
@@ -2839,6 +2817,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                             &mut shots,
                                             &mut dragging,
                                             &mut over_addrs,
+                                            screen,
                                         );
                                     }
                                 }
@@ -2864,6 +2843,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                             &mut shots,
                                             &mut dragging,
                                             &mut over_addrs,
+                                            screen,
                                         );
                                     }
                                 }
@@ -2881,6 +2861,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                     &mut shots,
                                     &mut dragging,
                                     &mut over_addrs,
+                                    screen,
                                 );
                             }
                             (None, Some(i)) => {
@@ -2911,6 +2892,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                     &mut shots,
                                     &mut dragging,
                                     &mut over_addrs,
+                                    screen,
                                 );
                             }
                             // A drag let go over nothing, which is not an error — abandoning a
@@ -2956,7 +2938,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // the overview, which is Part E — until then the indicator is the only pointer
                 // way to change desktops, and a control that does nothing until a later
                 // milestone is worse than one that does the obvious thing.
-                if p.x as u32 >= INDICATOR_X {
+                if p.x as u32 >= screen.indicator_x() {
                     // **Clicking the indicator opens the overview** (`desktop-shell.md` §7),
                     // which is what it was always specified to do — Part D made it advance to
                     // the next desktop only because there was no overview to open yet.
@@ -2964,11 +2946,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         && let Some(m) = manager.as_mut()
                     {
                         sent_request = true;
-                        recapture(m, &entries, current_desktop, &mut shots);
+                        recapture(m, &entries, current_desktop, &mut shots, screen);
                         overview = open_overview(
                             &mut session, window, &theme, &font, &shots, &desktops,
                             current_desktop, &entries, &mut over_addrs,
-                            wallpaper.as_ref().map(|w| w.picture.as_slice()),
+                            wallpaper.as_ref().map(|w| w.picture.as_slice()), screen,
                         );
                         if let Some(id) = overview {
                             stick(m, id, b"the overview");
@@ -2987,7 +2969,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
                 let i = (p.x as u32 / ENTRY_W) as usize;
                 let shown_ids: alloc::vec::Vec<u32> =
-                    visible_entries(&entries, current_desktop).iter().map(|e| e.id).collect();
+                    visible_entries(&entries, current_desktop, screen).iter().map(|e| e.id).collect();
                 if let Some(&wid) = shown_ids.get(i)
                     && let Some(m) = manager.as_mut()
                 {
@@ -3053,8 +3035,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             let want = clock_text();
             if want != shown_clock {
                 shown_clock = want;
-                let picture = render_bar(&theme, &font, &shown_clock).into_bytes();
-                let len = BAR_PITCH * BAR_H as usize;
+                let picture = render_bar(&theme, &font, &shown_clock, screen).into_bytes();
+                let len = screen.pitch() * BAR_H as usize;
                 // `acquire`, for the reason the bottom bar's repaint gives: a buffer index this
                 // code kept itself would invert its phase on any iteration where the commit did
                 // not go out, and every repaint after that would write into what is on screen.
@@ -3068,7 +3050,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     unsafe {
                         core::ptr::copy_nonoverlapping(picture.as_ptr(), top_addrs[b as usize], len)
                     };
-                    if w.commit(b, (0, 0, SCREEN_W, BAR_H)).is_err() {
+                    if w.commit(b, (0, 0, screen.width, BAR_H)).is_err() {
                         kprint(b"desktop-shell: top bar Commit failed\n");
                     }
                 }
@@ -3081,11 +3063,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if list_dirty
             && let Some(id) = bottom
         {
-            let shown = visible_entries(&entries, current_desktop);
+            let shown = visible_entries(&entries, current_desktop, screen);
             let label = desktop_label(&desktops, current_desktop);
             log_window_list(&shown, &label, desktops.len());
-            let picture = render_window_bar(&theme, &font, &shown, &label).into_bytes();
-            let len = BAR_PITCH * BAR_H as usize;
+            let picture = render_window_bar(&theme, &font, &shown, &label, screen).into_bytes();
+            let len = screen.pitch() * BAR_H as usize;
             // **`acquire`, not an index this code keeps itself.** The first version alternated
             // a counter and advanced it unconditionally while the commit's result was
             // discarded — so any iteration where the commit did not go out inverted the phase,
@@ -3103,7 +3085,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 unsafe {
                     core::ptr::copy_nonoverlapping(picture.as_ptr(), bottom_addrs[b as usize], len)
                 };
-                if w.commit(b, (0, 0, SCREEN_W, BAR_H)).is_err() {
+                if w.commit(b, (0, 0, screen.width, BAR_H)).is_err() {
                     kprint(b"desktop-shell: bottom bar Commit failed\n");
                 }
             }
@@ -3120,11 +3102,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 && let Some(m) = manager.as_mut()
             {
                 sent_request = true;
-                recapture(m, &entries, current_desktop, &mut shots);
+                recapture(m, &entries, current_desktop, &mut shots, screen);
                 present_overview(
                     &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
                     &entries, &over_addrs,
-                    wallpaper.as_ref().map(|w| w.picture.as_slice()),
+                    wallpaper.as_ref().map(|w| w.picture.as_slice()), screen,
                 );
                 Line::new()
                     .s(b"desktop-shell: overview now showing ")
@@ -3427,14 +3409,14 @@ fn query_layout(mgr: &mut ChannelTransport) -> Option<MgrLayout> {
 /// **A shell with no manager channel draws bars and launches things** — see where the channel is
 /// taken — so it still needs numbers, and these are the ones it used everywhere before there was
 /// an op to ask with. Named rather than inlined so the fallback is visible as a fallback.
-fn default_layout() -> MgrLayout {
+fn default_layout(screen: Screen) -> MgrLayout {
     MgrLayout {
-        screen_w: SCREEN_W,
-        screen_h: SCREEN_H as u32,
+        screen_w: screen.width,
+        screen_h: screen.height,
         work_x: 0,
         work_y: BAR_H as i32,
-        work_w: SCREEN_W,
-        work_h: (SCREEN_H as u32).saturating_sub(BAR_H * 2),
+        work_w: screen.width,
+        work_h: screen.height.saturating_sub(BAR_H * 2),
     }
 }
 
@@ -3545,9 +3527,10 @@ fn render_overview(
     current: u32,
     entries: &[WinEntry],
     wallpaper: Option<&[u8]>,
+    screen: Screen,
 ) -> MemFramebuffer {
     let geometry =
-        Geometry::with_pitch(SCREEN_W, SCREEN_H as u32, OVER_PITCH, PixelFormat::ARGB8888)
+        Geometry::with_pitch(screen.width, screen.height, screen.pitch(), PixelFormat::ARGB8888)
             .unwrap_or_else(|| fail(b"desktop-shell: bad overview geometry\n"));
     use libdraw::framebuffer::Framebuffer as _;
     let mut fb = MemFramebuffer::new(geometry);
@@ -3569,7 +3552,7 @@ fn render_overview(
     // **The wallpaper again, scaled once for every miniature that wants it.** Once rather than
     // per row: `box_downscale` averages the whole source per destination pixel, so doing it per
     // desktop would repeat a million reads for an identical answer.
-    let mini = wallpaper.and_then(|p| mini_wallpaper(p));
+    let mini = wallpaper.and_then(|p| mini_wallpaper(p, screen));
 
     // The sidebar's rows, drawn through the toolkit so they look like the rest of the shell.
     let mut rows: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
@@ -3582,7 +3565,7 @@ fn render_overview(
             row(alloc::vec![
                 padding(
                     Insets::all(MINI_PAD),
-                    desktop_preview(entries, d.id, theme, mini.is_some())
+                    desktop_preview(entries, d.id, theme, mini.is_some(), screen)
                 ),
                 padding(Insets { top: 8, right: 8, bottom: 8, left: 0 }, text(label)),
             ]),
@@ -3590,10 +3573,10 @@ fn render_overview(
     }
     let side = column(rows);
     let bounds = Rect::new(
-        (SCREEN_W - SIDE_W) as i32,
+        screen.width.saturating_sub(SIDE_W) as i32,
         BAR_H as i32,
         SIDE_W,
-        SCREEN_H as u32 - BAR_H,
+        screen.height.saturating_sub(BAR_H),
     );
     let metrics = FontMetrics::new(font, theme.font_px);
     let l = layout(&side, bounds, &metrics);
@@ -3642,7 +3625,7 @@ fn render_overview(
     // The thumbnails, blitted straight in: they are already pixels, so there is nothing for the
     // toolkit to lay out and a element per pixel would be absurd.
     for (i, (_, w, h, px)) in shots.iter().enumerate() {
-        let (tx, ty, _, _) = thumb_rect(i);
+        let (tx, ty, _, _) = thumb_rect(i, screen);
         let pitch = (*w as usize) * 4;
         for y in 0..*h {
             for x in 0..*w {
@@ -3663,13 +3646,12 @@ fn render_overview(
 /// **Undimmed, unlike the overview's own ground.** The ground is dimmed so the things drawn over
 /// it read; a miniature *is* the thing being read, and a dimmed one would be a picture of a
 /// desktop nobody has.
-fn mini_wallpaper(picture: &[u8]) -> Option<(alloc::vec::Vec<u8>, Geometry)> {
-    let src = Geometry::with_pitch(
-        SCREEN_W,
-        SCREEN_H as u32,
-        SCREEN_W as usize * 4,
-        PixelFormat::XRGB8888,
-    )?;
+///
+/// **`picture` is the screen-sized composition [`open_wallpaper`] kept, and `screen` must be the
+/// screen it was composed for.** Read at any other width, `box_downscale` still accepts it and
+/// every row comes out that many bytes out of step — sheared, with nothing logged.
+fn mini_wallpaper(picture: &[u8], screen: Screen) -> Option<(alloc::vec::Vec<u8>, Geometry)> {
+    let src = Geometry::with_pitch(screen.width, screen.height, screen.pitch(), PixelFormat::XRGB8888)?;
     let (w, h) = (MINI_W - 2, MINI_H - 2);
     let dst = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888)?;
     let mut out = alloc::vec![0u8; dst.pitch * h as usize];
@@ -3700,9 +3682,10 @@ fn recapture(
     entries: &[WinEntry],
     current: u32,
     shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
+    screen: Screen,
 ) {
     shots.clear();
-    for e in visible_entries(entries, current) {
+    for e in visible_entries(entries, current, screen) {
         if e.minimized {
             continue;
         }
@@ -3730,11 +3713,12 @@ fn open_overview(
     entries: &[WinEntry],
     addrs: &mut [*mut u8; BUFFERS],
     wallpaper: Option<&[u8]>,
+    screen: Screen,
 ) -> Option<u32> {
-    let len = OVER_PITCH * SCREEN_H as usize;
+    let len = screen.pitch() * screen.height as usize;
     let id = session
         .create(
-            &CreateWindowRequest::new(SCREEN_W, SCREEN_H as u32, Role::Popup { parent }),
+            &CreateWindowRequest::new(screen.width, screen.height, Role::Popup { parent }),
             BUFFERS,
         )
         .ok()?;
@@ -3760,9 +3744,9 @@ fn open_overview(
         // desktop shows through its ground.
         if w.attach_with_format(
             i as u32,
-            SCREEN_W,
-            SCREEN_H as u32,
-            OVER_PITCH as u32,
+            screen.width,
+            screen.height,
+            screen.pitch() as u32,
             handle,
             PixelFormat::ARGB8888,
         )
@@ -3791,7 +3775,9 @@ fn open_overview(
     } else {
         kprint(b"desktop-shell: overview ground is the desktop colour\n");
     }
-    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs, wallpaper);
+    present_overview(
+        session, id, theme, font, shots, desktops, current, entries, addrs, wallpaper, screen,
+    );
     Some(id)
 }
 
@@ -3808,10 +3794,11 @@ fn present_overview(
     entries: &[WinEntry],
     addrs: &[*mut u8; BUFFERS],
     wallpaper: Option<&[u8]>,
+    screen: Screen,
 ) {
-    let len = OVER_PITCH * SCREEN_H as usize;
-    let bytes =
-        render_overview(theme, font, shots, desktops, current, entries, wallpaper).into_bytes();
+    let len = screen.pitch() * screen.height as usize;
+    let bytes = render_overview(theme, font, shots, desktops, current, entries, wallpaper, screen)
+        .into_bytes();
     if bytes.len() != len {
         return;
     }
@@ -3824,7 +3811,7 @@ fn present_overview(
     // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
     // allocations, so they cannot overlap.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
-    let _ = w.commit(slot, (0, 0, SCREEN_W, SCREEN_H as u32));
+    let _ = w.commit(slot, (0, 0, screen.width, screen.height));
 }
 
 /// Destroy the overview and forget what it was showing.
@@ -3834,6 +3821,7 @@ fn close_overview(
     shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
     dragging: &mut Option<u32>,
     addrs: &mut [*mut u8; BUFFERS],
+    screen: Screen,
 ) {
     if let Some(id) = overview.take() {
         if let Some(w) = session.window(id) {
@@ -3842,7 +3830,7 @@ fn close_overview(
         // **Unmapped, not merely forgotten.** Destroying the window drops the compositor's
         // side; this process's two 4 MB mappings would otherwise stay for the session's life.
         for a in addrs.iter_mut() {
-            release_buffer(a, OVER_PITCH * SCREEN_H as usize);
+            release_buffer(a, screen.pitch() * screen.height as usize);
         }
         shots.clear();
         *dragging = None;
@@ -3874,6 +3862,7 @@ fn desktop_preview(
     desktop: u32,
     theme: &Theme,
     wallpaper: bool,
+    screen: Screen,
 ) -> Element<()> {
     // The screen's proportions, so the miniature is the shape of the thing it stands for.
     let (iw, ih) = (MINI_W - 2, MINI_H - 2);
@@ -3897,12 +3886,13 @@ fn desktop_preview(
         // Scaled by the same ratio in both axes as the screen, and clamped into the interior: a
         // window dragged partly off-screen must not draw outside the miniature that stands for
         // the screen.
-        let sx = (e.origin.0.max(0) as u32 * iw / SCREEN_W).min(iw.saturating_sub(1));
-        let sy = (e.origin.1.max(0) as u32 * ih / SCREEN_H as u32).min(ih.saturating_sub(1));
+        let (screen_w, screen_h) = (screen.width.max(1), screen.height.max(1));
+        let sx = (e.origin.0.max(0) as u32 * iw / screen_w).min(iw.saturating_sub(1));
+        let sy = (e.origin.1.max(0) as u32 * ih / screen_h).min(ih.saturating_sub(1));
         // At least two pixels, or the border and the face have nowhere to go and a window
         // vanishes rather than being small.
-        let sw = (e.size.0 * iw / SCREEN_W).max(2).min(iw - sx);
-        let sh = (e.size.1 * ih / SCREEN_H as u32).max(2).min(ih - sy);
+        let sw = (e.size.0 * iw / screen_w).max(2).min(iw - sx);
+        let sh = (e.size.1 * ih / screen_h).max(2).min(ih - sy);
         let face = if e.focused { theme.face_hover } else { theme.face };
         layers.push(offset(
             1 + sx as i32,
@@ -3926,19 +3916,13 @@ const MINI_H: u32 = 60;
 /// Space around a miniature inside its row.
 const MINI_PAD: u32 = 6;
 
-// **The miniature is a size `box_downscale` will accept, and the compiler is what says so.**
-// That function refuses a destination larger than the source in either axis, and a refusal here
-// puts every preview back to a flat colour — which is precisely the bug this change exists to
-// fix, reappearing with nothing failing (PR #273 review, optional 5). A gate line would report
-// it; this makes it unbuildable, which is better: raising `MINI_W` past the screen's width is
-// then a compile error beside the constant rather than flat blue somebody notices in a month.
-const _: () = assert!(
-    MINI_W > 2 && MINI_H > 2 && MINI_W - 2 <= SCREEN_W && MINI_H - 2 <= SCREEN_H as u32,
-    "a sidebar miniature must be smaller than the screen it is a miniature of"
-);
+// **A miniature has an interior.** It must also be smaller than the screen, which `box_downscale`
+// requires and refuses otherwise — a refusal that `mini_wallpaper` logs by name (PR #273 review,
+// optional 5). That half was a compile-time check against a written-down 1280×800 until Phase 5
+// Part E; against a screen read at startup it is the log line, and any screen too small for a
+// 94-pixel miniature is too small for the overview's chrome anyway.
+const _: () = assert!(MINI_W > 2 && MINI_H > 2, "a sidebar miniature needs an interior");
 
-/// The overview's sidebar width, at the right-hand edge.
-const SIDE_W: u32 = 200;
 /// One desktop row in the sidebar.
 ///
 /// **Tall enough for a miniature** since M11 Part E batch 10: `MINI_H` plus `MINI_PAD` on each
@@ -3946,16 +3930,8 @@ const SIDE_W: u32 = 200;
 /// in two places and the gate names which (that is the cost of a click point a gate can aim at,
 /// and M11's decision 2 chose it deliberately).
 const SIDE_ROW_H: u32 = MINI_H + MINI_PAD * 2;
-/// A thumbnail's size in the overview's grid.
-const THUMB_W: u32 = 240;
-/// See [`THUMB_W`].
+/// A thumbnail's height in the overview's grid; its width is [`THUMB_W`].
 const THUMB_H: u32 = 150;
-/// Space around each thumbnail.
-const THUMB_PAD: u32 = 16;
-/// How many thumbnails fit across the grid.
-const THUMB_COLS: u32 = (SCREEN_W - SIDE_W) / (THUMB_W + THUMB_PAD);
-/// Bytes per row of the overview's own buffer.
-const OVER_PITCH: usize = (SCREEN_W as usize) * 4;
 
 /// How far the wallpaper is darkened under the overview, as a coverage of black.
 ///
@@ -3985,17 +3961,18 @@ const OVERVIEW_SIDE_ALPHA: u8 = 150;
 /// **One function for drawing and for hit-testing**, which is the lesson the bottom bar's
 /// indicator taught: a hit region computed separately from the layout is right at one window
 /// count and wrong everywhere else (PR #243 review, blocking 2).
-fn thumb_rect(i: usize) -> (u32, u32, u32, u32) {
-    let col = (i as u32) % THUMB_COLS;
-    let row = (i as u32) / THUMB_COLS;
+fn thumb_rect(i: usize, screen: Screen) -> (u32, u32, u32, u32) {
+    let cols = screen.thumb_cols();
+    let col = (i as u32) % cols;
+    let row = (i as u32) / cols;
     let x = THUMB_PAD + col * (THUMB_W + THUMB_PAD);
     let y = BAR_H + THUMB_PAD + row * (THUMB_H + THUMB_PAD);
     (x, y, THUMB_W, THUMB_H)
 }
 
 /// Which sidebar row a point is in, if any.
-fn side_row_at(x: i32, y: i32, rows: usize) -> Option<usize> {
-    if x < (SCREEN_W - SIDE_W) as i32 || y < BAR_H as i32 {
+fn side_row_at(x: i32, y: i32, rows: usize, screen: Screen) -> Option<usize> {
+    if x < screen.width.saturating_sub(SIDE_W) as i32 || y < BAR_H as i32 {
         return None;
     }
     let i = ((y as u32 - BAR_H) / SIDE_ROW_H) as usize;
@@ -4003,12 +3980,12 @@ fn side_row_at(x: i32, y: i32, rows: usize) -> Option<usize> {
 }
 
 /// Which thumbnail a point is in, if any.
-fn thumb_at(x: i32, y: i32, n: usize) -> Option<usize> {
+fn thumb_at(x: i32, y: i32, n: usize, screen: Screen) -> Option<usize> {
     if x < 0 || y < 0 {
         return None;
     }
     (0..n).find(|&i| {
-        let (tx, ty, tw, th) = thumb_rect(i);
+        let (tx, ty, tw, th) = thumb_rect(i, screen);
         x >= tx as i32 && x < (tx + tw) as i32 && y >= ty as i32 && y < (ty + th) as i32
     })
 }
@@ -4485,6 +4462,7 @@ fn place_new_windows(
     dropped: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
     restore: &mut alloc::vec::Vec<(u32, (i32, i32, u32, u32))>,
     current: u32,
+    screen: Screen,
 ) -> bool {
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
@@ -4741,9 +4719,9 @@ fn place_new_windows(
         // the screen's border — which reads as a window that has been shoved rather than placed.
         // One step in, so the offset matches the one the cascade already uses downward.
         let (x, y) = (CASCADE_STEP, *next_origin);
-        // Wrapped, or the 34th window is placed below an 800px screen and never seen.
+        // Wrapped, or a window is placed below the screen and never seen.
         *next_origin += CASCADE_STEP;
-        if *next_origin > SCREEN_H - CASCADE_STEP {
+        if *next_origin > screen.height as i32 - CASCADE_STEP {
             // Back to where the cascade starts, which is one step below the bar rather than
             // against it — the same inset the first window gets.
             *next_origin = BAR_H as i32 + CASCADE_STEP;

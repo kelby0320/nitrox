@@ -41,16 +41,6 @@ use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The screen the greeter centres itself on.
-///
-/// **Fixed rather than queried**, the same trade `desktop-shell` makes for its bars and for the
-/// same reason: the compositor has no op that reports the screen's size, and adding one to place
-/// one window would be a protocol change made for a stub's convenience. `check-display` hardcodes
-/// the same 1280x800.
-const SCREEN_W: u32 = 1280;
-/// See [`SCREEN_W`].
-const SCREEN_H: u32 = 800;
-
 /// The greeter window's size. Fixed rather than screen-relative: the compositor places it at
 /// the origin today, and a greeter that resized itself would be the first client to have a
 /// placement opinion — which is `desktop-shell`'s job from Part E.
@@ -455,6 +445,36 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         Err(_) => fail(b"desktop-session-mgr: connect to /dev/draw FAILED\n"),
     };
     let mut session = Session::new(transport);
+    // **Where the greeter goes, from the screen it is on** (Phase 5 Part E). It centred on a
+    // written-down 1280×800 until then, which on the laptop's 1366×768 put it 43 px left of centre
+    // and 16 px low. **No size to fall back on**: a screen that cannot be read leaves the greeter
+    // asking for the origin and saying so, a visible wrong in a login that still works, rather
+    // than a number that is right on one machine.
+    // SAFETY: `root_ns` is live for this process's whole run.
+    let origin = match unsafe { libsurface::screen::read(root_ns) } {
+        Ok(screen) => {
+            let origin = (
+                (screen.width.saturating_sub(GREETER_W) / 2) as i32,
+                (screen.height.saturating_sub(GREETER_H) / 2) as i32,
+            );
+            Line::new()
+                .s(b"desktop-session-mgr: greeter centred at ")
+                .i(origin.0 as i64)
+                .s(b",")
+                .i(origin.1 as i64)
+                .s(b" on a ")
+                .u(screen.width as u64)
+                .s(b"x")
+                .u(screen.height as u64)
+                .s(b" screen")
+                .end();
+            origin
+        }
+        Err(_) => {
+            kprint(b"desktop-session-mgr: /dev/draw/screen unreadable; the greeter asks for the origin\n");
+            (0, 0)
+        }
+    };
     // **This window lands at the origin, and it is created before every other client's.**
     // `service-mgr` brings the login chain up before it starts declared services, so the
     // greeter is bottom-most and the reference windows `check-display` and `check-terminal`
@@ -468,7 +488,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // **The mapped addresses are kept**, not dropped after attach: every keystroke redraws,
     // so the greeter writes new pixels into whichever buffer the compositor has released.
     let mut addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    let mut window = match open_greeter(&mut session, &font, &greeter, &mut addrs, len) {
+    let mut window = match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
         Some(id) => id,
         None => fail(b"desktop-session-mgr: greeter could not be drawn\n"),
     };
@@ -565,7 +585,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             greeter.denied = !ok;
             // Back to a login window. A fresh one rather than a retained one, for the reason
             // above — and its buffers with it, since the old window's are gone.
-            match open_greeter(&mut session, &font, &greeter, &mut addrs, len) {
+            match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
                 Some(id) => window = id,
                 None => fail(b"desktop-session-mgr: could not draw the greeter again\n"),
             }
@@ -577,7 +597,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     }
 }
 
-/// Create the greeter window, attach fresh buffers, and present it. `None` if any step failed.
+/// Create the greeter window at `origin`, attach fresh buffers, and present it. `None` if any
+/// step failed.
 ///
 /// Called for the first login and again after every session, because the window is destroyed
 /// for the duration of one — see the call site for why.
@@ -587,6 +608,7 @@ fn open_greeter(
     greeter: &Greeter,
     addrs: &mut [*mut u8; BUFFERS],
     len: usize,
+    origin: (i32, i32),
 ) -> Option<u32> {
     // **Centred, and created before every other client's window.** `service-mgr` brings the login
     // chain up before it starts declared services, so the greeter is bottom-most and the
@@ -594,19 +616,13 @@ fn open_greeter(
     // load-bearing rather than incidental: a greeter created *after* them would cover the regions
     // those gates compare, and the failure would read as a compositing regression.
     //
-    // **The centre is computed from constants, not queried** (M11 Part E batch 8), which is the
-    // same trade `desktop-shell` makes for its bars: the compositor has no "what size is the
-    // screen" op, and adding one so a login box can centre itself would be a protocol change made
-    // for one window's convenience. If the screen is ever a different size this lands off-centre,
-    // which is a visible and harmless wrong rather than a silent one.
+    // **The origin is the screen's centre**, read from `/dev/draw/screen` by the caller (Phase 5
+    // Part E); it was computed from a written-down 1280×800 from M11 Part E batch 8 until then.
     //
     // **It asks rather than being placed.** Nothing is managing windows yet — the shell that
     // would is what this window exists to let somebody start — so a `normal` window's origin is
     // its own request, honoured when the compositor gives up waiting for a manager.
-    let (x, y) = (
-        (SCREEN_W.saturating_sub(GREETER_W) / 2) as i32,
-        (SCREEN_H.saturating_sub(GREETER_H) / 2) as i32,
-    );
+    let (x, y) = origin;
     let window = session
         .create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS)
         .ok()?;
