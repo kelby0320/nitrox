@@ -219,8 +219,10 @@ impl CpuState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MadtEntry {
     /// Type 0 (Processor Local APIC, 8-bit ids) or type 9 (Processor Local x2APIC, 32-bit).
-    /// Firmware may describe the same machine either way — type 9 is required for an APIC id
-    /// above 254 and permitted below — so both are CPUs.
+    /// Both are CPUs: type 9 is required for an APIC id of 255 or above, and a machine whose ids
+    /// are all lower may still list its CPUs that way. **But some firmware lists a CPU both
+    /// ways**, and ACPI 6.5 §5.2.12.12 says that where both kinds of entry are present an x2APIC
+    /// entry's id is 255 or above — see [`not_counted`].
     Cpu { x2apic: bool, uid: u32, apic_id: u32, state: CpuState },
     /// Type 1.
     IoApic(IoApic),
@@ -289,9 +291,43 @@ fn madt_entries(madt: &[u8]) -> impl Iterator<Item = MadtEntry> + '_ {
     })
 }
 
+/// Whether the MADT has a usable type-0 CPU entry: one whose id is not `0xFF` (no CPU) and that
+/// is enabled or online-capable. What [`not_counted`] asks of a low x2APIC id.
+fn has_lapic_cpus(madt: &[u8]) -> bool {
+    madt_entries(madt).any(|entry| {
+        matches!(
+            entry,
+            MadtEntry::Cpu { x2apic: false, apic_id, state: CpuState::Enabled | CpuState::OnlineCapable, .. }
+                if apic_id != 0xFF
+        )
+    })
+}
+
+/// Why a CPU entry is not a CPU of its own, or `None` when it is (or `entry` is not a CPU entry).
+/// `has_lapic_cpus` is [`has_lapic_cpus`] for the same table. Two reasons, both the ones Linux
+/// applies (`acpi_check_lapic`, `acpi_parse_x2apic`):
+///
+/// - **An id that names no CPU**: `0xFF` in a type-0 entry, `0xFFFF_FFFF` in a type-9 one.
+/// - **A low x2APIC id where type-0 entries list the CPUs.** ACPI 6.5 §5.2.12.12: where both kinds
+///   are present, an x2APIC entry's id is 255 or above. Some firmware lists each CPU both ways
+///   regardless, and counting both reads eight CPUs on a four-thread machine.
+///
+/// Such an entry is still logged, with the reason, so a report shows what the firmware listed.
+fn not_counted(entry: &MadtEntry, has_lapic_cpus: bool) -> Option<&'static str> {
+    match *entry {
+        MadtEntry::Cpu { x2apic: false, apic_id: 0xFF, .. }
+        | MadtEntry::Cpu { x2apic: true, apic_id: 0xFFFF_FFFF, .. } => Some("no CPU has this id"),
+        MadtEntry::Cpu { x2apic: true, apic_id, .. } if has_lapic_cpus && apic_id < 0xFF => {
+            Some("below 255, and lapic entries list the CPUs")
+        }
+        _ => None,
+    }
+}
+
 /// Parse a MADT ("APIC" table) into the caller's buffers, truncating at each buffer's
 /// capacity. Returns `(n_ioapic, n_override, n_cpu)`, where a CPU is an **enabled** entry of
-/// either processor type — online-capable ones are not present at boot.
+/// either processor type — online-capable ones are not present at boot — that [`not_counted`]
+/// has no reason to leave out.
 fn parse_madt(
     madt: &[u8],
     ioapics: &mut [IoApic],
@@ -299,7 +335,11 @@ fn parse_madt(
     cpus: &mut [u32],
 ) -> (usize, usize, usize) {
     let (mut ni, mut no, mut nc) = (0, 0, 0);
+    let has_lapic = has_lapic_cpus(madt);
     for entry in madt_entries(madt) {
+        if not_counted(&entry, has_lapic).is_some() {
+            continue;
+        }
         match entry {
             MadtEntry::Cpu { apic_id, state: CpuState::Enabled, .. } if nc < cpus.len() => {
                 cpus[nc] = apic_id;
@@ -319,15 +359,18 @@ fn parse_madt(
     (ni, no, nc)
 }
 
-/// Log one MADT entry on one line.
-fn log_madt_entry(entry: &MadtEntry) {
+/// Log one MADT entry on one line, a CPU entry the count leaves out marked with why
+/// ([`not_counted`]; `has_lapic_cpus` is [`has_lapic_cpus`] for the same table).
+fn log_madt_entry(entry: &MadtEntry, has_lapic_cpus: bool) {
     match *entry {
         MadtEntry::Cpu { x2apic, uid, apic_id, state } => crate::kprintln!(
-            "madt: {} uid {} apic {} {}",
+            "madt: {} uid {} apic {} {}{}{}",
             if x2apic { "x2apic" } else { "lapic" },
             uid,
             apic_id,
-            state.name()
+            state.name(),
+            if not_counted(entry, has_lapic_cpus).is_some() { " — not counted: " } else { "" },
+            not_counted(entry, has_lapic_cpus).unwrap_or("")
         ),
         MadtEntry::IoApic(io) => crate::kprintln!(
             "madt: ioapic {} @{:#x} gsi {}",
@@ -508,8 +551,9 @@ impl ArchPlatform for X86Platform {
             if let Some((lapic, flags)) = madt_header(madt) {
                 crate::kprintln!("madt: local APIC @{:#x} flags {:#x}", lapic, flags);
             }
+            let has_lapic = has_lapic_cpus(madt);
             for entry in madt_entries(madt) {
-                log_madt_entry(&entry);
+                log_madt_entry(&entry, has_lapic);
             }
         }
         crate::kprintln!(
@@ -778,6 +822,63 @@ mod tests {
         let mut cp = [0u32; 4];
         assert_eq!(parse_madt(&madt, &mut io, &mut ov, &mut cp), (0, 0, 1));
         assert_eq!(cp[0], 0x100);
+    }
+
+    #[test]
+    fn a_cpu_listed_both_ways_counts_once_and_a_low_x2apic_id_alone_still_counts() {
+        let header = || {
+            let mut madt = sdt_header(b"APIC", 0);
+            madt.extend_from_slice(&0xFEE0_0000u32.to_le_bytes());
+            madt.extend_from_slice(&0u32.to_le_bytes());
+            madt
+        };
+        let lapic = |madt: &mut Vec<u8>, id: u8, flags: u32| {
+            madt.extend_from_slice(&[0, 8, id, id]);
+            madt.extend_from_slice(&flags.to_le_bytes());
+        };
+        let x2apic = |madt: &mut Vec<u8>, id: u32| {
+            madt.extend_from_slice(&[9, 16, 0, 0]);
+            madt.extend_from_slice(&id.to_le_bytes());
+            madt.extend_from_slice(&1u32.to_le_bytes());
+            madt.extend_from_slice(&id.to_le_bytes());
+        };
+        let count = |madt: &[u8]| {
+            let mut cp = [0u32; 16];
+            parse_madt(madt, &mut [IoApic::ZERO; 1], &mut [SourceOverride::ZERO; 1], &mut cp).2
+        };
+
+        // Four threads listed both ways — the x2APIC half first, which the rule must not depend
+        // on — plus one CPU only an x2APIC entry can describe.
+        let mut both = header();
+        for id in 0..4 {
+            x2apic(&mut both, id);
+        }
+        for id in 0..4 {
+            lapic(&mut both, id as u8, 1);
+        }
+        x2apic(&mut both, 0x100);
+        assert!(has_lapic_cpus(&both));
+        assert_eq!(count(&both), 5, "each low id once, and the id only type 9 can hold");
+        let superseded = madt_entries(&both).filter(|e| not_counted(e, true).is_some()).count();
+        assert_eq!(superseded, 4, "the four low-id x2APIC entries, and not the high one");
+
+        // No type-0 entries: a low x2APIC id is the only description of that CPU.
+        let mut alone = header();
+        for id in 0..4 {
+            x2apic(&mut alone, id);
+        }
+        assert!(!has_lapic_cpus(&alone));
+        assert_eq!(count(&alone), 4);
+
+        // Type-0 entries that describe no usable CPU — id 0xFF, or disabled — supersede nothing,
+        // and neither they nor an x2APIC entry naming no CPU is counted.
+        let mut unusable = header();
+        lapic(&mut unusable, 0xFF, 1);
+        lapic(&mut unusable, 1, 0);
+        x2apic(&mut unusable, 0);
+        x2apic(&mut unusable, 0xFFFF_FFFF);
+        assert!(!has_lapic_cpus(&unusable));
+        assert_eq!(count(&unusable), 1, "only the x2APIC entry with id 0");
     }
 
     #[test]

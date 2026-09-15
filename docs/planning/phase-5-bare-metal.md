@@ -613,6 +613,9 @@ before the kernel starts. Both disappear the moment root is on a disk.
 >   addresses belong to whichever OVMF build runs.
 > - **The logical CPU count is CPUID's, per package**; the MADT lines and `smp:` already count what
 >   the boot launched.
+> - **The MADT count leaves out a CPU listed twice** — a type-9 entry below id 255 beside usable
+>   type-0 entries, as Linux does — and entries whose id names no CPU; their lines say why (PR #300
+>   review).
 > - **Limine draws the entry's em dash as a hyphen.** Legible, and the detector reads colours, not
 >   text.
 > - **The report fits QEMU's boot in two pages** at 160×49 rows; page 2 ends at the framebuffer

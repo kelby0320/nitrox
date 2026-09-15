@@ -25617,6 +25617,12 @@ padding, and COM1 detected by its scratch register. Three things behind those li
 - **`parse_madt` walks an entry iterator** covering types 0, 1, 2, 4, 9 and 0xA with enabled /
   online-capable / disabled, and enabled type-9 CPUs now count. Host-tested against QEMU's MADT
   captured from a boot by a temporary hex dump; control: counting type 0 alone fails the type-9 test.
+  **Two kinds of entry are listed and not counted** (PR #300 review): an id that names no CPU
+  (`0xFF`, `0xFFFF_FFFF`), and a type-9 id below 255 where usable type-0 entries exist — ACPI 6.5
+  §5.2.12.12 says both kinds together means x2APIC ids of 255 and up, some firmware lists each CPU
+  both ways anyway, and Linux's `acpi_parse_x2apic` skips the same entries. Counting them would have
+  read `8 CPU` beside `smp: 4 CPU(s) online` on such firmware, a false difference in the list Part F
+  compares. The line says why it was not counted. Controls: dropping either rule fails its test.
 - **A driver returns what it did.** `ahci::init` returns a `device::Outcome` from every exit —
   claimed with its MSI or INTx signal, or declined with why — and `drivers::probe` records it and
   logs one line per enumerated function: claimed, declined, or no driver. The type makes "matched

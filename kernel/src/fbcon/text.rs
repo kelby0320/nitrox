@@ -534,14 +534,29 @@ mod tests {
     /// Write each page into a fresh grid exactly `rows` tall, as the report draws it, and read it
     /// back — failing if a page scrolled, which is the property the pager exists for.
     fn draw_pages(bytes: &[u8], cols: usize, rows: usize) -> Vec<Vec<String>> {
-        Pages::new(bytes, cols, rows)
-            .map(|page| {
-                let mut g = grid(cols, rows);
-                g.write(page);
-                assert_eq!(g.top, 0, "a page scrolled the grid it was drawn in");
-                (0..rows).map(|r| line(&g, r)).collect()
-            })
-            .collect()
+        Pages::new(bytes, cols, rows).map(|page| drawn_without_scrolling(page, cols, rows)).collect()
+    }
+
+    /// Write `page` into a grid `rows` tall, assert it did not scroll, and return its rows.
+    ///
+    /// The reference is the same page in a grid [`MAX_ROWS`] tall, where a page for `rows` rows
+    /// has room to spare: the short grid must read row for row as the roomy one's top, the roomy
+    /// one must have nothing below that, and both cursors must agree — the last catches a run of
+    /// newlines that scrolls nothing but blank rows. **Not `top == 0`**, which a scroll can leave
+    /// unchanged: at one row a jump is the whole grid, and at three rows three jumps come back
+    /// round (PR #300 review).
+    fn drawn_without_scrolling(page: &[u8], cols: usize, rows: usize) -> Vec<String> {
+        let mut g = grid(cols, rows);
+        g.write(page);
+        let mut roomy = grid(cols, MAX_ROWS);
+        roomy.write(page);
+        let lines: Vec<String> = (0..rows).map(|r| line(&g, r)).collect();
+        let room: Vec<String> = (0..MAX_ROWS).map(|r| line(&roomy, r)).collect();
+        assert!(roomy.cursor().0 < rows, "a page needs more than {rows} rows at {cols} columns: {page:?}");
+        assert!(room[rows..].iter().all(String::is_empty), "a page needs more than {rows} rows: {page:?}");
+        assert_eq!(lines, room[..rows], "a page scrolled a grid {rows} tall: {page:?}");
+        assert_eq!(g.cursor(), roomy.cursor(), "a page scrolled a grid {rows} tall: {page:?}");
+        lines
     }
 
     #[test]
@@ -584,9 +599,7 @@ mod tests {
             let pages: Vec<&[u8]> = Pages::new(&log, cols, rows).collect();
             let mut offset = 0;
             for page in &pages {
-                let mut g = grid(cols, rows);
-                g.write(page);
-                assert_eq!(g.top, 0, "a page scrolled at {cols}x{rows}");
+                drawn_without_scrolling(page, cols, rows);
                 assert_eq!(&log[offset..offset + page.len()], *page, "a page is not the log's next bytes");
                 offset += page.len();
                 // The only byte a cut may leave out is the newline it was made at.

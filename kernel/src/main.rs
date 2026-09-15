@@ -700,6 +700,7 @@ fn log_handoff() -> &'static [u8] {
 
     // SAFETY: as above.
     let hhdm = unsafe { (&raw const HHDM_REQUEST).read().response };
+    // SAFETY: as above — a non-null response Limine wrote.
     let hhdm = if hhdm.is_null() { 0 } else { unsafe { (*hhdm).offset } };
     // SAFETY: as above.
     let date = unsafe { (&raw const DATE_AT_BOOT_REQUEST).read().response };
