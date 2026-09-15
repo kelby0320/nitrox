@@ -568,7 +568,8 @@ binding, so they are its gate.
 >   fails three steps later as `image not found: /bin/auth-service`. So step 3 also requires `init`'s
 >   first read through the new root, `/system/current-generation`, and the zeroed partition fails
 >   there. The server's behaviour is unchanged here — it predates Part C and is recorded in the
->   decision log.
+>   decision log. (Fixed before Part F, 2026-09-15: the server now refuses such a device, and the
+>   zeroed partition fails at the mount.)
 > - **The time bound is 1.5 s, timed by when lines reach the host.** Timing `expect` returns read 0 ms
 >   under KVM, because both lines arrive in one burst; the Session now stamps each chunk on arrival.
 >   Good path 39 ms (KVM) and 180 ms (TCG); with the self-interrupt deleted, 3,082–3,311 ms (KVM) and

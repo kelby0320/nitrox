@@ -224,7 +224,10 @@ than an implementation detail.
    mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.
 2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server, hand
    over the device handle, wait for its `Ready` message carrying the server's endpoint,
-   and bind that endpoint at the mount point. Any failure → the emergency path.
+   and bind that endpoint at the mount point. Any failure → the emergency path. The
+   server reads the superblock and the root directory **before** it answers, and a device
+   it cannot serve gets a refusal instead, which init prints:
+   `init: fs-server-ext4 for / on gpt-partlabel:nitrox-live refused: no ext4 filesystem: …`.
 3. **Bind the system servers**, each by the same spawn → `Ready` → bind handshake:
    `profile-server` at `/bin` (projecting the store), `logging-service` at `/log`, and
    `tty-server` at `/dev/tty`.

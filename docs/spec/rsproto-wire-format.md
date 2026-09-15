@@ -169,6 +169,8 @@ pub struct ReadyMessage {
 
 The supervisor binds `handles[0]` into the appropriate namespace location after receiving this message. See [why-supervisor-registration.md](../rationale/why-supervisor-registration.md).
 
+**A refusal in place of Ready.** A server that cannot serve what it was given — today, `fs-server-ext4` over a device holding no filesystem it can read — sends `Meta::Ready` with `RsFlags::ERROR` set, an [`ErrorBody`](#error-replies) in place of the `ReadyMessage`, and **no handle**, then exits. `kerror` is what a request would have failed with for the same reason; `msg` is the reason, in a sentence a supervisor prints beside what only it knows (the device, the mount point). `request_id` is 0 and `RsFlags::REPLY` is clear: the message answers nothing. A supervisor treats a refusal as a failed start and closes any handle that arrived with one. Only `init` receives one today (`userspace/init/src/ready.rs`).
+
 ## Error replies
 
 Any operation can produce an error reply by setting `RsFlags::ERROR`:

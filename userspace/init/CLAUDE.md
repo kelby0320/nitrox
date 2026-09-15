@@ -26,7 +26,7 @@ The line init draws is about **runtime state and started services**, not about s
 
 This means:
 - `libos` `Handle<T,M>` + `block_on` for typed, async-shaped I/O is fine (init uses it — e.g. `read_current_generation`). Raw `sys_io_submit`/`sys_wait` + `RawHandle` are still available where mixing is simpler.
-- Use `IpcMsg` directly for the fs-server handshake, not `librsproto` — a *pragmatic current choice* (init hand-parses the tiny Ready envelope), not because init couldn't; librsproto is a stateful protocol layer init has no need to pull in yet.
+- Use `IpcMsg` directly for the fs-server handshake, not `librsproto` — a *pragmatic current choice* (init hand-parses the tiny Ready envelope, and a refusal's reason, in `src/ready.rs`), not because init couldn't; librsproto is a stateful protocol layer init has no need to pull in yet. It is a **dev-dependency** only, so the parser's host tests can build messages with the encoder every server uses.
 - Parse TOML manually (init has its own minimal TOML parser, since a full parser pulls in more than init needs).
 
 ## Critical-path discipline

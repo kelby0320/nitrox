@@ -8,6 +8,11 @@ libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 libos = { path = "../libos" }
 
+# The host tests of `ready` build messages with the encoder every server uses. A dev-dependency
+# only: init's own build still hand-parses (`userspace/init/CLAUDE.md`).
+[dev-dependencies]
+librsproto = { path = "../librsproto" }
+
 # A library + binary split: the library holds init's host-testable internals (the
 # bump-allocator math now; the `toml_lite` parser in Part 4), the binary is the
 # bare-target PID-1 entry point. `cargo xtask test` runs the lib tests on the host

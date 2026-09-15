@@ -124,33 +124,116 @@ struct Superblock {
     first_data_block: u32,
 }
 
-fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
-    let mut sb = [0u8; 1024];
-    r.read_at(1024, &mut sb)?;
-    if rd_u16(&sb, 56) != SUPER_MAGIC {
-        return Err(FsError::Corrupt);
+/// Why a device cannot be served, named specifically enough for a supervisor to print.
+///
+/// **The same checks every request makes**, not a second list of them: [`read_superblock`] is
+/// [`parse_superblock`] with the reason collapsed into an [`FsError`], so the check the server
+/// runs before it says Ready ([`check_device`]) cannot drift from the one each lookup runs after.
+/// Until Phase 5 the server said Ready without reading anything, and a partition holding no
+/// filesystem at all mounted: the first sign was `image not found` for the first program run off
+/// it, three steps from the cause.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Unservable {
+    /// The superblock's bytes could not be read off the device.
+    Unreadable,
+    /// No ext4 magic where the superblock belongs — the device holds no ext4 filesystem.
+    NoMagic {
+        /// What was there instead.
+        found: u16,
+    },
+    /// 64-bit block numbers, which change the group-descriptor layout this reader walks.
+    Wide64Bit,
+    /// Blocks larger than the reader's 4 KiB scratch.
+    BlockTooLarge {
+        /// `s_log_block_size`: the block size is `1024 << log`.
+        log: u32,
+    },
+    /// A superblock field the layout divides or indexes by is zero.
+    ZeroField(&'static str),
+    /// The root directory's inode could not be read: the inode table the group descriptors
+    /// name is past the end of the device, or the device failed.
+    RootUnreadable,
+    /// Inode 2, the root, is not a directory: the superblock parses, but the group descriptors
+    /// or the inode table are not what it describes.
+    RootNotDirectory {
+        /// The inode's `i_mode`.
+        mode: u16,
+    },
+}
+
+impl Unservable {
+    /// The [`FsError`] a request fails with for the same reason.
+    pub fn fs_error(self) -> FsError {
+        match self {
+            Unservable::Unreadable | Unservable::RootUnreadable => FsError::Io,
+            Unservable::NoMagic { .. }
+            | Unservable::ZeroField(_)
+            | Unservable::RootNotDirectory { .. } => FsError::Corrupt,
+            Unservable::Wide64Bit | Unservable::BlockTooLarge { .. } => FsError::Unsupported,
+        }
     }
-    if rd_u32(&sb, 96) & INCOMPAT_64BIT != 0 {
-        return Err(FsError::Unsupported); // 64-bit changes the descriptor layout
+}
+
+impl core::fmt::Display for Unservable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Unservable::Unreadable => write!(f, "the superblock could not be read off the device"),
+            Unservable::NoMagic { found } => write!(
+                f,
+                "no ext4 filesystem: superblock magic {found:#06x}, not {SUPER_MAGIC:#06x}"
+            ),
+            Unservable::Wide64Bit => write!(f, "a 64-bit ext4 filesystem, which this server does not read"),
+            // The shift is taken on a u64 and saturated, since `log` is whatever the device held.
+            Unservable::BlockTooLarge { log } => write!(
+                f,
+                "blocks of 2^{} bytes, over the {MAX_BLOCK} this server reads",
+                10u32.saturating_add(log)
+            ),
+            Unservable::ZeroField(field) => write!(f, "a malformed superblock: {field} is zero"),
+            Unservable::RootUnreadable => write!(
+                f,
+                "the root directory's inode could not be read: the inode table is past the end of \
+                 the device, or the device failed"
+            ),
+            Unservable::RootNotDirectory { mode } => write!(
+                f,
+                "inode 2 is not a directory (mode {mode:#06o}): the group descriptors or the inode \
+                 table are not what the superblock describes"
+            ),
+        }
     }
-    let log_bs = rd_u32(&sb, 24);
-    if log_bs > 2 {
-        return Err(FsError::Unsupported); // > 4 KiB blocks exceed the scratch buffer
+}
+
+/// Parse the 1024 bytes at device byte 1024 into the facts the reader needs.
+fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
+    let magic = rd_u16(sb, 56);
+    if magic != SUPER_MAGIC {
+        return Err(Unservable::NoMagic { found: magic });
     }
-    let block_size = 1024u32 << log_bs;
-    let inode_size = rd_u16(&sb, 88) as u32;
-    let inodes_per_group = rd_u32(&sb, 40);
-    if inode_size == 0 || inodes_per_group == 0 {
-        return Err(FsError::Corrupt);
+    if rd_u32(sb, 96) & INCOMPAT_64BIT != 0 {
+        return Err(Unservable::Wide64Bit); // 64-bit changes the descriptor layout
     }
-    let desc_size = match rd_u16(&sb, 254) as u32 {
+    let log = rd_u32(sb, 24);
+    if log > 2 {
+        return Err(Unservable::BlockTooLarge { log }); // > 4 KiB blocks exceed the scratch buffer
+    }
+    let block_size = 1024u32 << log;
+    let inode_size = rd_u16(sb, 88) as u32;
+    if inode_size == 0 {
+        return Err(Unservable::ZeroField("s_inode_size"));
+    }
+    let inodes_per_group = rd_u32(sb, 40);
+    if inodes_per_group == 0 {
+        return Err(Unservable::ZeroField("s_inodes_per_group"));
+    }
+    let desc_size = match rd_u16(sb, 254) as u32 {
         0 => 32,
         d => d,
     };
-    let blocks_per_group = rd_u32(&sb, 32);
-    let first_data_block = rd_u32(&sb, 20);
+    let blocks_per_group = rd_u32(sb, 32);
+    let first_data_block = rd_u32(sb, 20);
     if blocks_per_group == 0 {
-        return Err(FsError::Corrupt);
+        return Err(Unservable::ZeroField("s_blocks_per_group"));
     }
     Ok(Superblock {
         block_size,
@@ -161,6 +244,30 @@ fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
         blocks_per_group,
         first_data_block,
     })
+}
+
+fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
+    let mut sb = [0u8; 1024];
+    r.read_at(1024, &mut sb)?;
+    parse_superblock(&sb).map_err(Unservable::fs_error)
+}
+
+/// Check that `r` holds a filesystem this reader can serve, before the server says it can.
+///
+/// **The superblock, then the root directory.** The superblock alone proves one block is
+/// right; reading inode 2 through the group descriptors and the inode table, and finding a
+/// directory, proves the layout the superblock describes is really there. Nothing past that is
+/// read: a filesystem wrong deeper down fails the request that reaches it.
+pub fn check_device<R: BlockReader>(r: &R) -> Result<(), Unservable> {
+    let mut raw = [0u8; 1024];
+    r.read_at(1024, &mut raw).map_err(|_| Unservable::Unreadable)?;
+    let sb = parse_superblock(&raw)?;
+    let root = read_inode(r, &sb, ROOT_INO).map_err(|_| Unservable::RootUnreadable)?;
+    let mode = rd_u16(&root, 0);
+    if mode & S_IFMT != S_IFDIR {
+        return Err(Unservable::RootNotDirectory { mode });
+    }
+    Ok(())
 }
 
 /// Read inode `ino` into a fixed 256-byte buffer (inodes are ≤ 256 bytes here).
@@ -1838,5 +1945,112 @@ mod tests {
         let mut inode = [0u8; 256];
         stamp(&mut inode, 1_784_900_730, 128, Stamp::Created);
         assert_eq!(&inode[I_CTIME_EXTRA..I_CTIME_EXTRA + 4], &[0, 0, 0, 0]);
+    }
+
+    // ---- the check before Ready (Phase 5) ----
+
+    use super::{Unservable, check_device, read_file, stat_file};
+    use crate::test_support::{ImageReader, fixture};
+    use crate::FsError;
+
+    /// Set a little-endian field in a fixture image's superblock (byte 1024 onwards).
+    fn poke_sb(img: &mut [u8], off: usize, bytes: &[u8]) {
+        img[1024 + off..1024 + off + bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[test]
+    fn a_real_filesystem_passes_the_check_at_both_block_sizes() {
+        for bs in [1024, 4096] {
+            assert_eq!(check_device(&ImageReader(fixture(bs, b"g\n"))), Ok(()), "{bs}-byte blocks");
+        }
+    }
+
+    #[test]
+    fn a_zeroed_device_is_refused_for_its_magic_and_a_short_one_as_unreadable() {
+        let len = fixture(4096, b"g\n").len();
+        assert_eq!(check_device(&ImageReader(vec![0; len])), Err(Unservable::NoMagic { found: 0 }));
+        // Shorter than the superblock's own bytes: the read fails before there is a magic to see.
+        assert_eq!(check_device(&ImageReader(vec![0; 1500])), Err(Unservable::Unreadable));
+    }
+
+    #[test]
+    fn each_superblock_check_names_what_it_found() {
+        let good = fixture(4096, b"g\n");
+        let refused = |off: usize, bytes: &[u8]| {
+            let mut img = good.clone();
+            poke_sb(&mut img, off, bytes);
+            check_device(&ImageReader(img)).unwrap_err()
+        };
+        assert_eq!(refused(56, &0x1234u16.to_le_bytes()), Unservable::NoMagic { found: 0x1234 });
+        assert_eq!(refused(96, &0x80u32.to_le_bytes()), Unservable::Wide64Bit);
+        assert_eq!(refused(24, &3u32.to_le_bytes()), Unservable::BlockTooLarge { log: 3 });
+        assert_eq!(refused(88, &0u16.to_le_bytes()), Unservable::ZeroField("s_inode_size"));
+        assert_eq!(refused(40, &0u32.to_le_bytes()), Unservable::ZeroField("s_inodes_per_group"));
+        assert_eq!(refused(32, &0u32.to_le_bytes()), Unservable::ZeroField("s_blocks_per_group"));
+    }
+
+    /// **A right superblock over the wrong blocks** — what a device whose first pages are right
+    /// and whose later ones are not looks like. The superblock alone passes it.
+    #[test]
+    fn a_superblock_whose_layout_is_not_there_is_refused_at_the_root() {
+        for (bs, gdt) in [(4096usize, 4096usize), (1024, 2048)] {
+            let good = fixture(bs as u32, b"g\n");
+
+            // The group descriptors zeroed: the inode table is "block 0", where inode 2 is not.
+            let mut img = good.clone();
+            img[gdt..gdt + bs].fill(0);
+            assert_eq!(
+                check_device(&ImageReader(img)),
+                Err(Unservable::RootNotDirectory { mode: 0 }),
+                "{bs}-byte blocks, descriptors zeroed"
+            );
+
+            // The inode table named past the end of the device.
+            let mut img = good.clone();
+            img[gdt + 8..gdt + 12].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+            assert_eq!(
+                check_device(&ImageReader(img)),
+                Err(Unservable::RootUnreadable),
+                "{bs}-byte blocks, inode table past the end"
+            );
+        }
+    }
+
+    /// The startup check and a request share one parser, so a request over a device the check
+    /// refuses fails with the error the check's reason maps to — as it did before the check.
+    #[test]
+    fn a_request_over_a_refused_device_fails_with_the_error_its_reason_names() {
+        let good = fixture(4096, b"g\n");
+        let mut out = [0u8; 64];
+
+        let zeroed = ImageReader(vec![0; good.len()]);
+        let why = check_device(&zeroed).unwrap_err();
+        assert_eq!(read_file(&zeroed, b"/system/current-generation", &mut out), Err(why.fs_error()));
+        assert_eq!(why.fs_error(), FsError::Corrupt);
+
+        let mut wide = good.clone();
+        poke_sb(&mut wide, 96, &0x80u32.to_le_bytes());
+        let wide = ImageReader(wide);
+        let why = check_device(&wide).unwrap_err();
+        assert_eq!(stat_file(&wide, b"/system/current-generation"), Err(why.fs_error()));
+        assert_eq!(why.fs_error(), FsError::Unsupported);
+    }
+
+    #[test]
+    fn each_reason_reads_as_a_sentence_naming_what_was_found() {
+        assert_eq!(
+            format!("{}", Unservable::NoMagic { found: 0 }),
+            "no ext4 filesystem: superblock magic 0x0000, not 0xef53"
+        );
+        assert_eq!(
+            format!("{}", Unservable::RootNotDirectory { mode: 0o100644 }),
+            "inode 2 is not a directory (mode 0o100644): the group descriptors or the inode table \
+             are not what the superblock describes"
+        );
+        // `log` is whatever the device held, so the size is not computed by shifting it.
+        assert_eq!(
+            format!("{}", Unservable::BlockTooLarge { log: u32::MAX }),
+            "blocks of 2^4294967295 bytes, over the 4096 this server reads"
+        );
     }
 }

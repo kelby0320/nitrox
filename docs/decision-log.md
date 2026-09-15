@@ -25808,3 +25808,65 @@ With those fixed every gate passed at every size, and CI's gates pass under KVM 
 `check-resolutions` reproduced it in one of its two chain-running boots at that size; at every other
 size it has finished every time. Nothing yet connects screen size to a CPU failing to go idle after a
 log source closes, and nothing is fixed on a guess — it is the finding to make observable next.
+
+---
+
+## 2026-09-15 — An fs-server that cannot serve its device says so, before Part F
+
+**`fs-server-ext4` read nothing before it said Ready.** The Part C gate found it (entry of
+2026-09-14): with the live image's partition zeroed, `init: mounted fs-server-ext4 at /` still
+printed, because the server checked the ext4 magic only when a lookup arrived, and the boot failed
+three steps later as `image not found: /bin/auth-service`. It was left for a decision then. It is
+fixed now, before the first boot on the laptop, because that boot's root is a RAM disk made of the
+bytes Limine loaded: if a real firmware's memory map puts them somewhere the kernel translates
+wrongly, this was the misdirection the screen would have shown. Part H's SATA disk would meet it
+again.
+
+**The check is the one every request already made, not a second list.** `ext4::parse_superblock`
+names why a superblock is unusable (`Unservable`: no magic, 64-bit, blocks over 4 KiB, a zero field);
+`read_superblock`, which every request calls, is that parser with the reason collapsed into the
+`FsError` it always returned, and a host test pins that a request over a refused device fails with
+the error the reason maps to. **`check_device` also reads the root directory**: the superblock
+alone proves one block is right, and reading inode 2 through the group descriptors and inode table
+proves the layout it describes is there. Nothing deeper is read; a filesystem wrong further in fails
+the request that reaches it.
+
+**A refusal travels in place of the Ready**, rather than as a line the server prints: `Meta::Ready`
+with `RsFlags::ERROR`, an `ErrorBody` carrying the reason, no handle, then exit
+(`docs/spec/rsproto-wire-format.md` § Meta::Ready). The server knows why; only `init` knows the
+device and the mount point, so `init` prints one line with all three:
+
+```
+init: fs-server-ext4 for / on gpt-partlabel:nitrox-live refused: no ext4 filesystem: superblock magic 0x0000, not 0xef53
+init: mount FAILED for /
+init: critical-path failure -- dropping to emergency shell
+```
+
+`init` still hand-parses (`userspace/init/CLAUDE.md`), now in `src/ready.rs`, host-tested with
+messages built by `librsproto`'s encoder (a dev-dependency only) and with lengths no correct encoder
+writes. The reason is printed with `Line::untrusted`, the rule for text that crossed the wire —
+control bytes as `?`, so it cannot start a line that looks like another process's — and a line too
+long to hold ends in `...` rather than looking complete (PR #303 review; a first version had its own
+copy of that rule, with a silent cut). Every handle that arrives with a message is closed except a
+Ready's endpoint, so a server that sends extra ones cannot leave them in PID 1's table.
+
+**The class, not the instance: every Ready failure was one line.** All eight of `init`'s handshakes —
+the mount and seven services — printed `<name> Ready timeout/invalid` for four different problems.
+`wait_ready` now says which: no Ready within 30 s, the server exited without sending one, it sent
+something else, or it refused and why. On a machine with no debugger those are four different first
+steps.
+
+**Verified.** Host: the check at both block sizes, each superblock reason, a zeroed device, a device
+too short to hold a superblock, zeroed group descriptors (refused at the root) and an inode table
+past the end (refused as unreadable), at 1 KiB and 4 KiB blocks; the refusal's wire form; every
+reason fitting uncut. Boots: `test-qemu` (AHCI root), `check-live` under TCG and KVM (mount to
+greeter 178 ms and 41 ms, unchanged), `test-interactive`, `check-images`. Controls, each
+failing `check-live` at `init: mounted fs-server-ext4 at /`, where the old boot got past it:
+
+- **the partition zeroed** → `refused: no ext4 filesystem: superblock magic 0x0000, not 0xef53`;
+- **a correct superblock over zeroed group descriptors** → `refused: inode 2 is not a directory
+  (mode 0o0000): the group descriptors or the inode table are not what the superblock describes`,
+  which the superblock check alone would have passed.
+
+`check-live` keeps its read through the new root (`/system/current-generation`): the check reads
+three blocks, and the lookup is still the first read of a file.

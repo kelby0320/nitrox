@@ -140,8 +140,9 @@ Userspace resource servers (`fs-server-*`, `netstack-server`, profile servers) c
 The startup protocol for any resource server:
 
 1. Supervisor spawns the RS with control IPC channel
-2. RS initializes
-3. RS sends `Meta::Ready` on the control channel including its endpoint handle
+2. RS initializes — and checks it can serve what it was given
+3. RS sends `Meta::Ready` on the control channel including its endpoint handle — or, if it
+   cannot serve, a refusal with its reason and no handle (`rsproto-wire-format.md` § Meta::Ready)
 4. Supervisor calls `sys_ns_bind(target_namespace, path, endpoint, rights)`
 
 Don't have an RS try to register itself. Don't grant `BIND_NAMESPACE` to an RS. See `docs/rationale/why-supervisor-registration.md`.
