@@ -816,15 +816,39 @@ answered.
 - **ACPI beyond the static tables.** No AML, no `_PRT`: Part A made them unnecessary for the disk.
 - **SMBIOS.** Useful, not on the list, and a table walk of its own.
 
-## Part E — the resolution this machine actually has ⬜
+## Part E — the resolution this machine actually has ✅
 
-- [ ] Boot QEMU at **the laptop's screen, as near as QEMU can show it**, and pass every display gate
+- [x] Boot QEMU at **the laptop's screen, as near as QEMU can show it**, and pass every display gate
       there, with every client and every gate taking the screen's size from the screen.
 
 `check-display` compares the guest's screen against a `libdraw` render, and the whole display
 arm has only ever run at the QEMU default. A padded stride and an odd width are exactly the
 conditions under which a compositor's damage arithmetic goes wrong by a few pixels a row.
 `libdraw`'s half is a host test; the guest half is a gate run at the laptop's geometry.
+
+> **Landed 2026-09-15**, in the four pieces below and against the revised detail pass. Clients read
+> `/dev/draw/screen`; the gates that boot a screen boot 1360×768 and aim from `DisplaySize`;
+> `cargo xtask check-resolutions` runs four of them at five sizes. Where the result differed:
+>
+> - **A shell that cannot read the leaf stops**, rather than falling back to `QueryLayout`: the
+>   manager channel is opened only after the bars exist (PR #242's deadlock), and the leaf resolves
+>   through the binding the shell's connection just used. The greeter falls back to the origin as
+>   planned, and its control saw the fallback line.
+> - **`check-report`'s page count is read, not pinned**: two pages at 1360×768, taken from the
+>   prompts, since a pinned count would fail on the next unrelated kernel line.
+> - **The plan's list of gate sites missed two**: check-login's overview sidebar at x = 1180, and
+>   check-input's corner-pinned burst. And `tune` stretched its preview wallpaper to the screen,
+>   which no desktop ever did.
+> - **`desktop-shell`'s library tests had never run in CI**, though its doc said `cargo xtask test`
+>   ran them; the layout arithmetic's tests needed them to.
+> - **`check-resolutions` earned its keep on its first two runs**, all of it gate assumptions sized
+>   for 1280: the pointer's pin (2000 px of travel) could not cross 2560; the right-half snap drag
+>   stopped 176 px short of 1920's edge, and made far enough for 2560 it overran the input ring until
+>   paced; and `touch ./` typed unpaced into a starting terminal lost its batch at 1024×768. Every
+>   gate passed at every size once those were fixed, but one boot:
+> - **The 1024×768 dead-log-source failure reproduced** — `a closed log source left a CPU spinning`,
+>   in one of the tool's two chain-running boots at that size, beside `test-qemu`'s 2 of 3. Still
+>   unexplained, and not fixed on a guess.
 
 > **Detail pass, 2026-09-15.** Written before any code, as Parts A, C and D were. Decisions marked
 > *(maintainer's call)* were put to the maintainer with the alternatives. **Revised in review
@@ -927,51 +951,51 @@ What stays unseen until Part F is the laptop's own padding and its width that is
 
 **E.1 — the screen leaf**
 
-- [ ] The compositor classifies `screen` beside `new`, `manage` and `<N>/info`, and answers a
+- [x] The compositor classifies `screen` beside `new`, `manage` and `<N>/info`, and answers a
       resolve with a `MemoryObject` holding the screen's `width` and `height` (`u32`, little-endian)
       and room reserved for what a later screen may add. A read shorter than the object is refused,
       as `info`'s is.
-- [ ] `docs/spec/rsproto-surface-ops.md` gains the section, beside `/dev/draw/<N>/info`.
+- [x] `docs/spec/rsproto-surface-ops.md` gains the section, beside `/dev/draw/<N>/info`.
 
 **E.2 — the clients ask, and the constants go**
 
-- [ ] **`SCREEN_W` and `SCREEN_H` are deleted** from `desktop-shell` and `desktop-session-mgr`, and
+- [x] **`SCREEN_W` and `SCREEN_H` are deleted** from `desktop-shell` and `desktop-session-mgr`, and
       `BAR_PITCH` and `OVER_PITCH` with them, so every site that used one fails to compile rather
       than being found by reading. The size is read from the leaf once at startup and passed down.
-- [ ] **`desktop-shell`** sizes both bars, the wallpaper window, the placement bounds and the entry
+- [x] **`desktop-shell`** sizes both bars, the wallpaper window, the placement bounds and the entry
       capacity from it, and places the window list at `height − BAR_H`. **The overview** too:
       `render_overview`'s popup and sidebar, `open_overview`, `present_overview` and
       `close_overview`'s buffers, `mini_wallpaper`'s reading of the wallpaper buffer — which, left at
       the old width over a 1360-wide buffer, would read every row 320 bytes (80 px) out of step and
       log nothing — and `desktop_preview`'s scaling of window origins. The work area still comes from
       `QueryLayout`.
-- [ ] **The greeter** centres on the leaf's size, and logs the origin it asked for, so a gate can
+- [x] **The greeter** centres on the leaf's size, and logs the origin it asked for, so a gate can
       check the centring rather than look at it.
-- [ ] **No size to fall back on.** A greeter that cannot resolve the leaf logs it and asks for the
+- [x] **No size to fall back on.** A greeter that cannot resolve the leaf logs it and asks for the
       origin; a shell that cannot logs it and takes the size from `QueryLayout`, and without a
       manager either, draws no bars. Each is a visible wrong in a session that still starts, and
       none needs a size written down.
-- [ ] **`fill` becomes a legal `wallpaper_mode`**: `docs/spec/theme-toml-schema.md` names both values,
+- [x] **`fill` becomes a legal `wallpaper_mode`**: `docs/spec/theme-toml-schema.md` names both values,
       `libdraw::theme` parses it (the refusal test keeps refusing a value that is neither, by name),
       and the theme `xtask` stages names `fill`.
-- [ ] **`libdraw::scale::fill`** beside `fit`: the smallest scale that covers the screen, capped at
+- [x] **`libdraw::scale::fill`** beside `fit`: the smallest scale that covers the screen, capped at
       1, centred, the overhang cropped. Its plan's origin is signed — `Fit::origin`'s "never
       negative" stays true of `fit` and is not borrowed. Host tests: 16:10 into 16:9 (at 1360×768,
       `drawn 1360x850 at 0,-41`), 16:9 into 16:10, and a picture smaller than the screen, drawn at
       its own size and centred.
-- [ ] **`TODO(wallpaper-fill)` narrows to the upscaler** in `docs/rationale/deferred-decisions.md`:
+- [x] **`TODO(wallpaper-fill)` narrows to the upscaler** in `docs/rationale/deferred-decisions.md`:
       filling by scaling down exists, and a picture that would need scaling up to cover the screen
       is the trigger that remains.
 
 **E.3 — the gates stop knowing the size, and CI's move**
 
-- [ ] **One place says what size a gate's screen is**: `qemu_display_args(size)` adds
+- [x] **One place says what size a gate's screen is**: `qemu_display_args(size)` adds
       `-vga none -device VGA,xres=…,yres=…`, and every gate that boots a screen — `check-display`,
       `check-input`, `check-terminal`, `check-login`, `check-fbcon`, `check-live`, `check-report`,
       and the `shot` and `bench-compose` tools — takes a size that defaults to 1360×768. A size
       whose width is not a multiple of 8 is refused with the reason, since QEMU would shear it.
       `test-qemu` and `test-interactive` keep QEMU's default.
-- [ ] **Every coordinate a gate uses comes from the size or from the guest**: the window list's
+- [x] **Every coordinate a gate uses comes from the size or from the guest**: the window list's
       and its right-hand click points and the desktop's centre from the screen size; the bottom
       bar's placement line from the size; the pointer's pin corner from the size; the wallpaper line
       computed with `scale::fill` on the host — one source for the expected answer, as
@@ -979,26 +1003,26 @@ What stays unseen until Part F is the laptop's own padding and its width that is
       are the ones § What QEMU can show lists, and a search for `1280`, `800`, `1279`, `799`, `788`,
       `776`, `1200`, `640` and `400` as substrings, not words, finds any others; each hit left is
       one somebody read.
-- [ ] **The framebuffer fact splits**: `test-qemu` keeps `1280x800 pitch 5120`, `check-report`
+- [x] **The framebuffer fact splits**: `test-qemu` keeps `1280x800 pitch 5120`, `check-report`
       asserts `1360x768 pitch 5440 padding 0`.
-- [ ] **`check-fbcon`'s handout frame is re-measured**: at 48 rows it shows at least the last 36
+- [x] **`check-fbcon`'s handout frame is re-measured**: at 48 rows it shows at least the last 36
       lines, and the kernel's last line was 29 lines before the handout when Part B measured it.
-- [ ] **`check-report`'s page count is read from the gate**: two pages at 1360×768 in the
+- [x] **`check-report`'s page count is read from the gate**: two pages at 1360×768 in the
       measurement above, pinned from the first real run.
-- [ ] **`check-login` asserts the layout it can now see**: the greeter's logged origin is centred
+- [x] **`check-login` asserts the layout it can now see**: the greeter's logged origin is centred
       for the size, the window-list click lands on the bottom bar, and the wallpaper line matches
       the host's `fill`.
-- [ ] Controls, each at 1360×768: the window list placed from the old height fails `check-login` at
+- [x] Controls, each at 1360×768: the window list placed from the old height fails `check-login` at
       its click; the greeter's old centring fails its assertion; the leaf's resolve refused makes the
       greeter log its fallback and fail the same assertion; `wallpaper_mode` put back to `fit` fails
       the wallpaper line.
 
 **E.4 — `cargo xtask check-resolutions`**, on demand
 
-- [ ] Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each of 1024×768,
+- [x] Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each of 1024×768,
       1280×800, 1360×768, 1920×1080 and 2560×1440 — every width a multiple of 8, for the reason
       above — one boot at a time, and prints a table of which passed. Not in CI.
-- [ ] **What it is allowed to find**: the 1024×768 demo-chain failure above is reproduced or not,
+- [x] **What it is allowed to find**: the 1024×768 demo-chain failure above is reproduced or not,
       with the transcript kept; a size that cannot boot in the guest's 256 MiB says so rather than
       timing out; 2560×1440 draws the wallpaper at its own size, centred, since filling that screen
       needs the upscaler. Anything it finds gets a decision-log entry; a class of failure gets a CI

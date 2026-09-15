@@ -1385,6 +1385,8 @@ enum Resolved {
     Manage,
     /// `<N>/info` — that window's metadata.
     Info(u32),
+    /// `screen` — the screen's size.
+    Screen,
     /// Anything else.
     Unknown,
 }
@@ -1399,6 +1401,9 @@ fn classify(suffix: &[u8]) -> Resolved {
     }
     if suffix == b"manage" {
         return Resolved::Manage;
+    }
+    if suffix == b"screen" {
+        return Resolved::Screen;
     }
     if let Some(slash) = suffix.iter().position(|&c| c == b'/')
         && &suffix[slash + 1..] == b"info"
@@ -1443,6 +1448,26 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
     }
+    reply_with_object(serve_end, request_id, &bytes)
+}
+
+/// Answer a `screen` resolve with a `MemoryObject` holding the screen's size
+/// (`rsproto-surface-ops.md`, "Reading the screen's size").
+fn reply_screen_info(serve_end: u64, request_id: u64, srv: &Server) -> bool {
+    let info = librsproto::surface::ScreenInfo {
+        width: srv.screen.size.w,
+        height: srv.screen.size.h,
+    };
+    let mut bytes = [0u8; librsproto::surface::SCREEN_INFO_LEN];
+    if info.write(&mut bytes).is_none() {
+        return reply_resolve_error(serve_end, request_id, KError::KernelError);
+    }
+    reply_with_object(serve_end, request_id, &bytes)
+}
+
+/// Reply to a resolve with a fresh `MemoryObject` holding `bytes` — the shape `<N>/info` and
+/// `screen` both answer in.
+fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
     // SAFETY: a plain anonymous object of `bytes.len()`.
     let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
     if obj <= 0 {
@@ -2809,7 +2834,7 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
         }
 
         // A forwarded resolve: `new` mints a session, `manage` mints the manager channel
-        // (one holder), `<N>/info` answers with window metadata. A bare `<N>` is a later
+        // (one holder), `<N>/info` answers with window metadata, `screen` with the screen's size. A bare `<N>` is a later
         // milestone; `<N>/ports/...` is unscheduled — see `TODO(port-shape-rework)`.
         // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
         let rr = unsafe {
@@ -2855,6 +2880,9 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             }
             Resolved::Info(id) => {
                 reply_window_info(serve_end, request_id, srv, id);
+            }
+            Resolved::Screen => {
+                reply_screen_info(serve_end, request_id, srv);
             }
             Resolved::Unknown => {
                 reply_resolve_error(serve_end, request_id, KError::NotFound);

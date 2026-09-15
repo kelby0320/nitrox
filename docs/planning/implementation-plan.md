@@ -313,6 +313,11 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     a self-test. The live image's menu has a report entry whose `cmdline: hwreport` holds the log on
     the screen a page per key before `init`. `test-qemu` asserts QEMU's answers; `check-report`
     chooses the entry with no serial port and reads the pages.
+  - **Part E (the laptop's resolution) is complete, 2026-09-15.** The desktop takes its size from
+    the screen: a `/dev/draw/screen` leaf, the shell and the greeter sized and centred from it, and
+    the wallpaper filling a 16:9 screen. Every gate that boots a screen boots 1360×768 — QEMU shears
+    the laptop's 1366 — while `test-qemu` keeps 1280×800, and `check-resolutions` runs the display
+    gates at five sizes on demand. A padded stride stays with the host tests.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

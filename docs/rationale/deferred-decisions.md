@@ -1475,11 +1475,14 @@ than hypothetical, on the maintainer's own judgement when the cap was chosen. A 
 object was the alternative and was declined: M10 rejected handle transfer for drops because a
 refused handle has no clean owner.
 
-**A wallpaper scaled to fill — `TODO(wallpaper-fill)` <!-- check-deferrals: no-code-site -->.**
+**A wallpaper scaled up — `TODO(wallpaper-fill)` <!-- check-deferrals: no-code-site -->.**
 M12 Part F fits a too-large picture and centres a smaller one, using the box downscale that exists
-and explicitly refuses to scale up. Filling needs an upscaler and a decision about interpolation.
-**Trigger: a picture that is neither the screen's size nor close to it** — the maintainer wants
-both as options eventually, so the theme key is designed with room for a mode beside the path.
+and explicitly refuses to scale up. **Narrowed in Phase 5 Part E**, which built `fill` as the second
+`wallpaper_mode` the key was designed for — scaling *down* to cover the screen and cropping — so a
+16:10 picture fills the laptop's 16:9 screen. What remains is the upscaler, and the decision about
+interpolation it needs: a `fill` of a picture smaller than the screen draws it at its own size.
+**Trigger: a screen larger than the picture a person wants filling it** — the first 2560×1440
+screen with the shipped 1920×1200 picture is one.
 
 **A press whose release never arrives — `TODO(lost-release)`.** Seen once, in CI, on 2026-09-08:
 `check-login --kvm` timed out on the editor's unsaved-buffer question because the click on its

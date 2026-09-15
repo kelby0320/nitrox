@@ -25739,3 +25739,72 @@ functions, which the first draft's list missed.
 **Seen and not explained:** at 1024×768 `test-qemu`'s dead-log-source check failed in 2 of 3 runs
 (`only 2 of 4 CPUs ever went idle`), against 4 of 4 passing at 1366×768 and 2 of 2 at the default.
 Nothing connects screen size to it; E.4 is where it gets reproduced, and nothing is fixed on a guess.
+
+---
+
+## 2026-09-15 — Phase 5 Part E: the desktop asks the screen its size, and the gates stop knowing it
+
+Part E shipped in the four pieces its revised detail pass (#301) laid out. The design held; what
+moved were one fallback, two missed gate sites, and what the new on-demand check found on its first
+runs.
+
+**E.1 — `/dev/draw/screen`.** A 16-byte `ScreenInfo` (width, height, eight reserved bytes ignored on
+read) the compositor answers a `screen` resolve with, through the object-reply helper it now shares
+with `<N>/info`, and `libsurface::screen::read` to resolve, map, read and unmap it. Not bound into an
+application's namespace, since none reads it.
+
+**E.2 — the clients ask, and the constants are gone.** `SCREEN_W` and `SCREEN_H` were deleted from
+`desktop-shell` and `desktop-session-mgr` with every constant derived from them, so each of the
+shell's 56 uses failed to compile and was changed rather than found. The shell's layout arithmetic
+became `desktop_shell::Screen`, host-tested at nine sizes, where the entry-under-the-indicator
+invariant had been a `const` assert at one — **and those library tests now run in
+`cargo xtask test`, which the library's own doc had claimed for months without being true.** The
+greeter centres on the leaf and, without it, asks for the origin. **The shell treats an unreadable
+leaf as fatal** rather than falling back to `QueryLayout`, which differs from the pass: the manager
+channel is opened only after the bars are created (PR #242's deadlock), so the fallback would have
+come too late to size them, and the leaf resolves through the very binding the shell's connection
+just used.
+
+`fill` is the second `wallpaper_mode` M12 decision 7 designed the key for: `scale::fill` covers the
+screen by scaling down only, rounds the overhanging dimension up, and draws a picture that would need
+an upscale at its own size; `place` already cropped. **Rounding up is a choice, not what keeps the
+screen covered** — the exact size is at least the screen's whole-number size, so truncating covers
+too (PR #302 review) — and the tests pin its direction rather than prove coverage by it.
+`TODO(wallpaper-fill)` narrowed to the upscaler. Controls: removing the upscale cap fails the
+upscale test and the property test that no fill grows a picture; truncating instead of rounding up
+fails only the two tests that pin rounded sizes, and the coverage property passes under it.
+
+**E.3 — every screen gate boots 1360×768 and aims from the size.** `qemu_base_args` takes the screen
+from every caller, so a new boot cannot forget to say; `test-qemu` and `test-interactive` say QEMU's
+default, and every other boot a `DisplaySize` (`--size WxH`, refusing a width QEMU would shear).
+Every coordinate is derived from the size and the chrome metrics the gate writes down a second time
+(M11 decision 2), and a host test pins that at 1280×800 each derivation equals the literal it
+replaced. **The pass's list of sites missed two** — check-login's overview sidebar at x = 1180, and
+check-input's corner-pinned burst — and `tune` turned out to stretch its preview wallpaper to the
+screen, which no desktop had done. Controls at 1360×768, each failing `check-login`: the window list
+placed at `800 − 24` (at its click), the greeter's old centring and the leaf's resolve refused (at
+the centring assertion — the greeter logged its fallback), the staged theme back to `fit` (at the
+wallpaper line). Also fixed: four format strings whose line continuations had collapsed into runs of
+spaces, two of them older than this part.
+
+**E.4 — `cargo xtask check-resolutions`, and what it found.** Four gates at 1024×768, 1280×800,
+1360×768, 1920×1080 and 2560×1440, each a child `cargo xtask <gate> --size` with its transcript kept.
+Its first two runs under TCG found **gate assumptions sized for 1280**, and nothing wrong with the
+system:
+
+- the pointer's pin was twenty `(100, 100)` motions — 2000 px, which does not cross 2560 — so the
+  burst after it started from the wrong place (`pin_motions` now over-drives the longer side);
+- the right-half snap drag's twelve motions of 120 stopped 176 px short of 1920's edge, and made
+  long enough for 2560 they overran the input ring and ended the gesture until paced;
+- `touch ./`, typed unpaced into a terminal that had just started, lost its batch at 1024×768
+  (`input batch DROPPED`) — the race the step's own comment describes, which waiting for `nxsh: up`
+  had closed only at the sizes the gate ran at. Paced as `type_at_terminal` already was: 3 of 3 at
+  1024×768.
+
+With those fixed every gate passed at every size, and CI's gates pass under KVM at 1360×768.
+
+**Found and not fixed: the dead-log-source check at 1024×768.** `test-qemu`'s demo chain failed
+`a closed log source left a CPU spinning` in 2 of 3 boots at 1024×768 during the detail pass, and
+`check-resolutions` reproduced it in one of its two chain-running boots at that size; at every other
+size it has finished every time. Nothing yet connects screen size to a CPU failing to go idle after a
+log source closes, and nothing is fixed on a guess — it is the finding to make observable next.

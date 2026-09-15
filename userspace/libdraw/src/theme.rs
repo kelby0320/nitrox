@@ -225,22 +225,24 @@ pub struct Theme {
     pub wallpaper: Option<ThemePath>,
     /// How a wallpaper is placed when it is not the screen's size.
     ///
-    /// **A key of its own, and today it has exactly one legal value** — M12 decision 7: the
-    /// maintainer wants filling as well eventually, so the *dimension* exists in the schema now
-    /// and a second mode is a value rather than a new key. `fill` needs an upscaler and a
-    /// decision about interpolation and is deferred as `TODO(wallpaper-fill)`; a file naming it
-    /// is refused by name rather than silently fitted, which is what makes that trigger
-    /// observable.
+    /// **A key of its own, with two values** — M12 decision 7 made the *dimension* part of the
+    /// schema so that a second mode would be a value rather than a new key, and Phase 5 Part E
+    /// added it: `fill`, for a 16:10 picture on the laptop's 16:9 screen. Neither mode scales up;
+    /// that is `TODO(wallpaper-fill)`. A value that is neither is refused by name rather than
+    /// silently fitted.
     pub wallpaper_mode: WallpaperMode,
 }
 
 /// How a wallpaper is placed. See [`Theme::wallpaper_mode`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum WallpaperMode {
-    /// Scale down to fit inside the screen if larger, centre if smaller. The only mode that
-    /// ships — [`scale::fit`](crate::scale::fit) is the arithmetic.
+    /// Scale down to fit inside the screen if larger, centre if smaller —
+    /// [`scale::fit`](crate::scale::fit). The built-in theme's.
     #[default]
     Fit,
+    /// Scale down to cover the screen, cropping the overhang; a picture that would need scaling
+    /// up is drawn at its own size — [`scale::fill`](crate::scale::fill). The staged theme's.
+    Fill,
 }
 
 impl WallpaperMode {
@@ -248,15 +250,24 @@ impl WallpaperMode {
     pub fn as_str(self) -> &'static str {
         match self {
             WallpaperMode::Fit => "fit",
+            WallpaperMode::Fill => "fill",
         }
     }
 
-    /// Parse a mode name — `None` for one that does not exist *yet*, which is the answer `fill`
-    /// gets until `TODO(wallpaper-fill)` is built.
+    /// Parse a mode name — `None` for one that does not exist.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "fit" => Some(WallpaperMode::Fit),
+            "fill" => Some(WallpaperMode::Fill),
             _ => None,
+        }
+    }
+
+    /// Plan where a picture of `image` goes on a `screen` of this mode.
+    pub fn plan(self, image: crate::geom::Size, screen: crate::geom::Size) -> crate::scale::Fit {
+        match self {
+            WallpaperMode::Fit => crate::scale::fit(image, screen),
+            WallpaperMode::Fill => crate::scale::fill(image, screen),
         }
     }
 }
@@ -953,18 +964,30 @@ mod tests {
     }
 
     #[test]
-    fn a_wallpaper_mode_that_does_not_exist_yet_is_refused_by_name() {
-        // **`fill` is `TODO(wallpaper-fill)`, and the refusal is what makes that observable.**
-        // Silently fitting a file that asked to fill would be a deferral nobody could find from
-        // the outside — a person would conclude filling was broken rather than absent.
-        let (t, issues) = Theme::from_config("wallpaper_mode = \"fill\"\n");
+    fn a_wallpaper_mode_that_does_not_exist_is_refused_by_name() {
+        // Silently fitting a file that asked for something else would leave a person concluding
+        // the mode was broken rather than absent. `stretch` is the obvious third mode, and it is
+        // not one: it makes every face in a picture the wrong shape.
+        let (t, issues) = Theme::from_config("wallpaper_mode = \"stretch\"\n");
         assert_eq!(t.wallpaper_mode, WallpaperMode::Fit, "the default is unchanged");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, IssueKind::BadValue);
-        // …and the one mode that does exist is taken.
-        let (t, issues) = Theme::from_config("wallpaper_mode = \"fit\"\n");
-        assert_eq!(t.wallpaper_mode, WallpaperMode::Fit);
-        assert!(issues.is_empty(), "{issues:?}");
+        // …and both modes that exist are taken, and written back as they were read.
+        for (name, mode) in [("fit", WallpaperMode::Fit), ("fill", WallpaperMode::Fill)] {
+            let (t, issues) = Theme::from_config(&alloc::format!("wallpaper_mode = \"{name}\"\n"));
+            assert_eq!(t.wallpaper_mode, mode);
+            assert!(issues.is_empty(), "{issues:?}");
+            assert!(t.to_config().contains(&alloc::format!("wallpaper_mode = \"{name}\"")));
+        }
+    }
+
+    #[test]
+    fn each_wallpaper_mode_plans_with_its_own_arithmetic() {
+        use crate::geom::Size;
+        let (image, screen) = (Size::new(1920, 1200), Size::new(1360, 768));
+        assert_eq!(WallpaperMode::Fit.plan(image, screen), crate::scale::fit(image, screen));
+        assert_eq!(WallpaperMode::Fill.plan(image, screen), crate::scale::fill(image, screen));
+        assert_ne!(WallpaperMode::Fit.plan(image, screen), WallpaperMode::Fill.plan(image, screen));
     }
 
     #[test]

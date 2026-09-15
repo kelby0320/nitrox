@@ -78,9 +78,123 @@ pub fn matches(name: &str, q: &str) -> bool {
     n.contains(&q)
 }
 
+/// The screen the shell lays itself out on, read once from `/dev/draw/screen` at startup.
+///
+/// **Asked, not written down** (Phase 5 Part E). Until then the shell had `SCREEN_W = 1280` and
+/// `SCREEN_H = 800`, and on the laptop's 1366×768 its window list was placed at `y = 776` — below
+/// the last row. Every size the shell derives from the screen is a method here, so the arithmetic
+/// is host-tested at every size rather than checked by a `const` assert at one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Screen {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// Each bar's height: the top bar, and the window list at the foot of the screen.
+pub const BAR_H: u32 = 24;
+
+/// Width of one window-list entry, in pixels.
+pub const ENTRY_W: u32 = 180;
+
+/// Width of the desktop indicator at the window list's right-hand end.
+pub const INDICATOR_W: u32 = 160;
+
+/// The overview's sidebar width, at the right-hand edge.
+pub const SIDE_W: u32 = 200;
+
+/// A thumbnail's width in the overview's grid.
+pub const THUMB_W: u32 = 240;
+
+/// Space around each thumbnail.
+pub const THUMB_PAD: u32 = 16;
+
+impl Screen {
+    /// Bytes per row of a buffer as wide as the screen — both bars, the wallpaper, the overview.
+    pub const fn pitch(self) -> usize {
+        self.width as usize * 4
+    }
+
+    /// Where the indicator starts, in bar-local x. Clicks at or past this belong to it.
+    ///
+    /// **Anchored to the screen's right edge.** The first version laid the indicator out after the
+    /// entries, so it was drawn at `n * ENTRY_W` and coincided with its hit region at exactly one
+    /// window count (PR #243 review, blocking 2); a flexible spacer between the entries and the
+    /// indicator is what puts it here, and [`max_entries`](Self::max_entries) reserves the width.
+    pub const fn indicator_x(self) -> u32 {
+        self.width.saturating_sub(INDICATOR_W)
+    }
+
+    /// How many entries the window list can show without one being painted under the indicator.
+    ///
+    /// **The invariant is the product**: `max_entries × ENTRY_W + INDICATOR_W ≤ width`. With the
+    /// capacity computed from the full width, a full bar painted an entry across the indicator's
+    /// hit region, and clicking the last window switched desktops (PR #243 review, blocking 2).
+    /// Entries past the limit are not shown; the window is still there.
+    pub const fn max_entries(self) -> usize {
+        (self.indicator_x() / ENTRY_W) as usize
+    }
+
+    /// Where the window list is placed: its top edge, one bar above the bottom of the screen.
+    pub const fn window_list_y(self) -> i32 {
+        self.height.saturating_sub(BAR_H) as i32
+    }
+
+    /// How many thumbnails fit across the overview's grid, beside the sidebar — at least one, so
+    /// a screen too narrow for a full column still lays thumbnails out rather than dividing by
+    /// zero.
+    pub const fn thumb_cols(self) -> u32 {
+        let cols = self.width.saturating_sub(SIDE_W) / (THUMB_W + THUMB_PAD);
+        if cols == 0 { 1 } else { cols }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sizes the shell has been or will be run at, and the edges of the arithmetic.
+    const SIZES: [(u32, u32); 9] = [
+        (0, 0),
+        (160, 100),
+        (339, 200),
+        (1024, 768),
+        (1280, 800),
+        (1360, 768),
+        (1366, 768),
+        (1920, 1080),
+        (2560, 1440),
+    ];
+
+    #[test]
+    fn no_entry_is_ever_painted_under_the_indicator() {
+        for (width, height) in SIZES {
+            let s = Screen { width, height };
+            let used = s.max_entries() as u32 * ENTRY_W;
+            assert!(used + INDICATOR_W.min(width) <= width, "{width}x{height}: {used} + indicator");
+            assert!(used <= s.indicator_x(), "{width}x{height}: an entry crosses the indicator");
+        }
+    }
+
+    #[test]
+    fn the_layout_at_the_old_size_and_at_the_gate_size() {
+        let old = Screen { width: 1280, height: 800 };
+        assert_eq!((old.indicator_x(), old.max_entries(), old.window_list_y()), (1120, 6, 776));
+        assert_eq!((old.thumb_cols(), old.pitch()), (4, 5120));
+        let gate = Screen { width: 1360, height: 768 };
+        assert_eq!((gate.indicator_x(), gate.max_entries(), gate.window_list_y()), (1200, 6, 744));
+        assert_eq!((gate.thumb_cols(), gate.pitch()), (4, 5440));
+    }
+
+    #[test]
+    fn a_screen_too_small_for_the_chrome_degrades_rather_than_wrapping() {
+        let tiny = Screen { width: 100, height: 10 };
+        assert_eq!(tiny.indicator_x(), 0);
+        assert_eq!(tiny.max_entries(), 0);
+        assert_eq!(tiny.window_list_y(), 0, "saturating, not a negative origin from a wrap");
+        assert_eq!(tiny.thumb_cols(), 1);
+    }
 
     fn app(name: &str, exec: &str) -> Application {
         Application { name: alloc::string::String::from(name), exec: alloc::string::String::from(exec) }

@@ -85,13 +85,13 @@ pub fn box_downscale(src: &[u8], src_geom: Geometry, dst: &mut [u8], dst_geom: G
     true
 }
 
-/// Where a picture goes on a screen, and at what size.
+/// Where a picture goes on a screen, and at what size — the plan [`fit`] and [`fill`] both make.
 ///
-/// **Fit if larger, centre if smaller** — M12 decision 7, and the whole of it. A picture bigger
-/// than the screen is scaled down to fit inside it with its aspect ratio kept; one that already
-/// fits is drawn at its own size, centred. Scaling *up* to fill is deferred as a **mode** rather
-/// than left out — `TODO(wallpaper-fill)` — because it needs an upscaler and a decision about
-/// interpolation, and the maintainer wants both eventually.
+/// **Two ways to plan it.** [`fit`] is M12 decision 7: a picture bigger than the screen is scaled
+/// down to fit inside it with its aspect ratio kept, and one that already fits is drawn at its own
+/// size, centred. [`fill`] is the second mode that decision designed the theme key for (Phase 5
+/// Part E): scaled down to *cover* the screen, the overhang cropped. Neither scales up — that is
+/// `TODO(wallpaper-fill)`, which needs an upscaler and a decision about interpolation.
 ///
 /// **A plan rather than a picture**, so the arithmetic is testable without a framebuffer. The
 /// caller downscales if [`scaled`](Self::scaled) and blits at [`origin`](Self::origin).
@@ -101,8 +101,9 @@ pub struct Fit {
     pub size: Size,
     /// Where its top-left corner goes.
     ///
-    /// Never negative: a picture is only ever drawn at a size that fits, so it is inset rather
-    /// than cropped. A caller does not have to clip.
+    /// **Never negative from [`fit`]**, which only draws a picture at a size that fits, so it is
+    /// inset rather than cropped. **Negative from [`fill`]** in the axis it crops: the picture is
+    /// larger than the screen there, and its overhang is split either side. [`place`] clips both.
     pub origin: Point,
     /// Whether reaching [`size`](Self::size) needs a downscale.
     ///
@@ -151,7 +152,51 @@ pub fn fit(image: Size, screen: Size) -> Fit {
     }
 }
 
-/// Draw `image` onto `dst` where [`fit`] says, filling the rest with `ground`.
+/// Plan `image` to cover a `screen`: the smallest downscale that leaves no part of the screen
+/// uncovered, centred, with the overhang cropped by [`place`].
+///
+/// **Scaling down only, and capped at 1.** Covering a screen larger than the picture in either
+/// axis would take an upscale, which is `TODO(wallpaper-fill)`; such a picture is drawn at its own
+/// size, centred — cropped in an axis where it is larger, and bordered by the ground in one where it
+/// is smaller. So a fill never makes a picture bigger than its file, and at worst looks like [`fit`]
+/// of a picture that did not need scaling.
+///
+/// **The overhanging dimension rounds up**, never past the picture's own size. That is a choice,
+/// not what keeps the screen covered: the exact scaled size is at least the screen's, which is a
+/// whole number, so truncating would cover it too. Up draws the picture under a pixel taller (or
+/// wider) than its shape, where down would draw it under a pixel shorter; neither can be seen,
+/// and the tests pin the direction so it does not change unnoticed. A zero dimension plans
+/// nothing, as [`fit`] does.
+pub fn fill(image: Size, screen: Size) -> Fit {
+    if image.w == 0 || image.h == 0 || screen.w == 0 || screen.h == 0 {
+        return Fit { size: Size::new(0, 0), origin: Point::new(0, 0), scaled: false };
+    }
+    let (iw, ih, sw, sh) = (image.w as u64, image.h as u64, screen.w as u64, screen.h as u64);
+    let size = if iw < sw || ih < sh {
+        // Covering would need an upscale in at least one axis: capped at the picture's own size.
+        image
+    } else if iw * sh <= ih * sw {
+        // The picture is no wider, relative to its height, than the screen: width binds, and the
+        // height overhangs.
+        Size::new(screen.w, (ih * sw).div_ceil(iw).min(ih) as u32)
+    } else {
+        // Wider than the screen's shape: height binds, and the width overhangs.
+        Size::new((iw * sh).div_ceil(ih).min(iw) as u32, screen.h)
+    };
+    Fit {
+        size,
+        // Truncating toward zero on a negative overhang puts the extra pixel off the left or top,
+        // the mirror of `fit`'s leftover going right and bottom. Half a pixel either way.
+        origin: Point::new(
+            (screen.w as i32 - size.w as i32) / 2,
+            (screen.h as i32 - size.h as i32) / 2,
+        ),
+        scaled: size != image,
+    }
+}
+
+/// Draw `image` onto `dst` where a [`fit`] or [`fill`] plan says, filling the rest with `ground`
+/// and cropping whatever falls outside.
 ///
 /// **The whole of "put a wallpaper on a screen", so the arithmetic is here rather than in the
 /// shell.** Two things in it are easy to get wrong and invisible when they are — the destination
@@ -397,11 +442,79 @@ mod tests {
         assert!(box_downscale(&src, sg, &mut dst, dg), "the planned size is one it accepts");
     }
 
+    // ---- fill (Phase 5 Part E) ----
+
+    #[test]
+    fn a_sixteen_by_ten_picture_fills_a_sixteen_by_nine_screen_by_cropping_top_and_bottom() {
+        // The shipped wallpaper on the gates' screen, and on the laptop's.
+        let gate = fill(Size::new(1920, 1200), Size::new(1360, 768));
+        assert_eq!(gate, Fit { size: Size::new(1360, 850), origin: Point::new(0, -41), scaled: true });
+        let laptop = fill(Size::new(1920, 1200), Size::new(1366, 768));
+        assert_eq!(laptop.size, Size::new(1366, 854), "853.75 rounds up; 853 would cover too");
+        assert_eq!(laptop.origin, Point::new(0, -43));
+    }
+
+    #[test]
+    fn a_sixteen_by_nine_picture_fills_a_sixteen_by_ten_screen_by_cropping_the_sides() {
+        let f = fill(Size::new(1920, 1080), Size::new(1280, 800));
+        assert_eq!(f.size, Size::new(1423, 800), "1422.2 rounds up");
+        assert_eq!(f.origin, Point::new(-71, 0));
+        assert!(f.scaled);
+    }
+
+    #[test]
+    fn a_fill_that_would_need_an_upscale_draws_the_picture_at_its_own_size() {
+        // The shipped picture on a 2560x1440 screen: covering it is 4/3, an upscale.
+        let big = fill(Size::new(1920, 1200), Size::new(2560, 1440));
+        assert_eq!(big, Fit { size: Size::new(1920, 1200), origin: Point::new(320, 120), scaled: false });
+        // Larger than the screen in one axis and smaller in the other: its own size, cropped
+        // vertically and bordered horizontally.
+        let tall = fill(Size::new(1000, 2000), Size::new(1360, 768));
+        assert_eq!(tall, Fit { size: Size::new(1000, 2000), origin: Point::new(180, -616), scaled: false });
+        // And the exact size is neither scaled nor moved.
+        assert_eq!(fill(Size::new(1360, 768), Size::new(1360, 768)).origin, Point::new(0, 0));
+    }
+
+    #[test]
+    fn every_scaled_fill_covers_the_screen_and_never_grows_the_picture() {
+        let pictures = [(1920, 1200), (1920, 1080), (4000, 1000), (1000, 4000), (1367, 769), (3001, 1999)];
+        let screens = [(1024, 768), (1280, 800), (1360, 768), (1366, 768), (1920, 1080), (7, 5)];
+        for (iw, ih) in pictures {
+            for (sw, sh) in screens {
+                let f = fill(Size::new(iw, ih), Size::new(sw, sh));
+                assert!(f.size.w <= iw && f.size.h <= ih, "{iw}x{ih} on {sw}x{sh}: grew to {:?}", f.size);
+                if f.scaled {
+                    let (x, y) = (f.origin.x, f.origin.y);
+                    assert!(x <= 0 && y <= 0, "{iw}x{ih} on {sw}x{sh}: origin {x},{y} leaves a margin");
+                    assert!(x + f.size.w as i32 >= sw as i32, "{iw}x{ih} on {sw}x{sh}: a bare column");
+                    assert!(y + f.size.h as i32 >= sh as i32, "{iw}x{ih} on {sw}x{sh}: a bare row");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn place_crops_a_fill_plan_to_the_screen() {
+        // Four columns of different colours, filling a two-column screen: the middle two show.
+        let ig = Geometry::with_pitch(4, 2, 16, PixelFormat::XRGB8888).unwrap();
+        let cols = [Rgb::new(10, 0, 0), Rgb::new(20, 0, 0), Rgb::new(30, 0, 0), Rgb::new(40, 0, 0)];
+        let img = packed(ig, |x, _| cols[x as usize]);
+        let dg = Geometry::with_pitch(2, 2, 12, PixelFormat::XRGB8888).unwrap();
+        let mut dst = alloc::vec![0xEEu8; dg.pitch * 2];
+        let plan = fill(Size::new(4, 2), Size::new(2, 2));
+        assert_eq!(plan, Fit { size: Size::new(4, 2), origin: Point::new(-1, 0), scaled: false });
+        assert!(place(&img, ig, plan, Rgb::new(0, 0, 0), &mut dst, dg));
+        assert_eq!((at(&dst, dg, 0, 0), at(&dst, dg, 1, 1)), (cols[1], cols[2]));
+        assert_eq!(&dst[8..12], &[0xEE; 4], "the destination's row padding is untouched");
+    }
+
     #[test]
     fn a_zero_dimension_is_answered_rather_than_panicking() {
         // The image's size comes from a file's header and the screen's from a device.
         assert_eq!(fit(Size::new(0, 100), Size::new(1280, 800)).size, Size::new(0, 0));
         assert_eq!(fit(Size::new(100, 100), Size::new(0, 800)).size, Size::new(0, 0));
+        assert_eq!(fill(Size::new(0, 100), Size::new(1280, 800)).size, Size::new(0, 0));
+        assert_eq!(fill(Size::new(100, 100), Size::new(1280, 0)).size, Size::new(0, 0));
     }
 
     fn geom(w: u32, h: u32) -> Geometry {
