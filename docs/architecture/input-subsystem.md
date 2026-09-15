@@ -1,8 +1,8 @@
 # Nitrox: Input Subsystem
 
 **Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11),
-loss reworked so relative motion survives a slow consumer (2026-08-26) — and this document
-describes what exists.** The whole path from an interrupt to a keystroke
+loss reworked so relative motion survives a slow consumer (2026-08-26), a key-press count for the
+hardware report (Phase 5 Part D, 2026-09-14) — and this document describes what exists.** The whole path from an interrupt to a keystroke
 arriving in a widget runs on every boot:
 
 | Stage | Where |
@@ -112,6 +112,12 @@ called from the timer IRQ dispatcher ahead of the DPC drain, is what breaks that
 read per tick, a drain only when the buffer is full. The ISR is the fast path; the sweep is
 what makes the fast path's loss recoverable rather than fatal (2026-08-13; see the decision
 log).
+
+**Before userspace, the driver has one consumer of its own** (Phase 5 Part D): the hardware
+report turns its pages on a key press. It needs to know only *that* a key went down, so the driver
+keeps a count of presses and nothing else (`drivers::ps2::key_presses`), and the report drains the
+keyboard's ring before userspace starts (`drain_keyboard`), so the keys that turned pages reach no
+program.
 
 The lesson generalises past this controller: **a driver for a shared-buffer device with an
 edge-derived interrupt needs a recovery path that does not depend on that interrupt.** A USB

@@ -380,7 +380,8 @@ mod tests {
 
     #[test]
     fn the_laptops_signature_needs_the_extended_model() {
-        // i3-7100U (Kaby Lake): CPUID.01H:EAX = 0x000806E9. Base fields alone say model 0xe.
+        // The laptop's i5-7200U (Kaby Lake-U): CPUID.01H:EAX = 0x000806E9. Base fields alone say
+        // model 0xe.
         assert_eq!(decode_signature(0x0008_06E9), (6, 0x8E, 9));
     }
 
@@ -396,14 +397,14 @@ mod tests {
 
     #[test]
     fn the_brand_string_reads_across_leaves_and_registers_in_order() {
-        let text = *b"  Intel(R) Core(TM) i3-7100U CPU @ 2.40GHz\0\0\0\0\0\0";
+        let text = *b"  Intel(R) Core(TM) i5-7200U CPU @ 2.50GHz\0\0\0\0\0\0";
         let reg = |at: usize| u32::from_le_bytes(text[at..at + 4].try_into().unwrap());
         let leaf = |i: usize| (reg(i * 16), reg(i * 16 + 4), reg(i * 16 + 8), reg(i * 16 + 12));
         let brand = brand_bytes([leaf(0), leaf(1), leaf(2)]);
         assert_eq!(brand, text);
         assert_eq!(
             format!("{}", crate::libkern::printable::Printable(brand_trimmed(&brand))),
-            "Intel(R) Core(TM) i3-7100U CPU @ 2.40GHz"
+            "Intel(R) Core(TM) i5-7200U CPU @ 2.50GHz"
         );
     }
 

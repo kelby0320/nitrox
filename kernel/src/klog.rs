@@ -45,8 +45,9 @@
 //! All state is behind an [`IrqSpinLock`]. [`push`] uses **`try_lock`** (skipping
 //! the line if contended) so teeing from the panic/exception path — which also
 //! flows through `write_str` — can never deadlock against a fault that strikes
-//! while the ring lock is held. The reader path ([`len`] / [`copy_into_frames`]) is
-//! syscall context and blocks on the lock normally.
+//! while the ring lock is held. The reader paths ([`len`] with [`copy_into_frames`] for
+//! `/dev/log`, and [`copy_into`] for the hardware report) are thread context and block on the lock
+//! normally.
 
 use crate::libkern::IrqSpinLock;
 use crate::libkern::lockrank::LockRank;
@@ -155,6 +156,20 @@ impl Klog {
         self.prefix_len + self.notice_len() + self.ring_len
     }
 
+    /// Copy the linearised snapshot into `out` — the same [`runs`](Self::runs), in order —
+    /// stopping when `out` is full. Returns the bytes copied.
+    fn copy_into(&self, out: &mut [u8]) -> usize {
+        let mut notice = [0u8; NOTICE_MAX];
+        let notice_len = if self.elided == 0 { 0 } else { format_notice(self.elided, &mut notice) };
+        let mut written = 0;
+        for run in self.runs(&notice[..notice_len]) {
+            let n = run.len().min(out.len() - written);
+            out[written..written + n].copy_from_slice(&run[..n]);
+            written += n;
+        }
+        written
+    }
+
     /// Length of the elision notice (`0` when nothing has been overwritten).
     fn notice_len(&self) -> usize {
         if self.elided == 0 {
@@ -242,6 +257,16 @@ pub fn len() -> usize {
 pub fn stats() -> (usize, usize, usize) {
     let g = KLOG.lock();
     (g.prefix_len, g.ring_len, g.elided)
+}
+
+/// Copy the linearised log into `out`, as [`copy_into_frames`] lays it out — boot prefix, the
+/// elision notice if any, the ring oldest-first — stopping when `out` is full. Returns the bytes
+/// copied. The hardware report's read (Phase 5 Part D.3); size `out` with [`len`].
+///
+/// Runs under the ring lock, which masks interrupts for the copy: at most [`KLOG_CAP`] bytes and
+/// a notice.
+pub fn copy_into(out: &mut [u8]) -> usize {
+    KLOG.lock().copy_into(out)
 }
 
 /// Copy the linearised log into `frames` (one page each, via the HHDM) — the
@@ -375,6 +400,22 @@ mod tests {
         k.append(&[b'a'; RING_CAP + 100]);
         // The sizing call and the copy must agree, or `/dev/log` truncates or overruns.
         assert_eq!(k.snapshot_len(), linearise(&k).len());
+    }
+
+    #[test]
+    fn the_buffer_copy_is_the_snapshot_and_stops_when_the_buffer_is_full() {
+        let mut k = fresh();
+        k.append(&[b'P'; PREFIX_CAP]);
+        k.append(&[b'a'; RING_CAP - 2]);
+        k.append(b"BCDE"); // wrapped, and two bytes elided
+        let whole = linearise(&k);
+        let mut out = vec![0u8; k.snapshot_len() + 10];
+        assert_eq!(k.copy_into(&mut out), whole.len());
+        assert_eq!(&out[..whole.len()], &whole[..]);
+        // A short buffer takes a prefix of the same bytes, across the prefix/notice boundary.
+        let mut short = vec![0u8; PREFIX_CAP + 5];
+        assert_eq!(k.copy_into(&mut short), PREFIX_CAP + 5);
+        assert_eq!(&short[..], &whole[..PREFIX_CAP + 5]);
     }
 
     #[test]

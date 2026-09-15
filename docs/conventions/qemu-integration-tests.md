@@ -81,13 +81,22 @@ A verdict is one bit, and some defects do not reach it. `test-qemu` therefore al
 against the **captured serial transcript** after a PASS, and a transcript check failing fails
 the run.
 
-`test-qemu` has four. **`check_login_chain`** requires
+`test-qemu` has eight (the list is `cmd_test_qemu`'s PASS arm); the ones with a story worth
+keeping are below, and `check_ahci_msi_path`, `check_block_read_selftest` and
+`check_oversize_refused` each carry theirs in a doc comment. **`check_login_chain`** requires
 `session-mgr: received fs + profile endpoints; auth resolved from /svc/auth` (the wording changed
 in M7 Part C, when the auth channel stopped being couriered and became a namespace resolve). It replaces a `verdict(false)`
 `session-mgr` used to fire when its endpoint handoff failed — a session supervisor adjudicating
 a test run — and without it a broken login chain reaches PASS, because nothing else in
 `test-qemu` reads it. It asserts the chain came *up*, not that anyone logged in: nothing types
 a password here.
+
+**`check_hardware_facts`** (Phase 5 Part D) requires the lines of the hardware report every boot
+logs that describe QEMU's machine as it is: q35's ECAM window, four enabled MADT CPUs and one IOAPIC,
+QEMU's ACPI tables by signature and OEM, the framebuffer's geometry with its padding, the AHCI
+controller **claimed** over MSI, COM1 present, and the pinned Limine. The boot passes with any of
+them wrong, which is why it is a transcript check; `check-report` asserts the other half — a
+declined controller, no COM1 — off the screen of a boot with no serial port.
 
 **`check_demo_chain`** requires `test-harness: all smoke tests passed`, **`check_display_selftest`**
 requires `display-selftest: PASSED`, and **`check_every_service_started`** forbids

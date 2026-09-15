@@ -173,8 +173,9 @@ fn kernel_main() {
     // What was handed over and what this processor is (Phase 5 Part D.1), before anything that
     // can fail on an unfamiliar machine: a boot that stops at the next step has already said
     // what it stopped on. Both only read — Limine's responses, and CPUID.
-    log_handoff();
+    let cmdline = log_handoff();
     arch::Cpu::log_identity();
+    let flags = parse_cmdline(cmdline);
 
     // Bring up the physical-memory buddy allocator and the slab on top of
     // it. This walks Limine's memory map and pokes the allocator — a likely
@@ -368,6 +369,13 @@ fn kernel_main() {
     // screen's drawing, which ran *after* this line — the binding resolved to "no aperture
     // recorded" every time, and the boot still passed because the demo is non-fatal.
     record_framebuffer();
+
+    // The hardware report, on a boot whose command line asked for one (Phase 5 Part D.3): here,
+    // because the drivers have bound, every CPU is up or failed to be, and the framebuffer is
+    // recorded — every fact the report shows exists — and nothing of userspace does yet.
+    if let Some(page_wait_secs) = flags.hwreport {
+        nitrox_kernel::report::run(page_wait_secs);
+    }
 
     run_first_userspace();
 
@@ -651,7 +659,9 @@ fn bring_up_aps() {
 ///
 /// Reads nothing but Limine's responses, so it runs before the allocators. A response the
 /// bootloader did not provide is said, not skipped — on a new machine an absence is a fact.
-fn log_handoff() {
+///
+/// Returns the command line's bytes (empty when there is none), for [`parse_cmdline`].
+fn log_handoff() -> &'static [u8] {
     // SAFETY (every request read below): the statics are written by Limine before `_start` and
     // only read afterwards; reading through a raw-pointer copy stops the optimiser folding the
     // pre-Limine null. A non-null response is a valid response of its type, and its strings
@@ -701,7 +711,7 @@ fn log_handoff() {
         None
     } else {
         // SAFETY: as above; the command line is NUL-terminated.
-        Some(unsafe { c_bytes((*cmdline).cmdline, 1024) })
+        Some(unsafe { c_bytes((*cmdline).cmdline, CMDLINE_MAX) })
     };
     match (date, cmdline) {
         (Some(d), Some(c)) => {
@@ -718,7 +728,7 @@ fn log_handoff() {
     let memmap = unsafe { (&raw const MEMMAP_REQUEST).read().response };
     if memmap.is_null() {
         kprintln!("memmap: no Limine memory map");
-        return;
+        return cmdline.unwrap_or(&[]);
     }
     // SAFETY: as above.
     let memmap = unsafe { &*memmap };
@@ -729,6 +739,28 @@ fn log_handoff() {
         tally.add(e.kind, e.length);
     }
     kprintln!("memmap: {}", tally);
+    cmdline.unwrap_or(&[])
+}
+
+/// The longest command line read. Limine sets no limit; a boot-menu entry is a line of text.
+const CMDLINE_MAX: usize = 1024;
+
+/// Parse the boot entry's command line, logging what it asks for and each word it ignores. A
+/// command line never stops a boot (see `nitrox_kernel::cmdline`).
+fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
+    use nitrox_kernel::cmdline::{self, Ignored};
+    let flags = cmdline::parse(line, |ignored| match ignored {
+        Ignored::Unknown(word) => kprintln!("cmdline: ignoring unknown word \"{}\"", Printable(word)),
+        Ignored::BadValue(word) => kprintln!(
+            "cmdline: \"{}\" has no readable number of seconds — using {}",
+            Printable(word),
+            cmdline::HWREPORT_DEFAULT_SECS
+        ),
+    });
+    if let Some(secs) = flags.hwreport {
+        kprintln!("cmdline: hardware report — each page waits up to {} s for a key", secs);
+    }
+    flags
 }
 
 /// A command line as a log line shows it: [`Printable`], except that an empty one stays empty

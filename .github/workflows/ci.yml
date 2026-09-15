@@ -265,6 +265,15 @@ jobs:
       - name: cargo xtask check-live --kvm
         run: cargo xtask check-live --kvm
 
+      # **The hardware report, read the way the laptop will be read** (Phase 5 Part D): the live
+      # image again, as a USB stick with the AHCI controller empty and **no serial port**. The
+      # gate finds Limine's menu, chooses `Nitrox — hardware report`, reads each page the kernel
+      # holds off the screen, presses a key for the next, and asserts what the pages say — a
+      # declined AHCI controller, the module disk, no UART — then that the boot goes on. The only
+      # gate that drives the boot menu, and the only one that sees the report at all.
+      - name: cargo xtask check-report --kvm
+        run: cargo xtask check-report --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve

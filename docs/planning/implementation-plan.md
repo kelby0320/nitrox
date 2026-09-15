@@ -306,6 +306,13 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     `cargo xtask image --live` carries the release root as `root.img`, mounted by the same
     `fs-server-ext4`. `check-live` boots it as a USB stick with no disk; `check-images` holds it to
     the release image but for one manifest line.
+  - **Part D (the hardware report) is complete, 2026-09-14.** Every boot logs what it found — the
+    bootloader handoff, the CPU, every ACPI table and MADT entry (type-9 CPUs now counted), each
+    PCI function's capabilities, and one line per function saying whether a driver claimed it,
+    declined it and why, or none matched — and says `console: no UART at COM1` rather than failing
+    a self-test. The live image's menu has a report entry whose `cmdline: hwreport` holds the log on
+    the screen a page per key before `init`. `test-qemu` asserts QEMU's answers; `check-report`
+    chooses the entry with no serial port and reads the pages.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

@@ -25,7 +25,7 @@ pub mod mouse;
 pub mod ring;
 pub mod scancode;
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch::ps2::Port;
 use crate::arch::timer::ArchTimer;
@@ -110,6 +110,11 @@ static PS2_DPC: Dpc = Dpc::new(ps2_intr_dpc, core::ptr::null_mut());
 /// Set once a device has answered and the handlers are armed. Guards [`poll`] — see there for
 /// why an absent controller would otherwise be drained on every tick.
 static PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// Key presses decoded since boot; a held key counts each typematic repeat, as the keyboard sends
+/// each as a press. What the hardware report waits on (Phase 5 Part D.3): it needs to know *that*
+/// a key went down and nothing about which, so no keystroke is kept where a log could show it.
+static KEY_PRESSES: AtomicU64 = AtomicU64::new(0);
 
 /// The leaked-`'static` device nodes, indexed by `DEV_*`. `device_ref` hands out counted
 /// references for `/dev/input/raw/<n>` lookups.
@@ -317,6 +322,9 @@ fn drain_controller() -> bool {
                         // test as well as the console's.
                         panic!("fbcon-gate: F10 pressed, and this kernel was built to stop on it");
                     }
+                    if pressed {
+                        KEY_PRESSES.fetch_add(1, Ordering::Relaxed);
+                    }
                     let value = if pressed {
                         crate::libkern::input::KEY_PRESS
                     } else {
@@ -377,6 +385,36 @@ pub fn poll() {
     }
     if drain_controller() {
         crate::dpc::enqueue(&PS2_DPC);
+    }
+}
+
+/// Key presses decoded since boot. Compare two readings to learn whether a key went down between
+/// them; the count says nothing about which key.
+pub fn key_presses() -> u64 {
+    KEY_PRESSES.load(Ordering::Relaxed)
+}
+
+/// `true` once a keyboard has answered and its interrupt is armed — the only case in which
+/// [`key_presses`] can ever move.
+pub fn keyboard_present() -> bool {
+    PRESENT.load(Ordering::Acquire) && !NODES[DEV_KEYBOARD].load(Ordering::Acquire).is_null()
+}
+
+/// Throw away every keyboard event waiting in the ring. Returns how many bytes of records went.
+///
+/// For keys pressed before anyone could have meant them for a program — the hardware report's
+/// page turns — so the first reader of `/dev/input/raw/0` does not receive them. Thread context;
+/// no reader is parked this early, so there is nothing to complete.
+pub fn drain_keyboard() -> usize {
+    let now = crate::arch::Timer::read_ns();
+    let mut scratch = [0u8; DRAIN_MAX];
+    let mut total = 0;
+    loop {
+        let n = PS2.lock().devices[DEV_KEYBOARD].ring.drain_into(&mut scratch, now);
+        if n == 0 {
+            return total;
+        }
+        total += n;
     }
 }
 

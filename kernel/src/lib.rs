@@ -14,6 +14,7 @@
 
 pub mod arch;
 pub mod clock;
+pub mod cmdline;
 pub mod device;
 pub mod dpc;
 pub mod drivers;
@@ -30,6 +31,7 @@ pub mod limine;
 pub mod mm;
 pub mod object;
 pub mod pci;
+pub mod report;
 pub mod rsproto;
 pub mod sched;
 pub mod syscall;
