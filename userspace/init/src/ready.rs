@@ -8,7 +8,8 @@
 //!
 //! The refusal is Phase 5's: `fs-server-ext4` used to say Ready over a device holding no
 //! filesystem, and the first sign was a program that would not load off the mount. It now
-//! refuses, and init prints the reason beside the device and mount point only it knows.
+//! refuses, and init prints the reason beside the device and mount point only it knows — through
+//! `Line::untrusted`, since it crossed the wire, and uncut: `Line` marks a line too long to hold.
 
 /// `"RSMG"`, the envelope's first four bytes.
 pub const RS_MAGIC: u32 = 0x5253_4D47;
@@ -21,9 +22,8 @@ pub const FLAG_ERROR: u32 = 1 << 1;
 pub const HEADER_LEN: usize = 28;
 /// An `ErrorBody` before its message: `kerror`, `server_code`, `msg_len`, reserved.
 pub const ERROR_BODY_LEN: usize = 12;
-/// The longest reason init prints. A longer one is cut: it is a line on a console that may be
-/// 170 columns wide, and the server is trusted with a device, not with init's log.
-pub const MAX_REASON: usize = 192;
+/// The most handles one `IpcMsg` carries, and so the most init can receive with a Ready.
+pub const IPC_HANDLE_MAX: usize = 8;
 
 /// What a server's first control message said.
 #[derive(Debug, PartialEq, Eq)]
@@ -60,14 +60,15 @@ fn reason(payload: &[u8]) -> Option<&[u8]> {
     body.get(ERROR_BODY_LEN..ERROR_BODY_LEN + msg_len)
 }
 
-/// Copy `reason` into `out` for printing: at most [`MAX_REASON`] bytes, and anything that is not
-/// printable ASCII as `?`, so a reason cannot move the console's cursor or colour its text.
-pub fn printable<'o>(reason: &[u8], out: &'o mut [u8; MAX_REASON]) -> &'o [u8] {
-    let n = reason.len().min(MAX_REASON);
-    for (o, &b) in out.iter_mut().zip(&reason[..n]) {
-        *o = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+/// Which of the `count` handles that arrived with `first` init must close: every one, unless
+/// it is a Ready, whose `handles[0]` is the endpoint to bind. A message with more handles than it
+/// should carry would otherwise leave the rest in PID 1's table for the life of the machine.
+pub fn handles_to_close(first: &First<'_>, count: usize) -> core::ops::Range<usize> {
+    let count = count.min(IPC_HANDLE_MAX);
+    match first {
+        First::Ready => 1.min(count)..count,
+        First::Refused(_) | First::Unexpected => 0..count,
     }
-    &out[..n]
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
@@ -143,11 +144,6 @@ mod tests {
         let mut short = good.clone();
         short[20..24].copy_from_slice(&4u32.to_le_bytes());
         assert_eq!(parse(&short, 0), First::Refused(b""));
-
-        // A body length so large that adding the header to it would overflow.
-        let mut huge = good.clone();
-        huge[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(parse(&huge, 0), First::Refused(b""));
     }
 
     #[test]
@@ -163,10 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_is_printed_cut_and_with_control_bytes_replaced() {
-        let mut out = [0u8; MAX_REASON];
-        assert_eq!(printable(b"magic 0x0000\x1b[2J\n\xe2\x80\x94", &mut out), b"magic 0x0000?[2J????");
-        let long = [b'x'; MAX_REASON + 10];
-        assert_eq!(printable(&long, &mut out).len(), MAX_REASON);
+    fn every_handle_that_is_not_the_endpoint_is_closed() {
+        let refused = First::Refused(b"why");
+        assert_eq!(handles_to_close(&First::Ready, 1), 1..1, "the endpoint is kept");
+        assert_eq!(handles_to_close(&First::Ready, 3), 1..3, "and only the endpoint");
+        assert_eq!(handles_to_close(&refused, 0), 0..0);
+        assert_eq!(handles_to_close(&refused, 3), 0..3);
+        assert_eq!(handles_to_close(&First::Unexpected, 2), 0..2);
+        // A count the kernel could never write is held to the buffer init received into.
+        assert_eq!(handles_to_close(&First::Unexpected, 100), 0..IPC_HANDLE_MAX);
     }
 }

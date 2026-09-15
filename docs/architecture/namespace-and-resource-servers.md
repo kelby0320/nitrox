@@ -524,7 +524,10 @@ themselves** (`why-supervisor-registration.md`). A supervisor:
    minimal own-namespace, and a **control channel**) — but **not** `BIND_NAMESPACE`;
 2. the RS initializes, creates its serving endpoint (`sys_channel_create`, keeping
    the receive end), and sends **Ready** (with the endpoint handle) on the control
-   channel (`docs/spec/rsproto-wire-format.md` § Ready);
+   channel (`docs/spec/rsproto-wire-format.md` § Ready) — or, if initializing found
+   it cannot serve (an fs-server over a device with no filesystem it can read), a
+   **refusal** carrying its reason and no handle, and exits; the supervisor reports
+   the reason and binds nothing;
 3. the supervisor receives Ready and calls `sys_ns_bind(ns, path, endpoint, rights)`
    to bind the endpoint at the chosen path with chosen rights;
 4. lookups resolving to `path` are now routed to the endpoint.

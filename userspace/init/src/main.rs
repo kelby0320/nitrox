@@ -97,7 +97,7 @@ static mut CLIPBOARD_ENDPOINT: u64 = 0;
 const IPC_MSG_LEN: usize = 4096;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; IPC_MSG_LEN] = [0; IPC_MSG_LEN];
-static mut IPC_HANDLES: [u64; 8] = [0; 8];
+static mut IPC_HANDLES: [u64; init::ready::IPC_HANDLE_MAX] = [0; init::ready::IPC_HANDLE_MAX];
 static mut IPC_COUNT: usize = 0;
 /// Spawn args for an `fs-server-ext4`: one moved handle — the control channel — in
 /// `handles[0]` (delivered to the child in `rdx`); it inherits a LOOKUP-only handle
@@ -674,24 +674,23 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
         let len = u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]) as usize;
         (count, len.min(IPC_MSG_LEN - 24))
     };
-    // SAFETY: the kernel installed handles[0] if `count` says it did.
-    let endpoint = if count >= 1 { unsafe { (&raw const IPC_HANDLES[0]).read() } } else { 0 };
-    // SAFETY: IPC_MSG is init's own buffer, read after the kernel filled it; single-threaded
-    // init writes it again only at its next receive.
-    let msg = unsafe { &*(&raw const IPC_MSG) };
+    // SAFETY: IPC_MSG and IPC_HANDLES are init's own buffers, read after the kernel filled them;
+    // single-threaded init writes them again only at its next receive.
+    let (msg, handles) = unsafe { (&*(&raw const IPC_MSG), &*(&raw const IPC_HANDLES)) };
     let first = init::ready::parse(&msg[24..24 + payload_len], count);
+    for &extra in &handles[init::ready::handles_to_close(&first, count)] {
+        // SAFETY: a handle that came with the message and is not the endpoint init binds; nothing
+        // else holds it.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, extra) };
+    }
     match first {
-        init::ready::First::Ready => return Some(endpoint),
+        init::ready::First::Ready => return Some(handles[0]),
+        // A reason crossed the wire, so it is printed as one; `Line` marks it if it is cut.
         init::ready::First::Refused(reason) if !reason.is_empty() => {
-            let mut buf = [0u8; init::ready::MAX_REASON];
-            say(b" refused: ").s(init::ready::printable(reason, &mut buf)).end();
+            say(b" refused: ").untrusted(reason).end()
         }
         init::ready::First::Refused(_) => say(b" refused, giving no reason init could read").end(),
         init::ready::First::Unexpected => say(b" sent something other than a Ready").end(),
-    }
-    if endpoint != 0 {
-        // SAFETY: a handle that came with a message init did not accept; nothing else holds it.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     }
     None
 }

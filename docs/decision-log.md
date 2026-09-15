@@ -25844,8 +25844,11 @@ init: critical-path failure -- dropping to emergency shell
 
 `init` still hand-parses (`userspace/init/CLAUDE.md`), now in `src/ready.rs`, host-tested with
 messages built by `librsproto`'s encoder (a dev-dependency only) and with lengths no correct encoder
-writes. A reason is cut at 192 bytes and anything not printable ASCII is shown as `?`, so a server
-cannot move the console's cursor.
+writes. The reason is printed with `Line::untrusted`, the rule for text that crossed the wire —
+control bytes as `?`, so it cannot start a line that looks like another process's — and a line too
+long to hold ends in `...` rather than looking complete (PR #303 review; a first version had its own
+copy of that rule, with a silent cut). Every handle that arrives with a message is closed except a
+Ready's endpoint, so a server that sends extra ones cannot leave them in PID 1's table.
 
 **The class, not the instance: every Ready failure was one line.** All eight of `init`'s handshakes —
 the mount and seven services — printed `<name> Ready timeout/invalid` for four different problems.
