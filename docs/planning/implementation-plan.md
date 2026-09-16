@@ -318,6 +318,13 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     the wallpaper filling a 16:9 screen. Every gate that boots a screen boots 1360×768 — QEMU shears
     the laptop's 1366 — while `test-qemu` keeps 1280×800, and `check-resolutions` runs the display
     gates at five sizes on demand. A padded stride stays with the host tests.
+  - **Part F (the first boot) booted on 2026-09-15**, at the first attempt and with no change to
+    the image: the report's four pages read off the laptop's own screen, a login, and a desktop.
+    Every fact the plan said to compare matched, including the padded pitch and AHCI over MSI with a
+    real disk behind it. Two surprises: the trackpad works (the firmware puts it on the i8042's
+    auxiliary port, so the PS/2 driver drives it — the plan had said Phase 6), and **redrawing the
+    whole screen is slow**, in proportion to area, which is Part G's trigger firing. Part F stays
+    open while that is fixed.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

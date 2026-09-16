@@ -1050,10 +1050,12 @@ multiple of 8 — so an error found only there is most likely in the arithmetic 
 - **Changing modes after boot.** The screen is the size Limine handed over for the life of the
   boot, and nothing here announces a change.
 
-## Part F — the first boot ⬜
+## Part F — the first boot ⬜ *(it boots; what it found is being fixed)*
 
-- [ ] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
-      USB stick, boot the laptop, and fix what breaks.
+- [x] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
+      USB stick, boot the laptop, and fix what breaks. **Booted 2026-09-15, first attempt, with no
+      change to the image**: the firmware handed over, the report's four pages were read off the
+      screen and photographed, the greeter took a login, and the desktop drew. See the decision log.
 
 The honest content of this part is unknown, which is why it is a part and not a checklist. What
 is known is the order to look in: firmware handoff → framebuffer → ACPI tables → CPU/APIC
@@ -1063,8 +1065,32 @@ bring-up → SMP → i8042 → userspace. Part B is what makes each of those obs
       instance, a QEMU-side gate — because a bug found once on hardware and not gated will be
       found again.
 
+**What the first boot found.**
+
+- **The screen is slow, in proportion to the area repainted.** The cursor moves smoothly; drawing
+  the desktop after login, or opening the overview, is painful. That is Part G's trigger, and Part G
+  is where it is measured and fixed.
+- **The trackpad works**, which this plan said it would not — see § What Phase 5 does not do.
+- Nothing else misbehaved in what was exercised, and nothing in the image needed changing to boot.
+
+**What matched the day's list exactly**: `framebuffer: 1366x768 pitch 5504 padding 40`, the console
+at `170x48 cells at scale 1`, ECAM at `0xe0000000` bus 0–255, x2APIC, 4 CPUs, `console: no UART at
+COM1`, and AHCI at `00:17.0` claimed over 32-bit MSI — this time with a disk behind it
+(`port 0 disk ready (1953525168 sectors, 953869 MiB)`), which QEMU's empty controller could not
+show. The MADT's `apic 255 disabled — not counted` entries exercised Part D's review fix on real
+firmware.
+
+**Three facts the plan did not have.** The framebuffer lives inside the iGPU's second BAR
+(`00:02.0 bar2 mmio base 0xa0000000 size 0x10000000`), which nothing claims, so no driver has set a
+memory type for it — the ground Part G stands on. The machine also carries an Atheros QCA9377
+(Phase 8) and a `DMAR` table, so it has VT-d if an IOMMU is ever wanted.
+
 ## Part G — framebuffer cache attributes ⬜
 
+- [x] **The measurement first** (2026-09-15): every boot logs the platform's cache policy, the
+      memory type of the framebuffer's own address, and a timed full-screen fill, so the fix is
+      judged against a number rather than an expectation. `arch::memory_types` is the neutral
+      interface; the range registers and the page-attribute table stay inside `arch/x86_64`.
 - [ ] A cache-attribute on `MemoryObject`, a way for the namespace server to set it, and a PAT
       (or MTRR) story.
 
@@ -1076,6 +1102,14 @@ hardware, which is also the first time anybody could observe it."
 
 Deliberately **after** Part F: the trigger is observation, and doing it blind would mean
 guessing at which attribute this framebuffer wants.
+
+**The observation arrived 2026-09-15.** Redrawing the whole screen is painful and the cursor is
+fine, so the cost is per pixel written, not per frame. The arithmetic fits an uncached mapping: a
+screen is 4 MB, tens of MB/s is 40–80 ms a frame, and write-combining would put it in single-digit
+milliseconds. It **is not yet measured on the machine**, and the first piece of this part is the
+measurement, not the fix: the report gains `IA32_PAT`, the MTRR default type and variable ranges,
+the effective type for the framebuffer's base, and a timed fill — hardware facts of the kind Part D
+already collects — and the fix is judged against that number.
 
 ## Part H — the installer ⬜
 
@@ -1095,10 +1129,15 @@ is not on the critical path.
 
 ## What Phase 5 does not do
 
-**No pointer.** The trackpad is I²C-HID, which needs a Designware I²C controller driver, the
-I²C-HID protocol, and a HID report-descriptor parser — a stack with no consumer but this one
-trackpad. A USB mouse is the cheaper pointer and comes with thumb drives attached, so it is
-[Phase 6](phase-6-usb.md).
+**No pointer — wrong, as of the first boot (2026-09-15).** The trackpad *works*: the firmware
+exposes it on the i8042's auxiliary port, `ps2: keyboard mouse armed (kbd vec0x33, aux vec0x34)`,
+and the PS/2 mouse driver this system has had since Phase 4 drives it. What is still absent is the
+I²C-HID path — the Designware I²C controller driver, the HID protocol and a report-descriptor
+parser — which is what the trackpad's *native* interface needs, and what Linux binds
+(`ELAN0501`). That stack has no consumer but this one device and stays unscheduled; a USB mouse
+remains [Phase 6](phase-6-usb.md). **The reasoning above was sound and the premise was not**, which
+is the whole argument for booting the machine: the firmware's legacy emulation was never in the
+plan's model of it.
 
 **No networking** ([Phase 8](phase-8-networking.md)), **no sound**, **no power management** —
 suspend, lid, battery and thermal all need AML, which means ACPICA, which is its own project

@@ -8867,6 +8867,15 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["cpu: requires +x2apic +rdtscp +nx +smep +smap;"],
     // QEMU's default mode, which `test-qemu` keeps so that every CI run boots two sizes.
     &["framebuffer: 1280x800 pitch 5120 padding 0 bpp 32"],
+    // **What a write to the screen costs, and why** (Phase 5 Part G's measurement). The values
+    // are the machine's and are not asserted — what is asserted is that the boot *says* them,
+    // since a report that quietly stopped carrying them is how the laptop's next boot would
+    // measure nothing. QEMU's own framebuffer is uncacheable here too, which is worth knowing:
+    // the emulator disagrees with the hardware about the *cost*, not about the configuration.
+    &["cache policy: ", "variable range(s), default "],
+    &["cache policy: page attributes 0:"],
+    &["framebuffer: ", " is ", "memory, and the kernel maps it write-back"],
+    &["framebuffer: a full-screen fill of ", "KiB took ", "MiB/s)"],
 ];
 
 /// The facts in `wanted` that no single line of `lines` carries every fragment of, each joined

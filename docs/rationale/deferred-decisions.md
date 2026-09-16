@@ -1446,6 +1446,13 @@ Fixing it needs a cache-attribute field on `MemoryObject`, a way for the namespa
 it, and a PAT or MTRR story. **Trigger: the first boot on real hardware**, which is also the first
 time anybody could observe it.
 
+**The trigger fired on 2026-09-15**, and the observation was not the one written above: the laptop
+draws the desktop slowly, in proportion to the area repainted, and a wrong *cost* rather than a
+wrong *result* is what a write-back mapping of an uncacheable range produces — the range registers
+win, so the writes were never cached in the first place. Every boot now says what the platform set
+(`cache policy:` lines), what that makes the framebuffer's own address, and how long a full-screen
+fill took, so the fix has a number to beat. The fix itself is Phase 5 Part G.
+
 > **Scheduled as Phase 5 Part G** (2026-09-10), deliberately *after* the first boot rather than
 > before it: the trigger is observation, and picking an attribute blind would be guessing at
 > what this framebuffer wants. The target machine's is a GOP linear framebuffer at

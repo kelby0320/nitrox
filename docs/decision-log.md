@@ -25920,3 +25920,106 @@ do. Controls, each failing at `applications modal closed`: the shell registering
 instead of `Super+A`, and the chord opening but never closing. `Super+H` cannot fire it — the
 compositor matches code and modifiers exactly, which `modifiers_must_match_exactly` pins. Also
 `check-login --kvm`, `test-qemu`, `check-display`, `check-terminal` and the host suite.
+
+---
+
+## 2026-09-15 — Phase 5 Part F: it boots on the laptop, and the screen is slow
+
+**It booted at the first attempt, from an image nothing was changed in.** The live stick built from
+`main` brought an Acer Aspire A315-51 — Kaby Lake-U, no serial port, 6 GB — from firmware to a
+graphical login and a desktop. The report entry held the kernel log on the machine's own screen for
+four pages, each turned by a key, and every one was photographed. Nothing in the kernel, the image
+or the userspace needed a change to get there, which is the thing five parts of preparation were
+for: Part B put the log on the screen of a machine with no COM1, Part C made a stick that carries
+the release root, Part D made every boot state what it found, Part E stopped the desktop assuming a
+size.
+
+**Every fact the plan said to compare matched.** `framebuffer: 1366x768 pitch 5504 padding 40`, the
+console at `170x48 cells at scale 1`, ECAM at `0xe0000000` bus 0–255, x2APIC, four CPUs online,
+`console: no UART at COM1`. The one that mattered most was the padded pitch: 40 pixels per row that
+QEMU structurally cannot produce (its GOP sets `PixelsPerScanLine = HorizontalResolution`), drawn
+correctly on the first try because the stride goes through `Geometry::offset_of` everywhere and the
+host tests draw on padded framebuffers. **AHCI came up over 32-bit MSI with a disk behind it** —
+`port 0 disk ready (1953525168 sectors, 953869 MiB)` — which is Part A's argument confirmed on the
+hardware it was written for, and the half QEMU's empty controller could never show. The MADT's
+`apic 255 disabled — not counted` lines exercised the PR #299 review fix on real firmware.
+
+**The trackpad works, and the plan said it would not.** `ps2: keyboard mouse armed (kbd vec0x33,
+aux vec0x34)`: this firmware exposes the touchpad on the i8042's auxiliary port, so the PS/2 mouse
+driver from Phase 4 drives it. The reasoning that put a pointer in Phase 6 was about I²C-HID, which
+is what Linux binds (`ELAN0501`) and what the device's native interface needs — sound reasoning
+resting on a premise nobody had checked, that the *only* path to the trackpad was the native one.
+Legacy emulation was not in the plan's model of the machine. The I²C-HID stack stays unscheduled;
+what changed is that Phase 5 has a pointer.
+
+**What it found: the screen is slow, in proportion to the area repainted.** The cursor moves
+smoothly; drawing the desktop after login, or opening the overview, is painful. Per-pixel cost, not
+per-frame. That is `TODO(framebuffer-cache-attr)`'s trigger — "the first boot on real hardware,
+which is also the first time anybody could observe it" — firing exactly as written, and the report
+supplies the ground it stands on: the framebuffer sits inside the integrated graphics' second BAR
+(`00:02.0 bar2 mmio base 0xa0000000 size 0x10000000`), which **no driver claims**, so nothing has
+set a memory type for it, and every user mapping this kernel makes is write-back
+(`protection_to_page_flags`). On x86 the stronger of the MTRR and the page table wins, and firmware
+marks a graphics aperture uncached as a matter of course.
+
+**That is a hypothesis, and Part G measures it before it fixes it.** The arithmetic fits — a screen
+is 4 MB, tens of MB/s is 40–80 ms a frame, write-combining would be single-digit milliseconds — and
+arithmetic that fits is not a measurement. The first piece of Part G is therefore the report
+growing `IA32_PAT`, the MTRR default type and variable ranges, the effective type for the
+framebuffer's base, and a timed fill, so the fix has a before number to be judged against. None of
+this is gated in QEMU yet: the memory type is exactly what an emulator cannot disagree with us
+about, so Part G's gates will be about the mechanism (the PAT programming, the attribute reaching
+the mapping) rather than its effect.
+
+**Part F stays open** while that is fixed, and the phase's definition of done still wants a terminal
+running a shell on the machine.
+
+---
+
+## 2026-09-15 — Part G's first piece: ask the machine what a screen costs
+
+**The laptop's slow redraw has a suspect and not yet a measurement.** The first boot drew the
+desktop slowly in proportion to the area repainted; every mapping this kernel makes is write-back;
+on x86 the stronger of the range registers and the page table wins; firmware marks a graphics
+aperture uncacheable as a matter of course. That chain is plausible enough to act on and no part of
+it was read off the machine — so this part starts by reading it off the machine, and the fix comes
+after.
+
+**Three facts every boot now logs**, none derived from the others:
+
+```
+cache policy: 8 variable range(s), default write-back, ranges enabled, fixed enabled
+cache policy: range 0x80000000..0x100000000 uncacheable
+cache policy: page attributes 0:write-back 1:write-through 2:uncacheable (overridable) …
+framebuffer: 0x80000000 is uncacheable memory, and the kernel maps it write-back — the stronger of the two wins, so that is what a write costs
+framebuffer: a full-screen fill of 4000 KiB took 12541 us (311 MiB/s)
+```
+
+The third is the one that cannot be argued with, and the first two say why, so a reader is not left
+inferring a cause from a number. They ride in the hardware report like every other Part D fact, so
+the laptop shows them with no serial port.
+
+**QEMU's framebuffer is uncacheable too** — that is the line above, from `test-qemu`. It is worth
+stating because it corrects the deferral's own words: "under QEMU this is harmless, and M13 Part A's
+benchmark measured it directly". The benchmark measured a *row*, and TCG's per-access emulation cost
+swamps the difference between an uncached write and a cached one, so the emulator agrees with the
+hardware about the **configuration** and disagrees about the **cost**. The measurement is therefore
+gated for its presence, never its value: `test-qemu` asserts the boot *says* these things, since a
+report that quietly stopped carrying them is how the laptop's next boot would measure nothing.
+
+**The timing is a real full-screen fill, not a model of one** — the same `Screen::fill` every clear
+and reclaim performs, over the same aperture, with the console's text repainted afterwards from the
+grid. A synthetic loop over a scratch buffer would have measured the loop.
+
+**`arch::memory_types` is a new neutral interface** (`docs/conventions/arch-boundary.md`): a
+`MemoryType` a log line can name, `at(phys)`, and `log_configuration`. The MTRR and PAT spelling
+stays inside `arch/x86_64`, where the vendor's names belong — a reader comparing the output against
+the manual needs them. The matching rules are the architecture's and are host-tested: disabled range
+registers make **everything** uncacheable rather than "whatever the page table says", uncacheable
+wins every overlap, write-through wins over write-back, and a table walked in the other order gives
+the same answer. Control: with the fill line no longer printed, `test-qemu` fails and names the
+missing fact.
+
+**Left for the fix**: `UC-` is decoded and named but nothing returns it yet, and the fixed ranges
+below 1 MiB are not read — nothing asks about an address down there, and `at` says "unknown" rather
+than guessing.

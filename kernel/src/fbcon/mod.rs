@@ -51,6 +51,7 @@ use crate::libkern::IrqSpinLock;
 use crate::libkern::lockrank::LockRank;
 use crate::limine::Framebuffer;
 use glyphs::{BLANK, GLYPH_W};
+use crate::arch::timer::ArchTimer;
 use text::{CELLS, Geometry, Grid, INK, MAX_COLS, PAPER};
 
 /// A linear framebuffer of 32-bit pixels, and the console's two colours packed for it.
@@ -187,6 +188,32 @@ impl Console {
         self.owner = Owner::Kernel;
         self.screen = Some(screen);
         Some(geometry)
+    }
+
+    /// Fill the whole screen, timed, and put the text back (Phase 5 Part G's measurement).
+    ///
+    /// `(bytes written, nanoseconds)`, or `None` when the kernel is not the one drawing — the
+    /// report holds the screen for a person to read, and userspace's pixels are not ours to
+    /// overwrite. **What a full-screen repaint costs is a hardware fact on a machine whose
+    /// framebuffer may be uncacheable**, and the only honest way to have it is to do one: the
+    /// same `fill` every clear and every reclaim performs, over the same aperture.
+    ///
+    /// The fill paints the margins as well as the cells, so putting the text back is a repaint
+    /// of every cell and nothing else.
+    pub fn time_full_fill(&mut self) -> Option<(usize, u64)> {
+        if self.owner != Owner::Kernel {
+            return None;
+        }
+        let screen = self.screen.as_ref()?;
+        let (w, h) = (screen.width, screen.height);
+        let start = crate::arch::Timer::read_ns();
+        screen.fill(0, 0, w, h, screen.paper);
+        let ns = crate::arch::Timer::read_ns().saturating_sub(start);
+        let rows = self.grid.geometry().rows;
+        if rows > 0 {
+            self.paint(0, rows - 1, true);
+        }
+        Some((w * h * 4, ns))
     }
 
     /// Who draws on the screen.
@@ -402,6 +429,13 @@ pub fn hold_for_report() -> Option<Geometry> {
 /// Show one page of the report, `prompt` on the last row. See [`Console::show_page`].
 pub fn show_page(page: &[u8], prompt: &[u8]) {
     with_console_waiting(|c| c.show_page(page, prompt));
+}
+
+/// Time a full-screen fill and repaint the text — see [`Console::time_full_fill`].
+pub fn time_full_fill() -> Option<(usize, u64)> {
+    let mut measured = None;
+    with_console_waiting(|c| measured = c.time_full_fill());
+    measured
 }
 
 /// End the report: the console draws again, from the grid.

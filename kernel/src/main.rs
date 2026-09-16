@@ -28,6 +28,7 @@ use nitrox_kernel::arch;
 use nitrox_kernel::arch::cpu::ArchCpu;
 use nitrox_kernel::arch::irq::ArchIrq;
 use nitrox_kernel::arch::irq_router::ArchIrqRouter;
+use nitrox_kernel::arch::memory_types::ArchMemoryTypes;
 use nitrox_kernel::arch::paging::ArchPaging;
 use nitrox_kernel::arch::platform::ArchPlatform;
 use nitrox_kernel::arch::smp::ArchSmp;
@@ -825,9 +826,59 @@ fn record_framebuffer() {
             padding,
             fb.bpp
         );
+        report_framebuffer_cost();
     } else {
         kprintln!("framebuffer: unsupported depth ({} bpp) — /dev/framebuffer unavailable", fb.bpp);
     }
+}
+
+/// What writing to the screen costs on this machine, and why (Phase 5 Part G's measurement).
+///
+/// **Three facts, none of them derived from the other two.** What the firmware set the caching of
+/// physical memory to; what it therefore says about the framebuffer's own address; and how long a
+/// full-screen fill actually took. The third is the one that cannot be argued with — a machine
+/// whose framebuffer is uncacheable writes a screen in tens of milliseconds, and one whose
+/// framebuffer is write-combining does it in single digits — and the first two say why, so a
+/// reader is not left inferring the cause from a number.
+///
+/// Every mapping this kernel makes is write-back today (`protection_to_page_flags`), and on x86
+/// the stronger of the two wins, so an uncacheable range makes the mapping uncacheable no matter
+/// what the page table says. That is `TODO(framebuffer-cache-attr)`.
+fn report_framebuffer_cost() {
+    // SAFETY: ring 0, during boot, with the console up.
+    unsafe { arch::MemoryTypes::log_configuration() };
+    if let Some((phys, _)) = framebuffer::aperture() {
+        // SAFETY: ring 0; reads configuration registers only.
+        match unsafe { arch::MemoryTypes::at(phys.as_u64()) } {
+            Some(kind) => kprintln!(
+                "framebuffer: {:#x} is {} memory, and the kernel maps it write-back{}",
+                phys.as_u64(),
+                kind.name(),
+                match kind {
+                    nitrox_kernel::arch::memory_types::MemoryType::WriteBack => "",
+                    _ => " — the stronger of the two wins, so that is what a write costs",
+                }
+            ),
+            None => kprintln!(
+                "framebuffer: {:#x} has no memory type of its own; the page table decides",
+                phys.as_u64()
+            ),
+        }
+    }
+    let Some((bytes, ns)) = fbcon::time_full_fill() else { return };
+    if ns == 0 {
+        kprintln!("framebuffer: a full-screen fill of {} KiB was below the clock's resolution", bytes / 1024);
+        return;
+    }
+    // Integer throughput: bytes per second, then mebibytes. `bytes` is at most a few million and
+    // the nanosecond count a few million more, so neither the product nor the quotient overflows.
+    let mib_per_s = (bytes as u64) * 1_000_000_000 / ns / (1024 * 1024);
+    kprintln!(
+        "framebuffer: a full-screen fill of {} KiB took {} us ({} MiB/s)",
+        bytes / 1024,
+        ns / 1000,
+        mib_per_s
+    );
 }
 
 // --- First userspace process --------------------------------------------
