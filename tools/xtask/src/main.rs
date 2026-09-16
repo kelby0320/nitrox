@@ -9307,6 +9307,18 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libgpt` host tests: the partition tables the installer writes and reads (Phase 5 Part
+    // H.1). Two of them hold the crate to **`sgdisk`** — it verifies what we write and we read
+    // what it wrote — because a partition table is a format other people's firmware consumes, and
+    // agreeing only with ourselves would prove nothing. `gdisk` is a project dependency alongside
+    // `e2fsprogs`, and the tests panic with that message if it is missing.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libgpt")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `librsproto` host tests (the resource-server protocol wire codec). A plain
     // lib (no bare-target bin), host-tested like `libkern`.
     run(Command::new("cargo")
