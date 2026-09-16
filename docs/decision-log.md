@@ -26051,3 +26051,40 @@ right thing and this kernel drops it at the namespace boundary.**
 That is Part G's fix, now with a number to beat: the same fill through `/dev/framebuffer` should
 cost what the console's costs. QEMU shows the *configuration* half of this and not the cost — under
 TCG both fills take the same time — so the gates assert the lines exist and never what they say.
+
+---
+
+## 2026-09-16 — Part G's detail pass: the bootloader was right and we drop it at the boundary
+
+Written after the measurement rather than before it, which is the point: the pass this part needed
+was not "which attribute does a framebuffer want" — every manual answers that — but "which of this
+system's two mappings is wrong", and only the machine could say.
+
+**The fault, precisely.** Limine maps the framebuffer write-combining and programs an attribute
+table with such an entry. `protection_to_page_flags` gives every `/dev/framebuffer` mapping no
+attribute at all, so it selects entry 0, write-back, and the uncacheable range the firmware set for
+the graphics aperture overrides it. The console draws at 2924 MiB/s and userspace at 54.
+
+**Three calls** (maintainer, 2026-09-16):
+
+- **The kernel programs its own attribute table**, on every CPU, with the layout both machines
+  already show. Owning it ends a silent dependency on a bootloader's choice; keeping Limine's exact
+  values is what makes that safe, because the console's mapping was made by the bootloader and
+  selects entry 5. A table that moved write-combining would change what an in-flight mapping means.
+  The boot logs the table before and after, and a gate holds the bootloader to it, so a change is
+  loud.
+- **The attribute lives on the `MemoryObject`**, kernel-set where the aperture is recorded, rather
+  than being asked for at map time. Two mappings of one aperture with different types is the
+  aliasing the manuals warn about and is exactly what this system has today; an object-level
+  attribute makes every mapping agree by construction. The deferral's "a way for the namespace
+  server to set it" narrows to the day a second device aperture needs one.
+- **A compositor that cannot allocate its shadow buffer now refuses to start.** Without it,
+  `present` composes straight into the display, which *reads* it — and reads from write-combining
+  memory are uncached. The fallback was harmless while writes were cached and becomes a trap under
+  this fix.
+
+**What will not be gated is the cost.** QEMU shows the configuration half faithfully — its own
+framebuffer is uncacheable, its console mapping asks for write-combining, a plain one for write-back
+— and disagrees about the price, since TCG emulates each access and both fills take the same time.
+So `test-qemu` asserts what each mapping asks for and that they agree after the fix; the numbers
+stay a laptop measurement. The before is recorded: 54 MiB/s against 2924.

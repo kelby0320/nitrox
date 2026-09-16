@@ -1117,9 +1117,69 @@ screen, before the compositor composites anything, is the lag the first boot rep
 
 **What the fix has to do**, with a number to beat: carry a cache attribute from the aperture to the
 user mapping, so `/dev/framebuffer` asks for write-combining and a full-screen fill through it costs
-what the console's costs. The attribute table already has a write-combining entry on both machines
-(`5:write-combining`, Limine's doing), so the first version need not program one — but a kernel that
-relies on the bootloader's table without checking it is a kernel that breaks on the next bootloader.
+what the console's costs.
+
+### The shape *(maintainer's calls, 2026-09-16)*
+
+- **The kernel programs its own attribute table**, on every CPU, with the layout both machines
+  already show (`0:WB 1:WT 2:UC- 3:UC 4:WP 5:WC 6:UC 7:UC` — Limine's). Keeping Limine's layout is
+  what makes the change safe rather than clever: the console's mapping was made by the bootloader
+  and selects entry 5, so a table that moved write-combining elsewhere would silently change what
+  that mapping means. Programming it ourselves ends the dependency on a bootloader's choice; keeping
+  the same values means nothing in flight changes meaning.
+- **The attribute lives on the `MemoryObject`**, set by the kernel when it records the aperture, not
+  asked for at map time. The aperture is device memory whatever maps it, so every mapping of it
+  agrees by construction — the aliasing the manuals warn about is exactly what this system has
+  today, and a map-time flag would leave it possible. The deferral's "a way for the namespace server
+  to set it" narrows to the day a second device aperture needs one.
+- **A compositor that cannot allocate its shadow buffer refuses to start.** Without it, `present`
+  composes directly into the display and `copy_damage` is skipped — that path *reads* the
+  framebuffer, and a read from write-combining memory is uncached. The fallback was a kindness when
+  writes were cached; under this fix it is a trap, and "no desktop" is a better failure than a
+  desktop that takes a second a frame.
+
+### The pieces, in dependency order
+
+- [ ] **G.1 — the kernel owns its attribute table.** Program `IA32_PAT` on the BSP and on each AP
+      with the layout above, by the vendor's sequence (interrupts off, caches disabled and written
+      back, the write, caches back on, TLB flushed). The boot already logs the table; it now logs
+      it **before and after**, and a gate asserts the bootloader's table was the one we program, so
+      a bootloader that changes it is loud rather than silent.
+- [ ] **G.2 — a memory object carries a cache attribute, and a mapping honours it.** A field on
+      `MemoryObject` (default: ordinary memory), a `PageFlags::WRITE_COMBINING` that selects the
+      entry, and `protection_to_page_flags` taking the object's attribute instead of assuming
+      write-back. Host tests: the flag reaches the right PTE bits; an object with no attribute maps
+      exactly as it does today.
+- [ ] **G.3 — the framebuffer aperture is marked write-combining** where it is recorded, so every
+      `/dev/framebuffer` mapping asks for it. The measurement's second mapping becomes a mapping
+      made the way a real one is, and its line says so.
+- [ ] **G.4 — the shadow buffer becomes mandatory.** The compositor fails to start rather than
+      composing into the display, and says why. `check-display` and `check-terminal` already boot
+      with one; the gate for the refusal is the allocation failing.
+- [ ] **G.5 — the gates.** `test-qemu` asserts what each mapping asks for (QEMU agrees about the
+      configuration, so this is gateable there) and that the two now agree. The **cost** is asserted
+      nowhere: under TCG both fills take the same time, and asserting a number an emulator cannot
+      produce is how a gate starts lying.
+
+### What to compare on the day
+
+The laptop's own before-and-after, from the same line: `54 MiB/s` through a plain mapping against
+`2924 MiB/s` through the bootloader's. After G.3 the `/dev/framebuffer` mapping should read within
+noise of the console's, and the desktop should stop being painful. **If it does not**, the fix is
+not the cause of the remaining cost and the next question is what the compositor spends its time on
+— which is a different part.
+
+### Left alone
+
+- **The console's own mapping.** It is the bootloader's, it already asks for write-combining, and
+  taking it over would be a second mapping to keep in step for no gain the measurement can see.
+- **Write-combining anywhere else.** AHCI's registers are uncached through `kvmap` and want to stay
+  that way; no other aperture is mapped into userspace.
+- **A store fence after a frame.** Nothing reads the framebuffer to decide anything — the display
+  engine scans it out continuously — so there is no completion flag whose ordering matters. If a
+  device ever consumes one, that is where a fence belongs.
+- **The self-hash's read path.** `libdraw::hash::hash_visible` reads the whole framebuffer and only
+  the self-test build calls it; it stays correct and costs one slow pass there.
 
 ## Part H — the installer ⬜
 
