@@ -339,6 +339,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxinstall"
+version = "0.1.0"
+dependencies = [
+ "libgpt",
+ "libheap",
+ "libkern",
+ "libstream",
+]
+
+[[package]]
 name = "nxsh"
 version = "0.1.0"
 dependencies = [

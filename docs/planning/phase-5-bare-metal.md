@@ -1337,15 +1337,31 @@ you use when there is no installed system to log into.
 > the installer entry alone**, since Limine loads what the chosen entry names, so an ordinary live
 > boot reads and holds nothing extra.
 
-- [ ] **`nxinstall`**: refuse anything that is not a whole disk, name the target's identity and
+- [x] **`nxinstall`**: refuse anything that is not a whole disk, name the target's identity and
       require it typed back, write the GPT, copy the ESP module and `root.img`'s filesystem into
       their partitions.
-- [ ] **`cargo xtask check-install`**: boot the live image's installer entry with a blank second
+- [x] **`cargo xtask check-install`**: boot the live image's installer entry with a blank second
       disk, drive the installer, then **boot that disk on its own** and assert the greeter. **It
       owes a positive**: `check-live` asserts an ordinary boot never says "installer session", and
       nothing yet asserts that an installer boot does — rename the line and both pass forever
       (PR #308 review, optional 8). The graphical path is what to drive, since the laptop has no
       serial port and its greeter is the only way in.
+> **H.1 closed 2026-09-16: Nitrox installs itself, and the installed disk boots.** Two things the
+> detail pass had left open were settled by building it. **The confirmation is an argument, not a
+> prompt** — no program in this system reads a terminal (a stage's `stdin` is the stage before it,
+> and `/dev/tty` in an application namespace mints a *fresh* terminal rather than naming the one
+> the program is in), so a first run prints the plan and the exact line that carries it out, and
+> running that line is the confirmation. And **the sources are found by what they contain** — a
+> FAT boot sector, a table naming `nitrox-live` — rather than by the module paths the kernel names
+> them with, which are a build script's business.
+>
+> The gate drives the whole path a person takes and asserts on the kernel log, since a release
+> terminal does not narrate its grid: the ESP module the installer entry alone loads, the **four**
+> devices handed on (the disk, two modules, and the `nitrox-live` partition found *inside* one of
+> them — which is why `/dev/blk/<n>` is not "the n-th disk"), and the milestones a destructive
+> operation records. Ordering cost three runs: the storage driver binds before the bootloader's
+> modules are published, a session namespace exists only after a login, and a `Super` chord
+> pressed before the shell registers it reaches nobody.
 
 **H.2 — a filesystem the size of the disk.**
 

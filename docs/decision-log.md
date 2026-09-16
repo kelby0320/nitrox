@@ -26388,3 +26388,44 @@ image's own ESP — the same shape as the other two live claims, which compare w
 produced rather than the functions that produced them. Two controls: the live initramfs in the
 module fails with `boot/initramfs: differs`, and a spurious extra file with `boot/spurious: only in
 the installable ESP`.
+
+## 2026-09-16 — Phase 5 Part H.1 closed: the system installs itself
+
+`nxinstall` is a Nitrox program, run from a terminal in the installer session, and
+`cargo xtask check-install` boots the live image's third entry with a blank disk, drives the
+install graphically, and then boots that disk on its own to a greeter.
+
+**It holds no authority of its own.** There is no privileged installer because there is nothing to
+be privileged *as*: it reaches a disk only where the session it runs in was given one. Run from an
+ordinary session it resolves nothing and says so, and no check inside it is what stops that.
+
+**The confirmation is an argument, not a prompt** — the detail pass had assumed a prompt. No
+program in this system reads a terminal: a stage's `stdin` is the typed stream from the stage
+before it, and `/dev/tty` in an application namespace *mints a fresh terminal* rather than naming
+the one the program is running in. So there is nothing to prompt on. A first run prints the plan
+and the exact line that would carry it out; running that line is the confirmation. That is a
+better interlock than `[y/N]` anyway — the identity has to come from the report the first run
+printed, so the dangerous form cannot be reached by holding Return.
+
+**Sources are found by what they contain, targets refused by what they are.** A FAT boot sector
+and a table naming `nitrox-live` identify the two things being copied; the module paths the kernel
+names them with are a build script's business and the wrong thing for an installer to depend on.
+The target is refused per kind, because each refusal catches a different mistake: a partition is
+what someone picks off a listing by accident, and a RAM disk is the running system itself.
+
+**The layout is host-tested and the program is not.** Where two partitions go is arithmetic whose
+mistakes destroy a disk and are invisible in a boot that succeeds — a root partition one block
+into the backup array installs a machine that works until something rewrites the table — so it is
+`nxinstall`'s lib, tested against `libgpt`'s writer in both directions. The I/O around it is what
+the gate boots.
+
+**What the gate cost to order.** Three runs, all the same lesson in different clothes: the storage
+driver binds during PCI enumeration and the bootloader's modules are published after it, a session
+namespace exists only once somebody has logged in, and a `Super` chord pressed before the shell
+has registered it is delivered to nobody. `expect` consumes what it scans past, so each of these
+presented as a timeout on a line that was plainly in the transcript.
+
+**And the gate proves a refusal, not just an install.** It aims the installer at the RAM disk the
+running root is inside — naming it *correctly*, so only its kind can refuse it — and asserts
+nothing was installed to it. The absence means something because the install that follows
+succeeds. A control that let a RAM disk through failed the gate with the line it was written for.

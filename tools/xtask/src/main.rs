@@ -270,6 +270,7 @@ fn main() -> ExitCode {
         "check-fbcon",
         "check-live",
         "check-report",
+        "check-install",
         "shot",
         "bench-compose",
         "qemu",
@@ -351,6 +352,7 @@ fn main() -> ExitCode {
         Some("check-login") => cmd_check_login(accel, gate_size),
         Some("check-fbcon") => cmd_check_fbcon(accel, gate_size),
         Some("check-live") => cmd_check_live(accel, gate_size),
+        Some("check-install") => cmd_check_install(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
@@ -394,6 +396,7 @@ fn print_help() {
            check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
            check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
            check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
+           check-install     install to a blank disk from the live menu, then boot that disk\n  \
            check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
@@ -598,6 +601,12 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // `test-harness` feature either: what its gate asserts is what it prints when it opens and
     // saves a file, which a release image prints too.
     build_userspace_bin("nxedit", None)?;
+    // The installer (Phase 5 Part H.1). A lib/bin split like the two above, and built into
+    // **every** image rather than the live one alone: it can reach a disk only where a session
+    // was given one, so in a release image it is a program that resolves nothing — and
+    // `check-images` holds the live root to being the release root file for file, which a
+    // live-only program would break.
+    build_userspace_bin("nxinstall", None)?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
@@ -2382,6 +2391,309 @@ fn percentile(v: &mut [u64], p: usize) -> u64 {
 ///    own interrupt does not make it;
 /// 4. a login on the serial column writes a file under `/home` and reads it back — the root is
 ///    writable, in RAM.
+/// The model and serial the gate's target disk reports, and the identity they compose into.
+///
+/// **Set explicitly rather than taken from QEMU's defaults**, for two reasons. The gate has to
+/// type the identity back, so it must know it exactly; and a name of its own choosing is proof
+/// the string travelled from the *device* — `ahci::identify`'s IDENTIFY words, the `info` leaf,
+/// `nxinstall`'s report — rather than being a constant that happens to match.
+const TARGET_MODEL: &str = "NITROX-TEST-DISK";
+/// The target disk's serial.
+const TARGET_SERIAL: &str = "INSTALL01";
+/// How many block devices an installer session sees on this gate's boot: the target disk, the
+/// two Limine modules, and the `nitrox-live` partition the GPT scan finds inside `root.img`.
+const SESSION_DEVICES: usize = 4;
+
+/// What the kernel calls the RAM disk `root.img` becomes — the running system's own root, and
+/// the device this gate points the installer at to prove it refuses one.
+const RAMDISK_IDENTITY: &str = "module 1 (/boot/root.img)";
+
+/// How big the gate's blank disk is. Small enough to write quickly under TCG, large enough for a
+/// 33 MiB boot partition and a root partition with room left over.
+const TARGET_MIB: u64 = 512;
+
+/// `cargo xtask check-install` — install to a blank disk, then boot that disk on its own.
+///
+/// **On demand, like `check-resolutions`**: two boots and a 512 MiB image is not a per-PR cost.
+///
+/// The first boot is the whole path a person takes on the laptop, driven the way they drive it:
+/// the live image's third menu entry, the **graphical** greeter (that machine has no serial port,
+/// so its greeter is the only way in), a terminal launched from the applications modal, and the
+/// installer typed at the shell in it. Nothing here reads the terminal's grid — a release image
+/// deliberately does not narrate it — so what the gate asserts on is the kernel log: the module
+/// the install entry loads, the devices the session and then the shell hand on, and the
+/// milestones `nxinstall` records for a destructive operation.
+///
+/// The second boot is the only assertion that really matters: the disk alone, no stick, and a
+/// greeter on it.
+fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image_live()?;
+    let ovmf = locate_ovmf()?;
+    let work = build_cache();
+    fs::create_dir_all(&work).ok();
+
+    // **A blank disk, made fresh.** Reusing one left by an earlier run would let an install that
+    // wrote nothing pass on the last run's bytes — the gate's own version of a stale artifact.
+    let target = work.join("install-target.img");
+    let _ = fs::remove_file(&target);
+    fs::File::create(&target)?.set_len(TARGET_MIB * 1024 * 1024)?;
+
+    let identity = format!("{TARGET_MODEL} ({TARGET_SERIAL})");
+    let qmp_sock = work.join("qmp-install.sock");
+    let _ = fs::remove_file(&qmp_sock);
+    let dump = work.join("install.ppm");
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-drive")
+        .arg(format!("if=none,id=stick,format=raw,file={}", live_image_path().display()))
+        .arg("-device")
+        .arg("usb-storage,bus=xhci.0,drive=stick")
+        // The target: a SATA disk on the AHCI controller, with an identity of the gate's
+        // choosing so the string `nxinstall` prints can only have come from IDENTIFY.
+        .arg("-drive")
+        .arg(format!("if=none,id=target,format=raw,file={}", target.display()))
+        .arg("-device")
+        .arg(format!("ide-hd,drive=target,bus=ide.0,model={TARGET_MODEL},serial={TARGET_SERIAL}"))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    println!("xtask: install gate — booting the live image's installer entry with a blank disk…\n");
+    let mut session = Session::spawn(cmd, "check-install")?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+    let result = run_install_steps(&mut session, &mut qmp, &dump, &identity);
+    let transcript = session.finish();
+    if let Err(e) = result {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(e);
+    }
+    // **And the refusal held.** Step 7 aimed the installer at the RAM disk the running system's
+    // root is inside, naming it correctly, so only its *kind* could refuse it. An install
+    // records a milestone; this asserts none names that device. The assertion is an absence, and
+    // what makes an absence mean something here is that the install which followed it succeeded
+    // — the same pairing `check-live` and this gate's step 5 make across two gates.
+    if let Some(line) = transcript.lines().find(|l| l.contains("installing to /dev/blk/1")) {
+        println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+        return Err(format!(
+            "the installer wrote to a RAM disk: {line:?}. `/dev/blk/1` is memory the bootloader \
+             loaded — the running system's own root — and writing it destroys the machine that \
+             is running and survives nothing. Refusing it is what `BlockKind` exists for."
+        )
+        .into());
+    }
+    println!("  ok: and it refused the RAM disk it was pointed at, named correctly");
+
+    // The second boot: what was written, on its own.
+    println!("\nxtask: booting the installed disk with no stick…\n");
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel, Some(size))?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", target.display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut session = Session::spawn(cmd, "check-install-boot")?;
+    let result = run_installed_boot_steps(&mut session);
+    let transcript = session.finish();
+    match result {
+        Ok(()) => {
+            println!("\nxtask: installed to a blank disk, and that disk boots to a greeter ✓");
+            Ok(())
+        }
+        Err(e) => {
+            println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+            Err(e)
+        }
+    }
+}
+
+/// The first boot: choose the installer entry, log in graphically, and run the installer.
+fn run_install_steps(
+    session: &mut Session,
+    qmp: &mut Qmp,
+    dump: &Path,
+    identity: &str,
+) -> R<()> {
+    // 1. Limine's menu, and its **third** entry.
+    let look = |qmp: &mut Qmp| -> R<(u32, u32, Vec<u8>)> {
+        qmp.screendump(dump)?;
+        parse_ppm(&fs::read(dump)?)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut highlight = loop {
+        let (w, h, rgb) = look(qmp)?;
+        if let Some(y) = limine_menu(w, h, &rgb) {
+            break y;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("no Limine menu within 120s (last dump {})", dump.display()).into());
+        }
+    };
+    for step in 1..=2 {
+        press(qmp, "down")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (w, h, rgb) = look(qmp)?;
+            match limine_menu(w, h, &rgb) {
+                Some(y) if y > highlight => {
+                    highlight = y;
+                    break;
+                }
+                _ if std::time::Instant::now() > deadline => {
+                    return Err(format!(
+                        "Down {step} did not move the menu's highlight below y {highlight} within \
+                         10s — the countdown may have booted it (last dump {})",
+                        dump.display()
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+        }
+    }
+    press(qmp, "ret")?;
+    println!("  ok: chose the live menu's third entry");
+
+    // 2. The disk this gate attached, named by IDENTIFY rather than by the gate. The model and
+    //    serial are the gate's own, so this string can only have come off the wire.
+    //
+    //    **Before the module lines, because that is where it is in the stream**: the storage
+    //    driver binds during PCI enumeration and the bootloader's modules are published after.
+    //    `expect` consumes what it scans past, so asserting these in the order they are
+    //    *interesting* rather than the order they happen hangs on a line that was there.
+    session.expect(&format!(
+        "disk ready ({} sectors, {} MiB): {identity}",
+        TARGET_MIB * 1024 * 1024 / 512,
+        TARGET_MIB
+    ))?;
+    println!("  ok: the target disk identified itself as {identity}");
+
+    // 3. **The module that entry alone carries.** This is the assertion that the installable ESP
+    //    is loaded by choosing the installer, and it is why the entry has a module line the other
+    //    two do not: an ordinary live boot does not read it, hold it, or publish it.
+    session.expect("ramdisk: module 2 (/boot/install-esp.img)")?;
+    println!("  ok: the installer entry loaded the installable ESP as a block device");
+
+    // 4. The graphical login, which on the laptop is the only way in.
+    session.expect("desktop-session-mgr: greeter presented")?;
+    type_at_greeter(qmp, session, DEMO_USER)?;
+    press(qmp, "tab")?;
+    type_at_greeter(qmp, session, DEMO_PASSWORD)?;
+    press(qmp, "ret")?;
+    session.expect("desktop-session-mgr: login ok -> home=")?;
+    println!("  ok: logged in at the greeter");
+
+    // 5. **The positive counterpart to `check-live`'s absence assertion** (PR #308 review,
+    //    optional 8): that gate proves an ordinary live boot reaches no disk, and until now
+    //    nothing proved an installer boot reaches one — a pair where only the negative exists
+    //    passes just as well when the feature has stopped working entirely. Three devices: the
+    //    disk, and the two modules the bootloader loaded.
+    //
+    //    **After the login, because that is when a session namespace exists.** Authority here is
+    //    not a property of the boot; it is built when somebody logs in, out of what the boot
+    //    permitted.
+    //
+    //    **Four, and the number is the assertion.** `/dev/blk/0` is the target disk, 1 and 2 are
+    //    the two modules, and 3 is the `nitrox-live` partition the GPT scan found *inside*
+    //    `root.img` — which is precisely why `/dev/blk/<n>` is not "the n-th disk" and why this
+    //    part built a way to tell them apart. A count that drifts means the registry's shape
+    //    changed under the installer, and the installer picks a target out of it by index.
+    session.expect(&format!("libsession: {SESSION_DEVICES} block device(s) handed to a namespace"))?;
+    println!("  ok: the installer session was handed the disks");
+    session.expect("desktop-shell: up (graphical session leader)")?;
+
+    // 6. A terminal, from the applications modal — the path a person takes, keyboard only,
+    //    because that is the path the laptop has.
+    //
+    //    **Wait until the chord exists.** A hotkey is registered with the compositor by the
+    //    shell, several seconds into a session, and a chord pressed before that is delivered to
+    //    nobody: the first version of this step pressed it as soon as the shell said it was up,
+    //    and the transcript shows `compositor: Super down` / `Super up` with nothing acting on
+    //    it. This line is printed after `Super+A` is registered, so it is the receipt.
+    session.expect("desktop-shell: Super+1..4 switches")?;
+    qmp.send_key("meta_l", true)?;
+    qmp.send_key("a", true)?;
+    qmp.send_key("a", false)?;
+    qmp.send_key("meta_l", false)?;
+    session.expect("desktop-shell: applications modal open")?;
+    type_into_modal(qmp, session, "nxterm")?;
+    press(qmp, "ret")?;
+
+    // **And the devices reach the program, not just the session.** This is the line PR #308's
+    // review added after a probe through a *serial* login had convinced me otherwise: an
+    // application namespace is built by `desktop-shell`, and until that fix it had no
+    // `/dev/blk`, so an installer typed at a terminal would have resolved nothing. On the laptop
+    // this is the only path there is.
+    session.expect(&format!(
+        "desktop-shell: {SESSION_DEVICES} block device(s) into nxterm's namespace (installer session)"
+    ))?;
+    session.expect("desktop-shell: placed window ")?;
+    println!("  ok: a terminal opened with the disks in its namespace");
+
+    // 7. **The refusal, first, and named correctly.** `/dev/blk/1` is the module the running
+    //    system's root is inside, and the identity typed here is its real one — so the *only*
+    //    reason to refuse is what the device **is**. Ordered before the real install so its
+    //    proof is available: nothing may say it installed to `/dev/blk/1`, and the transcript is
+    //    checked for that after the install that follows has succeeded, which is what stops the
+    //    absence from being satisfied by an installer that never ran at all.
+    type_text(qmp, &format!("nxinstall /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
+    press(qmp, "ret")?;
+
+    // 8. The installer, typed at the shell in it.
+    //
+    //    **`/dev/blk/0` is the disk**, and this gate asserts that rather than assuming it: the
+    //    AHCI disk is registered before the two modules, so a change in that order should fail
+    //    here rather than silently install to something else. The line above named it.
+    let cmd = format!("nxinstall /dev/blk/0 \"{identity}\"");
+    type_text(qmp, &cmd)?;
+    press(qmp, "ret")?;
+
+    // What a destructive operation leaves in the system log, which is also the only thing this
+    // gate can read: a release terminal does not narrate its grid.
+    session.expect(&format!("nxinstall: installing to /dev/blk/0 ({identity})"))?;
+    println!("  ok: the installer named the disk back and started");
+    session.expect("nxinstall: wrote the partition table, the boot partition and the root filesystem")?;
+    println!("  ok: the install finished");
+    Ok(())
+}
+
+/// The second boot: the installed disk, alone.
+fn run_installed_boot_steps(session: &mut Session) -> R<()> {
+    // **It found its root by the label this installer wrote**, not by the one the live image
+    // used: the bytes copied in are the live root's, and what makes them `nitrox-root` is the
+    // partition table `nxinstall` built.
+    session.expect("init:   /: fs-server-ext4 on gpt-partlabel:nitrox-root (rw)")?;
+    session.expect("init: mounted fs-server-ext4 at /")?;
+    println!("  ok: the installed disk mounted its own root");
+    // And no module disk: nothing is riding along this time.
+    session.expect("desktop-session-mgr: greeter presented")?;
+    println!("  ok: the greeter came up on the installed system");
+    Ok(())
+}
+
 fn cmd_check_live(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image_live()?;
@@ -6092,6 +6404,63 @@ fn press(qmp: &mut Qmp, qcode: &str) -> R<()> {
 /// word injected as fast as QMP can send it outruns a client that repaints between keystrokes,
 /// and the tail lands on a client that is not looking. A human types slower than this loop; a
 /// harness does not.
+/// Type `text` into whatever window holds the keyboard, one character at a time.
+///
+/// **Paced rather than acknowledged**, which is the difference between this and
+/// [`type_at_greeter`] and `check-terminal`'s loop. Those wait on a line the guest emits per
+/// keystroke — a greeter redraw, a grid echo — and neither exists here: `check-install` drives a
+/// **release** terminal, which deliberately does not narrate its grid to the kernel log (that
+/// instrumentation is `test-harness` only, and a terminal that told the console what was typed
+/// would be worse than a missing gate). So the receipt is unavailable and the pacing is explicit.
+///
+/// The delay is what a keystroke costs the terminal: it repaints, waits for a free buffer and
+/// copies a window of pixels before it looks at input again. `check-terminal`'s comment measured
+/// that a word injected as fast as QMP can send it outruns that and loses the tail.
+fn type_text(qmp: &mut Qmp, text: &str) -> R<()> {
+    for c in text.chars() {
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        qmp.send_key(&qcode, true)?;
+        qmp.send_key(&qcode, false)?;
+        if shift {
+            qmp.send_key("shift", false)?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    Ok(())
+}
+
+/// The QMP key code for `c`, and whether it needs shift held.
+///
+/// Refuses what it does not know rather than skipping it: a character silently dropped from a
+/// command line produces a *different command*, and here that is the difference between naming
+/// the disk correctly and naming a different disk.
+fn qcode_for(c: char) -> R<(String, bool)> {
+    let s = |t: &str, shift: bool| Ok((t.to_string(), shift));
+    match c {
+        'a'..='z' => s(&c.to_string(), false),
+        'A'..='Z' => s(&c.to_ascii_lowercase().to_string(), true),
+        '0'..='9' => s(&c.to_string(), false),
+        ' ' => s("spc", false),
+        '-' => s("minus", false),
+        '_' => s("minus", true),
+        '/' => s("slash", false),
+        '.' => s("dot", false),
+        ',' => s("comma", false),
+        '"' => s("apostrophe", true),
+        '\'' => s("apostrophe", false),
+        '(' => s("9", true),
+        ')' => s("0", true),
+        other => Err(format!(
+            "no qcode for {other:?} — add one to `qcode_for` rather than letting a command line \
+             lose a character"
+        )
+        .into()),
+    }
+}
+
 fn type_at_greeter(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
     for c in text.chars() {
         let qcode = match c {
@@ -9342,6 +9711,19 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `nxinstall`'s **layout** tests (Phase 5 Part H.1): where the two partitions go on a
+    // target, and every reason to refuse one. `--lib` skips the `#![no_main]` bin. The
+    // arithmetic is here rather than in the program because its mistakes destroy a disk and are
+    // invisible in a boot that succeeds — a root partition one block into the backup array
+    // installs a machine that works until something rewrites the table.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("nxinstall")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `librsproto` host tests (the resource-server protocol wire codec). A plain
     // lib (no bare-target bin), host-tested like `libkern`.
     run(Command::new("cargo")
@@ -11865,6 +12247,11 @@ fn profile_programs() -> Vec<&'static str> {
     // build that packaged the browser and not the editor would present a file row that opens
     // nothing, which is the failure this list exists to make impossible.
     v.push("nxedit");
+    // The installer (Phase 5 Part H.1). In `/bin` and **not** in the applications modal: it is a
+    // command-line tool like the coreutils, run from a terminal in the installer session, and a
+    // modal entry would offer a person a window that does not exist. It ships in every image for
+    // the reason `build_userspace_bin` gives — authority is the session's, not the program's.
+    v.push("nxinstall");
     v
 }
 
