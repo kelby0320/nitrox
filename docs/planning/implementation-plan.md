@@ -325,6 +325,13 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     auxiliary port, so the PS/2 driver drives it — the plan had said Phase 6), and **redrawing the
     whole screen is slow**, in proportion to area, which is Part G's trigger firing. Part F stays
     open while that is fixed.
+  - **Part G (framebuffer cache attributes) is built, 2026-09-16, and awaits its measurement.**
+    The kernel programs its own cache-policy table on every CPU; `mm::Caching` travels from the
+    object through the VMA to the page flags; the framebuffer aperture records write-combining
+    once, so `/dev/framebuffer` mappings ask for it as the bootloader's mapping always did; and a
+    compositor with no shadow buffer refuses to serve, because composing into write-combining
+    memory reads it back. QEMU shows the configuration and cannot show the cost — the laptop's
+    54 MiB/s is the number it has to beat.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

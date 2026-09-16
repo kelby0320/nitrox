@@ -2911,11 +2911,19 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     let _ = info;
     // **From here on the aperture is unreachable except through `screen`.** Frames are composed
     // in the shadow buffer and copied out, so nothing is ever scanned out half-painted (M13
-    // Part A). Without the buffer everything still works and the flicker returns, so the console
-    // says which it is: a screen that flickers should not be a thing anyone has to guess at.
+    // Part A).
+    //
+    // **And without the buffer there is no serving at all** (Phase 5 Part G.4). Until then this
+    // logged a line and carried on: composing straight into the display cost a flicker, which is
+    // worse than a desktop but better than none. The framebuffer is write-combining since Part
+    // G.3, and composing into it directly reads it back — reads from write-combining memory are
+    // uncached, 54 MiB/s on the laptop, which is not a flicker but a second a frame. A session
+    // that cannot start says so; one that takes a second to repaint looks like a hang with no
+    // line to explain it.
     let mut screen = Screen::new(aperture);
     if !screen.is_buffered() {
-        kprint(b"compositor: no shadow buffer -- compositing straight to the display\n");
+        kprint(b"compositor: no shadow buffer (needs one frame's worth of memory) -- cannot serve\n");
+        exit(1);
     }
 
     let Some((kernel_end, serve_end)) = make_channel(SESSION_QUEUE_DEPTH) else {

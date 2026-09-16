@@ -26092,3 +26092,62 @@ numbers stay a laptop measurement. The before is recorded: 54 MiB/s against 2924
 **Nothing in this part is built yet** — this entry is the pass, and G.1 to G.5 are unticked in the
 plan. Said plainly because the log is where "why doesn't the compositor fall back?" gets answered,
 and an entry written in the present tense would answer it wrongly (PR #305 review, finding 1).
+
+---
+
+## 2026-09-16 — Phase 5 Part G: the attribute the bootloader chose, carried to userspace
+
+**G.1 — the kernel programs its own cache-policy table.** Every CPU installs it before making any
+mapping that names an entry: the BSP in `paging_init`, each AP in `ap_cpu_init`, by the vendor's
+sequence (interrupts off, no-fill mode, write back, drop the TLB with its global entries, write the
+table, write back, restore). The values are the ones Limine already leaves, deliberately: two
+entries are live before the kernel takes over — the console's framebuffer mapping selects 5, every
+`kvmap` MMIO mapping selects 2 — so a different layout would change what an in-flight mapping means.
+Owning the table is what stops those meanings depending on a bootloader's choice. The boot says
+whether the platform's table was ours and prints the old one when it was not; `test-qemu` asserts
+the "was the same" form, so a bootloader that changes its table is loud.
+
+**The first version of that constant had its entries shifted**, and the boot caught it by printing
+DIFFERED — the comparison doing exactly the job it was added for. A host test now pins the layout,
+so the next such mistake costs a second rather than a boot.
+
+**G.2 — caching is a property of memory, carried by every mapping of it.** `mm::Caching` on the
+`MemoryObject` and on the VMA, `PageFlags::WRITE_COMBINING` for the bits that select entry 5, and
+`protection_to_page_flags` becomes `page_flags_for(prot, caching)` at all four sites. The VMA
+carries it so a page faulted in later maps the way the first one did. An object-level attribute is
+what makes every mapping of one aperture agree: two that disagree is the aliasing the manuals warn
+about, and is what this system had.
+
+**G.3 — the aperture records what it is, once.** `record_aperture` takes the caching, and both the
+`MemoryObject` that `/dev/framebuffer` mints and the boot's own measurement read it back.
+
+**That last part started as a lie.** The measurement built its second mapping with write-combining
+written into the measurement, so it reported "a mapping made as userspace's is asks for
+write-combining" no matter what userspace actually got — a control that unmarked the aperture passed
+the gate. One recorded answer read by both fixed it, and the control now fails with the gate naming
+the missing line. The lesson is the one this project keeps relearning: a measurement that names its
+own parameters measures itself.
+
+**G.4 — a compositor with no shadow buffer refuses to serve.** It used to log a line and compose
+straight into the display, on the reasoning that the fallback costs a flicker and taking the session
+down to avoid a *visual* defect is a poor trade. That reasoning assumed writes to the display were
+ordinary writes. Under write-combining, composing into the display reads it back, and those reads
+are uncached — 54 MiB/s on the laptop, a second a frame rather than a flicker. Control: with the
+allocation forced to fail, the compositor prints `no shadow buffer … cannot serve` and exits, and
+`check-display` fails.
+
+**G.5 — what is gated, and what cannot be.** `test-qemu` asserts that both mappings ask for
+write-combining and that the boot says what each is; the timings are asserted nowhere, because TCG
+emulates every access and reports both fills at the same speed. QEMU agrees with the hardware about
+the configuration and says nothing useful about the cost.
+
+**Not yet measured on the machine.** Every gate passes under QEMU — the host suite, `test-qemu`,
+`check-display`, `check-terminal`, `check-login`, `check-live`, `check-fbcon`, `check-report`,
+`check-images`, `test-interactive` — and the number this part exists to change is the laptop's
+54 MiB/s. The stick is built; the measurement is the next thing.
+
+**Seen once and not fixed:** `check-login` failed one run at the window-geometry read, matching a
+window-list line where a geometry line was expected (`could not read a window geometry from "list on
+cli of 3 [20:  window 20]"`), then passed four runs. The window's title had not arrived yet, so the
+list line read `window 20` rather than `nxfiles`. That is a gate parsing a line it did not mean to,
+which is a different fault from the click-not-acted-on flake; no cause proven, nothing guessed at.

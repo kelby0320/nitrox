@@ -1141,23 +1141,23 @@ what the console's costs.
 
 ### The pieces, in dependency order
 
-- [ ] **G.1 — the kernel owns its attribute table.** Program `IA32_PAT` on the BSP and on each AP
+- [x] **G.1 — the kernel owns its attribute table.** Program `IA32_PAT` on the BSP and on each AP
       with the layout above, by the vendor's sequence (interrupts off, caches disabled and written
       back, the write, caches back on, TLB flushed). The boot already logs the table; it now logs
       it **before and after**, and a gate asserts the bootloader's table was the one we program, so
       a bootloader that changes it is loud rather than silent.
-- [ ] **G.2 — a memory object carries a cache attribute, and a mapping honours it.** A field on
+- [x] **G.2 — a memory object carries a cache attribute, and a mapping honours it.** A field on
       `MemoryObject` (default: ordinary memory), a `PageFlags::WRITE_COMBINING` that selects the
       entry, and `protection_to_page_flags` taking the object's attribute instead of assuming
       write-back. Host tests: the flag reaches the right PTE bits; an object with no attribute maps
       exactly as it does today.
-- [ ] **G.3 — the framebuffer aperture is marked write-combining** where it is recorded, so every
+- [x] **G.3 — the framebuffer aperture is marked write-combining** where it is recorded, so every
       `/dev/framebuffer` mapping asks for it. The measurement's second mapping becomes a mapping
       made the way a real one is, and its line says so.
-- [ ] **G.4 — the shadow buffer becomes mandatory.** The compositor fails to start rather than
+- [x] **G.4 — the shadow buffer becomes mandatory.** The compositor fails to start rather than
       composing into the display, and says why. `check-display` and `check-terminal` already boot
       with one; the gate for the refusal is the allocation failing.
-- [ ] **G.5 — the gates.** `test-qemu` asserts what each mapping asks for (QEMU agrees about the
+- [x] **G.5 — the gates.** `test-qemu` asserts what each mapping asks for (QEMU agrees about the
       configuration, so this is gateable there) and that the two now agree. The **cost** is asserted
       nowhere: under TCG both fills take the same time, and asserting a number an emulator cannot
       produce is how a gate starts lying.
@@ -1169,6 +1169,10 @@ The laptop's own before-and-after, from the same line: `54 MiB/s` through a plai
 noise of the console's, and the desktop should stop being painful. **If it does not**, the fix is
 not the cause of the remaining cost and the next question is what the compositor spends its time on
 — which is a different part.
+
+> **Built 2026-09-16, and not yet measured on the machine.** Under QEMU both mappings now ask for
+> write-combining and every gate passes; the emulator cannot show the cost, so the laptop is where
+> this part is judged. The stick to boot is the one built from this branch.
 
 ### Left alone
 
