@@ -41,6 +41,14 @@ open-ended list into a portable runtime, networking, and the browser. The 2026-0
 under an emulator and every later phase inherits that ambiguity — a `std::thread` bug and an
 interrupt-routing bug look identical from userspace. See the decision log for both.
 
+**Unscheduled, and written down so it is not lost**:
+
+- [administration.md](administration.md) — elevation (the capability-system answer to `sudo`),
+  administrative accounts as policy rather than identity, and the tools an installed system needs:
+  partitioning, formatting, mounting, accounts, passwords. A **stub**; its scope and its place in
+  the phase order are decided once Phase 5 completes. It exists because Phase 5 Part H's installer
+  is its first client, and an installer built without a destination is one that gets replaced.
+
 **Subproject plans** (detailed breakdowns that hang off a phase):
 
 - [shell-coreutils-plan.md](shell-coreutils-plan.md) — the typed shell + coreutils (a Phase 4
