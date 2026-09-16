@@ -1332,7 +1332,11 @@ you use when there is no installed system to log into.
       require it typed back, write the GPT, copy the ESP module and `root.img`'s filesystem into
       their partitions.
 - [ ] **`cargo xtask check-install`**: boot the live image's installer entry with a blank second
-      disk, drive the installer, then **boot that disk on its own** and assert the greeter.
+      disk, drive the installer, then **boot that disk on its own** and assert the greeter. **It
+      owes a positive**: `check-live` asserts an ordinary boot never says "installer session", and
+      nothing yet asserts that an installer boot does — rename the line and both pass forever
+      (PR #308 review, optional 8). The graphical path is what to drive, since the laptop has no
+      serial port and its greeter is the only way in.
 
 **H.2 — a filesystem the size of the disk.**
 

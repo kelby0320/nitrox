@@ -26332,3 +26332,30 @@ than all of them.
 **What this leaves in the tree is a capability with nothing using it**: an installer session that
 can reach disks, and no installer. `nxinstall`, the installable ESP module and `check-install` are
 the rest of H.1.
+
+### What PR #308's review changed
+
+**The disks stopped at the shell.** A session namespace is `desktop-shell`'s own, and every program
+it launches gets a namespace built by `build_app_namespace` — which had no `/dev/blk`. So an
+installer typed at a terminal would have resolved nothing, and **on the laptop the graphical session
+is the only way to log in at all**, there being no serial port. The in-boot probe that had convinced
+me was a *serial* login, where `nxsh` runs in the session namespace directly: the same shape of
+mistake this part has made twice already — exercising a path that is not the one that matters. The
+shell now hands the devices on as it hands on its endpoints, `libsession::rebind_block_devices` is
+the one implementation both levels use, and the probe was redone through the greeter:
+`desktop-shell: 3 block device(s) into nxterm's namespace (installer session)`.
+
+**And any image honoured `install`, not just the live one.** The detail pass said the installer
+environment should be a live-image difference expressed as *data*; it was written as code that
+ships everywhere, so a machine whose firmware menu lets someone type a command line would have
+handed them a session holding every disk. The live initramfs now carries `etc/install-allowed` and
+a release one does not: the word is the request and the file is the permission. `check-images`
+asserts both halves, because a check that only refused the file in a release image would pass just
+as happily if it stopped being built at all.
+
+**Smaller things the review found**: `libgpt` wrote spaces into labels and refused to read them
+back (`EFI System` → `EFI?System`), and its `last_usable` had no test — a header one block too
+generous lets a partition overwrite the backup array, and `sgdisk --verify` does not catch it;
+`read` cut a table with more partitions than fit instead of refusing it; the `/proc/cmdline` doc
+comment had been inserted into `proc_self_status`'s, orphaning it; and four current-behaviour docs
+still said no session can ever reach `/dev/blk`.

@@ -102,6 +102,7 @@ dependencies = [
  "libheap",
  "libkern",
  "librsproto",
+ "libsession",
  "libstream",
  "libsurface",
  "libtime",

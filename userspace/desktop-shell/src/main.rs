@@ -1252,6 +1252,28 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     if app_ns == 0 {
         return false;
     }
+    // **The disks, if this session has any** (Phase 5 Part H.1). It has them only on an installer
+    // boot, where a supervisor handed them over deliberately; on every other session this finds
+    // nothing and binds nothing.
+    //
+    // **Without this the disks stop at the shell.** The session namespace is the shell's own, and
+    // every program it launches gets the namespace built above — so an installer typed at a
+    // terminal would resolve nothing, and on the laptop the graphical session is the *only* way
+    // to log in, there being no serial port (PR #308 review, blocking 1). The shell passes the
+    // devices on exactly as it passes its endpoints.
+    //
+    // Ambient within an installer session, and deliberately so: that session exists to write a
+    // disk. Per-program grants are what `docs/planning/administration.md`'s broker is for.
+    let disks = libsession::rebind_block_devices(session_ns, app_ns);
+    if disks > 0 {
+        Line::new()
+            .s(b"desktop-shell: ")
+            .u(disks as u64)
+            .s(b" block device(s) into ")
+            .untrusted(program.as_bytes())
+            .s(b"'s namespace (installer session)")
+            .end();
+    }
     if !verify_app_namespace(app_ns, !home.is_empty(), desktop != 0) {
         // SAFETY: closing the namespace; nothing was launched into it.
         unsafe { syscall1(SYS_HANDLE_CLOSE, app_ns) };

@@ -479,55 +479,9 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     // Each device's `info` leaf is a snapshot object, so it is resolved once here and bound
     // beside its device. Device facts do not change while a machine runs — a disk does not
     // become a partition — and nothing here supports hot-plug.
-    let mut has_blk = false;
-    if bind_blk {
-        let mut bound = 0;
-        for n in 0..MAX_BLOCK_DEVICES {
-            let mut path = [0u8; 20];
-            let dev_len = write_blk_path(&mut path, n, false);
-            let (st, dev) = ns_lookup(
-                root_ns,
-                &path[..dev_len],
-                RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER,
-            );
-            if st != 0 || dev == 0 {
-                break; // the registry is dense; the first miss is the end of it
-            }
-            // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle
-            // bind, so no subtree base.
-            let br = unsafe {
-                syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, dev_len as u64, dev, 0, 0)
-            };
-            // SAFETY: the bind took its own reference; close ours.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
-            if br != 0 {
-                continue;
-            }
-            bound += 1;
-            let info_len = write_blk_path(&mut path, n, true);
-            let (ist, info) = ns_lookup(root_ns, &path[..info_len], RIGHT_MAP_READ | RIGHT_TRANSFER);
-            if ist == 0 && info != 0 {
-                // SAFETY: as above; the info snapshot binds as a direct handle too.
-                let ir = unsafe {
-                    syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, info_len as u64, info, 0, 0)
-                };
-                // SAFETY: closing our own handle.
-                unsafe { syscall1(SYS_HANDLE_CLOSE, info) };
-                if ir != 0 {
-                    kprint(b"libsession: a device's info leaf would not bind\n");
-                }
-            }
-        }
-        has_blk = bound > 0;
-        if has_blk {
-            Line::new()
-                .s(b"libsession: installer session -- ")
-                .u(bound as u64)
-                .s(b" block device(s) reachable")
-                .end();
-        } else {
-            kprint(b"libsession: installer session asked for disks and found none\n");
-        }
+    let has_blk = bind_blk && rebind_block_devices(root_ns, ns) > 0;
+    if bind_blk && !has_blk {
+        kprint(b"libsession: installer session asked for disks and found none\n");
     }
     // SAFETY: single-threaded session-mgr; one namespace is built at a time.
     unsafe {
@@ -538,6 +492,71 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         SESSION_HAS_CLIPBOARD = has_clipboard;
     }
     ns
+}
+
+/// Hand every block device reachable from `from_ns` to `to_ns`, with its `info` snapshot, and
+/// return how many were bound.
+///
+/// **A supervisor cannot re-bind `/dev/blk` itself**: it is a *kernel-server* binding and
+/// `sys_ns_bind` takes endpoints and direct handles, which a boot answered with "not in this
+/// supervisor's namespace" the first time this was tried. So each device is resolved and bound
+/// individually — finer-grained than the registry, and the shape an elevation broker will want
+/// when it grants one disk rather than all of them (`docs/planning/administration.md`).
+///
+/// **Two callers, which is why it is here** (`userspace/CLAUDE.md` on where a helper lives once it
+/// has two): a session manager hands the devices to a session, and `desktop-shell` hands them on
+/// to the applications it launches. Without that second step the disks reach the shell and nothing
+/// a person can type into — and on the laptop, where there is no serial port, the graphical
+/// session is the only way to log in at all (PR #308 review, blocking 1).
+///
+/// Each device's `info` is a snapshot object, resolved once and bound beside its device: device
+/// facts do not change while a machine runs, and nothing here supports hot-plug.
+pub fn rebind_block_devices(from_ns: u64, to_ns: u64) -> usize {
+    let mut bound = 0;
+    for n in 0..MAX_BLOCK_DEVICES {
+        let mut path = [0u8; 20];
+        let dev_len = write_blk_path(&mut path, n, false);
+        let (st, dev) = ns_lookup(
+            from_ns,
+            &path[..dev_len],
+            RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER,
+        );
+        if st != 0 || dev == 0 {
+            break; // the registry is dense; the first miss is the end of it
+        }
+        // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle bind,
+        // so no subtree base.
+        let br = unsafe {
+            syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, dev_len as u64, dev, 0, 0)
+        };
+        // SAFETY: the bind took its own reference; close ours.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
+        if br != 0 {
+            continue;
+        }
+        bound += 1;
+        let info_len = write_blk_path(&mut path, n, true);
+        let (ist, info) = ns_lookup(from_ns, &path[..info_len], RIGHT_MAP_READ | RIGHT_TRANSFER);
+        if ist == 0 && info != 0 {
+            // SAFETY: as above; the info snapshot binds as a direct handle too.
+            let ir = unsafe {
+                syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, info_len as u64, info, 0, 0)
+            };
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, info) };
+            if ir != 0 {
+                kprint(b"libsession: a device's info leaf would not bind\n");
+            }
+        }
+    }
+    if bound > 0 {
+        Line::new()
+            .s(b"libsession: ")
+            .u(bound as u64)
+            .s(b" block device(s) handed to a namespace")
+            .end();
+    }
+    bound
 }
 
 /// Block devices a session may be handed. The registry is small — a disk, its partitions, any
@@ -572,7 +591,34 @@ fn write_blk_path(out: &mut [u8; 20], n: usize, info: bool) -> usize {
 /// the line and this looks for it (Phase 5 Part H.1).
 ///
 /// A word, not a substring: `installer-notes` on the line is not a request to install.
+///
+/// **And the word alone is not enough.** The kernel serves the command line to every image alike,
+/// so an installed machine whose firmware menu lets somebody type one would otherwise hand them a
+/// session holding every disk. The live image carries `/initramfs/etc/install-allowed` and a
+/// release image does not — `check-images` holds both to that — so the word is the request and the
+/// file is the permission (PR #308 review, optional 7). The detail pass said this should be data;
+/// this is the data.
 pub fn installer_boot(root_ns: u64) -> bool {
+    if !image_allows_install(root_ns) {
+        return false;
+    }
+    cmdline_says_install(root_ns)
+}
+
+/// Whether this image permits an installer session at all: the live image's marker file.
+fn image_allows_install(root_ns: u64) -> bool {
+    let (st, obj) = ns_lookup(root_ns, b"/initramfs/etc/install-allowed", RIGHT_MAP_READ);
+    if st != 0 || obj == 0 {
+        return false;
+    }
+    // SAFETY: closing our own handle; the file's contents are not read — its existence is the
+    // answer, and the initramfs is the image's own data.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, obj) };
+    true
+}
+
+/// Whether the kernel's command line carries the word `install`.
+fn cmdline_says_install(root_ns: u64) -> bool {
     let (st, mem) = ns_lookup(root_ns, b"/proc/cmdline", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
         return false;

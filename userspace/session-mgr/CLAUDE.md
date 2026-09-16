@@ -95,7 +95,11 @@ the tty endpoint where the profile endpoint belongs.
 ## What a session namespace contains
 
 `/home` (the user's home, a subtree of the fs-server), `/bin` (the profile server,
-whole-tree), `/session/user`, `/dev/console`. Both server bindings **share** init's
+whole-tree), `/session/user`, `/dev/console` — and, **on an installer boot only**, the machine's
+block devices, each bound individually with its `info` snapshot (Phase 5 Part H.1). That last is
+the conditional member, and it is a design decision like every other: it is selected by the live
+image's own boot-menu entry, never by an installed system's ordinary login, and it is what the
+elevation broker will one day grant after authenticating instead. Both server bindings **share** init's
 registration rather than minting a rival — the kernel's bind-mount semantics, one server
 connection under many names.
 

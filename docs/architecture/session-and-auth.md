@@ -66,8 +66,9 @@ kernel ─spawns→ init (full SysCaps)
 Every arrow only ever *attenuates* authority. `BIND_NAMESPACE` is concentrated in the
 three supervisors (init, service-mgr, session-mgr — the v5.1 concentration) and
 reaches no leaf. The user shell holds **empty** syscaps and a namespace that names
-only its session's resources, so it cannot *name* `/dev/blk` or another user's home —
-there is nothing to deny.
+only its session's resources, so it cannot *name* another user's home — there is nothing to deny.
+`/dev/blk` is in that set only for an installer session, which the live image's own boot entry
+selects; see § the session namespace below.
 
 This is the same supervisor-mediated shape used everywhere else in the system
 ([why-supervisor-registration](../rationale/why-supervisor-registration.md)): a leaf
@@ -169,9 +170,19 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/bin` | the system profile endpoint | read-only (program names resolve) |
 | `/store` | the store | read-only (shared artifacts) |
 
-Deliberately **absent**: `/dev/blk`, other users' homes, admin resources, the raw
-filesystem root. *Absence is the sandbox* — this is Nitrox's "sandboxing by namespace
-construction, not permission denial." The user shell is then spawned with this
+Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
+`/dev/blk` on every boot but one. *Absence is the sandbox* — this is Nitrox's "sandboxing by
+namespace construction, not permission denial."
+
+**The one exception, since Phase 5 Part H.1: an installer session.** The live image's third
+boot-menu entry passes `install` on the kernel command line; a session built on *that* boot is
+handed the machine's block devices (each device and its `info` snapshot, bound individually — a
+supervisor cannot re-bind the `/dev/blk` kernel server), and `desktop-shell` passes them on to the
+programs it launches, because on a machine with no serial port the graphical session is the only
+way to log in. Nothing else grants them: an ordinary live boot and an installed system build the
+namespace above, and `check-live` asserts that an ordinary boot's transcript never mentions an
+installer session. When elevation exists (`../planning/administration.md`), a broker will construct
+this namespace after authenticating, and the installer will not change. The user shell is then spawned with this
 namespace (`SpawnArgs.namespace`; the child receives a LOOKUP-only handle to it) and
 **empty `SysCaps`** — a fully unprivileged leaf.
 
@@ -214,7 +225,7 @@ The process the human drives. In the introducing slice it is an explicit
 **throwaway** — the real shell arrives in Phase 4 — whose only job is to demonstrate
 that the constructed session works: it runs in the session namespace, writes to and
 reads back a file under `/home`, and cannot reach anything outside its namespace (a
-lookup of `/dev/blk` simply fails — the name is not bound). It is intentionally
+lookup of `/dev/blk` simply fails — the name is not bound, on every boot but an installer one). It is intentionally
 minimal and disposable.
 
 The interactive entry point of a healthy system is session-mgr's `login:` prompt on

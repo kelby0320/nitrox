@@ -10216,6 +10216,27 @@ fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
     names.sort();
     names.dedup();
     let differ: Vec<&String> = names.into_iter().filter(|k| r.get(*k) != l.get(*k)).collect();
+    // **The marker, asserted in both directions** (Phase 5 Part H.1). The kernel serves the
+    // command line to every image alike, so `install` is honoured only where this file is: the
+    // live image must carry it and a release image must not. Both halves, because a check that
+    // only refused it in the release image would pass just as happily if it stopped being built
+    // at all, and the installer session would then be unreachable with nothing failing.
+    const MARKER: &str = "etc/install-allowed";
+    if !l.contains_key(MARKER) {
+        return Err(format!(
+            "the live initramfs must carry `{MARKER}`: it is what permits an installer session, \
+             and without it the live image's own install entry does nothing"
+        )
+        .into());
+    }
+    if r.contains_key(MARKER) {
+        return Err(format!(
+            "a release initramfs must not carry `{MARKER}` — it is what keeps an installer \
+             session a live-image thing rather than something any boot can ask for"
+        )
+        .into());
+    }
+    let differ: Vec<&String> = differ.into_iter().filter(|k| k.as_str() != MARKER).collect();
     if differ != ["etc/init.toml"] {
         return Err(format!(
             "the live initramfs must differ from the release one in `etc/init.toml` alone — the \
@@ -11823,6 +11844,20 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
         init_toml.push_str(TEST_BINDS_TOML);
     }
     cpio_entry(&mut buf, 1, "etc/init.toml", init_toml.as_bytes());
+    if root == RootDevice::Live {
+        // **What makes `install` a live-image word** (Phase 5 Part H.1). The kernel serves the
+        // command line to every image alike, so without this an installed machine would honour
+        // `install` too — and a firmware menu that lets somebody type a command line is a
+        // firmware menu that hands them a session with every disk in it. The word is necessary
+        // and this file is the sufficient half; a release image ships no such file, so the word
+        // means nothing there (PR #308 review, optional 7).
+        cpio_entry(
+            &mut buf,
+            1,
+            "etc/install-allowed",
+            b"This image may run an installer session when the boot says `install`.\n",
+        );
+    }
     // The declarations file. Its **content** is what differs between a test image and a
     // release image — see `BOOT_PROBE_TOML`. The programs below do not differ.
     let mut services = String::from(SERVICES_TOML);

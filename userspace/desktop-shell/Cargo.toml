@@ -24,6 +24,11 @@ edition = "2024"
 # lives once it does.
 libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
+# **Only for `rebind_block_devices`** (Phase 5 Part H.1): handing an installer session's disks on
+# to the program it launches is the same operation a session manager performs one level up, and
+# `userspace/CLAUDE.md` puts a helper with two consumers below both of them. The shell takes no
+# other part of this crate — it is not a supervisor of sessions.
+libsession = { path = "../libsession" }
 # `io` for `session::Dir`: the modal reads /bin as a forwarded directory.
 librsproto = { path = "../librsproto", features = ["io"] }
 libsurface = { path = "../libsurface" }

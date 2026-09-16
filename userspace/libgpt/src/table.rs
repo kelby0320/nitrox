@@ -56,6 +56,9 @@ pub enum ReadError {
     /// A field describes a table this code does not read: an entry size that is not 128, a header
     /// shorter than the fields it must carry, or an array that does not fit the buffer.
     Unsupported,
+    /// More partitions in use than [`MAX_PARTITIONS`]. Refused rather than truncated: a caller
+    /// searching for one of the rest would be told it is not there.
+    TooManyPartitions,
 }
 
 /// Why a table could not be built.
@@ -353,7 +356,10 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
             continue;
         }
         if table.count == MAX_PARTITIONS {
-            break;
+            // **Refused rather than cut.** A caller asking `by_name` for a partition in the part
+            // that was dropped would be told "no such partition" about a table that has one
+            // (PR #308 review, optional 9). Nothing this system builds comes near eight.
+            return Err(ReadError::TooManyPartitions);
         }
         let mut name = [0u8; 36];
         let mut name_len = 0;
@@ -363,8 +369,11 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
                 break;
             }
             // Non-ASCII becomes `?`: this name is shown to a person and matched against labels
-            // this system writes, both of which are ASCII.
-            name[k] = if hi == 0 && lo.is_ascii_graphic() { lo } else { b'?' };
+            // this system writes, both of which are ASCII. **A space is a label character** —
+            // `EFI System` and `Basic data partition` are what other tools write, and
+            // `is_ascii_graphic` alone excludes the space, so this crate could not read back a
+            // label it had itself written (PR #308 review, finding 3).
+            name[k] = if hi == 0 && (lo.is_ascii_graphic() || lo == b' ') { lo } else { b'?' };
             name_len = k + 1;
         }
         table.partitions[table.count] = Partition {
@@ -589,6 +598,60 @@ mod tests {
         assert_eq!(root.type_guid, TYPE_LINUX_FS);
         assert!(root.first_lba > esp.last_lba, "and they do not overlap");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_label_with_a_space_survives_the_round_trip() {
+        // `EFI System` and `Basic data partition` are what other tools write, and this crate
+        // wrote spaces and refused to read them back (PR #308 review, finding 3).
+        let p = Partition::new(TYPE_EFI_SYSTEM, [0x22; 16], 2048, 4096, b"EFI System");
+        let disk = build_disk(&[p]);
+        let t = read(&disk).unwrap();
+        assert_eq!(t.partitions()[0].name(), b"EFI System");
+        assert!(t.by_name(b"EFI System").is_some(), "and is findable by that name");
+    }
+
+    /// **The boundary the backup array sits on**, which `sgdisk --verify` does not police: a
+    /// header one block too generous lets a partition overwrite the backup, and firmware then
+    /// finds a corrupt backup exactly when the primary is damaged (PR #308 review, finding 4).
+    #[test]
+    fn the_last_usable_block_stops_short_of_the_backup_array() {
+        let disk = build_disk(&two_partitions());
+        let t = read(&disk).unwrap();
+        // The disk's last block holds the backup header and the 32 before it the backup array.
+        assert_eq!(t.last_usable, DISK - ARRAY_BLOCKS - 2);
+        assert_eq!(t.last_usable, 262_110, "and that is what sgdisk reports for this size");
+
+        let mut front = vec![0u8; FRONT_BYTES];
+        let mut back = vec![0u8; BACK_BYTES];
+        let at_edge = [Partition::new(TYPE_LINUX_FS, [0x33; 16], 2048, t.last_usable, b"edge")];
+        assert!(build(DISK, GUID, &at_edge, &mut front, &mut back).is_ok(), "the last block is usable");
+        let past = [Partition::new(TYPE_LINUX_FS, [0x33; 16], 2048, t.last_usable + 1, b"past")];
+        assert_eq!(
+            build(DISK, GUID, &past, &mut front, &mut back),
+            Err(BuildError::OutOfRange),
+            "one block further is the backup array"
+        );
+    }
+
+    #[test]
+    fn a_table_with_more_partitions_than_fit_is_refused_not_cut() {
+        let mut parts = Vec::new();
+        for i in 0..(MAX_PARTITIONS + 1) as u64 {
+            parts.push(Partition::new(
+                TYPE_LINUX_FS,
+                [0x33; 16],
+                2048 + i * 1000,
+                2048 + i * 1000 + 500,
+                b"p",
+            ));
+        }
+        let mut front = vec![0u8; FRONT_BYTES];
+        let mut back = vec![0u8; BACK_BYTES];
+        build(DISK, GUID, &parts, &mut front, &mut back).expect("nine partitions are writable");
+        let mut disk = vec![0u8; DISK as usize * BLOCK];
+        disk[..FRONT_BYTES].copy_from_slice(&front);
+        assert_eq!(read(&disk), Err(ReadError::TooManyPartitions));
     }
 
     /// A label longer than the field is cut on a character, and read back as what was written.

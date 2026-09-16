@@ -212,22 +212,6 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/proc/self/status` — a **leaf** server returning the **caller's own**
-/// numeric identity as a fresh read-only [`MemoryObject`] text snapshot:
-///
-/// ```text
-/// pid=2
-/// tid=5
-/// ```
-///
-/// The second consumer of the **capture → format → synthesize** discipline
-/// (see `docs/architecture/scheduler.md` § "The stats surface"): the identity
-/// is read from the running syscall context under one `SCHED` hold
-/// ([`crate::sched::current_pid_tid`]) — like the other `/proc/self` leaves
-/// there is **no pid parameter to forge** — then formatted and wrapped with no
-/// lock held. A kernel/boot caller (no owning process) or a non-empty `suffix`
-/// is *not found*. Closes the deferred numeric-`/proc/self/status` item
-/// (`docs/rationale/deferred-decisions.md`).
 /// `/proc/cmdline` — the command line this boot was given, as a fresh read-only
 /// [`MemoryObject`] holding the bytes and nothing else (no trailing newline: it is one line, and
 /// a reader matching words does not want to strip one).
@@ -246,6 +230,22 @@ fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
+/// `/proc/self/status` — a **leaf** server returning the **caller's own**
+/// numeric identity as a fresh read-only [`MemoryObject`] text snapshot:
+///
+/// ```text
+/// pid=2
+/// tid=5
+/// ```
+///
+/// The second consumer of the **capture → format → synthesize** discipline
+/// (see `docs/architecture/scheduler.md` § "The stats surface"): the identity
+/// is read from the running syscall context under one `SCHED` hold
+/// ([`crate::sched::current_pid_tid`]) — like the other `/proc/self` leaves
+/// there is **no pid parameter to forge** — then formatted and wrapped with no
+/// lock held. A kernel/boot caller (no owning process) or a non-empty `suffix`
+/// is *not found*. Closes the deferred numeric-`/proc/self/status` item
+/// (`docs/rationale/deferred-decisions.md`).
 fn proc_self_status(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
