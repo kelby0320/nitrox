@@ -1,18 +1,19 @@
 //! x86_64's answer to [`crate::arch::memory_types`]: the variable-range MTRRs, the default type,
 //! and the page-attribute table (PAT), read and reported.
 //!
-//! **Read-only, for now.** Phase 5 Part G's first piece is the measurement — what the firmware
-//! set, and what a full-screen write therefore costs — because the fix (mapping the framebuffer
-//! write-combining) should be judged against a number rather than against an expectation.
+//! **Read, and written.** The reading came first, in Part G's measurement: what the firmware set,
+//! and what a full-screen write therefore costs, because a fix judged against an expectation is
+//! not judged. The writing is [`install_policy`](ArchMemoryTypes::install_policy), which every CPU
+//! calls during bring-up so the table's meanings stop depending on a bootloader's choice.
 //!
-//! **The effective type is the stronger of the range registers and the page table**, which is why
-//! the range registers decide the framebuffer's fate today: every user mapping this kernel makes
-//! is write-back (`mm::addr_space::protection_to_page_flags`), and write-back under an uncacheable
-//! range is uncacheable. The one way a page table can *raise* an uncacheable range is a PAT entry
-//! of write-combining, which is what Part G is for.
+//! **The effective type is the stronger of the range registers and the page table.** That is why
+//! the range registers used to decide the framebuffer's fate: a mapping with no attribute is
+//! write-back, and write-back under an uncacheable range is uncacheable. The one way a page table
+//! can *raise* such a range is an attribute of write-combining, which is what a
+//! [`Caching::WriteCombining`](crate::mm::Caching) object now asks for.
 
 use super::regs;
-use crate::arch::memory_types::{ArchMemoryTypes, MemoryType};
+use crate::arch::memory_types::{ArchMemoryTypes, MemoryType, Policy};
 
 /// `IA32_MTRRCAP`: how many variable ranges the CPU has, and whether fixed ranges exist.
 const MSR_MTRRCAP: u32 = 0xFE;
@@ -40,6 +41,25 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const FIXED_RANGE_TOP: u64 = 0x10_0000;
 /// Ranges are read into a fixed array; the architecture allows at most this many.
 const MAX_RANGES: usize = 64;
+
+/// `CR0.CD` — no-fill cache mode, which the vendor's procedure enters before the table changes.
+const CR0_CACHE_DISABLE: u64 = 1 << 30;
+/// `CR0.NW` — not-write-through. Cleared alongside `CD`, as the procedure requires.
+const CR0_NOT_WRITE_THROUGH: u64 = 1 << 29;
+/// `CR4.PGE` — global pages, cleared and restored around the change so global TLB entries go too.
+const CR4_GLOBAL_PAGES: u64 = 1 << 7;
+
+/// The attribute table this kernel programs, entry 0 first:
+/// write-back, write-through, `UC-`, uncacheable, write-protected, **write-combining**,
+/// uncacheable, uncacheable.
+///
+/// **These are the values Limine already leaves**, on the laptop and under QEMU alike, and that is
+/// deliberate rather than lazy: mappings made before the kernel takes the table over chose their
+/// entries out of it. Two such entries are live — the console's framebuffer mapping selects 5, and
+/// every `kvmap` MMIO mapping selects 2 — so a layout that moved either would change what an
+/// in-flight mapping means. What owning it buys is that the meanings stop depending on a
+/// bootloader's choice; what keeping the values buys is that nothing in flight changes.
+const KERNEL_PAT: u64 = 0x0000_0105_0007_0406;
 
 /// x86_64's memory-type configuration.
 pub struct X86MemoryTypes;
@@ -127,6 +147,21 @@ unsafe fn read_ranges(out: &mut [Range; MAX_RANGES]) -> usize {
     used
 }
 
+/// Print an attribute table, entry by entry.
+fn log_table(what: &str, pat: u64) {
+    crate::kprintln!(
+        "cache policy: {what} 0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7:{}",
+        decode((pat & 0xFF) as u8).name(),
+        decode((pat >> 8 & 0xFF) as u8).name(),
+        decode((pat >> 16 & 0xFF) as u8).name(),
+        decode((pat >> 24 & 0xFF) as u8).name(),
+        decode((pat >> 32 & 0xFF) as u8).name(),
+        decode((pat >> 40 & 0xFF) as u8).name(),
+        decode((pat >> 48 & 0xFF) as u8).name(),
+        decode((pat >> 56 & 0xFF) as u8).name()
+    );
+}
+
 impl ArchMemoryTypes for X86MemoryTypes {
     unsafe fn at(phys: u64) -> Option<MemoryType> {
         if regs::cpuid(1, 0).3 & CPUID_EDX_MTRR == 0 {
@@ -151,12 +186,55 @@ impl ArchMemoryTypes for X86MemoryTypes {
         if regs::cpuid(1, 0).3 & CPUID_EDX_PAT == 0 {
             return None;
         }
-        let root = <super::paging::X86Paging as crate::arch::paging::ArchPaging>::active_root();
+        use crate::arch::paging::ArchPaging;
+        let root = super::paging::X86Paging::active_root();
         // SAFETY: the active root is live and reachable through the HHDM.
-        let index = unsafe { super::paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
+        let index =
+            unsafe { super::paging::X86Paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
         // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
         let pat = unsafe { regs::rdmsr(MSR_PAT) };
         Some(decode((pat >> (8 * index as u32) & 0xFF) as u8))
+    }
+
+    unsafe fn install_policy() -> Policy {
+        if regs::cpuid(1, 0).3 & CPUID_EDX_PAT == 0 {
+            return Policy::NoTable;
+        }
+        // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
+        let had = unsafe { regs::rdmsr(MSR_PAT) };
+        // **The vendor's sequence** (SDM vol. 3, "Programming the PAT"), which exists because the
+        // caches may hold lines whose memory type the old table described: enter no-fill mode,
+        // write everything back, drop the TLB including its global entries, change the table,
+        // write back again, and only then let the caches fill.
+        //
+        // SAFETY: ring 0 during this CPU's bring-up, per this function's contract. Interrupts are
+        // off across the window, so nothing runs on this CPU while its caches are disabled — a
+        // handler that touched memory would run at no-fill speed but stay correct; the reason to
+        // hold them off is that the window must not be extended by one.
+        unsafe {
+            let was_on = <super::cpu::X86Cpu as crate::arch::cpu::ArchCpu>::interrupts_disable();
+            let cr0 = regs::read_cr0();
+            regs::write_cr0((cr0 | CR0_CACHE_DISABLE) & !CR0_NOT_WRITE_THROUGH);
+            regs::wbinvd();
+            let cr4 = regs::read_cr4();
+            regs::write_cr4(cr4 & !CR4_GLOBAL_PAGES);
+            regs::write_cr3(regs::read_cr3());
+            regs::wrmsr(MSR_PAT, KERNEL_PAT);
+            regs::wbinvd();
+            regs::write_cr3(regs::read_cr3());
+            regs::write_cr4(cr4);
+            regs::write_cr0(cr0);
+            if was_on {
+                <super::cpu::X86Cpu as crate::arch::cpu::ArchCpu>::interrupts_enable();
+            }
+        }
+        if had == KERNEL_PAT {
+            return Policy::Unchanged;
+        }
+        // The "before" half of G.1's before-and-after: a table nobody expected is worth printing
+        // once, because every mapping made before this call named an entry in it.
+        log_table("the bootloader's table was", had);
+        Policy::Replaced
     }
 
     unsafe fn log_configuration() {
@@ -197,20 +275,10 @@ impl ArchMemoryTypes for X86MemoryTypes {
         let pat = unsafe { regs::rdmsr(MSR_PAT) };
         // Entry `n` is byte `n`; a page selects one with its PAT, PCD and PWT bits. **Two
         // entries are in use today**: a mapping with no cache flags lands on entry 0, and
-        // `PageFlags::NO_CACHE` sets `PCD` alone, which selects entry 2 — `UC-` in the table
-        // both machines show, not plain uncacheable. Every kernel MMIO mapping (`kvmap`, the
-        // interrupt router) is entry 2 (PR #305 review, finding 2).
-        crate::kprintln!(
-            "cache policy: page attributes 0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7:{}",
-            decode((pat & 0xFF) as u8).name(),
-            decode((pat >> 8 & 0xFF) as u8).name(),
-            decode((pat >> 16 & 0xFF) as u8).name(),
-            decode((pat >> 24 & 0xFF) as u8).name(),
-            decode((pat >> 32 & 0xFF) as u8).name(),
-            decode((pat >> 40 & 0xFF) as u8).name(),
-            decode((pat >> 48 & 0xFF) as u8).name(),
-            decode((pat >> 56 & 0xFF) as u8).name()
-        );
+        // `PageFlags::NO_CACHE` sets `PCD` alone, which selects entry 2 — `UC-`, not plain
+        // uncacheable. Every kernel MMIO mapping (`kvmap`, the interrupt router) is entry 2
+        // (PR #305 review, finding 2).
+        log_table("page attributes", pat);
     }
 }
 
@@ -308,5 +376,22 @@ mod tests {
         assert_eq!(decode(7), MemoryType::UncacheableWeak);
         assert_eq!(decode(2), MemoryType::Other(2));
         assert_eq!(decode(3), MemoryType::Other(3));
+    }
+
+    /// **The table this kernel programs, spelled out.** A `u64` of packed type bytes is exactly
+    /// the kind of constant that is wrong in a way nothing notices: the first version of it had
+    /// the entries shifted, and only a boot — which compared it against the bootloader's and said
+    /// they DIFFERED — caught that. This is the same check, in a second.
+    #[test]
+    fn the_kernels_table_is_the_layout_its_doc_claims() {
+        let entry = |n: u32| decode((KERNEL_PAT >> (8 * n) & 0xFF) as u8);
+        assert_eq!(entry(0), MemoryType::WriteBack, "a mapping with no cache bits");
+        assert_eq!(entry(1), MemoryType::WriteThrough);
+        assert_eq!(entry(2), MemoryType::UncacheableWeak, "what every kvmap MMIO mapping selects");
+        assert_eq!(entry(3), MemoryType::Uncacheable);
+        assert_eq!(entry(4), MemoryType::WriteProtected);
+        assert_eq!(entry(5), MemoryType::WriteCombining, "what the framebuffer will select");
+        assert_eq!(entry(6), MemoryType::Uncacheable);
+        assert_eq!(entry(7), MemoryType::Uncacheable);
     }
 }

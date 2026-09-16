@@ -1432,39 +1432,6 @@ inspector, anything that reports on the system rather than on a home directory. 
 first is the thing that makes the shape concrete, and until one does, guessing at the shape is how
 you get an administrator account that fits nothing.
 
-**A cache attribute on a mapped device aperture — `TODO(framebuffer-cache-attr)`.** Userspace maps `/dev/framebuffer` **write-back cached**:
-`protection_to_page_flags` never sets `PageFlags::NO_CACHE`, and nothing carries a cache attribute
-from a `MemoryObject` to a user PTE — `NO_CACHE` is used only by `kvmap`, for kernel MMIO.
-
-Under QEMU this is harmless, and M13 Part A's benchmark measured it directly: writing a row to the
-aperture takes the same time as writing one to an anonymous mapping, under both accelerators. On
-real hardware it is a **correctness** problem rather than a performance one — a PCI framebuffer BAR
-wants write-combining or uncached, and a write-back mapping can leave writes sitting in cache or
-reorder them in ways a device does not expect.
-
-Fixing it needs a cache-attribute field on `MemoryObject` and a PAT story; "a way for the namespace
-server to set it" turned out **not** to be needed — see the measurement below, which puts the
-attribute on the object the kernel already mints. **Trigger: the first boot on real hardware**,
-which is also the first time anybody could observe it.
-
-**The trigger fired on 2026-09-15**, and the observation was not the one written above: the laptop
-draws the desktop slowly, in proportion to the area repainted — a wrong *cost*, not a wrong result.
-
-**And the cause is narrower than this entry assumed.** Measured on the laptop 2026-09-16, the same
-full-screen fill through the two mappings this framebuffer has: **1368 us (2924 MiB/s)** through the
-console's, which the bootloader maps write-combining, and **72930 us (54 MiB/s)** through a plain
-one, as every `/dev/framebuffer` mapping is. So it is not that a device aperture is mapped
-write-back in the abstract: the bootloader already asks for the right thing and this kernel drops it
-when userspace maps the same memory. Every boot now logs the platform's cache policy, what each
-mapping asks for, and both timings. The fix is Phase 5 Part G, and 54 MiB/s is the number it has to
-beat.
-
-> **Scheduled as Phase 5 Part G** (2026-09-10), deliberately *after* the first boot rather than
-> before it: the trigger is observation, and picking an attribute blind would be guessing at
-> what this framebuffer wants. The target machine's is a GOP linear framebuffer at
-> `0xa0000000`, 1366×768×32 with a **padded pitch of 5504** — the padding is already handled,
-> the caching is not.
-
 **An icon set — `TODO(icon-set)` <!-- check-deferrals: no-code-site -->.** The window controls are
 drawn as shapes (M11 Part E batch 2a): a bar, a square, two strokes. Real icons need a naming
 convention, a size convention and a lookup path, which is a second decision after the one that
@@ -1984,6 +1951,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A cache attribute on a mapped device aperture (`framebuffer-cache-attr`) | 2026-09-16 | Phase 5 Part G, and **the entry above was wrong about what it would cost**: it called a write-back mapping of a PCI BAR a *correctness* problem — writes left in cache, reordered — and on the laptop nothing was ever cached, because the firmware's range registers call the graphics aperture uncacheable and the stronger of the two wins. It was a performance problem, and a 45x one: a full screen took 72930 us through a `/dev/framebuffer` mapping against 1368 through the bootloader's mapping of the same pixels. **The bootloader had already asked for write-combining**; this kernel dropped the attribute at the namespace boundary, where `protection_to_page_flags` gave every user mapping no attribute at all. The fix is `mm::Caching` on the `MemoryObject` and the VMA, `PageFlags::WRITE_COMBINING` selecting entry 5 of a table the kernel now programs itself on every CPU (keeping the bootloader's exact values, because two entries were already live in mappings it made), and the framebuffer aperture recording its answer once for the object and the boot's own measurement to read. "A way for the namespace server to set it" was **not** needed and is not built: the aperture the kernel mints is the only device object userspace maps, so the attribute is the object's. A compositor with no shadow buffer now refuses to serve rather than composing into the display, because composing into write-combining memory reads it back. Measured after: 1632 us, 2451 MiB/s. **Two of this part's own instruments lied before they worked** — the measurement built its second mapping with the attribute written into the measurement, and the handout line printed the aperture's value instead of the object's — each caught by a control that should have failed and did not. |
 | MSI (message-signalled interrupts) | 2026-09-11 | Phase 5 Part A, and **the trigger this entry carried was the wrong one** — it was filed as performance work ("NVMe, multi-queue NICs, or performance work on interrupt-heavy devices") when on real hardware it is a correctness unblocker: the AHCI driver took its GSI from the PCI interrupt-line register, which QEMU's firmware programs and real UEFI frequently leaves meaningless, the authoritative routing being the DSDT's `_PRT` — which needs AML, which means ACPICA. MSI needs none of it. `pci::read_msi` and `pci::program_msi` decode and program the capability, `ArchIrqInstall::install_msi` composes the x86 message, and AHCI prefers MSI while keeping INTx as the fallback for a function that advertises no capability. **Message Control bit 7 selects the structure, not the address width**: Message Data sits at `+0x0C` when the address is 64-bit and `+0x08` when it is not, and the two target controllers disagree — QEMU's ICH9 AHCI is 64-bit, the laptop's Sunrise Point-LP is not — so the branch the target machine takes is the one no QEMU boot can exercise. Host tests carry both shapes, built from the real captures, and are negative-controlled by forcing the offset to `+0x0C` unconditionally, which is the driver the emulator alone would have produced. Bus mastering and the INTx-disable bit came with it, being the same config-space plumbing: nothing in Nitrox had ever set either, and DMA worked only because the firmware did. MSI-X stays deferred with a consumer-based trigger of its own. |
 | A dedicated arch trait for the device-interrupt *installation* facility (`msi`) | 2026-09-11 | Built in Phase 5 Part A **at the second consumer**, which is what this entry asked for. `ArchIrqInstall` carries `install_intx` — the old neutral `install_pci_irq` free function, moved verbatim — and `install_msi`, in `kernel/src/arch/irq_install.rs` with the x86 half in `kernel/src/arch/x86_64/irq_install.rs`: a module of its own rather than more of `ioapic.rs`, because only the INTx half is the IOAPIC's business at all. The MSI half yields a **message** rather than programming a device, which is where the arch boundary falls — the address and data are architectural, the PCI capability they are written into is not. It also refuses rather than truncates when a destination will not fit the compatibility format's eight bits, a narrowing the dense-index binding already assumed and nothing had written down. **Closing this exposed a hole in `check-deferrals` itself**: the last `TODO(msi)` marker in the tree was the gate's own doc comment illustrating the tag syntax, so the entry was backed by an example rather than by a code site, and would have stayed green with its real marker deleted. The illustration is a placeholder now, and the gate fails correctly on an unbacked entry again. |
 | A call cannot be nested in an argument list (`shell-nested-call`) | 2026-09-10 | Reported from using the shell — `let x = age_plus_n(my_age(), 3)` did not compile, because `my_age()` was never parsed. **The entry named two causes and prescribed a fix for each; there was one cause and neither fix was needed.** `paren_args` has to see the token *after* an identifier to tell `f(name: v)` from `f(name.field)`, which is one more than the lexer caches — so it consumed the identifier and resumed in a hand-written copy of the expression tiers. Everything wrong followed from the copy existing: no `(` arm (both reported shapes), and a binary tier that folded flat. **That last one nobody had found**: `format("{}", a + b * c)` parsed as `(a + b) * c` while `format("{}", 1 + 2 * 3)` and `let z = a + b * c` were both right, so an argument list silently changed the meaning of arithmetic whenever the argument began with a name. The fix is a **rewind** — `Lexer` is `Clone`, `paren_args` marks, looks for the `:`, and puts the lexer back if there is none — after which an argument is parsed by `expr` like every other expression and the 82-line copy is deleted. Cloning the whole lexer rather than a chosen subset of its fields is the point: a hand-picked snapshot is what goes stale when the struct gains a field, and it would fail as a mis-parse rather than as a compile error. `test-interactive` step 7's two-line workaround is gone. |

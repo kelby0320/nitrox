@@ -470,3 +470,18 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
              options(nomem, nostack, preserves_flags));
     }
 }
+
+/// Write back and invalidate every cache on this CPU (`wbinvd`).
+///
+/// Ring 0, and expensive — the whole point is that it is: the vendor's procedure for changing a
+/// cache-policy register requires the caches to hold nothing that the old policy described.
+///
+/// # Safety
+/// Ring 0. Discards nothing (everything dirty is written back first), but it stalls this CPU for
+/// as long as the caches take, so it belongs in boot paths and not beside ordinary work.
+pub unsafe fn wbinvd() {
+    // SAFETY: `wbinvd` is a ring-0 instruction with no operands. It touches no normal memory the
+    // compiler must know about — the write-back is architectural, not a store it can reorder —
+    // but `nomem` would let the compiler keep a value in a register across it, so it is omitted.
+    unsafe { asm!("wbinvd", options(nostack, preserves_flags)) };
+}

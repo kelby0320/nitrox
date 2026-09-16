@@ -126,6 +126,11 @@ fn flags_to_pte_bits(flags: PageFlags) -> u64 {
     if flags.contains(PageFlags::WRITE_THROUGH) {
         bits |= PTE_PWT;
     }
+    // **Entry 5 of the table this kernel programs** (`KERNEL_PAT`): `PAT` and `PWT`, no `PCD`.
+    // The entry is named there, not here — this is the bit pattern that selects it.
+    if flags.contains(PageFlags::WRITE_COMBINING) {
+        bits |= PTE_PAT | PTE_PWT;
+    }
     bits
 }
 
@@ -188,7 +193,7 @@ const fn attribute_of(raw: u64, huge: bool) -> u8 {
 ///
 /// # Safety
 /// `root` must be a live page-table root reachable through the HHDM.
-pub(super) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
+pub(crate) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
     if !virt.is_canonical() {
         return None;
     }
@@ -542,6 +547,11 @@ impl ArchPaging for X86Paging {
             }
             Some(PhysAddr::new(pte.phys().as_u64() | page_offset(virt)))
         }
+    }
+
+    unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
+        // SAFETY: forwarded from the trait's contract.
+        unsafe { attribute_index(root, virt) }
     }
 
     fn active_root() -> PhysAddr {

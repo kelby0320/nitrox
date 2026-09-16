@@ -52,6 +52,20 @@ impl MemoryType {
     }
 }
 
+/// What [`install_policy`](ArchMemoryTypes::install_policy) found and did.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Policy {
+    /// The platform's table was already the one this kernel programs.
+    Unchanged,
+    /// It was something else, and now it is the kernel's. Mappings made before this chose their
+    /// entries out of the old table.
+    Replaced,
+    /// This CPU has no such table at all, so there is nothing to install and no attribute to
+    /// select: every mapping is whatever the range registers say. No x86-64 part ships like this,
+    /// and the case is handled rather than assumed away because the check for it is one bit.
+    NoTable,
+}
+
 /// What the platform says about caching physical memory.
 pub trait ArchMemoryTypes {
     /// The type the firmware's configuration gives `phys`, or `None` where the CPU offers no
@@ -71,6 +85,21 @@ pub trait ArchMemoryTypes {
     /// # Safety
     /// Ring 0. Walks the active page tables.
     unsafe fn of_mapping(virt: u64) -> Option<MemoryType>;
+
+    /// Install the kernel's own cache-policy table on **this** CPU, and say what happened.
+    ///
+    /// Every CPU needs its own call: the table is per-CPU state, and a CPU whose table disagreed
+    /// with its neighbours' would give the same page different meanings depending on which core
+    /// touched it.
+    ///
+    /// **[`Policy::Replaced`] is not a failure** — the table is the kernel's either way. It means
+    /// the platform handed over something else, which matters because mappings made *before* this
+    /// call (the bootloader's, including the one the console draws through) chose their entries
+    /// out of the old table.
+    ///
+    /// # Safety
+    /// Ring 0, during this CPU's bring-up, before it makes any mapping that names an entry.
+    unsafe fn install_policy() -> Policy;
 
     /// Log the platform's cache-policy configuration, in that architecture's own terms — the
     /// one place the spelling is allowed to show, because a reader comparing this against the

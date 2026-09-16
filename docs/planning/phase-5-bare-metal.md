@@ -1050,7 +1050,7 @@ multiple of 8 — so an error found only there is most likely in the arithmetic 
 - **Changing modes after boot.** The screen is the size Limine handed over for the life of the
   boot, and nothing here announces a change.
 
-## Part F — the first boot ⬜ *(it boots; what it found is being fixed)*
+## Part F — the first boot ✅
 
 - [x] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
       USB stick, boot the laptop, and fix what breaks. **Booted 2026-09-15, first attempt, with no
@@ -1061,15 +1061,22 @@ The honest content of this part is unknown, which is why it is a part and not a 
 is known is the order to look in: firmware handoff → framebuffer → ACPI tables → CPU/APIC
 bring-up → SMP → i8042 → userspace. Part B is what makes each of those observable.
 
-- [ ] Whatever this finds gets a decision-log entry and, where it is a class rather than an
+- [x] Whatever this finds gets a decision-log entry and, where it is a class rather than an
       instance, a QEMU-side gate — because a bug found once on hardware and not gated will be
-      found again.
+      found again. **Both findings did**: the slow screen became Part G, gated by what each mapping
+      asks for; the working trackpad corrected this plan. A third, found on the way, was a
+      pre-existing page-table bug Part G's review caught (a huge page's `PAT` bit read as part of
+      its frame), now host-tested.
+
+**Closed 2026-09-16.** The desktop runs on the laptop from a USB stick: a login from the built-in
+keyboard, `Super+A`, and `nxterm` running a shell — the phase's definition of done but for the disk
+it boots from, which is Part H. The trackpad works too, which this plan had not expected.
 
 **What the first boot found.**
 
 - **The screen is slow, in proportion to the area repainted.** The cursor moves smoothly; drawing
   the desktop after login, or opening the overview, is painful. That is Part G's trigger, and Part G
-  is where it is measured and fixed.
+  measured and fixed it: 54 MiB/s to 2451 through a `/dev/framebuffer` mapping.
 - **The trackpad works**, which this plan said it would not — see § What Phase 5 does not do.
 - Nothing else misbehaved in what was exercised, and nothing in the image needed changing to boot.
 
@@ -1141,23 +1148,23 @@ what the console's costs.
 
 ### The pieces, in dependency order
 
-- [ ] **G.1 — the kernel owns its attribute table.** Program `IA32_PAT` on the BSP and on each AP
+- [x] **G.1 — the kernel owns its attribute table.** Program `IA32_PAT` on the BSP and on each AP
       with the layout above, by the vendor's sequence (interrupts off, caches disabled and written
       back, the write, caches back on, TLB flushed). The boot already logs the table; it now logs
       it **before and after**, and a gate asserts the bootloader's table was the one we program, so
       a bootloader that changes it is loud rather than silent.
-- [ ] **G.2 — a memory object carries a cache attribute, and a mapping honours it.** A field on
+- [x] **G.2 — a memory object carries a cache attribute, and a mapping honours it.** A field on
       `MemoryObject` (default: ordinary memory), a `PageFlags::WRITE_COMBINING` that selects the
       entry, and `protection_to_page_flags` taking the object's attribute instead of assuming
       write-back. Host tests: the flag reaches the right PTE bits; an object with no attribute maps
       exactly as it does today.
-- [ ] **G.3 — the framebuffer aperture is marked write-combining** where it is recorded, so every
+- [x] **G.3 — the framebuffer aperture is marked write-combining** where it is recorded, so every
       `/dev/framebuffer` mapping asks for it. The measurement's second mapping becomes a mapping
       made the way a real one is, and its line says so.
-- [ ] **G.4 — the shadow buffer becomes mandatory.** The compositor fails to start rather than
+- [x] **G.4 — the shadow buffer becomes mandatory.** The compositor fails to start rather than
       composing into the display, and says why. `check-display` and `check-terminal` already boot
       with one; the gate for the refusal is the allocation failing.
-- [ ] **G.5 — the gates.** `test-qemu` asserts what each mapping asks for (QEMU agrees about the
+- [x] **G.5 — the gates.** `test-qemu` asserts what each mapping asks for (QEMU agrees about the
       configuration, so this is gateable there) and that the two now agree. The **cost** is asserted
       nowhere: under TCG both fills take the same time, and asserting a number an emulator cannot
       produce is how a gate starts lying.
@@ -1169,6 +1176,11 @@ The laptop's own before-and-after, from the same line: `54 MiB/s` through a plai
 noise of the console's, and the desktop should stop being painful. **If it does not**, the fix is
 not the cause of the remaining cost and the next question is what the compositor spends its time on
 — which is a different part.
+
+> **Measured 2026-09-16: 54 MiB/s → 2451 MiB/s**, against 2931 through the bootloader's own
+> mapping — a full screen in 1632 us where it took 72930. The desktop is no longer painful. The
+> remaining 20% between the two mappings is unexplained; the likely cause is page size (2 MiB
+> against 4 KiB), and it is recorded rather than chased.
 
 ### Left alone
 

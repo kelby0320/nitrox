@@ -179,8 +179,11 @@ still-running compositor show itself.
 - **Scrollback.** What scrolled off is on COM1 and, for the kernel's lines, in `/dev/log`.
 - **Anything for a machine without a linear 32-bit framebuffer.** `init` returns `None` and says
   so on COM1, which on such a machine nobody reads.
-- **Cache attributes for the aperture.** The console writes through Limine's higher-half mapping
-  as it stands; Phase 5 Part G is what decides what that mapping should be on real hardware.
+- **Cache attributes for the *console's* mapping.** The aperture has one since Phase 5 Part G:
+  every `/dev/framebuffer` mapping asks for write-combining, which took a full-screen fill on the
+  laptop from 54 MiB/s to 2451. The console writes through Limine's higher-half mapping, which
+  already asked for it, so taking that over would be a second mapping to keep in step for no gain
+  any measurement can see.
 - **A display that fails after the handout.** From the yield until a stop, nothing is painted, so
   a compositor that acquires the aperture and then dies — `obj.map` failing, or a panic before its
   first frame — leaves the screen frozen on `compositor: up` with its reason in the grid and on

@@ -323,8 +323,18 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     Every fact the plan said to compare matched, including the padded pitch and AHCI over MSI with a
     real disk behind it. Two surprises: the trackpad works (the firmware puts it on the i8042's
     auxiliary port, so the PS/2 driver drives it — the plan had said Phase 6), and **redrawing the
-    whole screen is slow**, in proportion to area, which is Part G's trigger firing. Part F stays
-    open while that is fixed.
+    whole screen is slow**, in proportion to area, which is Part G's trigger firing. **Part F closed
+    2026-09-16**, once Part G made the screen fast: the desktop runs on the laptop from a USB stick,
+    with a login from its own keyboard, `Super+A`, and `nxterm` running a shell — the phase's
+    definition of done but for the disk it boots from, which is Part H.
+  - **Part G (framebuffer cache attributes) is complete, 2026-09-16: 54 MiB/s → 2451.**
+    The kernel programs its own cache-policy table on every CPU; `mm::Caching` travels from the
+    object through the VMA to the page flags; the framebuffer aperture records write-combining
+    once, so `/dev/framebuffer` mappings ask for it as the bootloader's mapping always did; and a
+    compositor with no shadow buffer refuses to serve, because composing into write-combining
+    memory reads it back. QEMU shows the configuration and cannot show the cost, so the laptop
+    judged it: a full screen in 1632 us where it took 72930, within 1.2x of the bootloader's own
+    mapping, and a desktop that is no longer painful.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness

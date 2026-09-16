@@ -28,6 +28,7 @@ pub struct PageFlags(u32);
 impl PageFlags {
     /// The page may be written. Without it the mapping is read-only.
     pub const WRITABLE: PageFlags = PageFlags(1 << 0);
+
     /// The page is reachable from ring 3. Without it it is kernel-only.
     pub const USER: PageFlags = PageFlags(1 << 1);
     /// Instruction fetches from the page fault — set this for data pages.
@@ -38,6 +39,13 @@ impl PageFlags {
     pub const NO_CACHE: PageFlags = PageFlags(1 << 4);
     /// Writes go straight through the cache instead of being written back.
     pub const WRITE_THROUGH: PageFlags = PageFlags(1 << 5);
+    /// Writes gathered into bursts, reads uncached: what a framebuffer wants, and the one
+    /// attribute that *raises* a range the firmware calls uncacheable (Phase 5 Part G.2).
+    ///
+    /// Not combined with [`NO_CACHE`](PageFlags::NO_CACHE) or
+    /// [`WRITE_THROUGH`](PageFlags::WRITE_THROUGH) — each names a whole answer, and a mapping
+    /// asking for two would select an entry neither meant.
+    pub const WRITE_COMBINING: PageFlags = PageFlags(1 << 6);
 
     /// No flags: a read-only, kernel-only, executable mapping.
     pub const fn empty() -> Self {
@@ -225,6 +233,20 @@ pub trait ArchPaging {
     /// `root` must be the physical base of a valid top-level page table
     /// reachable through the higher-half direct map.
     unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>;
+
+    /// Which cache-attribute entry the mapping of `virt` in `root` selects, or `None` if it is
+    /// not mapped. The entries themselves are the architecture's — what a caller can do with this
+    /// is compare two mappings, or check one against the table the kernel programs.
+    ///
+    /// **This exists so the fix has a testable surface.** Part G's translation from a
+    /// [`Caching`](crate::mm::Caching) to hardware bits is otherwise only visible on a booted
+    /// machine, and a gate on a boot line proved to pass with the translation deleted
+    /// (PR #306 review).
+    ///
+    /// # Safety
+    /// `root` must be the physical base of a valid top-level page table reachable through the
+    /// higher-half direct map.
+    unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8>;
 
     /// The physical base of the page table the current CPU is using (the
     /// address field of the architecture's page-table-root register).

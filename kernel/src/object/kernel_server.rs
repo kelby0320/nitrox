@@ -352,7 +352,7 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// depth other than 32 bits), rather than a zero-sized object a client would map and then
 /// scribble past.
 fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
-    let Some((phys_base, info)) = crate::framebuffer::aperture() else {
+    let Some((phys_base, info, caching)) = crate::framebuffer::aperture() else {
         return OpStatus::Rejected(KError::Unsupported);
     };
 
@@ -363,9 +363,25 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
             // the buddy allocator manages (Limine reports it as framebuffer, not usable
             // RAM), and it stays mapped for the life of the system.
             match unsafe {
-                MemoryObject::try_new_borrowed(phys_base, info.byte_len as usize)
+                MemoryObject::try_new_borrowed(
+                    phys_base,
+                    info.byte_len as usize,
+                    // **What the aperture said it is** (Phase 5 Part G.3), not a second opinion
+                    // about framebuffers: one answer, recorded at boot, reaching every mapping.
+                    caching,
+                )
             } {
                 Ok(obj) => {
+                    // **Said out loud, because nothing else can see it** (PR #306 review): the
+                    // object a client maps is the only place the aperture's answer actually
+                    // reaches userspace, and a handout that quietly minted an ordinary object
+                    // would cost 45x on the laptop with every gate still green. The boot's own
+                    // measurement cannot catch that — it reads the aperture, not this object.
+                    // **`obj`, not the value passed to the constructor.** A first version read
+                    // the aperture's variable here, so a control that minted an ordinary object
+                    // still printed "write-combining" — a line about the wrong thing, twice in
+                    // one part (PR #306 review). What a client maps is what this object says.
+                    crate::kprintln!("framebuffer: handed out as {} memory", obj.caching().name());
                     // **The screen changes hands here**, before the handle exists: the console
                     // stops painting under its own lock, so nothing it draws can land on a frame
                     // this client has started. Only on success — a refused handout leaves the

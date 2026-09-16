@@ -21,7 +21,7 @@ use core::ptr;
 
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
-use crate::mm::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap};
+use crate::mm::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap, Caching};
 use crate::object::header::KObjectHeader;
 
 /// Whether a [`MemoryObject`]'s frames belong to it.
@@ -58,6 +58,9 @@ pub struct MemoryObject {
     frames: KVec<PhysAddr>,
     /// Whether [`Drop`] frees `frames`.
     ownership: FrameOwnership,
+    /// How every mapping of these frames is cached. Ordinary memory unless the object is a
+    /// device aperture that says otherwise (Phase 5 Part G.2).
+    caching: Caching,
 }
 
 impl MemoryObject {
@@ -124,6 +127,7 @@ impl MemoryObject {
             size,
             frames,
             ownership: FrameOwnership::Owned,
+            caching: Caching::Normal,
         })
     }
 
@@ -155,6 +159,7 @@ impl MemoryObject {
     pub unsafe fn try_new_borrowed(
         base: PhysAddr,
         size: usize,
+        caching: Caching,
     ) -> Result<KBox<Self>, AllocError> {
         let size = (size.max(1) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let npages = size >> PAGE_SHIFT;
@@ -173,12 +178,18 @@ impl MemoryObject {
             size,
             frames,
             ownership: FrameOwnership::Borrowed,
+            caching,
         })
     }
 
     /// Whether this object's frames are freed when it drops.
     pub fn ownership(&self) -> FrameOwnership {
         self.ownership
+    }
+
+    /// How every mapping of this object is cached.
+    pub fn caching(&self) -> Caching {
+        self.caching
     }
 
     /// Allocate a memory object holding a copy of `bytes` (size rounded up to a
@@ -315,7 +326,7 @@ mod tests {
         let base = PhysAddr::new(0xF000_0000);
         // SAFETY: test-only. Nothing maps or dereferences these frames — the test
         // inspects the object's bookkeeping, never the memory itself.
-        let m = unsafe { MemoryObject::try_new_borrowed(base, 3 * PAGE_SIZE + 1).unwrap() };
+        let m = unsafe { MemoryObject::try_new_borrowed(base, 3 * PAGE_SIZE + 1, Caching::Normal).unwrap() };
 
         assert_eq!(m.ownership(), FrameOwnership::Borrowed);
         assert_eq!(m.size(), 4 * PAGE_SIZE, "size rounds up to whole pages");
@@ -345,7 +356,12 @@ mod tests {
         // SAFETY: test-only. Nothing maps or dereferences these frames; the object
         // only records their addresses, and Borrowed drop must not touch them.
         let m = unsafe {
-            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGES * PAGE_SIZE).unwrap()
+            MemoryObject::try_new_borrowed(
+                PhysAddr::new(APERTURE),
+                PAGES * PAGE_SIZE,
+                Caching::WriteCombining,
+            )
+            .unwrap()
         };
         drop(m);
 
@@ -435,5 +451,20 @@ mod tests {
         assert_eq!(test_probe::memory_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::memory_object_destroys(), 1);
+    }
+
+    /// The attribute is the object's, and a mapping asks it (Phase 5 Part G.2). An owned object —
+    /// ordinary memory — never asks for anything.
+    #[test]
+    fn an_aperture_carries_its_caching_and_ordinary_memory_does_not() {
+        init_global_heap();
+        const APERTURE: u64 = 0xF000_0000;
+        // SAFETY: a made-up physical range no test maps or frees; nothing reads through it.
+        let device = unsafe {
+            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGE_SIZE, Caching::WriteCombining)
+                .unwrap()
+        };
+        assert_eq!(device.caching(), Caching::WriteCombining);
+        assert_eq!(MemoryObject::try_new(PAGE_SIZE).unwrap().caching(), Caching::Normal);
     }
 }

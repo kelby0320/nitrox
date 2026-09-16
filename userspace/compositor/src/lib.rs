@@ -1408,15 +1408,27 @@ pub struct Screen<F: Framebuffer> {
 impl<F: Framebuffer> Screen<F> {
     /// Wrap `display`, allocating a shadow buffer the same shape.
     ///
-    /// **Degrades rather than dies.** A full-screen buffer is megabytes (4.1 MB at 1280x800) and
-    /// the allocation can fail; a compositor that aborted there would take the graphical session
-    /// with it, to avoid a *visual* defect. Without the buffer this composes straight into the
-    /// display, which is exactly what shipped before this change: the flicker comes back and
-    /// everything else works. [`Screen::is_buffered`] reports which happened so the caller can say
-    /// so on the console rather than leaving it to be discovered by looking at the screen.
+    /// **The caller must not run without it** — since Phase 5 Part G.4, and this used to say the
+    /// opposite. The argument for degrading was that the fallback costs a *visual* defect, the
+    /// flicker, and taking the session down to avoid one is a poor trade. That argument rested on
+    /// writes to the display being ordinary memory writes. They are not: the framebuffer is
+    /// write-combining now, so composing into it directly *reads* it back, and a read from
+    /// write-combining memory is uncached — the laptop measures such traffic at 54 MiB/s, which
+    /// is a second of compositing per frame rather than a flicker. [`Screen::is_buffered`] still
+    /// reports which happened; `main.rs` now refuses to serve when it is false.
     pub fn new(display: F) -> Self {
         let shadow = MemFramebuffer::try_new(display.geometry());
         Self { shadow, display }
+    }
+
+    /// Wrap `display` with a shadow buffer the caller already has.
+    ///
+    /// **For a caller that must allocate before it acquires the display** — which `main.rs` must,
+    /// because acquiring is what stops the kernel's console drawing, and a refusal after that is
+    /// one nobody on a serial-less machine can read (PR #306 review). The buffer's geometry is the
+    /// display's by construction there: both come from the same `/dev/framebuffer/info`.
+    pub fn with_shadow(display: F, shadow: MemFramebuffer) -> Self {
+        Self { shadow: Some(shadow), display }
     }
 
     /// A screen with no shadow buffer — the path [`Screen::new`] falls back to when the

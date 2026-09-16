@@ -26092,3 +26092,124 @@ numbers stay a laptop measurement. The before is recorded: 54 MiB/s against 2924
 **Nothing in this part is built yet** — this entry is the pass, and G.1 to G.5 are unticked in the
 plan. Said plainly because the log is where "why doesn't the compositor fall back?" gets answered,
 and an entry written in the present tense would answer it wrongly (PR #305 review, finding 1).
+
+---
+
+## 2026-09-16 — Phase 5 Part G: the attribute the bootloader chose, carried to userspace
+
+**G.1 — the kernel programs its own cache-policy table.** Every CPU installs it before making any
+mapping that names an entry: the BSP in `paging_init`, each AP in `ap_cpu_init`, by the vendor's
+sequence (interrupts off, no-fill mode, write back, drop the TLB with its global entries, write the
+table, write back, restore). The values are the ones Limine already leaves, deliberately: two
+entries are live before the kernel takes over — the console's framebuffer mapping selects 5, every
+`kvmap` MMIO mapping selects 2 — so a different layout would change what an in-flight mapping means.
+Owning the table is what stops those meanings depending on a bootloader's choice. The boot says
+whether the platform's table was ours and prints the old one when it was not; `test-qemu` asserts
+the "was the same" form, so a bootloader that changes its table is loud.
+
+**The first version of that constant had its entries shifted**, and the boot caught it by printing
+DIFFERED — the comparison doing exactly the job it was added for. A host test now pins the layout,
+so the next such mistake costs a second rather than a boot.
+
+**G.2 — caching is a property of memory, carried by every mapping of it.** `mm::Caching` on the
+`MemoryObject` and on the VMA, `PageFlags::WRITE_COMBINING` for the bits that select entry 5, and
+`protection_to_page_flags` becomes `page_flags_for(prot, caching)` at all four sites. The VMA
+carries it so each site reads one answer rather than asking again — **not** because a fault-in path
+needs it, which the first draft of this entry claimed: object mappings install every page up front,
+and the kinds that fault in are ordinary memory (PR #306 review). An object-level attribute is what
+makes every mapping of one aperture agree: two that disagree is the aliasing the manuals warn about,
+and is what this system had.
+
+**G.3 — the aperture records what it is, once.** `record_aperture` takes the caching, and both the
+`MemoryObject` that `/dev/framebuffer` mints and the boot's own measurement read it back.
+
+**That last part started as a lie.** The measurement built its second mapping with write-combining
+written into the measurement, so it reported "a mapping made as userspace's is asks for
+write-combining" no matter what userspace actually got — a control that unmarked the aperture passed
+the gate. One recorded answer read by both fixed it, and the control now fails with the gate naming
+the missing line. The lesson is the one this project keeps relearning: a measurement that names its
+own parameters measures itself.
+
+**G.4 — a compositor with no shadow buffer refuses to serve.** It used to log a line and compose
+straight into the display, on the reasoning that the fallback costs a flicker and taking the session
+down to avoid a *visual* defect is a poor trade. That reasoning assumed writes to the display were
+ordinary writes. Under write-combining, composing into the display reads it back, and those reads
+are uncached — 54 MiB/s on the laptop, a second a frame rather than a flicker. Control: with the
+allocation forced to fail, the compositor prints `no shadow buffer … cannot serve` and exits, and
+`check-display` fails.
+
+**G.5 — what is gated, and what cannot be.** `test-qemu` asserts that both mappings ask for
+write-combining and that the boot says what each is; the timings are asserted nowhere, because TCG
+emulates every access and reports both fills at the same speed. QEMU agrees with the hardware about
+the configuration and says nothing useful about the cost.
+
+**Measured on the machine, and it is the fix.** The same boot line, before and after:
+
+| a full-screen fill of 4098 KiB | before | after |
+|---|---|---|
+| through the console's mapping | 1368 us — 2924 MiB/s | 1364 us — 2931 MiB/s |
+| through a mapping made as userspace's is | **72930 us — 54 MiB/s** | **1632 us — 2451 MiB/s** |
+
+**Forty-five times**, and the desktop stopped being painful — which is the observation Part F
+opened with, closed by the number that explains it. Every gate passes under QEMU too, which says
+only that nothing broke: the emulator reports both fills at the same speed either way.
+
+**The two mappings are not equal, and the gap is not explained.** 1632 us against 1364 is about 20%
+on the same pixels through page tables that now ask for the same thing. The likely reason is page
+size — the bootloader's mapping is a 2 MiB page, and a mapping this kernel makes is a thousand
+4 KiB ones, so the walk and the TLB pressure differ — but that is a hypothesis, and this part has
+already been wrong once about a plausible chain. It is written down rather than acted on: 20% on a
+path that just got 45x faster is not where the next hour goes.
+
+**What PR #306's review changed.** The blocking finding was that **nothing tested the path the fix
+runs through**: `page_flags_for` had no test, and the boot line that claimed to measure a userspace
+mapping was computed from a second copy of the translation inside the measurement. The reviewer
+deleted the real translation and watched every test and gate stay green. Three things closed it —
+the measurement now calls `page_flags_for` itself, a host test exercises it, and another maps a
+borrowed write-combining object through `map_object` and reads the leaf entry's attribute back.
+A fourth followed: **the handout line had the same shape of bug**, printing the aperture's value
+rather than the object's, so a control that minted an ordinary object still printed
+write-combining. It prints `obj.caching()` now, and `test-qemu` asserts it — the one place the
+aperture's answer actually reaches userspace.
+
+**Three instruments in one part, each wrong in the same way**: the measurement's mapping, the
+handout's line, and (before the laptop) the hypothesis itself. Each named its own answer instead of
+reading the one that mattered, and each was caught by a control that should have failed and did
+not. The lesson is cheap to state and evidently hard to apply: a test of a value the test supplies
+is a test of itself.
+
+**Also from the review**: the deferral moved to Resolved with its stale `TODO` marker removed —
+`check-deferrals` had been keeping it green on a marker for work that had landed; the compositor
+allocates its shadow buffer **before** acquiring the framebuffer, because acquiring is what stops
+the console drawing and a refusal after it is unreadable on a machine with no serial port; and
+`install_policy` now distinguishes "no attribute table" from "the bootloader's differed", verified
+by booting `-cpu max,-pat`, where the aperture is recorded as ordinary memory rather than setting a
+bit that is reserved without a table.
+
+**Seen once and not fixed:** `check-login` failed one run at the window-geometry read, matching a
+window-list line where a geometry line was expected (`could not read a window geometry from "list on
+cli of 3 [20:  window 20]"`), then passed four runs. The window's title had not arrived yet, so the
+list line read `window 20` rather than `nxfiles`. That is a gate parsing a line it did not mean to,
+which is a different fault from the click-not-acted-on flake; no cause proven, nothing guessed at.
+
+---
+
+## 2026-09-16 — Phase 5 Part F closes: a shell on the laptop, from its own keyboard
+
+Part G made the screen fast and the first boot's one finding is gone. On the machine: the greeter
+takes a login from the built-in keyboard, `Super+A` opens the applications modal — the chord that
+exists because a `panel` cannot be reached without a pointer — and `nxterm` runs a shell. The
+trackpad works as well, which the plan had put in Phase 6.
+
+**That is the phase's definition of done but for one line**: the machine still boots from a USB
+stick, and "installed on its own disk" is Part H. Everything else it asks for is true — ext4 through
+AHCI (from the RAM disk today, from the internal disk at Part H), a keyboard, a compositor, a
+terminal, and kernel diagnostics on the machine's own screen with no serial cable.
+
+**What the phase's five preparatory parts bought, stated plainly**, because the first boot is the
+only place their value could be observed: the screen carried the log on a machine with no COM1
+(Part B); the stick carried the release root (Part C); every boot said what it found, which is how
+two firmware facts were confirmed and one was falsified in minutes rather than by bisecting (Part
+D); the desktop sized itself to a screen nobody had told it about (Part E); and MSI was already the
+interrupt path the laptop's AHCI needs (Part A). Nothing in the image was changed to make the first
+boot work.

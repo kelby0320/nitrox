@@ -146,6 +146,14 @@ pub fn ap_cpu_init() {
     // precede the first `context_switch` on this CPU, which unconditionally
     // restores the incoming thread's save area.
     super::fpu::init_cpu();
+    // The cache-policy table is per-CPU, so each AP installs the kernel's own (Phase 5 Part G.1).
+    // Silently: the BSP's line already said whether the platform's table matched, and four CPUs
+    // saying the same thing is four lines of a boot log nobody reads.
+    //
+    // SAFETY: ring-0 AP bring-up, before this CPU makes or follows any mapping of its own.
+    let _ = unsafe {
+        <super::memory_types::X86MemoryTypes as crate::arch::memory_types::ArchMemoryTypes>::install_policy()
+    };
     // SAFETY: ring-0 AP bring-up path; the CPU advertises x2APIC (asserted inside
     // `enable_this_cpu`), and this runs before the AP touches the local APIC.
     unsafe { super::apic::enable_this_cpu() };

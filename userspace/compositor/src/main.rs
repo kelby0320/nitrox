@@ -2899,6 +2899,29 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
 pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     kprint(b"compositor: up\n");
 
+    // **The shadow buffer is allocated before the screen changes hands** (PR #306 review,
+    // optional 4). Acquiring `/dev/framebuffer` is what makes the kernel's console stop drawing,
+    // so a refusal after it is a refusal nobody can read: on a machine with no serial port — the
+    // one this is for — the screen would simply stop at `compositor: up`. Reading the geometry
+    // does not take the screen; only `acquire` does.
+    //
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let shadow = match unsafe { libdraw::acquire::read_info(root_ns) }
+        .and_then(|info| libdraw::acquire::geometry_from(&info))
+    {
+        Ok(geometry) => match libdraw::framebuffer::MemFramebuffer::try_new(geometry) {
+            Some(shadow) => shadow,
+            None => {
+                kprint(b"compositor: no memory for a shadow buffer -- cannot serve\n");
+                exit(1);
+            }
+        },
+        Err(_) => {
+            kprint(b"compositor: cannot read the framebuffer's shape -- cannot serve\n");
+            exit(1);
+        }
+    };
+
     // Authority is the binding: a compositor is a process whose namespace has this.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let (aperture, info) = match unsafe { libdraw::acquire::acquire(root_ns) } {
@@ -2911,12 +2934,15 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     let _ = info;
     // **From here on the aperture is unreachable except through `screen`.** Frames are composed
     // in the shadow buffer and copied out, so nothing is ever scanned out half-painted (M13
-    // Part A). Without the buffer everything still works and the flicker returns, so the console
-    // says which it is: a screen that flickers should not be a thing anyone has to guess at.
-    let mut screen = Screen::new(aperture);
-    if !screen.is_buffered() {
-        kprint(b"compositor: no shadow buffer -- compositing straight to the display\n");
-    }
+    // Part A).
+    //
+    // **And without the buffer there is no serving at all** (Phase 5 Part G.4), which is why the
+    // allocation happened above rather than here. Until then this logged a line and carried on:
+    // composing straight into the display cost a flicker, which is worse than a desktop but
+    // better than none. The framebuffer is write-combining since Part G.3, and composing into it
+    // directly reads it back — reads from write-combining memory are uncached, 54 MiB/s on the
+    // laptop, which is not a flicker but a second a frame.
+    let mut screen = Screen::with_shadow(aperture, shadow);
 
     let Some((kernel_end, serve_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
         kprint(b"compositor: channel create FAIL\n");
