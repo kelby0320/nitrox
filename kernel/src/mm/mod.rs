@@ -48,6 +48,27 @@ pub fn demand_fault_count() -> u64 {
 /// allocation.
 pub const PAGE_SIZE: usize = 4096;
 
+/// How a mapping of some memory should be cached (Phase 5 Part G.2).
+///
+/// **A property of the memory, carried by every mapping of it.** A device aperture wants the same
+/// treatment whoever maps it, and two mappings of one aperture that disagree are the aliasing the
+/// vendor's manuals warn about — which is what this system had until Part G: the bootloader mapped
+/// the framebuffer write-combining and every `/dev/framebuffer` mapping asked for write-back, which
+/// the firmware's uncacheable range then overrode. The laptop measured that at 54 MiB/s against
+/// 2924 through the bootloader's mapping of the same pixels.
+///
+/// Only the two cases the system has. Anything finer belongs to the day something needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Caching {
+    /// Ordinary memory: cached, and the page table says nothing about it. Every anonymous and
+    /// file-backed mapping.
+    #[default]
+    Normal,
+    /// Writes gathered into bursts, reads uncached — what a framebuffer wants, and the one case
+    /// where a page table can *raise* a range the firmware calls uncacheable.
+    WriteCombining,
+}
+
 /// `log2(PAGE_SIZE)`. Pre-shifted so frame arithmetic is `addr >> PAGE_SHIFT`.
 pub const PAGE_SHIFT: u32 = 12;
 

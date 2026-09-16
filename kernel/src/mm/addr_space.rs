@@ -57,7 +57,7 @@ use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
+use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{MemoryObject, ObjectRef};
 use crate::libkern::lockrank::LockRank;
 
@@ -222,7 +222,7 @@ impl AddressSpace {
             return Err((boxed, MapError::Overlap));
         }
 
-        let flags = protection_to_page_flags(boxed.prot);
+        let flags = page_flags_for(boxed.prot, boxed.caching);
         let root = guard.root;
         let total_pages = range.pages();
         let mut installed: u64 = 0;
@@ -366,7 +366,7 @@ impl AddressSpace {
             _ => {}
         }
 
-        let flags = protection_to_page_flags(vma.prot);
+        let flags = page_flags_for(vma.prot, vma.caching);
         let kind = vma.mapping;
         let root = guard.root;
         // Round the faulting address down to its page base.
@@ -460,6 +460,9 @@ impl AddressSpace {
         // header is at offset 0); we only read its frame list.
         let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
         let frames = mobj.frames();
+        // **The object decides how its pages are cached**, and the VMA carries the answer so a
+        // page faulted in later maps the way the first one did (Phase 5 Part G.2).
+        let caching = mobj.caching();
         let npages = range.pages();
         debug_assert!(frames.len() as u64 >= npages, "object too small for range");
 
@@ -471,6 +474,7 @@ impl AddressSpace {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
+        boxed.caching = caching;
 
         let mut guard = self.inner.lock();
 
@@ -478,7 +482,7 @@ impl AddressSpace {
             return Err((object, MapError::Overlap));
         }
 
-        let flags = protection_to_page_flags(prot);
+        let flags = page_flags_for(prot, caching);
         let root = guard.root;
         let mut installed: u64 = 0;
 
@@ -612,7 +616,7 @@ impl AddressSpace {
         {
             return false;
         }
-        let flags = protection_to_page_flags(vma.prot);
+        let flags = page_flags_for(vma.prot, vma.caching);
         let root = guard.root;
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
         // SAFETY: `root` is this AS's PML4; `frame` is a live, resident cache frame
@@ -824,21 +828,18 @@ fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
     }
 }
 
-/// Translate the VMA-level [`Protection`] into hardware
+/// Translate the VMA-level [`Protection`] and [`Caching`] into hardware
 /// [`PageFlags`]. `NO_EXECUTE` is inverted because the hardware default
 /// is executable (NX is opt-in), but [`Protection`]'s default is
 /// non-executable (W^X by default).
 ///
-/// **No cache attribute is carried, so every user mapping is write-back** — including
-/// `/dev/framebuffer`, whose aperture is a device window the bootloader maps write-combining.
-/// Write-back has no effect of its own there: the firmware's range registers call that memory
-/// uncacheable and the stronger of the two wins, so these mappings are **uncached**, which the
-/// laptop measured on 2026-09-16 at 54 MiB/s against 2924 through the bootloader's mapping of the
-/// same pixels — 73 ms to fill one screen. A *performance* problem, then, and a large one; the
-/// reordering a write-back mapping of a PCI BAR could cause never arises, because nothing is
-/// cached. `TODO(framebuffer-cache-attr)` — it needs a cache-attribute field on `MemoryObject`
-/// carried to here, and a PAT story (Phase 5 Part G).
-fn protection_to_page_flags(prot: Protection) -> PageFlags {
+/// **The caching comes from the object, through the VMA** (Phase 5 Part G.2), so every mapping of
+/// one aperture asks for the same thing and a page faulted in later cannot forget what the mapping
+/// was made for. Until then this carried no attribute at all, which meant `/dev/framebuffer`
+/// mappings asked for write-back over memory the firmware calls uncacheable — the stronger wins,
+/// so they were uncached, measured on the laptop at 54 MiB/s against 2924 through the bootloader's
+/// write-combining mapping of the same pixels.
+fn page_flags_for(prot: Protection, caching: Caching) -> PageFlags {
     let mut f = PageFlags::empty();
     if prot.contains(Protection::WRITE) {
         f = f | PageFlags::WRITABLE;
@@ -848,6 +849,9 @@ fn protection_to_page_flags(prot: Protection) -> PageFlags {
     }
     if prot.contains(Protection::USER) {
         f = f | PageFlags::USER;
+    }
+    if caching == Caching::WriteCombining {
+        f = f | PageFlags::WRITE_COMBINING;
     }
     f
 }

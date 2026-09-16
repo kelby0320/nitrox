@@ -352,7 +352,7 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// depth other than 32 bits), rather than a zero-sized object a client would map and then
 /// scribble past.
 fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
-    let Some((phys_base, info)) = crate::framebuffer::aperture() else {
+    let Some((phys_base, info, caching)) = crate::framebuffer::aperture() else {
         return OpStatus::Rejected(KError::Unsupported);
     };
 
@@ -363,7 +363,13 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
             // the buddy allocator manages (Limine reports it as framebuffer, not usable
             // RAM), and it stays mapped for the life of the system.
             match unsafe {
-                MemoryObject::try_new_borrowed(phys_base, info.byte_len as usize)
+                MemoryObject::try_new_borrowed(
+                    phys_base,
+                    info.byte_len as usize,
+                    // **What the aperture said it is** (Phase 5 Part G.3), not a second opinion
+                    // about framebuffers: one answer, recorded at boot, reaching every mapping.
+                    caching,
+                )
             } {
                 Ok(obj) => {
                     // **The screen changes hands here**, before the handle exists: the console

@@ -814,7 +814,11 @@ fn record_framebuffer() {
 
     // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
     // reported for this boot, so `address - offset` is the aperture's physical base.
-    if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset()) } {
+    // **The aperture is a framebuffer, so it is write-combining** (Phase 5 Part G.3) — said once,
+    // here, and read by everything that maps it: the `MemoryObject` `/dev/framebuffer` mints, and
+    // the measurement below.
+    let caching = nitrox_kernel::mm::Caching::WriteCombining;
+    if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset(), caching) } {
         // **The padding, as a number** (Phase 5 Part D.1): the bytes each row carries past its
         // last pixel. The laptop's is 40, and a reader should not have to subtract to see it.
         let padding = fb.pitch as i64 - (fb.width * (fb.bpp as u64).div_ceil(8)) as i64;
@@ -852,7 +856,7 @@ fn record_framebuffer() {
 fn report_framebuffer_cost(console_virt: u64) {
     // SAFETY: ring 0, during boot, with the console up.
     unsafe { arch::MemoryTypes::log_configuration() };
-    let Some((phys, info)) = framebuffer::aperture() else { return };
+    let Some((phys, info, caching)) = framebuffer::aperture() else { return };
     // SAFETY: ring 0; reads configuration registers only.
     match unsafe { arch::MemoryTypes::at(phys.as_u64()) } {
         Some(kind) => kprintln!(
@@ -870,12 +874,12 @@ fn report_framebuffer_cost(console_virt: u64) {
         ),
     }
 
-    // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is: writable, with
-    // no cache attribute of its own. `map_mmio` would not do — it forces uncached, which is a
-    // third thing neither mapping is.
+    // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is — which since
+    // G.3 means writable *and* write-combining, because the object says so. `map_mmio` would not
+    // do: it forces uncached, a third thing neither mapping is.
     let bytes = info.pitch as usize * info.height as usize;
     let pages = (bytes as u64).div_ceil(nitrox_kernel::mm::PAGE_SIZE as u64);
-    let plain = plain_mapping(phys, pages);
+    let plain = plain_mapping(phys, pages, caching);
     // SAFETY: `plain`, when mapped, addresses the same framebuffer for the length of the call;
     // the console is the kernel's and no userspace exists yet.
     let measured = unsafe { fbcon::time_full_fills(plain.map(|v| v.as_u64() as *mut u8)) };
@@ -890,7 +894,7 @@ fn report_framebuffer_cost(console_virt: u64) {
     };
     asks("the console's mapping", console_virt);
     if let Some(v) = plain {
-        asks("a plain mapping (what userspace gets)", v.as_u64());
+        asks("a mapping made as userspace's is", v.as_u64());
     }
     if let Some(v) = plain {
         // SAFETY: undoing this function's own mapping of pages nothing else refers to. The vmap
@@ -915,7 +919,7 @@ fn report_framebuffer_cost(console_virt: u64) {
     );
     match f.other_ns {
         Some(ns) => kprintln!(
-            "framebuffer: the same fill took {} us ({} MiB/s) through a plain write-back mapping, as userspace gets",
+            "framebuffer: the same fill took {} us ({} MiB/s) through a mapping made as userspace's is",
             ns / 1000,
             rate(ns)
         ),
@@ -923,12 +927,22 @@ fn report_framebuffer_cost(console_virt: u64) {
     }
 }
 
-/// Map `pages` of the framebuffer at `phys` with no cache attribute — the flags
-/// `protection_to_page_flags` gives a `/dev/framebuffer` mapping. `None` if the vmap or the page
-/// tables refuse, which costs the comparison and nothing else.
-fn plain_mapping(phys: nitrox_kernel::mm::PhysAddr, pages: u64) -> Option<nitrox_kernel::mm::VirtAddr> {
+/// Map `pages` of the framebuffer at `phys` with the flags a `/dev/framebuffer` mapping gets —
+/// which is what makes the second timing worth having: it is not a model of userspace's mapping,
+/// it is one. `None` if the vmap or the page tables refuse, which costs the comparison and
+/// nothing else.
+fn plain_mapping(
+    phys: nitrox_kernel::mm::PhysAddr,
+    pages: u64,
+    caching: nitrox_kernel::mm::Caching,
+) -> Option<nitrox_kernel::mm::VirtAddr> {
     use nitrox_kernel::arch::paging::PageFlags;
-    use nitrox_kernel::mm::{PhysAddr, VirtAddr, kvmap};
+    use nitrox_kernel::mm::{Caching, PhysAddr, VirtAddr, kvmap};
+    // The flags a `/dev/framebuffer` mapping gets, from the same answer that gives them to it.
+    let mut flags = PageFlags::WRITABLE;
+    if caching == Caching::WriteCombining {
+        flags = flags | PageFlags::WRITE_COMBINING;
+    }
     let base = kvmap::vmap_alloc_pages(pages).ok()?;
     let root = arch::Paging::active_root();
     for i in 0..pages {
@@ -937,7 +951,7 @@ fn plain_mapping(phys: nitrox_kernel::mm::PhysAddr, pages: u64) -> Option<nitrox
         // SAFETY: `v` is a fresh vmap page in the shared kernel half; `p` is a frame of the
         // framebuffer aperture this kernel already maps; the flags are the ones a user mapping of
         // it gets.
-        unsafe { arch::Paging::map_page(root, v, p, PageFlags::WRITABLE).ok()? };
+        unsafe { arch::Paging::map_page(root, v, p, flags).ok()? };
         // SAFETY: `v`'s entry has just changed.
         unsafe { arch::Paging::flush_tlb_page(v) };
     }

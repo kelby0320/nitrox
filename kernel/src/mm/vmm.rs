@@ -294,6 +294,9 @@ pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
     pub mapping: MappingKind,
+    /// How this mapping's pages are cached — the backing object's answer, taken when the VMA is
+    /// made so that faulting a page in later cannot forget it.
+    pub caching: crate::mm::Caching,
     /// `Some(_)` iff `mapping == MappingKind::Object`: the owning reference to
     /// the backing [`MemoryObject`](crate::object::MemoryObject), held so its
     /// frames outlive this mapping. Dropped when the VMA is freed (unmap or
@@ -309,6 +312,7 @@ impl Vma {
             range,
             prot,
             mapping,
+            caching: crate::mm::Caching::Normal,
             object: None,
             link: RbLink::new(range.end()),
         }
@@ -316,11 +320,17 @@ impl Vma {
 
     /// Construct an object-backed VMA holding `object` alive for its lifetime.
     /// Not `const` because it stores a (non-`const`) [`ObjectRef`].
-    pub fn new_object(range: VAddrRange, prot: Protection, object: ObjectRef) -> Self {
+    pub fn new_object(
+        range: VAddrRange,
+        prot: Protection,
+        object: ObjectRef,
+        caching: crate::mm::Caching,
+    ) -> Self {
         Self {
             range,
             prot,
             mapping: MappingKind::Object,
+            caching,
             object: Some(object),
             link: RbLink::new(range.end()),
         }

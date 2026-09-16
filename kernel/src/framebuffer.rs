@@ -10,7 +10,7 @@ use crate::libkern::framebuffer::FramebufferInfo;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::spinlock::IrqSpinLock;
 use crate::limine::Framebuffer;
-use crate::mm::PhysAddr;
+use crate::mm::{Caching, PhysAddr};
 
 /// The system framebuffer's physical extent and pixel layout, captured once at boot.
 ///
@@ -27,6 +27,14 @@ pub struct FramebufferAperture {
     pub phys_base: PhysAddr,
     /// Geometry and channel layout, in the shape userspace receives.
     pub info: FramebufferInfo,
+    /// How every mapping of it is cached (Phase 5 Part G.3).
+    ///
+    /// **Recorded here because two things need the same answer**: the `MemoryObject` minted when
+    /// something resolves `/dev/framebuffer`, and the boot's own measurement, which maps the
+    /// aperture the way userspace's mapping is made and times a fill through it. A measurement
+    /// that named its flags itself would go on saying "as userspace's is" after userspace's
+    /// stopped being that — which is exactly what it did until a control caught it.
+    pub caching: Caching,
 }
 
 /// The captured aperture, or `None` if no usable framebuffer was reported.
@@ -46,7 +54,7 @@ static APERTURE: IrqSpinLock<Option<FramebufferAperture>> =
 ///
 /// `fb` must be Limine's live framebuffer descriptor, and `hhdm_offset` the offset
 /// Limine reported, so that `address - hhdm_offset` is the aperture's physical base.
-pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64) -> bool {
+pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64, caching: Caching) -> bool {
     if fb.bpp != 32 {
         return false;
     }
@@ -69,11 +77,15 @@ pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64) -> bool {
         blue_shift: fb.blue_mask_shift,
         blue_size: fb.blue_mask_size,
     };
-    *APERTURE.lock() = Some(FramebufferAperture { phys_base: PhysAddr::new(virt - hhdm_offset), info });
+    *APERTURE.lock() = Some(FramebufferAperture {
+        phys_base: PhysAddr::new(virt - hhdm_offset),
+        info,
+        caching,
+    });
     true
 }
 
-/// The captured aperture's physical base and geometry, if one was recorded.
-pub fn aperture() -> Option<(PhysAddr, FramebufferInfo)> {
-    APERTURE.lock().as_ref().map(|a| (a.phys_base, a.info))
+/// The captured aperture's physical base, geometry and caching, if one was recorded.
+pub fn aperture() -> Option<(PhysAddr, FramebufferInfo, Caching)> {
+    APERTURE.lock().as_ref().map(|a| (a.phys_base, a.info, a.caching))
 }

@@ -28,6 +28,7 @@ pub struct PageFlags(u32);
 impl PageFlags {
     /// The page may be written. Without it the mapping is read-only.
     pub const WRITABLE: PageFlags = PageFlags(1 << 0);
+
     /// The page is reachable from ring 3. Without it it is kernel-only.
     pub const USER: PageFlags = PageFlags(1 << 1);
     /// Instruction fetches from the page fault — set this for data pages.
@@ -38,6 +39,13 @@ impl PageFlags {
     pub const NO_CACHE: PageFlags = PageFlags(1 << 4);
     /// Writes go straight through the cache instead of being written back.
     pub const WRITE_THROUGH: PageFlags = PageFlags(1 << 5);
+    /// Writes gathered into bursts, reads uncached: what a framebuffer wants, and the one
+    /// attribute that *raises* a range the firmware calls uncacheable (Phase 5 Part G.2).
+    ///
+    /// Not combined with [`NO_CACHE`](PageFlags::NO_CACHE) or
+    /// [`WRITE_THROUGH`](PageFlags::WRITE_THROUGH) — each names a whole answer, and a mapping
+    /// asking for two would select an entry neither meant.
+    pub const WRITE_COMBINING: PageFlags = PageFlags(1 << 6);
 
     /// No flags: a read-only, kernel-only, executable mapping.
     pub const fn empty() -> Self {

@@ -126,6 +126,11 @@ fn flags_to_pte_bits(flags: PageFlags) -> u64 {
     if flags.contains(PageFlags::WRITE_THROUGH) {
         bits |= PTE_PWT;
     }
+    // **Entry 5 of the table this kernel programs** (`KERNEL_PAT`): `PAT` and `PWT`, no `PCD`.
+    // The entry is named there, not here — this is the bit pattern that selects it.
+    if flags.contains(PageFlags::WRITE_COMBINING) {
+        bits |= PTE_PAT | PTE_PWT;
+    }
     bits
 }
 

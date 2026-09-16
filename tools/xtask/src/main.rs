@@ -8883,12 +8883,15 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
     // QEMU agrees with the hardware about. The bootloader maps the framebuffer write-combining;
     // a mapping this kernel makes asks for write-back, which an uncacheable range overrides.
-    &["framebuffer: the console's mapping asks for "],
-    &["framebuffer: a plain mapping (what userspace gets) asks for "],
+
+    // **The two mappings agree since Part G.3**, which is the fix in one line: the aperture's
+    // object says write-combining, so every mapping of it asks for that, the bootloader's included.
+    &["framebuffer: the console's mapping asks for write-combining"],
+    &["framebuffer: a mapping made as userspace's is asks for write-combining"],
     &["framebuffer: a full-screen fill of ", "KiB took ", "through the console's mapping"],
     // The pair is the point: same loop, same pixels, two page-table entries. A boot that lost the
     // second line would leave the comparison looking like one number nobody could interpret.
-    &["framebuffer: the same fill took ", "through a plain write-back mapping"],
+    &["framebuffer: the same fill took ", "through a mapping made as userspace's is"],
 ];
 
 /// The facts in `wanted` that no single line of `lines` carries every fragment of, each joined
