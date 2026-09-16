@@ -4475,6 +4475,12 @@ fn read_block_sector0(root_ns: u64, path: &[u8]) -> i32 {
 /// name. Each verifies the `0x55AA` boot signature.
 fn block_demo(root_ns: u64) {
     kprint(b"test-harness: /dev/blk demo start\n");
+    // **What each device is** (Phase 5 Part H.1), before reading either: an index says nothing,
+    // and this registry holds a disk, the partitions found on it and any module RAM disk. The
+    // installer refuses to write anything that is not a `disk`, so the facts it will decide on are
+    // asserted here, where a boot can check them.
+    report_block_info(root_ns, b"/dev/blk/0/info", b"test-harness: /dev/blk/0");
+    report_block_info(root_ns, b"/dev/blk/1/info", b"test-harness: /dev/blk/1");
     report_block_read(root_ns, b"/dev/blk/0", b"test-harness: /dev/blk/0 (disk) read");
     report_block_read(root_ns, b"/dev/blk/1", b"test-harness: /dev/blk/1 (partition) read");
     report_block_read(
@@ -4482,6 +4488,54 @@ fn block_demo(root_ns: u64) {
         b"/dev/disk/by-partlabel/NITROX_ESP",
         b"test-harness: /dev/disk/by-partlabel/NITROX_ESP read",
     );
+}
+
+/// Read one device's `info` leaf and log what it says: kind, capacity and name.
+///
+/// **The capacity is taken from `sys_handle_stat` as well**, because the two must agree — the
+/// installer sizes a partition table from the handle's `size` and refuses a device by its `kind`,
+/// and a disagreement between them would be a layout bug nothing else would notice.
+fn report_block_info(root_ns: u64, path: &[u8], label: &[u8]) {
+    let (st, mem) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        kprint(label);
+        kprint(b" info FAIL (no leaf)\n");
+        return;
+    }
+    let len = core::mem::size_of::<libkern::abi::BlockDeviceInfo>();
+    // SAFETY: the leaf is a read-only object holding one record, and `len` is its size.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, len as u64, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(label);
+        kprint(b" info FAIL (unmappable)\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return;
+    }
+    // SAFETY: `addr` maps `len` readable bytes the kernel filled with one record.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+    match libkern::abi::BlockDeviceInfo::read(bytes) {
+        Some(info) => {
+            let mut line = Line::new();
+            line.s(label)
+                .s(b" is a ")
+                .s(info.kind().name().as_bytes())
+                .s(b", ")
+                .u(info.byte_capacity() / (1024 * 1024))
+                .s(b" MiB, named ")
+                .untrusted(info.name())
+                .end();
+        }
+        None => {
+            kprint(label);
+            kprint(b" info FAIL (short record)\n");
+        }
+    }
+    // SAFETY: our own mapping and handle; nothing else refers to either.
+    unsafe {
+        syscall3(SYS_MEMORY_UNMAP, addr as u64, len as u64, 0);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
 }
 
 /// Read+verify one block path and log the outcome under `label`.

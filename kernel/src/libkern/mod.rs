@@ -19,6 +19,7 @@
 
 pub mod chacha;
 pub mod clock;
+pub mod block;
 pub mod framebuffer;
 pub mod handle;
 pub mod input;

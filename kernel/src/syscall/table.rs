@@ -962,7 +962,13 @@ fn stat_on(t: &HandleTable, h: RawHandle, pid: u32) -> Result<HandleInfo, KError
 }
 
 /// The byte size reported in `HandleInfo.size` for a sized resource, else `0`. A
-/// `MemoryObject`'s page-rounded size; a `FileObject`'s exact file size.
+/// `MemoryObject`'s page-rounded size; a `FileObject`'s exact file size; a block
+/// `DeviceNode`'s capacity.
+///
+/// **A disk's capacity is a size like the others** (Phase 5 Part H.1), and until it was reported
+/// here nothing in userspace could learn how big a disk is — which an installer needs before it
+/// can lay out a partition table. A non-block device node has a zeroed geometry and so reports
+/// `0`, as everything unsized does.
 fn object_byte_size(ty: KObjectType, obj: &ObjectRef) -> u64 {
     match ty {
         // SAFETY: `obj` pins a live object of the matched type.
@@ -970,6 +976,10 @@ fn object_byte_size(ty: KObjectType, obj: &ObjectRef) -> u64 {
             unsafe { &*(obj.as_ptr() as *const MemoryObject) }.size() as u64
         }
         KObjectType::FileObject => unsafe { &*(obj.as_ptr() as *const FileObject) }.size() as u64,
+        // SAFETY: as above.
+        KObjectType::DeviceNode => {
+            unsafe { &*(obj.as_ptr() as *const DeviceNode) }.block_info().byte_capacity()
+        }
         _ => 0,
     }
 }

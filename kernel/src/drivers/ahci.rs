@@ -16,6 +16,8 @@
 //! MSI-X are deferred (`docs/rationale/deferred-decisions.md`).
 //! See `docs/architecture/drivers-and-irps.md`.
 
+use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
+use crate::libkern::printable::Printable;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::device::{Outcome, Signal};
@@ -367,7 +369,8 @@ pub fn init(controller: &ObjectRef) -> Outcome {
 
     // IDENTIFY the disk (polled — bring-up runs with interrupts masked).
     // SAFETY: `disk` is the just-published live state.
-    let sectors = match unsafe { identify(&mut *disk) } {
+    let mut name = [0u8; MAX_DEVICE_NAME];
+    let (sectors, name_len) = match unsafe { identify(&mut *disk, &mut name) } {
         Some(s) => s,
         None => {
             crate::kprintln!("ahci: IDENTIFY failed on port {}", port);
@@ -377,10 +380,13 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     // SAFETY: exclusive at bring-up (no IRQ, no other CPU).
     unsafe { (*disk).sectors = sectors };
     crate::kprintln!(
-        "ahci: port {} disk ready ({} sectors, {} MiB)",
+        "ahci: port {} disk ready ({} sectors, {} MiB): {}",
         port,
         sectors,
-        sectors * SECTOR_SIZE as u64 / (1024 * 1024)
+        sectors * SECTOR_SIZE as u64 / (1024 * 1024),
+        // The model is a fact about the machine, so it belongs in the report every boot logs
+        // (Part D) as much as in the info a program reads.
+        Printable(&name[..name_len])
     );
 
     // Prefer MSI: the device is told a vector and raises the interrupt itself,
@@ -440,7 +446,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
     write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
 
-    if publish_disk(controller, sectors, disk) {
+    if publish_disk(controller, sectors, &name[..name_len], disk) {
         Outcome::Claimed { driver: DRIVER, signal }
     } else {
         declined("the disk's device node could not be allocated")
@@ -499,7 +505,7 @@ fn wait_clear(pb: u64, off: u64, mask: u32) {
 ///
 /// # Safety
 /// `disk` is the live, brought-up disk state; called at bring-up with no IRQ.
-unsafe fn identify(disk: &mut AhciDisk) -> Option<u64> {
+unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize)> {
     let data = DmaBuffer::alloc(SECTOR_SIZE as usize).ok()?;
     let frags = [PhysFrag {
         base: data.phys().as_u64(),
@@ -519,8 +525,60 @@ unsafe fn identify(disk: &mut AhciDisk) -> Option<u64> {
             | (words.add(102).read() as u64) << 32
             | (words.add(103).read() as u64) << 48
     };
+    // **The model and serial, which this read already has** (Phase 5 Part H.1). Words 10..=19 are
+    // the serial and 27..=46 the model, ASCII in **byte-swapped pairs** — the wire order of the
+    // old 16-bit register interface, kept for compatibility ever since. A person about to lose a
+    // disk's contents confirms it by this string, so it is worth the twenty lines.
+    // SAFETY: as above; words 10..=46 are inside the 512-byte result.
+    let len = unsafe { format_identity(words, name) };
     // `data` drops here (IDENTIFY is one-shot); the command is complete.
-    if n == 0 { None } else { Some(n) }
+    if n == 0 { None } else { Some((n, len)) }
+}
+
+/// Write `model (serial)` from an IDENTIFY result into `out`, returning its length.
+///
+/// # Safety
+/// `words` must address a complete 512-byte IDENTIFY result.
+unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) -> usize {
+    // SAFETY: forwarded from the caller's contract.
+    let field = |first: usize, words_len: usize, dst: &mut [u8]| -> usize {
+        let mut n = 0;
+        for i in 0..words_len {
+            // SAFETY: `first + i` is within the 256-word result, per the caller's contract.
+            let w = unsafe { words.add(first + i).read() };
+            for b in [(w >> 8) as u8, w as u8] {
+                if n < dst.len() {
+                    dst[n] = if b.is_ascii_graphic() || b == b' ' { b } else { b'?' };
+                    n += 1;
+                }
+            }
+        }
+        // ATA pads with spaces to the field width.
+        while n > 0 && dst[n - 1] == b' ' {
+            n -= 1;
+        }
+        n
+    };
+    let mut model = [0u8; 40];
+    let mut serial = [0u8; 20];
+    let m = field(27, 20, &mut model);
+    let s = field(10, 10, &mut serial);
+    let mut n = 0;
+    let mut push = |bytes: &[u8], out: &mut [u8; MAX_DEVICE_NAME], n: &mut usize| {
+        for &b in bytes {
+            if *n < MAX_DEVICE_NAME {
+                out[*n] = b;
+                *n += 1;
+            }
+        }
+    };
+    push(&model[..m], out, &mut n);
+    if s > 0 {
+        push(b" (", out, &mut n);
+        push(&serial[..s], out, &mut n);
+        push(b")", out, &mut n);
+    }
+    n
 }
 
 /// Fill slot 0's command header + table for an ATA command transferring the
@@ -607,7 +665,7 @@ fn wait_command_polled(disk: &AhciDisk) -> bool {
 }
 
 /// Publish the disk as a block `DeviceNode` in the device table.
-fn publish_disk(controller: &ObjectRef, sectors: u64, disk: *mut AhciDisk) -> bool {
+fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut AhciDisk) -> bool {
     // SAFETY: `controller` pins a live `DeviceNode`.
     let cdesc = unsafe { &*(controller.as_ptr() as *const DeviceNode) }.descriptor();
     let backend = BlockBackend {
@@ -638,7 +696,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, disk: *mut AhciDisk) -> bo
         func: cdesc.func,
         _pad: [0; 3],
     };
-    match DeviceNode::try_new_block(descriptor, geometry, backend) {
+    match DeviceNode::try_new_block(descriptor, geometry, BlockKind::Disk, name, backend) {
         Ok(node) => {
             // SAFETY: adopt the creation reference into the device table.
             let r = unsafe {

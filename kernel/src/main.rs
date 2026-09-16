@@ -1267,9 +1267,17 @@ fn run_first_userspace() {
     // **unconditionally**: the device-table registry carries liveness, so a
     // lookup of `/dev/blk/0` is `NotFound` if no disk was discovered, harmless.
     // The binding grants `READ` + `WRITE` (the RW fs-server writes filesystem metadata via
-    // `sys_io_submit` writes; the Model A data path is the kernel's) plus the generic band.
-    let block_binding_rights =
-        Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    // `sys_io_submit` writes; the Model A data path is the kernel's) plus the generic band, and
+    // **`MAP_READ` for the `<n>/info` leaf** (Phase 5 Part H.1): that leaf answers with a
+    // read-only `MemoryObject`, and a lookup attenuates to the binding's rights, so without this
+    // the record resolves and cannot be read. `MAP_READ` on a `DeviceNode` means nothing — a
+    // device is not mappable — so this widens only what the leaf serves.
+    let block_binding_rights = Rights::READ
+        | Rights::WRITE
+        | Rights::MAP_READ
+        | Rights::DUPLICATE
+        | Rights::INSPECT
+        | Rights::TRANSFER;
     if ns
         .bind_kernel_server(b"/dev/blk", KernelServerId::BlockDevice, block_binding_rights)
         .is_err()

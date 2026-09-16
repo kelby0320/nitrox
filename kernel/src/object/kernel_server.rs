@@ -20,6 +20,7 @@
 
 use crate::libkern::KBox;
 use crate::libkern::handle::{KObjectType, Rights};
+use crate::object::DeviceNode;
 use crate::object::EntropyObject;
 use crate::object::MemoryObject;
 use crate::object::ObjectRef;
@@ -273,12 +274,28 @@ fn initramfs_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// `requested` is accepted to match the RS contract but ignored — the binding's
 /// rights cap what the caller obtains, applied by the lookup syscall.
 fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
-    let Some(index) = parse_index(suffix) else {
+    // **`<n>/info` says what `<n>` is** (Phase 5 Part H.1), the shape `/dev/framebuffer/info`
+    // already uses: one `BlockDeviceInfo`, copied into a fresh read-only object. Without it a
+    // program choosing a device knows only an index, and this registry holds whole disks, the
+    // partitions found on them and memory published as a disk.
+    let (index_bytes, want_info) = match suffix.strip_suffix(b"/info") {
+        Some(head) => (head, true),
+        None => (suffix, false),
+    };
+    let Some(index) = parse_index(index_bytes) else {
         return OpStatus::Rejected(KError::NotFound);
     };
-    match crate::device::find_block_device(index) {
-        Some(node) => OpStatus::Completed(node),
-        None => OpStatus::Rejected(KError::NotFound),
+    let Some(node) = crate::device::find_block_device(index) else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    if !want_info {
+        return OpStatus::Completed(node);
+    }
+    // SAFETY: `find_block_device` returns a live `DeviceNode` reference.
+    let info = unsafe { &*(node.as_ptr() as *const DeviceNode) }.block_info();
+    match MemoryObject::try_new_filled(info.as_bytes()) {
+        Ok(obj) => complete_with_memobj(obj),
+        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }
 }
 

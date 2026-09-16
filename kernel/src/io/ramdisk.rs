@@ -44,6 +44,7 @@ use crate::arch::irq::ArchIrq;
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpOp, IrpStatus, PhysFrag};
+use crate::libkern::block::{BlockKind, NameBuf, MAX_DEVICE_NAME};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, KBox, KVec};
@@ -232,7 +233,7 @@ fn ramdisk_poll(_ctx: *mut ()) {
 ///
 /// The first call installs the completion vector. Boot-time only — two first calls racing would
 /// each take a vector.
-pub fn try_new_device(rd: &'static RamDisk) -> Result<KBox<DeviceNode>, AllocError> {
+pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNode>, AllocError> {
     if COMPLETION_VECTOR.load(Ordering::Acquire) == 0 {
         // SAFETY: ring 0 at boot, after the interrupt table; the handler is a `'static` fn.
         let vector = unsafe { crate::arch::IrqInstall::install_software(ramdisk_completion_isr) };
@@ -269,7 +270,9 @@ pub fn try_new_device(rd: &'static RamDisk) -> Result<KBox<DeviceNode>, AllocErr
         func: 0,
         _pad: [0; 3],
     };
-    DeviceNode::try_new_block(descriptor, geometry, backend)
+    // **A RAM disk says so** (Phase 5 Part H.1): it is memory, it disappears at power-off, and an
+    // installer that wrote to one would install onto something that will not be there.
+    DeviceNode::try_new_block(descriptor, geometry, BlockKind::RamDisk, name, backend)
 }
 
 // --- Limine modules as disks --------------------------------------------------------------
@@ -329,7 +332,11 @@ pub fn publish_modules() {
                 continue;
             }
         };
-        let node = match try_new_device(rd) {
+        let mut name = [0u8; MAX_DEVICE_NAME];
+        let mut w = NameBuf::new(&mut name);
+        let _ = core::fmt::Write::write_fmt(&mut w, format_args!("module {} ({})", disk.index, path));
+        let name_len = w.len();
+        let node = match try_new_device(rd, &name[..name_len]) {
             Ok(n) => n,
             Err(_) => {
                 crate::kprintln!("ramdisk: module {} ({}): out of memory", disk.index, path);

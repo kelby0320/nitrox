@@ -426,6 +426,120 @@ const _: () = assert!(offset_of!(HandleInfo, generation) == 12);
 /// does not compare `#[repr(C)]` layouts — the asserts are the stronger check, and they
 /// fail at build time rather than in a separate pass.
 ///
+/// What a block device is, mirroring `kernel/src/libkern/block.rs` byte for byte.
+///
+/// Read from `/dev/blk/<n>/info`, the shape `/dev/framebuffer/info` already uses. A program that
+/// is about to write a partition table needs all three facts: **what** the device is (this
+/// registry holds whole disks, their partitions and memory published as a disk), how big it is,
+/// and what to call it so a person can confirm the one they mean.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlockDeviceInfo {
+    /// A [`BlockKind`] discriminant; anything unrecognised is [`BlockKind::Unknown`].
+    pub kind: u32,
+    /// Bytes per logical block — 512 or 4096.
+    pub logical_block_size: u32,
+    /// Total addressable logical blocks.
+    pub block_count: u64,
+    /// Bytes of [`name`](Self::name) that are meaningful.
+    pub name_len: u32,
+    /// Reserved; zero.
+    pub _reserved: u32,
+    /// The device's name: a disk's model and serial, a partition's label, a module's path.
+    pub name: [u8; MAX_DEVICE_NAME],
+}
+
+/// Longest device name served, in bytes. See `kernel/src/libkern/block.rs`.
+pub const MAX_DEVICE_NAME: usize = 72;
+
+const _: () = assert!(core::mem::size_of::<BlockDeviceInfo>() == 96);
+const _: () = assert!(core::mem::align_of::<BlockDeviceInfo>() == 8);
+const _: () = assert!(offset_of!(BlockDeviceInfo, kind) == 0);
+const _: () = assert!(offset_of!(BlockDeviceInfo, logical_block_size) == 4);
+const _: () = assert!(offset_of!(BlockDeviceInfo, block_count) == 8);
+const _: () = assert!(offset_of!(BlockDeviceInfo, name_len) == 16);
+const _: () = assert!(offset_of!(BlockDeviceInfo, _reserved) == 20);
+const _: () = assert!(offset_of!(BlockDeviceInfo, name) == 24);
+
+impl Default for BlockDeviceInfo {
+    fn default() -> Self {
+        Self {
+            kind: BlockKind::Unknown as u32,
+            logical_block_size: 0,
+            block_count: 0,
+            name_len: 0,
+            _reserved: 0,
+            name: [0; MAX_DEVICE_NAME],
+        }
+    }
+}
+
+impl BlockDeviceInfo {
+    /// What kind of device this is. **An unrecognised discriminant reads as
+    /// [`BlockKind::Unknown`]**, which is what a caller that refuses what it does not understand
+    /// wants: a newer kernel naming a fourth kind must not have it mistaken for a disk.
+    pub fn kind(&self) -> BlockKind {
+        match self.kind {
+            1 => BlockKind::Disk,
+            2 => BlockKind::Partition,
+            3 => BlockKind::RamDisk,
+            _ => BlockKind::Unknown,
+        }
+    }
+
+    /// The name, as the bytes that are meaningful.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(MAX_DEVICE_NAME)]
+    }
+
+    /// Capacity in bytes — the same number `sys_handle_stat` reports for the device's handle.
+    pub fn byte_capacity(&self) -> u64 {
+        self.block_count.saturating_mul(self.logical_block_size as u64)
+    }
+
+    /// Read one out of the bytes `/dev/blk/<n>/info` maps. `None` if there are too few.
+    pub fn read(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < core::mem::size_of::<Self>() {
+            return None;
+        }
+        let mut info = Self::default();
+        let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        info.kind = u32_at(0);
+        info.logical_block_size = u32_at(4);
+        info.block_count = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        info.name_len = u32_at(16).min(MAX_DEVICE_NAME as u32);
+        info.name.copy_from_slice(&bytes[24..24 + MAX_DEVICE_NAME]);
+        Some(info)
+    }
+}
+
+/// What kind of block device a node is; mirrors `kernel/src/libkern/block.rs`.
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BlockKind {
+    /// A driver claimed it but said nothing about what it is.
+    #[default]
+    Unknown = 0,
+    /// A whole disk — the thing a partition table goes on.
+    Disk = 1,
+    /// One partition of a disk.
+    Partition = 2,
+    /// Memory published as a disk: a bootloader module.
+    RamDisk = 3,
+}
+
+impl BlockKind {
+    /// A word for a message or a disk list.
+    pub const fn name(self) -> &'static str {
+        match self {
+            BlockKind::Unknown => "unknown",
+            BlockKind::Disk => "disk",
+            BlockKind::Partition => "partition",
+            BlockKind::RamDisk => "ram disk",
+        }
+    }
+}
+
 /// **Channel layout is reported, not assumed.** Firmware does not always choose
 /// `0x00RRGGBB`; a client that hardcodes it renders channel-swapped output on hardware
 /// that reports BGR.

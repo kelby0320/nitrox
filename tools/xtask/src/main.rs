@@ -8879,6 +8879,13 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // every `kvmap` MMIO mapping — chose its entry out of a different one. A bootloader that
     // changes its table fails here rather than silently changing what a live mapping means.
     &["cache policy: the kernel's table is installed; the bootloader's was the same"],
+    // **What each block device says it is** (Phase 5 Part H.1). The installer refuses to write
+    // anything that is not a `disk`, and this registry holds whole disks, the partitions found on
+    // them and memory published as a disk — so a partition that called itself a disk would be a
+    // partition table written over a filesystem. The capacity and the name are asserted with it:
+    // they are what a person confirms a destructive operation by.
+    &["test-harness: /dev/blk/0 is a disk, 128 MiB, named QEMU HARDDISK"],
+    &["test-harness: /dev/blk/1 is a partition, 48 MiB, named NITROX_ESP"],
     &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
     // QEMU agrees with the hardware about. Both ask for write-combining since Part G; before it,

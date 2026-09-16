@@ -14,6 +14,7 @@
 //! CRC validation is deferred (the signature + sane bounds are checked).
 
 use crate::io::block::{Partition, partition_backend, read_blocking};
+use crate::libkern::block::{BlockKind, NameBuf, MAX_DEVICE_NAME};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{KBox, KVec, Rights, SpinLock};
 use crate::object::device_node::{
@@ -124,7 +125,37 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
         logical_block_size: SECTOR as u32,
         block_count: count,
     };
-    let node = match DeviceNode::try_new_block(descriptor, geometry, backend) {
+    let by_partlabel = decode_partlabel(&e[56..128]);
+    // **A partition's name is its label** — what `init.toml` selects it by, and what a person
+    // reading a disk list recognises. An unlabelled one says which slice of which disk it is,
+    // because "partition" alone is not something you can confirm before destroying it.
+    let mut name = [0u8; MAX_DEVICE_NAME];
+    let name_len = match by_partlabel.as_ref() {
+        // `decode_partlabel` returns the whole `/dev/disk/by-partlabel/<label>` path, because that
+        // is what it is for. A device's name is the label itself: a person confirming a partition
+        // reads `nitrox-root`, not a path they cannot type anywhere.
+        Some(path) => {
+            let label = path.strip_prefix(PARTLABEL_PREFIX).unwrap_or(&path[..]);
+            let n = label.len().min(MAX_DEVICE_NAME);
+            name[..n].copy_from_slice(&label[..n]);
+            n
+        }
+        None => {
+            let mut w = NameBuf::new(&mut name);
+            let _ = core::fmt::Write::write_fmt(
+                &mut w,
+                format_args!("partition {} (unlabelled)", index),
+            );
+            w.len()
+        }
+    };
+    let node = match DeviceNode::try_new_block(
+        descriptor,
+        geometry,
+        BlockKind::Partition,
+        &name[..name_len],
+        backend,
+    ) {
         Ok(n) => n,
         Err(_) => return false,
     };
@@ -134,7 +165,6 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
     };
 
     let by_partuuid = format_partuuid(&e[16..32]);
-    let by_partlabel = decode_partlabel(&e[56..128]);
     // **The label, by name.** A partition is found by its label (`init.toml`'s
     // `gpt-partlabel:`), and until Phase 5 Part C no line said which labels a disk carried — so a
     // live boot could not show it had found `nitrox-live`, and the laptop's hardware report could
