@@ -26213,3 +26213,43 @@ two firmware facts were confirmed and one was falsified in minutes rather than b
 D); the desktop sized itself to a screen nobody had told it about (Part E); and MSI was already the
 interrupt path the laptop's AHCI needs (Part A). Nothing in the image was changed to make the first
 boot work.
+
+---
+
+## 2026-09-16 — Part H's detail pass: the installer is mostly code we already have
+
+Written after a spike rather than a guess, because the part *sounds* like three filesystem writers
+and turns out to need one.
+
+**What the spike found.** `/dev/blk/<n>` already grants `READ | WRITE` on a whole disk, so nothing
+in the kernel stands between a program and a partition table. The `fs-server-ext4` library is pure
+logic over `BlockReader`/`BlockWriter` and already creates files, makes directories and grows
+extents — so an installer **links it** and writes into the target filesystem with no mount, no
+second server, and no runtime-mount machinery, which was the piece I expected to cost the most.
+`e2fsprogs` is already a host dev dependency, so `e2fsck` can judge anything we write. Two things
+are missing and both are small: a disk will not say how big it is
+(`object_byte_size` answers for memory and file objects and returns `0` for a device node, in the
+function whose doc says object-aware size logic belongs there), and there is no CRC32 in the tree.
+
+**The calls** (maintainer, 2026-09-16):
+
+- **A Nitrox program, not an `xtask`** — the open question this part carried since 2026-09-10,
+  settled towards self-hosting *because the spike made it cheap*. `nxinstall /dev/blk/1`, typed at
+  the shell the live desktop already provides.
+- **The ESP is shipped, not formatted.** A prebuilt FAT32 image rides along as another Limine
+  module and is copied in as raw sectors. Writing FAT32 would be the second-hardest thing in the
+  part and buys nothing: the host already builds ESPs, and UEFI's removable-media path means there
+  is no bootloader to install.
+- **The root filesystem is the one thing we write** — and not in the first slice. H.1 raw-copies
+  the image's root to prove partitioning and booting from the internal disk; H.2 replaces that with
+  `mkfs.ext4` sized to the disk. The copy loop it throws away is thirty lines and is the same loop
+  the ESP needs.
+- **`check-install` runs on demand**, like `check-resolutions`. It is two boots — install, then
+  boot the disk that was written — and the installer changes rarely once it works.
+- **The installed root is labelled `nitrox-root` and the live one stays `nitrox-live`**, so a
+  machine with the stick still in it cannot mount the wrong root. The labels come from the GPT the
+  installer writes, not from the bytes it copies.
+
+**What is deliberately not in it**: dual boot, shrinking, free-space probing (the whole disk is
+taken), an NVRAM boot entry (needs runtime services this kernel does not call), a journal (nothing
+here reads one), and resizing (H.2 makes the filesystem the right size instead).

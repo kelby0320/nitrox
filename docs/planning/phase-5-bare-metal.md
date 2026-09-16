@@ -1092,7 +1092,7 @@ firmware.
 memory type for it — the ground Part G stands on. The machine also carries an Atheros QCA9377
 (Phase 8) and a `DMAR` table, so it has VT-d if an IOMMU is ever wanted.
 
-## Part G — framebuffer cache attributes ⬜
+## Part G — framebuffer cache attributes ✅
 
 - [x] **The measurement first** (2026-09-15): every boot logs the platform's cache policy, the
       memory type of the framebuffer's own address, and a timed full-screen fill, so the fix is
@@ -1206,10 +1206,104 @@ The machine is a test machine and its Debian install has no value (maintainer, 2
 this **takes the whole disk** — no shrinking, no dual boot, no probing for free space. That
 removes the hardest part of writing an installer.
 
-Open question for when we get here: whether the installer is a Nitrox program run from the live
-image (self-hosting, and the better story) or an `xtask` that writes a stick from the
-development machine (much less work). The live image makes the second sufficient, so the first
-is not on the critical path.
+### The spike: what already exists, and the one thing missing *(2026-09-16)*
+
+The open question above — a Nitrox program or an `xtask` — is settled below, and it is settled by
+how little the self-hosting version turns out to need.
+
+- **Writing the disk needs no new kernel surface.** `/dev/blk/<n>` resolves the *n*-th whole block
+  device with `READ | WRITE | DUPLICATE | INSPECT | TRANSFER`, so a program can write a partition
+  table and raw sectors today. The partition-name bindings (`/dev/disk/by-partlabel/…`) are made
+  once at boot from the labels found then, which does not matter: an installer works at absolute
+  offsets on the whole device, and the *installed* system discovers its own partitions when it
+  boots.
+- **The disk will not say how big it is.** The kernel has it — `BlockGeometry { logical_block_size,
+  block_count }` on the device node, filled by the claiming driver — and reports it nowhere:
+  `object_byte_size` answers for a `MemoryObject` and a `FileObject` and returns `0` for everything
+  else, so `sys_handle_stat` on a disk says zero. That function's own doc says object-aware size
+  logic belongs there, so this is about five lines rather than a new syscall.
+- **The ext4 *writer* already exists.** `fs-server-ext4`'s library is pure logic over
+  `BlockReader`/`BlockWriter` and has `create_file`, `mkdir_at`, `grow_file`, `truncate_file`. An
+  installer **links the crate** and writes into the target filesystem directly — no mount, no
+  second fs-server, no runtime-mount machinery.
+- **`e2fsprogs` is already a host dev dependency** (the fixtures run `mke2fs`), so `e2fsck -fn` is
+  available as the oracle for anything this part writes.
+- **There is no CRC32 in the tree.** A GPT needs two of them. Twenty lines, host-testable against
+  the published vectors.
+
+### The shape *(maintainer's calls, 2026-09-16)*
+
+- **A Nitrox program run from the live desktop**, not an `xtask` that writes a disk from the
+  development machine. `nxinstall /dev/blk/1`, typed at `nxsh` in `nxterm` — the smallest surface
+  that is still self-hosting, and one a gate can drive the way `check-terminal` drives the shell.
+- **The ESP is copied, not formatted.** The live image carries a **prebuilt FAT32 ESP** for the
+  installed system as another Limine module, built by the same `build_esp` the images already use;
+  the installer copies it in as raw sectors. That removes the fiddliest filesystem in the job from
+  the project entirely. **UEFI needs no bootloader install step**: firmware boots
+  `/EFI/BOOT/BOOTX64.EFI` from the removable path, which is how the stick boots today.
+- **The root filesystem is ours to make** — that is H.2, and it is the only new filesystem writer
+  this part needs. H.1 raw-copies the image's root instead, to prove partitioning and booting from
+  the internal disk before any of it exists.
+- **The installed root is labelled `nitrox-root`**, which the release `init.toml` already names,
+  and the live one keeps `nitrox-live`. A machine with the stick still in it therefore cannot mount
+  the wrong root: the labels are written by *our* GPT, not carried in the copied bytes.
+- **`check-install` runs on demand**, like `check-resolutions`: two boots is not a per-PR cost, and
+  the installer changes rarely once it works.
+- **Safety, since this writes to a real disk**: the target must be named explicitly, the disk the
+  system booted from is refused, and the confirmation is the disk's own identity typed back.
+
+### The pieces, in dependency order
+
+**H.1 — it boots from the internal disk.**
+
+- [ ] **`sys_handle_stat` reports a block device's capacity**: `object_byte_size` gains the
+      `DeviceNode` arm, `logical_block_size * block_count`. Host test, and the spec doc's
+      `HandleInfo.size` line stops saying "else `0`".
+- [ ] **`libgpt`** (userspace, host-tested): protective MBR, header, entry array, both CRC32s, and
+      the backup table at the last usable block — **and a reader**, because the installer has to
+      find the filesystem inside the image it is copying from. Tested against the kernel's own
+      parser (the same structures, independently written) and `sgdisk --verify`.
+- [ ] **The image carries an installable ESP** as a module: the *release* ESP, whose `limine.conf`
+      has no module line and whose initramfs names `gpt-partlabel:nitrox-root`. The kernel already
+      publishes every module after the initramfs as a block device, so the installer reads both its
+      sources — this and `root.img` — as `/dev/blk/<n>`.
+- [ ] **`nxinstall`**: confirm the target, write the GPT (ESP + root), copy the ESP module into the
+      first partition and `root.img`'s filesystem into the second.
+- [ ] **`cargo xtask check-install`**: boot the live image with a blank second disk, drive the
+      installer over the serial console, then **boot that disk on its own** and assert the greeter.
+      Two boots in one gate; on demand, not in CI.
+
+**H.2 — a filesystem the size of the disk.**
+
+- [ ] **`mkfs.ext4`, layout only**, in the fs-server crate beside the writer that will populate it:
+      superblock, group descriptors, block and inode bitmaps, inode table, root directory. The
+      feature set is the one our reader reads and `mke2fs` already builds our images with — 4 KiB
+      blocks, extents, `filetype`, no journal, no 64-bit, no `metadata_csum`, no `resize_inode`.
+      Host-tested with `e2fsck -fn` as the oracle and read back by our own parser.
+- [ ] **`nxinstall` formats and copies**: the root partition gets a filesystem the size of the
+      disk, and the live root is copied into it file by file through `create_file`/`mkdir_at`.
+- [ ] The gate asserts the installed root is the **disk's** size, not the image's.
+
+**H.3 — what a person sees.**
+
+- [ ] A disk list worth choosing from (each `/dev/blk/<n>` with its capacity, now that
+      `sys_handle_stat` reports one), progress while it copies, and refusals that say what to do.
+
+### What to compare on the day
+
+The laptop boots from its own disk with the stick removed, to the same desktop: `ahci: port 0 disk
+ready`, `gpt: partition … label "nitrox-root"`, `init: mounted fs-server-ext4 at /`, the greeter,
+and `Super+A` to a shell. That is the phase's definition of done, and its last open line.
+
+### Left alone
+
+- **Dual boot, shrinking, and probing for free space.** The machine's Debian install has no value;
+  taking the whole disk removes the hardest part of an installer.
+- **An EFI boot entry in NVRAM.** Writing one needs UEFI runtime services, which this kernel does
+  not call. The removable-media path boots without it.
+- **A journal.** Our fs-server does not read one and `mke2fs` already builds our images without.
+- **Resizing an existing filesystem.** H.2 makes one the right size instead.
+- **Installing from anything but the live image**, and installing *to* anything but a whole disk.
 
 ---
 
