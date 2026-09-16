@@ -72,6 +72,22 @@ pub trait ArchMemoryTypes {
     /// Ring 0. Walks the active page tables.
     unsafe fn of_mapping(virt: u64) -> Option<MemoryType>;
 
+    /// Install the kernel's own cache-policy table on **this** CPU, and say whether what was
+    /// already there matched it.
+    ///
+    /// Every CPU needs its own call: the table is per-CPU state, and a CPU whose table disagreed
+    /// with its neighbours' would give the same page different meanings depending on which core
+    /// touched it.
+    ///
+    /// **A `false` is not a failure** — the table is now the kernel's either way. It means the
+    /// platform handed over something else, which matters because mappings made *before* this
+    /// call (the bootloader's, including the one the console draws through) chose their entries
+    /// out of the old table.
+    ///
+    /// # Safety
+    /// Ring 0, during this CPU's bring-up, before it makes any mapping that names an entry.
+    unsafe fn install_policy() -> bool;
+
     /// Log the platform's cache-policy configuration, in that architecture's own terms — the
     /// one place the spelling is allowed to show, because a reader comparing this against the
     /// vendor's manual needs the vendor's names.

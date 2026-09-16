@@ -1415,6 +1415,21 @@ fn paging_init() {
     // switch-in). Each AP repeats this for itself in `ap_cpu_init` — CR0/CR4 and
     // the extended-state mask are per-CPU registers.
     arch::fpu_init_cpu();
+    // **The cache-policy table becomes the kernel's, here** (Phase 5 Part G.1), before this CPU
+    // makes any mapping that names an entry in it. Each AP does the same for itself in
+    // `ap_cpu_init`: the table is per-CPU state, and CPUs that disagreed would give one page
+    // different meanings depending on which core touched it.
+    //
+    // SAFETY: ring 0, on the boot CPU, before `kvmap::init` maps anything.
+    let matched = unsafe { arch::MemoryTypes::install_policy() };
+    kprintln!(
+        "cache policy: the kernel's table is installed; the bootloader's {}",
+        if matched {
+            "was the same"
+        } else {
+            "DIFFERED — mappings it made, including the console's, chose entries from another table"
+        }
+    );
     kprintln!(
         "fp/simd enabled ({}-bit vectors, {} B per-thread save area)",
         arch::fpu_vector_bits(),

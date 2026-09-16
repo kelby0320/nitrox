@@ -8874,6 +8874,11 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // the emulator disagrees with the hardware about the *cost*, not about the configuration.
     &["cache policy: ", "variable range(s), default "],
     &["cache policy: page attributes 0:"],
+    // **The bootloader is held to the table the kernel programs** (Phase 5 Part G.1). The kernel
+    // owns it either way; what this asserts is that nothing in flight — the console's mapping,
+    // every `kvmap` MMIO mapping — chose its entry out of a different one. A bootloader that
+    // changes its table fails here rather than silently changing what a live mapping means.
+    &["cache policy: the kernel's table is installed; the bootloader's was the same"],
     &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
     // QEMU agrees with the hardware about. The bootloader maps the framebuffer write-combining;
