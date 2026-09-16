@@ -1123,9 +1123,10 @@ what the console's costs.
 
 - **The kernel programs its own attribute table**, on every CPU, with the layout both machines
   already show (`0:WB 1:WT 2:UC- 3:UC 4:WP 5:WC 6:UC 7:UC` — Limine's). Keeping Limine's layout is
-  what makes the change safe rather than clever: the console's mapping was made by the bootloader
-  and selects entry 5, so a table that moved write-combining elsewhere would silently change what
-  that mapping means. Programming it ourselves ends the dependency on a bootloader's choice; keeping
+  what makes the change safe rather than clever: **two entries are already in use** — the console's
+  mapping, made by the bootloader, selects entry 5, and every `kvmap` MMIO mapping selects entry 2 —
+  so a table that moved write-combining or `UC-` elsewhere would silently change what live mappings
+  mean. Programming it ourselves ends the dependency on a bootloader's choice; keeping
   the same values means nothing in flight changes meaning.
 - **The attribute lives on the `MemoryObject`**, set by the kernel when it records the aperture, not
   asked for at map time. The aperture is device memory whatever maps it, so every mapping of it
@@ -1173,8 +1174,11 @@ not the cause of the remaining cost and the next question is what the compositor
 
 - **The console's own mapping.** It is the bootloader's, it already asks for write-combining, and
   taking it over would be a second mapping to keep in step for no gain the measurement can see.
-- **Write-combining anywhere else.** AHCI's registers are uncached through `kvmap` and want to stay
-  that way; no other aperture is mapped into userspace.
+- **Write-combining anywhere else.** AHCI's registers go through `kvmap`, which sets `PCD` alone —
+  attribute entry 2, `UC-` in the table both machines show, and uncacheable in practice because the
+  range registers say so. They want to stay that way, and no other aperture is mapped into
+  userspace. **G.1 has to keep entry 2 meaning what it means**, not only entry 5: every kernel MMIO
+  mapping selects it (PR #305 review, finding 2).
 - **A store fence after a frame.** Nothing reads the framebuffer to decide anything — the display
   engine scans it out continuously — so there is no completion flag whose ordering matters. If a
   device ever consumes one, that is where a fence belongs.

@@ -195,8 +195,11 @@ impl ArchMemoryTypes for X86MemoryTypes {
         }
         // SAFETY: CPUID advertises the page-attribute table, so `IA32_PAT` is implemented.
         let pat = unsafe { regs::rdmsr(MSR_PAT) };
-        // Entry `n` is byte `n`; a page selects one with its PAT, PCD and PWT bits. The kernel
-        // sets none of them today, so every mapping lands on entry 0.
+        // Entry `n` is byte `n`; a page selects one with its PAT, PCD and PWT bits. **Two
+        // entries are in use today**: a mapping with no cache flags lands on entry 0, and
+        // `PageFlags::NO_CACHE` sets `PCD` alone, which selects entry 2 — `UC-` in the table
+        // both machines show, not plain uncacheable. Every kernel MMIO mapping (`kvmap`, the
+        // interrupt router) is entry 2 (PR #305 review, finding 2).
         crate::kprintln!(
             "cache policy: page attributes 0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7:{}",
             decode((pat & 0xFF) as u8).name(),

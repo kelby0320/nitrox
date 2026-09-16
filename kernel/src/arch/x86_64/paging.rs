@@ -44,6 +44,10 @@ const PTE_PCD: u64 = 1 << 4;
 /// Page size — at a non-leaf level this entry maps a huge page directly.
 /// This module never sets it; [`translate`] reads it.
 const PTE_HUGE: u64 = 1 << 7;
+/// A 4 KiB leaf's `PAT` bit — the high bit of its attribute-table index.
+const PTE_PAT: u64 = 1 << 7;
+/// A 2 MiB or 1 GiB leaf's `PAT` bit, moved because bit 7 means "huge" there.
+const PTE_HUGE_PAT: u64 = 1 << 12;
 /// Global — the translation survives a CR3 reload.
 const PTE_GLOBAL: u64 = 1 << 8;
 /// No-execute. Faults unless `EFER.NXE` is set; see [`ensure_nxe`].
@@ -128,53 +132,6 @@ fn flags_to_pte_bits(flags: PageFlags) -> u64 {
 // --- Virtual-address index split (9-9-9-9-12) ---------------------------
 
 /// PML4 index of `v` — virtual-address bits 47:39.
-/// The page-attribute index the mapping of `virt` selects — `PAT:PCD:PWT`, the three bits that
-/// choose one of the eight entries of the attribute table — or `None` if `virt` is not mapped.
-///
-/// **A leaf's `PAT` bit moves with the page size**: bit 7 in a 4 KiB entry, bit 12 in a 2 MiB or
-/// 1 GiB one, where bit 7 means "huge". Reading the 4 KiB position on a huge page would report the
-/// huge bit as an attribute, which is how a mapping that asks for write-back reads as one that
-/// asks for something else.
-///
-/// # Safety
-/// `root` must be a live page-table root reachable through the HHDM.
-pub(super) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
-    if !virt.is_canonical() {
-        return None;
-    }
-    let index_of = |raw: u64, huge: bool| -> u8 {
-        let pat = if huge { raw >> 12 & 1 } else { raw >> 7 & 1 };
-        ((pat << 2) | (raw >> 4 & 1) << 1 | (raw >> 3 & 1)) as u8
-    };
-    // SAFETY: as `translate`'s walk, which this mirrors: present non-huge entries point at real
-    // tables reachable through the HHDM, and every index is masked to 0..512.
-    unsafe {
-        let pml4e = *table_ptr(root).add(pml4_index(virt));
-        if !pml4e.is_present() {
-            return None;
-        }
-        let pdpte = *table_ptr(pml4e.phys()).add(pdpt_index(virt));
-        if !pdpte.is_present() {
-            return None;
-        }
-        if pdpte.is_huge() {
-            return Some(index_of(pdpte.0, true));
-        }
-        let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
-        if !pde.is_present() {
-            return None;
-        }
-        if pde.is_huge() {
-            return Some(index_of(pde.0, true));
-        }
-        let pte = *table_ptr(pde.phys()).add(pt_index(virt));
-        if !pte.is_present() {
-            return None;
-        }
-        Some(index_of(pte.0, false))
-    }
-}
-
 const fn pml4_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 39) & 0x1FF) as usize
 }
@@ -197,6 +154,71 @@ const fn pt_index(v: VirtAddr) -> usize {
 /// 4 KiB page offset of `v` — virtual-address bits 11:0.
 const fn page_offset(v: VirtAddr) -> u64 {
     v.as_u64() & 0xFFF
+}
+
+// --- Leaf entries, whose bits move with the page size -------------------
+//
+// A leaf's `PAT` bit is bit 7 in a 4 KiB entry and bit 12 in a 2 MiB or 1 GiB one, because bit 7
+// is what *says* the entry is huge. Two things read a leaf — its frame and its attribute — and
+// both have to know which. They are plain functions so the bit arithmetic is host-tested: the one
+// huge mapping this kernel reads today selects the same entry whichever bit is read (PR #305
+// review, optional 4), so no boot can tell a wrong bit from a right one.
+
+/// The physical frame a leaf entry names.
+///
+/// **Bit 12 is part of the frame on a 4 KiB entry and the `PAT` bit on a huge one**, so a huge
+/// entry's base must drop it: a write-combining 2 MiB page whose `PAT` bit is set otherwise
+/// translates 4 KiB too high (PR #305 review, optional 7).
+const fn frame_base(raw: u64, huge: bool) -> u64 {
+    let mask = if huge { PTE_ADDR_MASK & !PTE_HUGE_PAT } else { PTE_ADDR_MASK };
+    raw & mask
+}
+
+/// The attribute-table entry a leaf entry selects — `PAT:PCD:PWT`, three bits choosing one of
+/// eight.
+const fn attribute_of(raw: u64, huge: bool) -> u8 {
+    let pat = if huge { (raw & PTE_HUGE_PAT) != 0 } else { (raw & PTE_PAT) != 0 };
+    (((pat as u64) << 2) | (raw >> 4 & 1) << 1 | (raw >> 3 & 1)) as u8
+}
+
+/// The page-attribute index the mapping of `virt` selects — `PAT:PCD:PWT`, the three bits that
+/// choose one of the eight entries of the attribute table — or `None` if `virt` is not mapped.
+///
+/// The bit arithmetic is [`attribute_of`]'s, which is host-tested.
+///
+/// # Safety
+/// `root` must be a live page-table root reachable through the HHDM.
+pub(super) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
+    if !virt.is_canonical() {
+        return None;
+    }
+    // SAFETY: as `translate`'s walk, which this mirrors: present non-huge entries point at real
+    // tables reachable through the HHDM, and every index is masked to 0..512.
+    unsafe {
+        let pml4e = *table_ptr(root).add(pml4_index(virt));
+        if !pml4e.is_present() {
+            return None;
+        }
+        let pdpte = *table_ptr(pml4e.phys()).add(pdpt_index(virt));
+        if !pdpte.is_present() {
+            return None;
+        }
+        if pdpte.is_huge() {
+            return Some(attribute_of(pdpte.0, true));
+        }
+        let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
+        if !pde.is_present() {
+            return None;
+        }
+        if pde.is_huge() {
+            return Some(attribute_of(pde.0, true));
+        }
+        let pte = *table_ptr(pde.phys()).add(pt_index(virt));
+        if !pte.is_present() {
+            return None;
+        }
+        Some(attribute_of(pte.0, false))
+    }
 }
 
 // --- Table access -------------------------------------------------------
@@ -504,7 +526,7 @@ impl ArchPaging for X86Paging {
             }
             if pdpte.is_huge() {
                 // 1 GiB page: frame base in bits 51:30, offset in bits 29:0.
-                return Some(PhysAddr::new(pdpte.phys().as_u64() | (virt.as_u64() & 0x3FFF_FFFF)));
+                return Some(PhysAddr::new(frame_base(pdpte.0, true) | (virt.as_u64() & 0x3FFF_FFFF)));
             }
             let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
             if !pde.is_present() {
@@ -512,7 +534,7 @@ impl ArchPaging for X86Paging {
             }
             if pde.is_huge() {
                 // 2 MiB page: frame base in bits 51:21, offset in bits 20:0.
-                return Some(PhysAddr::new(pde.phys().as_u64() | (virt.as_u64() & 0x1F_FFFF)));
+                return Some(PhysAddr::new(frame_base(pde.0, true) | (virt.as_u64() & 0x1F_FFFF)));
             }
             let pte = *table_ptr(pde.phys()).add(pt_index(virt));
             if !pte.is_present() {
@@ -821,5 +843,48 @@ mod tests {
                 "round-trip mismatch at kernel entry {i}"
             );
         }
+    }
+
+    // ---- what a leaf's bits mean, which moves with the page size ----
+
+    /// The console's own mapping on the laptop, as a probe printed it (PR #305 review): a 2 MiB
+    /// page at `0x80000000` selecting attribute 5, write-combining.
+    const HUGE_WC: u64 = 0x8000_10EB;
+
+    #[test]
+    fn a_huge_leafs_frame_drops_the_attribute_bit_that_a_small_one_keeps() {
+        // Bit 12 set: the frame on a 4 KiB entry, the `PAT` bit on a huge one.
+        assert_eq!(frame_base(HUGE_WC, true), 0x8000_0000, "a huge page starts where it says");
+        assert_eq!(frame_base(HUGE_WC, false), 0x8000_1000, "the same bit is frame on a small one");
+        // And a huge entry without the bit is unchanged by the masking.
+        assert_eq!(frame_base(0x8000_00EB, true), 0x8000_0000);
+    }
+
+    /// **The case no boot can catch**: the one huge mapping this kernel reads selects entry 5
+    /// whichever bit is read, because it has both set. These are the entries that differ.
+    #[test]
+    fn a_huge_leafs_attribute_comes_from_bit_twelve_and_a_small_ones_from_bit_seven() {
+        assert_eq!(attribute_of(HUGE_WC, true), 5, "PAT | PWT: write-combining in Limine's table");
+        // Bit 7 is "huge" here, so reading it would report 5 for an entry that selects 1.
+        assert_eq!(attribute_of(0x8000_008B, true), 1, "PWT alone: entry 1");
+        assert_eq!(attribute_of(0x8000_008B, false), 5, "the same bits in a 4 KiB entry");
+        // Write-back, the default every plain mapping lands on, read both ways.
+        assert_eq!(attribute_of(0x8000_0083, true), 0, "a huge page with no attribute bits");
+        assert_eq!(attribute_of(0x8000_0003, false), 0);
+        // Each bit alone, in a 4 KiB entry: PWT=1, PCD=2, PAT=4.
+        assert_eq!(attribute_of(PTE_PWT, false), 1);
+        assert_eq!(attribute_of(PTE_PCD, false), 2);
+        assert_eq!(attribute_of(PTE_PAT, false), 4);
+        assert_eq!(attribute_of(PTE_PCD | PTE_PWT, false), 3);
+    }
+
+    /// The mapping `kvmap` makes for device registers selects entry 2, not entry 3 — `UC-` in
+    /// both tables this system has seen. Written down because a comment here once said the kernel
+    /// set no attribute bits at all (PR #305 review, finding 2).
+    #[test]
+    fn a_no_cache_mapping_selects_the_entry_pcd_alone_names() {
+        let bits = flags_to_pte_bits(PageFlags::NO_CACHE);
+        assert_eq!(bits, PTE_PCD);
+        assert_eq!(attribute_of(bits, false), 2);
     }
 }

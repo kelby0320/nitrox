@@ -892,6 +892,17 @@ fn report_framebuffer_cost(console_virt: u64) {
     if let Some(v) = plain {
         asks("a plain mapping (what userspace gets)", v.as_u64());
     }
+    if let Some(v) = plain {
+        // SAFETY: undoing this function's own mapping of pages nothing else refers to. The vmap
+        // range is never reused, so the address is not handed out again.
+        //
+        // **Before the early return below**, not after it: `time_full_fills` answers `None` when
+        // the console has no screen — a framebuffer `record_aperture` accepted and `Screen::new`
+        // refused, say — and a write-back alias of the whole aperture left mapped for the life of
+        // the boot is the one thing this measurement must not leave behind (PR #305 review,
+        // optional 5).
+        unsafe { unmap_plain(v, pages) };
+    }
     let Some(f) = measured else { return };
     let rate = |ns: u64| -> u64 {
         if ns == 0 { 0 } else { (f.bytes as u64) * 1_000_000_000 / ns / (1024 * 1024) }
@@ -902,11 +913,6 @@ fn report_framebuffer_cost(console_virt: u64) {
         f.own_ns / 1000,
         rate(f.own_ns)
     );
-    if let Some(v) = plain {
-        // SAFETY: undoing this function's own mapping of pages nothing else refers to. The vmap
-        // range is never reused, so the address is not handed out again.
-        unsafe { unmap_plain(v, pages) };
-    }
     match f.other_ns {
         Some(ns) => kprintln!(
             "framebuffer: the same fill took {} us ({} MiB/s) through a plain write-back mapping, as userspace gets",

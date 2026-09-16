@@ -26067,24 +26067,28 @@ the graphics aperture overrides it. The console draws at 2924 MiB/s and userspac
 
 **Three calls** (maintainer, 2026-09-16):
 
-- **The kernel programs its own attribute table**, on every CPU, with the layout both machines
+- **The kernel will program its own attribute table**, on every CPU, with the layout both machines
   already show. Owning it ends a silent dependency on a bootloader's choice; keeping Limine's exact
-  values is what makes that safe, because the console's mapping was made by the bootloader and
-  selects entry 5. A table that moved write-combining would change what an in-flight mapping means.
-  The boot logs the table before and after, and a gate holds the bootloader to it, so a change is
-  loud.
+  values is what makes that safe, because **two entries are already live** — the console's mapping,
+  the bootloader's, selects entry 5, and every `kvmap` MMIO mapping selects entry 2 (`UC-`) — and a
+  table that moved either would change what an in-flight mapping means. G.1 will log the table
+  before and after and gate the bootloader's against the one it programs, so a change is loud.
 - **The attribute lives on the `MemoryObject`**, kernel-set where the aperture is recorded, rather
   than being asked for at map time. Two mappings of one aperture with different types is the
   aliasing the manuals warn about and is exactly what this system has today; an object-level
   attribute makes every mapping agree by construction. The deferral's "a way for the namespace
   server to set it" narrows to the day a second device aperture needs one.
-- **A compositor that cannot allocate its shadow buffer now refuses to start.** Without it,
-  `present` composes straight into the display, which *reads* it — and reads from write-combining
-  memory are uncached. The fallback was harmless while writes were cached and becomes a trap under
-  this fix.
+- **A compositor that cannot allocate its shadow buffer will refuse to start** (G.4; the fallback
+  is still there today). Without a shadow, `present` composes straight into the display, which
+  *reads* it — and reads from write-combining memory are uncached. The fallback is harmless while
+  writes are cached and becomes a trap under this fix.
 
 **What will not be gated is the cost.** QEMU shows the configuration half faithfully — its own
 framebuffer is uncacheable, its console mapping asks for write-combining, a plain one for write-back
 — and disagrees about the price, since TCG emulates each access and both fills take the same time.
-So `test-qemu` asserts what each mapping asks for and that they agree after the fix; the numbers
-stay a laptop measurement. The before is recorded: 54 MiB/s against 2924.
+So `test-qemu` will assert what each mapping asks for and that they agree after the fix; the
+numbers stay a laptop measurement. The before is recorded: 54 MiB/s against 2924.
+
+**Nothing in this part is built yet** — this entry is the pass, and G.1 to G.5 are unticked in the
+plan. Said plainly because the log is where "why doesn't the compositor fall back?" gets answered,
+and an entry written in the present tense would answer it wrongly (PR #305 review, finding 1).

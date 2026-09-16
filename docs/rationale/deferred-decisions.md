@@ -1442,16 +1442,22 @@ real hardware it is a **correctness** problem rather than a performance one — 
 wants write-combining or uncached, and a write-back mapping can leave writes sitting in cache or
 reorder them in ways a device does not expect.
 
-Fixing it needs a cache-attribute field on `MemoryObject`, a way for the namespace server to set
-it, and a PAT or MTRR story. **Trigger: the first boot on real hardware**, which is also the first
-time anybody could observe it.
+Fixing it needs a cache-attribute field on `MemoryObject` and a PAT story; "a way for the namespace
+server to set it" turned out **not** to be needed — see the measurement below, which puts the
+attribute on the object the kernel already mints. **Trigger: the first boot on real hardware**,
+which is also the first time anybody could observe it.
 
 **The trigger fired on 2026-09-15**, and the observation was not the one written above: the laptop
-draws the desktop slowly, in proportion to the area repainted, and a wrong *cost* rather than a
-wrong *result* is what a write-back mapping of an uncacheable range produces — the range registers
-win, so the writes were never cached in the first place. Every boot now says what the platform set
-(`cache policy:` lines), what that makes the framebuffer's own address, and how long a full-screen
-fill took, so the fix has a number to beat. The fix itself is Phase 5 Part G.
+draws the desktop slowly, in proportion to the area repainted — a wrong *cost*, not a wrong result.
+
+**And the cause is narrower than this entry assumed.** Measured on the laptop 2026-09-16, the same
+full-screen fill through the two mappings this framebuffer has: **1368 us (2924 MiB/s)** through the
+console's, which the bootloader maps write-combining, and **72930 us (54 MiB/s)** through a plain
+one, as every `/dev/framebuffer` mapping is. So it is not that a device aperture is mapped
+write-back in the abstract: the bootloader already asks for the right thing and this kernel drops it
+when userspace maps the same memory. Every boot now logs the platform's cache policy, what each
+mapping asks for, and both timings. The fix is Phase 5 Part G, and 54 MiB/s is the number it has to
+beat.
 
 > **Scheduled as Phase 5 Part G** (2026-09-10), deliberately *after* the first boot rather than
 > before it: the trigger is observation, and picking an attribute blind would be guessing at
