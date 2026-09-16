@@ -26141,10 +26141,23 @@ write-combining and that the boot says what each is; the timings are asserted no
 emulates every access and reports both fills at the same speed. QEMU agrees with the hardware about
 the configuration and says nothing useful about the cost.
 
-**Not yet measured on the machine.** Every gate passes under QEMU — the host suite, `test-qemu`,
-`check-display`, `check-terminal`, `check-login`, `check-live`, `check-fbcon`, `check-report`,
-`check-images`, `test-interactive` — and the number this part exists to change is the laptop's
-54 MiB/s. The stick is built; the measurement is the next thing.
+**Measured on the machine, and it is the fix.** The same boot line, before and after:
+
+| a full-screen fill of 4098 KiB | before | after |
+|---|---|---|
+| through the console's mapping | 1368 us — 2924 MiB/s | 1364 us — 2931 MiB/s |
+| through a mapping made as userspace's is | **72930 us — 54 MiB/s** | **1632 us — 2451 MiB/s** |
+
+**Forty-five times**, and the desktop stopped being painful — which is the observation Part F
+opened with, closed by the number that explains it. Every gate passes under QEMU too, which says
+only that nothing broke: the emulator reports both fills at the same speed either way.
+
+**The two mappings are not equal, and the gap is not explained.** 1632 us against 1364 is about 20%
+on the same pixels through page tables that now ask for the same thing. The likely reason is page
+size — the bootloader's mapping is a 2 MiB page, and a mapping this kernel makes is a thousand
+4 KiB ones, so the walk and the TLB pressure differ — but that is a hypothesis, and this part has
+already been wrong once about a plausible chain. It is written down rather than acted on: 20% on a
+path that just got 45x faster is not where the next hour goes.
 
 **Seen once and not fixed:** `check-login` failed one run at the window-geometry read, matching a
 window-list line where a geometry line was expected (`could not read a window geometry from "list on

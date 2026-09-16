@@ -1170,9 +1170,10 @@ noise of the console's, and the desktop should stop being painful. **If it does 
 not the cause of the remaining cost and the next question is what the compositor spends its time on
 — which is a different part.
 
-> **Built 2026-09-16, and not yet measured on the machine.** Under QEMU both mappings now ask for
-> write-combining and every gate passes; the emulator cannot show the cost, so the laptop is where
-> this part is judged. The stick to boot is the one built from this branch.
+> **Measured 2026-09-16: 54 MiB/s → 2451 MiB/s**, against 2931 through the bootloader's own
+> mapping — a full screen in 1632 us where it took 72930. The desktop is no longer painful. The
+> remaining 20% between the two mappings is unexplained; the likely cause is page size (2 MiB
+> against 4 KiB), and it is recorded rather than chased.
 
 ### Left alone
 
