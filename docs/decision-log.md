@@ -26278,3 +26278,57 @@ function whose doc says object-aware size logic belongs there), and there is no 
 **What is deliberately not in it**: dual boot, shrinking, free-space probing (the whole disk is
 taken), an NVRAM boot entry (needs runtime services this kernel does not call), a journal (nothing
 here reads one), and resizing (H.2 makes the filesystem the right size instead).
+
+---
+
+## 2026-09-16 — Phase 5 Part H.1: what an installer needs before it can exist
+
+Four pieces, none of them the installer: a device surface, two specs that had drifted, a partition
+table library, and the path by which authority over a disk reaches a program. The part is deliberate
+about that order — the pass it follows was reviewed twice and both blocking findings were design
+errors found before any code rested on them.
+
+**A block device says what it is, how big it is, and what to call it.** `/dev/blk/<n>` handed out
+the *n*-th block device and said nothing more, while the same registry holds whole disks, the
+partitions found on them, and memory published as a disk — so the pass's own example command,
+`nxinstall /dev/blk/1`, would have written a partition table over the running live root. Now each
+driver names what it publishes: AHCI keeps the model and serial its IDENTIFY already read
+(`QEMU HARDDISK (QM00001)`; the laptop's `ST1000LM035`), the GPT scan uses a partition's label, the
+ramdisk its module path. `sys_handle_stat` reports a device's capacity, and `/dev/blk/<n>/info`
+serves the record, the shape `/dev/framebuffer/info` already had. `test-qemu` asserts what each
+device says, and the control — the GPT scan publishing `Disk` — fails it, which is the mistake that
+would cost a filesystem.
+
+**Two specs caught up with an ABI that had moved without them.** `syscall-abi.md` documented a
+16-byte `HandleInfo` where both sides have carried 24 with `size` at offset 16 since the file
+object; a reader sizing a buffer from the spec would have been overrun. `device-node.md` called
+`/dev/blk` "whole disks" — the confusion this part exists to end — and its binding read-only, which
+stopped being true in Phase 3. Both now say what they say and when they were wrong until.
+
+**`libgpt` writes tables whole and reads them whole**, with both CRC32s (there was no CRC32 anywhere
+in the tree) and refusals that are part of the format: overlapping partitions, a range before the
+first usable block or past the last, a backwards range. **`sgdisk` is the oracle in both
+directions** — it verifies what this writes, and this reads what it wrote — because a partition
+table is a format other people's firmware consumes; the kernel's own parser checks neither checksum
+and reads no backup header, so agreeing with it would have proved little.
+
+**Authority arrives by choosing a boot entry.** A session namespace omits `/dev/blk` deliberately,
+so the live menu grew a third entry whose `cmdline: install` reaches userspace through a new
+`/proc/cmdline` leaf; a session built on that boot is handed the machine's disks, and an ordinary
+live boot is unchanged — which `check-live` now asserts over the whole transcript, because a sandbox
+that quietly widens fails nothing. The kernel interprets the word not at all, and its log line
+stopped calling an unrecognised word "ignored": one that decides what the machine does is not being
+ignored, it is being passed on.
+
+**Two things a boot corrected that reading the code had not.** The `info` leaf resolved and would
+not map — `/dev/blk`'s binding granted no `MAP_READ`, and a lookup attenuates to the binding's
+rights. And a supervisor cannot re-bind `/dev/blk` at all: it is a *kernel-server* binding, where
+`sys_ns_bind` takes endpoints and direct handles, so the first draft's "bind the registry into the
+session" answered `not in this supervisor's namespace`. Each device and its info snapshot is bound
+individually instead — finer-grained than the registry, and the shape
+[`administration.md`](planning/administration.md)'s broker will want when it grants one disk rather
+than all of them.
+
+**What this leaves in the tree is a capability with nothing using it**: an installer session that
+can reach disks, and no installer. `nxinstall`, the installable ESP module and `check-install` are
+the rest of H.1.

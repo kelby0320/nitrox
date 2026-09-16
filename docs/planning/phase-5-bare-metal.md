@@ -1292,24 +1292,32 @@ you use when there is no installed system to log into.
 
 **H.1 — it boots from the internal disk.**
 
-- [ ] **Devices say what they are.** A block device reports its **kind** (whole disk, partition,
+- [x] **Devices say what they are.** A block device reports its **kind** (whole disk, partition,
       RAM disk), its **capacity**, and an **identity** a person can recognise (the model and serial
       `ahci::identify` already reads). `sys_handle_stat`'s `size` is the natural home for the
       capacity — `object_byte_size` gains the `DeviceNode` arm — and the rest needs a small surface
       of its own; `/dev/blk/<n>/info`, mirroring `/dev/framebuffer/info`, is the shape that already
       exists in this system. Host tests, and `test-qemu` asserting what QEMU's machine reports.
-- [ ] **The syscall spec catches up.** `docs/spec/syscall-abi.md` documents a **16-byte**
+- [x] **The syscall spec catches up.** `docs/spec/syscall-abi.md` documents a **16-byte**
       `HandleInfo`; the ABI has been 24 bytes with `size` at offset 16 on both sides since the file
       object landed (review, finding 4). Add the field, then the device case.
       `docs/spec/device-node.md` says `/dev/blk/<n>` is a whole disk and that the binding is
       read-only; both have been false since slice 6.
-- [ ] **`libgpt`** (userspace, host-tested): protective MBR, header, entry array, both CRC32s, the
+- [x] **`libgpt`** (userspace, host-tested): protective MBR, header, entry array, both CRC32s, the
       backup table — **and a reader**, because the installer has to find the filesystem inside the
       image it copies from. `sgdisk --verify` is the oracle; the kernel's parser checks neither CRC
       and reads no backup header, so it is a weak second opinion at best.
-- [ ] **The installer environment**: a third boot-menu entry whose command line starts a session
+- [x] **The installer environment**: a third boot-menu entry whose command line starts a session
       whose namespace includes `/dev/blk`, expressed as data in the live image. The ordinary live
       session keeps the sandbox it has.
+> **Four of these landed 2026-09-16, and two of them were corrected by a boot.** The `info` leaf
+> resolved and would not map, because `/dev/blk`'s binding granted no `MAP_READ` and a lookup
+> attenuates to the binding's rights. And a supervisor **cannot re-bind `/dev/blk`** at all: it is a
+> kernel-server binding, and `sys_ns_bind` binds endpoints and direct handles — so the installer
+> session is handed each device and its info snapshot individually, which is finer-grained than the
+> registry and the shape an elevation broker will want when it grants one disk rather than all of
+> them.
+
 - [ ] **The image carries an installable ESP** as a module: the *release* ESP, whose `limine.conf`
       has no module line and whose initramfs names `gpt-partlabel:nitrox-root`. The kernel publishes
       every module after the initramfs as a block device, so the installer reads both its sources —
