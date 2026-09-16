@@ -460,8 +460,8 @@ impl AddressSpace {
         // header is at offset 0); we only read its frame list.
         let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
         let frames = mobj.frames();
-        // **The object decides how its pages are cached**, and the VMA carries the answer so a
-        // page faulted in later maps the way the first one did (Phase 5 Part G.2).
+        // **The object decides how its pages are cached**, and the VMA carries the answer rather
+        // than each site asking again (Phase 5 Part G.2).
         let caching = mobj.caching();
         let npages = range.pages();
         debug_assert!(frames.len() as u64 >= npages, "object too small for range");
@@ -834,12 +834,15 @@ fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
 /// non-executable (W^X by default).
 ///
 /// **The caching comes from the object, through the VMA** (Phase 5 Part G.2), so every mapping of
-/// one aperture asks for the same thing and a page faulted in later cannot forget what the mapping
-/// was made for. Until then this carried no attribute at all, which meant `/dev/framebuffer`
-/// mappings asked for write-back over memory the firmware calls uncacheable — the stronger wins,
-/// so they were uncached, measured on the laptop at 54 MiB/s against 2924 through the bootloader's
-/// write-combining mapping of the same pixels.
-fn page_flags_for(prot: Protection, caching: Caching) -> PageFlags {
+/// one aperture asks for the same thing. Until then this carried no attribute at all, which meant
+/// `/dev/framebuffer` mappings asked for write-back over memory the firmware calls uncacheable —
+/// the stronger wins, so they were uncached, measured on the laptop at 54 MiB/s against 2924
+/// through the bootloader's write-combining mapping of the same pixels, and 2451 after.
+///
+/// **Public because the boot measures through it.** `report_framebuffer_cost` maps the aperture
+/// the way a `/dev/framebuffer` mapping is made, and a measurement holding its own copy of this
+/// translation is one that passes when the translation is deleted (PR #306 review, blocking 1).
+pub fn page_flags_for(prot: Protection, caching: Caching) -> PageFlags {
     let mut f = PageFlags::empty();
     if prot.contains(Protection::WRITE) {
         f = f | PageFlags::WRITABLE;
@@ -1461,5 +1464,59 @@ mod tests {
             }
             // Drop frees all eight faulted frames + the PML4.
         }
+    }
+
+    /// **The translation the fix runs through** (Phase 5 Part G.2). A control that deleted the
+    /// write-combining branch of `page_flags_for` left every test and every gate green, because
+    /// nothing tested this function and the one boot line that named it was computed from a copy
+    /// of it (PR #306 review, blocking 1).
+    #[test]
+    fn a_write_combining_mapping_asks_for_it_and_an_ordinary_one_asks_for_nothing() {
+        let prot = Protection::WRITE | Protection::USER;
+        let normal = page_flags_for(prot, Caching::Normal);
+        let wc = page_flags_for(prot, Caching::WriteCombining);
+        assert!(!normal.contains(PageFlags::WRITE_COMBINING), "ordinary memory asks for nothing");
+        assert!(wc.contains(PageFlags::WRITE_COMBINING));
+        // Everything else about the two mappings is the same — the attribute is not a protection.
+        assert!(wc.contains(PageFlags::WRITABLE) && wc.contains(PageFlags::USER));
+        assert_eq!(
+            normal.contains(PageFlags::NO_EXECUTE),
+            wc.contains(PageFlags::NO_EXECUTE),
+            "caching does not decide executability"
+        );
+    }
+
+    /// **End to end, in page tables**: an aperture object that says write-combining is mapped with
+    /// the entry that means it, and an ordinary object is not. This is the path
+    /// `/dev/framebuffer` takes — `map_object` reading the object's own answer — and the one the
+    /// laptop's 45x came from.
+    #[test]
+    fn mapping_an_aperture_object_selects_the_write_combining_entry() {
+        init_global_heap();
+        const APERTURE: u64 = 0xF000_0000;
+        let asp = AddressSpace::new().unwrap();
+
+        // SAFETY: a physical range no test reads or frees; only its page-table entries are read.
+        let device = unsafe {
+            MemoryObject::try_new_borrowed(
+                PhysAddr::new(APERTURE),
+                PAGE as usize,
+                Caching::WriteCombining,
+            )
+            .unwrap()
+        };
+        asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), into_obj(device))
+            .expect("map_object must succeed");
+        let ordinary = MemoryObject::try_new(PAGE as usize).unwrap();
+        asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary))
+            .expect("map_object must succeed");
+
+        // Entry 5 is write-combining and entry 0 is write-back in the table the kernel programs
+        // (`KERNEL_PAT`); the numbers are the architecture's, so they are read here rather than
+        // named again.
+        let index = |v: u64| unsafe { Paging::attribute_index(asp.root(), va(v)) };
+        assert_eq!(index(PAGE * 4), Some(5), "the aperture's mapping");
+        assert_eq!(index(PAGE * 8), Some(0), "ordinary memory's");
+        assert_eq!(index(PAGE * 16), None, "nothing is mapped there");
     }
 }

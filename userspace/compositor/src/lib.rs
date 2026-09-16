@@ -1421,6 +1421,16 @@ impl<F: Framebuffer> Screen<F> {
         Self { shadow, display }
     }
 
+    /// Wrap `display` with a shadow buffer the caller already has.
+    ///
+    /// **For a caller that must allocate before it acquires the display** — which `main.rs` must,
+    /// because acquiring is what stops the kernel's console drawing, and a refusal after that is
+    /// one nobody on a serial-less machine can read (PR #306 review). The buffer's geometry is the
+    /// display's by construction there: both come from the same `/dev/framebuffer/info`.
+    pub fn with_shadow(display: F, shadow: MemFramebuffer) -> Self {
+        Self { shadow: Some(shadow), display }
+    }
+
     /// A screen with no shadow buffer — the path [`Screen::new`] falls back to when the
     /// allocation fails.
     ///

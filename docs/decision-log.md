@@ -26114,9 +26114,11 @@ so the next such mistake costs a second rather than a boot.
 **G.2 — caching is a property of memory, carried by every mapping of it.** `mm::Caching` on the
 `MemoryObject` and on the VMA, `PageFlags::WRITE_COMBINING` for the bits that select entry 5, and
 `protection_to_page_flags` becomes `page_flags_for(prot, caching)` at all four sites. The VMA
-carries it so a page faulted in later maps the way the first one did. An object-level attribute is
-what makes every mapping of one aperture agree: two that disagree is the aliasing the manuals warn
-about, and is what this system had.
+carries it so each site reads one answer rather than asking again — **not** because a fault-in path
+needs it, which the first draft of this entry claimed: object mappings install every page up front,
+and the kinds that fault in are ordinary memory (PR #306 review). An object-level attribute is what
+makes every mapping of one aperture agree: two that disagree is the aliasing the manuals warn about,
+and is what this system had.
 
 **G.3 — the aperture records what it is, once.** `record_aperture` takes the caching, and both the
 `MemoryObject` that `/dev/framebuffer` mints and the boot's own measurement read it back.
@@ -26158,6 +26160,31 @@ size — the bootloader's mapping is a 2 MiB page, and a mapping this kernel mak
 4 KiB ones, so the walk and the TLB pressure differ — but that is a hypothesis, and this part has
 already been wrong once about a plausible chain. It is written down rather than acted on: 20% on a
 path that just got 45x faster is not where the next hour goes.
+
+**What PR #306's review changed.** The blocking finding was that **nothing tested the path the fix
+runs through**: `page_flags_for` had no test, and the boot line that claimed to measure a userspace
+mapping was computed from a second copy of the translation inside the measurement. The reviewer
+deleted the real translation and watched every test and gate stay green. Three things closed it —
+the measurement now calls `page_flags_for` itself, a host test exercises it, and another maps a
+borrowed write-combining object through `map_object` and reads the leaf entry's attribute back.
+A fourth followed: **the handout line had the same shape of bug**, printing the aperture's value
+rather than the object's, so a control that minted an ordinary object still printed
+write-combining. It prints `obj.caching()` now, and `test-qemu` asserts it — the one place the
+aperture's answer actually reaches userspace.
+
+**Three instruments in one part, each wrong in the same way**: the measurement's mapping, the
+handout's line, and (before the laptop) the hypothesis itself. Each named its own answer instead of
+reading the one that mattered, and each was caught by a control that should have failed and did
+not. The lesson is cheap to state and evidently hard to apply: a test of a value the test supplies
+is a test of itself.
+
+**Also from the review**: the deferral moved to Resolved with its stale `TODO` marker removed —
+`check-deferrals` had been keeping it green on a marker for work that had landed; the compositor
+allocates its shadow buffer **before** acquiring the framebuffer, because acquiring is what stops
+the console drawing and a refusal after it is unreadable on a machine with no serial port; and
+`install_policy` now distinguishes "no attribute table" from "the bootloader's differed", verified
+by booting `-cpu max,-pat`, where the aperture is recorded as ordinary memory rather than setting a
+bit that is reserved without a table.
 
 **Seen once and not fixed:** `check-login` failed one run at the window-geometry read, matching a
 window-list line where a geometry line was expected (`could not read a window geometry from "list on

@@ -234,6 +234,20 @@ pub trait ArchPaging {
     /// reachable through the higher-half direct map.
     unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>;
 
+    /// Which cache-attribute entry the mapping of `virt` in `root` selects, or `None` if it is
+    /// not mapped. The entries themselves are the architecture's — what a caller can do with this
+    /// is compare two mappings, or check one against the table the kernel programs.
+    ///
+    /// **This exists so the fix has a testable surface.** Part G's translation from a
+    /// [`Caching`](crate::mm::Caching) to hardware bits is otherwise only visible on a booted
+    /// machine, and a gate on a boot line proved to pass with the translation deleted
+    /// (PR #306 review).
+    ///
+    /// # Safety
+    /// `root` must be the physical base of a valid top-level page table reachable through the
+    /// higher-half direct map.
+    unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8>;
+
     /// The physical base of the page table the current CPU is using (the
     /// address field of the architecture's page-table-root register).
     /// Read-only.

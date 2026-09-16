@@ -295,7 +295,13 @@ pub struct Vma {
     pub prot: Protection,
     pub mapping: MappingKind,
     /// How this mapping's pages are cached — the backing object's answer, taken when the VMA is
-    /// made so that faulting a page in later cannot forget it.
+    /// made.
+    ///
+    /// **Read wherever page flags are computed**, which is four sites, of which only `map_object`
+    /// can see anything but [`Caching::Normal`](crate::mm::Caching) today: an object mapping
+    /// installs every page up front, and the kinds that fault in — anonymous and file-backed — are
+    /// ordinary memory. The field is here so the answer travels with the mapping rather than being
+    /// recomputed per site, not because a fault-in path depends on it (PR #306 review).
     pub caching: crate::mm::Caching,
     /// `Some(_)` iff `mapping == MappingKind::Object`: the owning reference to
     /// the backing [`MemoryObject`](crate::object::MemoryObject), held so its

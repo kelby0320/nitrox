@@ -69,6 +69,16 @@ pub enum Caching {
     WriteCombining,
 }
 
+impl Caching {
+    /// A name for a log line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Caching::Normal => "ordinary",
+            Caching::WriteCombining => "write-combining",
+        }
+    }
+}
+
 /// `log2(PAGE_SIZE)`. Pre-shifted so frame arithmetic is `addr >> PAGE_SHIFT`.
 pub const PAGE_SHIFT: u32 = 12;
 

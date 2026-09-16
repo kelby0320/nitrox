@@ -1,18 +1,19 @@
 //! x86_64's answer to [`crate::arch::memory_types`]: the variable-range MTRRs, the default type,
 //! and the page-attribute table (PAT), read and reported.
 //!
-//! **Read-only, for now.** Phase 5 Part G's first piece is the measurement — what the firmware
-//! set, and what a full-screen write therefore costs — because the fix (mapping the framebuffer
-//! write-combining) should be judged against a number rather than against an expectation.
+//! **Read, and written.** The reading came first, in Part G's measurement: what the firmware set,
+//! and what a full-screen write therefore costs, because a fix judged against an expectation is
+//! not judged. The writing is [`install_policy`](ArchMemoryTypes::install_policy), which every CPU
+//! calls during bring-up so the table's meanings stop depending on a bootloader's choice.
 //!
-//! **The effective type is the stronger of the range registers and the page table**, which is why
-//! the range registers decide the framebuffer's fate today: every user mapping this kernel makes
-//! is write-back (`mm::addr_space::protection_to_page_flags`), and write-back under an uncacheable
-//! range is uncacheable. The one way a page table can *raise* an uncacheable range is a PAT entry
-//! of write-combining, which is what Part G is for.
+//! **The effective type is the stronger of the range registers and the page table.** That is why
+//! the range registers used to decide the framebuffer's fate: a mapping with no attribute is
+//! write-back, and write-back under an uncacheable range is uncacheable. The one way a page table
+//! can *raise* such a range is an attribute of write-combining, which is what a
+//! [`Caching::WriteCombining`](crate::mm::Caching) object now asks for.
 
 use super::regs;
-use crate::arch::memory_types::{ArchMemoryTypes, MemoryType};
+use crate::arch::memory_types::{ArchMemoryTypes, MemoryType, Policy};
 
 /// `IA32_MTRRCAP`: how many variable ranges the CPU has, and whether fixed ranges exist.
 const MSR_MTRRCAP: u32 = 0xFE;
@@ -185,17 +186,19 @@ impl ArchMemoryTypes for X86MemoryTypes {
         if regs::cpuid(1, 0).3 & CPUID_EDX_PAT == 0 {
             return None;
         }
-        let root = <super::paging::X86Paging as crate::arch::paging::ArchPaging>::active_root();
+        use crate::arch::paging::ArchPaging;
+        let root = super::paging::X86Paging::active_root();
         // SAFETY: the active root is live and reachable through the HHDM.
-        let index = unsafe { super::paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
+        let index =
+            unsafe { super::paging::X86Paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
         // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
         let pat = unsafe { regs::rdmsr(MSR_PAT) };
         Some(decode((pat >> (8 * index as u32) & 0xFF) as u8))
     }
 
-    unsafe fn install_policy() -> bool {
+    unsafe fn install_policy() -> Policy {
         if regs::cpuid(1, 0).3 & CPUID_EDX_PAT == 0 {
-            return false;
+            return Policy::NoTable;
         }
         // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
         let had = unsafe { regs::rdmsr(MSR_PAT) };
@@ -225,12 +228,13 @@ impl ArchMemoryTypes for X86MemoryTypes {
                 <super::cpu::X86Cpu as crate::arch::cpu::ArchCpu>::interrupts_enable();
             }
         }
-        if had != KERNEL_PAT {
-            // The "before" half of G.1's before-and-after: a table nobody expected is worth
-            // printing once, because every mapping made before this call named an entry in it.
-            log_table("the bootloader's table was", had);
+        if had == KERNEL_PAT {
+            return Policy::Unchanged;
         }
-        had == KERNEL_PAT
+        // The "before" half of G.1's before-and-after: a table nobody expected is worth printing
+        // once, because every mapping made before this call named an entry in it.
+        log_table("the bootloader's table was", had);
+        Policy::Replaced
     }
 
     unsafe fn log_configuration() {

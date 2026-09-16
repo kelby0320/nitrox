@@ -28,7 +28,7 @@ use nitrox_kernel::arch;
 use nitrox_kernel::arch::cpu::ArchCpu;
 use nitrox_kernel::arch::irq::ArchIrq;
 use nitrox_kernel::arch::irq_router::ArchIrqRouter;
-use nitrox_kernel::arch::memory_types::ArchMemoryTypes;
+use nitrox_kernel::arch::memory_types::{ArchMemoryTypes, Policy};
 use nitrox_kernel::arch::paging::ArchPaging;
 use nitrox_kernel::arch::platform::ArchPlatform;
 use nitrox_kernel::arch::smp::ArchSmp;
@@ -803,6 +803,18 @@ fn limine_framebuffer() -> Result<&'static Framebuffer, &'static str> {
 /// Must run before `run_first_userspace` binds `/dev/framebuffer`. Requires the HHDM, since
 /// Limine reports the framebuffer at a higher-half virtual address and a `MemoryObject` needs
 /// the physical base.
+/// Whether this CPU has a cache-attribute table, recorded by `paging_init` for
+/// [`record_framebuffer`] to read: without one there is no write-combining to ask for.
+///
+/// A static rather than a second `CPUID` because the answer is the one the boot already acted on —
+/// two reads could disagree only if they disagreed about the same CPU, which would be worse.
+static ATTRIBUTE_TABLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// See [`ATTRIBUTE_TABLE`].
+fn policy_installed() -> bool {
+    ATTRIBUTE_TABLE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn record_framebuffer() {
     let fb = match limine_framebuffer() {
         Ok(fb) => fb,
@@ -817,7 +829,14 @@ fn record_framebuffer() {
     // **The aperture is a framebuffer, so it is write-combining** (Phase 5 Part G.3) — said once,
     // here, and read by everything that maps it: the `MemoryObject` `/dev/framebuffer` mints, and
     // the measurement below.
-    let caching = nitrox_kernel::mm::Caching::WriteCombining;
+    //
+    // **Unless this CPU has no attribute table to name it in**, in which case the bit that would
+    // select write-combining is reserved, and a mapping that set it would fault rather than run
+    // slowly (PR #306 review, optional 5).
+    let caching = match policy_installed() {
+        true => nitrox_kernel::mm::Caching::WriteCombining,
+        false => nitrox_kernel::mm::Caching::Normal,
+    };
     if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset(), caching) } {
         // **The padding, as a number** (Phase 5 Part D.1): the bytes each row carries past its
         // last pixel. The laptop's is 40, and a reader should not have to subtract to see it.
@@ -841,18 +860,18 @@ fn record_framebuffer() {
 /// **Four facts, and the fourth is the one the first boot did not expect.** What the firmware set
 /// the caching of physical memory to; what that makes the framebuffer's own address; how long a
 /// full-screen fill takes through the mapping the console draws on; and how long the same fill
-/// takes through a mapping made the way **userspace's** is — write-back, no cache attribute, as
-/// `protection_to_page_flags` makes every `/dev/framebuffer` mapping.
+/// takes through a mapping made the way **userspace's** is — built by `page_flags_for` from the
+/// aperture's own answer, which is what a `/dev/framebuffer` mapping is built from.
 ///
 /// The laptop's first measurement had only the third of those, and it came back at GiB/s over
 /// memory the range registers call uncacheable. That is not possible for an uncached write, so the
 /// cost is not a property of the memory: it is a property of the page table entry, and the two
-/// mappings of this framebuffer do not agree. The pair of timings is what says so.
+/// mappings of this framebuffer did not agree until Part G made them. The pair of timings is what
+/// says so — 54 MiB/s against 2924 before, 2451 against 2931 after.
 ///
 /// **A second mapping of device memory with a different type is exactly the aliasing the manuals
-/// warn about**, and it is also what this system does continuously today — the bootloader's
-/// mapping and every `/dev/framebuffer` mapping differ. The measurement holds it for one fill and
-/// unmaps it; `TODO(framebuffer-cache-attr)` is the fix.
+/// warn about.** Since Part G the two agree — the aperture's answer reaches both — so this maps
+/// the same attribute the console's mapping has, holds it for one fill, and unmaps it.
 fn report_framebuffer_cost(console_virt: u64) {
     // SAFETY: ring 0, during boot, with the console up.
     unsafe { arch::MemoryTypes::log_configuration() };
@@ -874,9 +893,9 @@ fn report_framebuffer_cost(console_virt: u64) {
         ),
     }
 
-    // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is — which since
-    // G.3 means writable *and* write-combining, because the object says so. `map_mmio` would not
-    // do: it forces uncached, a third thing neither mapping is.
+    // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is: the same
+    // translation, from the same recorded answer. `map_mmio` would not do — it forces uncached, a
+    // third thing neither mapping is.
     let bytes = info.pitch as usize * info.height as usize;
     let pages = (bytes as u64).div_ceil(nitrox_kernel::mm::PAGE_SIZE as u64);
     let plain = plain_mapping(phys, pages, caching);
@@ -884,7 +903,8 @@ fn report_framebuffer_cost(console_virt: u64) {
     // the console is the kernel's and no userspace exists yet.
     let measured = unsafe { fbcon::time_full_fills(plain.map(|v| v.as_u64() as *mut u8)) };
     // **What each mapping asks for**, which is the fact the timings are evidence of. The
-    // bootloader made the console's; `protection_to_page_flags` makes the other's.
+    // bootloader made the console's; `page_flags_for` makes the other's, as it makes every
+    // `/dev/framebuffer` mapping's.
     let asks = |what: &str, virt: u64| {
         // SAFETY: ring 0; walks the active page tables and reads a configuration register.
         match unsafe { arch::MemoryTypes::of_mapping(virt) } {
@@ -936,13 +956,13 @@ fn plain_mapping(
     pages: u64,
     caching: nitrox_kernel::mm::Caching,
 ) -> Option<nitrox_kernel::mm::VirtAddr> {
-    use nitrox_kernel::arch::paging::PageFlags;
-    use nitrox_kernel::mm::{Caching, PhysAddr, VirtAddr, kvmap};
-    // The flags a `/dev/framebuffer` mapping gets, from the same answer that gives them to it.
-    let mut flags = PageFlags::WRITABLE;
-    if caching == Caching::WriteCombining {
-        flags = flags | PageFlags::WRITE_COMBINING;
-    }
+    use nitrox_kernel::mm::vmm::Protection;
+    use nitrox_kernel::mm::{PhysAddr, VirtAddr, addr_space, kvmap};
+    // **The flags a `/dev/framebuffer` mapping gets, from the function that gives them to it.**
+    // Not a second copy of that translation: the first version rebuilt the flags here, and a
+    // control that deleted the real translation left this measurement — and the gate reading its
+    // line — perfectly green (PR #306 review, blocking 1).
+    let flags = addr_space::page_flags_for(Protection::WRITE, caching);
     let base = kvmap::vmap_alloc_pages(pages).ok()?;
     let root = arch::Paging::active_root();
     for i in 0..pages {
@@ -1435,15 +1455,24 @@ fn paging_init() {
     // different meanings depending on which core touched it.
     //
     // SAFETY: ring 0, on the boot CPU, before `kvmap::init` maps anything.
-    let matched = unsafe { arch::MemoryTypes::install_policy() };
-    kprintln!(
-        "cache policy: the kernel's table is installed; the bootloader's {}",
-        if matched {
-            "was the same"
-        } else {
-            "DIFFERED — mappings it made, including the console's, chose entries from another table"
-        }
-    );
+    let policy = unsafe { arch::MemoryTypes::install_policy() };
+    ATTRIBUTE_TABLE.store(policy != Policy::NoTable, core::sync::atomic::Ordering::Relaxed);
+    match policy {
+        Policy::Unchanged => kprintln!(
+            "cache policy: the kernel's table is installed; the bootloader's was the same"
+        ),
+        Policy::Replaced => kprintln!(
+            "cache policy: the kernel's table is installed; the bootloader's DIFFERED — mappings \
+             it made, including the console's, chose entries from another table"
+        ),
+        // Not "differed": there was nothing to differ. Said plainly because the consequence is
+        // real — no attribute table means no write-combining, so the framebuffer below is
+        // recorded as ordinary memory and the desktop pays the uncached price it always did.
+        Policy::NoTable => kprintln!(
+            "cache policy: this CPU has no attribute table — every mapping is what the range \
+             registers say, and write-combining is unavailable"
+        ),
+    }
     kprintln!(
         "fp/simd enabled ({}-bit vectors, {} B per-thread save area)",
         arch::fpu_vector_bits(),

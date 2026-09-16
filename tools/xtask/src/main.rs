@@ -8881,13 +8881,18 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     &["cache policy: the kernel's table is installed; the bootloader's was the same"],
     &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
-    // QEMU agrees with the hardware about. The bootloader maps the framebuffer write-combining;
-    // a mapping this kernel makes asks for write-back, which an uncacheable range overrides.
+    // QEMU agrees with the hardware about. Both ask for write-combining since Part G; before it,
+    // the bootloader's did and a mapping this kernel made asked for write-back, which an
+    // uncacheable range overrode.
 
     // **The two mappings agree since Part G.3**, which is the fix in one line: the aperture's
     // object says write-combining, so every mapping of it asks for that, the bootloader's included.
     &["framebuffer: the console's mapping asks for write-combining"],
     &["framebuffer: a mapping made as userspace's is asks for write-combining"],
+    // **And what the client actually got.** The two lines above are the kernel measuring its own
+    // mappings; this one is the object `/dev/framebuffer` mints, which is the only place the
+    // aperture's answer reaches userspace and the only fact a compositor's speed depends on.
+    &["framebuffer: handed out as write-combining memory"],
     &["framebuffer: a full-screen fill of ", "KiB took ", "through the console's mapping"],
     // The pair is the point: same loop, same pixels, two page-table entries. A boot that lost the
     // second line would leave the comparison looking like one number nobody could interpret.
