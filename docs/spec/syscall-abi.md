@@ -149,7 +149,7 @@ fn sys_handle_stat(h: RawHandle, out: UserMutPtr<HandleInfo>) -> isize
 ```
 Writes metadata about `h` to `*out`. Requires `INSPECT` right on `h`. Returns `0`.
 
-`HandleInfo` is a fixed `#[repr(C)]` record (16 bytes, 8-byte aligned, no interior padding):
+`HandleInfo` is a fixed `#[repr(C)]` record (24 bytes, 8-byte aligned, no interior padding):
 
 ```rust
 #[repr(C)]
@@ -157,8 +157,23 @@ pub struct HandleInfo {
     pub rights: u64,       // offset 0  — Rights::bits()
     pub object_type: u32,  // offset 8  — KObjectType discriminant
     pub generation: u32,   // offset 12 — handle generation counter
+    pub size: u64,         // offset 16 — the object's byte size, or 0
 }
 ```
+
+**`size` is the object's own measure, and `0` where it has none:**
+
+| Object | `size` |
+|---|---|
+| `MemoryObject` | its page-rounded byte size |
+| `FileObject` | the file's exact byte size |
+| `DeviceNode`, block class | the device's capacity in bytes (`logical_block_size × block_count`) |
+| anything else | `0` |
+
+**This record has been 24 bytes since the file object landed, and this document said 16 until
+2026-09-16** — an omission worth naming, because a reader who sized a buffer from the spec would
+have had the kernel write eight bytes past it (PR #307 review). The kernel and `libkern` both carry
+layout assertions, which is why the drift was invisible.
 
 `owner_pid` is intentionally not reported: a process can only `stat` handles it owns (the table enforces `owner_pid == caller`), so it would always equal the caller's pid.
 

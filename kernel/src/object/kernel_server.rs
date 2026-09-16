@@ -20,6 +20,7 @@
 
 use crate::libkern::KBox;
 use crate::libkern::handle::{KObjectType, Rights};
+use crate::object::DeviceNode;
 use crate::object::EntropyObject;
 use crate::object::MemoryObject;
 use crate::object::ObjectRef;
@@ -47,6 +48,8 @@ pub enum KernelServerId {
     /// `/proc/self/status` — the caller's numeric pid/tid as a read-only
     /// [`MemoryObject`] text snapshot (see [`proc_self_status`]).
     ProcSelfStatus,
+    /// `/proc/cmdline` — the command line this boot was given, as text.
+    ProcCmdline,
     /// `/initramfs/<path>` — a file from the boot CPIO blob, served as a
     /// read-only [`MemoryObject`] copy (see [`initramfs_server`]).
     Initramfs,
@@ -116,6 +119,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::ProcSelfThread => proc_self_thread(suffix, requested),
         KernelServerId::ProcSelfNamespace => proc_self_namespace(suffix, requested),
         KernelServerId::ProcSelfStatus => proc_self_status(suffix, requested),
+        KernelServerId::ProcCmdline => proc_cmdline(suffix, requested),
         KernelServerId::Initramfs => initramfs_server(suffix, requested),
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
         KernelServerId::RawInput => raw_input_server(suffix, requested),
@@ -208,6 +212,24 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
+/// `/proc/cmdline` — the command line this boot was given, as a fresh read-only
+/// [`MemoryObject`] holding the bytes and nothing else (no trailing newline: it is one line, and
+/// a reader matching words does not want to strip one).
+///
+/// **The kernel does not interpret every word of it.** It reads the flags it acts on at boot
+/// (`cmdline::parse`) and serves the line whole, so a word meant for userspace — `install`, which
+/// selects the installer session (Phase 5 Part H.1) — needs no kernel-side list to survive the
+/// journey. A non-empty `suffix` is *not found*; this is a leaf.
+fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    match MemoryObject::try_new_filled(crate::cmdline::line()) {
+        Ok(obj) => complete_with_memobj(obj),
+        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+    }
+}
+
 /// `/proc/self/status` — a **leaf** server returning the **caller's own**
 /// numeric identity as a fresh read-only [`MemoryObject`] text snapshot:
 ///
@@ -273,12 +295,28 @@ fn initramfs_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// `requested` is accepted to match the RS contract but ignored — the binding's
 /// rights cap what the caller obtains, applied by the lookup syscall.
 fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
-    let Some(index) = parse_index(suffix) else {
+    // **`<n>/info` says what `<n>` is** (Phase 5 Part H.1), the shape `/dev/framebuffer/info`
+    // already uses: one `BlockDeviceInfo`, copied into a fresh read-only object. Without it a
+    // program choosing a device knows only an index, and this registry holds whole disks, the
+    // partitions found on them and memory published as a disk.
+    let (index_bytes, want_info) = match suffix.strip_suffix(b"/info") {
+        Some(head) => (head, true),
+        None => (suffix, false),
+    };
+    let Some(index) = parse_index(index_bytes) else {
         return OpStatus::Rejected(KError::NotFound);
     };
-    match crate::device::find_block_device(index) {
-        Some(node) => OpStatus::Completed(node),
-        None => OpStatus::Rejected(KError::NotFound),
+    let Some(node) = crate::device::find_block_device(index) else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    if !want_info {
+        return OpStatus::Completed(node);
+    }
+    // SAFETY: `find_block_device` returns a live `DeviceNode` reference.
+    let info = unsafe { &*(node.as_ptr() as *const DeviceNode) }.block_info();
+    match MemoryObject::try_new_filled(info.as_bytes()) {
+        Ok(obj) => complete_with_memobj(obj),
+        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }
 }
 
@@ -557,6 +595,7 @@ mod tests {
             KernelServerId::ProcSelfThread,
             KernelServerId::ProcSelfNamespace,
             KernelServerId::ProcSelfStatus,
+            KernelServerId::ProcCmdline,
         ] {
             match dispatch(id, b"sub", Rights::empty()) {
                 OpStatus::Rejected(KError::NotFound) => {}

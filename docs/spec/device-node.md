@@ -170,12 +170,22 @@ enumeration — but the in-kernel resource-server registry
 
 ### The naming scheme
 
-- **Whole disks: `/dev/blk/0`, `/dev/blk/1`, …** — enumeration-order indices.
+- **Block devices: `/dev/blk/0`, `/dev/blk/1`, …** — enumeration-order indices.
   Namespace prefix matching is **component-boundary** (`/dev/blk` covers
   `/dev/blk/0` with suffix `0`, *not* `/dev/blk0`), so the index is a path
   component under the `/dev/blk` subtree. Order is not stable across boots (it
   follows PCI/port discovery), so these are *enumeration* names, not *identity*
-  names — fine for Phase 2's single QEMU disk and for low-level tools.
+  names.
+- **Not "whole disks", which this document said until 2026-09-16.** The registry holds every
+  block node: whole disks, the **partitions** the GPT scan publishes on them, and memory published
+  as a disk (a bootloader module). An index alone therefore says nothing about what it names, and a
+  program that assumed otherwise would write a partition table over a mounted filesystem.
+- **`/dev/blk/<n>/info`** answers that, as `/dev/framebuffer/info` does for the display: a
+  read-only `MemoryObject` holding one `BlockDeviceInfo` (`kernel/src/libkern/block.rs`,
+  mirrored in `userspace/libkern/src/abi.rs`) — the device's **kind** (disk, partition, RAM disk
+  or unknown), its logical block size and block count, and a **name** for a person to recognise it
+  by: a disk's model and serial, a partition's label, a module's path. `sys_handle_stat` reports
+  the same capacity as the handle's `size`.
 - **Content-stable names — `/dev/disk/by-partuuid/*`, `/dev/disk/by-partlabel/*`
   — are slice 6.** They are derived from GPT partition metadata, so they are
   order-independent and are what `init.toml` mount specs reference. The raw
@@ -189,10 +199,16 @@ arrive; the `/dev/blk` registry remains block-only.
 
 ### Rights at the binding
 
-The `/dev/blk` binding is created **read-only** (`READ` without `WRITE`) in
-Phase 2: `fs-server-ext4` mounts read-only (`docs/planning/implementation-plan.md`
-slice 7), so a write `IoOp` is rejected at the lookup-rights gate before any IRP
-is built. Read-write block access lands with RW filesystems (Phase 3).
+The `/dev/blk` binding grants **`READ | WRITE | MAP_READ`** plus the generic band. It was
+read-only in Phase 2, when `fs-server-ext4` mounted read-only and a write `IoOp` was meant to be
+rejected at the lookup-rights gate; `WRITE` came with read-write filesystems in Phase 3 and this
+section said otherwise until 2026-09-16. `MAP_READ` is for the `<n>/info` leaf, which answers with
+a `MemoryObject`: a lookup attenuates to the binding's rights, so without it the record resolves
+and cannot be read. It means nothing on a `DeviceNode`, which is not mappable.
+
+**Reaching the binding at all is authority.** It lives in init's root namespace and
+`libsession::build_namespace` deliberately omits it, so an ordinary session cannot resolve
+`/dev/blk` however its rights read — see [`administration.md`](../planning/administration.md).
 
 ## Discovery and driver matching (Phase 2)
 

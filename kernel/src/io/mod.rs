@@ -58,7 +58,7 @@ fn block_irp_self_test() {
             return;
         }
     };
-    let device = match ramdisk::try_new_device(rd) {
+    let device = match ramdisk::try_new_device(rd, b"io self-test ramdisk") {
         Ok(dn) => adopt(dn, KObjectType::DeviceNode),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (ramdisk device alloc failed)");

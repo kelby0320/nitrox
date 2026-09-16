@@ -15,6 +15,7 @@
 //! `docs/spec/device-node.md`.
 
 use crate::io::block::BlockBackend;
+use crate::libkern::block::{BlockDeviceInfo, BlockKind};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::object::ObjectRef;
@@ -252,6 +253,9 @@ pub struct DeviceNode {
     descriptor: ResourceDescriptor,
     /// Block geometry (zeroed until a block driver claims the node).
     geometry: BlockGeometry,
+    /// What kind of block device this is, and what to call it — the facts a program choosing a
+    /// device needs (Phase 5 Part H.1). Default for a non-block node.
+    block_info: BlockDeviceInfo,
     /// The block I/O entry point, present iff this is a `Block` node a driver has
     /// claimed (`sys_io_submit` dispatches through it).
     block_backend: Option<BlockBackend>,
@@ -277,6 +281,7 @@ impl DeviceNode {
             class,
             descriptor,
             geometry,
+            block_info: BlockDeviceInfo::default(),
             block_backend: None,
             char_backend: None,
         })
@@ -295,6 +300,7 @@ impl DeviceNode {
             class: DeviceClass::Char,
             descriptor,
             geometry: BlockGeometry::ZERO,
+            block_info: BlockDeviceInfo::default(),
             block_backend: None,
             char_backend: Some(backend),
         })
@@ -305,6 +311,8 @@ impl DeviceNode {
     pub fn try_new_block(
         descriptor: ResourceDescriptor,
         geometry: BlockGeometry,
+        kind: BlockKind,
+        name: &[u8],
         backend: BlockBackend,
     ) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
@@ -313,6 +321,16 @@ impl DeviceNode {
             class: DeviceClass::Block,
             descriptor,
             geometry,
+            // **The driver says what it published.** Only it knows: the same registry holds
+            // whole disks, the partitions found on them and memory published as a disk, and a
+            // program that cannot tell them apart writes a partition table over a mounted root
+            // (Phase 5 Part H.1).
+            block_info: BlockDeviceInfo::new(
+                kind,
+                geometry.logical_block_size,
+                geometry.block_count,
+                name,
+            ),
             block_backend: Some(backend),
             char_backend: None,
         })
@@ -336,6 +354,11 @@ impl DeviceNode {
     /// The device's block geometry (zeroed for non-block nodes).
     pub fn geometry(&self) -> BlockGeometry {
         self.geometry
+    }
+
+    /// What this device is and what to call it (defaulted for non-block nodes).
+    pub fn block_info(&self) -> BlockDeviceInfo {
+        self.block_info
     }
 
     /// The block I/O backend, if this is a claimed block device.

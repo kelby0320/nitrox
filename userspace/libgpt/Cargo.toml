@@ -1,0 +1,11 @@
+[package]
+name = "libgpt"
+version = "0.1.0"
+edition = "2024"
+
+# Reading and writing GUID partition tables, `core`-only, `#![no_std]`, no `alloc`, no
+# dependencies — the `libcrypto` shape, and for the same reason: it is arithmetic over
+# caller-provided buffers, so it builds for the bare target and for the host, and its tests run on
+# the host against `sgdisk`. The installer writes tables with it (Phase 5 Part H.1) and reads the
+# one inside the image it copies from. See `docs/planning/phase-5-bare-metal.md` § Part H.
+[dependencies]

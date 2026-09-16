@@ -2459,6 +2459,10 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // a device that fails, so a zeroed partition stops at the line above — but the check reads
     // three blocks, and `init`'s first lookup is still the first read of a file.
     s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
+    // **And this boot is not an installer boot.** The live image's third menu entry starts a
+    // session that can write every disk in the machine; the ordinary entry must not, and absence
+    // is the kind of property that rots silently — nothing fails when a sandbox quietly widens.
+    // Asserted against the whole transcript at the end of the run, below.
     s.expect("desktop-session-mgr: greeter presented")?;
     let took = s.matched_at().saturating_duration_since(mounted);
     if took > LIVE_MOUNT_TO_GREETER {
@@ -2497,6 +2501,20 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     s.send("format(\"live-rows={}\", (open ./live-proof.txt | count))")?;
     s.expect("live-rows=3")?;
     println!("  ok: a file written under /home read back from the RAM disk");
+
+    // **An ordinary live boot reaches no disk** (Phase 5 Part H.1). The live image's third menu
+    // entry starts a session that can write every disk in the machine; this entry must not, and a
+    // widened sandbox is exactly the kind of regression nothing fails on. Asserted over the whole
+    // transcript, because what is being checked is an **absence**.
+    let text = s.transcript();
+    if let Some(line) = text.lines().find(|l| l.contains("installer session")) {
+        return Err(format!(
+            "an ordinary live boot built an installer session: {line:?}. `/dev/blk` reaches a \
+             session only when the boot asked for it (`cmdline: install`), which this one did not"
+        )
+        .into());
+    }
+    println!("  ok: and no session on this boot could reach a disk");
     Ok(())
 }
 
@@ -8879,6 +8897,13 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // every `kvmap` MMIO mapping — chose its entry out of a different one. A bootloader that
     // changes its table fails here rather than silently changing what a live mapping means.
     &["cache policy: the kernel's table is installed; the bootloader's was the same"],
+    // **What each block device says it is** (Phase 5 Part H.1). The installer refuses to write
+    // anything that is not a `disk`, and this registry holds whole disks, the partitions found on
+    // them and memory published as a disk — so a partition that called itself a disk would be a
+    // partition table written over a filesystem. The capacity and the name are asserted with it:
+    // they are what a person confirms a destructive operation by.
+    &["test-harness: /dev/blk/0 is a disk, 128 MiB, named QEMU HARDDISK"],
+    &["test-harness: /dev/blk/1 is a partition, 48 MiB, named NITROX_ESP"],
     &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
     // **What each mapping asks for**, which is what the timings are evidence of — and the half
     // QEMU agrees with the hardware about. Both ask for write-combining since Part G; before it,
@@ -9297,6 +9322,18 @@ fn cmd_test() -> R<()> {
         .arg("-p")
         .arg("init")
         .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libgpt` host tests: the partition tables the installer writes and reads (Phase 5 Part
+    // H.1). Two of them hold the crate to **`sgdisk`** — it verifies what we write and we read
+    // what it wrote — because a partition table is a format other people's firmware consumes, and
+    // agreeing only with ourselves would prove nothing. `gdisk` is a project dependency alongside
+    // `e2fsprogs`, and the tests panic with that message if it is missing.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libgpt")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
@@ -10179,6 +10216,27 @@ fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
     names.sort();
     names.dedup();
     let differ: Vec<&String> = names.into_iter().filter(|k| r.get(*k) != l.get(*k)).collect();
+    // **The marker, asserted in both directions** (Phase 5 Part H.1). The kernel serves the
+    // command line to every image alike, so `install` is honoured only where this file is: the
+    // live image must carry it and a release image must not. Both halves, because a check that
+    // only refused it in the release image would pass just as happily if it stopped being built
+    // at all, and the installer session would then be unreachable with nothing failing.
+    const MARKER: &str = "etc/install-allowed";
+    if !l.contains_key(MARKER) {
+        return Err(format!(
+            "the live initramfs must carry `{MARKER}`: it is what permits an installer session, \
+             and without it the live image's own install entry does nothing"
+        )
+        .into());
+    }
+    if r.contains_key(MARKER) {
+        return Err(format!(
+            "a release initramfs must not carry `{MARKER}` — it is what keeps an installer \
+             session a live-image thing rather than something any boot can ask for"
+        )
+        .into());
+    }
+    let differ: Vec<&String> = differ.into_iter().filter(|k| k.as_str() != MARKER).collect();
     if differ != ["etc/init.toml"] {
         return Err(format!(
             "the live initramfs must differ from the release one in `etc/init.toml` alone — the \
@@ -11786,6 +11844,20 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
         init_toml.push_str(TEST_BINDS_TOML);
     }
     cpio_entry(&mut buf, 1, "etc/init.toml", init_toml.as_bytes());
+    if root == RootDevice::Live {
+        // **What makes `install` a live-image word** (Phase 5 Part H.1). The kernel serves the
+        // command line to every image alike, so without this an installed machine would honour
+        // `install` too — and a firmware menu that lets somebody type a command line is a
+        // firmware menu that hands them a session with every disk in it. The word is necessary
+        // and this file is the sufficient half; a release image ships no such file, so the word
+        // means nothing there (PR #308 review, optional 7).
+        cpio_entry(
+            &mut buf,
+            1,
+            "etc/install-allowed",
+            b"This image may run an installer session when the boot says `install`.\n",
+        );
+    }
     // The declarations file. Its **content** is what differs between a test image and a
     // release image — see `BOOT_PROBE_TOML`. The programs below do not differ.
     let mut services = String::from(SERVICES_TOML);
@@ -12097,6 +12169,9 @@ const LIVE_MENU_TIMEOUT_SECS: u32 = 5;
 
 /// The live image's boot-menu entry that boots into the hardware report (Phase 5 Part D.2).
 const LIVE_REPORT_ENTRY: &str = "Nitrox — hardware report";
+/// The live menu's third entry: the installer session. Its `cmdline: install` reaches userspace
+/// through `/proc/cmdline`; the kernel does not act on it.
+const LIVE_INSTALL_ENTRY: &str = "Nitrox — install to this machine";
 
 /// The live image's `limine.conf`, from the release one (`base`): `root.img` as a second module,
 /// and **a menu** — a countdown, the release entry first as the default, and a second entry that
@@ -12137,7 +12212,15 @@ fn live_limine_conf(base: &str) -> R<String> {
     if !report_entry.contains("cmdline: hwreport") {
         return Err("boot/limine.conf's entry has no `path:` line to put the command line beside".into());
     }
-    Ok(format!("{}\n\n{report_entry}\n", with_timeout.trim_end()))
+    // **The installer's own entry** (Phase 5 Part H.1). `install` means nothing to the kernel —
+    // it serves the line at `/proc/cmdline` and `libsession` looks for the word — and what it
+    // selects is a *session* whose namespace includes `/dev/blk`. An ordinary live boot has no
+    // path to a disk, which is the point: authority arrives by choosing this entry, and later by
+    // a broker that authenticates (`docs/planning/administration.md`).
+    let install_entry = default_entry
+        .replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
+        .replacen("\n    path:", "\n    cmdline: install\n    path:", 1);
+    Ok(format!("{}\n\n{report_entry}\n\n{install_entry}\n", with_timeout.trim_end()))
 }
 
 /// Total bytes of the regular files under `dir`.
@@ -13041,7 +13124,7 @@ mod diag_tests {
     }
 
     #[test]
-    fn the_live_menu_boots_the_release_entry_by_default_and_offers_the_report() {
+    fn the_live_menu_boots_the_release_entry_by_default_and_offers_the_report_and_the_installer() {
         let base = fs::read_to_string(limine_conf()).expect("boot/limine.conf is readable");
         let conf = live_limine_conf(&base).expect("the shipped limine.conf is one entry");
         assert_eq!(
@@ -13059,8 +13142,19 @@ mod diag_tests {
              \x20   cmdline: hwreport\n\
              \x20   path: boot():/boot/kernel\n\
              \x20   module_path: boot():/boot/initramfs\n\
+             \x20   module_path: boot():/boot/root.img\n\
+             \n\
+             /Nitrox — install to this machine\n\
+             \x20   protocol: limine\n\
+             \x20   cmdline: install\n\
+             \x20   path: boot():/boot/kernel\n\
+             \x20   module_path: boot():/boot/initramfs\n\
              \x20   module_path: boot():/boot/root.img\n"
         );
+        // **The default entry carries no command line**, which is what keeps an ordinary live
+        // boot sandboxed: `install` is what reaches a session, and only the third entry says it.
+        let first = conf.split("\n\n").nth(1).expect("the default entry");
+        assert!(!first.contains("cmdline:"), "the default entry must pass nothing: {first:?}");
     }
 
     #[test]
