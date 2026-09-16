@@ -29,6 +29,7 @@ pub mod entropy;
 pub mod irq;
 pub mod irq_install;
 pub mod irq_router;
+pub mod memory_types;
 pub mod paging;
 pub mod platform;
 pub mod registers;
@@ -112,6 +113,9 @@ pub use smp::MAX_CPUS;
 // object. See `arch/timer.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::timer::X86Timer as Timer;
+// What the firmware set the caching of physical memory to — see `arch/memory_types.rs`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::memory_types::X86MemoryTypes as MemoryTypes;
 // The machine's battery-backed wall clock, read **once** at boot to anchor
 // `crate::clock`. Neutral name because the concept is portable and the hardware is
 // not: x86 has the CMOS RTC behind ports 0x70/0x71, aarch64 boards a memory-mapped

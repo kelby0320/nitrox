@@ -1050,10 +1050,12 @@ multiple of 8 — so an error found only there is most likely in the arithmetic 
 - **Changing modes after boot.** The screen is the size Limine handed over for the life of the
   boot, and nothing here announces a change.
 
-## Part F — the first boot ⬜
+## Part F — the first boot ⬜ *(it boots; what it found is being fixed)*
 
-- [ ] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
-      USB stick, boot the laptop, and fix what breaks.
+- [x] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
+      USB stick, boot the laptop, and fix what breaks. **Booted 2026-09-15, first attempt, with no
+      change to the image**: the firmware handed over, the report's four pages were read off the
+      screen and photographed, the greeter took a login, and the desktop drew. See the decision log.
 
 The honest content of this part is unknown, which is why it is a part and not a checklist. What
 is known is the order to look in: firmware handoff → framebuffer → ACPI tables → CPU/APIC
@@ -1063,8 +1065,32 @@ bring-up → SMP → i8042 → userspace. Part B is what makes each of those obs
       instance, a QEMU-side gate — because a bug found once on hardware and not gated will be
       found again.
 
+**What the first boot found.**
+
+- **The screen is slow, in proportion to the area repainted.** The cursor moves smoothly; drawing
+  the desktop after login, or opening the overview, is painful. That is Part G's trigger, and Part G
+  is where it is measured and fixed.
+- **The trackpad works**, which this plan said it would not — see § What Phase 5 does not do.
+- Nothing else misbehaved in what was exercised, and nothing in the image needed changing to boot.
+
+**What matched the day's list exactly**: `framebuffer: 1366x768 pitch 5504 padding 40`, the console
+at `170x48 cells at scale 1`, ECAM at `0xe0000000` bus 0–255, x2APIC, 4 CPUs, `console: no UART at
+COM1`, and AHCI at `00:17.0` claimed over 32-bit MSI — this time with a disk behind it
+(`port 0 disk ready (1953525168 sectors, 953869 MiB)`), which QEMU's empty controller could not
+show. The MADT's `apic 255 disabled — not counted` entries exercised Part D's review fix on real
+firmware.
+
+**Three facts the plan did not have.** The framebuffer lives inside the iGPU's second BAR
+(`00:02.0 bar2 mmio base 0xa0000000 size 0x10000000`), which nothing claims, so no driver has set a
+memory type for it — the ground Part G stands on. The machine also carries an Atheros QCA9377
+(Phase 8) and a `DMAR` table, so it has VT-d if an IOMMU is ever wanted.
+
 ## Part G — framebuffer cache attributes ⬜
 
+- [x] **The measurement first** (2026-09-15): every boot logs the platform's cache policy, the
+      memory type of the framebuffer's own address, and a timed full-screen fill, so the fix is
+      judged against a number rather than an expectation. `arch::memory_types` is the neutral
+      interface; the range registers and the page-attribute table stay inside `arch/x86_64`.
 - [ ] A cache-attribute on `MemoryObject`, a way for the namespace server to set it, and a PAT
       (or MTRR) story.
 
@@ -1076,6 +1102,88 @@ hardware, which is also the first time anybody could observe it."
 
 Deliberately **after** Part F: the trigger is observation, and doing it blind would mean
 guessing at which attribute this framebuffer wants.
+
+**Measured on the machine, 2026-09-16.** The same full-screen fill, one loop over the same pixels,
+through the two mappings this framebuffer has:
+
+| mapping | asks for | fill |
+|---|---|---|
+| the console's, made by Limine | write-combining | 1368 us — 2924 MiB/s |
+| a plain one, as `/dev/framebuffer` gets | write-back, overridden by an uncacheable range | 72930 us — **54 MiB/s** |
+
+So the fault is not "a device aperture mapped write-back" in the abstract: **the bootloader already
+maps it write-combining, and this kernel drops that when userspace maps the same memory.** 73 ms per
+screen, before the compositor composites anything, is the lag the first boot reported.
+
+**What the fix has to do**, with a number to beat: carry a cache attribute from the aperture to the
+user mapping, so `/dev/framebuffer` asks for write-combining and a full-screen fill through it costs
+what the console's costs.
+
+### The shape *(maintainer's calls, 2026-09-16)*
+
+- **The kernel programs its own attribute table**, on every CPU, with the layout both machines
+  already show (`0:WB 1:WT 2:UC- 3:UC 4:WP 5:WC 6:UC 7:UC` — Limine's). Keeping Limine's layout is
+  what makes the change safe rather than clever: **two entries are already in use** — the console's
+  mapping, made by the bootloader, selects entry 5, and every `kvmap` MMIO mapping selects entry 2 —
+  so a table that moved write-combining or `UC-` elsewhere would silently change what live mappings
+  mean. Programming it ourselves ends the dependency on a bootloader's choice; keeping
+  the same values means nothing in flight changes meaning.
+- **The attribute lives on the `MemoryObject`**, set by the kernel when it records the aperture, not
+  asked for at map time. The aperture is device memory whatever maps it, so every mapping of it
+  agrees by construction — the aliasing the manuals warn about is exactly what this system has
+  today, and a map-time flag would leave it possible. The deferral's "a way for the namespace server
+  to set it" narrows to the day a second device aperture needs one.
+- **A compositor that cannot allocate its shadow buffer refuses to start.** Without it, `present`
+  composes directly into the display and `copy_damage` is skipped — that path *reads* the
+  framebuffer, and a read from write-combining memory is uncached. The fallback was a kindness when
+  writes were cached; under this fix it is a trap, and "no desktop" is a better failure than a
+  desktop that takes a second a frame.
+
+### The pieces, in dependency order
+
+- [ ] **G.1 — the kernel owns its attribute table.** Program `IA32_PAT` on the BSP and on each AP
+      with the layout above, by the vendor's sequence (interrupts off, caches disabled and written
+      back, the write, caches back on, TLB flushed). The boot already logs the table; it now logs
+      it **before and after**, and a gate asserts the bootloader's table was the one we program, so
+      a bootloader that changes it is loud rather than silent.
+- [ ] **G.2 — a memory object carries a cache attribute, and a mapping honours it.** A field on
+      `MemoryObject` (default: ordinary memory), a `PageFlags::WRITE_COMBINING` that selects the
+      entry, and `protection_to_page_flags` taking the object's attribute instead of assuming
+      write-back. Host tests: the flag reaches the right PTE bits; an object with no attribute maps
+      exactly as it does today.
+- [ ] **G.3 — the framebuffer aperture is marked write-combining** where it is recorded, so every
+      `/dev/framebuffer` mapping asks for it. The measurement's second mapping becomes a mapping
+      made the way a real one is, and its line says so.
+- [ ] **G.4 — the shadow buffer becomes mandatory.** The compositor fails to start rather than
+      composing into the display, and says why. `check-display` and `check-terminal` already boot
+      with one; the gate for the refusal is the allocation failing.
+- [ ] **G.5 — the gates.** `test-qemu` asserts what each mapping asks for (QEMU agrees about the
+      configuration, so this is gateable there) and that the two now agree. The **cost** is asserted
+      nowhere: under TCG both fills take the same time, and asserting a number an emulator cannot
+      produce is how a gate starts lying.
+
+### What to compare on the day
+
+The laptop's own before-and-after, from the same line: `54 MiB/s` through a plain mapping against
+`2924 MiB/s` through the bootloader's. After G.3 the `/dev/framebuffer` mapping should read within
+noise of the console's, and the desktop should stop being painful. **If it does not**, the fix is
+not the cause of the remaining cost and the next question is what the compositor spends its time on
+— which is a different part.
+
+### Left alone
+
+- **The console's own mapping.** It is the bootloader's, it already asks for write-combining, and
+  taking it over would be a second mapping to keep in step for no gain the measurement can see.
+- **Write-combining anywhere else.** AHCI's registers go through `kvmap`, which sets `PCD` alone —
+  attribute entry 2, `UC-` in the table both machines show, and uncacheable in practice because the
+  range registers say so. They want to stay that way, and no other aperture is mapped into
+  userspace. **G.1 has to keep entry 2 meaning what it means**, not only entry 5: every kernel MMIO
+  mapping selects it (PR #305 review, finding 2).
+- **A store fence after a frame.** Nothing reads the framebuffer to decide anything — the display
+  engine scans it out continuously — so there is no completion flag whose ordering matters. If a
+  device ever consumes one, that is where a fence belongs.
+- **The self-hash's read path.** `libdraw::hash::hash_visible` reads the whole framebuffer and only
+  the self-test build calls it; it stays correct and costs one slow pass there.
 
 ## Part H — the installer ⬜
 
@@ -1095,10 +1203,15 @@ is not on the critical path.
 
 ## What Phase 5 does not do
 
-**No pointer.** The trackpad is I²C-HID, which needs a Designware I²C controller driver, the
-I²C-HID protocol, and a HID report-descriptor parser — a stack with no consumer but this one
-trackpad. A USB mouse is the cheaper pointer and comes with thumb drives attached, so it is
-[Phase 6](phase-6-usb.md).
+**No pointer — wrong, as of the first boot (2026-09-15).** The trackpad *works*: the firmware
+exposes it on the i8042's auxiliary port, `ps2: keyboard mouse armed (kbd vec0x33, aux vec0x34)`,
+and the PS/2 mouse driver this system has had since Phase 4 drives it. What is still absent is the
+I²C-HID path — the Designware I²C controller driver, the HID protocol and a report-descriptor
+parser — which is what the trackpad's *native* interface needs, and what Linux binds
+(`ELAN0501`). That stack has no consumer but this one device and stays unscheduled; a USB mouse
+remains [Phase 6](phase-6-usb.md). **The reasoning above was sound and the premise was not**, which
+is the whole argument for booting the machine: the firmware's legacy emulation was never in the
+plan's model of it.
 
 **No networking** ([Phase 8](phase-8-networking.md)), **no sound**, **no power management** —
 suspend, lid, battery and thermal all need AML, which means ACPICA, which is its own project

@@ -51,6 +51,7 @@ use crate::libkern::IrqSpinLock;
 use crate::libkern::lockrank::LockRank;
 use crate::limine::Framebuffer;
 use glyphs::{BLANK, GLYPH_W};
+use crate::arch::timer::ArchTimer;
 use text::{CELLS, Geometry, Grid, INK, MAX_COLS, PAPER};
 
 /// A linear framebuffer of 32-bit pixels, and the console's two colours packed for it.
@@ -109,6 +110,21 @@ impl Screen {
         unsafe {
             core::ptr::write_volatile(self.base.add(y * self.pitch + x * 4) as *mut u32, color);
         }
+    }
+
+    /// The same screen, written through another mapping of the same pixels.
+    ///
+    /// For the measurement in `report_framebuffer_cost`: one loop, one geometry, two page-table
+    /// entries, so the difference between the two timings is the mapping and nothing else.
+    ///
+    /// # Safety
+    /// `base` must address `pitch * height` writable bytes of the *same* framebuffer, for as long
+    /// as the returned value is used.
+    unsafe fn with_base(&self, base: *mut u8) -> Option<Self> {
+        if base.is_null() || (base as usize) % 4 != 0 {
+            return None;
+        }
+        Some(Self { base, ..*self })
     }
 
     fn fill(&self, x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -187,6 +203,51 @@ impl Console {
         self.owner = Owner::Kernel;
         self.screen = Some(screen);
         Some(geometry)
+    }
+
+    /// Fill the whole screen, timed, through the console's own mapping and — when `also` is
+    /// given — through a second mapping of the same pixels; then put the text back (Phase 5
+    /// Part G's measurement).
+    ///
+    /// `None` when the kernel is not the one drawing: the report holds the screen for a person to
+    /// read, and userspace's pixels are not ours to overwrite.
+    ///
+    /// **Two mappings, because the first boot's numbers said the cost is not a property of the
+    /// memory.** A fill through the console's mapping ran at GiB/s on a machine whose range
+    /// registers call that memory uncacheable, which is only possible if the mapping asks for
+    /// something else — so what a *write* costs is a question about a page table, and the honest
+    /// way to ask it is to write the same pixels twice, with the same loop, through the two
+    /// mappings the system actually has.
+    ///
+    /// The fill paints the margins as well as the cells, so putting the text back is a repaint
+    /// of every cell and nothing else.
+    ///
+    /// # Safety
+    /// `also`, if given, must address `pitch * height` writable bytes of the same framebuffer.
+    pub unsafe fn time_full_fills(&mut self, also: Option<*mut u8>) -> Option<Fills> {
+        if self.owner != Owner::Kernel {
+            return None;
+        }
+        let screen = self.screen.as_ref()?;
+        let (w, h) = (screen.width, screen.height);
+        // The other mapping first: whatever it paints, the console's own fill paints over.
+        let other_ns = match also {
+            // SAFETY: forwarded from this function's contract.
+            Some(base) => unsafe { screen.with_base(base) }.map(|alt| {
+                let start = crate::arch::Timer::read_ns();
+                alt.fill(0, 0, w, h, alt.paper);
+                crate::arch::Timer::read_ns().saturating_sub(start)
+            }),
+            None => None,
+        };
+        let start = crate::arch::Timer::read_ns();
+        screen.fill(0, 0, w, h, screen.paper);
+        let own_ns = crate::arch::Timer::read_ns().saturating_sub(start);
+        let rows = self.grid.geometry().rows;
+        if rows > 0 {
+            self.paint(0, rows - 1, true);
+        }
+        Some(Fills { bytes: w * h * 4, own_ns, other_ns })
     }
 
     /// Who draws on the screen.
@@ -402,6 +463,28 @@ pub fn hold_for_report() -> Option<Geometry> {
 /// Show one page of the report, `prompt` on the last row. See [`Console::show_page`].
 pub fn show_page(page: &[u8], prompt: &[u8]) {
     with_console_waiting(|c| c.show_page(page, prompt));
+}
+
+/// What a full-screen fill cost, through one mapping or two.
+pub struct Fills {
+    /// Bytes written per fill — the pixels, not the padding between rows.
+    pub bytes: usize,
+    /// Through the console's own mapping, the one the bootloader made.
+    pub own_ns: u64,
+    /// Through the second mapping, if one was given.
+    pub other_ns: Option<u64>,
+}
+
+/// Time a full-screen fill through the console's mapping and optionally a second one, then
+/// repaint the text — see [`Console::time_full_fills`].
+///
+/// # Safety
+/// `also`, if given, must address the same framebuffer, writable, for the call's duration.
+pub unsafe fn time_full_fills(also: Option<*mut u8>) -> Option<Fills> {
+    let mut measured = None;
+    // SAFETY: forwarded from this function's contract.
+    with_console_waiting(|c| measured = unsafe { c.time_full_fills(also) });
+    measured
 }
 
 /// End the report: the console draws again, from the grid.

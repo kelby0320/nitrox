@@ -63,8 +63,12 @@ unchanged.
   `arch::paging` (`ArchPaging` → `Paging`), `arch::irq` (`ArchIrq` → `Irq`),
   `arch::cpu` (`ArchCpu` → `Cpu`), `arch::user_access` (`ArchUserAccess` →
   `UserAccess`), `arch::smp` (`ArchSmp` → `Smp`), `arch::registers`
-  (`ArchRegisters` → `Registers`, with the per-arch `RegisterValues` ABI type);
-  future `arch::timer`, `arch::fpu`.
+  (`ArchRegisters` → `Registers`, with the per-arch `RegisterValues` ABI type),
+  `arch::timer` (`ArchTimer` → `Timer`), `arch::irq_router` (`ArchIrqRouter` →
+  `IrqRouter`), `arch::irq_install` (`ArchIrqInstall` → `IrqInstall`),
+  `arch::platform` (`ArchPlatform` → `Platform`), `arch::entropy`
+  (`ArchEntropy` → `Entropy`), `arch::memory_types` (`ArchMemoryTypes` →
+  `MemoryTypes`); future `arch::fpu`.
 - A few re-exported module names are themselves neutral and acceptable:
   `arch::abi` (the platform ABI constants) and `arch::serial` (the debug
   console). Their *names* carry no architecture jargon even though their
