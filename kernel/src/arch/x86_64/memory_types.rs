@@ -147,6 +147,18 @@ impl ArchMemoryTypes for X86MemoryTypes {
         Some(type_for(phys, &ranges[..used], decode((def & 0xFF) as u8), enabled))
     }
 
+    unsafe fn of_mapping(virt: u64) -> Option<MemoryType> {
+        if regs::cpuid(1, 0).3 & CPUID_EDX_PAT == 0 {
+            return None;
+        }
+        let root = <super::paging::X86Paging as crate::arch::paging::ArchPaging>::active_root();
+        // SAFETY: the active root is live and reachable through the HHDM.
+        let index = unsafe { super::paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
+        // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
+        let pat = unsafe { regs::rdmsr(MSR_PAT) };
+        Some(decode((pat >> (8 * index as u32) & 0xFF) as u8))
+    }
+
     unsafe fn log_configuration() {
         let edx = regs::cpuid(1, 0).3;
         if edx & CPUID_EDX_MTRR == 0 {

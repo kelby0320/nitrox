@@ -826,7 +826,7 @@ fn record_framebuffer() {
             padding,
             fb.bpp
         );
-        report_framebuffer_cost();
+        report_framebuffer_cost(fb.address as u64);
     } else {
         kprintln!("framebuffer: unsupported depth ({} bpp) — /dev/framebuffer unavailable", fb.bpp);
     }
@@ -834,51 +834,125 @@ fn record_framebuffer() {
 
 /// What writing to the screen costs on this machine, and why (Phase 5 Part G's measurement).
 ///
-/// **Three facts, none of them derived from the other two.** What the firmware set the caching of
-/// physical memory to; what it therefore says about the framebuffer's own address; and how long a
-/// full-screen fill actually took. The third is the one that cannot be argued with — a machine
-/// whose framebuffer is uncacheable writes a screen in tens of milliseconds, and one whose
-/// framebuffer is write-combining does it in single digits — and the first two say why, so a
-/// reader is not left inferring the cause from a number.
+/// **Four facts, and the fourth is the one the first boot did not expect.** What the firmware set
+/// the caching of physical memory to; what that makes the framebuffer's own address; how long a
+/// full-screen fill takes through the mapping the console draws on; and how long the same fill
+/// takes through a mapping made the way **userspace's** is — write-back, no cache attribute, as
+/// `protection_to_page_flags` makes every `/dev/framebuffer` mapping.
 ///
-/// Every mapping this kernel makes is write-back today (`protection_to_page_flags`), and on x86
-/// the stronger of the two wins, so an uncacheable range makes the mapping uncacheable no matter
-/// what the page table says. That is `TODO(framebuffer-cache-attr)`.
-fn report_framebuffer_cost() {
+/// The laptop's first measurement had only the third of those, and it came back at GiB/s over
+/// memory the range registers call uncacheable. That is not possible for an uncached write, so the
+/// cost is not a property of the memory: it is a property of the page table entry, and the two
+/// mappings of this framebuffer do not agree. The pair of timings is what says so.
+///
+/// **A second mapping of device memory with a different type is exactly the aliasing the manuals
+/// warn about**, and it is also what this system does continuously today — the bootloader's
+/// mapping and every `/dev/framebuffer` mapping differ. The measurement holds it for one fill and
+/// unmaps it; `TODO(framebuffer-cache-attr)` is the fix.
+fn report_framebuffer_cost(console_virt: u64) {
     // SAFETY: ring 0, during boot, with the console up.
     unsafe { arch::MemoryTypes::log_configuration() };
-    if let Some((phys, _)) = framebuffer::aperture() {
-        // SAFETY: ring 0; reads configuration registers only.
-        match unsafe { arch::MemoryTypes::at(phys.as_u64()) } {
-            Some(kind) => kprintln!(
-                "framebuffer: {:#x} is {} memory, and the kernel maps it write-back{}",
-                phys.as_u64(),
-                kind.name(),
-                match kind {
-                    nitrox_kernel::arch::memory_types::MemoryType::WriteBack => "",
-                    _ => " — the stronger of the two wins, so that is what a write costs",
-                }
-            ),
-            None => kprintln!(
-                "framebuffer: {:#x} has no memory type of its own; the page table decides",
-                phys.as_u64()
-            ),
+    let Some((phys, info)) = framebuffer::aperture() else { return };
+    // SAFETY: ring 0; reads configuration registers only.
+    match unsafe { arch::MemoryTypes::at(phys.as_u64()) } {
+        Some(kind) => kprintln!(
+            "framebuffer: {:#x} is {} memory, and a plain mapping of it is write-back{}",
+            phys.as_u64(),
+            kind.name(),
+            match kind {
+                nitrox_kernel::arch::memory_types::MemoryType::WriteBack => "",
+                _ => " — the stronger of the two wins, so a plain mapping pays that",
+            }
+        ),
+        None => kprintln!(
+            "framebuffer: {:#x} has no memory type of its own; the page table decides",
+            phys.as_u64()
+        ),
+    }
+
+    // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is: writable, with
+    // no cache attribute of its own. `map_mmio` would not do — it forces uncached, which is a
+    // third thing neither mapping is.
+    let bytes = info.pitch as usize * info.height as usize;
+    let pages = (bytes as u64).div_ceil(nitrox_kernel::mm::PAGE_SIZE as u64);
+    let plain = plain_mapping(phys, pages);
+    // SAFETY: `plain`, when mapped, addresses the same framebuffer for the length of the call;
+    // the console is the kernel's and no userspace exists yet.
+    let measured = unsafe { fbcon::time_full_fills(plain.map(|v| v.as_u64() as *mut u8)) };
+    // **What each mapping asks for**, which is the fact the timings are evidence of. The
+    // bootloader made the console's; `protection_to_page_flags` makes the other's.
+    let asks = |what: &str, virt: u64| {
+        // SAFETY: ring 0; walks the active page tables and reads a configuration register.
+        match unsafe { arch::MemoryTypes::of_mapping(virt) } {
+            Some(kind) => kprintln!("framebuffer: {what} asks for {}", kind.name()),
+            None => kprintln!("framebuffer: {what} could not be read"),
+        }
+    };
+    asks("the console's mapping", console_virt);
+    if let Some(v) = plain {
+        asks("a plain mapping (what userspace gets)", v.as_u64());
+    }
+    let Some(f) = measured else { return };
+    let rate = |ns: u64| -> u64 {
+        if ns == 0 { 0 } else { (f.bytes as u64) * 1_000_000_000 / ns / (1024 * 1024) }
+    };
+    kprintln!(
+        "framebuffer: a full-screen fill of {} KiB took {} us ({} MiB/s) through the console's mapping",
+        f.bytes / 1024,
+        f.own_ns / 1000,
+        rate(f.own_ns)
+    );
+    if let Some(v) = plain {
+        // SAFETY: undoing this function's own mapping of pages nothing else refers to. The vmap
+        // range is never reused, so the address is not handed out again.
+        unsafe { unmap_plain(v, pages) };
+    }
+    match f.other_ns {
+        Some(ns) => kprintln!(
+            "framebuffer: the same fill took {} us ({} MiB/s) through a plain write-back mapping, as userspace gets",
+            ns / 1000,
+            rate(ns)
+        ),
+        None => kprintln!("framebuffer: no second mapping to compare — the vmap is exhausted"),
+    }
+}
+
+/// Map `pages` of the framebuffer at `phys` with no cache attribute — the flags
+/// `protection_to_page_flags` gives a `/dev/framebuffer` mapping. `None` if the vmap or the page
+/// tables refuse, which costs the comparison and nothing else.
+fn plain_mapping(phys: nitrox_kernel::mm::PhysAddr, pages: u64) -> Option<nitrox_kernel::mm::VirtAddr> {
+    use nitrox_kernel::arch::paging::PageFlags;
+    use nitrox_kernel::mm::{PhysAddr, VirtAddr, kvmap};
+    let base = kvmap::vmap_alloc_pages(pages).ok()?;
+    let root = arch::Paging::active_root();
+    for i in 0..pages {
+        let v = VirtAddr::new(base.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
+        let p = PhysAddr::new(phys.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
+        // SAFETY: `v` is a fresh vmap page in the shared kernel half; `p` is a frame of the
+        // framebuffer aperture this kernel already maps; the flags are the ones a user mapping of
+        // it gets.
+        unsafe { arch::Paging::map_page(root, v, p, PageFlags::WRITABLE).ok()? };
+        // SAFETY: `v`'s entry has just changed.
+        unsafe { arch::Paging::flush_tlb_page(v) };
+    }
+    Some(base)
+}
+
+/// Undo [`plain_mapping`].
+///
+/// # Safety
+/// `base .. base + pages` must be the mapping [`plain_mapping`] returned, unused from here on.
+unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
+    use nitrox_kernel::mm::VirtAddr;
+    let root = arch::Paging::active_root();
+    for i in 0..pages {
+        let v = VirtAddr::new(base.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            let _ = arch::Paging::unmap_page(root, v);
+            arch::Paging::flush_tlb_page(v);
         }
     }
-    let Some((bytes, ns)) = fbcon::time_full_fill() else { return };
-    if ns == 0 {
-        kprintln!("framebuffer: a full-screen fill of {} KiB was below the clock's resolution", bytes / 1024);
-        return;
-    }
-    // Integer throughput: bytes per second, then mebibytes. `bytes` is at most a few million and
-    // the nanosecond count a few million more, so neither the product nor the quotient overflows.
-    let mib_per_s = (bytes as u64) * 1_000_000_000 / ns / (1024 * 1024);
-    kprintln!(
-        "framebuffer: a full-screen fill of {} KiB took {} us ({} MiB/s)",
-        bytes / 1024,
-        ns / 1000,
-        mib_per_s
-    );
 }
 
 // --- First userspace process --------------------------------------------

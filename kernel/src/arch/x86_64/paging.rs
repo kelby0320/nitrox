@@ -128,6 +128,53 @@ fn flags_to_pte_bits(flags: PageFlags) -> u64 {
 // --- Virtual-address index split (9-9-9-9-12) ---------------------------
 
 /// PML4 index of `v` — virtual-address bits 47:39.
+/// The page-attribute index the mapping of `virt` selects — `PAT:PCD:PWT`, the three bits that
+/// choose one of the eight entries of the attribute table — or `None` if `virt` is not mapped.
+///
+/// **A leaf's `PAT` bit moves with the page size**: bit 7 in a 4 KiB entry, bit 12 in a 2 MiB or
+/// 1 GiB one, where bit 7 means "huge". Reading the 4 KiB position on a huge page would report the
+/// huge bit as an attribute, which is how a mapping that asks for write-back reads as one that
+/// asks for something else.
+///
+/// # Safety
+/// `root` must be a live page-table root reachable through the HHDM.
+pub(super) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
+    if !virt.is_canonical() {
+        return None;
+    }
+    let index_of = |raw: u64, huge: bool| -> u8 {
+        let pat = if huge { raw >> 12 & 1 } else { raw >> 7 & 1 };
+        ((pat << 2) | (raw >> 4 & 1) << 1 | (raw >> 3 & 1)) as u8
+    };
+    // SAFETY: as `translate`'s walk, which this mirrors: present non-huge entries point at real
+    // tables reachable through the HHDM, and every index is masked to 0..512.
+    unsafe {
+        let pml4e = *table_ptr(root).add(pml4_index(virt));
+        if !pml4e.is_present() {
+            return None;
+        }
+        let pdpte = *table_ptr(pml4e.phys()).add(pdpt_index(virt));
+        if !pdpte.is_present() {
+            return None;
+        }
+        if pdpte.is_huge() {
+            return Some(index_of(pdpte.0, true));
+        }
+        let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
+        if !pde.is_present() {
+            return None;
+        }
+        if pde.is_huge() {
+            return Some(index_of(pde.0, true));
+        }
+        let pte = *table_ptr(pde.phys()).add(pt_index(virt));
+        if !pte.is_present() {
+            return None;
+        }
+        Some(index_of(pte.0, false))
+    }
+}
+
 const fn pml4_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 39) & 0x1FF) as usize
 }

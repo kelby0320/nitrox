@@ -8874,8 +8874,16 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // the emulator disagrees with the hardware about the *cost*, not about the configuration.
     &["cache policy: ", "variable range(s), default "],
     &["cache policy: page attributes 0:"],
-    &["framebuffer: ", " is ", "memory, and the kernel maps it write-back"],
-    &["framebuffer: a full-screen fill of ", "KiB took ", "MiB/s)"],
+    &["framebuffer: ", " is ", "memory, and a plain mapping of it is write-back"],
+    // **What each mapping asks for**, which is what the timings are evidence of — and the half
+    // QEMU agrees with the hardware about. The bootloader maps the framebuffer write-combining;
+    // a mapping this kernel makes asks for write-back, which an uncacheable range overrides.
+    &["framebuffer: the console's mapping asks for "],
+    &["framebuffer: a plain mapping (what userspace gets) asks for "],
+    &["framebuffer: a full-screen fill of ", "KiB took ", "through the console's mapping"],
+    // The pair is the point: same loop, same pixels, two page-table entries. A boot that lost the
+    // second line would leave the comparison looking like one number nobody could interpret.
+    &["framebuffer: the same fill took ", "through a plain write-back mapping"],
 ];
 
 /// The facts in `wanted` that no single line of `lines` carries every fragment of, each joined

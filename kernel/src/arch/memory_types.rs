@@ -61,6 +61,17 @@ pub trait ArchMemoryTypes {
     /// Ring 0. Reads architecture configuration registers; touches no memory.
     unsafe fn at(phys: u64) -> Option<MemoryType>;
 
+    /// What the *mapping* of `virt` asks for, or `None` if it is not mapped.
+    ///
+    /// Distinct from [`at`](ArchMemoryTypes::at), which answers for the physical memory: the two
+    /// disagreeing is the whole of Phase 5 Part G. What the hardware then does is the stronger of
+    /// the two, except that a mapping asking for write-combining raises an uncacheable range —
+    /// the one case where a page table wins, and the one the fix uses.
+    ///
+    /// # Safety
+    /// Ring 0. Walks the active page tables.
+    unsafe fn of_mapping(virt: u64) -> Option<MemoryType>;
+
     /// Log the platform's cache-policy configuration, in that architecture's own terms — the
     /// one place the spelling is allowed to show, because a reader comparing this against the
     /// vendor's manual needs the vendor's names.
