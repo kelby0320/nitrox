@@ -26164,3 +26164,25 @@ window-list line where a geometry line was expected (`could not read a window ge
 cli of 3 [20:  window 20]"`), then passed four runs. The window's title had not arrived yet, so the
 list line read `window 20` rather than `nxfiles`. That is a gate parsing a line it did not mean to,
 which is a different fault from the click-not-acted-on flake; no cause proven, nothing guessed at.
+
+---
+
+## 2026-09-16 — Phase 5 Part F closes: a shell on the laptop, from its own keyboard
+
+Part G made the screen fast and the first boot's one finding is gone. On the machine: the greeter
+takes a login from the built-in keyboard, `Super+A` opens the applications modal — the chord that
+exists because a `panel` cannot be reached without a pointer — and `nxterm` runs a shell. The
+trackpad works as well, which the plan had put in Phase 6.
+
+**That is the phase's definition of done but for one line**: the machine still boots from a USB
+stick, and "installed on its own disk" is Part H. Everything else it asks for is true — ext4 through
+AHCI (from the RAM disk today, from the internal disk at Part H), a keyboard, a compositor, a
+terminal, and kernel diagnostics on the machine's own screen with no serial cable.
+
+**What the phase's five preparatory parts bought, stated plainly**, because the first boot is the
+only place their value could be observed: the screen carried the log on a machine with no COM1
+(Part B); the stick carried the release root (Part C); every boot said what it found, which is how
+two firmware facts were confirmed and one was falsified in minutes rather than by bisecting (Part
+D); the desktop sized itself to a screen nobody had told it about (Part E); and MSI was already the
+interrupt path the laptop's AHCI needs (Part A). Nothing in the image was changed to make the first
+boot work.

@@ -1050,7 +1050,7 @@ multiple of 8 — so an error found only there is most likely in the arithmetic 
 - **Changing modes after boot.** The screen is the size Limine handed over for the life of the
   boot, and nothing here announces a change.
 
-## Part F — the first boot ⬜ *(it boots; what it found is being fixed)*
+## Part F — the first boot ✅
 
 - [x] Write the live image (`cargo xtask image --live` → `tools/build-cache/nitrox-live.img`) to a
       USB stick, boot the laptop, and fix what breaks. **Booted 2026-09-15, first attempt, with no
@@ -1061,15 +1061,22 @@ The honest content of this part is unknown, which is why it is a part and not a 
 is known is the order to look in: firmware handoff → framebuffer → ACPI tables → CPU/APIC
 bring-up → SMP → i8042 → userspace. Part B is what makes each of those observable.
 
-- [ ] Whatever this finds gets a decision-log entry and, where it is a class rather than an
+- [x] Whatever this finds gets a decision-log entry and, where it is a class rather than an
       instance, a QEMU-side gate — because a bug found once on hardware and not gated will be
-      found again.
+      found again. **Both findings did**: the slow screen became Part G, gated by what each mapping
+      asks for; the working trackpad corrected this plan. A third, found on the way, was a
+      pre-existing page-table bug Part G's review caught (a huge page's `PAT` bit read as part of
+      its frame), now host-tested.
+
+**Closed 2026-09-16.** The desktop runs on the laptop from a USB stick: a login from the built-in
+keyboard, `Super+A`, and `nxterm` running a shell — the phase's definition of done but for the disk
+it boots from, which is Part H. The trackpad works too, which this plan had not expected.
 
 **What the first boot found.**
 
 - **The screen is slow, in proportion to the area repainted.** The cursor moves smoothly; drawing
   the desktop after login, or opening the overview, is painful. That is Part G's trigger, and Part G
-  is where it is measured and fixed.
+  measured and fixed it: 54 MiB/s to 2451 through a `/dev/framebuffer` mapping.
 - **The trackpad works**, which this plan said it would not — see § What Phase 5 does not do.
 - Nothing else misbehaved in what was exercised, and nothing in the image needed changing to boot.
 
