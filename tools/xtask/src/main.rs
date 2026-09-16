@@ -59,6 +59,11 @@ const IMAGE_SIZE_MIB: u64 = 128;
 /// `nitrox-root` partition.
 const ESP_SIZE_MIB: u64 = 48;
 
+/// Smallest FAT32 this tooling builds: below about this many mebibytes of clusters, `mformat`
+/// refuses the geometry and a smaller filesystem would have to be FAT16. The installable ESP is
+/// sized to its contents or to this, whichever is larger (Phase 5 Part H.1).
+const FAT32_MIN_MIB: u64 = 33;
+
 // Test-only fixture credential for the auth + session-mgr login-path demo. **Not a
 // secret**: the shipped image stores only the one-way PBKDF2 verifier of
 // `DEMO_PASSWORD`; the password is a build input for the emulator demo user. init's
@@ -10198,15 +10203,18 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
 
 /// `check-images`' live half: the live image differs from the release image **only in data**.
 ///
-/// Two claims, each checked against what the builds produced rather than against the functions that
-/// produced them — a live build that called `stage_rootfs` and then wrote one file more would pass
-/// a check on the function (PR #297 review):
+/// Three claims, each checked against what the builds produced rather than against the functions
+/// that produced them — a live build that called `stage_rootfs` and then wrote one file more would
+/// pass a check on the function (PR #297 review):
 ///
 /// 1. the live initramfs carries the release initramfs's files, byte-identical except
 ///    `etc/init.toml`, which must differ — it names `nitrox-live`;
 /// 2. the ext4 filesystem inside the built stick's `root.img` holds the same entries as the
 ///    release image's root partition — names, kinds, sizes and contents — read back out of both
-///    with `debugfs`.
+///    with `debugfs`;
+/// 3. the FAT filesystem inside the stick's `install-esp.img` module — the ESP the installer
+///    writes to a disk — holds the same entries as the release image's own ESP. The first two
+///    are about the stick booting; this one is about the machine booting once the stick is gone.
 fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
     let live_cpio = dir.join("live.cpio");
     build_initramfs_for(&live_cpio, BuildMode::Normal, RootDevice::Live)?;
@@ -10266,17 +10274,7 @@ fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
 
     let release_tree = ext4_tree(&release_fs, &dir.join("release-root"))?;
     let live_tree = ext4_tree(&live_fs, &dir.join("live-root"))?;
-    let mut problems: Vec<String> = Vec::new();
-    for (path, entry) in &release_tree {
-        match live_tree.get(path) {
-            None => problems.push(format!("{path}: missing from the live root")),
-            Some(e) if e != entry => problems.push(format!("{path}: differs")),
-            Some(_) => {}
-        }
-    }
-    for path in live_tree.keys().filter(|p| !release_tree.contains_key(*p)) {
-        problems.push(format!("{path}: only in the live root"));
-    }
+    let problems = tree_problems(&release_tree, &live_tree, "the live root");
     if !problems.is_empty() {
         return Err(format!(
             "the filesystem inside the live image's root.img is not the release root: {problems:?}. \
@@ -10287,6 +10285,37 @@ fn check_live_image(dir: &Path, release_cpio: &Path) -> R<()> {
     println!(
         "check-images: the live root.img holds the release root's {} entries, byte for byte ✓",
         release_tree.len()
+    );
+
+    // **The installable ESP is the release ESP** (Phase 5 Part H.1, PR #307 review finding 6).
+    // The two claims above compare the parts of the live image that boot the *stick*; this module
+    // is the part that boots the machine **afterwards**, and nothing above would notice it being
+    // built from the live `limine.conf` and the live initramfs. That mistake is silent in every
+    // gate and on the desk: the installed machine boots while the stick is still plugged in, and
+    // fails the first time it is not, looking for `gpt-partlabel:nitrox-live`. So it is compared
+    // file for file against what a release image actually ships — which is also what makes
+    // `build_esp`'s own arguments the thing under test rather than a second copy of them.
+    let install_esp = dir.join("install-esp.img");
+    let _ = fs::remove_file(&install_esp);
+    run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/install-esp.img").arg(&install_esp))?;
+    let release_esp = dir.join("release-esp.img");
+    carve_partition(&image_path(), 1, &release_esp)?;
+    let release_esp_tree = fat_tree(&release_esp, &dir.join("release-esp"))?;
+    let install_esp_tree = fat_tree(&install_esp, &dir.join("install-esp"))?;
+    let problems = tree_problems(&release_esp_tree, &install_esp_tree, "the installable ESP");
+    if !problems.is_empty() {
+        return Err(format!(
+            "the live image's `install-esp.img` module is not the release ESP: {problems:?}. It is \
+             what the installer copies onto a disk, so it must carry the release menu — no module \
+             lines — and the release initramfs, which names `gpt-partlabel:{ROOT_PARTLABEL}`. \
+             Built from the live image's own initramfs or `limine.conf`, it installs a system that \
+             mounts the stick it came from."
+        )
+        .into());
+    }
+    println!(
+        "check-images: the installable ESP module is the release ESP's {} entries ✓",
+        release_esp_tree.len()
     );
     Ok(())
 }
@@ -10330,7 +10359,32 @@ fn ext4_tree(fs_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
     if !status.success() {
         return Err(format!("debugfs could not read {}", fs_img.display()).into());
     }
-    let mut tree = BTreeMap::new();
+    let tree = host_tree(out)?;
+    if tree.is_empty() {
+        return Err(format!("debugfs extracted nothing from {}", fs_img.display()).into());
+    }
+    Ok(tree)
+}
+
+/// Extract the FAT filesystem image `fat_img` into `out` with `mcopy`, and describe every entry
+/// under it by path relative to the root — [`ext4_tree`] for the other filesystem in these images.
+///
+/// `mcopy` globs on the FAT side, so `::/*` is passed through literally rather than by a shell.
+fn fat_tree(fat_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
+    if out.exists() {
+        fs::remove_dir_all(out)?;
+    }
+    fs::create_dir_all(out)?;
+    run(Command::new("mcopy").arg("-i").arg(fat_img).arg("-s").arg("::/*").arg(out))?;
+    let tree = host_tree(out)?;
+    if tree.is_empty() {
+        return Err(format!("mcopy extracted nothing from {}", fat_img.display()).into());
+    }
+    Ok(tree)
+}
+
+/// Describe every entry under `root` by path relative to it: a directory, or a size and a hash.
+fn host_tree(root: &Path) -> R<BTreeMap<String, TreeEntry>> {
     fn walk(root: &Path, dir: &Path, tree: &mut BTreeMap<String, TreeEntry>) -> R<()> {
         use std::hash::{Hash, Hasher};
         for entry in fs::read_dir(dir)? {
@@ -10349,11 +10403,30 @@ fn ext4_tree(fs_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
         }
         Ok(())
     }
-    walk(out, out, &mut tree)?;
-    if tree.is_empty() {
-        return Err(format!("debugfs extracted nothing from {}", fs_img.display()).into());
-    }
+    let mut tree = BTreeMap::new();
+    walk(root, root, &mut tree)?;
     Ok(tree)
+}
+
+/// Every way `actual` departs from `expected`, named by path — empty when the two hold the same
+/// entries with the same bytes.
+fn tree_problems(
+    expected: &BTreeMap<String, TreeEntry>,
+    actual: &BTreeMap<String, TreeEntry>,
+    actual_name: &str,
+) -> Vec<String> {
+    let mut problems: Vec<String> = Vec::new();
+    for (path, entry) in expected {
+        match actual.get(path) {
+            None => problems.push(format!("{path}: missing from {actual_name}")),
+            Some(e) if e != entry => problems.push(format!("{path}: differs")),
+            Some(_) => {}
+        }
+    }
+    for path in actual.keys().filter(|p| !expected.contains_key(*p)) {
+        problems.push(format!("{path}: only in {actual_name}"));
+    }
+    problems
 }
 
 /// The initramfs files a **test** image is allowed to differ from a **release** image in.
@@ -12132,13 +12205,49 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
         .arg(((root_sectors * 512) / 4096).to_string()))?;
     splice_into(&root_img, root_lba * 512, &rootfs)?;
 
-    // 2. Limine's configuration: the release one, with `root.img` as the second module and a
-    //    menu with a hardware-report entry.
+    // 2. **The ESP the installer writes to a disk** (Phase 5 Part H.1): a FAT32 filesystem built
+    //    by the same `build_esp` every image uses, carrying the *release* menu — no module lines,
+    //    and an initramfs whose `init.toml` names `gpt-partlabel:nitrox-root`. It rides as a
+    //    module, so the kernel publishes it as a block device and the installer copies it sector
+    //    by sector; writing FAT32 is thereby not this project's problem.
+    //
+    //    **Sized to its contents, not to `ESP_SIZE_MIB`.** The firmware reads every module off
+    //    the stick before the kernel runs, which is what `LIVE_ROOT_MAX_MIB` exists to bound, and
+    //    a 48 MiB image mostly of zeroes would triple that read for nothing. FAT32's own floor is
+    //    about 33 MiB of clusters, so that is the floor here too.
+    //
+    //    **Its initramfs is built here rather than being the one this function was handed**: the
+    //    caller's is the *live* one, and it names `gpt-partlabel:nitrox-live`. Copied into an
+    //    installed machine it would produce a system that mounts the stick it was installed from
+    //    — which boots exactly once, on the desk, and never again (PR #307 review, finding 6).
+    //    `check_live_image` reads this filesystem back out of the built stick and holds every
+    //    file in it against the release ESP, because the mistake is invisible until a real
+    //    machine reboots without the stick.
+    let install_esp = work.join("install-esp.img");
+    let install_initramfs = work.join("initramfs");
+    build_initramfs_for(&install_initramfs, BuildMode::Normal, RootDevice::Disk)?;
+    let esp_payload = [bootx64, kernel, install_initramfs.as_path()]
+        .iter()
+        .map(|p| fs::metadata(p).map(|m| m.len()))
+        .sum::<Result<u64, _>>()?;
+    let install_esp_mib = FAT32_MIN_MIB.max(esp_payload.div_ceil(MIB) + 8);
+    build_esp(
+        &install_esp,
+        install_esp_mib * MIB / 512,
+        bootx64,
+        &limine_conf(),
+        kernel,
+        &install_initramfs,
+        &[],
+    )?;
+
+    // 3. Limine's configuration: the release one, with `root.img` and the installable ESP as
+    //    modules and a menu with a hardware-report entry and an installer entry.
     let conf = work.join("limine.conf");
     fs::write(&conf, live_limine_conf(&fs::read_to_string(limine_conf())?)?)?;
 
     // 3. The stick: one ESP big enough for all of it.
-    let payload = [bootx64, kernel, initramfs, root_img.as_path()]
+    let payload = [bootx64, kernel, initramfs, root_img.as_path(), install_esp.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))
         .sum::<Result<u64, _>>()?;
@@ -12155,7 +12264,18 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
         .arg(out))?;
     let (esp_lba, esp_sectors) = partition_extent(out, 1)?;
     let esp = work.join("esp.img");
-    build_esp(&esp, esp_sectors, bootx64, &conf, kernel, initramfs, &[(root_img.as_path(), "/boot/root.img")])?;
+    build_esp(
+        &esp,
+        esp_sectors,
+        bootx64,
+        &conf,
+        kernel,
+        initramfs,
+        &[
+            (root_img.as_path(), "/boot/root.img"),
+            (install_esp.as_path(), "/boot/install-esp.img"),
+        ],
+    )?;
     splice_into(out, esp_lba * 512, &esp)?;
     println!(
         "xtask: live root.img {root_img_mib} MiB ({staged} bytes staged), stick {} MiB",
@@ -12217,9 +12337,17 @@ fn live_limine_conf(base: &str) -> R<String> {
     // selects is a *session* whose namespace includes `/dev/blk`. An ordinary live boot has no
     // path to a disk, which is the point: authority arrives by choosing this entry, and later by
     // a broker that authenticates (`docs/planning/administration.md`).
+    //
+    // **The installable ESP rides on this entry alone.** Limine loads a module because the entry
+    // the person chose names it, so a module line here costs the other two boots nothing: an
+    // ordinary live boot does not read 33 MiB more off the stick, hold it in RAM for the rest of
+    // the session, and publish a block device no session can reach. The plan's worry about what
+    // firmware reads before the kernel runs is therefore a worry about *installing*, which is the
+    // one boot where paying it buys something.
     let install_entry = default_entry
         .replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
-        .replacen("\n    path:", "\n    cmdline: install\n    path:", 1);
+        .replacen("\n    path:", "\n    cmdline: install\n    path:", 1)
+        + "\n    module_path: boot():/boot/install-esp.img";
     Ok(format!("{}\n\n{report_entry}\n\n{install_entry}\n", with_timeout.trim_end()))
 }
 
@@ -13149,12 +13277,21 @@ mod diag_tests {
              \x20   cmdline: install\n\
              \x20   path: boot():/boot/kernel\n\
              \x20   module_path: boot():/boot/initramfs\n\
-             \x20   module_path: boot():/boot/root.img\n"
+             \x20   module_path: boot():/boot/root.img\n\
+             \x20   module_path: boot():/boot/install-esp.img\n"
         );
         // **The default entry carries no command line**, which is what keeps an ordinary live
         // boot sandboxed: `install` is what reaches a session, and only the third entry says it.
         let first = conf.split("\n\n").nth(1).expect("the default entry");
         assert!(!first.contains("cmdline:"), "the default entry must pass nothing: {first:?}");
+        // **And carries no installable ESP**, which is what keeps it as cheap to boot as it was:
+        // the module is 33 MiB of firmware reads and of permanently-held RAM, and an ordinary
+        // session could not reach the device it becomes anyway.
+        assert_eq!(
+            conf.matches("install-esp.img").count(),
+            1,
+            "only the installer entry loads the installable ESP: {conf}"
+        );
     }
 
     #[test]

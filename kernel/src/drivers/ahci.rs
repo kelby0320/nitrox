@@ -564,7 +564,7 @@ unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) ->
     let m = field(27, 20, &mut model);
     let s = field(10, 10, &mut serial);
     let mut n = 0;
-    let mut push = |bytes: &[u8], out: &mut [u8; MAX_DEVICE_NAME], n: &mut usize| {
+    let push = |bytes: &[u8], out: &mut [u8; MAX_DEVICE_NAME], n: &mut usize| {
         for &b in bytes {
             if *n < MAX_DEVICE_NAME {
                 out[*n] = b;

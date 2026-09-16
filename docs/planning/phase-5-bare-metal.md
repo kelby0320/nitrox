@@ -1318,16 +1318,25 @@ you use when there is no installed system to log into.
 > registry and the shape an elevation broker will want when it grants one disk rather than all of
 > them.
 
-- [ ] **The image carries an installable ESP** as a module: the *release* ESP, whose `limine.conf`
+- [x] **The image carries an installable ESP** as a module: the *release* ESP, whose `limine.conf`
       has no module line and whose initramfs names `gpt-partlabel:nitrox-root`. The kernel publishes
       every module after the initramfs as a block device, so the installer reads both its sources —
       this and `root.img` — as ordinary devices. **It roughly triples what firmware reads off the
       stick before the kernel runs** (`root.img` is 26 MiB, `ESP_SIZE_MIB` is 48, FAT32's floor is
       about 33 MiB), which is what `LIVE_ROOT_MAX_MIB` exists to bound — so the module is sized to
       its contents, not to `ESP_SIZE_MIB`.
-- [ ] **`check-images` gates that module against the release ESP.** Its live half compares the
+- [x] **`check-images` gates that module against the release ESP.** Its live half compares the
       initramfs and `root.img` and would not notice a module built with the live `limine.conf`,
       which installs a system that mounts a stick that is no longer there (review, finding 6).
+> **Both landed 2026-09-16, and the predicted mistake was the one that happened.** The first build
+> of the module carried the *live* initramfs — `assemble_live_image` is handed it, it is the same
+> size, and every gate passed — so an installed machine would have looked for `nitrox-live` and
+> booted only while the stick was still in it. The module builds its own release initramfs now, and
+> `check-images` compares the filesystem out of the built stick against the release ESP rather than
+> trusting the call that made it. One thing the detail pass had not settled: **the module rides on
+> the installer entry alone**, since Limine loads what the chosen entry names, so an ordinary live
+> boot reads and holds nothing extra.
+
 - [ ] **`nxinstall`**: refuse anything that is not a whole disk, name the target's identity and
       require it typed back, write the GPT, copy the ESP module and `root.img`'s filesystem into
       their partitions.

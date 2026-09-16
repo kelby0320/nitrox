@@ -26359,3 +26359,32 @@ generous lets a partition overwrite the backup array, and `sgdisk --verify` does
 `read` cut a table with more partitions than fit instead of refusing it; the `/proc/cmdline` doc
 comment had been inserted into `proc_self_status`'s, orphaning it; and four current-behaviour docs
 still said no session can ever reach `/dev/blk`.
+
+## 2026-09-16 — Phase 5 Part H.1: the installable ESP, and what it was carrying
+
+The live image now ships the ESP an installed machine boots from, as a third Limine module. It is
+built by the same `build_esp` every image uses, so the installer copies it onto a disk sector by
+sector and writing FAT32 is never this project's problem.
+
+**Sized to its contents, not to `ESP_SIZE_MIB`.** 48 MiB mostly of zeroes would triple what firmware
+reads off a USB stick before the kernel runs, which is the cost `LIVE_ROOT_MAX_MIB` exists to bound.
+FAT32's own floor is about 33 MiB of clusters, so that is the floor here.
+
+**It rides on the installer entry alone**, which the detail pass had not settled. Limine loads a
+module because the entry a person chose names it, so the ordinary live boot and the hardware report
+pay nothing: no 33 MiB read, no 33 MiB held for the session, and no block device published that no
+session on that boot could reach anyway. The plan's worry about what firmware reads is thereby a
+worry about *installing*, the one boot where paying it buys something.
+
+**The first build of it carried the live initramfs** — the review's finding 6, reproduced exactly.
+`assemble_live_image` is handed the initramfs for the stick, and using it here is the natural
+mistake: the file is right there, it is the same size, and every gate passes. An installed machine
+would then look for `gpt-partlabel:nitrox-live`, which means it boots on the desk with the stick
+still in it and fails the first time it is not. The module builds its own release initramfs now.
+
+**So the gate compares the module's filesystem, not the call that built it.** `check-images`
+extracts `install-esp.img` out of the built stick and holds every file in it against the release
+image's own ESP — the same shape as the other two live claims, which compare what the builds
+produced rather than the functions that produced them. Two controls: the live initramfs in the
+module fails with `boot/initramfs: differs`, and a spurious extra file with `boot/spurious: only in
+the installable ESP`.
