@@ -1103,13 +1103,23 @@ hardware, which is also the first time anybody could observe it."
 Deliberately **after** Part F: the trigger is observation, and doing it blind would mean
 guessing at which attribute this framebuffer wants.
 
-**The observation arrived 2026-09-15.** Redrawing the whole screen is painful and the cursor is
-fine, so the cost is per pixel written, not per frame. The arithmetic fits an uncached mapping: a
-screen is 4 MB, tens of MB/s is 40–80 ms a frame, and write-combining would put it in single-digit
-milliseconds. It **is not yet measured on the machine**, and the first piece of this part is the
-measurement, not the fix: the report gains `IA32_PAT`, the MTRR default type and variable ranges,
-the effective type for the framebuffer's base, and a timed fill — hardware facts of the kind Part D
-already collects — and the fix is judged against that number.
+**Measured on the machine, 2026-09-16.** The same full-screen fill, one loop over the same pixels,
+through the two mappings this framebuffer has:
+
+| mapping | asks for | fill |
+|---|---|---|
+| the console's, made by Limine | write-combining | 1368 us — 2924 MiB/s |
+| a plain one, as `/dev/framebuffer` gets | write-back, overridden by an uncacheable range | 72930 us — **54 MiB/s** |
+
+So the fault is not "a device aperture mapped write-back" in the abstract: **the bootloader already
+maps it write-combining, and this kernel drops that when userspace maps the same memory.** 73 ms per
+screen, before the compositor composites anything, is the lag the first boot reported.
+
+**What the fix has to do**, with a number to beat: carry a cache attribute from the aperture to the
+user mapping, so `/dev/framebuffer` asks for write-combining and a full-screen fill through it costs
+what the console's costs. The attribute table already has a write-combining entry on both machines
+(`5:write-combining`, Limine's doing), so the first version need not program one — but a kernel that
+relies on the bootloader's table without checking it is a kernel that breaks on the next bootloader.
 
 ## Part H — the installer ⬜
 

@@ -26023,3 +26023,31 @@ missing fact.
 **Left for the fix**: `UC-` is decoded and named but nothing returns it yet, and the fixed ranges
 below 1 MiB are not read — nothing asks about an address down there, and `at` says "unknown" rather
 than guessing.
+
+### The laptop's answer, and the story it falsified (2026-09-16)
+
+The first measurement came back at **2931 MiB/s** over memory the laptop's range registers call
+uncacheable. An uncached write cannot do that. So the cost was never a property of the memory, and
+the sentence this part started from — "every user mapping is write-back, an uncacheable range wins,
+so the framebuffer is slow" — was **half right in a way that would have made the fix look wrong**:
+the kernel's own drawing was already fast, and a fix judged by the console would have measured
+nothing.
+
+What is true is that this framebuffer has **two mappings that disagree**, so the measurement now
+fills the screen twice, with one loop over the same pixels, through both:
+
+| mapping | asks for | a full-screen fill |
+|---|---|---|
+| the console's, made by the bootloader | write-combining | 1368 us — **2924 MiB/s** |
+| a plain one, as `/dev/framebuffer` gets | write-back, overridden to uncacheable | 72930 us — **54 MiB/s** |
+
+**Fifty-four times, and 73 ms for one screen**, which is the "painful" the first boot reported —
+before the compositor has done any compositing. Limine maps the framebuffer write-combining and
+programs the attribute table to have such an entry (`5:write-combining`, on the laptop and under
+QEMU alike); `protection_to_page_flags` then hands userspace a mapping with no attribute at all,
+which lands on entry 0, write-back, which the uncacheable range overrides. **The bootloader did the
+right thing and this kernel drops it at the namespace boundary.**
+
+That is Part G's fix, now with a number to beat: the same fill through `/dev/framebuffer` should
+cost what the console's costs. QEMU shows the *configuration* half of this and not the cost — under
+TCG both fills take the same time — so the gates assert the lines exist and never what they say.
