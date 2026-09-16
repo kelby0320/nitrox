@@ -137,6 +137,19 @@ pub struct NamespaceSpec<'a> {
     /// into a windowed session costs. The serial column binds it because the console *is* its
     /// terminal.
     pub bind_console: bool,
+    /// Bind `/dev/blk` into the session, so it can read and write **whole disks** (Phase 5
+    /// Part H.1).
+    ///
+    /// **False for every ordinary session, and that is the sandbox.** A session with this can
+    /// overwrite any disk in the machine, including the one it booted from; the omission of
+    /// `/dev/blk` is what makes a login safe rather than any check inside a program.
+    ///
+    /// `true` only for an **installer session**, which the live image starts from its own
+    /// boot-menu entry and which exists to write a disk. When elevation arrives
+    /// (`docs/planning/administration.md`) a broker will construct exactly this namespace after
+    /// authenticating, and nothing here changes: the authority is a binding a supervisor made,
+    /// which is what that phase is for.
+    pub bind_blk: bool,
 }
 
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
@@ -210,8 +223,9 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
 /// Construct a session namespace for a login whose home is `home` (an absolute path,
 /// e.g. `/home/alice`): a fresh namespace binding the user's home subtree of the
 /// fs-server at `/home` (RW) and the console at `/dev/console` (so the shell has I/O).
-/// Deliberately **omits** everything else (`/dev/blk`, other homes, the raw fs root) —
-/// absence is the sandbox. Proves `BIND_NAMESPACE` + subtree scoping + shared-
+/// Deliberately **omits** everything else (other homes, the raw fs root) — absence is the
+/// sandbox. `/dev/blk` is omitted too unless [`NamespaceSpec::bind_blk`] asks for it, which only
+/// an installer session does. Proves `BIND_NAMESPACE` + subtree scoping + shared-
 /// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
 /// `root_ns` is session-mgr's inherited namespace (to resolve the console).
 pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
@@ -225,6 +239,7 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
         user,
         bind_fonts,
         bind_console,
+        bind_blk,
     } = *spec;
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
@@ -451,14 +466,145 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
             has_console = true;
         }
     }
+    // **The disks, one at a time** (Phase 5 Part H.1), for an installer session only.
+    //
+    // `/dev/blk` is a *kernel-server* binding and `sys_ns_bind` binds endpoints and direct
+    // handles — a supervisor cannot re-bind a kernel server, and the first draft of this tried
+    // to, which a boot answered with "not in this supervisor's namespace". So the supervisor
+    // resolves each device and binds **it**, which is finer-grained than the registry anyway:
+    // what a session gets is the devices this code decided to hand it, which is the shape the
+    // elevation broker will want when it grants one disk rather than all of them
+    // (`docs/planning/administration.md`).
+    //
+    // Each device's `info` leaf is a snapshot object, so it is resolved once here and bound
+    // beside its device. Device facts do not change while a machine runs — a disk does not
+    // become a partition — and nothing here supports hot-plug.
+    let mut has_blk = false;
+    if bind_blk {
+        let mut bound = 0;
+        for n in 0..MAX_BLOCK_DEVICES {
+            let mut path = [0u8; 20];
+            let dev_len = write_blk_path(&mut path, n, false);
+            let (st, dev) = ns_lookup(
+                root_ns,
+                &path[..dev_len],
+                RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER,
+            );
+            if st != 0 || dev == 0 {
+                break; // the registry is dense; the first miss is the end of it
+            }
+            // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle
+            // bind, so no subtree base.
+            let br = unsafe {
+                syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, dev_len as u64, dev, 0, 0)
+            };
+            // SAFETY: the bind took its own reference; close ours.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
+            if br != 0 {
+                continue;
+            }
+            bound += 1;
+            let info_len = write_blk_path(&mut path, n, true);
+            let (ist, info) = ns_lookup(root_ns, &path[..info_len], RIGHT_MAP_READ | RIGHT_TRANSFER);
+            if ist == 0 && info != 0 {
+                // SAFETY: as above; the info snapshot binds as a direct handle too.
+                let ir = unsafe {
+                    syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, info_len as u64, info, 0, 0)
+                };
+                // SAFETY: closing our own handle.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, info) };
+                if ir != 0 {
+                    kprint(b"libsession: a device's info leaf would not bind\n");
+                }
+            }
+        }
+        has_blk = bound > 0;
+        if has_blk {
+            Line::new()
+                .s(b"libsession: installer session -- ")
+                .u(bound as u64)
+                .s(b" block device(s) reachable")
+                .end();
+        } else {
+            kprint(b"libsession: installer session asked for disks and found none\n");
+        }
+    }
     // SAFETY: single-threaded session-mgr; one namespace is built at a time.
     unsafe {
+        SESSION_HAS_BLK = has_blk;
         SESSION_HAS_BIN = has_bin;
         SESSION_HAS_TTY = has_tty;
         SESSION_HAS_CONSOLE = has_console;
         SESSION_HAS_CLIPBOARD = has_clipboard;
     }
     ns
+}
+
+/// Block devices a session may be handed. The registry is small — a disk, its partitions, any
+/// module — and a session that needed more than this would be a machine nothing here has seen.
+const MAX_BLOCK_DEVICES: usize = 16;
+
+/// Write `/dev/blk/<n>` (or `/dev/blk/<n>/info`) into `out`, returning its length.
+fn write_blk_path(out: &mut [u8; 20], n: usize, info: bool) -> usize {
+    let prefix = b"/dev/blk/";
+    out[..prefix.len()].copy_from_slice(prefix);
+    let mut len = prefix.len();
+    // One or two digits, which `MAX_BLOCK_DEVICES` bounds.
+    if n >= 10 {
+        out[len] = b'0' + (n / 10) as u8;
+        len += 1;
+    }
+    out[len] = b'0' + (n % 10) as u8;
+    len += 1;
+    if info {
+        out[len..len + 5].copy_from_slice(b"/info");
+        len += 5;
+    }
+    len
+}
+
+/// Whether this boot asked for an **installer session**: the word `install` on the kernel's
+/// command line, read from `/proc/cmdline`.
+///
+/// **One reader for both columns.** The serial and graphical session managers each build
+/// namespaces and each must make the same decision; two copies of "does the line contain
+/// `install`" is two places for it to drift. The kernel does not interpret the word — it serves
+/// the line and this looks for it (Phase 5 Part H.1).
+///
+/// A word, not a substring: `installer-notes` on the line is not a request to install.
+pub fn installer_boot(root_ns: u64) -> bool {
+    let (st, mem) = ns_lookup(root_ns, b"/proc/cmdline", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        return false;
+    }
+    // One page is more than any bootloader's line; a longer one is cut, and a word cut in half
+    // does not match.
+    const MAX: usize = 4096;
+    // SAFETY: the leaf answers with a read-only object of the line's length.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, MAX as u64, RIGHT_MAP_READ) };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return false;
+    }
+    // SAFETY: `addr` maps `MAX` readable bytes; the tail past the line is zero.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, MAX) };
+    let found = bytes
+        .split(|b| b.is_ascii_whitespace() || *b == 0)
+        .any(|word| word == b"install");
+    // SAFETY: our own mapping and handle.
+    unsafe {
+        syscall3(SYS_MEMORY_UNMAP, addr as u64, MAX as u64, 0);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
+    found
+}
+
+/// Whether the last-built session namespace got `/dev/blk` — an installer session, and nothing
+/// else. Read for the log line and by the gate that asserts an ordinary session does *not*.
+pub fn session_has_blk() -> bool {
+    // SAFETY: single-threaded session-mgr.
+    unsafe { SESSION_HAS_BLK }
 }
 
 /// Whether the last-built session namespace got its `/bin`. Read only for the log line —
@@ -469,6 +615,7 @@ pub fn session_has_bin() -> bool {
 }
 
 /// Set by [`build_session_namespace`]; see [`session_has_bin`].
+static mut SESSION_HAS_BLK: bool = false;
 static mut SESSION_HAS_BIN: bool = false;
 
 /// Whether the last [`build_namespace`] bound `/dev/console`.

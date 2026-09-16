@@ -30,6 +30,25 @@ pub enum Ignored<'a> {
     BadValue(&'a [u8]),
 }
 
+/// The command line this boot was given, for `/proc/cmdline` to serve.
+///
+/// **Userspace has its own questions about it.** The kernel reads the words it acts on
+/// ([`Flags`]) and nothing else — `install`, which selects the installer session (Phase 5 Part
+/// H.1), means nothing here and everything to `session-mgr`. Rather than the kernel carrying a
+/// list of words it does not use, the line is served whole and each reader looks for its own.
+static LINE: crate::libkern::SpinLock<&'static [u8]> =
+    crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, &[]);
+
+/// Remember the line this boot was given. Called once, at boot, before userspace.
+pub fn record(line: &'static [u8]) {
+    *LINE.lock() = line;
+}
+
+/// The line this boot was given, empty if there was none.
+pub fn line() -> &'static [u8] {
+    *LINE.lock()
+}
+
 /// Parse `line` into [`Flags`], reporting each word it ignores to `ignored`. Words are
 /// separated by ASCII whitespace; a later occurrence of a flag replaces an earlier one.
 pub fn parse<'a>(line: &'a [u8], mut ignored: impl FnMut(Ignored<'a>)) -> Flags {

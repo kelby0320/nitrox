@@ -48,6 +48,8 @@ pub enum KernelServerId {
     /// `/proc/self/status` — the caller's numeric pid/tid as a read-only
     /// [`MemoryObject`] text snapshot (see [`proc_self_status`]).
     ProcSelfStatus,
+    /// `/proc/cmdline` — the command line this boot was given, as text.
+    ProcCmdline,
     /// `/initramfs/<path>` — a file from the boot CPIO blob, served as a
     /// read-only [`MemoryObject`] copy (see [`initramfs_server`]).
     Initramfs,
@@ -117,6 +119,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::ProcSelfThread => proc_self_thread(suffix, requested),
         KernelServerId::ProcSelfNamespace => proc_self_namespace(suffix, requested),
         KernelServerId::ProcSelfStatus => proc_self_status(suffix, requested),
+        KernelServerId::ProcCmdline => proc_cmdline(suffix, requested),
         KernelServerId::Initramfs => initramfs_server(suffix, requested),
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
         KernelServerId::RawInput => raw_input_server(suffix, requested),
@@ -225,6 +228,24 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// lock held. A kernel/boot caller (no owning process) or a non-empty `suffix`
 /// is *not found*. Closes the deferred numeric-`/proc/self/status` item
 /// (`docs/rationale/deferred-decisions.md`).
+/// `/proc/cmdline` — the command line this boot was given, as a fresh read-only
+/// [`MemoryObject`] holding the bytes and nothing else (no trailing newline: it is one line, and
+/// a reader matching words does not want to strip one).
+///
+/// **The kernel does not interpret every word of it.** It reads the flags it acts on at boot
+/// (`cmdline::parse`) and serves the line whole, so a word meant for userspace — `install`, which
+/// selects the installer session (Phase 5 Part H.1) — needs no kernel-side list to survive the
+/// journey. A non-empty `suffix` is *not found*; this is a leaf.
+fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    match MemoryObject::try_new_filled(crate::cmdline::line()) {
+        Ok(obj) => complete_with_memobj(obj),
+        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+    }
+}
+
 fn proc_self_status(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -574,6 +595,7 @@ mod tests {
             KernelServerId::ProcSelfThread,
             KernelServerId::ProcSelfNamespace,
             KernelServerId::ProcSelfStatus,
+            KernelServerId::ProcCmdline,
         ] {
             match dispatch(id, b"sub", Rights::empty()) {
                 OpStatus::Rejected(KError::NotFound) => {}

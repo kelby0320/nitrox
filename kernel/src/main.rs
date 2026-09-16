@@ -177,6 +177,8 @@ fn kernel_main() {
     let cmdline = log_handoff();
     arch::Cpu::log_identity();
     let flags = parse_cmdline(cmdline);
+    // Kept whole for `/proc/cmdline`: the words this kernel does not act on are userspace's.
+    nitrox_kernel::cmdline::record(cmdline);
 
     // Bring up the physical-memory buddy allocator and the slab on top of
     // it. This walks Limine's memory map and pokes the allocator — a likely
@@ -752,7 +754,14 @@ const CMDLINE_MAX: usize = 1024;
 fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
     use nitrox_kernel::cmdline::{self, Ignored};
     let flags = cmdline::parse(line, |ignored| match ignored {
-        Ignored::Unknown(word) => kprintln!("cmdline: ignoring unknown word \"{}\"", Printable(word)),
+        // **Not "ignored": passed on.** The kernel acts on the words it knows and serves the
+        // whole line at `/proc/cmdline`, so a word it does not recognise may still be somebody's
+        // — `install` is `session-mgr`'s (Phase 5 Part H.1). Saying "ignoring" of a word that
+        // decides what the machine does would be the log lying about the boot.
+        Ignored::Unknown(word) => kprintln!(
+            "cmdline: \"{}\" is not a kernel flag; userspace reads it at /proc/cmdline",
+            Printable(word)
+        ),
         Ignored::BadValue(word) => kprintln!(
             "cmdline: \"{}\" has no readable number of seconds — using {}",
             Printable(word),
@@ -1220,6 +1229,14 @@ fn run_first_userspace() {
         (
             &b"/proc/self/status"[..],
             KernelServerId::ProcSelfStatus,
+            proc_self_status_rights,
+        ),
+        // `/proc/cmdline` — the line this boot was given, as text. Not under `/proc/self`: it is
+        // one fact about the machine, the same for every reader. `session-mgr` looks for
+        // `install` in it (Phase 5 Part H.1), and a person debugging a boot wants to see it.
+        (
+            &b"/proc/cmdline"[..],
+            KernelServerId::ProcCmdline,
             proc_self_status_rights,
         ),
     ];

@@ -2459,6 +2459,10 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // a device that fails, so a zeroed partition stops at the line above — but the check reads
     // three blocks, and `init`'s first lookup is still the first read of a file.
     s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
+    // **And this boot is not an installer boot.** The live image's third menu entry starts a
+    // session that can write every disk in the machine; the ordinary entry must not, and absence
+    // is the kind of property that rots silently — nothing fails when a sandbox quietly widens.
+    // Asserted against the whole transcript at the end of the run, below.
     s.expect("desktop-session-mgr: greeter presented")?;
     let took = s.matched_at().saturating_duration_since(mounted);
     if took > LIVE_MOUNT_TO_GREETER {
@@ -2497,6 +2501,20 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     s.send("format(\"live-rows={}\", (open ./live-proof.txt | count))")?;
     s.expect("live-rows=3")?;
     println!("  ok: a file written under /home read back from the RAM disk");
+
+    // **An ordinary live boot reaches no disk** (Phase 5 Part H.1). The live image's third menu
+    // entry starts a session that can write every disk in the machine; this entry must not, and a
+    // widened sandbox is exactly the kind of regression nothing fails on. Asserted over the whole
+    // transcript, because what is being checked is an **absence**.
+    let text = s.transcript();
+    if let Some(line) = text.lines().find(|l| l.contains("installer session")) {
+        return Err(format!(
+            "an ordinary live boot built an installer session: {line:?}. `/dev/blk` reaches a \
+             session only when the boot asked for it (`cmdline: install`), which this one did not"
+        )
+        .into());
+    }
+    println!("  ok: and no session on this boot could reach a disk");
     Ok(())
 }
 
@@ -12116,6 +12134,9 @@ const LIVE_MENU_TIMEOUT_SECS: u32 = 5;
 
 /// The live image's boot-menu entry that boots into the hardware report (Phase 5 Part D.2).
 const LIVE_REPORT_ENTRY: &str = "Nitrox — hardware report";
+/// The live menu's third entry: the installer session. Its `cmdline: install` reaches userspace
+/// through `/proc/cmdline`; the kernel does not act on it.
+const LIVE_INSTALL_ENTRY: &str = "Nitrox — install to this machine";
 
 /// The live image's `limine.conf`, from the release one (`base`): `root.img` as a second module,
 /// and **a menu** — a countdown, the release entry first as the default, and a second entry that
@@ -12156,7 +12177,15 @@ fn live_limine_conf(base: &str) -> R<String> {
     if !report_entry.contains("cmdline: hwreport") {
         return Err("boot/limine.conf's entry has no `path:` line to put the command line beside".into());
     }
-    Ok(format!("{}\n\n{report_entry}\n", with_timeout.trim_end()))
+    // **The installer's own entry** (Phase 5 Part H.1). `install` means nothing to the kernel —
+    // it serves the line at `/proc/cmdline` and `libsession` looks for the word — and what it
+    // selects is a *session* whose namespace includes `/dev/blk`. An ordinary live boot has no
+    // path to a disk, which is the point: authority arrives by choosing this entry, and later by
+    // a broker that authenticates (`docs/planning/administration.md`).
+    let install_entry = default_entry
+        .replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
+        .replacen("\n    path:", "\n    cmdline: install\n    path:", 1);
+    Ok(format!("{}\n\n{report_entry}\n\n{install_entry}\n", with_timeout.trim_end()))
 }
 
 /// Total bytes of the regular files under `dir`.
@@ -13060,7 +13089,7 @@ mod diag_tests {
     }
 
     #[test]
-    fn the_live_menu_boots_the_release_entry_by_default_and_offers_the_report() {
+    fn the_live_menu_boots_the_release_entry_by_default_and_offers_the_report_and_the_installer() {
         let base = fs::read_to_string(limine_conf()).expect("boot/limine.conf is readable");
         let conf = live_limine_conf(&base).expect("the shipped limine.conf is one entry");
         assert_eq!(
@@ -13078,8 +13107,19 @@ mod diag_tests {
              \x20   cmdline: hwreport\n\
              \x20   path: boot():/boot/kernel\n\
              \x20   module_path: boot():/boot/initramfs\n\
+             \x20   module_path: boot():/boot/root.img\n\
+             \n\
+             /Nitrox — install to this machine\n\
+             \x20   protocol: limine\n\
+             \x20   cmdline: install\n\
+             \x20   path: boot():/boot/kernel\n\
+             \x20   module_path: boot():/boot/initramfs\n\
              \x20   module_path: boot():/boot/root.img\n"
         );
+        // **The default entry carries no command line**, which is what keeps an ordinary live
+        // boot sandboxed: `install` is what reaches a session, and only the third entry says it.
+        let first = conf.split("\n\n").nth(1).expect("the default entry");
+        assert!(!first.contains("cmdline:"), "the default entry must pass nothing: {first:?}");
     }
 
     #[test]

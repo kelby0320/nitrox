@@ -313,6 +313,9 @@ fn run_session(
         // Its clients render text, and a constructed namespace has no font without this.
         bind_fonts: true,
         bind_console: false,
+        // **Only on an installer boot** (Phase 5 Part H.1) — the same decision the serial column
+        // makes, from the same reader, because both build sessions and neither may differ.
+        bind_blk: libsession::installer_boot(root_ns),
     });
     if session_ns == 0 {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
