@@ -38,6 +38,45 @@ pub const ROOT_LABEL: &[u8] = b"nitrox-root";
 /// refused rather than written wrongly.
 pub const LOGICAL_BLOCK: u32 = 512;
 
+/// What a run of the installer did, and therefore what it exits with.
+///
+/// **The status answers "did what you asked for happen", not "was anything written".** Asking
+/// what an install *would* do — a device with no identity after it — and being told is a
+/// success: it is a query, it answered, and it says in its own words that nothing was written.
+/// Treating it as a failure made the shell print `pipeline failed` directly underneath a calm
+/// explanation of what to type next, which reads as though something had broken (first install
+/// attempt on the laptop, 2026-09-17).
+///
+/// Asking for an install and not getting one is a failure whatever refused it — a wrong kind of
+/// device, a name that did not match, a disk too small, an I/O error part-way. In all of those
+/// the caller asked for something that did not happen, which is exactly what a non-zero status
+/// is for, and a script that stops on it stops correctly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    /// The devices this session can reach were listed.
+    Listed,
+    /// What an install would do was reported. Nothing was written.
+    Planned,
+    /// The install completed.
+    Installed,
+    /// An install was asked for and did not happen. Nothing was written, or the failure says
+    /// how far it got.
+    NotInstalled,
+    /// The command line was not one this program accepts.
+    Usage,
+}
+
+impl Outcome {
+    /// The process exit status.
+    pub fn status(self) -> i64 {
+        match self {
+            Outcome::Listed | Outcome::Planned | Outcome::Installed => 0,
+            Outcome::NotInstalled => 1,
+            Outcome::Usage => 2,
+        }
+    }
+}
+
 /// Why a target cannot be installed to. Each is a sentence a person can act on, which is why
 /// the numbers travel with the variant rather than being formatted away here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +251,23 @@ mod tests {
         let exact = l.root_first + 24 * 2048 + ARRAY_BLOCKS + 1;
         assert!(plan(exact, 512, 33 * 2048, 24 * 2048).is_ok(), "control: exactly enough");
         assert!(plan(exact - 1, 512, 33 * 2048, 24 * 2048).is_err(), "one block short");
+    }
+
+    /// **A question answered is not a failure.** The two-step confirmation is the *ordinary*
+    /// path through this program — a person is meant to run the one-operand form, read it, and
+    /// then run what it prints — so reporting it as a failure puts `pipeline failed` under
+    /// every correct use of the installer.
+    #[test]
+    fn asking_what_would_happen_succeeds_and_asking_for_an_install_that_did_not_happen_does_not() {
+        assert_eq!(Outcome::Planned.status(), 0, "a plan is an answer, not a failure");
+        assert_eq!(Outcome::Listed.status(), 0);
+        assert_eq!(Outcome::Installed.status(), 0);
+        // And the half that must stay non-zero: a script that asked for an install and did not
+        // get one has to be able to stop.
+        assert_ne!(Outcome::NotInstalled.status(), 0);
+        assert_ne!(Outcome::Usage.status(), 0);
+        // Usage is distinguishable from a refusal, which is the split every program here uses.
+        assert_ne!(Outcome::Usage.status(), Outcome::NotInstalled.status());
     }
 
     /// 4 Kn disks exist, `libgpt` addresses 512-byte blocks throughout, and the difference is

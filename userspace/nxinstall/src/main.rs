@@ -64,12 +64,10 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The program did its job.
-const EXIT_OK: i64 = 0;
-/// It refused, or failed part-way.
+/// What a failure before the program is running exits with — a malformed setup message, or a
+/// panic. Every other status comes from [`nxinstall::Outcome`], which is where the policy is
+/// stated and tested.
 const EXIT_FAILURE: i64 = 1;
-/// It was invoked wrongly.
-const EXIT_USAGE: i64 = 2;
 
 /// How far `/dev/blk/<n>` is scanned. The registry is dense, so the first miss ends the scan;
 /// this only bounds a kernel that grew a hole.
@@ -406,20 +404,18 @@ fn copy(
     Ok(())
 }
 
-/// Everything after the confirmation matched.
-fn install(
-    io: &Io,
-    target: &Device,
-    srcs: &Sources,
-    say: &mut dyn FnMut(&str),
-) -> Result<(), String> {
-    let block = target.info.logical_block_size as u64;
-    let esp_bytes = srcs.esp.info.byte_capacity();
-    let root_bytes = srcs.root_extent.1 * BLOCK as u64;
-    let layout = nxinstall::plan(
+/// Where the two partitions would go on `target`, or why they cannot.
+///
+/// **Worked out before the confirmation, not after it.** A disk that cannot take the install is
+/// refused while the person is still reading the plan, rather than after they have typed its
+/// name back — and the plan can then say how big the root partition would actually be, which is
+/// the number they are agreeing to lose (first install attempt, 2026-09-17).
+fn layout_for(target: &Device, srcs: &Sources) -> Result<nxinstall::Layout, String> {
+    let block = target.info.logical_block_size.max(1) as u64;
+    nxinstall::plan(
         target.info.block_count,
         target.info.logical_block_size,
-        esp_bytes / BLOCK as u64,
+        srcs.esp.info.byte_capacity() / BLOCK as u64,
         srcs.root_extent.1,
     )
     .map_err(|e| match e {
@@ -432,7 +428,20 @@ fn install(
             human(have * block),
             human(need * block)
         ),
-    })?;
+    })
+}
+
+/// Everything after the confirmation matched.
+fn install(
+    io: &Io,
+    target: &Device,
+    srcs: &Sources,
+    layout: &nxinstall::Layout,
+    say: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let block = target.info.logical_block_size as u64;
+    let esp_bytes = srcs.esp.info.byte_capacity();
+    let root_bytes = srcs.root_extent.1 * BLOCK as u64;
 
     let (esp_guid, root_guid) = match (random_guid(), random_guid()) {
         (Some(a), Some(b)) => (a, b),
@@ -580,7 +589,13 @@ fn say_to(stderr: Option<u64>, line: &str) {
 // ---------------------------------------------------------------------------------------------
 
 /// Run, and return the exit status.
-fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>) -> i64 {
+fn run(
+    namespace: u64,
+    argv: &[String],
+    stdout: Option<u64>,
+    stderr: Option<u64>,
+) -> nxinstall::Outcome {
+    use nxinstall::Outcome;
     let mut say = |line: &str| say_to(stderr, line);
 
     let devs = devices(namespace);
@@ -592,7 +607,7 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
                 "no block devices in this session. Installing needs a session that was given \
                  one — the live image's \"install to this machine\" entry.",
             );
-            return EXIT_FAILURE;
+            return Outcome::NotInstalled;
         }
         match stdout {
             Some(h) => emit_devices(h, &devs),
@@ -608,18 +623,18 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
                 }
             }
         }
-        return EXIT_OK;
+        return Outcome::Listed;
     }
     if operands.len() > 2 {
         say("usage: nxinstall [DEVICE [IDENTITY]]");
-        return EXIT_USAGE;
+        return Outcome::Usage;
     }
 
     // The target, by the path the listing printed.
     let wanted = operands[0].as_str();
     let Some(target) = devs.iter().find(|d| d.path() == wanted) else {
         say(&format!("{wanted} is not a block device this session can reach."));
-        return EXIT_FAILURE;
+        return Outcome::NotInstalled;
     };
 
     // **What it is, before what it is called.** The refusals are per-kind because the mistake
@@ -632,20 +647,20 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
                 "{wanted} is a partition, not a disk. An install writes a partition table, which \
                  would destroy the disk this partition is part of."
             ));
-            return EXIT_FAILURE;
+            return Outcome::NotInstalled;
         }
         BlockKind::RamDisk => {
             say(&format!(
                 "{wanted} is memory published as a disk — one of the modules this live system is \
                  running from. Writing it would destroy the running system and survive nothing."
             ));
-            return EXIT_FAILURE;
+            return Outcome::NotInstalled;
         }
         BlockKind::Unknown => {
             say(&format!(
                 "{wanted} does not say what it is, so this installer will not write to it."
             ));
-            return EXIT_FAILURE;
+            return Outcome::NotInstalled;
         }
     }
     if target.info.name().is_empty() {
@@ -653,12 +668,12 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
             "{wanted} reports no model or serial, so there is nothing to confirm it by. This \
              installer will not write to a disk it cannot name."
         ));
-        return EXIT_FAILURE;
+        return Outcome::NotInstalled;
     }
 
     let Some((mem, addr)) = scratch(CHUNK) else {
         say("could not allocate a transfer buffer.");
-        return EXIT_FAILURE;
+        return Outcome::NotInstalled;
     };
     let io = Io { mem, addr };
 
@@ -666,11 +681,19 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
         Ok(s) => s,
         Err(e) => {
             say(&e);
-            return EXIT_FAILURE;
+            return Outcome::NotInstalled;
+        }
+    };
+    let layout = match layout_for(target, &srcs) {
+        Ok(l) => l,
+        Err(e) => {
+            say(&e);
+            return Outcome::NotInstalled;
         }
     };
 
     let identity = target.name();
+    let block = target.info.logical_block_size as u64;
     if operands.len() == 1 {
         say(&format!(
             "{} is {} ({})",
@@ -679,14 +702,18 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
             human(target.info.byte_capacity())
         ));
         say(&format!(
-            "  a boot partition of {} and a root partition of the rest",
-            human(srcs.esp.info.byte_capacity())
+            "  a boot partition of {} and a root partition of {}",
+            human(layout.esp_blocks() * block),
+            human(layout.root_blocks() * block)
         ));
         say("  everything already on that disk is lost");
         say("");
         say("nothing has been written. To go ahead, name the disk back:");
         say(&format!("  nxinstall {} \"{}\"", target.path(), identity));
-        return EXIT_FAILURE;
+        // **A plan is an answer, not a failure** — see `Outcome`. This is the ordinary first
+        // step through the program, and exiting non-zero put `nxsh: pipeline failed` directly
+        // under the line telling a person what to type next.
+        return Outcome::Planned;
     }
 
     if operands[1].as_str() != identity.as_str() {
@@ -695,18 +722,18 @@ fn run(namespace: u64, argv: &[String], stdout: Option<u64>, stderr: Option<u64>
             target.path(),
             identity
         ));
-        return EXIT_FAILURE;
+        return Outcome::NotInstalled;
     }
 
     say(&format!("installing to {} ({})", target.path(), identity));
-    match install(&io, target, &srcs, &mut say) {
+    match install(&io, target, &srcs, &layout, &mut say) {
         Ok(()) => {
             say("done. Remove the installation medium and restart.");
-            EXIT_OK
+            Outcome::Installed
         }
         Err(e) => {
             say(&e);
-            EXIT_FAILURE
+            Outcome::NotInstalled
         }
     }
 }
@@ -728,7 +755,7 @@ pub unsafe extern "C" fn _start(notif: u64, namespace: u64, endpoint: u64, arg0:
         // Spawned without a shell: no `argv`, so the only thing it can do is list.
         None => (Vec::new(), None, None),
     };
-    exit(run(namespace, &argv, stdout, stderr));
+    exit(run(namespace, &argv, stdout, stderr).status());
 }
 
 /// Nothing here is recoverable; say where it happened and stop.

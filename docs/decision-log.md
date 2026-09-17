@@ -26471,3 +26471,35 @@ QEMU never showed it. And partitions were named from zero, where `/dev/sda1`, `s
 firmware all number them from one; the laptop's disk list disagreed with Debian's about which
 partition was which. Both now have host tests, the identity one against this drive's exact
 padding.
+
+## 2026-09-17 — `nxinstall`'s exit status: a question answered is not a failure
+
+The second laptop run printed the plan correctly and then, directly underneath the line telling
+the person what to type next, `nxsh: pipeline failed: 'nxinstall' exited 1`. The shell was right;
+the status was wrong.
+
+**The status answers "did what you asked for happen", not "was anything written".** The
+one-operand form is a *query* — it reports what an install would do and says in its own words
+that nothing was written — and it is the **ordinary first step** through this program, not an
+error path. Exiting non-zero there put a failure line under every correct use of the installer,
+which teaches a person to distrust output they are meant to act on. It is `Outcome::Planned` now,
+and zero.
+
+What stays non-zero is asking for an install and not getting one, whatever refused it: a
+partition, a RAM disk, a disk that cannot be named, a name that did not match, a disk too small,
+an I/O error part-way. There a caller asked for something that did not happen, and a script that
+stops on it stops correctly. The policy lives in `nxinstall::Outcome` with a host test, rather
+than as a scatter of integer returns — there were three constants and five `return EXIT_FAILURE`
+sites, and nothing said which of them were refusals of a request and which were answers to a
+question.
+
+**Two things the same screen prompted.** The layout is now worked out **before** the
+confirmation rather than inside the install, so a disk that cannot take one is refused while the
+person is still reading the plan instead of after they have typed its name back — and the plan
+names the root partition's actual size, which is the number they are agreeing to lose, rather
+than "the rest".
+
+**What no gate can see**: the exit status of a command typed in a *terminal*. `nxsh` reports it
+into the grid, and `check-install` boots a release image whose terminal does not narrate one.
+The policy is host-tested and the wiring is a single `return`; this particular line was confirmed
+from a photograph of the laptop's screen.
