@@ -1380,12 +1380,33 @@ you use when there is no installed system to log into.
 > one group has inodes, both `e2fsck`-clean, and both fail against the old allocators.
 > Locality is *not* attempted — a new inode goes in the first group with a free one rather than
 > near its parent, which is correct and worse for a seek pattern.
-- [ ] **`mkfs.ext4`, layout only**, beside the writer that populates it: superblock, group
+- [x] **`mkfs.ext4`, layout only**, beside the writer that populates it: superblock, group
       descriptors, bitmaps, inode table, root directory. **What `mke2fs` actually gives our images**
       is `ext_attr dir_index filetype extent flex_bg sparse_super large_file huge_file dir_nlink
       extra_isize` with flex groups of 16 — `flex_bg` and `sparse_super` are *layout* on a
       multi-group filesystem, so this either places packed metadata and backup superblocks or
       declares it does not. `e2fsck -fn` is the oracle; our own parser reads it back.
+> **Landed 2026-09-17 as `fs-server-ext4::mkfs`.** It **declares `sparse_super`, `extent`,
+> `filetype`, `large_file`, `huge_file`, `dir_nlink`, `extra_isize` and implements all of them**;
+> `flex_bg` is deliberately *not* declared, because packing several groups' metadata together is
+> an optimisation and a bit set for a layout that is not there describes a filesystem that does
+> not exist. A test reads the feature line back with `dumpe2fs` and holds it to that list, so the
+> claim is run rather than asserted in a comment.
+>
+> **Inodes are capped at about a million** whatever the ratio asks for. Without `metadata_csum`
+> there is no `lazy_itable_init`, so every inode is 256 bytes of zeroes written before the first
+> file exists: at `mke2fs`'s default ratio a 931 GiB disk asks for 61 million, which is 16 GiB to
+> write at install time. A million files is a generous ceiling for a personal machine's root and
+> costs 256 MiB.
+>
+> **The oracle was weaker than it read, and that is the finding worth carrying.** `e2fsck -fn`
+> **exits 0** while printing `Free blocks count wrong (7669, counted=7662). Fix? no` — measured
+> against 1.47.0 — and `assert_e2fsck_clean` had tested the exit status since 2026-07-24. Every
+> test using it was blind to summary-information corruption, which is exactly what a filesystem
+> *writer* gets wrong. It reads the output now; two tests that had hand-rolled their own copy of
+> the invocation call it instead. Under the stronger check every pre-existing writer test still
+> passes, so the code was right — the assurance was not.
+
 - [ ] **`nxinstall` formats and copies**: a filesystem the size of the disk, and the live root
       copied into it file by file through `create_file`/`mkdir_at`. **What it copies from** has to
       be said: H.1's raw copy takes a root a session has been writing to, and dirty pages reach the
