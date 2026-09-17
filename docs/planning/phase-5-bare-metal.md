@@ -1,14 +1,38 @@
 # Nitrox Implementation Plan — Phase 5 — Bare metal
 
 Part of the [Nitrox Implementation Plan index](implementation-plan.md), which holds the
-current status, the full phase list, and the cross-cutting workstreams. Phases 0–4 are
-complete; Phase 5 is active.
+current status, the full phase list, and the cross-cutting workstreams. Phases 0–5 are
+complete.
 
 ---
 
-## Phase 5: Bare metal
+## Phase 5: Bare metal ✅ **complete, 2026-09-17**
 
 **Goal:** Nitrox boots and runs on a real machine, installed on its own disk.
+
+**Done.** The Acer Aspire A315-51 boots Nitrox from its own internal disk with no other
+operating system on it, to a greeter that takes a login from its own keyboard and a terminal
+running `nxsh`. Every clause of the Definition of Done below is met, and the last of them was
+met by `nxinstall` writing the disk from a live USB stick rather than by anything staged from
+a build machine.
+
+**What the machine taught us that QEMU could not**, in the order it happened: the trackpad
+works (the firmware puts it on the i8042's auxiliary port, so Phase 6 owes less than the plan
+said); a full-screen redraw was **45× slower** than it should be, because this kernel dropped
+the bootloader's write-combining attribute at the namespace boundary; an ATA serial is padded
+on whichever end the drive likes, so an identity came back with twelve spaces inside it; a
+program's diagnostics reached **nobody** in a graphical session, because the fallback is COM1
+and this machine has none; a partition-table buffer sized for one block met a disk needing 59;
+and `e2fsck -fn` **exits 0 while reporting problems**, which had made a test helper decorative
+since July. Five of those six were invisible under emulation by construction — the sixth was
+invisible because every fixture was smaller than the structure it tested.
+
+**Left open, recorded rather than fixed**: `copy` and `remove` are slower on real storage than
+a 5400 rpm disk accounts for (`TODO(fs-throughput)`, undiagnosed — the measurement comes
+first); an installed machine's UEFI entry relies on the firmware creating one for
+`\EFI\BOOT\BOOTX64.EFI`, which this firmware does and another might not; and an external
+program's arguments cannot be computed in `nxsh`, found while trying to write a test for this
+phase's own work.
 
 **Why this comes before the portable runtime, networking and the browser.** Everything built
 through Phase 4 has only ever executed under QEMU. That is not a small asterisk: an emulator
@@ -1098,8 +1122,10 @@ memory type for it — the ground Part G stands on. The machine also carries an 
       memory type of the framebuffer's own address, and a timed full-screen fill, so the fix is
       judged against a number rather than an expectation. `arch::memory_types` is the neutral
       interface; the range registers and the page-attribute table stay inside `arch/x86_64`.
-- [ ] A cache-attribute on `MemoryObject`, a way for the namespace server to set it, and a PAT
-      (or MTRR) story.
+- [x] A cache-attribute on `MemoryObject`, ~~a way for the namespace server to set it,~~ and a PAT
+      (or MTRR) story. **The struck-through half was not needed**: the aperture the kernel mints
+      is the only device object userspace maps, so the attribute belongs to the object rather
+      than to whoever binds it. See the deferral's Resolved entry.
 
 The deferral for this says it outright: under QEMU it is harmless and measured to cost nothing,
 but **on real hardware it is a correctness problem** — a PCI framebuffer BAR wants
@@ -1197,9 +1223,9 @@ not the cause of the remaining cost and the next question is what the compositor
 - **The self-hash's read path.** `libdraw::hash::hash_visible` reads the whole framebuffer and only
   the self-test build calls it; it stays correct and costs one slow pass there.
 
-## Part H — the installer ⬜
+## Part H — the installer ✅
 
-- [ ] A sized disk image (the current one is fixed at 128 MiB) and a way to write Nitrox to the
+- [x] A sized disk image (the current one is fixed at 128 MiB) and a way to write Nitrox to the
       internal disk: partition, format, populate, install the bootloader.
 
 The machine is a test machine and its Debian install has no value (maintainer, 2026-09-10), so

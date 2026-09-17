@@ -1395,6 +1395,25 @@ audit) — so they are mirrored here.
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
 
+**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`, undiagnosed.**
+Observed on the laptop, 2026-09-17, copying and then deleting about 180 MB under `/home`:
+both are slower than a 5400 rpm disk accounts for, and both get worse with larger directories
+(maintainer). **This is the first time either has run against real storage** — every previous
+number came from QEMU, where a RAM-backed or host-cached image hides exactly this.
+
+Not diagnosed, and deliberately not guessed at: the honest list of suspects is long and each
+one is separately recorded above. The **quadratic directory scan** predicts the
+worse-with-size half exactly (an insert re-reads a directory's blocks, so N entries cost N²).
+The constant factor has more candidates than that explains: the driver issues **one command at
+a time** with no NCQ; there is **no read-ahead or clustered fill**; the fs-server reads and
+writes metadata **one 4 KiB block per `sys_io_submit`**; and a single file copy is a chain of
+IPC round trips — resolve, create, grow, map, write, sync — none of them batched.
+
+**The measurement comes first**, as it did in Part G, where the plausible explanation was
+wrong: a write-back mapping was blamed for a 45× cost that turned out to be a dropped
+write-combining attribute, and only a number on the real machine settled it. **Trigger**: the
+first time somebody is waiting on it, or the next phase that moves bulk data — which is USB.
+
 **An external program's arguments cannot be computed — `TODO(nxsh-computed-args)`.** Measured
 against the interpreter, 2026-09-17: `copy src format("/home/f-{}.png", i)` is a **parse error**
 (a call cannot sit in argument position); `copy src "/home/f-" ++ i` passes three literal words

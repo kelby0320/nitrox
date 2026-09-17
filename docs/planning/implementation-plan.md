@@ -29,8 +29,8 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 2 — Filesystem and namespace | [phase-2-filesystem-namespace.md](phase-2-filesystem-namespace.md) | ✅ complete (2026-06-26) |
 | 3 — Service ecosystem | [phase-3-service-ecosystem.md](phase-3-service-ecosystem.md) | ✅ complete (2026-07-21) |
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
-| 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | 🚧 active |
-| 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
+| 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
+| 6 — USB | [phase-6-usb.md](phase-6-usb.md) | 🚧 next |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
 | 8 — Networking | [phase-8-networking.md](phase-8-networking.md) | planned |
 | 9 — The browser | [phase-9-browser.md](phase-9-browser.md) | planned |
@@ -343,6 +343,17 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     memory reads it back. QEMU shows the configuration and cannot show the cost, so the laptop
     judged it: a full screen in 1632 us where it took 72930, within 1.2x of the bootloader's own
     mapping, and a desktop that is no longer painful.
+  - **Phase 5 closed 2026-09-17.** The laptop boots Nitrox from its own internal disk, installed
+    by `nxinstall` from a live stick, to a greeter and a terminal — every clause of the phase's
+    Definition of Done. Six things the machine found that QEMU could not are listed in
+    [phase-5-bare-metal.md](phase-5-bare-metal.md); three are left open and recorded rather than
+    fixed, the largest being that `copy` and `remove` are slower on real storage than the disk
+    accounts for (`TODO(fs-throughput)`, undiagnosed — the measurement comes first, as it did in
+    Part G where the plausible explanation was wrong).
+  - **Part H.2 (a filesystem the size of the disk) is complete, 2026-09-17.** Allocation reaches
+    every block group, `fs-server-ext4::mkfs` lays out a filesystem for the partition, and
+    `nxinstall` fills it file by file rather than copying sectors. Confirmed on the laptop by
+    writing about 180 MB where the old install held 112 MiB.
   - **Part H.1 (the installer) is complete, 2026-09-16: the system installs itself.** The live
     image carries the ESP an installed machine boots from as a module on its installer entry
     alone, `libgpt` writes the target's table, and `nxinstall` — an ordinary Nitrox program with

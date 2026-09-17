@@ -26528,3 +26528,47 @@ the live root's 24 MiB — `nxinstall` copies raw sectors, so the filesystem doe
 space around it. H.2 owes both halves: `mkfs.ext4` layout, and cross-group allocation in
 `fs-server-ext4`, whose `alloc_inode`/`alloc_block` still search block group 0 only. Until then
 the installed machine has about 112 MiB to write into.
+
+## 2026-09-17 — Phase 5 closed: it runs on the machine
+
+The Acer Aspire A315-51 boots Nitrox from its own internal disk, with no other operating system
+on it, to a greeter that takes a login from its own keyboard and a terminal running `nxsh`. The
+disk was written by `nxinstall` from a live USB stick. Every clause of the phase's Definition of
+Done is met.
+
+**The phase's argument was about debuggability** — "a `std::thread` bug and an interrupt-routing
+bug look identical from userspace", and every phase built on an untested foundation inherits that
+ambiguity. Judged against that, here is what the machine found and an emulator could not:
+
+- **The trackpad works.** The firmware puts it on the i8042's auxiliary port, so the PS/2 driver
+  already drove it; the plan had assigned a pointer to Phase 6.
+- **A full screen redrew 45× too slowly**, because this kernel dropped the bootloader's
+  write-combining attribute at the namespace boundary. The deferral that predicted this called it
+  a *correctness* problem; it was a performance one, and only the number settled it.
+- **An ATA serial is padded on whichever end the drive chooses.** This Seagate right-justifies,
+  so an identity came back with twelve spaces inside it — and the installer then asked a person to
+  type it back exactly.
+- **A program's diagnostics reached nobody.** A stage's `stderr` was `None` and the fallback is
+  `kprint`, which is COM1; this machine has none. Every program's errors had been going nowhere in
+  a graphical session for as long as QEMU was the only machine.
+- **A partition-table buffer sized for one block met a disk needing 59**, and the installer died
+  with no message — the previous finding is why there was no message.
+- **`e2fsck -fn` exits 0 while reporting problems**, which had made a test helper decorative since
+  July.
+
+**Five of those six were invisible under emulation by construction.** The sixth — the oracle —
+was invisible because nobody had aimed a control at it. The two that were *not* about hardware at
+all are the ones worth carrying forward: a fixture smaller than the structure it tests proves the
+structure works at that size and nothing more, and that mistake was made twice in the same part,
+the second time while fixing the first.
+
+**Left open, recorded rather than fixed.** `copy` and `remove` are slower on real storage than a
+5400 rpm disk accounts for — undiagnosed, and deliberately not guessed at, because Part G is the
+worked example of a plausible explanation being wrong. An installed machine's boot entry relies on
+firmware creating one for `\EFI\BOOT\BOOTX64.EFI`; this firmware does, and that is one machine's
+answer rather than a general one. And `nxsh` cannot compute an external program's arguments, found
+while trying to write the obvious test for this phase's own work.
+
+**Phase 6 — USB — is next**, and it inherits a smaller debt than the plan assumed: the pointer
+question is answered, and the machine that will exercise a USB stack is now one that runs from its
+own disk.
