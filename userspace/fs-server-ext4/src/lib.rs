@@ -943,6 +943,123 @@ mod tests {
         assert!(!line.contains("has_journal"), "there is no journal: {line}");
     }
 
+    /// **More groups than one block of descriptors holds**, which is the case the installer
+    /// died on and no test could reach.
+    ///
+    /// A group-descriptor table is 32 bytes per group: one 1 KiB block describes 32 groups,
+    /// one 4 KiB block describes 128. The laptop's 931 GiB root has **7,452 groups — 59 blocks
+    /// of table** — and the first version of `format` built the whole thing in a single
+    /// one-block buffer, so it indexed past the end at group 128 and panicked. Every fixture
+    /// here was four groups or fewer, 128 bytes of descriptors, so nothing failed until a real
+    /// disk (2026-09-17). This is the same shape as the single-group fixture that hid
+    /// group-0-only allocation, and the lesson is the same: **a fixture smaller than the
+    /// structure it is testing proves the structure works at that size and nothing more.**
+    ///
+    /// **Written to a sparse file, not to memory.** 70 groups of 8 MiB is a 560 MiB filesystem;
+    /// `mkfs` touches a few hundred blocks of it, and the holes read as zeros, so this costs
+    /// about a megabyte of disk and no RAM at all. That is what makes testing a *large*
+    /// filesystem affordable, and the absence of it is why this bug shipped.
+    #[test]
+    fn a_descriptor_table_spanning_several_blocks_is_written_whole() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        /// A [`BlockWriter`] straight onto a file, so unwritten regions stay holes.
+        struct SparseFile(std::cell::RefCell<std::fs::File>);
+        impl BlockReader for SparseFile {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+                let mut f = self.0.borrow_mut();
+                f.seek(SeekFrom::Start(offset)).map_err(|_| FsError::Io)?;
+                f.read_exact(buf).map_err(|_| FsError::Io)
+            }
+        }
+        impl BlockWriter for SparseFile {
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+                let mut f = self.0.borrow_mut();
+                f.seek(SeekFrom::Start(offset)).map_err(|_| FsError::Io)?;
+                f.write_all(buf).map_err(|_| FsError::Io)
+            }
+        }
+
+        let dir = std::env::temp_dir()
+            .join(std::format!("nitrox-mkfs-wide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.ext4");
+        // 70 groups at 1 KiB blocks: 3 blocks of descriptors, and backups in 0, 1, 3, 5, 7,
+        // 9, 25, 27, 49 — nine copies of a table that is not one block.
+        let blocks = 70u64 * 8192;
+        let f = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(blocks * 1024).unwrap();
+        let img = SparseFile(std::cell::RefCell::new(f));
+        let geom = crate::mkfs::format(
+            &img,
+            &crate::mkfs::Params {
+                blocks,
+                block_size: 1024,
+                bytes_per_inode: 16384,
+                uuid: *b"nitrox-wide-uuid",
+                label: *b"nitrox-root\0\0\0\0\0",
+                now: TEST_NOW,
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(geom.groups, 70);
+        assert!(
+            geom.gdt_blocks > 1,
+            "this test means nothing with a one-block table ({} blocks)",
+            geom.gdt_blocks
+        );
+
+        // **The last group's descriptor, read back, before the oracle is asked.** A table
+        // truncated at its first block leaves this one zeroed — and `e2fsck` on a filesystem
+        // that broken does not report it, it *spins*: measured at ten minutes of CPU before
+        // being killed. A test whose failure mode is a hang is not a test, so the cheap,
+        // deterministic claim goes first and the oracle confirms the rest.
+        //
+        // The expected value is re-derived from the documented layout rather than read from
+        // the private helper that wrote it: a group's metadata starts after its superblock
+        // copy and descriptor table, if it has one.
+        let last = geom.groups - 1;
+        let expect = geom.group_start(last)
+            + if geom.has_super(last) { 1 + geom.gdt_blocks as u64 } else { 0 };
+        let mut d = [0u8; 32];
+        img.read_at(
+            (geom.first_data_block as u64 + 1) * 1024 + last as u64 * 32,
+            &mut d,
+        )
+        .unwrap();
+        let bitmap = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as u64;
+        assert_eq!(
+            bitmap, expect,
+            "group {last}'s descriptor is wrong ({bitmap}, expected {expect}) — the table is \
+             {} blocks and only the first was written",
+            geom.gdt_blocks
+        );
+        drop(img);
+
+        // The oracle reads every copy of the table it can find, so a truncated or misplaced
+        // one is its business, not ours to re-derive.
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = std::format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
+        assert!(!text.contains("? no"), "e2fsck found a problem:\n{text}");
+        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
+    }
+
     /// A filesystem large enough to need **backup superblocks past group 1**, which is where
     /// `sparse_super` stops being a rule about small numbers. `e2fsck -b` reads one of the
     /// backups rather than the primary, so it fails if the copy is wrong or in the wrong place

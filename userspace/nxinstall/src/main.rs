@@ -58,7 +58,8 @@ use libkern::handle::{RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, RIGHT_WRITE};
 use libkern::syscall::{
     SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
     SYS_MEMORY_CREATE,
-    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4,
+    SYS_CHANNEL_SEND, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
+    syscall2, syscall4, syscall6,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
@@ -904,13 +905,90 @@ pub unsafe extern "C" fn _start(notif: u64, namespace: u64, endpoint: u64, arg0:
         // Spawned without a shell: no `argv`, so the only thing it can do is list.
         None => (Vec::new(), None, None),
     };
+    // SAFETY: single-threaded, before anything can panic.
+    unsafe { PANIC_SINK = stderr.unwrap_or(0) };
     exit(run(namespace, &argv, stdout, stderr).status());
 }
 
-/// Nothing here is recoverable; say where it happened and stop.
+/// The `stderr` sink, kept for the panic handler.
+///
+/// **Because a panic here reached nobody.** The handler printed through `kprint`, which is
+/// `SYS_DEBUG_KPRINT` and so reaches COM1 and nothing else: on the machine this program is for
+/// there is no COM1, so an out-of-bounds index in `mkfs` showed up as `nxsh: pipeline failed:
+/// 'nxinstall' exited 1` under a screen of progress lines and nothing else at all (the second
+/// laptop install, 2026-09-17). A program whose every other word goes to the terminal has to
+/// say *this* there too — it is the one message where the alternative is a person guessing.
+static mut PANIC_SINK: u64 = 0;
+
+/// A panic message, built without allocating: the heap is the last thing to trust here.
+static mut PANIC_MSG: [u8; 4096] = [0; 4096];
+
+/// Nothing here is recoverable; say where it happened, on the terminal, and stop.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    kprint(b"nxinstall: panic\n");
-    let _ = info;
+    // SAFETY: single-threaded, and nothing runs after this.
+    unsafe {
+        let buf = &mut *(&raw mut PANIC_MSG);
+        let mut n = 0usize;
+        let mut put = |bytes: &[u8], n: &mut usize| {
+            let take = bytes.len().min(buf.len().saturating_sub(*n + 1));
+            buf[*n..*n + take].copy_from_slice(&bytes[..take]);
+            *n += take;
+        };
+        put(b"nxinstall: stopped by an internal error", &mut n);
+        if let Some(loc) = info.location() {
+            put(b" at ", &mut n);
+            put(loc.file().as_bytes(), &mut n);
+            put(b":", &mut n);
+            // The line number, without `format!`.
+            let mut line = loc.line();
+            let mut digits = [0u8; 10];
+            let mut d = digits.len();
+            loop {
+                d -= 1;
+                digits[d] = b'0' + (line % 10) as u8;
+                line /= 10;
+                if line == 0 || d == 0 {
+                    break;
+                }
+            }
+            put(&digits[d..], &mut n);
+        }
+        put(b". Nothing further was written.\n", &mut n);
+        kprint(&buf[..n]);
+        let sink = (&raw const PANIC_SINK).read();
+        if sink != 0 {
+            raw_send(sink, &buf[..n]);
+        }
+    }
     exit(EXIT_FAILURE);
 }
+
+/// Send one message on a channel without allocating — what the panic handler needs, where
+/// `IpcPort` would box a 4 KiB buffer.
+fn raw_send(channel: u64, payload: &[u8]) {
+    const OFF_PAYLOAD_LEN: usize = 4;
+    const OFF_PAYLOAD: usize = 24;
+    // SAFETY: single-threaded; this static is used by nothing else.
+    unsafe {
+        let msg = &mut *(&raw mut RAW_MSG);
+        let n = payload.len().min(msg.len() - OFF_PAYLOAD);
+        msg[..OFF_PAYLOAD].fill(0);
+        msg[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(n as u32).to_le_bytes());
+        msg[OFF_PAYLOAD..OFF_PAYLOAD + n].copy_from_slice(&payload[..n]);
+        let no_handles = [0u64; 1];
+        // Non-blocking: a full channel is not worth hanging a dying process over.
+        syscall6(
+            SYS_CHANNEL_SEND,
+            channel,
+            msg.as_ptr() as u64,
+            no_handles.as_ptr() as u64,
+            0,
+            libkern::abi::SENDMODE_NOBLOCK,
+            0,
+        );
+    }
+}
+
+/// The panic handler's outgoing message.
+static mut RAW_MSG: [u8; 4096] = [0; 4096];

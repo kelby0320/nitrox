@@ -365,27 +365,7 @@ pub fn format<W: BlockWriter>(
     w.write_at(root_off, &inode)?;
 
     // --- the group descriptors, then the superblock and its backups -------------------
-    let mut descs = [0u8; MAX_BLOCK];
     let free = g.free_blocks();
-    for group in 0..g.groups {
-        let meta = g.metadata_start(group);
-        let mut d = [0u8; DESC_SIZE as usize];
-        wr_u32(&mut d, 0, meta as u32); // bg_block_bitmap_lo
-        wr_u32(&mut d, 4, (meta + 1) as u32); // bg_inode_bitmap_lo
-        wr_u32(&mut d, 8, (meta + 2) as u32); // bg_inode_table_lo
-        let mut gfree = g.blocks_in_group(group) as u64 - g.overhead(group);
-        let mut ifree = g.inodes_per_group;
-        if group == 0 {
-            gfree -= 1; // the root directory's block
-            ifree -= FIRST_INO - 1;
-            wr_u16(&mut d, 16, 1); // bg_used_dirs_count_lo: the root
-        }
-        wr_u16(&mut d, 12, gfree as u16); // bg_free_blocks_count_lo
-        wr_u16(&mut d, 14, ifree as u16); // bg_free_inodes_count_lo
-        let at = group as usize * DESC_SIZE as usize;
-        descs[at..at + DESC_SIZE as usize].copy_from_slice(&d);
-    }
-
     let mut sb = [0u8; 1024];
     wr_u32(&mut sb, 0, g.inodes_count);
     wr_u32(&mut sb, 4, g.blocks_count as u32);
@@ -416,8 +396,36 @@ pub fn format<W: BlockWriter>(
     wr_u32(&mut sb, 264, p.now as u32); // s_mkfs_time
     wr_u16(&mut sb, 348, EXTRA_ISIZE); // s_min_extra_isize
     wr_u16(&mut sb, 350, EXTRA_ISIZE); // s_want_extra_isize
-    write_super_and_gdt(w, &g, &sb, &descs)?;
+    write_super_and_gdt(w, &g, &sb)?;
     Ok(g)
+}
+
+/// One group's descriptor.
+///
+/// Computed on demand rather than held in a table, which is the whole reason this is a
+/// function: the table for a 931 GiB disk is 7,452 descriptors — **238 KiB, or 59 blocks** —
+/// and the first version of this built it in a single one-block buffer. It indexed past the
+/// end at group 128 and the installer died on a real disk with no message, because a panic in
+/// a program whose diagnostics go to the terminal prints through `kprint` instead. The gate's
+/// filesystem has four groups, 128 bytes of descriptors, so nothing under QEMU could reach it
+/// — the same shape of blindness as the single-group fixture that hid group-0-only allocation
+/// (2026-09-17).
+fn descriptor(g: &Geometry, group: u32) -> [u8; DESC_SIZE as usize] {
+    let meta = g.metadata_start(group);
+    let mut d = [0u8; DESC_SIZE as usize];
+    wr_u32(&mut d, 0, meta as u32); // bg_block_bitmap_lo
+    wr_u32(&mut d, 4, (meta + 1) as u32); // bg_inode_bitmap_lo
+    wr_u32(&mut d, 8, (meta + 2) as u32); // bg_inode_table_lo
+    let mut gfree = g.blocks_in_group(group) as u64 - g.overhead(group);
+    let mut ifree = g.inodes_per_group;
+    if group == 0 {
+        gfree -= 1; // the root directory's block
+        ifree -= FIRST_INO - 1;
+        wr_u16(&mut d, 16, 1); // bg_used_dirs_count_lo: the root
+    }
+    wr_u16(&mut d, 12, gfree as u16); // bg_free_blocks_count_lo
+    wr_u16(&mut d, 14, ifree as u16); // bg_free_inodes_count_lo
+    d
 }
 
 /// Write the superblock and descriptor table into group 0 and every backup group.
@@ -428,10 +436,12 @@ fn write_super_and_gdt<W: BlockWriter>(
     w: &W,
     g: &Geometry,
     sb: &[u8; 1024],
-    descs: &[u8],
 ) -> Result<(), FsError> {
     let bs = g.block_size as u64;
-    let gdt_bytes = g.gdt_blocks as usize * g.block_size as usize;
+    // **A block of descriptors at a time**, filled from [`descriptor`]. The table is 59 blocks
+    // on a terabyte, and this library holds one block of scratch.
+    let per_block = (g.block_size / DESC_SIZE) as usize;
+    let mut block = [0u8; MAX_BLOCK];
     for group in 0..g.groups {
         if !g.has_super(group) {
             continue;
@@ -447,7 +457,19 @@ fn write_super_and_gdt<W: BlockWriter>(
             (start * bs, (start + 1) * bs)
         };
         w.write_at(sb_at, &copy)?;
-        w.write_at(gdt_at, &descs[..gdt_bytes])?;
+        for b in 0..g.gdt_blocks as usize {
+            block[..g.block_size as usize].fill(0);
+            for i in 0..per_block {
+                let described = (b * per_block + i) as u32;
+                if described >= g.groups {
+                    break;
+                }
+                let at = i * DESC_SIZE as usize;
+                block[at..at + DESC_SIZE as usize]
+                    .copy_from_slice(&descriptor(g, described));
+            }
+            w.write_at(gdt_at + b as u64 * bs, &block[..g.block_size as usize])?;
+        }
     }
     Ok(())
 }
