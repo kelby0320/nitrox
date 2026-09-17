@@ -61,12 +61,16 @@ backward-compatible).
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
 `docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a
 deferral recorded only in a crate `CLAUDE.md` is one nobody reviews): extent-tree splitting
-/ index nodes (depth > 0), cross-group inode/block allocation (creation is **group 0
-only**), `metadata_csum` checksums, and jbd2 journaling + replay (the fixtures are
-`^has_journal`). Overwrite is data-only (no metadata change) and is the kernel's writeback;
+/ index nodes (depth > 0), `metadata_csum` checksums, and jbd2 journaling + replay (the
+fixtures are `^has_journal`). Overwrite is data-only (no metadata change) and is the kernel's writeback;
 the server allocates on growth + creation but never touches file data (Model A).
 
-**Now implemented** (was deferred): truncate (2026-07-24), rename, delete, and
+**Now implemented** (was deferred): **cross-group allocation** (2026-09-17) — both
+allocators walk every block group, so a filesystem is as large as the disk rather than as
+large as group 0; the trigger was the installer making a 931 GiB root that held 112 MiB.
+**Test fixtures default to a single group** (4,096 blocks against 8,192 per group), which is
+why nothing caught it: use `fixture_blocks` when what you are changing can run out of one.
+Also truncate (2026-07-24), rename, delete, and
 **growing a full directory** (2026-07-29) — a directory whose blocks are all full gains
 another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries.
 

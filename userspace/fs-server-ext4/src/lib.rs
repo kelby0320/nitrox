@@ -148,6 +148,27 @@ pub(crate) mod test_support {
     pub(crate) const TEST_NOW: i64 = 1_784_900_730;
 
     pub(crate) fn fixture(block_size: u32, content: &[u8]) -> Vec<u8> {
+        fixture_blocks(block_size, 4096, 0, content)
+    }
+
+    /// [`fixture`], with the filesystem's size in blocks chosen by the caller.
+    ///
+    /// **For crossing a block group.** `mke2fs` puts `8 * block_size` blocks in a group, so
+    /// the 4096-block default is a single group and no test built on it can reach a second
+    /// one — which is how "creation is group 0 only" went unnoticed until a real disk was
+    /// partitioned (Phase 5 Part H.2). At 1 KiB blocks a group is 8,192 blocks, so 24,576
+    /// gives three, the last of them deliberately short: 24,575 addressable blocks do not
+    /// divide by 8,192, and the bitmap's spare bits address nothing.
+    ///
+    /// `bytes_per_inode` is `mke2fs -i`, or `0` to let it choose. A large ratio gives *few*
+    /// inodes per group, which is how a test can exhaust group 0's inodes by creating a
+    /// couple of hundred files instead of eight thousand.
+    pub(crate) fn fixture_blocks(
+        block_size: u32,
+        blocks: u32,
+        bytes_per_inode: u32,
+        content: &[u8],
+    ) -> Vec<u8> {
         // A unique dir per call (cargo runs tests in parallel threads) so they
         // never share / remove each other's staging tree.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -162,14 +183,18 @@ pub(crate) mod test_support {
             .write_all(content)
             .unwrap();
         let img = dir.join("rootfs.ext4");
-        let status = Command::new("mke2fs")
-            .args(["-q", "-F", "-t", "ext4"])
+        let mut cmd = Command::new("mke2fs");
+        cmd.args(["-q", "-F", "-t", "ext4"])
             .args(["-O", "^has_journal,^64bit,^metadata_csum,^resize_inode"])
-            .args(["-b", &block_size.to_string()])
+            .args(["-b", &block_size.to_string()]);
+        if bytes_per_inode != 0 {
+            cmd.args(["-i", &bytes_per_inode.to_string()]);
+        }
+        let status = cmd
             .arg("-d")
             .arg(&dir)
             .arg(&img)
-            .arg("4096") // blocks
+            .arg(blocks.to_string())
             .status()
             .expect("mke2fs must be installed (e2fsprogs) to run fs-server-ext4 tests");
         assert!(status.success(), "mke2fs failed");
@@ -182,7 +207,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture};
+    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture, fixture_blocks};
 
     #[test]
     fn reads_current_generation_1k_blocks() {
@@ -761,6 +786,78 @@ mod tests {
     }
 
     /// Run `e2fsck -fn` over an image and assert it is clean (no changes needed, no errors).
+    /// **A file bigger than block group 0**, which is the whole of Part H.2's first box.
+    ///
+    /// Before cross-group allocation this failed with `TooLarge` while `dumpe2fs` showed most
+    /// of the filesystem free — and the number that matters is not this fixture's but the
+    /// laptop's: a 931 GiB root confined to group 0 held about 112 MiB. **No existing test
+    /// could have caught it**, because every fixture was 4,096 blocks and a group is 8,192, so
+    /// the second group did not exist to fail to reach.
+    ///
+    /// The physical block numbers are the assertion. A size assertion passes with the
+    /// allocator confined to group 0 — it would simply have failed earlier — and `e2fsck`
+    /// alone would pass on a filesystem that allocated nothing.
+    #[test]
+    fn a_file_grows_past_block_group_0_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        // Three groups of 8,192 1 KiB blocks. `flex_bg` packs all three groups' metadata into
+        // group 0, so group 0 has roughly 6,600 free data blocks and groups 1 and 2 are empty.
+        let rw = RwImage(RefCell::new(fixture_blocks(1024, 24576, 0, b"x\n")));
+        ext4::create_file(&rw, b"/", b"big", TEST_NOW).unwrap();
+        let size = 9 * 1024 * 1024; // 9,216 blocks — past what group 0 can hold
+        assert_eq!(ext4::grow_file(&rw, b"/big", size, TEST_NOW).unwrap(), size);
+        assert_eq!(ext4::stat_file(&rw, b"/big").unwrap(), size);
+
+        // Every block the file got, and the highest of them.
+        let mut runs = [BlockRun::default(); 8];
+        let n = ext4::map_range(&rw, b"/big", 0, 16384, &mut runs).unwrap();
+        let highest = runs[..n]
+            .iter()
+            .filter(|r| r.device_lba != 0)
+            .map(|r| r.device_lba + r.length as u64 - 1)
+            .max()
+            .expect("a grown file has blocks");
+        assert!(
+            highest > 8192,
+            "every block landed inside group 0 (highest {highest}), so the file cannot be \
+             {size} bytes — group 0 holds 8,192 blocks including all three groups' metadata"
+        );
+        // And nothing was placed past the end of the filesystem, which is the other half of
+        // the last group's short tail.
+        assert!(highest < 24576, "block {highest} is past the end of the device");
+        assert_e2fsck_clean(&rw.0.into_inner(), "grow-cross-group");
+    }
+
+    /// **More files than one group has inodes**, the other half of the same box.
+    ///
+    /// `-i 65536` gives this fixture 128 inodes per group, so the 129th file is the first that
+    /// cannot come from group 0. The assertion is that every create succeeds *and* that an
+    /// inode number exceeds what a group holds — read out of the superblock rather than
+    /// written down here, since `mke2fs` chooses it.
+    #[test]
+    fn more_files_than_group_0_holds_inodes_for_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let img = fixture_blocks(1024, 24576, 65536, b"x\n");
+        let per_group = rd_u32(&img[1024..2048], 40);
+        assert!(per_group > 0 && per_group < 200, "expected a small inode ratio, got {per_group}");
+        let rw = RwImage(RefCell::new(img));
+
+        let want = per_group as usize + 40;
+        let mut highest = 0u32;
+        for i in 0..want {
+            let name = std::format!("f{i:04}");
+            let ino = ext4::create_file(&rw, b"/", name.as_bytes(), TEST_NOW)
+                .unwrap_or_else(|e| panic!("create {name} (number {i}) failed: {e:?}"));
+            highest = highest.max(ino);
+        }
+        assert!(
+            highest > per_group,
+            "{want} files all fit in the {per_group} inodes of group 0 (highest inode \
+             {highest}), which cannot be true"
+        );
+        assert_e2fsck_clean(&rw.0.into_inner(), "inodes-cross-group");
+    }
+
     fn assert_e2fsck_clean(img: &[u8], tag: &str) {
         let dir = std::env::temp_dir()
             .join(std::format!("nitrox-{}-{}", tag, std::process::id()));

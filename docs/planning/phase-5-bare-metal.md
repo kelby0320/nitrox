@@ -1365,9 +1365,21 @@ you use when there is no installed system to log into.
 
 **H.2 — a filesystem the size of the disk.**
 
-- [ ] **Cross-group allocation** in `fs-server-ext4` — `alloc_inode` and `alloc_block` beyond group
+- [x] **Cross-group allocation** in `fs-server-ext4` — `alloc_inode` and `alloc_block` beyond group
       0 — and the deferral moves out of `deferred-decisions.md`. Without it a "filesystem the size
       of the disk" holds about 112 MiB.
+> **Landed 2026-09-17.** `alloc_block` scans outward from the goal's group and `alloc_inode` takes
+> the first group with a free inode, each **clamped to the last group's short tail** — a bitmap
+> always has `blocks_per_group` bits, so a filesystem whose size is not a whole number of groups
+> ends with bits that address nothing. A group whose descriptor says zero free is skipped without
+> reading its bitmap, because the alternative is reading 7,600 of them on a terabyte.
+>
+> **Why no test caught it: every fixture was one group.** `mke2fs` puts `8 * block_size` blocks in
+> a group and the fixture built 4,096, so the second group did not exist to fail to reach. There
+> is a `fixture_blocks` now; the two new tests grow a file past group 0 and create more files than
+> one group has inodes, both `e2fsck`-clean, and both fail against the old allocators.
+> Locality is *not* attempted — a new inode goes in the first group with a free one rather than
+> near its parent, which is correct and worse for a seek pattern.
 - [ ] **`mkfs.ext4`, layout only**, beside the writer that populates it: superblock, group
       descriptors, bitmaps, inode table, root directory. **What `mke2fs` actually gives our images**
       is `ext_attr dir_index filetype extent flex_bg sparse_super large_file huge_file dir_nlink
