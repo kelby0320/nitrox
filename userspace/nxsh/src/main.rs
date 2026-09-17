@@ -41,7 +41,7 @@ use libkern::syscall::{
     syscall3, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
-use libstream::channel::{ChannelReceiver, ChannelSink, IpcPort};
+use libstream::channel::{ChannelSink, IpcPort, MsgPort};
 use libstream::wire::ByteSink;
 use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup_env};
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
@@ -116,7 +116,11 @@ fn signalled(n: i64, handle: u64) -> bool {
 
 /// One message off the pipeline's shared `stderr`, staged before it goes to the terminal.
 static mut ERR_MSG: [u8; 4096] = [0; 4096];
-static mut ERR_HANDLES: [u64; 8] = [0; 8];
+/// Slots for handles a message transfers. Named as a constant rather than read back off the
+/// static: `ERR_HANDLES.len()` is a shared reference to a mutable static, which this edition
+/// denies.
+const ERR_HANDLES_LEN: usize = 8;
+static mut ERR_HANDLES: [u64; ERR_HANDLES_LEN] = [0; ERR_HANDLES_LEN];
 static mut ERR_COUNT: usize = 0;
 
 /// Write every diagnostic waiting on `err` to the terminal, and do not block.
@@ -149,6 +153,18 @@ fn drain_diagnostics(err: u64, tty: u64) {
             if rr != 0 {
                 break; // WouldBlock (nothing waiting) or the last stage has closed its end
             }
+            // **Close anything transferred, because `sys_channel_recv` *installs* it.** A
+            // diagnostic is text and carries no handles, but this endpoint is not a trusted
+            // one: every program the shell spawns holds a `SEND` duplicate of it, so what
+            // arrives here is whatever a stage sent. Leaving them installed leaks one handle
+            // per message until the table is full, at which point the shell's *spawn* path
+            // starts failing for reasons that have nothing to do with the command being run
+            // (PR #309 review, 3). This is why the `TTY_*` drain two screens up needs no such
+            // loop: that channel is served by `tty-server`, which sends no handles.
+            for i in 0..ERR_COUNT.min(ERR_HANDLES_LEN) {
+                syscall1(SYS_HANDLE_CLOSE, ERR_HANDLES[i]);
+            }
+            ERR_COUNT = 0;
             let len =
                 u32::from_le_bytes([ERR_MSG[4], ERR_MSG[5], ERR_MSG[6], ERR_MSG[7]]) as usize;
             let text = core::slice::from_raw_parts(
@@ -277,9 +293,12 @@ impl Host for NitroxHost {
         // somewhere a person can see. The shell drains this into the terminal it already
         // writes its prompt and results to.
         //
-        // Deep enough that a stage reporting progress through a long job is never waiting on
-        // the shell to read: a send commits to a bounded pending-sender queue before it
-        // blocks, so the effective slack is larger than this again.
+        // **The slack is 36 messages, and that is a bound rather than a reassurance.** A stage
+        // sends with `SENDMODE_BLOCK`, so a full ring does not fail — it *blocks the stage*
+        // once the kernel's pending-sender queue is also full, and that queue is
+        // `IpcChannel::MAX_PENDING_SENDS`, which is 4. So a stage stops making progress at its
+        // 37th unread diagnostic, and the shell must be draining by then. It drains at every
+        // point it waits; the one window left is named at the feed below (PR #309 review, 4).
         let (err_rx, err_tx) =
             pipe(32).map_err(|_| String::from("could not create a diagnostic channel"))?;
 
@@ -310,6 +329,17 @@ impl Host for NitroxHost {
             // handle to two stages would leave the second with nothing.
             // SAFETY: register-only syscall on a channel endpoint this shell owns.
             let err_dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, err_tx, RIGHT_SEND | RIGHT_TRANSFER) };
+            if err_dup <= 0 {
+                // **Say so rather than degrade quietly.** A stage with no `stderr` falls back
+                // to `kprint`, which on a machine with no serial port reaches nobody — the
+                // exact failure this plumbing exists to close, and it would reappear with
+                // nothing said anywhere (PR #309 review, 6). The stage still runs: losing its
+                // diagnostics is worse than not running it, but not by enough to refuse.
+                self.say(&alloc::format!(
+                    "nxsh: `{}` gets no diagnostic channel; its errors go to the kernel log\n",
+                    spec.program
+                ));
+            }
             let streams = Streams {
                 stdin: upstream.take(),
                 stdout: Some(tx),
@@ -343,20 +373,31 @@ impl Host for NitroxHost {
             }
         }
 
+        // **Close the shell's own write end before anything else can block.** Every stage
+        // holds a duplicate, so the read end reports end-of-stream once the last of them is
+        // gone — and until this is closed it never would, because the shell would still be a
+        // writer.
+        // SAFETY: closing our own handle; the stages hold their duplicates.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, err_tx) };
+
         // Feed the head stage only once everything downstream is running.
+        //
+        // **The one window where the shell is not draining.** `put` blocks on a depth-4 pipe,
+        // so a head stage that has stopped reading its `stdin` stops the shell here — and a
+        // stage blocked on its 37th unread diagnostic is exactly such a stage. Draining either
+        // side of the feed narrows it to the duration of one `put` rather than closing it; a
+        // real fix is an interleaved send, which is a change to `ChannelSink` rather than to
+        // this caller. Named rather than papered over (PR #309 review, 4): it needs a head
+        // stage that emits 37 diagnostics *before* reading a byte of input.
         if let (Some(tx), Some(bytes)) = (feed, input) {
+            drain_diagnostics(err_rx, self.tty);
             let mut sender = ChannelSink::new(IpcPort::new(tx), libkern::abi::IPC_PAYLOAD_SIZE);
             let _ = sender.put(bytes);
             let _ = sender.finish();
             // SAFETY: closing our write end so the stage sees the stream end.
             unsafe { syscall1(SYS_HANDLE_CLOSE, tx) };
+            drain_diagnostics(err_rx, self.tty);
         }
-
-        // **Close the shell's own write end.** Every stage holds a duplicate, so the read
-        // end reports end-of-stream once the last of them is gone — and until this is
-        // closed it never would, because the shell would still be a writer.
-        // SAFETY: closing our own handle; the stages hold their duplicates.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, err_tx) };
 
         // Read the tail *before* reaping: a stage that has filled its channel is waiting
         // for this reader, so reaping first would deadlock any producer larger than one
@@ -375,6 +416,15 @@ impl Host for NitroxHost {
             // whole job with the shell sitting in this wait, and diagnostics buffered until
             // it finished would arrive as a wall of text after the fact. Without a
             // terminal they go to the kernel log, which is where they went before.
+            // **One loop that waits, drains and reads.** The tail's messages are taken one
+            // at a time here rather than by `ChannelReceiver::receive`, which loops on `rx`
+            // alone with no timeout — so nothing drained the diagnostics while a long output
+            // was being read, and a stage blocked on its 37th unread diagnostic would never
+            // send its `last` message. Neither side moves after that (PR #309 review, 4).
+            let mut port = IpcPort::new(rx);
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut complete = false;
+            let mut overflowed = false;
             loop {
                 // **Poll before blocking.** A channel signals its waiters at the moment
                 // a message is enqueued, so a waiter that arrives *afterwards* never
@@ -408,28 +458,40 @@ impl Host for NitroxHost {
                         u64::MAX,
                     )
                 };
-                // **Which handle woke matters now that three can.** Breaking on any wake
-                // would treat an arriving diagnostic as though the tail had spoken, and the
-                // blocking read below would then sit on output that is not there — while
-                // the stage filled the diagnostic channel behind it.
-                if waited < 1 || signalled(waited, rx) {
-                    break; // the tail has something to say, or the wait failed
+                if waited < 1 {
+                    break; // the wait failed; there is nothing more to read
                 }
-                drain_diagnostics(err_rx, self.tty);
-                if self.tty != 0 && drain_tty_interrupt(self.tty) {
-                    for &c in &children {
-                        // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-                        unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+                // **Which handle woke matters, and only `rx` means output.** Reading on any
+                // wake would block on a message that is not there — the diagnostic channel
+                // and the terminal both signal this wait too.
+                if signalled(waited, rx) {
+                    match port.recv(&mut bytes) {
+                        // The `last` marker: the stream is whole.
+                        Ok(true) => {
+                            complete = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        // The peer closed without finishing. What arrived is a fragment of a
+                        // typed stream, which is not something to hand the evaluator — the
+                        // same judgement `ChannelReceiver::receive` makes by returning an
+                        // error, kept here now that the loop is this caller's.
+                        Err(_) => break,
+                    }
+                    // Checked as it accumulates rather than at the end, so an unbounded
+                    // producer is stopped by the cap instead of by the allocator.
+                    if bytes.len() > MAX_CAPTURE {
+                        overflowed = true;
+                        break;
                     }
                 }
             }
-            if let Ok(bytes) = ChannelReceiver::new(IpcPort::new(rx)).receive() {
-                if bytes.len() > MAX_CAPTURE {
-                    return Err(String::from("a stage produced more output than nxsh will hold"));
-                }
-                if !bytes.is_empty() {
-                    output = Some(bytes);
-                }
+            drain_diagnostics(err_rx, self.tty);
+            if overflowed {
+                return Err(String::from("a stage produced more output than nxsh will hold"));
+            }
+            if complete && !bytes.is_empty() {
+                output = Some(bytes);
             }
             // SAFETY: closing our read end.
             unsafe { syscall1(SYS_HANDLE_CLOSE, rx) };

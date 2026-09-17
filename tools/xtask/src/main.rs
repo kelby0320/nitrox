@@ -2422,7 +2422,8 @@ const TARGET_MIB: u64 = 512;
 /// installer typed at the shell in it. Nothing here reads the terminal's grid — a release image
 /// deliberately does not narrate it — so what the gate asserts on is the kernel log: the module
 /// the install entry loads, the devices the session and then the shell hand on, and the
-/// milestones `nxinstall` records for a destructive operation.
+/// milestones `nxinstall` records for a destructive operation — including the *refusal* of one,
+/// which is an event in its own right and the only part of a refusal a gate can see.
 ///
 /// The second boot is the only assertion that really matters: the disk alone, no stick, and a
 /// greeter on it.
@@ -2660,6 +2661,12 @@ fn run_install_steps(
     //    checked for that after the install that follows has succeeded, which is what stops the
     //    absence from being satisfied by an installer that never ran at all.
     type_at_terminal(qmp, &format!("nxinstall /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
+    // **The positive half, and it is what makes the absence below mean anything.** An
+    // absence alone is satisfied by a command that never ran, by a character going astray so
+    // the operand named nothing, and by a refusal for the wrong *reason* — the name check
+    // rather than the kind check. This line says which check fired (PR #309 review, 7).
+    session.expect("nxinstall: refused /dev/blk/1: it is a ram disk, not a disk")?;
+    println!("  ok: the RAM disk was refused for being one, named correctly");
 
     // 8. The installer, typed at the shell in it.
     //
@@ -12625,7 +12632,7 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
     let conf = work.join("limine.conf");
     fs::write(&conf, live_limine_conf(&fs::read_to_string(limine_conf())?)?)?;
 
-    // 3. The stick: one ESP big enough for all of it.
+    // 4. The stick: one ESP big enough for all of it.
     let payload = [bootx64, kernel, initramfs, root_img.as_path(), install_esp.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))

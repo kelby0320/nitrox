@@ -198,6 +198,27 @@ mod tests {
         assert!(l.root_blocks() > 900 * 2048, "a 1 GiB disk should yield most of itself");
     }
 
+    /// **An ESP that is not a whole number of MiB**, which is the only input that makes the
+    /// assertion above mean anything. Every other test here passes a 33 MiB source, and
+    /// `ESP_FIRST + 33 * 2048` is already aligned — so `align_up` was the identity on the whole
+    /// suite, and deleting it left all seven tests passing (PR #309 review, blocking 1).
+    ///
+    /// The real input is `byte_capacity() / 512` of whatever RAM disk the module became.
+    /// `assemble_live_image` happens to size that to a whole MiB today, so `check-install`
+    /// cannot see this either; size it to its contents instead, or copy from anywhere else, and
+    /// nothing but this test stands between a misaligned partition and every write to it
+    /// costing a read-modify-write of the neighbouring physical sector.
+    #[test]
+    fn an_esp_that_is_not_a_whole_number_of_mib_still_aligns_the_root() {
+        let odd = plan(2 * 1024 * 1024, 512, 33 * 2048 + 1, 24 * 2048).expect("still fits");
+        assert_eq!(odd.esp_last, ESP_FIRST + 33 * 2048, "the ESP is its own size, unrounded");
+        assert_eq!(odd.root_first % ALIGN, 0, "and the root still starts on a boundary");
+        assert_eq!(odd.root_first, 35 * 2048, "the next boundary after the ESP, not the block after it");
+        // The control, stated here rather than inferred: without rounding, the root would start
+        // on the block straight after the ESP, which this asserts is *not* where it is.
+        assert_ne!(odd.root_first, odd.esp_last + 1);
+    }
+
     /// The failure `libgpt`'s own `last_usable` test exists for, from the other side: a root
     /// partition that runs into the backup array boots fine and loses the table later.
     #[test]

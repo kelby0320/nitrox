@@ -86,7 +86,9 @@ const LIVE_LABEL: &[u8] = b"nitrox-live";
 
 /// `sys_wait` scratch for a single pending operation.
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-/// `sys_wait` results: one 32-byte record.
+/// `sys_wait` results: one `IoResult`, which is 24 bytes (`handle`, `status`, `reserved`,
+/// `result`). The buffer is rounded up; the number is stated correctly because a reader
+/// computing a stride from it would be wrong.
 static mut WAIT_RESULTS: [u8; 32] = [0; 32];
 
 /// The front of a GPT: protective MBR, header, entry array.
@@ -192,7 +194,12 @@ fn random_guid() -> Option<[u8; 16]> {
 struct Device {
     /// Its index under `/dev/blk`.
     index: usize,
-    /// The device handle, with whatever of read/write the binding allowed.
+    /// The device handle, with read **and** write.
+    ///
+    /// Not "whatever the binding allowed": [`devices`] asks for both and stops at the first
+    /// index that does not resolve, so a device bound read-only would end the scan rather than
+    /// appear in the list read-only. `libsession` binds both today; a session that granted less
+    /// would need a second lookup here rather than a different comment (PR #309 review).
     handle: u64,
     /// What it says it is.
     info: BlockDeviceInfo,
@@ -630,11 +637,24 @@ fn run(
         return Outcome::Usage;
     }
 
+    // **An install that was *asked for* and refused is an event; a plan is not.** Someone
+    // naming a device and its identity is asking to destroy a disk, and what stopped that
+    // belongs in the system log beside the milestones an install leaves — not least because
+    // it is the only thing a gate can see, the refusal itself being a conversation on a
+    // terminal (PR #309 review, 7). The one-operand form logs nothing: it is a question.
+    let requested = operands.len() == 2;
+    let refuse = |what: &str| {
+        if requested {
+            log(&format!("refused {}: {what}", operands[0]));
+        }
+    };
+
     // The target, by the path the listing printed.
     let wanted = operands[0].as_str();
     let Some(target) = devs.iter().find(|d| d.path() == wanted) else {
         say(&format!("{wanted} is not a block device this session can reach."));
-        return Outcome::NotInstalled;
+        refuse("not a block device in this session");
+            return Outcome::NotInstalled;
     };
 
     // **What it is, before what it is called.** The refusals are per-kind because the mistake
@@ -647,6 +667,7 @@ fn run(
                 "{wanted} is a partition, not a disk. An install writes a partition table, which \
                  would destroy the disk this partition is part of."
             ));
+            refuse("it is a partition, not a disk");
             return Outcome::NotInstalled;
         }
         BlockKind::RamDisk => {
@@ -654,12 +675,14 @@ fn run(
                 "{wanted} is memory published as a disk — one of the modules this live system is \
                  running from. Writing it would destroy the running system and survive nothing."
             ));
+            refuse("it is a ram disk, not a disk");
             return Outcome::NotInstalled;
         }
         BlockKind::Unknown => {
             say(&format!(
                 "{wanted} does not say what it is, so this installer will not write to it."
             ));
+            refuse("it does not say what it is");
             return Outcome::NotInstalled;
         }
     }
@@ -668,7 +691,8 @@ fn run(
             "{wanted} reports no model or serial, so there is nothing to confirm it by. This \
              installer will not write to a disk it cannot name."
         ));
-        return Outcome::NotInstalled;
+        refuse("it reports no model or serial");
+            return Outcome::NotInstalled;
     }
 
     let Some((mem, addr)) = scratch(CHUNK) else {
@@ -688,6 +712,7 @@ fn run(
         Ok(l) => l,
         Err(e) => {
             say(&e);
+            refuse("the disk cannot take the install");
             return Outcome::NotInstalled;
         }
     };
@@ -722,12 +747,18 @@ fn run(
             target.path(),
             identity
         ));
+        // **The reason, not what was typed.** A console line never carries a person's
+        // keystrokes; that the two did not match is the program's own finding.
+        refuse("the name given did not match");
         return Outcome::NotInstalled;
     }
 
     say(&format!("installing to {} ({})", target.path(), identity));
     match install(&io, target, &srcs, &layout, &mut say) {
         Ok(()) => {
+            // TODO(ahci-flush): the driver has no `FLUSH CACHE`, so the last sectors may
+            // still be in the drive's volatile cache when a person acts on this line. See
+            // `docs/rationale/deferred-decisions.md`.
             say("done. Remove the installation medium and restart.");
             Outcome::Installed
         }

@@ -204,6 +204,19 @@ commands at once across the command list. The software queue's depth is already
 `PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly. Trigger: an I/O-latency-bound
 workload (an SSD, or many concurrent readers).
 
+**No `FLUSH CACHE` after a write — `TODO(ahci-flush)`.** `kernel/src/drivers/ahci.rs` issues
+`IDENTIFY`, `READ DMA EXT` and `WRITE DMA EXT` and nothing else; there is no `0xEA`. A drive is
+free to hold written sectors in its own volatile cache, and this system has no orderly shutdown
+that would flush them — a person powers the machine off. Every writer before Phase 5 Part H.1
+wrote through a filesystem on a machine that stayed running, so the gap cost nothing; `nxinstall`
+is the first writer that says "done, remove the medium and restart" with its last sectors
+possibly still in the drive. It survived the first real install, which is evidence that this
+drive's cache is either write-through or flushed by the firmware's reset, not that the next one
+will be. **Trigger: the first install that comes back with a corrupt tail**, or any writer that
+needs a durability point (a journal, a database). The command is a non-data ATA command, which
+this driver has no path for — `submit` is built around a PRDT — so it is a small new path rather
+than a new opcode. (PR #309 review, optional.)
+
 **Stateless `File::ReadRange` fill — Model B only, no shipping consumer.** Every
 filesystem shipping today is Model A (the kernel reads the device directly from a block
 map), so this costs nothing at present; it applies when a **non-block** filesystem exists —
