@@ -294,6 +294,15 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
     })
 }
 
+/// The filesystem's block size, for a caller that has to place file data itself.
+///
+/// The Model A data path never needs this — the kernel scales a `BlockRun` by the size it was
+/// told — but a program writing a filesystem's *contents* directly does: `nxinstall` maps a
+/// file it just grew and writes the bytes into those blocks.
+pub fn block_size<R: BlockReader>(r: &R) -> Result<u32, FsError> {
+    Ok(read_superblock(r)?.block_size)
+}
+
 fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
     let mut sb = [0u8; 1024];
     r.read_at(1024, &mut sb)?;

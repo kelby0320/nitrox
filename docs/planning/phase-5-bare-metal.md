@@ -1407,12 +1407,29 @@ you use when there is no installed system to log into.
 > the invocation call it instead. Under the stronger check every pre-existing writer test still
 > passes, so the code was right — the assurance was not.
 
-- [ ] **`nxinstall` formats and copies**: a filesystem the size of the disk, and the live root
+- [x] **`nxinstall` formats and copies**: a filesystem the size of the disk, and the live root
       copied into it file by file through `create_file`/`mkdir_at`. **What it copies from** has to
       be said: H.1's raw copy takes a root a session has been writing to, and dirty pages reach the
       disk only on `sys_file_sync` or unmap.
-- [ ] The gate asserts a write **past group 0**, not merely that the superblock names the disk's
+- [x] The gate asserts a write **past group 0**, not merely that the superblock names the disk's
       size — the size assertion passes with the allocator confined to group 0.
+
+> **H.2 closed 2026-09-17.** `nxinstall` lays out a filesystem the size of the root partition
+> and walks the source, creating each directory and file — 41 files into a 477 MiB root in the
+> gate, where H.1 put a 24 MiB filesystem on the same partition. Two things the box asked to be
+> said, now said in `copy.rs`: it copies **the source's bytes on the device**, not this session's
+> view of them, so an install carries the system as it shipped rather than one session's
+> accidents; and it carries **no permissions and no timestamps**, because nothing in this system
+> reads a mode bit — authority is the namespace's — and these files were created now.
+>
+> **The gate holds the installed root to three things a boot cannot show**, on the host, between
+> the two boots: `e2fsck -fn` clean, the superblock's block count being the *partition's*, and a
+> 136 MiB file reaching block 37,778 — past group 0 — written with the allocator the guest runs.
+> The third is the box's own point: a size assertion passes with allocation confined to the
+> first group. Doing it in the guest would mean moving 128 MiB at TCG speed for a property this
+> settles in a second, and the file is written to a copy so the disk that boots is the one the
+> installer made. Control: a filesystem laid out an eighth of the partition's size fails with
+> "it was copied onto the disk rather than made for it".
 
 **H.3 — what a person sees.**
 

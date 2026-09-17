@@ -17,6 +17,12 @@ edition = "2024"
 # The partition table, written whole and read whole. The lib needs it too — a `Layout`
 # becomes `Partition`s — which is why it is not behind a feature.
 libgpt = { path = "../libgpt" }
+# **The ext4 format library**, which is this crate's other half of the job: `mkfs` lays out a
+# filesystem the size of the partition and `create_file`/`mkdir_at`/`grow_file` fill it. The
+# crate is named for the server, and its lib is the format — the same lib the server's bin is
+# a syscall shim around. Part H.2's plan named these functions, so the dependency is the
+# design rather than a shortcut.
+fs-server-ext4 = { path = "../fs-server-ext4" }
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 libstream = { path = "../libstream", features = ["io"] }

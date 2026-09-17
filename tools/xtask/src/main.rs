@@ -2498,6 +2498,9 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
     }
     println!("  ok: and it refused the RAM disk it was pointed at, named correctly");
 
+    // Before booting it: what the boot cannot tell us about the filesystem.
+    check_installed_root(&target, &work)?;
+
     // The second boot: what was written, on its own.
     println!("\nxtask: booting the installed disk with no stick…\n");
     let mut cmd = Command::new("qemu-system-x86_64");
@@ -2529,6 +2532,150 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
             Err(e)
         }
     }
+}
+
+/// An in-memory filesystem image, for holding an installed root to the code that will serve it.
+struct MemFs(std::cell::RefCell<Vec<u8>>);
+
+impl fs_server_ext4::BlockReader for MemFs {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), fs_server_ext4::FsError> {
+        let v = self.0.borrow();
+        let start = offset as usize;
+        let end = start.checked_add(buf.len()).ok_or(fs_server_ext4::FsError::Io)?;
+        if end > v.len() {
+            return Err(fs_server_ext4::FsError::Io);
+        }
+        buf.copy_from_slice(&v[start..end]);
+        Ok(())
+    }
+}
+
+impl fs_server_ext4::BlockWriter for MemFs {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), fs_server_ext4::FsError> {
+        let mut v = self.0.borrow_mut();
+        let start = offset as usize;
+        let end = start.checked_add(buf.len()).ok_or(fs_server_ext4::FsError::Io)?;
+        if end > v.len() {
+            return Err(fs_server_ext4::FsError::Io);
+        }
+        v[start..end].copy_from_slice(buf);
+        Ok(())
+    }
+}
+
+/// Hold the root filesystem an install just made to three claims the boot cannot make.
+///
+/// **A booting machine proves the filesystem works; it does not prove the filesystem is the
+/// size of the disk.** H.1's install booted perfectly with a 24 MiB filesystem on a 477 MiB
+/// partition — everything the second boot asserts passed, and the machine had 24 MiB. So:
+///
+/// 1. `e2fsck -fn` finds it clean — the oracle, on a filesystem laid out by `mkfs` and filled
+///    by `create_file`, both of them ours;
+/// 2. it spans more than one block group and its superblock's block count is the partition's,
+///    which is the difference between "a filesystem" and "a filesystem for this disk";
+/// 3. **a write lands past group 0** — done here with the allocator the guest runs, because a
+///    size assertion passes just as well with allocation confined to the first group, and
+///    doing it in the guest means moving 128 MiB at TCG speed for a property this settles in a
+///    second. The file is written to a copy, so the disk that boots is the one the installer
+///    made.
+fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
+    use fs_server_ext4::{BlockReader, ext4};
+
+    let (lba, sectors) = partition_extent(disk, 2)?;
+    let fs = work.join("installed-root.ext4");
+    carve_partition(disk, 2, &fs)?;
+    let bytes = fs::read(&fs)?;
+    let partition_blocks = sectors * 512 / 4096;
+
+    // (1) The oracle. `e2fsck -fn` **exits 0 while reporting problems**, so the output is what
+    // is read — the same lesson the crate's own test helper learned (Phase 5 Part H.2).
+    let out = Command::new("e2fsck").args(["-fn", &fs.display().to_string()]).output()
+        .map_err(|e| format!("run e2fsck: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("? no") || !text.contains(" files (") {
+        return Err(format!(
+            "e2fsck is not happy with the root this install made (partition at LBA {lba}):\n{text}"
+        )
+        .into());
+    }
+    println!("  ok: the installed root is e2fsck-clean");
+
+    // (2) It is the partition's size, not the source image's.
+    let img = MemFs(std::cell::RefCell::new(bytes));
+    let mut sb = [0u8; 1024];
+    img.read_at(1024, &mut sb).map_err(|e| format!("read the superblock: {e:?}"))?;
+    let blocks = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;
+    let per_group = u32::from_le_bytes([sb[32], sb[33], sb[34], sb[35]]) as u64;
+    let groups = blocks.div_ceil(per_group);
+    if blocks + 8 < partition_blocks {
+        return Err(format!(
+            "the installed filesystem is {blocks} blocks on a {partition_blocks}-block \
+             partition — it was copied onto the disk rather than made for it, which is exactly \
+             what H.1 did and H.2 exists to stop"
+        )
+        .into());
+    }
+    if groups < 2 {
+        return Err(format!(
+            "the installed filesystem has one block group ({blocks} blocks), so this gate \
+             cannot say anything about crossing one"
+        )
+        .into());
+    }
+    println!("  ok: it is {blocks} blocks across {groups} groups — the partition's size");
+
+    // (3) A write past group 0, with the allocator the guest runs.
+    let big = per_group * 4096 + 8 * 1024 * 1024; // comfortably into group 1
+    ext4::create_file(&img, b"/", b"past-group-0", 0).map_err(|e| format!("create: {e:?}"))?;
+    ext4::grow_file(&img, b"/past-group-0", big as usize, 0)
+        .map_err(|e| format!("grow past group 0 failed: {e:?} — the allocator did not leave \
+                              the first group, which is what H.2's first box is"))?;
+    let mut runs = [fs_server_ext4::BlockRun::default(); 8];
+    let n = ext4::map_range(&img, b"/past-group-0", 0, big / 4096 + 1, &mut runs)
+        .map_err(|e| format!("map: {e:?}"))?;
+    let highest = runs[..n]
+        .iter()
+        .filter(|r| r.device_lba != 0)
+        .map(|r| r.device_lba + r.length as u64 - 1)
+        .max()
+        .ok_or("the grown file has no blocks")?;
+    if highest < per_group {
+        return Err(format!(
+            "every block of a {big}-byte file landed in group 0 (highest {highest} of \
+             {per_group} per group)"
+        )
+        .into());
+    }
+    let grown = work.join("installed-root-grown.ext4");
+    fs::write(&grown, img.0.into_inner())?;
+    let out = Command::new("e2fsck").args(["-fn", &grown.display().to_string()]).output()
+        .map_err(|e| format!("run e2fsck: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("? no") || !text.contains(" files (") {
+        return Err(format!("e2fsck after a cross-group write:\n{text}").into());
+    }
+    println!("  ok: a {} file reached block {highest}, past group 0, and stays clean",
+             human_bytes(big));
+    Ok(())
+}
+
+/// Bytes as a person reads them.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut u) = (n, 0);
+    while v >= 1024 && u + 1 < UNITS.len() {
+        v /= 1024;
+        u += 1;
+    }
+    format!("{v} {}", UNITS[u])
 }
 
 /// The first boot: choose the installer entry, log in graphically, and run the installer.
@@ -2679,8 +2826,19 @@ fn run_install_steps(
     // gate can read: a release terminal does not narrate its grid.
     session.expect(&format!("nxinstall: installing to /dev/blk/0 ({identity})"))?;
     println!("  ok: the installer named the disk back and started");
-    session.expect("nxinstall: wrote the partition table, the boot partition and the root filesystem")?;
-    println!("  ok: the install finished");
+    // **A filesystem it made, not one it copied** (Phase 5 Part H.2). The size in this line is
+    // the *partition's*, which is the whole point: H.1 put a 24 MiB filesystem on it.
+    session.expect("nxinstall: wrote the partition table, the boot partition, and a ")?;
+    let line = session.rest_of_line()?;
+    let files: u32 = line
+        .rsplit_once("holding ")
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("no file count in the installer's milestone: {line:?}"))?;
+    if files < 20 {
+        return Err(format!("the installer copied {files} files, which is not a root: {line}").into());
+    }
+    println!("  ok: the install finished —{}", line.trim_end());
     Ok(())
 }
 
