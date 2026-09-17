@@ -273,7 +273,11 @@ const MAX_INODES: u64 = 1 << 20;
 /// immediately, and zeroing a terabyte to make an empty filesystem is time spent for nothing.
 /// Every structure a reader or `e2fsck` looks at *is* written, including the parts of a
 /// bitmap and an inode table that describe nothing yet, because those are read.
-pub fn format<W: BlockWriter>(w: &W, p: &Params) -> Result<Geometry, FsError> {
+pub fn format<W: BlockWriter>(
+    w: &W,
+    p: &Params,
+    progress: &mut dyn FnMut(u32, u32),
+) -> Result<Geometry, FsError> {
     let g = Geometry::new(p).map_err(MkfsError::fs_error)?;
     let bs = p.block_size as usize;
 
@@ -317,10 +321,16 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params) -> Result<Geometry, FsError> {
 
         // The inode table, zeroed. `e2fsck` reads every inode, so a slot holding whatever the
         // disk held before is a slot it may decide is a file.
+        //
+        // **This is where the time goes.** A 931 GiB disk has 7,452 groups, and writing each
+        // one's two bitmaps and inode table is about 300 MiB in total — minutes on a spinning
+        // disk, one command at a time, with nothing else to show for it. Hence `progress`:
+        // silence for that long is indistinguishable from a hang.
         block[..bs].fill(0);
         for b in 0..g.itable_blocks as u64 {
             w.write_at((itable + b) * p.block_size as u64, &block[..bs])?;
         }
+        progress(group + 1, g.groups);
     }
 
     // --- the root directory ----------------------------------------------------------

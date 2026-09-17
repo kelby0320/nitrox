@@ -555,13 +555,19 @@ fn install(
             label: *b"nitrox-root\0\0\0\0\0",
             now,
         },
+        // **A line every so often, because this is the slow part.** Two bitmaps and an inode
+        // table per group is about 300 MiB of scattered writes on a terabyte, one command at a
+        // time — minutes, and a person watching a still screen cannot tell that from a hang.
+        // Every 256th group is roughly every few seconds.
+        &mut |done, total| {
+            if done == 1 || done == total || done % 256 == 0 {
+                say(&format!("  group {done} of {total}"));
+            }
+        },
     )
     .map_err(|e| format!("the filesystem would not lay out: {e:?}. The disk is partitioned \
                           and its boot partition written; nothing readable is on the root."))?;
-    say(&format!(
-        "  {} group(s), {} inodes",
-        geom.groups, geom.inodes_count
-    ));
+    say(&format!("  {} inodes across {} group(s)", geom.inodes_count, geom.groups));
 
     // The source is the live root's own partition *inside* the RAM disk, read as the bytes on
     // the device rather than through this session's view of them — see `copy`'s module doc.

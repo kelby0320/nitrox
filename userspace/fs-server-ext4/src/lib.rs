@@ -875,6 +875,7 @@ mod tests {
                 label: *b"nitrox-root\0\0\0\0\0",
                 now: TEST_NOW,
             },
+            &mut |_, _| {},
         )
         .unwrap();
         (img.0.into_inner(), geom)
