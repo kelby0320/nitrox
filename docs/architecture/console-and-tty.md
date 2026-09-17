@@ -1,6 +1,6 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-09-10.** The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-09-17**, when a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -32,14 +32,23 @@ driver (`drivers::console`): COM1 RX IRQ → ring → a parked `sys_io_submit(Re
 that has the handle can read; one that does not, cannot. The driver delivers **raw bytes** and
 says so — "echo and line editing live in userspace".
 
-**Output is not.** There is no write path at all: `CharBackend` has only `submit_read`. Every
-byte any userspace program prints goes through `SYS_DEBUG_KPRINT`, an ambient debug syscall
-that takes no handle.
+**Output is not — at the console.** There is no write path there at all: `CharBackend` has only
+`submit_read`, and `SYS_DEBUG_KPRINT` is an ambient debug syscall that takes no handle.
 
-**So the console is half a capability**, and the half that is missing is the half that matters
-for a system whose thesis is that authority travels through the namespace. A process with an
-empty namespace can still write to the console. Nothing can redirect, pipe, capture, or log a
-shell's output, because there is no object to redirect.
+**What reaches a person now travels a handle, and that changed in two steps.** A shell hosted in
+a terminal writes its prompt, its results and its errors to the **tty** it was handed
+(2026-08-12); and since 2026-09-17 a *stage's* diagnostics do too — `nxsh` gives every program it
+spawns a send end of one shared `stderr` and drains it into that terminal
+(`userspace/nxsh/src/main.rs`), as does `display`'s output. Before that a program's diagnostics
+fell back to `kprint`, which reaches COM1 and nothing else, so on a machine with no serial port
+they reached nobody at all; the laptop Phase 5 targets is what made that visible.
+
+**What is still ambient** is the fallback: a shell with *no* terminal — a script, a Tier-0 stage,
+anything before the login chain — still writes through `SYS_DEBUG_KPRINT`, holding no handle, so
+a process with an empty namespace can still write to the console and nothing can redirect, pipe,
+capture or log that output. The console remains half a capability; the half that is missing is
+now narrower than "all output". See `docs/rationale/deferred-decisions.md`,
+`TODO(tty-server)`.
 
 **Line editing is duplicated three times** — `eshell`, `session-mgr`'s login, and `nxsh`'s REPL
 each implement backspace, echo, and line accumulation over the raw byte stream. They have

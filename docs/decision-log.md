@@ -26359,3 +26359,172 @@ generous lets a partition overwrite the backup array, and `sgdisk --verify` does
 `read` cut a table with more partitions than fit instead of refusing it; the `/proc/cmdline` doc
 comment had been inserted into `proc_self_status`'s, orphaning it; and four current-behaviour docs
 still said no session can ever reach `/dev/blk`.
+
+## 2026-09-16 — Phase 5 Part H.1: the installable ESP, and what it was carrying
+
+The live image now ships the ESP an installed machine boots from, as a third Limine module. It is
+built by the same `build_esp` every image uses, so the installer copies it onto a disk sector by
+sector and writing FAT32 is never this project's problem.
+
+**Sized to its contents, not to `ESP_SIZE_MIB`.** 48 MiB mostly of zeroes would triple what firmware
+reads off a USB stick before the kernel runs, which is the cost `LIVE_ROOT_MAX_MIB` exists to bound.
+FAT32's own floor is about 33 MiB of clusters, so that is the floor here.
+
+**It rides on the installer entry alone**, which the detail pass had not settled. Limine loads a
+module because the entry a person chose names it, so the ordinary live boot and the hardware report
+pay nothing: no 33 MiB read, no 33 MiB held for the session, and no block device published that no
+session on that boot could reach anyway. The plan's worry about what firmware reads is thereby a
+worry about *installing*, the one boot where paying it buys something.
+
+**The first build of it carried the live initramfs** — the review's finding 6, reproduced exactly.
+`assemble_live_image` is handed the initramfs for the stick, and using it here is the natural
+mistake: the file is right there, it is the same size, and every gate passes. An installed machine
+would then look for `gpt-partlabel:nitrox-live`, which means it boots on the desk with the stick
+still in it and fails the first time it is not. The module builds its own release initramfs now.
+
+**So the gate compares the module's filesystem, not the call that built it.** `check-images`
+extracts `install-esp.img` out of the built stick and holds every file in it against the release
+image's own ESP — the same shape as the other two live claims, which compare what the builds
+produced rather than the functions that produced them. Two controls: the live initramfs in the
+module fails with `boot/initramfs: differs`, and a spurious extra file with `boot/spurious: only in
+the installable ESP`.
+
+## 2026-09-16 — Phase 5 Part H.1 closed: the system installs itself
+
+`nxinstall` is a Nitrox program, run from a terminal in the installer session, and
+`cargo xtask check-install` boots the live image's third entry with a blank disk, drives the
+install graphically, and then boots that disk on its own to a greeter.
+
+**It holds no authority of its own.** There is no privileged installer because there is nothing to
+be privileged *as*: it reaches a disk only where the session it runs in was given one. Run from an
+ordinary session it resolves nothing and says so, and no check inside it is what stops that.
+
+**The confirmation is an argument, not a prompt** — the detail pass had assumed a prompt. No
+program in this system reads a terminal: a stage's `stdin` is the typed stream from the stage
+before it, and `/dev/tty` in an application namespace *mints a fresh terminal* rather than naming
+the one the program is running in. So there is nothing to prompt on. A first run prints the plan
+and the exact line that would carry it out; running that line is the confirmation. That is a
+better interlock than `[y/N]` anyway — the identity has to come from the report the first run
+printed, so the dangerous form cannot be reached by holding Return.
+
+**Sources are found by what they contain, targets refused by what they are.** A FAT boot sector
+and a table naming `nitrox-live` identify the two things being copied; the module paths the kernel
+names them with are a build script's business and the wrong thing for an installer to depend on.
+The target is refused per kind, because each refusal catches a different mistake: a partition is
+what someone picks off a listing by accident, and a RAM disk is the running system itself.
+
+**The layout is host-tested and the program is not.** Where two partitions go is arithmetic whose
+mistakes destroy a disk and are invisible in a boot that succeeds — a root partition one block
+into the backup array installs a machine that works until something rewrites the table — so it is
+`nxinstall`'s lib, tested against `libgpt`'s writer in both directions. The I/O around it is what
+the gate boots.
+
+**What the gate cost to order.** Three runs, all the same lesson in different clothes: the storage
+driver binds during PCI enumeration and the bootloader's modules are published after it, a session
+namespace exists only once somebody has logged in, and a `Super` chord pressed before the shell
+has registered it is delivered to nobody. `expect` consumes what it scans past, so each of these
+presented as a timeout on a line that was plainly in the transcript.
+
+**And the gate proves a refusal, not just an install.** It aims the installer at the RAM disk the
+running root is inside — naming it *correctly*, so only its kind can refuse it — and asserts
+nothing was installed to it. The absence means something because the install that follows
+succeeds. A control that let a RAM disk through failed the gate with the line it was written for.
+
+## 2026-09-17 — The first install attempt on the laptop found three things, one of them a hole
+
+`nxinstall` was run on the laptop in its two non-destructive forms. The disk list was right —
+`ST1000LM035-1RK172`, 931 GiB, at `/dev/blk/0`, with the Debian partitions correctly typed as
+`partition` and refused, and the two modules as `ram disk`. The second form printed **nothing**.
+
+**A stage's diagnostics had nowhere to go, and this is the owed half of `TODO(tty-server)`.**
+`nxsh` handed every stage `Streams { stderr: None, .. }` on the reasoning that a stage's `stderr`
+is "the shell's own — the console". It is: `SYS_DEBUG_KPRINT`, ambient, taking no handle, reaching
+COM1 and nothing else. Under QEMU a developer reads those lines off the serial port, so the hole
+was invisible for as long as the only machine was QEMU. The laptop has no serial port, and its
+framebuffer console stops drawing the moment the compositor is handed the screen — so every
+diagnostic from every program has been going nowhere in a graphical session. `nxinstall` is merely
+the first program whose *entire* output is diagnostics, so it is the first one where this showed.
+
+The shell now creates one `stderr` per pipeline — shared, as design §1 says — hands each stage a
+duplicate, and drains it into the terminal it already writes its prompt and results to. It drains
+at the two places the shell waits (reading the tail, and reaping) and once more after the last
+stage is gone, so a program's final word is not lost to the wait that noticed its exit. Which
+handle woke now has to be read out of `IoResult.handle`: breaking on any wake would treat an
+arriving diagnostic as the tail speaking and then block on output that is not there.
+`Host::out` — `display`'s output — went the same way for the same reason and is fixed with it.
+What remains of the deferral is the *ambience*: a shell with no terminal still writes to the
+console without holding a handle to it.
+
+**The gate could not have caught this, and now one can.** `check-install` asserts on the kernel
+log, which is exactly the channel that vanishes on the laptop — the third time this part has
+proved a path that is not the one that matters. The assertion belongs in `check-terminal`, which
+boots the test image and so can read `nxterm`'s grid: a failing `remove` must render *in the
+grid*. Its control is decisive — with `stderr: None` restored, the gate times out on that line
+and the serial transcript carries `remove: no such path` instead. Same message, wrong
+destination.
+
+**Two smaller things the same run found.** `format_identity` trimmed only *trailing* spaces, and
+ATA does not say which end a drive pads: this Seagate right-justifies its serial in the 20-byte
+field, so the name read `ST1000LM035-1RK172 (            WDELGVZ3)` — which the installer then
+asked a person to type back character for character. Its model is left-justified, which is why
+QEMU never showed it. And partitions were named from zero, where `/dev/sda1`, `sgdisk` and the
+firmware all number them from one; the laptop's disk list disagreed with Debian's about which
+partition was which. Both now have host tests, the identity one against this drive's exact
+padding.
+
+## 2026-09-17 — `nxinstall`'s exit status: a question answered is not a failure
+
+The second laptop run printed the plan correctly and then, directly underneath the line telling
+the person what to type next, `nxsh: pipeline failed: 'nxinstall' exited 1`. The shell was right;
+the status was wrong.
+
+**The status answers "did what you asked for happen", not "was anything written".** The
+one-operand form is a *query* — it reports what an install would do and says in its own words
+that nothing was written — and it is the **ordinary first step** through this program, not an
+error path. Exiting non-zero there put a failure line under every correct use of the installer,
+which teaches a person to distrust output they are meant to act on. It is `Outcome::Planned` now,
+and zero.
+
+What stays non-zero is asking for an install and not getting one, whatever refused it: a
+partition, a RAM disk, a disk that cannot be named, a name that did not match, a disk too small,
+an I/O error part-way. There a caller asked for something that did not happen, and a script that
+stops on it stops correctly. The policy lives in `nxinstall::Outcome` with a host test, rather
+than as a scatter of integer returns — there were three constants and five `return EXIT_FAILURE`
+sites, and nothing said which of them were refusals of a request and which were answers to a
+question.
+
+**Two things the same screen prompted.** The layout is now worked out **before** the
+confirmation rather than inside the install, so a disk that cannot take one is refused while the
+person is still reading the plan instead of after they have typed its name back — and the plan
+names the root partition's actual size, which is the number they are agreeing to lose, rather
+than "the rest".
+
+**What no gate can see**: the exit status of a command typed in a *terminal*. `nxsh` reports it
+into the grid, and `check-install` boots a release image whose terminal does not narrate one.
+The policy is host-tested and the wiring is a single `return`; this particular line was confirmed
+from a photograph of the laptop's screen.
+
+## 2026-09-17 — Nitrox boots the laptop from its own disk
+
+`nxinstall` wrote the internal disk from the live stick and the machine boots Nitrox with the
+stick removed. That is the line `phase-5-bare-metal.md` calls the phase's definition of done, and
+it is closed. Everything before this had run under QEMU or from a USB stick that had to stay
+plugged in.
+
+**The UEFI risk was answered by the install rather than by the test for it.** The plan said to
+check from Debian, before wiping, whether this firmware reaches `\EFI\BOOT\BOOTX64.EFI` on a
+*fixed* disk — the spec's removable-media path, which a fixed disk reaches only through a boot
+option the firmware chose to create. OVMF makes one for every disk it finds, so `check-install`
+passes either way and says nothing about real firmware. The test was skipped and the install run
+instead; it boots, so this firmware does create one. An NVRAM writer stays deferred.
+
+**That is one machine's answer, and the deferral is not closed by it.** The risk was correctly
+named — it just did not fire here. A firmware that does not create the entry would still need the
+add-boot-option screen or `efibootmgr` from a Linux stick, and this outcome is evidence the
+fallback path is *sometimes* enough rather than that it is always enough.
+
+**What the machine is now.** The root partition is the whole disk, and the filesystem inside it is
+the live root's 24 MiB — `nxinstall` copies raw sectors, so the filesystem does not know about the
+space around it. H.2 owes both halves: `mkfs.ext4` layout, and cross-group allocation in
+`fs-server-ext4`, whose `alloc_inode`/`alloc_block` still search block group 0 only. Until then
+the installed machine has about 112 MiB to write into.

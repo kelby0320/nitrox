@@ -1,6 +1,6 @@
 # Boot Flow
 
-**Status:** Current (last checked 2026-09-14, when the framebuffer console took the first line of `kernel_main`, and again the same day when Phase 5 Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
+**Status:** Current (last checked 2026-09-17, when Phase 5 Part H.1 gave the live image a third menu entry and a fourth thing in its ESP — the installable ESP an installed machine boots from; before that 2026-09-14, when the framebuffer console took the first line of `kernel_main` and Part D made every boot log its handoff and CPU). Describes the boot as it runs today — UEFI →
 Limine → kernel → `init` → fs-server → `service-mgr` → `auth-service` → `session-mgr` → login →
 `nxsh`, and in a release image on to the graphical session (Phases 0–4 complete, Phase 4 closed
 2026-09-10). Every stage below is exercised on each CI run by
@@ -70,16 +70,29 @@ driver:
 nitrox-live.img (GPT — one partition)
 └── partition 1 (EFI System, FAT32, "NITROX_ESP")
     ├── /EFI/BOOT/BOOTX64.EFI, /boot/kernel, /boot/LICENSE-Terminus.txt   ← as above
-    ├── /boot/limine/limine.conf      ← the release one, plus a second module_path
+    ├── /boot/limine/limine.conf      ← the release one, with a menu of three entries
     ├── /boot/initramfs               ← the release one, but init.toml names nitrox-live
-    └── /boot/root.img                ← GPT image, one ext4 partition "nitrox-live":
-                                          the release root, built by the same staging
+    ├── /boot/root.img                ← GPT image, one ext4 partition "nitrox-live":
+    │                                     the release root, built by the same staging
+    └── /boot/install-esp.img         ← FAT32 image: the ESP an *installed* machine boots
+                                          from. The release menu, and the release
+                                          initramfs, which names nitrox-root
 ```
 
-Limine loads `root.img` through the firmware as the second module; the kernel publishes it as a
-RAM-backed block device (`kernel/src/io/ramdisk.rs`), and `init` mounts it as it would a disk.
-`cargo xtask check-images` holds the live initramfs to the release one but for `etc/init.toml`,
-and the filesystem inside `root.img` to the release root partition's, file for file.
+**Which modules a boot loads depends on the entry chosen**, because Limine loads what the entry
+names. All three load the initramfs and `root.img`; only `Nitrox — install to this machine` also
+loads `install-esp.img`, so an ordinary live boot does not read a further 33 MiB off the stick,
+hold it for the session, or publish a block device no session on that boot could reach. The
+kernel publishes every module after the initramfs as a RAM-backed block device
+(`kernel/src/io/ramdisk.rs`); `init` mounts `root.img`'s partition as it would a disk, and the
+installer reads both its sources — `install-esp.img` and `root.img` — as ordinary devices.
+
+`cargo xtask check-images` holds three things: the live initramfs to the release one but for
+`etc/init.toml`, the filesystem inside `root.img` to the release root partition's, and the
+filesystem inside `install-esp.img` to the **release image's own ESP**, file for file. The third
+is what catches a module built with the live `limine.conf` or the live initramfs — an installed
+machine that mounts the stick it was installed from, which boots once, on the desk, and never
+again.
 
 The initramfs holds **four programs and two manifests**, and the rule is narrow: a program is
 in the boot image only if it cannot come from a filesystem. `init` (the kernel boot-loads it),
@@ -320,6 +333,7 @@ tty server: its whole precondition is that the normal path failed. See
 | `cargo xtask test-interactive` | The login chain end to end over the serial console, expect-driven: the login prompt, a rejected password, a successful login, and shell behaviour after it. |
 | `cargo xtask check-fbcon` | The same boot with **no serial port at all** (`-serial none`), read back off the screen: the kernel's first and last lines, userspace's up to the compositor, the hand-over, and a panic taking the screen back. |
 | `cargo xtask check-live` | The **live image** booted as a USB stick with no disk: the menu's countdown boots its default entry with no command line, the root module becomes a RAM disk, `init` mounts and reads through it, the greeter comes up within a bound a tick-bound RAM disk cannot meet, and a serial login writes under `/home`. |
+| `cargo xtask check-install` | The live image's **installer entry**, on demand rather than in CI: Limine's menu found and its *third* entry chosen, the `install-esp.img` module that entry alone loads becoming a block device, the disk identifying itself, the four devices a session and then the shell hand on, a graphical login, a terminal from the applications modal, and `nxinstall` typed at the shell in it — then **that disk booted on its own**, mounting `gpt-partlabel:nitrox-root` and reaching a greeter with no stick attached. |
 | `cargo xtask check-report` | The live image's **hardware report**, with no serial port: Limine's menu found and its second entry chosen, each report page read off the screen and a key pressed for the next, the facts that machine has asserted from the pages — a declined AHCI controller, the module disk, no UART — and the boot going on to the hand-over. `test-qemu` asserts the facts its own boot has from the transcript: the tables, CPUs and IOAPIC, a claimed AHCI controller, COM1 present. |
 
 See [qemu integration tests](../conventions/qemu-integration-tests.md).

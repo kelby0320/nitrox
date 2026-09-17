@@ -553,18 +553,29 @@ unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) ->
                 }
             }
         }
-        // ATA pads with spaces to the field width.
-        while n > 0 && dst[n - 1] == b' ' {
+        // **ATA pads with spaces, and not always on the right.** The standard says the
+        // field is space-padded and says nothing about which end, so drives differ: the
+        // laptop's Seagate right-justifies its serial in the 20-byte field, and trimming
+        // only the tail left `ST1000LM035-1RK172 (            WDELGVZ3)` — a name the
+        // installer then asked a person to type back exactly, spaces and all (first
+        // install attempt, 2026-09-17). Its *model* is left-justified, which is why QEMU
+        // and the model field never showed this.
+        let mut start = 0;
+        while start < n && dst[start] == b' ' {
+            start += 1;
+        }
+        while n > start && dst[n - 1] == b' ' {
             n -= 1;
         }
-        n
+        dst.copy_within(start..n, 0);
+        n - start
     };
     let mut model = [0u8; 40];
     let mut serial = [0u8; 20];
     let m = field(27, 20, &mut model);
     let s = field(10, 10, &mut serial);
     let mut n = 0;
-    let mut push = |bytes: &[u8], out: &mut [u8; MAX_DEVICE_NAME], n: &mut usize| {
+    let push = |bytes: &[u8], out: &mut [u8; MAX_DEVICE_NAME], n: &mut usize| {
         for &b in bytes {
             if *n < MAX_DEVICE_NAME {
                 out[*n] = b;
@@ -949,5 +960,69 @@ mod tests {
         let bytes = MAX_PRDT_ENTRIES as usize * crate::mm::PAGE_SIZE;
         assert_eq!(bytes, 1_015_808);
         assert_eq!(bytes / 1024, 992);
+    }
+
+    /// Lay `text` into an IDENTIFY field the way a drive does: byte-swapped within each
+    /// 16-bit word, space-padded to the field width. `text` is taken verbatim, so a caller
+    /// can write the padding itself and choose which end it sits on.
+    fn put_field(words: &mut [u16; 256], first: usize, width_words: usize, text: &[u8]) {
+        let mut bytes = [b' '; 40];
+        bytes[..text.len()].copy_from_slice(text);
+        for i in 0..width_words {
+            words[first + i] = u16::from(bytes[i * 2]) << 8 | u16::from(bytes[i * 2 + 1]);
+        }
+    }
+
+    /// The name a drive reporting `model` and `serial` would be given. No `alloc` — the
+    /// kernel's host tests run against the same no-alloc code the boot path uses.
+    fn identity_of(model: &[u8], serial: &[u8]) -> ([u8; MAX_DEVICE_NAME], usize) {
+        let mut words = [0u16; 256];
+        put_field(&mut words, 27, 20, model);
+        put_field(&mut words, 10, 10, serial);
+        let mut out = [0u8; MAX_DEVICE_NAME];
+        // SAFETY: `words` is a full 256-word IDENTIFY result, which is the contract.
+        let n = unsafe { format_identity(words.as_ptr(), &mut out) };
+        (out, n)
+    }
+
+    /// `identity_of`, asserted against `want`.
+    fn assert_identity(model: &[u8], serial: &[u8], want: &[u8]) {
+        let (out, n) = identity_of(model, serial);
+        assert_eq!(
+            &out[..n],
+            want,
+            "model {:?} serial {:?} produced {:?}",
+            core::str::from_utf8(model),
+            core::str::from_utf8(serial),
+            core::str::from_utf8(&out[..n])
+        );
+    }
+
+    /// **Padding is trimmed at both ends**, because the standard does not say which end a
+    /// drive pads and they disagree. The laptop's Seagate right-justifies its serial, so
+    /// trimming only the tail produced a name with a dozen spaces inside it — which the
+    /// installer then asked a person to type back character for character (2026-09-17).
+    #[test]
+    fn a_right_justified_field_loses_its_padding_too() {
+        // The laptop's drive, as it actually reports itself.
+        assert_identity(
+            b"ST1000LM035-1RK172",
+            b"            WDELGVZ3",
+            b"ST1000LM035-1RK172 (WDELGVZ3)",
+        );
+        // The control: a left-justified serial, which is what QEMU reports and is the only
+        // shape that ever worked.
+        assert_identity(b"QEMU HARDDISK", b"QM00001", b"QEMU HARDDISK (QM00001)");
+        // Padding on both ends of both fields, and interior spaces kept — a model is
+        // allowed to contain one, and `QEMU HARDDISK` is the proof.
+        assert_identity(b"  A B  ", b"   C D  ", b"A B (C D)");
+    }
+
+    /// A field that is nothing but padding is empty, not a run of spaces — and a disk with
+    /// no serial is named by its model alone rather than by an empty bracket.
+    #[test]
+    fn an_all_padding_field_comes_back_empty() {
+        assert_identity(b"ST1000LM035", b"                    ", b"ST1000LM035");
+        assert_identity(b"                                        ", b"", b"");
     }
 }

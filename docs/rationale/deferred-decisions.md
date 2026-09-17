@@ -204,6 +204,19 @@ commands at once across the command list. The software queue's depth is already
 `PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly. Trigger: an I/O-latency-bound
 workload (an SSD, or many concurrent readers).
 
+**No `FLUSH CACHE` after a write — `TODO(ahci-flush)`.** `kernel/src/drivers/ahci.rs` issues
+`IDENTIFY`, `READ DMA EXT` and `WRITE DMA EXT` and nothing else; there is no `0xEA`. A drive is
+free to hold written sectors in its own volatile cache, and this system has no orderly shutdown
+that would flush them — a person powers the machine off. Every writer before Phase 5 Part H.1
+wrote through a filesystem on a machine that stayed running, so the gap cost nothing; `nxinstall`
+is the first writer that says "done, remove the medium and restart" with its last sectors
+possibly still in the drive. It survived the first real install, which is evidence that this
+drive's cache is either write-through or flushed by the firmware's reset, not that the next one
+will be. **Trigger: the first install that comes back with a corrupt tail**, or any writer that
+needs a durability point (a journal, a database). The command is a non-data ATA command, which
+this driver has no path for — `submit` is built around a PRDT — so it is a small new path rather
+than a new opcode. (PR #309 review, optional.)
+
 **Stateless `File::ReadRange` fill — Model B only, no shipping consumer.** Every
 filesystem shipping today is Model A (the kernel reads the device directly from a block
 map), so this costs nothing at present; it applies when a **non-block** filesystem exists —
@@ -1230,12 +1243,22 @@ D.5d).** The server exists: `userspace/tty-server` is a workspace member, `init`
 2026-08-03 — which is how a reader concludes the whole capability hole is open when half of it
 is closed.
 
-**The half that is still owed** is the one the headline names: *output*. `nxsh` prints through
-`kprint` (`userspace/nxsh/src/main.rs`), so the ambient `SYS_DEBUG_KPRINT` path above is
-unchanged for shell output even though input now goes through a capability. Nothing can
-redirect, pipe, capture or log it, because there is still no object to redirect. The three
-consequences listed above should be re-measured against the shipped server rather than trusted:
-they were written when nothing was built.
+**Most of the output half closed 2026-09-17** (Phase 5 Part H.1), and what closed it was the
+laptop. A stage's `stderr` was `None`, so every program's diagnostics fell back to `kprint` —
+ambient, COM1-only — and `Host::out`, which is `display`'s output, did the same. Under QEMU a
+developer read them off the serial port. The laptop has no serial port and its framebuffer
+console stops drawing once the compositor holds the screen, so in a graphical session they
+reached **nobody**; `nxinstall`'s first run, which is entirely diagnostics, printed a bare exit
+status. `nxsh` now creates one shared `stderr` per pipeline, hands each stage a duplicate, and
+drains it into the terminal (`userspace/nxsh/src/main.rs`); `check-terminal` asserts a failing
+`remove` renders in `nxterm`'s grid.
+
+**What is still owed is the *ambience***, which is the part this entry's headline names: a shell
+with no terminal — a script, a Tier-0 stage — still writes to the console through
+`SYS_DEBUG_KPRINT`, holding no handle to it, so that output cannot be redirected, piped,
+captured or logged because there is still no object to redirect. The three consequences listed
+above should be re-measured against the shipped server rather than trusted: they were written
+when nothing was built.
 
 Excluded from the design deliberately, and still absent: job control (needs process groups,
 which do not exist, and cannot use signals), key events (need a real keyboard driver), and

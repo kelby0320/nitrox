@@ -1318,25 +1318,50 @@ you use when there is no installed system to log into.
 > registry and the shape an elevation broker will want when it grants one disk rather than all of
 > them.
 
-- [ ] **The image carries an installable ESP** as a module: the *release* ESP, whose `limine.conf`
+- [x] **The image carries an installable ESP** as a module: the *release* ESP, whose `limine.conf`
       has no module line and whose initramfs names `gpt-partlabel:nitrox-root`. The kernel publishes
       every module after the initramfs as a block device, so the installer reads both its sources —
       this and `root.img` — as ordinary devices. **It roughly triples what firmware reads off the
       stick before the kernel runs** (`root.img` is 26 MiB, `ESP_SIZE_MIB` is 48, FAT32's floor is
       about 33 MiB), which is what `LIVE_ROOT_MAX_MIB` exists to bound — so the module is sized to
       its contents, not to `ESP_SIZE_MIB`.
-- [ ] **`check-images` gates that module against the release ESP.** Its live half compares the
+- [x] **`check-images` gates that module against the release ESP.** Its live half compares the
       initramfs and `root.img` and would not notice a module built with the live `limine.conf`,
       which installs a system that mounts a stick that is no longer there (review, finding 6).
-- [ ] **`nxinstall`**: refuse anything that is not a whole disk, name the target's identity and
+> **Both landed 2026-09-16, and the predicted mistake was the one that happened.** The first build
+> of the module carried the *live* initramfs — `assemble_live_image` is handed it, it is the same
+> size, and every gate passed — so an installed machine would have looked for `nitrox-live` and
+> booted only while the stick was still in it. The module builds its own release initramfs now, and
+> `check-images` compares the filesystem out of the built stick against the release ESP rather than
+> trusting the call that made it. One thing the detail pass had not settled: **the module rides on
+> the installer entry alone**, since Limine loads what the chosen entry names, so an ordinary live
+> boot reads and holds nothing extra.
+
+- [x] **`nxinstall`**: refuse anything that is not a whole disk, name the target's identity and
       require it typed back, write the GPT, copy the ESP module and `root.img`'s filesystem into
       their partitions.
-- [ ] **`cargo xtask check-install`**: boot the live image's installer entry with a blank second
+- [x] **`cargo xtask check-install`**: boot the live image's installer entry with a blank second
       disk, drive the installer, then **boot that disk on its own** and assert the greeter. **It
       owes a positive**: `check-live` asserts an ordinary boot never says "installer session", and
       nothing yet asserts that an installer boot does — rename the line and both pass forever
       (PR #308 review, optional 8). The graphical path is what to drive, since the laptop has no
       serial port and its greeter is the only way in.
+> **H.1 closed 2026-09-16: Nitrox installs itself, and the installed disk boots.** Two things the
+> detail pass had left open were settled by building it. **The confirmation is an argument, not a
+> prompt** — no program in this system reads a terminal (a stage's `stdin` is the stage before it,
+> and `/dev/tty` in an application namespace mints a *fresh* terminal rather than naming the one
+> the program is in), so a first run prints the plan and the exact line that carries it out, and
+> running that line is the confirmation. And **the sources are found by what they contain** — a
+> FAT boot sector, a table naming `nitrox-live` — rather than by the module paths the kernel names
+> them with, which are a build script's business.
+>
+> The gate drives the whole path a person takes and asserts on the kernel log, since a release
+> terminal does not narrate its grid: the ESP module the installer entry alone loads, the **four**
+> devices handed on (the disk, two modules, and the `nitrox-live` partition found *inside* one of
+> them — which is why `/dev/blk/<n>` is not "the n-th disk"), and the milestones a destructive
+> operation records. Ordering cost three runs: the storage driver binds before the bootloader's
+> modules are published, a session namespace exists only after a login, and a `Super` chord
+> pressed before the shell registers it reaches nobody.
 
 **H.2 — a filesystem the size of the disk.**
 
@@ -1358,14 +1383,27 @@ you use when there is no installed system to log into.
 
 **H.3 — what a person sees.**
 
-- [ ] A disk list worth choosing from (kind, capacity, model), progress while it copies, and
+- [x] A disk list worth choosing from (kind, capacity, model), progress while it copies, and
       refusals that say what to do.
+> **Landed with H.1, and three of its details were settled by the laptop rather than by design**
+> (2026-09-17). A disk's identity carried the ATA field's padding, because the standard does not
+> say which end a drive pads and this one right-justifies its serial; partitions were numbered
+> from zero where every other tool numbers them from one; and a refusal that printed the plan
+> exited non-zero, so the shell reported `pipeline failed` directly under the line saying what to
+> type next. The largest was not this part's at all: **a stage's diagnostics reached nobody in a
+> graphical session**, because `nxsh` handed every stage `stderr: None` and the fallback is
+> `kprint`, which is COM1-only. A machine with no serial port is what made that visible.
 
 ### What to compare on the day
 
 The laptop boots from its own disk with the stick removed, to the same desktop: `ahci: port 0 disk
 ready`, `gpt: partition … label "nitrox-root"`, `init: mounted fs-server-ext4 at /`, the greeter,
 and `Super+A` to a shell. That is the phase's definition of done, and its last open line.
+
+> **Done, 2026-09-17.** `nxinstall` wrote the laptop's internal disk from the live stick, and the
+> machine boots Nitrox from it with the stick removed. The line above is closed; what remains
+> under Part H is H.2, which is about how *much* of that disk the filesystem uses, not whether it
+> boots.
 
 ### Left alone
 
@@ -1380,6 +1418,12 @@ and `Super+A` to a shell. That is the phase's definition of done, and its last o
   `BootOrder`, and reboot. If that boots Nitrox, the install will; if it does not, the fallback is
   the firmware's add-boot-option screen or `efibootmgr` from a Linux stick, and an NVRAM writer
   stops being deferrable.
+  > **Answered 2026-09-17, and not by the test.** The test was skipped and the install was run
+  > instead; the machine boots. So this firmware does reach `\EFI\BOOT\BOOTX64.EFI` on a fixed
+  > disk, and an NVRAM writer stays deferred. **It is answered for one machine**, which is all a
+  > single laptop can answer — the risk was real, and the next firmware this meets may still want
+  > the add-boot-option screen. What is now known is that the fallback path is enough somewhere,
+  > which it was not before.
 - **A journal.** Our fs-server does not read one and `mke2fs` already builds our images without.
 - **Resizing an existing filesystem.** H.2 makes one the right size instead.
 - **Installing from anything but the live image**, and installing *to* anything but a whole disk.

@@ -65,6 +65,7 @@ cargo xtask check-fbcon    # boot with NO serial port; read the boot and a panic
 cargo xtask image --live   # the live image: release root as a RAM-disk module, for a USB stick
 cargo xtask check-live     # boot the live image as a USB stick with no disk; mount, greeter, a write
 cargo xtask check-report   # choose the live menu's hardware report, no serial port; read its pages
+cargo xtask check-install  # install to a blank disk from the live menu, then boot that disk
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
 ```
 
@@ -152,6 +153,17 @@ is a USB driver. It asserts the module became a disk named `nitrox-live`, that `
 read through it, that the greeter came up within 1.5 s of the mount (a RAM disk completing on the
 timer tick instead of its own interrupt takes 3 s or more), and that a serial login writes under
 `/home`. It runs in CI's QEMU job.
+
+`cargo xtask check-install` is the **installer gate** (Phase 5 Part H.1), on demand like
+`check-resolutions`: two boots, and a 512 MiB disk image. The first boots the live image's third
+menu entry with a blank disk attached, and drives the path a person takes on the laptop —
+Limine's menu, the **graphical** greeter, a terminal from the applications modal, and `nxinstall`
+typed at the shell in it. Nothing reads the terminal's grid (a release image deliberately does
+not narrate it), so what it asserts on is the kernel log: the ESP module that entry alone loads,
+the four devices the session and then the shell hand on, and the milestones a destructive
+operation records. It also aims the installer at the RAM disk holding the running root, named
+correctly, and asserts nothing was installed to it. The second boot is the disk alone, with no
+stick, and a greeter on it.
 
 `cargo xtask check-report` is the **hardware report gate** (Phase 5 Part D). Every boot logs what it
 found — the bootloader handoff, the CPU, every ACPI table and MADT entry, each PCI function's

@@ -142,9 +142,15 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
         }
         None => {
             let mut w = NameBuf::new(&mut name);
+            // **Numbered from one, as every other tool numbers partitions.** `index` counts
+            // from zero because it is a position in an array; a partition *number* is
+            // 1-based everywhere a person will have met one — `/dev/sda1`, `sgdisk`'s
+            // listing, the firmware's `HD(1,GPT,…)`. The disk list on the laptop showed
+            // `partition 0`, `partition 1`, `partition 2` against a Debian install whose
+            // own tools call the same three 1, 2 and 3 (2026-09-17).
             let _ = core::fmt::Write::write_fmt(
                 &mut w,
-                format_args!("partition {} (unlabelled)", index),
+                format_args!("partition {} (unlabelled)", index + 1),
             );
             w.len()
         }
@@ -175,7 +181,10 @@ fn publish_partition(disk: &ObjectRef, e: &[u8], first_lba: u64, count: u64, ind
         .unwrap_or("");
     crate::kprintln!(
         "gpt:  partition {} lba {}..{} ({} sectors) label \"{}\" -> block node",
-        index,
+        // 1-based, to agree with the name above and with every other tool. The boot log and
+        // a disk list disagreeing about which partition is which is worse than either
+        // convention on its own.
+        index + 1,
         first_lba,
         first_lba + count - 1,
         count,

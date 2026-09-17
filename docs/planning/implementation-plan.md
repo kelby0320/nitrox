@@ -343,6 +343,22 @@ interrupt-routing bug look identical from userspace. See the decision log for bo
     memory reads it back. QEMU shows the configuration and cannot show the cost, so the laptop
     judged it: a full screen in 1632 us where it took 72930, within 1.2x of the bootloader's own
     mapping, and a desktop that is no longer painful.
+  - **Part H.1 (the installer) is complete, 2026-09-16: the system installs itself.** The live
+    image carries the ESP an installed machine boots from as a module on its installer entry
+    alone, `libgpt` writes the target's table, and `nxinstall` — an ordinary Nitrox program with
+    no authority of its own — refuses anything that is not a whole disk, requires the disk's
+    identity typed back as an *argument* (nothing in this system reads a terminal), and copies the
+    two sources it finds by what they contain. `cargo xtask check-install` drives the whole path a
+    person takes on the laptop and then boots the written disk alone to a greeter. H.2 owes the
+    filesystem the size of the disk: what is copied today is the live root, and the ext4 writer
+    still allocates in block group 0 only.
+  - **The laptop boots Nitrox from its own disk, 2026-09-17** — the phase's definition of done.
+    `nxinstall` wrote the internal disk from the live stick and the machine came up on it with the
+    stick removed, which also answered the UEFI question the plan had flagged: this firmware does
+    reach `\EFI\BOOT\BOOTX64.EFI` on a fixed disk, so an NVRAM writer stays deferred. One
+    machine's answer, not a general one. What is left under Part H is H.2 — the filesystem is the
+    live root's 24 MiB inside a whole-disk partition, so the machine has about 112 MiB until
+    cross-group allocation lands.
   - Two deferrals name "real hardware" as their trigger and this phase fires both — shared
     INTx and framebuffer cache attributes. A third, `_PRT`/MSI routing, is *reclassified* here:
     it sits under MSI/MSI-X, filed as performance work, and Part A argues it is a correctness
