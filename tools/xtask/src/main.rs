@@ -2659,17 +2659,14 @@ fn run_install_steps(
     //    proof is available: nothing may say it installed to `/dev/blk/1`, and the transcript is
     //    checked for that after the install that follows has succeeded, which is what stops the
     //    absence from being satisfied by an installer that never ran at all.
-    type_text(qmp, &format!("nxinstall /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
-    press(qmp, "ret")?;
+    type_at_terminal(qmp, &format!("nxinstall /dev/blk/1 \"{RAMDISK_IDENTITY}\""))?;
 
     // 8. The installer, typed at the shell in it.
     //
     //    **`/dev/blk/0` is the disk**, and this gate asserts that rather than assuming it: the
     //    AHCI disk is registered before the two modules, so a change in that order should fail
     //    here rather than silently install to something else. The line above named it.
-    let cmd = format!("nxinstall /dev/blk/0 \"{identity}\"");
-    type_text(qmp, &cmd)?;
-    press(qmp, "ret")?;
+    type_at_terminal(qmp, &format!("nxinstall /dev/blk/0 \"{identity}\""))?;
 
     // What a destructive operation leaves in the system log, which is also the only thing this
     // gate can read: a release terminal does not narrate its grid.
@@ -6377,13 +6374,18 @@ fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
     // which resolves to nothing. Sleeping only *between* keys leaves exactly that one gap.
     for c in line.chars() {
         std::thread::sleep(PER_KEY);
-        match c {
-            ' ' => press(qmp, "spc")?,
-            _ => {
-                let mut qcode = String::new();
-                qcode.push(c);
-                press(qmp, &qcode)?;
-            }
+        // **One character map, in `qcode_for`.** This loop handled lowercase and space,
+        // which is all `check-terminal` ever typed; `check-install` types a disk's identity
+        // back — uppercase, quotes, brackets — and a second map would be a second thing to
+        // keep correct. A character neither knows is an error there rather than a silent
+        // skip, because a dropped character makes a *different command line*.
+        let (qcode, shift) = qcode_for(c)?;
+        if shift {
+            qmp.send_key("shift", true)?;
+        }
+        press(qmp, &qcode)?;
+        if shift {
+            qmp.send_key("shift", false)?;
         }
     }
     std::thread::sleep(PER_KEY);
@@ -6395,40 +6397,6 @@ fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
 fn press(qmp: &mut Qmp, qcode: &str) -> R<()> {
     qmp.send_key(qcode, true)?;
     qmp.send_key(qcode, false)?;
-    Ok(())
-}
-
-/// Type `text` at the greeter, one character at a time, waiting for each redraw.
-///
-/// **One at a time and waited for**, for the reason `check-terminal`'s typing loop gives: a
-/// word injected as fast as QMP can send it outruns a client that repaints between keystrokes,
-/// and the tail lands on a client that is not looking. A human types slower than this loop; a
-/// harness does not.
-/// Type `text` into whatever window holds the keyboard, one character at a time.
-///
-/// **Paced rather than acknowledged**, which is the difference between this and
-/// [`type_at_greeter`] and `check-terminal`'s loop. Those wait on a line the guest emits per
-/// keystroke — a greeter redraw, a grid echo — and neither exists here: `check-install` drives a
-/// **release** terminal, which deliberately does not narrate its grid to the kernel log (that
-/// instrumentation is `test-harness` only, and a terminal that told the console what was typed
-/// would be worse than a missing gate). So the receipt is unavailable and the pacing is explicit.
-///
-/// The delay is what a keystroke costs the terminal: it repaints, waits for a free buffer and
-/// copies a window of pixels before it looks at input again. `check-terminal`'s comment measured
-/// that a word injected as fast as QMP can send it outruns that and loses the tail.
-fn type_text(qmp: &mut Qmp, text: &str) -> R<()> {
-    for c in text.chars() {
-        let (qcode, shift) = qcode_for(c)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        qmp.send_key(&qcode, true)?;
-        qmp.send_key(&qcode, false)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(40));
-    }
     Ok(())
 }
 
@@ -6461,6 +6429,12 @@ fn qcode_for(c: char) -> R<(String, bool)> {
     }
 }
 
+/// Type `text` at the greeter, one character at a time, waiting for each redraw.
+///
+/// **One at a time and waited for**, for the reason `check-terminal`'s typing loop gives: a
+/// word injected as fast as QMP can send it outruns a client that repaints between keystrokes,
+/// and the tail lands on a client that is not looking. A human types slower than this loop; a
+/// harness does not.
 fn type_at_greeter(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
     for c in text.chars() {
         let qcode = match c {
@@ -6699,6 +6673,24 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // `TODO(gui-dev-tty)` seen from the other side, and Milestone 7 closes both when
     // `desktop-shell` constructs a namespace per application.
     session.expect("nxterm: grid> ")?;
+
+    // **A stage's *diagnostic* reaches the grid too** (Phase 5 Part H.1). Everything above
+    // this is a program's `stdout` — a typed stream the shell captures and renders as the
+    // pipeline's value. Diagnostics take the other path in design §1, and until now that
+    // path ended nowhere a person could see: `Streams::stderr` was `None`, so a program fell
+    // back to `kprint` — `SYS_DEBUG_KPRINT`, which reaches COM1 and nothing else. Under
+    // QEMU a developer read them off the serial port and the hole was invisible; on the
+    // laptop, which has no serial port, `nxinstall`'s entire first run printed nothing at
+    // all (first install attempt, 2026-09-17).
+    //
+    // **This is the gate that can see it.** `check-install` drives a release image and
+    // cannot read the grid; here `nxterm` narrates it, so the whole new path is asserted at
+    // once: the stage sends on the shared `stderr`, the shell drains it while waiting, and
+    // it lands in the grid as text. A failing `remove` is the cheapest diagnostic in the
+    // tree, and a path that does not exist is a message no successful command would print.
+    type_at_terminal(&mut qmp, "remove /nothing-here")?;
+    session.expect("nxterm: grid> remove: ")?;
+    println!("  ok: a stage's diagnostic rendered in the grid, not on the kernel log");
 
     // **The menu is a window now (M6 C3).** It was a `Stack` layer over the terminal, which
     // worked only because it happened to fit inside it; as a `popup` it is parented to the

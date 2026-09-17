@@ -26429,3 +26429,45 @@ presented as a timeout on a line that was plainly in the transcript.
 running root is inside — naming it *correctly*, so only its kind can refuse it — and asserts
 nothing was installed to it. The absence means something because the install that follows
 succeeds. A control that let a RAM disk through failed the gate with the line it was written for.
+
+## 2026-09-17 — The first install attempt on the laptop found three things, one of them a hole
+
+`nxinstall` was run on the laptop in its two non-destructive forms. The disk list was right —
+`ST1000LM035-1RK172`, 931 GiB, at `/dev/blk/0`, with the Debian partitions correctly typed as
+`partition` and refused, and the two modules as `ram disk`. The second form printed **nothing**.
+
+**A stage's diagnostics had nowhere to go, and this is the owed half of `TODO(tty-server)`.**
+`nxsh` handed every stage `Streams { stderr: None, .. }` on the reasoning that a stage's `stderr`
+is "the shell's own — the console". It is: `SYS_DEBUG_KPRINT`, ambient, taking no handle, reaching
+COM1 and nothing else. Under QEMU a developer reads those lines off the serial port, so the hole
+was invisible for as long as the only machine was QEMU. The laptop has no serial port, and its
+framebuffer console stops drawing the moment the compositor is handed the screen — so every
+diagnostic from every program has been going nowhere in a graphical session. `nxinstall` is merely
+the first program whose *entire* output is diagnostics, so it is the first one where this showed.
+
+The shell now creates one `stderr` per pipeline — shared, as design §1 says — hands each stage a
+duplicate, and drains it into the terminal it already writes its prompt and results to. It drains
+at the two places the shell waits (reading the tail, and reaping) and once more after the last
+stage is gone, so a program's final word is not lost to the wait that noticed its exit. Which
+handle woke now has to be read out of `IoResult.handle`: breaking on any wake would treat an
+arriving diagnostic as the tail speaking and then block on output that is not there.
+`Host::out` — `display`'s output — went the same way for the same reason and is fixed with it.
+What remains of the deferral is the *ambience*: a shell with no terminal still writes to the
+console without holding a handle to it.
+
+**The gate could not have caught this, and now one can.** `check-install` asserts on the kernel
+log, which is exactly the channel that vanishes on the laptop — the third time this part has
+proved a path that is not the one that matters. The assertion belongs in `check-terminal`, which
+boots the test image and so can read `nxterm`'s grid: a failing `remove` must render *in the
+grid*. Its control is decisive — with `stderr: None` restored, the gate times out on that line
+and the serial transcript carries `remove: no such path` instead. Same message, wrong
+destination.
+
+**Two smaller things the same run found.** `format_identity` trimmed only *trailing* spaces, and
+ATA does not say which end a drive pads: this Seagate right-justifies its serial in the 20-byte
+field, so the name read `ST1000LM035-1RK172 (            WDELGVZ3)` — which the installer then
+asked a person to type back character for character. Its model is left-justified, which is why
+QEMU never showed it. And partitions were named from zero, where `/dev/sda1`, `sgdisk` and the
+firmware all number them from one; the laptop's disk list disagreed with Debian's about which
+partition was which. Both now have host tests, the identity one against this drive's exact
+padding.

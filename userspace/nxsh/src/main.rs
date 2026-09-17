@@ -32,9 +32,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libkern::abi::{HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
-use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ};
+use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
+    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
+    SYS_MEMORY_MAP,
     SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE,
     SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1, syscall2,
     syscall3, syscall4, syscall5,
@@ -84,10 +85,92 @@ const EXIT_KIND_NORMAL: u32 = 0;
 // *kind* and reported every non-zero exit as a crash.
 static mut NOTIF: libkern::abi::Notification =
     libkern::abi::Notification { kind: 0, body: [0; 60] };
-/// Two waiters: the notification channel, and the terminal — the pipeline wait watches
-/// both, so `Ctrl-C` is noticed while a *stage* is what is taking the time (§11h).
-static mut WAIT_HANDLES: [u64; 2] = [0; 2];
-static mut WAIT_RESULTS: [u8; 48] = [0; 48];
+/// Three waiters: what the pipeline is producing, the terminal — so `Ctrl-C` is noticed
+/// while a *stage* is what is taking the time (§11h) — and the pipeline's shared `stderr`,
+/// so a stage's diagnostics reach the screen **while** it is still working rather than
+/// after it finishes (Phase 5 Part H.1).
+static mut WAIT_HANDLES: [u64; 3] = [0; 3];
+static mut WAIT_RESULTS: [u8; 72] = [0; 72];
+
+/// Was `handle` among the `n` results `sys_wait` just wrote?
+///
+/// `IoResult.handle` is at offset 0 of each 24-byte record, which is what makes a
+/// multi-handle wait usable: without reading it a caller knows only that *something*
+/// signalled, and would have to treat a diagnostic arriving as though the pipeline's output
+/// had — then block reading output that is not there.
+fn signalled(n: i64, handle: u64) -> bool {
+    if n < 1 {
+        return false;
+    }
+    // SAFETY: the syscall wrote `n` records, and `n` is bounded by the handle count we
+    // passed, which is at most the array's length.
+    unsafe {
+        let r = &raw const WAIT_RESULTS as *const u8;
+        (0..n as usize).any(|i| {
+            let mut bits = [0u8; 8];
+            core::ptr::copy_nonoverlapping(r.add(i * 24), bits.as_mut_ptr(), 8);
+            u64::from_le_bytes(bits) == handle
+        })
+    }
+}
+
+/// One message off the pipeline's shared `stderr`, staged before it goes to the terminal.
+static mut ERR_MSG: [u8; 4096] = [0; 4096];
+static mut ERR_HANDLES: [u64; 8] = [0; 8];
+static mut ERR_COUNT: usize = 0;
+
+/// Write every diagnostic waiting on `err` to the terminal, and do not block.
+///
+/// **This is the half of `TODO(tty-server)` that was owed** (`deferred-decisions.md`): a
+/// stage's diagnostics used to have nowhere to go. `Streams::stderr` was `None`, so a
+/// program fell back to `kprint` — `SYS_DEBUG_KPRINT`, which reaches COM1 and nothing else.
+/// On a machine with a serial port a developer saw them; on the laptop Phase 5 targets,
+/// which has none and whose framebuffer console stops drawing once the compositor is handed
+/// the screen, they went nowhere at all. `nxinstall` is what made that visible: its entire
+/// first run — the plan, and the line that would carry it out — is diagnostics, and on the
+/// laptop it printed a bare exit status.
+///
+/// Each diagnostic is one whole message, because `stderr` is shared between the stages of a
+/// pipeline and a partial line would interleave with another stage's.
+fn drain_diagnostics(err: u64, tty: u64) {
+    if err == 0 {
+        return;
+    }
+    // SAFETY: single-threaded shell; valid recv out-params.
+    unsafe {
+        loop {
+            let rr = syscall4(
+                SYS_CHANNEL_RECV,
+                err,
+                (&raw mut ERR_MSG) as u64,
+                (&raw mut ERR_HANDLES) as u64,
+                (&raw mut ERR_COUNT) as u64,
+            );
+            if rr != 0 {
+                break; // WouldBlock (nothing waiting) or the last stage has closed its end
+            }
+            let len =
+                u32::from_le_bytes([ERR_MSG[4], ERR_MSG[5], ERR_MSG[6], ERR_MSG[7]]) as usize;
+            let text = core::slice::from_raw_parts(
+                ((&raw const ERR_MSG) as *const u8).add(24),
+                len.min(4096 - 24),
+            );
+            let Ok(text) = core::str::from_utf8(text) else {
+                continue; // a diagnostic is text; anything else is not ours to render
+            };
+            // A diagnostic carries its own trailing newline and `tty_write_crlf` ends every
+            // line it is given, so passing one through unchanged would leave a blank line
+            // between every message.
+            let text = text.strip_suffix('\n').unwrap_or(text);
+            if tty != 0 {
+                tty_write_crlf(tty, text);
+            } else {
+                kprint(text.as_bytes());
+                kprint(b"\n");
+            }
+        }
+    }
+}
 static mut SPAWN: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 1,
@@ -109,6 +192,21 @@ struct NitroxHost {
 }
 
 impl NitroxHost {
+    /// Say `text` where the person running this shell will see it: the terminal if there is
+    /// one, the kernel log if there is not.
+    ///
+    /// **The fallback is not a substitute.** `kprint` reaches COM1, so on a machine without
+    /// a serial port it reaches nobody — which is the whole of why this method exists. A
+    /// shell with no terminal is a script or a Tier-0 stage, where the kernel log is the
+    /// only sink there has ever been.
+    fn say(&mut self, text: &str) {
+        if self.tty != 0 {
+            tty_write_crlf(self.tty, text.strip_suffix('\n').unwrap_or(text));
+        } else {
+            kprint(text.as_bytes());
+        }
+    }
+
     fn resolve_program(&mut self, name: &str) -> Result<u64, String> {
         if name.starts_with('/') || name.starts_with("./") || name.starts_with("../") {
             return lookup(self.namespace, name.as_bytes())
@@ -173,6 +271,18 @@ impl Host for NitroxHost {
         let mut children: Vec<u64> = Vec::new();
         let mut capture: Option<u64> = None;
 
+        // **One `stderr` for the whole pipeline, not one per stage**, which is what design §1
+        // means by a shared diagnostic sink: a stage's diagnostics bypass the pipe, so they
+        // must not be threaded through the pipeline's value, but they do have to arrive
+        // somewhere a person can see. The shell drains this into the terminal it already
+        // writes its prompt and results to.
+        //
+        // Deep enough that a stage reporting progress through a long job is never waiting on
+        // the shell to read: a send commits to a bounded pending-sender queue before it
+        // blocks, so the effective slack is larger than this again.
+        let (err_rx, err_tx) =
+            pipe(32).map_err(|_| String::from("could not create a diagnostic channel"))?;
+
         for (i, spec) in stages.iter().enumerate() {
             let last = i + 1 == stages.len();
             // Depth 4: enough to keep a producer moving, small enough that backpressure
@@ -195,13 +305,18 @@ impl Host for NitroxHost {
             }
             spawned += 1;
 
+            // **A duplicate per stage, because a setup message *moves* its handles.** The
+            // sink is shared, so each stage needs its own reference to it; handing the same
+            // handle to two stages would leave the second with nothing.
+            // SAFETY: register-only syscall on a channel endpoint this shell owns.
+            let err_dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, err_tx, RIGHT_SEND | RIGHT_TRANSFER) };
             let streams = Streams {
                 stdin: upstream.take(),
                 stdout: Some(tx),
-                // §1: diagnostics bypass the pipe entirely. A stage's `stderr` is the
-                // shell's own — the console — rather than anything threaded through the
-                // pipeline's value.
-                stderr: None,
+                // §1: diagnostics bypass the pipe entirely — they are not part of the
+                // pipeline's value. They go to the shell's shared sink, which the shell
+                // renders on the terminal.
+                stderr: (err_dup > 0).then_some(err_dup as u64),
             };
             let argv: Vec<&str> = spec.argv.iter().map(|s| s.as_str()).collect();
             // The same environment to every stage, arguments passed through as written:
@@ -237,6 +352,12 @@ impl Host for NitroxHost {
             unsafe { syscall1(SYS_HANDLE_CLOSE, tx) };
         }
 
+        // **Close the shell's own write end.** Every stage holds a duplicate, so the read
+        // end reports end-of-stream once the last of them is gone — and until this is
+        // closed it never would, because the shell would still be a writer.
+        // SAFETY: closing our own handle; the stages hold their duplicates.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, err_tx) };
+
         // Read the tail *before* reaping: a stage that has filled its channel is waiting
         // for this reader, so reaping first would deadlock any producer larger than one
         // pipe's worth.
@@ -247,36 +368,55 @@ impl Host for NitroxHost {
             // until the last stage exits, so `sleep 60 | …` blocks here for a minute and
             // never reaches the reap loop. Waking on the tty, asking the stages to stop,
             // and then reading is what makes `Ctrl-C` reach a *stage* at all.
-            if self.tty != 0 {
-                loop {
-                    // **Poll before blocking.** A channel signals its waiters at the moment
-                    // a message is enqueued, so a waiter that arrives *afterwards* never
-                    // sees that edge — and the interrupt is enqueued before this wait
-                    // begins, because the tty sees `Ctrl-C` in the same console read as the
-                    // line that started the pipeline. Waiting first meant sleeping on a
-                    // message that was already sitting in the queue.
-                    if drain_tty_interrupt(self.tty) {
-                        for &c in &children {
-                            // SAFETY: a Process handle this shell owns, SIGNAL from spawn.
-                            unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-                        }
-                        continue;
+            //
+            // **And the diagnostics are drained here for the same reason**, which is why
+            // this loop now runs whether or not there is a terminal: a stage that reports
+            // progress through a long job — `nxinstall` copying a partition — spends that
+            // whole job with the shell sitting in this wait, and diagnostics buffered until
+            // it finished would arrive as a wall of text after the fact. Without a
+            // terminal they go to the kernel log, which is where they went before.
+            loop {
+                // **Poll before blocking.** A channel signals its waiters at the moment
+                // a message is enqueued, so a waiter that arrives *afterwards* never
+                // sees that edge — and the interrupt is enqueued before this wait
+                // begins, because the tty sees `Ctrl-C` in the same console read as the
+                // line that started the pipeline. Waiting first meant sleeping on a
+                // message that was already sitting in the queue.
+                drain_diagnostics(err_rx, self.tty);
+                if self.tty != 0 && drain_tty_interrupt(self.tty) {
+                    for &c in &children {
+                        // SAFETY: a Process handle this shell owns, SIGNAL from spawn.
+                        unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
                     }
-                    // SAFETY: valid waiter buffers; two handles.
-                    let waited = unsafe {
-                        WAIT_HANDLES[0] = rx;
-                        WAIT_HANDLES[1] = self.tty;
-                        syscall4(
-                            SYS_WAIT,
-                            (&raw const WAIT_HANDLES) as u64,
-                            2,
-                            (&raw mut WAIT_RESULTS) as u64,
-                            u64::MAX,
-                        )
+                    continue;
+                }
+                // SAFETY: valid waiter buffers; two or three handles.
+                let waited = unsafe {
+                    WAIT_HANDLES[0] = rx;
+                    WAIT_HANDLES[1] = err_rx;
+                    let n = if self.tty != 0 {
+                        WAIT_HANDLES[2] = self.tty;
+                        3
+                    } else {
+                        2
                     };
-                    if waited < 1 || !drain_tty_interrupt(self.tty) {
-                        break; // the tail has something to say, or the wait failed
-                    }
+                    syscall4(
+                        SYS_WAIT,
+                        (&raw const WAIT_HANDLES) as u64,
+                        n,
+                        (&raw mut WAIT_RESULTS) as u64,
+                        u64::MAX,
+                    )
+                };
+                // **Which handle woke matters now that three can.** Breaking on any wake
+                // would treat an arriving diagnostic as though the tail had spoken, and the
+                // blocking read below would then sit on output that is not there — while
+                // the stage filled the diagnostic channel behind it.
+                if waited < 1 || signalled(waited, rx) {
+                    break; // the tail has something to say, or the wait failed
+                }
+                drain_diagnostics(err_rx, self.tty);
+                if self.tty != 0 && drain_tty_interrupt(self.tty) {
                     for &c in &children {
                         // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
                         unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
@@ -295,10 +435,16 @@ impl Host for NitroxHost {
             unsafe { syscall1(SYS_HANDLE_CLOSE, rx) };
         }
 
-        Ok(PipelineRun {
-            stages: reap(self.notif, self.tty, &children, stages, spawned, strict),
-            output,
-        })
+        let reaped = reap(self.notif, self.tty, err_rx, &children, stages, spawned, strict);
+        // **One last drain, after every stage is gone.** A program's final word is often its
+        // most important — a refusal, or what it wrote — and it can be sent microseconds
+        // before `exit`, which is to say after the wait that noticed the exit had already
+        // returned. Draining only inside the loop drops exactly that message.
+        drain_diagnostics(err_rx, self.tty);
+        // SAFETY: closing our read end; every writer is gone.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, err_rx) };
+
+        Ok(PipelineRun { stages: reaped, output })
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
@@ -452,7 +598,7 @@ impl Host for NitroxHost {
     }
 
     fn diag(&mut self, text: &str) {
-        kprint(text.as_bytes());
+        self.say(text);
     }
 
     /// §11h. A **non-blocking** receive: this runs at every statement boundary, so it
@@ -497,13 +643,15 @@ impl Host for NitroxHost {
         }
     }
 
-    /// **Shell output is ambient.** `kprint` is `SYS_DEBUG_KPRINT`, which takes no handle,
-    /// so nothing can redirect, pipe, capture or log this — there is no object to redirect.
-    /// The *input* half of that hole closed when `tty-server` shipped (2026-08-13); this is
-    /// the half still owed, and this line is the whole of it.
-    /// TODO(tty-server): `docs/rationale/deferred-decisions.md`.
+    /// **`display`'s output goes to the terminal when there is one** (Phase 5 Part H.1).
+    /// It went to `kprint` — `SYS_DEBUG_KPRINT`, ambient, taking no handle — which reaches
+    /// COM1 and nothing else, so on a machine with no serial port `display` printed
+    /// nowhere at all. What remains of `TODO(tty-server)` after this is the *ambience*: a
+    /// shell with no terminal still writes to the console without holding a handle to it,
+    /// and nothing can redirect, pipe or log that, because there is still no object to
+    /// redirect. TODO(tty-server): `docs/rationale/deferred-decisions.md`.
     fn out(&mut self, text: &str) {
-        kprint(text.as_bytes());
+        self.say(text);
     }
 }
 
@@ -523,6 +671,7 @@ impl Host for NitroxHost {
 fn reap(
     notif: u64,
     tty: u64,
+    err: u64,
     children: &[u64],
     stages: &[StageSpec],
     spawned: usize,
@@ -535,14 +684,20 @@ fn reap(
         // as long as the pipeline runs, so this is the only place `Ctrl-C` can be noticed
         // while a *stage* is what is taking the time (§11h) — the evaluator's checkpoint
         // does not run until this returns.
-        // SAFETY: valid waiter buffers; two handles when there is a terminal.
+        // **The diagnostics are drained here too**, not only in the capture wait: a stage
+        // that has closed its output but not yet exited is still able to speak, and a
+        // pipeline with nothing on its tail reaches this loop immediately and spends the
+        // whole job in it.
+        drain_diagnostics(err, tty);
+        // SAFETY: valid waiter buffers; two or three handles.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
+            WAIT_HANDLES[1] = err;
             let n = if tty != 0 {
-                WAIT_HANDLES[1] = tty;
-                2
+                WAIT_HANDLES[2] = tty;
+                3
             } else {
-                1
+                2
             };
             syscall4(
                 SYS_WAIT,
@@ -552,6 +707,7 @@ fn reap(
                 u64::MAX,
             )
         };
+        drain_diagnostics(err, tty);
         if waited < 1 {
             continue;
         }
