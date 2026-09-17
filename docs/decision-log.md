@@ -26503,3 +26503,28 @@ than "the rest".
 into the grid, and `check-install` boots a release image whose terminal does not narrate one.
 The policy is host-tested and the wiring is a single `return`; this particular line was confirmed
 from a photograph of the laptop's screen.
+
+## 2026-09-17 — Nitrox boots the laptop from its own disk
+
+`nxinstall` wrote the internal disk from the live stick and the machine boots Nitrox with the
+stick removed. That is the line `phase-5-bare-metal.md` calls the phase's definition of done, and
+it is closed. Everything before this had run under QEMU or from a USB stick that had to stay
+plugged in.
+
+**The UEFI risk was answered by the install rather than by the test for it.** The plan said to
+check from Debian, before wiping, whether this firmware reaches `\EFI\BOOT\BOOTX64.EFI` on a
+*fixed* disk — the spec's removable-media path, which a fixed disk reaches only through a boot
+option the firmware chose to create. OVMF makes one for every disk it finds, so `check-install`
+passes either way and says nothing about real firmware. The test was skipped and the install run
+instead; it boots, so this firmware does create one. An NVRAM writer stays deferred.
+
+**That is one machine's answer, and the deferral is not closed by it.** The risk was correctly
+named — it just did not fire here. A firmware that does not create the entry would still need the
+add-boot-option screen or `efibootmgr` from a Linux stick, and this outcome is evidence the
+fallback path is *sometimes* enough rather than that it is always enough.
+
+**What the machine is now.** The root partition is the whole disk, and the filesystem inside it is
+the live root's 24 MiB — `nxinstall` copies raw sectors, so the filesystem does not know about the
+space around it. H.2 owes both halves: `mkfs.ext4` layout, and cross-group allocation in
+`fs-server-ext4`, whose `alloc_inode`/`alloc_block` still search block group 0 only. Until then
+the installed machine has about 112 MiB to write into.

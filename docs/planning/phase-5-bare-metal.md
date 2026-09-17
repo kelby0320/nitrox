@@ -1383,14 +1383,27 @@ you use when there is no installed system to log into.
 
 **H.3 — what a person sees.**
 
-- [ ] A disk list worth choosing from (kind, capacity, model), progress while it copies, and
+- [x] A disk list worth choosing from (kind, capacity, model), progress while it copies, and
       refusals that say what to do.
+> **Landed with H.1, and three of its details were settled by the laptop rather than by design**
+> (2026-09-17). A disk's identity carried the ATA field's padding, because the standard does not
+> say which end a drive pads and this one right-justifies its serial; partitions were numbered
+> from zero where every other tool numbers them from one; and a refusal that printed the plan
+> exited non-zero, so the shell reported `pipeline failed` directly under the line saying what to
+> type next. The largest was not this part's at all: **a stage's diagnostics reached nobody in a
+> graphical session**, because `nxsh` handed every stage `stderr: None` and the fallback is
+> `kprint`, which is COM1-only. A machine with no serial port is what made that visible.
 
 ### What to compare on the day
 
 The laptop boots from its own disk with the stick removed, to the same desktop: `ahci: port 0 disk
 ready`, `gpt: partition … label "nitrox-root"`, `init: mounted fs-server-ext4 at /`, the greeter,
 and `Super+A` to a shell. That is the phase's definition of done, and its last open line.
+
+> **Done, 2026-09-17.** `nxinstall` wrote the laptop's internal disk from the live stick, and the
+> machine boots Nitrox from it with the stick removed. The line above is closed; what remains
+> under Part H is H.2, which is about how *much* of that disk the filesystem uses, not whether it
+> boots.
 
 ### Left alone
 
@@ -1405,6 +1418,12 @@ and `Super+A` to a shell. That is the phase's definition of done, and its last o
   `BootOrder`, and reboot. If that boots Nitrox, the install will; if it does not, the fallback is
   the firmware's add-boot-option screen or `efibootmgr` from a Linux stick, and an NVRAM writer
   stops being deferrable.
+  > **Answered 2026-09-17, and not by the test.** The test was skipped and the install was run
+  > instead; the machine boots. So this firmware does reach `\EFI\BOOT\BOOTX64.EFI` on a fixed
+  > disk, and an NVRAM writer stays deferred. **It is answered for one machine**, which is all a
+  > single laptop can answer — the risk was real, and the next firmware this meets may still want
+  > the add-boot-option screen. What is now known is that the fallback path is enough somewhere,
+  > which it was not before.
 - **A journal.** Our fs-server does not read one and `mke2fs` already builds our images without.
 - **Resizing an existing filesystem.** H.2 makes one the right size instead.
 - **Installing from anything but the live image**, and installing *to* anything but a whole disk.
