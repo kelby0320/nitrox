@@ -1414,22 +1414,6 @@ wrong: a write-back mapping was blamed for a 45× cost that turned out to be a d
 write-combining attribute, and only a number on the real machine settled it. **Trigger**: the
 first time somebody is waiting on it, or the next phase that moves bulk data — which is USB.
 
-**An external program's arguments cannot be computed — `TODO(nxsh-computed-args)`.** Measured
-against the interpreter, 2026-09-17: `copy src format("/home/f-{}.png", i)` is a **parse error**
-(a call cannot sit in argument position); `copy src "/home/f-" ++ i` passes three literal words
-— `/home/f-`, `++`, `i`; `save format(...)` answers "`save` needs a path", since `save` takes a
-bareword; and `$i` inside a word is literal, §8d having rejected interpolation. So there is **no
-way to build a path in a loop**, and `for i in 1..50 { copy a b-i }` — the first thing anyone
-reaches for — cannot be written at all.
-
-The design is deliberate as far as it goes: §10's "arguments are kept unevaluated and each
-operator decides" is what lets `sort size` name a column and `display files` name a binding, and
-§8d's rejection of interpolation is argued at length. What is missing is the *escape hatch* every
-shell has for when you do want evaluation — `$(…)`, `${x}`, or an explicit "evaluate this
-argument" marker. Found by trying to write the obvious test for Part H.2's whole point: a script
-that writes more than 112 MiB. **Trigger**: the second time somebody needs it. The workaround is
-a fixed sequence of literal commands, which is what the laptop used.
-
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 
 **Encrypted root (LUKS).** Architecture accommodates this — LUKS is a block device filter driver in initramfs; init invokes it before spawning fs-server. Not in initial scope. Trigger: encrypted-root deployment.

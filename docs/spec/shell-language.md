@@ -618,6 +618,27 @@ assignable values per §5c (`let f = { |x| x + 1 }` wasn't legal grammar before 
 bareword-predicate sugar from §8b is unaffected — it desugars into `{ |it| ... }` under the hood,
 so nobody has to type the pipes for that path by hand.
 
+### 8c-1. Computing an argument: parenthesise it
+
+Argument position lexes **words, not expressions** — that is what lets `copy /home/a /home/b`
+name two paths and `sort size` name a column, and it is why there is no interpolation (§8d). A
+bareword therefore goes through untouched: `copy src /dst-$i.png` passes the literal
+`/dst-$i.png`, and `copy src "f-" ++ i` passes three separate words.
+
+**To compute one, wrap it in parentheses.** A parenthesised expression in argument position is
+evaluated and its rendered value becomes one argument:
+
+```
+for i in 1..50 { copy /home/w.png (format("/home/big-{}.png", i)) }
+copy /home/w.png ("/home/big-" ++ i)
+```
+
+Without this paragraph the grammar reads as though computing an argument were impossible —
+`format(…)` unparenthesised is a *parse error*, because `(` closes a word — and that reading has
+already cost once (2026-09-17). Pinned by
+`a_parenthesised_argument_to_an_external_program_is_evaluated` in `userspace/nxsh/src/eval.rs`,
+which asserts both halves: the parenthesised form is evaluated, the bareword beside it is not.
+
 ### 8d. String literals — no interpolation; `format()` instead
 
 Rejected full string interpolation (`"hello ${name}"`) on two grounds: it forces the string

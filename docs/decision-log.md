@@ -26572,3 +26572,36 @@ while trying to write the obvious test for this phase's own work.
 **Phase 6 — USB — is next**, and it inherits a smaller debt than the plan assumed: the pointer
 question is answered, and the machine that will exercise a USB stack is now one that runs from its
 own disk.
+
+## 2026-09-17 — Four failing examples are not a grammar
+
+I told the maintainer `nxsh` could not compute an external program's argument, and filed a
+deferral saying so. It can. `for i in 1..50 { copy /home/w.png (format("/home/big-{}.png", i)) }`
+works, and produces exactly the argv you would want.
+
+**How the mistake was made.** Trying to write a script that would write more than 112 MiB — the
+test for Part H.2's own point — I probed four forms against the interpreter: an unparenthesised
+call (parse error), `"a" ++ i` (three literal words), `save format(…)` (wants a bareword), and
+`$i` (literal). All four failed, so I generalised to "there is no way", handed over a
+thirteen-line workaround, and wrote the generalisation into `deferred-decisions.md`.
+
+The probe was the right instinct — measuring beats guessing, and it is how the four *individual*
+answers were correct. What was wrong was the inference: **four examples that fail do not describe
+a grammar**, and I had already read the code that should have stopped me, `Arg::Positional(e) =>
+argv.push(self.eval(e)?.render())` — the evaluator evaluates positional arguments. The failures
+are all in the *lexer*: argument position scans words, and `(` closes a word, so an expression
+never forms unless you open one. That is a deliberate design (a bareword must stay literal, or
+`copy /home/a /home/b` and `sort size` break) with an escape hatch nobody had written down.
+
+**What changed.** The deferral is withdrawn rather than reworded — it described a limitation that
+does not exist. §8c-1 of `shell-language.md` documents the escape hatch, since its absence is
+what made the grammar read as though computing an argument were impossible. And
+`a_parenthesised_argument_to_an_external_program_is_evaluated` pins both halves: the
+parenthesised form is evaluated, the bareword beside it is not. The nearest existing test covered
+a call inside a **function**'s argument list, which is a different grammar and is why this went
+unnoticed.
+
+**The general lesson is about what a probe licenses.** A probe answers the question you asked it.
+Concluding a *capability does not exist* from a handful of failures is a claim about everything
+you did not try, and the cost here was a wrong deferral, a wrong answer to the maintainer, and a
+workaround thirteen lines long for something that fits on one.

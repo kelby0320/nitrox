@@ -150,6 +150,13 @@ fn po_wait(po: u64) -> (i32, u64) {
 /// transfer in a single command), not one per 512-byte sector — 8× fewer block-I/O round
 /// trips, which is what made the same-CPU wake latency so acute (see the decision log,
 /// 2026-07-23). The parser's individual reads are small (≤ one 4 KiB filesystem block).
+///
+/// **One block per `sys_io_submit` is a suspect in `TODO(fs-throughput)`** — `copy` and
+/// `remove` are slower on real storage than a 5400 rpm disk accounts for (measured on the
+/// laptop, 2026-09-17), and every metadata read and write a mutation makes comes through here
+/// one 4 KiB block at a time. It is *a* suspect and not a diagnosis: see
+/// `docs/rationale/deferred-decisions.md`, which lists the others and says the measurement
+/// comes first.
 struct DiskReader {
     /// The read-only block-device handle (from the setup message).
     device: u64,

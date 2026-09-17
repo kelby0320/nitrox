@@ -30,9 +30,15 @@ invisible because every fixture was smaller than the structure it tested.
 **Left open, recorded rather than fixed**: `copy` and `remove` are slower on real storage than
 a 5400 rpm disk accounts for (`TODO(fs-throughput)`, undiagnosed — the measurement comes
 first); an installed machine's UEFI entry relies on the firmware creating one for
-`\EFI\BOOT\BOOTX64.EFI`, which this firmware does and another might not; and an external
-program's arguments cannot be computed in `nxsh`, found while trying to write a test for this
-phase's own work.
+`\EFI\BOOT\BOOTX64.EFI`, which this firmware does and another might not.
+
+**And one thing recorded wrongly, then corrected the same day.** Trying to write a script that
+wrote more than 112 MiB, I probed four forms, found all four failed, and concluded `nxsh` could
+not compute an external program's argument at all — filing a deferral saying so. It can:
+parentheses are the escape hatch, `for i in 1..50 { copy a (format("b-{}", i)) }` works, and the
+evaluator I had already read evaluates positional arguments. Four failing examples are not a
+grammar. The deferral is withdrawn, §8c-1 of the shell spec now says how to do it, and a test
+pins both halves — the parenthesised form evaluated, the bareword beside it literal.
 
 **Why this comes before the portable runtime, networking and the browser.** Everything built
 through Phase 4 has only ever executed under QEMU. That is not a small asterisk: an emulator
