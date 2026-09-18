@@ -26605,3 +26605,53 @@ unnoticed.
 Concluding a *capability does not exist* from a handful of failures is a claim about everything
 you did not try, and the cost here was a wrong deferral, a wrong answer to the maintainer, and a
 workaround thirteen lines long for something that fits on one.
+
+## 2026-09-17 — What comes after Phase 5, and why the design goes first
+
+Phase 5 closed this morning. The remaining plan said Phase 6 is USB; two things now sit in front
+of it, and the phases are **not renumbered** — the numbers appear throughout this log, which is
+append-only, and shifting USB to 7 would make every historical reference wrong to tidy a table.
+
+**Display arm M16 — the design, adopted — comes first.** The maintainer designed a polished shell
+with Claude Design and handed it over as a runnable page. It goes before the administration work
+for a reason that is the maintainer's own standing rule: the admin tools are UI surfaces, and
+building them against the current look to restyle them afterwards is building something that has
+to be replaced. `administration.md` also carries an unanswered display question — "the prompt must
+belong to the broker, which on this system means a window the compositor trusts" — so the two
+overlap whichever order they are taken in.
+
+**Then administration**, whose closing slice should be the installer becoming the broker's first
+client. The stub already frames it that way, and "first client" is only meaningful if something
+consumes the broker: a set of admin tools with no consumer is precisely the state PR #308's review
+criticised in Part H.1.
+
+**What the design asked for and did not get.** The page contains a notification centre, quick
+settings with volume and brightness, a System Settings application, desktop icons and a launcher.
+Notifications and quick settings have no infrastructure — no service, no audio, no backlight.
+Settings largely existed so the maintainer could try layouts. Desktop icons duplicate the Places
+menu. The launcher is deferred rather than rejected. **Categories are dropped**: the design files
+three programs under "Accessories" and a taxonomy invented for three entries is one we would have
+to live with.
+
+**One deliberate divergence, and it is a correction of the design rather than a compromise with
+it.** In the mock a focused window differs from an unfocused one by a thin outline in dark mode
+and almost nothing in light. We already carry `title_active` and `title_inactive`; they will
+differ visibly. A desktop where you cannot tell which window has the keyboard gets reported as a
+focus bug, and this one is meant to be used on a laptop with no pointer worth speaking of.
+
+**The structural rule this milestone is written around.** A redesign is the change most able to
+turn `check-display` into a tautology: every visual assertion moves at once, and the tempting
+repair is to adjust the reference until it matches whatever the code now draws. So nothing — no
+colour, radius or metric — is written twice. It goes in the theme; the toolkit reads the theme;
+the reference render reads the same theme. A gate then fails when the code disagrees with the
+design, which is the only disagreement worth gating. The design makes this easy by containing its
+own `theme.toml`.
+
+**And one thing the detail pass found that a screenshot cannot show.** Rounded corners are not a
+painting change. `compose_exposed` skips the background under any surface that `covers` its
+rectangle, and a rounded window does not cover its rectangle — its corners must show whatever is
+behind them. The three ways out are in the milestone; the one worth costing first makes `covers` a
+*region* rather than a predicate, because the alternatives are either wrong where windows overlap
+or pay M13 Part A's measured double-write on every pixel of every window. On a machine where a
+framebuffer mistake cost 45× three days ago, that is not a detail to discover during
+implementation.
