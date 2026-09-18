@@ -892,9 +892,22 @@ impl DisplaySize {
     /// that had stopped drawing where it says (M11 decision 2). 30 since the desktop refresh's
     /// Part C, which took the design's bars; it was 24.
     const BAR_H: i32 = 30;
-    /// The desktop indicator's width at the bottom bar's right-hand end — `desktop_shell::INDICATOR_W`,
-    /// for the same reason.
-    const INDICATOR_W: i32 = 160;
+    /// Where the bottom bar's first task button starts, how wide one is, and the step from one to
+    /// the next — `desktop_shell::panel::TASKS_X`, `TASK_W` and `TASK_PITCH`, for the same reason.
+    /// The show-desktop button and the rule before them are what the 48 pixels are (desktop
+    /// refresh, Part C).
+    const TASKS_X: i32 = 48;
+    /// See [`TASKS_X`](Self::TASKS_X).
+    const TASK_W: i32 = 186;
+    /// See [`TASKS_X`](Self::TASKS_X).
+    const TASK_PITCH: i32 = 190;
+    /// The show-desktop button's middle, from the left edge.
+    const SHOW_DESKTOP_X: i32 = 20;
+    /// The desktop's name at the switcher's right-hand end, from the screen's right edge. The
+    /// switcher is anchored there and the name is its last part, so this is inside the name for
+    /// any name of two characters or more — which `panel`'s own test pins, at five widths and
+    /// four names.
+    const NAME_FROM_RIGHT: i32 = 30;
     /// The overview sidebar's width — `desktop_shell::SIDE_W`, for the same reason.
     const SIDE_W: i32 = 200;
 
@@ -939,9 +952,20 @@ impl DisplaySize {
         self.bottom_bar_y() + Self::BAR_H / 2
     }
 
-    /// The middle of the desktop indicator, which opens the overview.
-    fn indicator_click(self) -> (i32, i32) {
-        (self.w as i32 - Self::INDICATOR_W / 2, self.bottom_bar_click_y())
+    /// The desktop's name on the bottom bar, which opens the overview — the indicator's job
+    /// before the desktop refresh's Part C gave the switcher its place.
+    fn desktop_name_click(self) -> (i32, i32) {
+        (self.w as i32 - Self::NAME_FROM_RIGHT, self.bottom_bar_click_y())
+    }
+
+    /// The middle of the task button in `slot`, counted from the left.
+    fn task_click(self, slot: usize) -> (i32, i32) {
+        (Self::TASKS_X + Self::TASK_PITCH * slot as i32 + Self::TASK_W / 2, self.bottom_bar_click_y())
+    }
+
+    /// The show-desktop button.
+    fn show_desktop_click(self) -> (i32, i32) {
+        (Self::SHOW_DESKTOP_X, self.bottom_bar_click_y())
     }
 
     /// The middle of the overview sidebar's width.
@@ -2194,6 +2218,12 @@ fn next_geometry(session: &mut Session) -> R<(u32, i32, i32, u32, u32)> {
 /// **Relative injection, so the pointer must be somewhere known first.** A PS/2 packet carries a
 /// 9-bit signed delta, so one huge motion is a different movement rather than a big one — the
 /// steps are bounded, and the corner is reached by over-driving into the clamp.
+///
+/// **It records where it left the pointer**, since the desktop refresh's Part C. Every caller but
+/// two did that by hand on the next line, and the two that did not — both in `shot` — walked their
+/// next move from a stale position into the bottom-right corner, which passed only while that
+/// corner happened to be the desktop indicator's. A believed position, not a confirmed one:
+/// `click_at` still forgets it when a press does not land where it was aimed.
 fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
     // **Pin only when the position is unknown.** The pin is twenty over-driven motions, and
     // repeating it before every click is what floods the guest's input ring.
@@ -2230,6 +2260,7 @@ fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
         dx -= sx;
         dy -= sy;
     }
+    qmp.pointer = Some((x, y));
     Ok(())
 }
 
@@ -4003,14 +4034,12 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // And it is listed, focused, because it has the keyboard.
     session.expect("desktop-shell: window list on ")?;
 
-    // Where a window-list entry sits: the first slot on the bottom bar, whose height comes from the
-    // screen this gate booted.
-    let list_click: (i32, i32) = (90, size.bottom_bar_click_y());
-    // How wide one is — `desktop-shell::ENTRY_W`, so slot `i`'s centre is `ENTRY_W * i + 90`.
-    // Hardcoded like every other chrome metric this gate aims at, and for the same reason: a
-    // gate that read the shell's layout to know where to click could agree with a shell that
-    // had stopped drawing where it says (M11 decision 2).
-    const ENTRY_W: i32 = 180;
+    // Where a window-list entry sits: the first task button on the bottom bar, whose height comes
+    // from the screen this gate booted. `DisplaySize::task_click` is hardcoded like every other
+    // chrome metric this gate aims at, and for the same reason: a gate that read the shell's layout
+    // to know where to click could agree with a shell that had stopped drawing where it says (M11
+    // decision 2).
+    let list_click: (i32, i32) = size.task_click(0);
 
     // 6a2. **The title bar's buttons ask, and the shell disposes** (M9 Part B). A client cannot
     //      minimise or maximise itself — both are manager operations — so the button sends
@@ -4112,6 +4141,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(&format!("compositor: asked window {term_id} to close"))?;
     session.expect("nxterm: asked to close, exiting")?;
     session.expect("nxterm: closing")?;
+    // **Its desktop went with it, and the compositor was told.** Desktop 1 was emptied and
+    // unnamed, so the lifecycle rule removed it and the shell landed on the one after — which is
+    // `Desktop 1` now, by position. Until the desktop refresh's Part C this move reached only the
+    // shell; step 6c2 is where the difference showed.
+    session.expect("desktop-shell: the compositor follows to Desktop 1")?;
     // The compositor tore the windows down with the session, and the list lost the entry.
     session.expect("desktop-shell: window list on Desktop 1 of 1 (empty)")?;
     println!("  ok: the taskbar asked, and the client closed itself");
@@ -4172,9 +4206,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     compositor state continuously rather than at one moment, so the assertions are about
     //     what the list *says*, not only that a click was received.
     //
-    //     The bar is the bottom `DisplaySize::BAR_H` rows of the screen, and entries are 180px
-    //     wide from the left — so `list_click`, x = 90 at half the bar's height, is inside the
-    //     first one at any size.
+    //     The bar is the bottom `DisplaySize::BAR_H` rows of the screen, and the first task
+    //     button spans x 48 to 234 — so `list_click`, at its middle and half the bar's height, is
+    //     inside it at any size.
 
     // Close the menu first: it is a popup on top, and a press meant for the bar would land in
     // it. **By clicking outside it rather than by pressing Escape** (M11 Part E batch 4) —
@@ -4190,8 +4224,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // The compositor sends `Surface::Dismissed` for that press now, which is the half a client
     // cannot see for itself.
     //
-    // **The bottom bar's dead space**, between the last window-list entry and the desktop
-    // indicator. A panel never takes focus, so a press there raises nothing and produces no focus
+    // **The bottom bar's dead space**, between the last task button and the switcher. A panel
+    // never takes focus, so a press there raises nothing and produces no focus
     // change *whatever else is on screen* — which is what makes it the honest test. Aiming at
     // bare desktop instead would depend on the terminal not being maximised at this point in the
     // gate, and it is.
@@ -4221,6 +4255,23 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // title, the compositor reports it on `WindowTitle`, and the bar shows it instead of
     // `window 6`. Nothing in the tree sent a title before this part.
     session.expect(":> nxterm")?;
+
+    // 6b2. **Show desktop, and back** (desktop refresh, Part C). The first press puts away every
+    //      window this desktop's bar shows and lights the button; the second brings back exactly
+    //      what the first put away. The restore set is the shell's, because minimising is a
+    //      manager operation — which the plan's first draft put in the compositor (its review,
+    //      finding 6). One window here, so the count is the claim: a press that put away nothing,
+    //      or brought back something it had not put away, says so.
+    let show = size.show_desktop_click();
+    click_at(&mut qmp, &mut session, show.0, show.1)?;
+    session.expect("desktop-shell: showing the desktop, minimised 1 window(s)")?;
+    session.expect("desktop-shell: window list on ")?;
+    session.expect(":_ nxterm")?;
+    click_at(&mut qmp, &mut session, show.0, show.1)?;
+    session.expect("desktop-shell: restored 1 window(s)")?;
+    // Focus arrives one iteration after the raise, so this is the second list line, as above.
+    session.expect(":> nxterm")?;
+    println!("  ok: show-desktop put the window away and brought it back");
 
     // And the chord, which is the half a taskbar alone does not cover: putting a window away
     // without reaching for its entry. `Super+H`.
@@ -4275,6 +4326,29 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: named this desktop work")?;
     session.expect("desktop-shell: window list on work of 2")?;
 
+    // 6c2. **The switcher** (desktop refresh, Part C): `›` goes to the next desktop, and a cell to
+    //      its own. Two desktops here — `work` and the scratch one after it — so two cells.
+    //      Aimed from the right edge, where the switcher is anchored; the name beside the arrows
+    //      moves them, so `desktop_shell::panel`'s own test pins both aims with `work` and then
+    //      `Desktop 2` as the name — the two states this step presses them in.
+    const NEXT_FROM_RIGHT: i32 = 75;
+    const FIRST_CELL_FROM_RIGHT: i32 = 163;
+    let bar_y = size.bottom_bar_click_y();
+    click_at(&mut qmp, &mut session, size.w as i32 - NEXT_FROM_RIGHT, bar_y)?;
+    session.expect("desktop-shell: switched to Desktop 2")?;
+    session.expect("desktop-shell: window list on Desktop 2 of 2 (empty)")?;
+    click_at(&mut qmp, &mut session, size.w as i32 - FIRST_CELL_FROM_RIGHT, bar_y)?;
+    session.expect("desktop-shell: switched to work")?;
+    // **And the terminal has the keyboard again, because it is on the desktop the compositor is
+    // showing.** The first runs of this step came back `[N:  nxterm]` — listed, unfocused, and not
+    // on screen: the shell had been re-pointed off a removed desktop at step 6a3 without telling
+    // the compositor, so "work" was one desktop to the shell and another to the compositor, and
+    // nothing showed it until something switched away and back (`sync_current`). The move below
+    // depends on this too: it moves the *focused* window.
+    session.expect("desktop-shell: window list on work of 2 [")?;
+    session.expect(":> nxterm")?;
+    println!("  ok: the switcher's arrow and its cell each switched desktops, and back to the window");
+
     // Move the terminal to the second desktop. `work` is now empty — and **named**, so it
     // stays; the desktop that received the window is no longer the scratch slot, so a new one
     // is appended. Two facts in one line: the bar still says `work`, and there are three.
@@ -4302,14 +4376,15 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // 6d. **The overview** (M8 Part E): frozen thumbnails of this desktop, a sidebar of the
     //     others, and a window moved by dropping its thumbnail on one.
     //
-    //     Opened from the indicator, which `desktop-shell.md` §7 always said it does — Part D
-    //     made it advance to the next desktop only because there was no overview to open.
+    //     Opened from the desktop's name at the switcher's end — the indicator's place until the
+    //     desktop refresh's Part C, which `desktop-shell.md` §7 always said opens the overview;
+    //     M8 Part D made it advance to the next desktop only because there was no overview yet.
     //
     //     Bring the terminal back to this desktop first: `work` is empty after 6c, and an
     //     overview of nothing has no thumbnail to drag.
     chord(&mut qmp, false, "1")?;
     session.expect("desktop-shell: switched to work")?;
-    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     // **The compositor's own line first, and it comes first in the guest too**: the shell
     // captures every visible window *before* it creates the overview to show them in. Asserted
     // rather than inferred, because an overview that opened with no thumbnails would satisfy
@@ -4333,7 +4408,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     let side_row = |i: i32| (size.sidebar_x(), DisplaySize::BAR_H + i * 72 + 36);
     // **The drag starts from a position already verified — by the click that opened this.** A
     // drag cannot check its own start: there is no press receipt until the button goes down, and
-    // by then it has begun. The indicator's `click_at` above asserted where it landed and left the
+    // by then it has begun. The name's `click_at` above asserted where it landed and left the
     // pointer there, and opening the overview does not move it, so the walk to the thumbnail is
     // the same arithmetic every other step here does.
     //
@@ -4414,11 +4489,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // Asserted by the compositor naming the window a press landed on: on another desktop a
     // non-sticky bar gives `win=none`, and no shell line follows because nothing was reached.
     //
-    // **The indicator opens the overview since Part E**, which is what `desktop-shell.md` §7
-    // always specified — Part D made it advance to the next desktop only because there was no
-    // overview to open. Escape closes it again so the serial login below is not typing at a
+    // **The desktop's name opens the overview**, as the indicator in its place did since M8
+    // Part E — what `desktop-shell.md` §7 always specified. Escape closes it again so the serial login below is not typing at a
     // popup that holds the keyboard.
-    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     // **Before the "overview open" line, because that is where it is** — `open_overview` reports
     // its ground and the caller announces the window afterwards. An expectation placed beside
     // its *topic* rather than beside its position in the stream scans past output that was
@@ -4485,7 +4559,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     Reported from a real session, which is the part worth keeping: the drag was gated and
     //     the click was not, and a gate that drives only the gesture it was written for cannot
     //     tell the difference between "unimplemented" and "untested".
-    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
 
     // The chord path first: an overview left showing the desktop you just switched away from is
@@ -4514,16 +4588,16 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: overview closed")?;
 
     // **And a click on its background dismisses**, the way clicking outside a menu does. That
-    // also makes the indicator a toggle: the overview covers the bar, so a second click where
-    // the indicator is lands on background.
-    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
+    // also makes the desktop's name a toggle: the overview covers the bar, so a second click
+    // where the name is lands on background.
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     click_at(&mut qmp, &mut session, 600, 700)?;
     session.expect("desktop-shell: overview closed")?;
 
     // And a click on a thumbnail activates its window, which is the third way out and the one
     // that takes you somewhere. `raise_window` is the same call the window list's entries make.
-    click_at(&mut qmp, &mut session, size.indicator_click().0, size.indicator_click().1)?;
+    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     click_at(&mut qmp, &mut session, 100, 100)?;
     session.expect("desktop-shell: overview raised window ")?;
@@ -6078,9 +6152,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("nxedit: buffer rev 1")?;
 
     // Its taskbar slot came off the shell's own list above: a slot is a *position*, and windows
-    // have been closed since the last time anything here counted, so `id * ENTRY_W` would land
-    // on somebody else's entry.
-    let entry = (ENTRY_W * slot as i32 + ENTRY_W / 2, list_click.1);
+    // have been closed since the last time anything here counted, so aiming by id would land on
+    // somebody else's entry.
+    let entry = size.task_click(slot);
 
     // **`middle_click_at` verifies the pointer with a left click first**, which on a taskbar
     // entry is a gesture in its own right — it raises the window, or minimises it if it already
@@ -6560,8 +6634,9 @@ fn burst_holds_its_position(
     // position injection can establish with no acknowledgement, because the clamp is what makes
     // it certain — 2000 px of travel into an edge lands on the edge whether or not some of it
     // arrives. A confirming click would be worse than redundant here: the bottom-right corner is
-    // the desktop indicator's hit region, so it opens the overview, which then takes the chord
-    // below instead of the shell.
+    // on the bottom bar, a few pixels past the desktop's name — which opens the overview, which
+    // would then take the chord below instead of the shell — and a click that confirmed a
+    // position by what it did there would depend on those few pixels.
     let screen = qmp.screen.ok_or("burst_holds_its_position: the screen's size is unset")?;
     let corner = screen.corner();
     for _ in 0..screen.pin_motions() {
@@ -7725,14 +7800,14 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     capture!("windows");
 
     // 5. **The overview**, which is the one surface with no other way to be looked at: it is
-    //    opened from the desktop indicator, it covers the screen, and it is where the sidebar's
+    //    opened from the desktop's name, it covers the screen, and it is where the sidebar's
     //    desktop miniatures live (M11 Part E batch 10).
     //    **Pressed by hand rather than through `click_at`**, because the shell logs the open
     //    while it routes the press and the compositor logs the press when it *delivers* the
     //    routed record — so the open comes first, and `click_at`'s own position assertion scans
     //    past it. Nothing is lost: a press that misses simply does not open the overview, and the
     //    wait below fails.
-    let overview_at = size.indicator_click();
+    let overview_at = size.desktop_name_click();
     move_pointer_to(&mut qmp, overview_at.0, overview_at.1)?;
     qmp.send_button("left", true)?;
     qmp.send_button("left", false)?;
@@ -10396,10 +10471,11 @@ fn cmd_test() -> R<()> {
         .current_dir(&userspace_dir))?;
 
     // `desktop-shell`'s library — the desktop-entry parser, the Applications menu's filter, and since Phase 5
-    // Part E the layout arithmetic on the screen's size (entry capacity, the indicator, the window
-    // list's placement). **Its own doc said this ran long before it did**: the three tests it had
-    // were compiled by nothing, so a capacity bug that painted an entry under the indicator would
-    // have passed CI.
+    // Part E the layout arithmetic on the screen's size (the window list's placement, and since the
+    // desktop refresh's Part C both bars as element trees, the task capacity beside the switcher
+    // and this gate's aims pinned as literals). **Its own doc said this ran long before it did**:
+    // the three tests it had were compiled by nothing, so a capacity bug that painted an entry
+    // under the indicator would have passed CI.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
@@ -14101,13 +14177,14 @@ mod diag_tests {
         assert_eq!(old.corner(), (1279, 799));
         assert_eq!(old.centre(), (640, 400));
         assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (770, 785));
-        assert_eq!(old.indicator_click(), (1200, 785));
+        assert_eq!(old.desktop_name_click(), (1250, 785));
+        assert_eq!((old.task_click(0), old.task_click(1), old.show_desktop_click()), ((141, 785), (331, 785), (20, 785)));
         assert_eq!(old.sidebar_x(), 1180);
         assert_eq!(old.pin_motions(), 20, "the pin the gates always used at this size");
         let big = DisplaySize::parse("2560x1440").unwrap();
         assert!(big.pin_motions() * 100 > big.w as usize, "a pin that cannot cross the screen");
         let gate = DisplaySize::GATE;
-        assert_eq!((gate.bottom_bar_y(), gate.indicator_click(), gate.sidebar_x()), (738, (1280, 753), 1260));
+        assert_eq!((gate.bottom_bar_y(), gate.desktop_name_click(), gate.sidebar_x()), (738, (1330, 753), 1260));
     }
 
     #[test]
@@ -14387,8 +14464,8 @@ mod diag_tests {
     #[test]
     fn a_taskbar_slot_is_the_position_of_the_id_not_the_id() {
         // **The distinction the gate depends on.** Ids are not slots — a window closed earlier
-        // in the run leaves the ones after it at lower positions — and clicking `id * ENTRY_W`
-        // would land on somebody else's entry as soon as anything had ever been closed.
+        // in the run leaves the ones after it at lower positions — and aiming by id would land
+        // on somebody else's entry as soon as anything had ever been closed.
         let list = "Desktop 1 of 2 [20:nxfiles] [24:notes.txt*] [31:untitled]";
         assert_eq!(taskbar_slot(list, 20), Some(0));
         assert_eq!(taskbar_slot(list, 24), Some(1));

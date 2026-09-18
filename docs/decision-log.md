@@ -26827,3 +26827,89 @@ was sent on `chose Clear`, before the terminal had the keyboard back from the cl
 failure the Part A entry recorded as unproven and unacted on. It happened again here without host
 load; the gate now waits for `focus=1`, the transcript's own order, and passed three runs running.
 The key's destination cannot be logged, so that is the evidence, and it is stated as that.
+
+## 2026-09-18 — Desktop refresh Part C: the panels
+
+**Both bars are the design's, and both are `libui` `Child`s now.** Thirty pixels each on
+`theme.panel` — the key Part A added and nothing had used, the bars having painted on `face` since
+M11 — with a `border` rule along the edge each shares with the desktop. Being `Child`s is what made
+the rest affordable: their controls are routed and light under the pointer, where the top bar had
+one hand-tested 120-pixel strip and the bottom one divided an x coordinate by `ENTRY_W`. A switcher
+whose width changes with the desktop's name could not have been hit-tested that way at all.
+
+**The applications modal became the Applications menu, and kept its behaviour.** The plan's
+condition was that adopting the menu's look must not cost typing to narrow it — on the laptop the
+fastest way to a program and the only one without a pointer. A filter field sits above the rows
+(`menu::popup_headed`), the popup resizes itself to what matches by committing a smaller buffer,
+and the top match is lit (`MenuState::select_first`) so Enter launches the row a person can see
+rather than an unnamed top hit. **One behaviour changed**: Enter with nothing typed closes the menu
+instead of launching the first entry — the rule every chord-opened menu here already keeps. The
+state is the same `MenuState` every window's menu bar keeps, so arrows, Escape and Left/Right
+between the two menus behave as they do everywhere; Left/Right is the only way to reach `Places`
+without a pointer. **Its log lines kept their order** — launched, then closed. The first run of
+this closed the popup first, and `check-login`'s `expect` scanned past the close.
+
+**The Places menu, and the list moved to reach it.** `libfs::places` and `HOME_FOLDERS` are
+`nxfiles`' `Browser::places()` and `DEFAULT_FOLDERS`, moved below both consumers (C.1): a second
+copy was what the plan's first draft had and claimed not to. A place launches `nxfiles` with the
+path as `argv[1]`, which the browser learned for this; its home stays `HOME`, since a browser that
+took the argument as its home would offer `Documents/Documents`. `Root`'s swatch is `deny`.
+`check-login`'s new step 13 opens `Documents` and reads the listing back.
+
+**What the design has and this does not.** No categories (maintainer, 2026-09-17). No
+`Run Application…` or `End session`: the launcher is deferred, there is no logout, and a row that
+does nothing is worse than none. **No icons, named in the plan as not built**: the design's are
+three CSS boxes keyed by program, and an icon is an asset question — a format, where the files
+live beside a desktop entry, who draws them. Three glyphs keyed by name would be exactly the thing
+that has to be removed when that is answered.
+
+**Show-desktop's restore set is the shell's** — the plan's review moved it out of the compositor,
+which the architecture keeps free of policy. It holds exactly what the press minimised, is bounded
+by the windows the bar shows (a window past the bar's end, minimised and then left behind, would
+have no way back — the `Super+H` rule), and lets go the moment anything on that desktop returns by
+another route, so the button's light is always true.
+
+**The switcher is back, bounded, and `desktop-shell.md` §7 says why.** §7 recorded a compact
+indicator as the decision because a row of boxes over dynamic desktops churns and "a name is a
+better use of the space". The design bounds the row at `min(3, total)` cells and keeps the name
+beside it, still opening the overview; §7a keeps the old argument and the answer to it. One
+divergence: an empty desktop's cell has a faint border where the design dashes it.
+
+**Six pixels a bar moved every aim at a bar, and each copy moved with a reason.** `BAR_H` 24 → 30
+in the shell and in `DisplaySize`; the overview sidebar aims, which had hardcoded 24; the pinned
+derivations at 1280×800, whose test says the six pixels are this part's. The bottom bar's aims are
+new: the first task at x 48–234 rather than 0–180, the desktop's name 30 pixels in from the right
+where the indicator's middle was 80. **Every one of them is pinned as a literal by
+`desktop_shell::panel`'s host tests** against a layout in the shipped face — the arrangement
+`dialog_buttons_land_where_the_constants_say` made for dialogs — so the gate's copies and the
+shell's layout cannot part without a host test failing first. The task capacity is tested at seven
+widths and four names never to put a button under the switcher, and to be tight; each new test
+has a negative control that fails it.
+
+**The bottom bar is created undrawn, as the hand-built one was.** The compositor docks a panel at
+the origin until a manager places it, and the shell becomes the manager only after the bar exists
+— so a `Child` drawn at creation sat over the top bar until it was placed. `Child::create_sized`
+makes a window without its first frame, and **refuses every role but a panel**: `open_sized` draws
+at once because a focusable window that has committed nothing is an invisible focus thief, and a
+panel never takes focus. A host test pins that a focusable role is refused before anything reaches
+the compositor; `open_sized` also closes the window now when its first frame fails, where it used
+to drop the `Child` and leave the compositor holding it.
+
+**`shot` had been walking the pointer from a stale position since it was written.**
+`move_pointer_to` did not record where it left the pointer, every caller but two did so by hand,
+and the two in `shot` then walked their next move from `(60, 12)` into the bottom-right corner —
+which opened the overview only because the corner was inside the old indicator. The helper
+records it now; `click_at` still forgets it when a press misses.
+
+**Found and fixed: the shell and the compositor could disagree about which desktop is current.**
+`normalize_desktops` removes an emptied, unnamed current desktop and lands the shell on the one
+that takes its place — and since M8 Part D it never told the compositor, which went on compositing
+the removed desktop and stamping new windows with its number, while the shell recorded its own
+number for them. `check-login` did exactly this at step 6a3, closing its first terminal, and from
+then on the two agreed on nothing, invisibly. The switcher's step 6c2 was the first thing to go to
+a desktop and back, and its terminal came back listed, unfocused and off screen. **The first
+diagnosis was wrong**: that a desktop switch does not refocus, with a gate that clicked the window
+back into focus. A probe logging what the compositor was asked for said otherwise — the switch back
+asked for desktop 2 and the terminal was on 1. `told_desktop` is what the compositor was last told,
+`switch_desktop` keeps it, and `sync_current` re-tells the compositor after each stretch that can
+normalise; the step asserts focus on return again, and 6a3 asserts the sync.

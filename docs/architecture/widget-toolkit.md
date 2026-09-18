@@ -1033,6 +1033,14 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
   anchors are read from, and `present_custom` reaches the escape hatch — `nxterm`'s grid is a
   `custom` node whose damage no diff can see.
 
+  **The desktop shell's bars and menus are `Child`s too since the desktop refresh's Part C**, which
+  added two things. A *popup* resizes itself — the Applications menu, narrowing as you type —
+  through the same `resize`, since a popup is never configured and a commit of a buffer of a new
+  size is what sets a window's bounds. And `create_sized` makes a window **without** its first
+  frame, for the bottom bar, which the compositor docks at the origin until the shell can place it:
+  it refuses every role but a panel, because an undrawn focusable window is the invisible focus
+  thief `open_sized` draws at once to avoid.
+
   **This is also the one thing in this crate that is not a function of values.** `libui` gained a
   `libsurface` dependency for it, which the layering in §10 always allowed and nothing had needed.
   Nothing else here can reach a syscall, and that is the property to protect.

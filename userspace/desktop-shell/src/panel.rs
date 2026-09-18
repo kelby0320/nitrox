@@ -1,4 +1,5 @@
-//! The top bar and the menus that hang from it, as element trees (desktop refresh, Part C).
+//! The shell's two bars and the menus that hang from the top one, as element trees (desktop
+//! refresh, Part C).
 //!
 //! **Pure, so the layout is host-tested** — and tested against the gates' own aims, which
 //! `xtask` writes down a second time on purpose (M11 decision 2: a gate that read the shell's
@@ -18,11 +19,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use libdraw::format::Rgb;
 use libdraw::geom::Size;
 use libui::element::{
     Element, Insets, center, center_v, column, fill, ink, padding, rounded_fill, row, sized, stack,
     text, wash, with_spacing,
 };
+use libui::layout::{Constraints, Metrics, measure};
 use libui::menu::{Item, Menu, MenuState, popup, popup_headed};
 use libui::widget::{TextFieldState, Theme, WidgetState, popup_frame, text_field};
 
@@ -271,6 +274,327 @@ pub fn menu_anchor(word: libdraw::geom::Rect) -> (i32, i32) {
     (word.origin.x + MENU_INSET_X, BAR_H as i32 + MENU_DROP)
 }
 
+// ---- the bottom bar -------------------------------------------------------------------------
+
+/// What the bottom bar knows about one window: enough to draw its button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Task<'a> {
+    /// The compositor's id, which is what a press on the button names.
+    pub id: u32,
+    /// What it reads — the window's title, or the shell's stand-in for a window with none.
+    pub title: &'a str,
+    /// Whether it holds the keyboard.
+    pub focused: bool,
+    /// Whether the shell has put it away.
+    pub minimized: bool,
+}
+
+/// What the switcher shows: every desktop, whether each has windows, and which one this is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Desktops<'a> {
+    /// One flag per desktop, in order: whether any window is on it.
+    pub occupied: &'a [bool],
+    /// The current desktop, as an index into `occupied`.
+    pub current: usize,
+    /// The current desktop's name — its own, or `Desktop N`.
+    pub label: &'a str,
+}
+
+/// What a press on the bottom bar asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BottomMsg {
+    /// Minimise everything on this desktop, or bring back what the last press put away.
+    ShowDesktop,
+    /// The window with this id — raise it, or put it away if it holds the keyboard. A middle
+    /// click closes it instead, which the shell reads off the event, since a message cannot say
+    /// which button made it.
+    Task(u32),
+    /// Go to the desktop at this index.
+    Desktop(usize),
+    /// Go to the previous desktop.
+    Previous,
+    /// Go to the next desktop.
+    Next,
+    /// Open the overview: the desktop's name is the switcher's "all desktops".
+    Overview,
+}
+
+/// The show-desktop button's key.
+pub const SHOW_KEY: u64 = 1;
+/// The rule after it.
+const RULE_KEY: u64 = 2;
+/// The empty stretch between the tasks and the switcher.
+const SPREAD_KEY: u64 = 3;
+/// The switcher, as one group.
+const SWITCHER_KEY: u64 = 4;
+/// The back arrow.
+pub const PREV_KEY: u64 = 5;
+/// The forward arrow.
+pub const NEXT_KEY: u64 = 6;
+/// The desktop's name.
+pub const NAME_KEY: u64 = 7;
+/// The cells, as a group.
+const CELLS_KEY: u64 = 8;
+/// Where the cells are keyed from, by desktop index.
+pub const CELL_KEY_BASE: u64 = 100;
+/// Where the task buttons are keyed from, by window id — clear of every other key here, since a
+/// window id is any `u32`.
+pub const TASK_KEY_BASE: u64 = 1 << 32;
+
+/// The bar's side padding: `padding: 0 7px`.
+pub const BAR_PAD_X: u32 = 7;
+/// The gap between the bar's items: `gap: 4px`.
+pub const BAR_GAP: u32 = 4;
+/// The show-desktop button: `26px × 22px`.
+pub const SHOW_W: u32 = 26;
+/// Every control's height on the bar: `22px`.
+const CONTROL_H: u32 = 22;
+/// The design's `--r`, which buttons on the bar share with windows.
+const CONTROL_RADIUS: u32 = 8;
+/// The rule after the show-desktop button: one pixel with `margin: 0 3px`.
+const RULE_W: u32 = 1 + 2 * 3;
+/// A task button's width: `186px`.
+pub const TASK_W: u32 = 186;
+/// Its sides: `padding: 0 9px`.
+const TASK_PAD_X: u32 = 9;
+/// Its dot: `5px`.
+const TASK_DOT: u32 = 5;
+/// The gap between the dot and the title: `gap: 7px`.
+const TASK_GAP: u32 = 7;
+/// Where the first task button starts, from the bar's left edge.
+pub const TASKS_X: u32 = BAR_PAD_X + SHOW_W + BAR_GAP + RULE_W + BAR_GAP;
+/// From one task button's left edge to the next.
+pub const TASK_PITCH: u32 = TASK_W + BAR_GAP;
+/// Everything on the bar that is not a task button or the switcher: both paddings, the
+/// show-desktop button, the rule, and the gaps around the empty stretch.
+const FIXED_W: u32 = 2 * BAR_PAD_X + SHOW_W + RULE_W + 3 * BAR_GAP;
+
+/// The switcher's padding: `padding: 0 8px`, inside its `border-left`.
+const GROUP_PAD_X: u32 = 8;
+/// The gap between the switcher's parts: `gap: 5px`.
+const GROUP_GAP: u32 = 5;
+/// An arrow: `17px × 18px`.
+const ARROW: (u32, u32) = (17, 18);
+/// A desktop cell: `24px × 16px`.
+const CELL: (u32, u32) = (24, 16);
+/// The gap between cells: `gap: 3px`.
+const CELL_GAP: u32 = 3;
+/// The mark in an occupied cell: `11px × 3px`, `3px` in and `4px` down from its border.
+const MARK: (u32, u32) = (11, 3);
+/// The name's sides: `padding: 0 5px`, and `margin-left: 2px` before it.
+const NAME_PAD: Insets = Insets { top: 0, right: 5, bottom: 0, left: 5 + 2 };
+/// The most cells the switcher shows at once.
+pub const MAX_CELLS: usize = 3;
+
+/// Which desktops the switcher shows cells for: up to [`MAX_CELLS`], around the current one.
+///
+/// **`min(3, total)`, never fewer** (the plan's rule, from the review that corrected a reading of
+/// a screenshot with two desktops open): with three or more, three cells, the current one in the
+/// middle where it can be — first, it is the first cell and the back arrow is disabled; last, it
+/// is the last.
+pub fn switcher_cells(current: usize, total: usize) -> core::ops::Range<usize> {
+    if total <= MAX_CELLS {
+        return 0..total;
+    }
+    let start = current.saturating_sub(1).min(total - MAX_CELLS);
+    start..start + MAX_CELLS
+}
+
+/// How many task buttons fit beside a switcher `switcher_w` wide on a bar `width` wide.
+///
+/// **The invariant is the product**: the bar laid out with this many never puts a button under
+/// the switcher. Entries past it are not shown; the window is still there, and on the overview.
+/// The switcher's width is measured rather than written down because it carries the desktop's
+/// name — see [`switcher_width`].
+pub fn task_capacity(width: u32, switcher_w: u32) -> usize {
+    (width.saturating_sub(FIXED_W + switcher_w) / TASK_PITCH) as usize
+}
+
+/// The switcher's width, measured — it changes with the desktop's name and how many cells show.
+pub fn switcher_width(d: &Desktops<'_>, theme: &Theme, m: &dyn Metrics) -> u32 {
+    measure(&switcher(d, None, theme), Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), m).w
+}
+
+/// A rounded box with a one-pixel border, on the bar: the border colour, then the ground a pixel
+/// in. `None` for either leaves it out, so a borderless box is its ground and a hollow one is a
+/// ring on the bar's own.
+fn boxed<Msg>(border: Option<Rgb>, ground: Option<Rgb>, radius: u32, panel: Rgb) -> Vec<Element<Msg>> {
+    let mut layers = Vec::with_capacity(2);
+    match (border, ground) {
+        (Some(b), g) => {
+            layers.push(rounded_fill(b, radius));
+            layers.push(padding(Insets::all(1), rounded_fill(g.unwrap_or(panel), radius.saturating_sub(1))));
+        }
+        (None, Some(g)) => layers.push(rounded_fill(g, radius)),
+        (None, None) => {}
+    }
+    layers
+}
+
+/// The bottom bar: show-desktop, a rule, one button per window, and the switcher at the right.
+///
+/// `tasks` is what fits — [`task_capacity`] is the caller's, because the chord that minimises the
+/// focused window has to be bounded by the same count. `shown` is whether show-desktop is holding
+/// windows to bring back, which lights it. The ground is the caller's, as the top bar's is.
+pub fn bottom_bar(
+    tasks: &[Task<'_>],
+    shown: bool,
+    desktops: &Desktops<'_>,
+    hovered: Option<u64>,
+    theme: &Theme,
+) -> Element<BottomMsg> {
+    let soft = theme.accent.blend(theme.panel, theme.scheme.hover_coverage());
+    let line_soft = theme.border.blend(theme.panel, 128);
+
+    // **Show desktop**: lit in the accent while it is holding windows, so the second press has a
+    // visible reason to exist.
+    let (bd, bg, fg) = if shown {
+        (theme.accent, soft, theme.accent)
+    } else {
+        let bd = if hovered == Some(SHOW_KEY) { theme.accent } else { theme.border };
+        (bd, theme.face_hover, theme.foreground_dim)
+    };
+    // The glyph: a 12×9 window, its top edge three pixels thick.
+    let glyph = sized(
+        Size::new(12, 9),
+        stack(alloc::vec![
+            fill(fg),
+            padding(Insets { top: 3, right: 1, bottom: 1, left: 1 }, fill(bg)),
+        ]),
+    );
+    let mut sd = boxed(Some(bd), Some(bg), CONTROL_RADIUS, theme.panel);
+    sd.push(center(glyph));
+    let show = center_v(sized(Size::new(SHOW_W, CONTROL_H), stack(sd)))
+        .on_press(BottomMsg::ShowDesktop)
+        .key(SHOW_KEY);
+    let rule = center_v(padding(
+        Insets { top: 0, right: 3, bottom: 0, left: 3 },
+        sized(Size::new(1, 18), fill(line_soft)),
+    ))
+    .key(RULE_KEY);
+
+    let mut items = alloc::vec![show, rule];
+    for t in tasks {
+        let key = TASK_KEY_BASE + t.id as u64;
+        // **The dot says what the window is doing**: put away, holding the keyboard, or simply
+        // there — the design's three states, where the old bar had a character in the label.
+        let dot = if t.minimized {
+            theme.foreground_dim
+        } else if t.focused {
+            theme.accent
+        } else {
+            theme.ok
+        };
+        // **The focused window is a raised face**, bordered, on the window's own ground; the
+        // pointer draws the border in the accent on any of them.
+        let border = if hovered == Some(key) {
+            Some(theme.accent)
+        } else if t.focused && !t.minimized {
+            Some(theme.border)
+        } else {
+            None
+        };
+        let ground = t.focused.then_some(theme.background);
+        let mut layers = boxed(border, ground, CONTROL_RADIUS, theme.panel);
+        layers.push(padding(
+            Insets { top: 0, right: TASK_PAD_X, bottom: 0, left: TASK_PAD_X },
+            with_spacing(
+                row(alloc::vec![
+                    center_v(sized(Size::new(TASK_DOT, TASK_DOT), rounded_fill(dot, TASK_DOT / 2))),
+                    center_v(text(t.title)),
+                ]),
+                TASK_GAP,
+            ),
+        ));
+        items.push(
+            center_v(sized(Size::new(TASK_W, CONTROL_H), stack(layers)))
+                .on_press(BottomMsg::Task(t.id))
+                .key(key),
+        );
+    }
+    items.push(sized(Size::new(0, 0), text("")).flex(1).key(SPREAD_KEY));
+    items.push(switcher(desktops, hovered, theme).key(SWITCHER_KEY));
+
+    let rule_top = column(alloc::vec![
+        sized(Size::new(0, 1), fill(theme.border)),
+        sized(Size::new(0, 0), text("")).flex(1),
+    ]);
+    stack(alloc::vec![
+        rule_top,
+        padding(
+            Insets { top: 1, right: BAR_PAD_X, bottom: 0, left: BAR_PAD_X },
+            with_spacing(row(items), BAR_GAP),
+        ),
+    ])
+}
+
+/// The switcher: `‹`, up to three cells, `›`, and the desktop's name — which opens the overview.
+fn switcher(d: &Desktops<'_>, hovered: Option<u64>, theme: &Theme) -> Element<BottomMsg> {
+    let soft = theme.accent.blend(theme.panel, theme.scheme.hover_coverage());
+    let line_soft = theme.border.blend(theme.panel, 128);
+    let total = d.occupied.len();
+
+    // An arrow: dim, and deaf, when there is nowhere to go.
+    let arrow = |glyph: &'static str, key: u64, live: bool, msg: BottomMsg| {
+        let mut layers = Vec::with_capacity(2);
+        if live && hovered == Some(key) {
+            layers.push(rounded_fill(soft, 2));
+        }
+        let ink_c = if live { theme.foreground } else { theme.border };
+        layers.push(center(ink(ink_c, text(glyph))));
+        let e = center_v(sized(Size::new(ARROW.0, ARROW.1), stack(layers)));
+        if live { e.on_press(msg).key(key) } else { e.key(key) }
+    };
+
+    let mut cells = Vec::with_capacity(MAX_CELLS);
+    for i in switcher_cells(d.current, total) {
+        let (cur, occ) = (i == d.current, d.occupied.get(i).copied().unwrap_or(false));
+        // **An empty desktop's border is the faint rule**, where the design dashes it: the
+        // difference it draws is "nothing here", and the missing mark already says that — a
+        // dashed rectangle is a primitive this toolkit does not have, for one border.
+        let border = if cur {
+            theme.accent
+        } else if occ {
+            theme.border
+        } else {
+            line_soft
+        };
+        let ground = if cur { soft } else { theme.background };
+        let mut layers = boxed(Some(border), Some(ground), 2, theme.panel);
+        if occ {
+            let mark = if cur { theme.accent } else { theme.border };
+            layers.push(padding(
+                Insets { top: 1 + 4, right: 0, bottom: 0, left: 1 + 3 },
+                sized(Size::new(MARK.0, MARK.1), rounded_fill(mark, 1)),
+            ));
+        }
+        cells.push(
+            center_v(sized(Size::new(CELL.0, CELL.1), stack(layers)))
+                .on_press(BottomMsg::Desktop(i))
+                .key(CELL_KEY_BASE + i as u64),
+        );
+    }
+    let name_ink = if hovered == Some(NAME_KEY) { theme.accent } else { theme.foreground };
+    let name = padding(NAME_PAD, center_v(ink(name_ink, text(d.label))))
+        .on_press(BottomMsg::Overview)
+        .key(NAME_KEY);
+
+    let parts = with_spacing(
+        row(alloc::vec![
+            arrow("\u{2039}", PREV_KEY, d.current > 0, BottomMsg::Previous),
+            with_spacing(row(cells), CELL_GAP).key(CELLS_KEY),
+            arrow("\u{203A}", NEXT_KEY, d.current + 1 < total, BottomMsg::Next),
+            name,
+        ]),
+        GROUP_GAP,
+    );
+    // The group's `border-left`, full control height, and its padding.
+    row(alloc::vec![
+        center_v(sized(Size::new(1, CONTROL_H), fill(line_soft))),
+        padding(Insets { top: 0, right: GROUP_PAD_X, bottom: 0, left: GROUP_PAD_X }, parts),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +607,12 @@ mod tests {
     use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+
+    /// `check-login`'s aim at the forward arrow, from the screen's right edge, with `work`
+    /// current and one scratch desktop after it.
+    const NEXT_FROM_RIGHT: i32 = 75;
+    /// Its aim at the first cell, from the right edge, with `Desktop 2` current of two.
+    const FIRST_CELL_FROM_RIGHT: i32 = 163;
 
     fn font() -> Font {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
@@ -501,5 +831,205 @@ mod tests {
         let s = libui::layout::measure(&e, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
         assert_eq!(s.w, PROMPT_W);
         assert!(s.h > 20 && s.h < 200, "{s:?}");
+    }
+
+    // --- the bottom bar -------------------------------------------------------------------------
+
+    fn tasks(n: usize) -> Vec<Task<'static>> {
+        (0..n)
+            .map(|i| Task { id: 10 + i as u32, title: "nxterm", focused: i == 0, minimized: false })
+            .collect()
+    }
+
+    /// The plan's rule: `min(3, total)` cells, the current one in the middle where it can be.
+    #[test]
+    fn the_switcher_shows_three_cells_around_the_current_desktop() {
+        assert_eq!(switcher_cells(0, 1), 0..1);
+        assert_eq!(switcher_cells(1, 2), 0..2);
+        assert_eq!(switcher_cells(0, 3), 0..3);
+        // On desktop 1 of three or more: three cells, not "two when there is no previous".
+        assert_eq!(switcher_cells(0, 5), 0..3);
+        assert_eq!(switcher_cells(1, 5), 0..3);
+        assert_eq!(switcher_cells(2, 5), 1..4);
+        assert_eq!(switcher_cells(4, 5), 2..5, "the last desktop is the last cell");
+        for total in 1..8 {
+            for cur in 0..total {
+                let r = switcher_cells(cur, total);
+                assert!(r.contains(&cur), "{cur} of {total} is not shown: {r:?}");
+                assert_eq!(r.len(), total.min(MAX_CELLS));
+                assert!(r.end <= total);
+            }
+        }
+    }
+
+    /// **No task button is ever laid out under the switcher**, at any screen and any name — the
+    /// product the capacity exists for — and the capacity is tight: one more would not fit.
+    #[test]
+    fn no_task_is_ever_laid_out_under_the_switcher() {
+        let (f, theme) = (font(), Theme::light());
+        let m = FontMetrics::new(&f, theme.font_px);
+        let occupied = [true, false, true, true, false];
+        for width in [640u32, 1024, 1280, 1360, 1366, 1920, 2560] {
+            for label in ["Desktop 1", "cli", "work", "a desktop with a long name, 32b"] {
+                for total in [1usize, 2, 5] {
+                    let d = Desktops { occupied: &occupied[..total], current: total - 1, label };
+                    let n = task_capacity(width, switcher_width(&d, &theme, &m));
+                    let ts = tasks(n);
+                    let bar = bottom_bar(&ts, false, &d, None, &theme);
+                    let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
+                    // The whole group, from its rule — not the name, which starts further in.
+                    let sw = locate(&bar, &l, SWITCHER_KEY).expect("the switcher is laid out");
+                    assert_eq!(sw.size.w, switcher_width(&d, &theme, &m), "{width}/{label}: squeezed");
+                    for t in &ts {
+                        let r = locate(&bar, &l, TASK_KEY_BASE + t.id as u64).unwrap();
+                        assert!(
+                            r.right() <= sw.origin.x as i64 && r.size.w == TASK_W,
+                            "{width}/{label}/{total}: task {} at {r:?} meets the switcher at {sw:?}",
+                            t.id
+                        );
+                    }
+                    let name = locate(&bar, &l, NAME_KEY).expect("the name is laid out");
+                    assert!(name.right() <= width as i64, "{width}/{label}: the name runs off the bar");
+                    // Tight: the next button would not have fitted.
+                    let next_right = TASKS_X + n as u32 * TASK_PITCH + TASK_W;
+                    let switcher_x = width - BAR_PAD_X - switcher_width(&d, &theme, &m);
+                    assert!(next_right + BAR_GAP > switcher_x - BAR_GAP, "{width}/{label}: room for one more");
+                }
+            }
+        }
+    }
+
+    /// **`check-login`'s bottom-bar aims, as literals.** Show-desktop at x 20; the first task's
+    /// middle at 141 and the next at 331; the bar's empty stretch at 600; the desktop's name at
+    /// 30 in from the right edge; and, with the desktops named `work` and one scratch, the
+    /// forward arrow and the first cell measured from the right edge too. All at half the bar.
+    #[test]
+    fn the_gates_bottom_bar_aims_land_on_what_they_name() {
+        let (f, theme) = (font(), Theme::light());
+        let m = FontMetrics::new(&f, theme.font_px);
+        let y = BAR_H as i32 / 2;
+        for width in [1024u32, 1280, 1360, 1920, 2560] {
+            let bounds = Rect::new(0, 0, width, BAR_H);
+            let w = width as i32;
+            for label in ["Desktop 1", "work", "cli", "Desktop 2"] {
+                let occupied = [true, false];
+                let d = Desktops { occupied: &occupied, current: 0, label };
+                let ts = tasks(2);
+                let bar = bottom_bar(&ts, false, &d, None, &theme);
+                assert_eq!(click(&bar, bounds, &m, 20, y), [BottomMsg::ShowDesktop], "{width}");
+                assert_eq!(click(&bar, bounds, &m, 141, y), [BottomMsg::Task(10)], "{width}");
+                assert_eq!(click(&bar, bounds, &m, 331, y), [BottomMsg::Task(11)], "{width}");
+                assert!(click(&bar, bounds, &m, 600, y).is_empty(), "{width}: 600 is not empty space");
+                assert_eq!(click(&bar, bounds, &m, w - 30, y), [BottomMsg::Overview], "{width}/{label}");
+            }
+            // The two the switcher step aims at, with `work` current and the scratch desktop
+            // after it — the state `check-login` is in when it presses them.
+            let occupied = [true, false];
+            let d = Desktops { occupied: &occupied, current: 0, label: "work" };
+            let bar = bottom_bar(&tasks(1), false, &d, None, &theme);
+            assert_eq!(click(&bar, bounds, &m, w - NEXT_FROM_RIGHT, y), [BottomMsg::Next], "{width}");
+            // …and from the second desktop, named `Desktop 2`, the first cell and the back arrow.
+            let d = Desktops { occupied: &occupied, current: 1, label: "Desktop 2" };
+            let bar = bottom_bar(&[], false, &d, None, &theme);
+            assert_eq!(
+                click(&bar, bounds, &m, w - FIRST_CELL_FROM_RIGHT, y),
+                [BottomMsg::Desktop(0)],
+                "{width}"
+            );
+        }
+    }
+
+    /// An arrow with nowhere to go does nothing, and says so by its ink.
+    #[test]
+    fn an_arrow_with_nowhere_to_go_is_deaf() {
+        let (f, theme) = (font(), Theme::light());
+        let m = FontMetrics::new(&f, theme.font_px);
+        let bounds = Rect::new(0, 0, 1360, BAR_H);
+        let occupied = [true, true, false];
+        for (current, prev_live, next_live) in [(0, false, true), (1, true, true), (2, true, false)] {
+            let d = Desktops { occupied: &occupied, current, label: "x" };
+            let bar = bottom_bar(&[], false, &d, None, &theme);
+            let l = layout(&bar, bounds, &m);
+            let at = |key| {
+                let r = locate(&bar, &l, key).unwrap();
+                (r.origin.x + r.size.w as i32 / 2, r.origin.y + r.size.h as i32 / 2)
+            };
+            let (px, py) = at(PREV_KEY);
+            let (nx, ny) = at(NEXT_KEY);
+            assert_eq!(click(&bar, bounds, &m, px, py) == [BottomMsg::Previous], prev_live, "prev at {current}");
+            assert_eq!(click(&bar, bounds, &m, nx, ny) == [BottomMsg::Next], next_live, "next at {current}");
+        }
+    }
+
+    /// Every colour the bar draws a state in, read off the tree: the dots, the focused face,
+    /// show-desktop lit, and the current cell.
+    #[test]
+    fn the_bar_draws_each_state_in_its_colour() {
+        let theme = Theme::light();
+        fn fills<M>(e: &Element<M>, out: &mut Vec<Rgb>) {
+            if let libui::element::Node::RoundedFill { colour, .. } = &e.node {
+                out.push(*colour);
+            }
+            for c in e.children() {
+                fills(c, out);
+            }
+        }
+        let task = |t: Task<'static>| {
+            let d = Desktops { occupied: &[true], current: 0, label: "x" };
+            let mut out = Vec::new();
+            // The task's own subtree is the third item of the bar's row.
+            let bar = bottom_bar(&[t], false, &d, None, &theme);
+            fills(&bar, &mut out);
+            out
+        };
+        let base = Task { id: 1, title: "t", focused: false, minimized: false };
+        assert!(task(base).contains(&theme.ok), "a window that is simply there is `ok`");
+        let focused = task(Task { focused: true, ..base });
+        assert!(focused.contains(&theme.accent), "the focused window's dot is the accent");
+        assert!(focused.contains(&theme.background), "and its face is the window's ground");
+        let min = task(Task { minimized: true, ..base });
+        assert!(min.contains(&theme.foreground_dim), "a minimised window's dot is dim");
+        assert!(!min.contains(&theme.ok) && !min.contains(&theme.background));
+
+        let d = Desktops { occupied: &[true], current: 0, label: "x" };
+        let mut quiet = Vec::new();
+        fills(&bottom_bar(&[], false, &d, None, &theme), &mut quiet);
+        let mut lit = Vec::new();
+        fills(&bottom_bar(&[], true, &d, None, &theme), &mut lit);
+        let soft = theme.accent.blend(theme.panel, theme.scheme.hover_coverage());
+        assert!(lit.iter().filter(|c| **c == theme.accent).count() > quiet.iter().filter(|c| **c == theme.accent).count(),
+            "show-desktop is lit in the accent while it is holding windows");
+        assert!(lit.contains(&soft) && quiet.contains(&theme.face_hover));
+    }
+
+    /// The bar keeps diffing as windows come and go, focus moves and the pointer lights things —
+    /// a shape `diff` refuses is a bar that stops drawing.
+    #[test]
+    fn the_bottom_bar_diffs_as_its_windows_change() {
+        let (f, theme) = (font(), Theme::light());
+        let m = FontMetrics::new(&f, theme.font_px);
+        let bounds = Rect::new(0, 0, 1360, BAR_H);
+        let mut tree = Tree::new();
+        let occupied = [true, false, false];
+        for (n, shown, current, hovered) in [
+            (0, false, 0, None),
+            (1, false, 0, Some(TASK_KEY_BASE + 10)),
+            (3, true, 1, Some(SHOW_KEY)),
+            (2, false, 2, Some(NAME_KEY)),
+            (0, false, 0, None),
+        ] {
+            let d = Desktops { occupied: &occupied, current, label: "Desktop 1" };
+            let bar = bottom_bar(&tasks(n), shown, &d, hovered, &theme);
+            let l = layout(&bar, bounds, &m);
+            assert!(tree.update(&bar, &l).is_ok(), "the bar stopped diffing at {n} tasks");
+        }
+    }
+
+    /// The arrows are characters, and a character the shipped face does not carry draws as
+    /// nothing with nothing reported — the reason `libui` pins its menu mark the same way.
+    #[test]
+    fn the_arrows_exist_in_the_shipped_face() {
+        let f = font();
+        assert!(f.has_glyph('\u{2039}') && f.has_glyph('\u{203A}'));
     }
 }

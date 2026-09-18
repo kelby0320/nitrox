@@ -84,17 +84,13 @@ use librsproto::surface::{
 };
 use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
-use libui::element::{
-    Element, Insets, bevel, column, custom, fill, offset, padding, row, sized, stack, text,
-};
+use libui::element::{Element, Insets, column, custom, fill, offset, padding, row, sized, stack, text};
 use libui::layout::layout;
-use desktop_shell::{
-    Application, BAR_H, ENTRY_W, INDICATOR_W, SIDE_W, Screen, THUMB_PAD, THUMB_W, parse_entry,
-};
-use desktop_shell::panel::{self, MenuMsg, TopMsg};
+use desktop_shell::{Application, BAR_H, SIDE_W, Screen, THUMB_PAD, THUMB_W, parse_entry};
+use desktop_shell::panel::{self, BottomMsg, MenuMsg, TopMsg};
 use libui::menu::{Item, KeyOutcome, MenuState};
 use libui::window::Child;
-use libui::paint::{FontMetrics, Theme, paint, paint_over};
+use libui::paint::{FontMetrics, Theme, paint_over};
 use libui::widget::TextFieldState;
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
@@ -304,12 +300,12 @@ fn desktop_label(desktops: &[Desktop], current: u32) -> alloc::string::String {
     s
 }
 
-/// The label an entry shows: its title, marked with what the shell knows about it.
+/// The label the serial log gives an entry: its title, marked with what the shell knows about it.
 ///
-/// **Marked rather than styled**, for now. The toolkit can colour a row, but the milestone that
-/// makes the shell look like anything is M11 — and a marker is legible in the serial log, which
-/// is where every gate reads this from. `desktop-shell.md` §2 describes the bar's appearance;
-/// this is the behaviour under it.
+/// **The log's, and no longer the bar's** (desktop refresh, Part C). The bar draws the design's
+/// dot — dim for a window put away, the accent for the one with the keyboard, `ok` for the rest —
+/// and these markers stay here because every gate reads the list from the serial log, where a
+/// colour cannot go. Both are built from the same two flags, so they cannot disagree.
 fn entry_label(e: &WinEntry) -> alloc::string::String {
     let mut s = alloc::string::String::new();
     s.push_str(if e.minimized {
@@ -319,6 +315,13 @@ fn entry_label(e: &WinEntry) -> alloc::string::String {
     } else {
         "  "
     });
+    s.push_str(&entry_title(e));
+    s
+}
+
+/// What an entry's button reads: its title, or the window's id when it has none.
+fn entry_title(e: &WinEntry) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
     if e.title.is_empty() {
         // A window that has not set a title still needs to be clickable, and an empty button
         // is not. Its id is the only other name it has.
@@ -351,79 +354,71 @@ fn entry_label(e: &WinEntry) -> alloc::string::String {
 /// switched desktops yet; now that something does, a bar showing another desktop's windows
 /// would be showing you what you just navigated away from.
 ///
-/// **At most [`Screen::max_entries`]**, so no entry is painted under the indicator's hit region.
-fn visible_entries(entries: &[WinEntry], current: u32, screen: Screen) -> alloc::vec::Vec<&WinEntry> {
-    entries.iter().filter(|e| e.desktop == current).take(screen.max_entries()).collect()
+/// **At most `capacity`** — [`task_capacity`] — so no button is laid out under the switcher, and
+/// the chord that minimises the focused window is bounded by the same count as the bar.
+fn visible_entries(entries: &[WinEntry], current: u32, capacity: usize) -> alloc::vec::Vec<&WinEntry> {
+    entries.iter().filter(|e| e.desktop == current).take(capacity).collect()
 }
 
-/// One taskbar entry: a bordered button, marked when its window holds the keyboard.
+/// What the switcher needs to know about the desktops: whether each has windows, where the
+/// current one is, and its label.
+fn desktop_facts(
+    desktops: &[Desktop],
+    entries: &[WinEntry],
+    current: u32,
+) -> (alloc::vec::Vec<bool>, usize, alloc::string::String) {
+    let occupied = desktops.iter().map(|d| entries.iter().any(|e| e.desktop == d.id)).collect();
+    let at = desktops.iter().position(|d| d.id == current).unwrap_or(0);
+    (occupied, at, desktop_label(desktops, current))
+}
+
+/// How many windows the bottom bar holds beside the switcher as it is now.
 ///
-/// **A box rather than a run of text** (M11 Part E batch 8). The entries were labels on a flat
-/// bar, so two windows read as one line with a gap in it — the reference desktop draws each as a
-/// button, and the border is what says where one ends and the next begins.
-///
-/// **The focused one is filled, the rest are the bar's own face.** The list already marks focus
-/// with a leading glyph; a filled face says it at a glance, and the two agree because they are
-/// built from the same flag.
-fn entry_cell(e: &WinEntry, theme: &Theme) -> Element<()> {
-    let face = if e.focused { theme.face_hover } else { theme.face };
-    stack(alloc::vec![
-        fill(theme.border),
-        padding(Insets::all(1), bevel(face)),
-        padding(Insets { top: 3, right: 7, bottom: 3, left: 7 }, text(entry_label(e))),
-    ])
-}
-
-/// The bottom bar's element tree: one button per window, then the desktop indicator.
-fn window_bar_view<'a>(shown: &[&'a WinEntry], label: &str, theme: &Theme) -> Element<()> {
-    let mut cells: alloc::vec::Vec<Element<()>> = alloc::vec::Vec::new();
-    for e in shown {
-        cells.push(sized(libdraw::geom::Size::new(ENTRY_W, 0), entry_cell(e, theme)));
-    }
-    if cells.is_empty() {
-        // An empty row lays out to nothing and commits a blank bar, which reads as a broken
-        // bar rather than an empty one.
-        cells.push(sized(
-            libdraw::geom::Size::new(ENTRY_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("No Windows")),
-        ));
-    }
-    // **A flexible gap, so the indicator is drawn where the hit-test looks for it.** `row`
-    // packs from the left; without this the indicator follows the last entry and moves every
-    // time a window opens or closes.
-    cells.push(sized(libdraw::geom::Size::new(0, 0), text("")).flex(1));
-    // **The indicator, at the end of the bar** (`desktop-shell.md` §7) — a compact readout of
-    // the current desktop rather than GNOME 2's switcher, which with *dynamic* desktops is a
-    // list that changes length and would be the churniest widget here.
-    cells.push(sized(
-        libdraw::geom::Size::new(INDICATOR_W, 0),
-        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(label)),
-    ));
-    row(cells)
-}
-
-/// Render the bottom bar for the windows on `current`, with the desktop indicator.
-fn render_window_bar(
+/// **Asked wherever the count matters, rather than kept**: it changes with the desktop's name and
+/// how many desktops there are, and the chord bound and the bar must agree about it in the same
+/// pass. A layout of one row is all it costs.
+fn task_capacity(
+    desktops: &[Desktop],
+    entries: &[WinEntry],
+    current: u32,
     theme: &Theme,
     font: &Font,
-    shown: &[&WinEntry],
-    label: &str,
     screen: Screen,
-) -> MemFramebuffer {
-    let geometry = Geometry::with_pitch(screen.width, BAR_H, screen.pitch(), PixelFormat::XRGB8888)
-        .unwrap_or_else(|| fail(b"desktop-shell: bad bottom bar geometry\n"));
-    let mut fb = MemFramebuffer::new(geometry);
-    let ui = window_bar_view(shown, label, theme);
-    let bounds = Rect::new(0, 0, screen.width, BAR_H);
-    let metrics = FontMetrics::new(font, theme.font_px);
-    let l = layout(&ui, bounds, &metrics);
-    // The session's theme, read once in `_start` — the shell's own chrome follows the file
-    // it hands to every application, or it themes the windows and not the bars around them.
-    // **On the panel's ground, not on a window's** — see `panel`: `paint` clears a damaged
-    // rectangle to `background`, which is the white an application draws on.
-    paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
-    });
-    fb
+) -> usize {
+    let (occupied, at, label) = desktop_facts(desktops, entries, current);
+    let d = panel::Desktops { occupied: &occupied, current: at, label: &label };
+    let w = panel::switcher_width(&d, theme, &FontMetrics::new(font, theme.font_px));
+    panel::task_capacity(screen.width, w)
+}
+
+/// The bottom bar's tree as things are now.
+#[allow(clippy::too_many_arguments)]
+fn bottom_view(
+    entries: &[WinEntry],
+    desktops: &[Desktop],
+    current: u32,
+    shown: bool,
+    hovered: Option<u64>,
+    theme: &Theme,
+    font: &Font,
+    screen: Screen,
+) -> Element<BottomMsg> {
+    let cap = task_capacity(desktops, entries, current, theme, font, screen);
+    let visible = visible_entries(entries, current, cap);
+    // **The title, or the id when there is none** — a window that has not named itself still
+    // needs a button to click. The serial log's markers are not drawn: the dot says it.
+    let titles: alloc::vec::Vec<alloc::string::String> = visible
+        .iter()
+        .map(|e| entry_title(e))
+        .collect();
+    let tasks: alloc::vec::Vec<panel::Task<'_>> = visible
+        .iter()
+        .zip(titles.iter())
+        .map(|(e, t)| panel::Task { id: e.id, title: t.as_str(), focused: e.focused, minimized: e.minimized })
+        .collect();
+    let (occupied, at, label) = desktop_facts(desktops, entries, current);
+    let d = panel::Desktops { occupied: &occupied, current: at, label: &label };
+    panel::bottom_bar(&tasks, shown, &d, hovered, theme)
 }
 
 /// Read the desktop entries `/applications` projects, as the Applications menu's entries.
@@ -1600,9 +1595,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
         l.end();
     }
-    // The bottom bar's buffers are this size too; it is still drawn by hand.
-    let len = screen.pitch() * BAR_H as usize;
-
     // **Build one application namespace and check it**, before anything is launched into it.
     // Every launch builds one the same way; doing it once here is
     // what makes the narrow bind observable — and the shell refusing to launch when the check
@@ -1694,44 +1686,32 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         alloc::vec![Desktop { id: 1, name: alloc::string::String::new() }];
     let mut next_desktop_id: u32 = 2;
     let mut current_desktop: u32 = 1;
-    let mut bottom_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    let bottom = match session.create(
-        &CreateWindowRequest::new(screen.width, BAR_H, Role::Panel { dock: Edge::Bottom, reserve: BAR_H }),
+    // What the compositor was last told is current — its own starting value, 1. See
+    // `sync_current` for why this is not always `current_desktop`.
+    let mut told_desktop: u32 = 1;
+    // **A `Child`, like the top bar** (desktop refresh, Part C): its buttons are routed rather than
+    // hit-tested by dividing x by a width written down beside the layout, which a switcher whose
+    // width changes with the desktop's name could not have survived.
+    //
+    // **Created undrawn**, as the hand-built bar it replaced was: the compositor docks a panel at
+    // the origin until it is placed, and it cannot be placed until the manager channel below is
+    // held — so a frame now would sit over the top bar for the length of that. Its first frame is
+    // the loop's first `present_bottom`, after it has been placed.
+    let mut bottom_bar = Child::create_sized(
+        &mut session,
+        Role::Panel { dock: Edge::Bottom, reserve: BAR_H },
+        libdraw::geom::Size::new(screen.width, BAR_H),
         BUFFERS,
-    ) {
-        Ok(id) => {
-            let mut ok = true;
-            for i in 0..BUFFERS {
-                let Some((handle, addr)) = shared_buffer(len) else {
-                    ok = false;
-                    break;
-                };
-                bottom_addrs[i] = addr;
-                let Some(mut w) = session.window(id) else {
-                    ok = false;
-                    break;
-                };
-                if w.attach(i as u32, screen.width, BAR_H, screen.pitch() as u32, handle).is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                Line::new()
-                    .s(b"desktop-shell: bottom bar presented, window ")
-                    .u(id as u64)
-                    .end();
-                Some(id)
-            } else {
-                kprint(b"desktop-shell: bottom bar buffers FAILED; no window list\n");
-                None
-            }
-        }
-        Err(_) => {
-            kprint(b"desktop-shell: bottom bar CreateWindow FAILED; no window list\n");
-            None
-        }
-    };
+    );
+    let bottom = bottom_bar.as_ref().map(|c| c.id());
+    match bottom {
+        Some(id) => Line::new().s(b"desktop-shell: bottom bar presented, window ").u(id as u64).end(),
+        None => kprint(b"desktop-shell: bottom bar CreateWindow FAILED; no window list\n"),
+    }
+    // **What show-desktop put away, and on which desktop** — the restore set, which is the
+    // shell's because minimising is a manager operation and the compositor keeps no policy (the
+    // plan's review, finding 6). `None` when the desktop is not being shown.
+    let mut shown: Option<(u32, alloc::vec::Vec<u32>)> = None;
 
     // **The manager channel, which makes this the compositor's first real manager.**
     //
@@ -1888,6 +1868,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             .i(screen.window_list_y() as i64)
             .end();
     }
+    // **Its first frame, now that it is where it belongs** — not at the loop's first pass, which
+    // may sit in `sys_wait` until something happens.
+    present_bottom(
+        &mut session, bottom_bar.as_mut(), &entries, &desktops, current_desktop, &shown, &theme,
+        &panel_theme, &font, screen,
+    );
 
 
     // The Applications menu's entries, read once. `desktop-shell.md` §4: they are desktop
@@ -2023,6 +2009,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         &mut desktops,
                         &entries,
                         &mut current_desktop,
+                        &mut told_desktop,
                         &mut next_desktop_id,
                         &launcher,
                     );
@@ -2171,7 +2158,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     let n = (id - HOTKEY_SWITCH_BASE) as usize;
                     if let Some(d) = desktops.get(n - 1) {
                         let to = d.id;
-                        if switch_desktop(m, &desktops, &mut current_desktop, to) {
+                        if switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, to) {
                             sent_request = true;
                             list_dirty = true;
                             normalize_desktops(
@@ -2274,8 +2261,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 // is drawn, clickable and focused — and its index in `entries` is 7, so a bound
                 // over the global list never reached it and the chord silently did nothing for
                 // a window the bar was showing (PR #243 review, finding 5).
+                let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
                 let shown_now: alloc::vec::Vec<u32> =
-                    visible_entries(&entries, current_desktop, screen).iter().map(|e| e.id).collect();
+                    visible_entries(&entries, current_desktop, cap).iter().map(|e| e.id).collect();
                 if id == HOTKEY_MINIMIZE
                     && let Some(e) = entries
                         .iter_mut()
@@ -2292,6 +2280,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                 }
             }
+        }
+        // **The compositor follows any move the drain made** — a window closing can empty the
+        // current desktop and move the shell off it. Before the next window can be created on
+        // the wrong one: windows arrive only through the drain above.
+        if let Some(m) = manager.as_mut() {
+            sync_current(m, &desktops, current_desktop, &mut told_desktop);
         }
         if session.pump().is_err() {
             fail(b"desktop-shell: compositor connection lost\n");
@@ -2687,7 +2681,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 if let Some(m) = manager.as_mut() {
                                     let to = desktops[i].id;
                                     sent_request = true;
-                                    if switch_desktop(m, &desktops, &mut current_desktop, to) {
+                                    if switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, to) {
                                         list_dirty = true;
                                         normalize_desktops(
                                             &mut desktops,
@@ -2732,6 +2726,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // elsewhere — and the release is then a click on a word whose menu is shut.
             if w == window {
                 let view = panel::top_bar(&shown_clock, bar.state.open(), top.hovered_key(), &theme);
+                // **Presented before it is routed**, so the tree a press is routed against is the
+                // one this view describes: a menu closed earlier in this drain un-lights its word,
+                // and a lit word is a different shape from a quiet one — the id mismatch that
+                // loses a click (M12 Part D). Nothing is drawn when nothing changed.
+                top.present(&mut session, &view, &font, &panel_theme);
                 for msg in top.route(&view, &font, &panel_theme, &event) {
                     let TopMsg::Menu(i) = msg;
                     bar.state.toggle(i);
@@ -2741,99 +2740,125 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
                 continue;
             }
-            // **A press on a window-list entry.** The entries are a fixed-width row, so the
-            // index is the x coordinate divided by the width — the same arithmetic the layout
-            // used to place them, rather than a second copy of the layout to hit-test against.
+            // **The bottom bar**, routed through the toolkit: show-desktop, one button per window,
+            // and the switcher. The tree is the one presented at the top of this pass, which is
+            // what a press has to be routed against.
             if Some(w) == bottom
-                && let libsurface::WindowEvent::Pointer(p) = event
-                && p.kind == librsproto::surface::POINTER_BUTTON
-                && p.flags & librsproto::surface::POINTER_PRESSED != 0
-                && p.x >= 0
+                && let Some(bb) = bottom_bar.as_mut()
             {
-                // **The indicator first**, because it owns the bar's right-hand end and the
-                // entry arithmetic below would otherwise claim that x as a window slot.
-                //
-                // Clicking it advances to the next desktop. `desktop-shell.md` §7 says it opens
-                // the overview, which is Part E — until then the indicator is the only pointer
-                // way to change desktops, and a control that does nothing until a later
-                // milestone is worse than one that does the obvious thing.
-                if p.x as u32 >= screen.indicator_x() {
-                    // **Clicking the indicator opens the overview** (`desktop-shell.md` §7),
-                    // which is what it was always specified to do — Part D made it advance to
-                    // the next desktop only because there was no overview to open yet.
-                    if overview.is_none()
-                        && let Some(m) = manager.as_mut()
-                    {
-                        sent_request = true;
-                        recapture(m, &entries, current_desktop, &mut shots, screen);
-                        overview = open_overview(
-                            &mut session, window, &theme, &font, &shots, &desktops,
-                            current_desktop, &entries, &mut over_addrs,
-                            wallpaper.as_ref().map(|w| w.picture.as_slice()), screen,
-                        );
-                        if let Some(id) = overview {
-                            stick(m, id, b"the overview");
-                            Line::new()
-                                .s(b"desktop-shell: overview open, window ")
-                                .u(id as u64)
-                                .s(b" showing ")
-                                .u(shots.len() as u64)
-                                .s(b" of ")
-                                .u(desktops.len() as u64)
-                                .s(b" desktops")
-                                .end();
+                let lit = shown.as_ref().is_some_and(|(d, _)| *d == current_desktop);
+                let view = bottom_view(
+                    &entries, &desktops, current_desktop, lit, bb.hovered_key(), &theme, &font, screen,
+                );
+                // Presented before it is routed, for the top bar's reason: the manager's events
+                // earlier in this pass may have changed the windows it shows.
+                bb.present(&mut session, &view, &font, &panel_theme);
+                // **The middle button closes**, which is what every taskbar this borrows from
+                // does. A message cannot say which button made it, so the event is asked.
+                let middle = matches!(
+                    event,
+                    libsurface::WindowEvent::Pointer(p) if p.button == libkern::abi::BTN_MIDDLE
+                );
+                for msg in bb.route(&view, &font, &panel_theme, &event) {
+                    let Some(m) = manager.as_mut() else { continue };
+                    match msg {
+                        BottomMsg::Task(wid) => {
+                            let Some(e) = entries.iter_mut().find(|e| e.id == wid) else { continue };
+                            sent_request = true;
+                            // It *asks*: a window holds a process's work, and the shell insists
+                            // only on a second click (M9 Part C, M12 Part A).
+                            if middle {
+                                ask_to_close(m, wid, &mut asked_to_close);
+                                continue;
+                            }
+                            // **Clicking the focused window puts it away**, which is what every
+                            // taskbar does and the only gesture that needs no second control.
+                            // Clicking anything else brings it forward, restoring it first if it
+                            // was minimized.
+                            if e.focused && !e.minimized {
+                                if minimize_window(m, e) {
+                                    Line::new().s(b"desktop-shell: minimized window ").u(wid as u64).end();
+                                }
+                            } else if raise_window(m, e) {
+                                Line::new().s(b"desktop-shell: raised window ").u(wid as u64).end();
+                            } else {
+                                Line::new()
+                                    .s(b"desktop-shell: raising window ")
+                                    .u(wid as u64)
+                                    .s(b" was refused")
+                                    .end();
+                            }
+                            list_dirty = true;
+                        }
+                        // Everything below is the left button's: a middle click on a control
+                        // that closes nothing does nothing.
+                        _ if middle => {}
+                        BottomMsg::ShowDesktop => {
+                            sent_request = true;
+                            let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
+                            show_desktop(m, &mut entries, current_desktop, cap, &mut shown);
+                            list_dirty = true;
+                        }
+                        BottomMsg::Desktop(_) | BottomMsg::Previous | BottomMsg::Next => {
+                            let at = desktops.iter().position(|d| d.id == current_desktop).unwrap_or(0);
+                            let to = match msg {
+                                BottomMsg::Desktop(i) => i,
+                                BottomMsg::Previous => at.saturating_sub(1),
+                                _ => at + 1,
+                            };
+                            let Some(to) = desktops.get(to).map(|d| d.id) else { continue };
+                            if to == current_desktop {
+                                continue;
+                            }
+                            sent_request = true;
+                            if switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, to) {
+                                list_dirty = true;
+                                normalize_desktops(
+                                    &mut desktops,
+                                    &entries,
+                                    &mut current_desktop,
+                                    &mut next_desktop_id,
+                                );
+                                overview_dirty = overview.is_some();
+                            }
+                        }
+                        // **The desktop's name opens the overview** — the switcher's "all
+                        // desktops", which is what `desktop-shell.md` §7 always said the
+                        // indicator in its place did.
+                        BottomMsg::Overview => {
+                            if overview.is_some() {
+                                continue;
+                            }
+                            sent_request = true;
+                            let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
+                            recapture(m, &entries, current_desktop, &mut shots, cap);
+                            overview = open_overview(
+                                &mut session, window, &theme, &font, &shots, &desktops,
+                                current_desktop, &entries, &mut over_addrs,
+                                wallpaper.as_ref().map(|w| w.picture.as_slice()), screen,
+                            );
+                            if let Some(id) = overview {
+                                stick(m, id, b"the overview");
+                                Line::new()
+                                    .s(b"desktop-shell: overview open, window ")
+                                    .u(id as u64)
+                                    .s(b" showing ")
+                                    .u(shots.len() as u64)
+                                    .s(b" of ")
+                                    .u(desktops.len() as u64)
+                                    .s(b" desktops")
+                                    .end();
+                            }
                         }
                     }
-                    continue;
                 }
-                let i = (p.x as u32 / ENTRY_W) as usize;
-                let shown_ids: alloc::vec::Vec<u32> =
-                    visible_entries(&entries, current_desktop, screen).iter().map(|e| e.id).collect();
-                if let Some(&wid) = shown_ids.get(i)
-                    && let Some(m) = manager.as_mut()
-                {
-                    // **Clicking the focused window puts it away**, which is what every
-                    // taskbar does and the only gesture that needs no second control. Clicking
-                    // anything else brings it forward, restoring it first if it was minimized.
-                    //
-                    // **Indexed through the *visible* list**, which since Part D is not the
-                    // whole one: entries on other desktops are not drawn, so `entries[i]` would
-                    // name a different window than the one under the cursor as soon as a window
-                    // moved away.
-                    let Some(e) = entries.iter_mut().find(|e| e.id == wid) else { continue };
-                    // **The middle button closes**, which is what every taskbar this borrows
-                    // from does — and it needs no room in a layout that is already one fixed
-                    // slot per window. It *asks*: a window holds a process's work, and the
-                    // shell insists only when nothing happens (M9 Part C).
-                    if p.button == libkern::abi::BTN_MIDDLE {
-                        sent_request = true;
-                        ask_to_close(m, wid, &mut asked_to_close);
-                        continue;
-                    }
-                    if e.focused && !e.minimized {
-                        sent_request = true;
-                        if minimize_window(m, e) {
-                            Line::new()
-                                .s(b"desktop-shell: minimized window ")
-                                .u(e.id as u64)
-                                .end();
-                        }
-                    } else {
-                        let id = e.id;
-                        sent_request = true;
-                        if raise_window(m, e) {
-                            Line::new().s(b"desktop-shell: raised window ").u(id as u64).end();
-                        } else {
-                            Line::new()
-                                .s(b"desktop-shell: raising window ")
-                                .u(id as u64)
-                                .s(b" was refused")
-                                .end();
-                        }
-                    }
-                    list_dirty = true;
-                }
+                continue;
             }
+        }
+        // And any the events made — a window dropped on another desktop from the overview can
+        // empty this one too.
+        if let Some(m) = manager.as_mut() {
+            sync_current(m, &desktops, current_desktop, &mut told_desktop);
         }
         // **A window that went on its own is no longer owed an insist.** Ids are never reused,
         // so a stale entry can never name a later window and nothing here is about correctness:
@@ -2866,39 +2891,30 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             kprint(b"desktop-shell: top bar Commit failed\n");
         }
 
-        // **Redraw the bar when the list changed, and only then.** Every manager event would
-        // otherwise repaint a bar that says the same thing, and a panel commit is a full-width
-        // blit the compositor has to composite.
-        if list_dirty
-            && let Some(id) = bottom
+        // **Show-desktop lets go the moment anything on that desktop is back** — a window
+        // restored from its button, a new one opened, one moved there. Its second press means
+        // "bring back what the first put away", which stops being a coherent request once the
+        // desktop is not what the first press left; and the button's light is what says whether
+        // there is anything to bring back.
+        if let Some((d, _)) = shown.as_ref()
+            && entries.iter().any(|e| e.desktop == *d && !e.minimized)
         {
-            let shown = visible_entries(&entries, current_desktop, screen);
-            let label = desktop_label(&desktops, current_desktop);
-            log_window_list(&shown, &label, desktops.len());
-            let picture = render_window_bar(&theme, &font, &shown, &label, screen).into_bytes();
-            let len = screen.pitch() * BAR_H as usize;
-            // **`acquire`, not an index this code keeps itself.** The first version alternated
-            // a counter and advanced it unconditionally while the commit's result was
-            // discarded — so any iteration where the commit did not go out inverted the phase,
-            // and every repaint after that wrote into the buffer the compositor was displaying.
-            // `acquire` blocks until one is genuinely free, which is the property being wanted,
-            // and it is already what every `Child::present` does (PR #242 review, finding 4).
-            if picture.len() == len
-                && let Some(mut w) = session.window(id)
-                && let Ok(b) = w.acquire()
-                && !bottom_addrs[b as usize].is_null()
-            {
-                // SAFETY: the destination maps `len` writable bytes and `picture` holds exactly
-                // `len`; the two are distinct allocations.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(picture.as_ptr(), bottom_addrs[b as usize], len)
-                };
-                if w.commit(b, (0, 0, screen.width, BAR_H)).is_err() {
-                    kprint(b"desktop-shell: bottom bar Commit failed\n");
-                }
-            }
+            shown = None;
+            list_dirty = true;
+        }
+        // **The window list in the log, when it changed** — every gate reads the bar from here.
+        if list_dirty {
+            let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
+            let listed = visible_entries(&entries, current_desktop, cap);
+            log_window_list(&listed, &desktop_label(&desktops, current_desktop), desktops.len());
             list_dirty = false;
         }
+        // **The bottom bar, every pass, as the top one is** — `Child::present` diffs and commits
+        // only what changed, so a pass that changed nothing costs a layout and no frame.
+        present_bottom(
+            &mut session, bottom_bar.as_mut(), &entries, &desktops, current_desktop, &shown, &theme,
+            &panel_theme, &font, screen,
+        );
 
         // **Re-render an open overview whose desktop changed.** Its thumbnails are of one
         // desktop, so a switch — from its own sidebar, or from a chord while it is up — makes
@@ -2910,7 +2926,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 && let Some(m) = manager.as_mut()
             {
                 sent_request = true;
-                recapture(m, &entries, current_desktop, &mut shots, screen);
+                let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
+                recapture(m, &entries, current_desktop, &mut shots, cap);
                 present_overview(
                     &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
                     &entries, &over_addrs,
@@ -3446,15 +3463,18 @@ fn mini_wallpaper(picture: &[u8], screen: Screen) -> Option<(alloc::vec::Vec<u8>
 /// **One function because opening and refreshing must agree.** They were the same loop written
 /// once when only opening existed; a refresh that captured a different set would show a desktop
 /// nobody could reach by opening it.
+///
+/// **At most `capacity`, the bar's own count** — the windows the bar shows, which is the bound
+/// this has always had and what keeps the grid from running past the screen.
 fn recapture(
     mgr: &mut ChannelTransport,
     entries: &[WinEntry],
     current: u32,
     shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
-    screen: Screen,
+    capacity: usize,
 ) {
     shots.clear();
-    for e in visible_entries(entries, current, screen) {
+    for e in visible_entries(entries, current, capacity) {
         if e.minimized {
             continue;
         }
@@ -3829,6 +3849,7 @@ fn serve_desktop_session(
     desktops: &mut alloc::vec::Vec<Desktop>,
     entries: &[WinEntry],
     current: &mut u32,
+    told: &mut u32,
     next_id: &mut u32,
     launcher: &Launcher<'_>,
 ) -> bool {
@@ -3919,7 +3940,7 @@ fn serve_desktop_session(
             };
             let to = d.id;
             let Some(m) = mgr else { return bad(KError::Unsupported) };
-            if !switch_desktop(m, desktops, current, to) {
+            if !switch_desktop(m, desktops, current, told, to) {
                 return bad(KError::InvalidArgument);
             }
             normalize_desktops(desktops, entries, current, next_id);
@@ -4167,17 +4188,34 @@ fn tell_scheme(mgr: &mut ChannelTransport, scheme: libdraw::theme::Scheme) {
 ///
 /// **The only thing the compositor is told about desktops.** Which ones exist, what they are
 /// called and when they disappear never leaves this process — `ui-composition-model.md` §6's
-/// split, and the reason the two cannot come to disagree.
+/// split. **What keeps the two in step is `told`**, the desktop the compositor was last told,
+/// because the shell's current desktop also moves by a route that is not a switch — see
+/// [`sync_current`].
 fn switch_desktop(
     mgr: &mut ChannelTransport,
     desktops: &[Desktop],
     current: &mut u32,
+    told: &mut u32,
     to: u32,
 ) -> bool {
-    use librsproto::surface::{MgrDesktop, OP_MGR_SET_CURRENT_DESKTOP};
     if to == *current || !desktops.iter().any(|d| d.id == to) {
         return false;
     }
+    if !tell_current(mgr, to) {
+        return false;
+    }
+    *current = to;
+    *told = to;
+    Line::new()
+        .s(b"desktop-shell: switched to ")
+        .untrusted(desktop_label(desktops, to).as_bytes())
+        .end();
+    true
+}
+
+/// Send `SetCurrentDesktop`, saying so if it would not go.
+fn tell_current(mgr: &mut ChannelTransport, to: u32) -> bool {
+    use librsproto::surface::{MgrDesktop, OP_MGR_SET_CURRENT_DESKTOP};
     let mut body = [0u8; core::mem::size_of::<MgrDesktop>()];
     if (MgrDesktop { desktop: to }).write(&mut body).is_none() {
         kprint(b"desktop-shell: a SetCurrentDesktop body would not serialise\n");
@@ -4188,12 +4226,35 @@ fn switch_desktop(
         kprint(b"desktop-shell: SetCurrentDesktop was refused\n");
         return false;
     }
-    *current = to;
-    Line::new()
-        .s(b"desktop-shell: switched to ")
-        .untrusted(desktop_label(desktops, to).as_bytes())
-        .end();
     true
+}
+
+/// Bring the compositor back into step with the shell's current desktop, when something other
+/// than a switch has moved it.
+///
+/// **`normalize_desktops` moves it**: an emptied, unnamed current desktop is removed, and the
+/// shell lands on the one that takes its place. Until the desktop refresh's Part C nothing told
+/// the compositor, which went on compositing the removed desktop and stamping new windows with
+/// its number — while `place_new_windows` recorded the shell's number for the same windows, on
+/// the grounds that the two are "the same number read from the other side". They were not, and
+/// nothing showed it until a switch: `check-login`'s switcher step went to a desktop and back and
+/// found its terminal on a desktop the compositor was no longer compositing — listed, unfocused,
+/// and not on screen. The chords had the same hole.
+///
+/// **Called after every stretch that can normalise**, rather than at each of the eight calls:
+/// what matters is that the compositor has been told before the next window it creates, and a
+/// window arrives only through the manager drain.
+fn sync_current(mgr: &mut ChannelTransport, desktops: &[Desktop], current: u32, told: &mut u32) {
+    if current == *told {
+        return;
+    }
+    if tell_current(mgr, current) {
+        *told = current;
+        Line::new()
+            .s(b"desktop-shell: the compositor follows to ")
+            .untrusted(desktop_label(desktops, current).as_bytes())
+            .end();
+    }
 }
 
 /// Log the window list, so a gate can read what the bar is showing.
@@ -4547,6 +4608,86 @@ fn place_new_windows(
             .end();
     }
     dirty
+}
+
+/// Draw the bottom bar as things are now, if anything it shows has changed.
+#[allow(clippy::too_many_arguments)]
+fn present_bottom(
+    session: &mut Session<ChannelTransport>,
+    bar: Option<&mut Child>,
+    entries: &[WinEntry],
+    desktops: &[Desktop],
+    current: u32,
+    shown: &Option<(u32, alloc::vec::Vec<u32>)>,
+    theme: &Theme,
+    panel_theme: &Theme,
+    font: &Font,
+    screen: Screen,
+) {
+    let Some(bar) = bar else { return };
+    let lit = shown.as_ref().is_some_and(|(d, _)| *d == current);
+    let view = bottom_view(entries, desktops, current, lit, bar.hovered_key(), theme, font, screen);
+    if !bar.present(session, &view, font, panel_theme) {
+        kprint(b"desktop-shell: bottom bar Commit failed\n");
+    }
+}
+
+/// Show-desktop: put away every window on `current`, or bring back what the last press put away.
+///
+/// **The restore set is exactly what this minimised**, not "everything minimised": a window put
+/// away before the press stays away after the second one, which is what makes the pair undo each
+/// other. **The window that had the keyboard is raised last**, so it is on top and focused again.
+///
+/// **Only the windows the bar shows** — the first `capacity` — for the reason `Super+H` is bounded
+/// the same way: a window past the bar's end has no button, so one minimised here and then left
+/// behind when the set is dropped would be a window with no way back.
+///
+/// **One set at a time.** Showing a second desktop forgets the first's, whose windows are still
+/// on that desktop's buttons — which is where any minimised window comes back from.
+fn show_desktop(
+    mgr: &mut ChannelTransport,
+    entries: &mut [WinEntry],
+    current: u32,
+    capacity: usize,
+    shown: &mut Option<(u32, alloc::vec::Vec<u32>)>,
+) {
+    // Taken only if it is this desktop's: another desktop's set is still that desktop's to undo.
+    if let Some((_, ids)) = shown.take_if(|(d, _)| *d == current) {
+        let mut back = 0u64;
+        for id in ids {
+            if let Some(e) = entries.iter_mut().find(|e| e.id == id && e.minimized)
+                && raise_window(mgr, e)
+            {
+                back += 1;
+            }
+        }
+        Line::new().s(b"desktop-shell: restored ").u(back).s(b" window(s)").end();
+        return;
+    }
+    let showing: alloc::vec::Vec<u32> =
+        visible_entries(entries, current, capacity).iter().filter(|e| !e.minimized).map(|e| e.id).collect();
+    let mut ids = alloc::vec::Vec::new();
+    let mut focused = None;
+    for e in entries.iter_mut().filter(|e| showing.contains(&e.id)) {
+        let (id, had_keyboard) = (e.id, e.focused);
+        if minimize_window(mgr, e) {
+            if had_keyboard {
+                focused = Some(id);
+            } else {
+                ids.push(id);
+            }
+        }
+    }
+    ids.extend(focused);
+    Line::new()
+        .s(b"desktop-shell: showing the desktop, minimised ")
+        .u(ids.len() as u64)
+        .s(b" window(s)")
+        .end();
+    // **Nothing put away is nothing to bring back**, so the button stays unlit.
+    if !ids.is_empty() {
+        *shown = Some((current, ids));
+    }
 }
 
 /// The program a place opens in — the folder's counterpart of [`OPENER`].

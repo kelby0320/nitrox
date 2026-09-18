@@ -213,6 +213,50 @@ impl Child {
         theme: &Theme,
         buffers: usize,
     ) -> Option<Self> {
+        let mut me = Self::create(session, role, at, size, buffers)?;
+        // Draw once, so a window that has been created is never a window that has never
+        // committed — see `create`'s destroy for what that costs.
+        if me.present(session, content, font, theme) {
+            Some(me)
+        } else {
+            me.close(session);
+            None
+        }
+    }
+
+    /// [`open_sized`](Self::open_sized) **without the first frame**, for a `panel` that has to be
+    /// moved before it is seen (desktop refresh, Part C).
+    ///
+    /// The compositor docks a panel at the origin, and only a manager can place it — which the
+    /// shell's bottom bar cannot wait for, because the shell becomes the manager only after the
+    /// bar exists (`desktop-shell`'s note where it creates it). Drawn at creation it would sit over
+    /// the top bar until placed; created here, its first [`present`](Self::present) is the first
+    /// frame anybody sees.
+    ///
+    /// **A panel only, and that is the whole of the safety argument.** `open_sized` draws at once
+    /// because a *focusable* window that has committed nothing is a focus candidate that is never
+    /// drawn — an invisible window eating every keystroke. A panel never takes focus, so the
+    /// argument does not reach it; any other role is refused.
+    pub fn create_sized<T: Transport>(
+        session: &mut Session<T>,
+        role: Role,
+        size: Size,
+        buffers: usize,
+    ) -> Option<Self> {
+        if !matches!(role, Role::Panel { .. }) {
+            return None;
+        }
+        Self::create(session, role, (0, 0), size, buffers)
+    }
+
+    /// Create the window and its buffers, drawing nothing.
+    fn create<T: Transport>(
+        session: &mut Session<T>,
+        role: Role,
+        at: (i32, i32),
+        size: Size,
+        buffers: usize,
+    ) -> Option<Self> {
         if size.w == 0 || size.h == 0 {
             return None;
         }
@@ -234,7 +278,7 @@ impl Child {
             }
             return None;
         };
-        let mut me = Self {
+        Some(Self {
             id,
             size,
             tree: Tree::new(),
@@ -243,10 +287,7 @@ impl Child {
             pool,
             hover: None,
             shown: None,
-        };
-        // Draw once, so a window that has been created is never a window that has never
-        // committed — see the destroy above for what that costs.
-        me.present(session, content, font, theme).then_some(me)
+        })
     }
 
     /// Take a new size — from a `Configure`, or from a popup's owner — reallocating what depends
@@ -721,6 +762,48 @@ mod tests {
     #[allow(dead_code)]
     fn _unused() -> Element<u32> {
         padding(Insets::all(0), text("x"))
+    }
+
+    /// A transport that counts what reaches it and refuses all of it.
+    #[derive(Default)]
+    struct Counting {
+        requests: usize,
+    }
+
+    impl libsurface::Transport for Counting {
+        fn request(
+            &mut self,
+            _op: u16,
+            _body: &[u8],
+            _handle: Option<u64>,
+            _reply: &mut [u8],
+        ) -> Result<Option<usize>, libsurface::UiError> {
+            self.requests += 1;
+            Err(libsurface::UiError::Malformed)
+        }
+        fn poll_event(&mut self, _buf: &mut [u8]) -> Result<Option<(u16, usize)>, libsurface::UiError> {
+            Ok(None)
+        }
+        fn wait_event(&mut self, _buf: &mut [u8]) -> Result<(u16, usize), libsurface::UiError> {
+            Err(libsurface::UiError::Malformed)
+        }
+    }
+
+    /// `create_sized` makes a window that draws nothing, which is safe only for a role that never
+    /// takes focus — so a focusable role is refused **before anything reaches the compositor**,
+    /// and a panel gets as far as asking.
+    #[test]
+    fn only_a_panel_may_be_created_undrawn() {
+        let size = Size::new(100, 30);
+        for role in [Role::Normal, Role::Popup { parent: 1 }, Role::Dialog { parent: 1 }] {
+            let mut session = Session::new(Counting::default());
+            assert!(Child::create_sized(&mut session, role, size, 2).is_none());
+            assert_eq!(session.into_transport().requests, 0, "{role:?} reached the compositor");
+        }
+        let mut session = Session::new(Counting::default());
+        let panel = Role::Panel { dock: librsproto::surface::Edge::Bottom, reserve: 30 };
+        assert!(Child::create_sized(&mut session, panel, size, 2).is_none(), "the mock refuses");
+        assert!(session.into_transport().requests > 0, "a panel was never asked for");
     }
 }
 

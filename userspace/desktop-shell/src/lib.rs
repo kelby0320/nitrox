@@ -86,6 +86,10 @@ pub fn matches(name: &str, q: &str) -> bool {
 /// `SCREEN_H = 800`, and on the laptop's 1366×768 its window list was placed at `y = 776` — below
 /// the last row. Every size the shell derives from the screen is a method here, so the arithmetic
 /// is host-tested at every size rather than checked by a `const` assert at one.
+///
+/// **Except how many windows the bottom bar holds**, since the desktop refresh's Part C: that
+/// depends on the switcher beside them, which carries the desktop's name, so it is
+/// [`panel::task_capacity`] of a measured width rather than a method of the screen alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Screen {
     /// Width in pixels.
@@ -102,12 +106,6 @@ pub struct Screen {
 /// aims at a bar keeps its own copy, and moved with this.
 pub const BAR_H: u32 = 30;
 
-/// Width of one window-list entry, in pixels.
-pub const ENTRY_W: u32 = 180;
-
-/// Width of the desktop indicator at the window list's right-hand end.
-pub const INDICATOR_W: u32 = 160;
-
 /// The overview's sidebar width, at the right-hand edge.
 pub const SIDE_W: u32 = 200;
 
@@ -121,26 +119,6 @@ impl Screen {
     /// Bytes per row of a buffer as wide as the screen — both bars, the wallpaper, the overview.
     pub const fn pitch(self) -> usize {
         self.width as usize * 4
-    }
-
-    /// Where the indicator starts, in bar-local x. Clicks at or past this belong to it.
-    ///
-    /// **Anchored to the screen's right edge.** The first version laid the indicator out after the
-    /// entries, so it was drawn at `n * ENTRY_W` and coincided with its hit region at exactly one
-    /// window count (PR #243 review, blocking 2); a flexible spacer between the entries and the
-    /// indicator is what puts it here, and [`max_entries`](Self::max_entries) reserves the width.
-    pub const fn indicator_x(self) -> u32 {
-        self.width.saturating_sub(INDICATOR_W)
-    }
-
-    /// How many entries the window list can show without one being painted under the indicator.
-    ///
-    /// **The invariant is the product**: `max_entries × ENTRY_W + INDICATOR_W ≤ width`. With the
-    /// capacity computed from the full width, a full bar painted an entry across the indicator's
-    /// hit region, and clicking the last window switched desktops (PR #243 review, blocking 2).
-    /// Entries past the limit are not shown; the window is still there.
-    pub const fn max_entries(self) -> usize {
-        (self.indicator_x() / ENTRY_W) as usize
     }
 
     /// Where the window list is placed: its top edge, one bar above the bottom of the screen.
@@ -175,30 +153,25 @@ mod tests {
     ];
 
     #[test]
-    fn no_entry_is_ever_painted_under_the_indicator() {
+    fn the_window_list_sits_one_bar_above_the_foot_at_every_size() {
         for (width, height) in SIZES {
             let s = Screen { width, height };
-            let used = s.max_entries() as u32 * ENTRY_W;
-            assert!(used + INDICATOR_W.min(width) <= width, "{width}x{height}: {used} + indicator");
-            assert!(used <= s.indicator_x(), "{width}x{height}: an entry crosses the indicator");
+            assert_eq!(s.window_list_y() as u32, height.saturating_sub(BAR_H), "{width}x{height}");
+            assert!(s.thumb_cols() >= 1, "{width}x{height}");
         }
     }
 
     #[test]
     fn the_layout_at_the_old_size_and_at_the_gate_size() {
         let old = Screen { width: 1280, height: 800 };
-        assert_eq!((old.indicator_x(), old.max_entries(), old.window_list_y()), (1120, 6, 770));
-        assert_eq!((old.thumb_cols(), old.pitch()), (4, 5120));
+        assert_eq!((old.window_list_y(), old.thumb_cols(), old.pitch()), (770, 4, 5120));
         let gate = Screen { width: 1360, height: 768 };
-        assert_eq!((gate.indicator_x(), gate.max_entries(), gate.window_list_y()), (1200, 6, 738));
-        assert_eq!((gate.thumb_cols(), gate.pitch()), (4, 5440));
+        assert_eq!((gate.window_list_y(), gate.thumb_cols(), gate.pitch()), (738, 4, 5440));
     }
 
     #[test]
     fn a_screen_too_small_for_the_chrome_degrades_rather_than_wrapping() {
         let tiny = Screen { width: 100, height: 10 };
-        assert_eq!(tiny.indicator_x(), 0);
-        assert_eq!(tiny.max_entries(), 0);
         assert_eq!(tiny.window_list_y(), 0, "saturating, not a negative origin from a wrap");
         assert_eq!(tiny.thumb_cols(), 1);
     }
