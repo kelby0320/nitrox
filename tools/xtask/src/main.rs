@@ -2611,11 +2611,18 @@ fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
     let blocks = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;
     let per_group = u32::from_le_bytes([sb[32], sb[33], sb[34], sb[35]]) as u64;
     let groups = blocks.div_ceil(per_group);
-    if blocks + 8 < partition_blocks {
+    // **The tolerance is one block group, not a handful of blocks.** `mkfs` drops a final
+    // group too short to hold its own metadata, as `mke2fs` does, so a filesystem may
+    // legitimately stop up to one short group before the end of its partition. What this is
+    // looking for is the H.1 failure — a 24 MiB filesystem on a 477 MiB partition — which is
+    // wrong by whole groups, not by a tail. A tighter bound would fail on the 0.25% of
+    // partition sizes whose last group is unusable (PR #310 review, finding 1).
+    if blocks + per_group < partition_blocks {
         return Err(format!(
             "the installed filesystem is {blocks} blocks on a {partition_blocks}-block \
-             partition — it was copied onto the disk rather than made for it, which is exactly \
-             what H.1 did and H.2 exists to stop"
+             partition, short by more than one block group of {per_group} — it was copied onto \
+             the disk rather than made for it, which is exactly what H.1 did and H.2 exists to \
+             stop"
         )
         .into());
     }
@@ -2631,9 +2638,20 @@ fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
     // (3) A write past group 0, with the allocator the guest runs.
     let big = per_group * 4096 + 8 * 1024 * 1024; // comfortably into group 1
     ext4::create_file(&img, b"/", b"past-group-0", 0).map_err(|e| format!("create: {e:?}"))?;
-    ext4::grow_file(&img, b"/past-group-0", big as usize, 0)
-        .map_err(|e| format!("grow past group 0 failed: {e:?} — the allocator did not leave \
-                              the first group, which is what H.2's first box is"))?;
+    ext4::grow_file(&img, b"/past-group-0", big as usize, 0).map_err(|e| match e {
+        // **Two failures that look alike and are not.** `TooLarge` is the allocator refusing
+        // to leave group 0, which is what this assertion exists for; `Unsupported` is the
+        // inline extent header running out of its four entries, which is a different deferral
+        // and would be the wrong diagnosis to print here (PR #310 review).
+        fs_server_ext4::FsError::Unsupported => format!(
+            "growing past group 0 needed a deeper extent tree than the four inline entries \
+             hold — that is the extent-splitting deferral, not the allocator"
+        ),
+        other => format!(
+            "grow past group 0 failed: {other:?} — the allocator did not leave the first \
+             group, which is what H.2's first box is"
+        ),
+    })?;
     let mut runs = [fs_server_ext4::BlockRun::default(); 8];
     let n = ext4::map_range(&img, b"/past-group-0", 0, big / 4096 + 1, &mut runs)
         .map_err(|e| format!("map: {e:?}"))?;

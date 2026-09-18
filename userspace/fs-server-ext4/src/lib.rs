@@ -1045,19 +1045,8 @@ mod tests {
 
         // The oracle reads every copy of the table it can find, so a truncated or misplaced
         // one is its business, not ours to re-derive.
-        let out = std::process::Command::new("e2fsck")
-            .args(["-fn", path.to_str().unwrap()])
-            .output()
-            .unwrap();
-        let text = std::format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert_e2fsck_clean_path(&path, "mkfs-wide");
         std::fs::remove_dir_all(&dir).ok();
-        assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
-        assert!(!text.contains("? no"), "e2fsck found a problem:\n{text}");
-        assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
     }
 
     /// A filesystem large enough to need **backup superblocks past group 1**, which is where
@@ -1098,11 +1087,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("img.ext4");
         std::fs::write(&p, img).unwrap();
+        assert_e2fsck_clean_path(&p, tag);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
+    /// want in memory, or one a gate carved out of an image.
+    ///
+    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
+    /// how the status-only check below survived being noticed; a third copy would be the same
+    /// mistake with the ink still wet (PR #310 review).
+    fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
         let out = std::process::Command::new("e2fsck")
             .args(["-fn", p.to_str().unwrap()])
             .output()
             .unwrap();
-        std::fs::remove_dir_all(&dir).ok();
         let text = std::format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

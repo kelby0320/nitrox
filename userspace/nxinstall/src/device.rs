@@ -35,13 +35,19 @@ pub struct PartitionIo {
 }
 
 impl PartitionIo {
-    /// Wrap `device`'s `[base, base + len)` bytes, transferring through `mem`, which must be
-    /// mapped read-write at `addr` for `cap` bytes with `cap` a multiple of [`SECTOR`].
+    /// Wrap `device`'s `[base, base + len)` bytes, transferring through `mem`.
     ///
     /// # Safety
     ///
-    /// The caller keeps `mem`/`addr` valid for this value's lifetime.
-    pub fn new(device: u64, base: u64, len: u64, mem: u64, addr: u64, cap: usize) -> Self {
+    /// `mem` must be mapped read-write at `addr` for at least `cap` bytes, `cap` must be a
+    /// multiple of [`SECTOR`], and both must stay valid for this value's lifetime.
+    ///
+    /// **`unsafe` because this is where the contract is made.** `read_at` and `write_at` are
+    /// safe methods that build a `&mut [u8]` from `addr` and `cap`; if a safe constructor
+    /// could set them, then entirely safe code — `PartitionIo::new(dev, base, len, mem, 0,
+    /// cap)`, or a `cap` larger than the mapping — would reach undefined behaviour through a
+    /// safe call. A `# Safety` section on a safe `fn` is the tell (PR #310 review, finding 2).
+    pub unsafe fn new(device: u64, base: u64, len: u64, mem: u64, addr: u64, cap: usize) -> Self {
         PartitionIo { device, base, len, mem, addr, cap }
     }
 
@@ -78,14 +84,15 @@ impl PartitionIo {
         Ok((start, span, intra))
     }
 
-    /// The scratch buffer's bytes.
+    /// The scratch buffer's first `n` bytes.
     ///
     /// # Safety
     ///
-    /// `addr` maps `cap` bytes read-write and `n <= cap`.
+    /// `n <= cap`. That `addr` maps `cap` bytes read-write is [`new`](Self::new)'s contract.
     unsafe fn scratch(&self, n: usize) -> &mut [u8] {
-        // SAFETY: the caller's contract, and this process is single-threaded — nothing else
-        // holds a reference to the mapping.
+        // SAFETY: `new` promised `addr` maps `cap` read-write bytes; the caller promised
+        // `n <= cap`; and this process is single-threaded, so nothing else holds a reference
+        // to the mapping.
         unsafe { core::slice::from_raw_parts_mut(self.addr as *mut u8, n) }
     }
 }

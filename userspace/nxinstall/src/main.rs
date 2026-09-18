@@ -466,7 +466,6 @@ fn install(
 ) -> Result<(), String> {
     let block = target.info.logical_block_size as u64;
     let esp_bytes = srcs.esp.info.byte_capacity();
-    let root_bytes = srcs.root_extent.1 * BLOCK as u64;
     // **Every timestamp in the new filesystem is the install's own.** These files are created
     // now; carrying the source's times would date a fresh machine to whenever the image was
     // built. A clock this system could not read leaves them at the epoch, which is wrong but
@@ -595,7 +594,6 @@ fn install(
         human(root_bytes_dst),
         copied.files
     ));
-    let _ = root_bytes;
     Ok(())
 }
 
@@ -615,10 +613,13 @@ fn wall_clock_seconds() -> i64 {
 /// transfer goes through; the caller holds it for as long as the window is used.
 fn partition_io(device: u64, base: u64, len: u64) -> Option<(device::PartitionIo, Scratch)> {
     let (mem, addr) = scratch(FS_SCRATCH)?;
-    Some((
-        device::PartitionIo::new(device, base, len, mem, addr, FS_SCRATCH as usize),
-        Scratch { mem, addr },
-    ))
+    // SAFETY: `scratch` just created `mem` and mapped it read-write at `addr` for exactly
+    // `FS_SCRATCH` bytes, which is a multiple of a sector; the `Scratch` returned beside the
+    // window keeps both alive until the caller drops it.
+    let io = unsafe {
+        device::PartitionIo::new(device, base, len, mem, addr, FS_SCRATCH as usize)
+    };
+    Some((io, Scratch { mem, addr }))
 }
 
 /// A mapped scratch object, unmapped and closed when it goes out of scope.

@@ -159,8 +159,14 @@ impl Geometry {
         if addressable < MIN_BLOCKS {
             return Err(MkfsError::TooSmall { have: p.blocks, need: MIN_BLOCKS });
         }
-        let groups = addressable.div_ceil(blocks_per_group as u64) as u32;
-        let gdt_blocks =
+        // **The filesystem may be smaller than the partition**, by up to one short final
+        // group — see the loop at the end of this function, which is why `blocks_count` is a
+        // variable rather than `p.blocks`.
+        let mut blocks_count = p.blocks;
+        let mut groups =
+            blocks_count.saturating_sub(first_data_block as u64).div_ceil(blocks_per_group as u64)
+                as u32;
+        let mut gdt_blocks =
             (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
 
         // **Inodes: the ratio, then a cap.** The table is written out in full — there is no
@@ -184,26 +190,62 @@ impl Geometry {
         inodes_per_group = inodes_per_group.max(per_block);
         // A group cannot hold more inodes than it has blocks to describe them with.
         inodes_per_group = inodes_per_group.min(blocks_per_group / 2 * per_block);
+        // **And no more than a group descriptor can count.** `bg_free_inodes_count_lo` is 16
+        // bits, so a group of more than 65,535 inodes would have its free count truncated on
+        // the way to disk and every descriptor would claim a number that is not true. No
+        // in-tree caller gets near it — `bytes_per_inode` is 16384 everywhere — but `Params`
+        // is public, and `bytes_per_inode = 512` on a single-group 4 KiB filesystem asks for
+        // 262,144 (PR #310 review). Clamped here, where the number is chosen, rather than
+        // where it is written out.
+        inodes_per_group = inodes_per_group.min(u16::MAX as u32 / per_block * per_block);
         let itable_blocks = inodes_per_group / per_block;
-        let inodes_count = inodes_per_group
-            .checked_mul(groups)
-            .ok_or(MkfsError::TooLarge)?;
 
-        let g = Geometry {
-            block_size: p.block_size,
-            blocks_count: p.blocks,
-            first_data_block,
-            blocks_per_group,
-            groups,
-            inodes_per_group,
-            inodes_count,
-            itable_blocks,
-            gdt_blocks,
+        // **Drop a final group too short to hold its own metadata**, as `mke2fs` does.
+        //
+        // Group 0 carries the most *overhead* and the last group can carry the fewest
+        // *blocks*, and those are independent: a filesystem can end with a group of 7 blocks
+        // that needs 68. The first version of this compared group 0 against itself and called
+        // that sufficient — "group 0 carries the most metadata, so if the root fits there it
+        // fits" — which is true of overhead and says nothing about the tail. `format` then
+        // wrote past the end of the filesystem, and `descriptor`'s free-block count
+        // underflowed. At `nxinstall`'s parameters roughly **one partition size in 400** lands
+        // there (PR #310 review, finding 1).
+        //
+        // Dropping costs at most one short group, which is by definition fewer blocks than its
+        // own metadata — about 70 on a 4 KiB filesystem, a quarter of a megabyte. Refusing
+        // instead would mean an installer that turns down one disk in 400 for a reason nobody
+        // could act on. Looping because dropping a group can shrink the descriptor table,
+        // which lowers every group's overhead; it terminates because `blocks_count` strictly
+        // decreases.
+        let g = loop {
+            let g = Geometry {
+                block_size: p.block_size,
+                blocks_count,
+                first_data_block,
+                blocks_per_group,
+                groups,
+                inodes_per_group,
+                inodes_count: inodes_per_group
+                    .checked_mul(groups)
+                    .ok_or(MkfsError::TooLarge)?,
+                itable_blocks,
+                gdt_blocks,
+            };
+            // Group 0 also holds the root directory's block, so it needs two more than its
+            // metadata.
+            if g.overhead(0) + 2 >= g.blocks_in_group(0) as u64 {
+                return Err(MkfsError::TooSmall { have: p.blocks, need: g.overhead(0) + 3 });
+            }
+            let last = groups - 1;
+            if groups == 1 || g.overhead(last) < g.blocks_in_group(last) as u64 {
+                break g;
+            }
+            // Cut the filesystem at the start of the group being dropped.
+            blocks_count = g.group_start(last);
+            groups -= 1;
+            gdt_blocks =
+                (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
         };
-        // Group 0 carries the most metadata, so if the root directory fits there it fits.
-        if g.overhead(0) + 2 >= g.blocks_in_group(0) as u64 {
-            return Err(MkfsError::TooSmall { have: p.blocks, need: g.overhead(0) + 3 });
-        }
         Ok(g)
     }
 
@@ -369,7 +411,12 @@ pub fn format<W: BlockWriter>(
     let mut sb = [0u8; 1024];
     wr_u32(&mut sb, 0, g.inodes_count);
     wr_u32(&mut sb, 4, g.blocks_count as u32);
-    wr_u32(&mut sb, 8, 0); // s_r_blocks_count_lo — see the note below
+    // **No reserved blocks**, where `mke2fs` reserves 5% for the superuser. That reservation
+    // exists so a full disk still leaves root able to log in and clean up; this system has no
+    // root account and no privileged process to reserve for, so the 5% would be 46 GiB of a
+    // terabyte withheld from its owner on behalf of nobody. `alloc_block` ignores the field
+    // either way, so this is a statement about whose disk it is rather than a behaviour change.
+    wr_u32(&mut sb, 8, 0); // s_r_blocks_count_lo
     wr_u32(&mut sb, 12, free as u32);
     wr_u32(&mut sb, 16, g.inodes_count - (FIRST_INO - 1));
     wr_u32(&mut sb, 20, g.first_data_block);
@@ -553,6 +600,68 @@ mod tests {
         // A small filesystem is governed by the ratio instead, not the cap.
         let small = Geometry::new(&params(24576, 1024)).unwrap();
         assert!((small.inodes_count as u64) < MAX_INODES);
+    }
+
+    /// **A final group shorter than its own metadata is dropped, not written past.**
+    ///
+    /// Both sizes are the reviewer's, reproduced (PR #310, finding 1): 8,200 blocks at 1 KiB
+    /// gives a second group of 7 blocks needing 68, and 26,214,401 blocks at 4 KiB — a size
+    /// `nxinstall` can be handed — gives group 800 a single block needing 83. The old guard
+    /// compared group 0 against itself and accepted both; `format` then wrote past the end of
+    /// the filesystem, and `descriptor`'s free-block count underflowed.
+    #[test]
+    fn a_final_group_too_short_for_its_metadata_is_dropped() {
+        for (blocks, bs) in [(8200u64, 1024u32), (26_214_401, 4096)] {
+            let g = Geometry::new(&params(blocks, bs)).expect("this is a usable disk");
+            let last = g.groups - 1;
+            assert!(
+                g.overhead(last) < g.blocks_in_group(last) as u64,
+                "{blocks} blocks at {bs}: the last group has {} blocks and {} of overhead",
+                g.blocks_in_group(last),
+                g.overhead(last)
+            );
+            // **Every group, not just the last** — the loop lowers the descriptor table as it
+            // drops groups, so the claim is about the geometry it settles on.
+            for n in 0..g.groups {
+                assert!(
+                    g.overhead(n) < g.blocks_in_group(n) as u64,
+                    "{blocks} blocks at {bs}: group {n} cannot hold its own metadata"
+                );
+            }
+            // The filesystem never claims more than the partition, and gives up at most the
+            // one short group — far less than a whole one.
+            assert!(g.blocks_count <= blocks);
+            assert!(
+                blocks - g.blocks_count < g.blocks_per_group as u64,
+                "{blocks} blocks at {bs}: gave up {} blocks, which is more than a tail",
+                blocks - g.blocks_count
+            );
+        }
+    }
+
+    /// The same property over a sweep, because the reviewer found it at 0.25% of sizes and a
+    /// hand-picked pair proves only the two that were picked.
+    #[test]
+    fn no_size_produces_a_group_that_cannot_hold_its_metadata() {
+        // `nxinstall`'s parameters, around 100 GiB, stepping by a group so the tail varies.
+        let mut checked = 0;
+        for n in 0..2000u64 {
+            let blocks = 26_214_400 + n * 7 + 1;
+            let g = match Geometry::new(&params(blocks, 4096)) {
+                Ok(g) => g,
+                Err(e) => panic!("{blocks} blocks refused: {e:?}"),
+            };
+            for i in 0..g.groups {
+                assert!(
+                    g.overhead(i) < g.blocks_in_group(i) as u64,
+                    "{blocks} blocks: group {i} has {} blocks, {} of overhead",
+                    g.blocks_in_group(i),
+                    g.overhead(i)
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 2000);
     }
 
     #[test]

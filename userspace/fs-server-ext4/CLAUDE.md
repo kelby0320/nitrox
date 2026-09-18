@@ -26,6 +26,13 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   mutation use bounded stack scratch (≤ one 4 KiB block). Do not pull in `alloc` here.
   Write path: `map_file` (extent → block runs), `grow_file` (block-bitmap allocation +
   extent-tree extension + inode update).
+- **`src/mkfs.rs` — making an empty filesystem** (Phase 5 Part H.2). Superblock and backups,
+  the group-descriptor table, per-group bitmaps and inode tables, a root directory. Same rules
+  as `ext4.rs`: `no_std`, **no `alloc`**, bounded stack scratch of one block — which is why the
+  descriptor table is written a block at a time rather than built whole (a 931 GiB disk needs
+  59 blocks of it, and the first version used one). Host-tested with `e2fsck -fn` **and**
+  `dumpe2fs` as oracles, and read back by this crate's own parser: `e2fsck` would accept a
+  filesystem the reader cannot walk, and the reader would accept its own mistakes.
 - **`src/serve.rs` — the request→reply core.** `serve_resolve(reader, request,
   content, reply)` parses a forwarded `Namespace::Resolve`, reads the file via the
   `BlockReader`, and builds the reply (success names a `MemoryObject` of the
@@ -74,6 +81,15 @@ Also truncate (2026-07-24), rename, delete, and
 **growing a full directory** (2026-07-29) — a directory whose blocks are all full gains
 another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries.
 
+## This crate's library has a second consumer
+
+`nxinstall` links it (`userspace/nxinstall/Cargo.toml`) and calls `mkfs::format`, `create_file`,
+`mkdir_at`, `grow_file` and `map_range` directly against a partition of a raw disk — the
+installer makes a filesystem and fills it without anything being mounted. **So the lib half is a
+format library, not only this server's insides**, and a change to a public signature here breaks
+a program that is not in this directory. The bin half (`main.rs`) is still the server and is
+nobody else's business.
+
 ## Capability discipline
 
 The server receives only what it needs at spawn: a **read-write block-device
@@ -84,7 +100,9 @@ holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
 
 ## Forbidden
 
-- `alloc` in the parser library (`ext4.rs`/`lib.rs`) — buffer-based only.
+- `alloc` in the library half (`ext4.rs`, `mkfs.rs`, `lib.rs`) — buffer-based only. The list
+  names every module because a rules file that enumerates three of four is one that permits the
+  fourth by omission (PR #310 review).
 - Touching **file data** — the kernel owns the data path (Model A); the server writes
   only metadata (bitmaps, extent tree, inode, superblock).
 - Binding itself into a namespace, or holding `BIND_NAMESPACE`.
