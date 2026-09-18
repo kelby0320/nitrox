@@ -29,8 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, center, column, dock, docked, fill, icon, padding,
-    row, sized, stack, text,
+    Edge, Element, IconKind, Insets, bevel, center, column, dock, docked, fill, icon, outline,
+    padding, row, sized, stack, text,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -114,11 +114,16 @@ pub fn button<Msg>(
 ///
 /// One helper, so the applications modal and a menu cannot disagree about what a popup looks
 /// like — they are the same kind of thing seen twice.
+///
+/// **Rounded since the desktop refresh's Part B**, because the compositor cuts a popup's corners
+/// to [`WINDOW_RADIUS`](libdraw::corner::WINDOW_RADIUS): the border is an
+/// [`outline`](crate::element::outline) drawn last, along that curve, rather than a square
+/// fill the cut would have taken the corners off.
 pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
     stack(alloc::vec![
-        fill(theme.border),
-        padding(Insets::all(POPUP_BORDER), fill(theme.face)),
+        fill(theme.face),
         padding(Insets::all(POPUP_BORDER), content),
+        outline(theme.border, libdraw::corner::WINDOW_RADIUS),
     ])
 }
 
@@ -149,10 +154,14 @@ pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &The
             content,
         ),
     );
+    // **The border is drawn last, and round** (desktop refresh, Part B). It was a square fill
+    // under a face inset by a pixel; the compositor now cuts a window's corners to
+    // `WINDOW_RADIUS`, which would take a square border's corners off with them. So the edge is
+    // an outline along the same curve, painted over the content it curves into.
     stack(alloc::vec![
-        fill(theme.border),
-        padding(Insets::all(WINDOW_BORDER), fill(theme.face)),
+        fill(theme.face),
         padding(Insets::all(WINDOW_BORDER), inner),
+        outline(theme.border, libdraw::corner::WINDOW_RADIUS),
     ])
 }
 

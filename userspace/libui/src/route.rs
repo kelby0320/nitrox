@@ -752,9 +752,16 @@ fn layout_at<'a>(l: &'a Layout, path: &[usize]) -> Option<&'a Layout> {
 /// Children are searched in reverse — the last child paints on top, so it is hit first — and
 /// a parent is only a hit if none of its children was. Zero-extent rectangles can contain
 /// nothing and fall out of `contains` naturally.
+///
+/// **A window's border is never hit** (desktop refresh, Part B). It is an
+/// [`Outline`](crate::element::Node::Outline) painted *last*, over the content its corners curve
+/// into, so it is the topmost child of every framed window and spans the whole of it. Hit like
+/// any other node it took every press in the window and, having no handler, answered none of
+/// them — the dialog-button test found it at once. A border is decoration, not a target, so the
+/// walk passes over it as if it were not there.
 fn hit_test(root: Option<&Widget>, layout: &Layout, at: Point) -> Option<u64> {
     fn walk(w: &Widget, l: &Layout, at: Point) -> Option<u64> {
-        if !l.rect.contains(at.x, at.y) {
+        if !l.rect.contains(at.x, at.y) || matches!(w.print, crate::diff::Fingerprint::Outline(..)) {
             return None;
         }
         for (cw, cl) in w.children.iter().zip(l.children.iter()).rev() {
@@ -880,6 +887,23 @@ mod tests {
         assert_eq!(down, vec![Msg::Pressed(1)]);
         let (up, _) = r.pointer(&t, &ui, &l, release(10, 400));
         assert!(up.is_empty(), "a release outside the widget is not a click");
+    }
+
+    #[test]
+    fn a_border_painted_over_a_window_does_not_take_its_presses() {
+        // **The shape every framed window has since the desktop refresh's Part B**: content,
+        // then an outline over the whole of it, last so its curved corners draw over the content
+        // they curve into. Topmost and full-size, it was hit before anything under it and had no
+        // handler, so every press in every window went nowhere.
+        let ui: Element<Msg> = crate::element::stack(vec![
+            sized(Size::new(640, 40), custom(1, Size::new(640, 40))).on_press(Msg::Pressed(1)),
+            crate::element::outline(libdraw::format::Rgb::BLACK, 8),
+        ]);
+        let (t, l) = build(&ui);
+        let mut r = Router::new();
+        let _ = r.pointer(&t, &ui, &l, press(10, 10));
+        let (up, _) = r.pointer(&t, &ui, &l, release(10, 10));
+        assert_eq!(up, vec![Msg::Pressed(1)], "the press reached the content under the border");
     }
 
     #[test]

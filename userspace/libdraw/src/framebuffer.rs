@@ -309,10 +309,62 @@ pub trait Framebuffer {
         }
     }
 
+    /// Draw the one-pixel border of `rect` with its corners rounded to `radius`, painting only
+    /// inside `clip` — **for a surface the compositor cuts to the same curve**.
+    ///
+    /// The straight edges are the outermost row and column, drawn solid. In each corner square the
+    /// border is blended at [`corner::border_share`](crate::corner::border_share), which is the
+    /// share of the *covered* part of a pixel that is border: the compositor supplies the
+    /// curve's own fade when it blends this surface over what is below, so the border must not
+    /// fade itself as well. That makes this the wrong call for a rounded shape drawn *inside* a
+    /// window, which nothing cuts afterwards; [`fill_rounded_rect`](Self::fill_rounded_rect) is
+    /// that one.
+    ///
+    /// Drawn over whatever is already there, so a window paints its content first and this last.
+    /// `rect` fixes the shape and `clip` is how much of it this frame repaints, for the reason
+    /// [`fill_rect_bevel`](Self::fill_rect_bevel) gives.
+    fn outline_rounded_rect(&mut self, rect: Rect, clip: Rect, colour: Rgb, radius: u32) {
+        let Some(paint) = rect.intersect(&clip) else { return };
+        let r = crate::corner::clamp(radius, rect.size.w, rect.size.h);
+        let (left, right) = (rect.origin.x, rect.right() as i32);
+        let (top, bottom) = (rect.origin.y, rect.bottom() as i32);
+        for y in paint.origin.y..paint.bottom() as i32 {
+            let dy = (y - top).min(bottom - 1 - y) as u32;
+            // Rows through the corners, and the top and bottom edges, are walked across; every
+            // other row has border only at its two ends.
+            if dy < r.max(1) {
+                for x in paint.origin.x..paint.right() as i32 {
+                    let dx = (x - left).min(right - 1 - x) as u32;
+                    if let Some(a) = border_alpha(r, dx, dy) {
+                        self.blend_pixel(x as u32, y as u32, colour, a);
+                    }
+                }
+            } else {
+                for x in [left, right - 1] {
+                    if paint.contains(x, y) {
+                        self.blend_pixel(x as u32, y as u32, colour, 255);
+                    }
+                }
+            }
+        }
+    }
+
     /// Fill the entire visible area.
     fn clear(&mut self, colour: Rgb) {
         let bounds = self.geometry().bounds();
         self.fill_rect(bounds, colour);
+    }
+}
+
+/// How strongly a rounded border covers the pixel `(dx, dy)` from its nearest corner, or `None`
+/// where there is no border — see [`Framebuffer::outline_rounded_rect`].
+fn border_alpha(radius: u32, dx: u32, dy: u32) -> Option<u8> {
+    if dx < radius && dy < radius {
+        Some(crate::corner::border_share(radius, dx, dy))
+    } else if dx == 0 || dy == 0 {
+        Some(255)
+    } else {
+        None
     }
 }
 
@@ -805,5 +857,49 @@ mod tests {
         big.fill_rounded_rect(shape, g.bounds(), fill, 50);
         three.fill_rounded_rect(shape, g.bounds(), fill, 3);
         assert_eq!(big, three);
+    }
+
+    #[test]
+    fn a_rounded_outline_is_solid_on_the_edges_shared_on_the_curve_and_absent_inside() {
+        let (under, line) = (Rgb::new(0xF0, 0xE0, 0xD0), Rgb::new(0x10, 0x20, 0x30));
+        let g = Geometry::packed(40, 30, PixelFormat::XRGB8888);
+        let shape = Rect::new(4, 3, 30, 20);
+        let mut fb = MemFramebuffer::filled(g, under);
+        fb.outline_rounded_rect(shape, g.bounds(), line, 8);
+        // The straight edges are the line; one pixel in, and the middle, are untouched.
+        for (x, y) in [(4, 12), (33, 12), (19, 3), (19, 22)] {
+            assert_eq!(fb.get_pixel(x, y), Some(line), "edge ({x},{y})");
+        }
+        for (x, y) in [(5, 12), (32, 12), (19, 4), (19, 21), (19, 12)] {
+            assert_eq!(fb.get_pixel(x, y), Some(under), "inside ({x},{y})");
+        }
+        // Nothing outside the rectangle is touched.
+        assert_eq!(fb.get_pixel(3, 12), Some(under));
+        // Each corner pixel is the line at its border share, the same in all four corners.
+        for dy in 0..8u32 {
+            for dx in 0..8u32 {
+                let want = line.blend(under, crate::corner::border_share(8, dx, dy));
+                let (l, t, r, b) = (4 + dx, 3 + dy, 33 - dx, 22 - dy);
+                for (x, y) in [(l, t), (r, t), (l, b), (r, b)] {
+                    assert_eq!(fb.get_pixel(x, y), Some(want), "({x},{y}) is ({dx},{dy}) in");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rounded_outline_repainted_in_pieces_is_the_same_picture() {
+        let (under, line) = (Rgb::new(0xF0, 0xE0, 0xD0), Rgb::new(0x10, 0x20, 0x30));
+        let g = Geometry::packed(40, 30, PixelFormat::XRGB8888);
+        let shape = Rect::new(4, 3, 30, 20);
+        let mut whole = MemFramebuffer::filled(g, under);
+        whole.outline_rounded_rect(shape, g.bounds(), line, 8);
+        let mut pieces = MemFramebuffer::filled(g, under);
+        for y in (0..30).step_by(4) {
+            for x in (0..40).step_by(5) {
+                pieces.outline_rounded_rect(shape, Rect::new(x, y, 5, 4), line, 8);
+            }
+        }
+        assert_eq!(pieces, whole);
     }
 }

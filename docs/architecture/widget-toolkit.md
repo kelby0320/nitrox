@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()` and the theming section was checked against it), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()` and Part B rounded the frames — `Node::Outline`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -495,8 +495,8 @@ is:
 
 | Widget | Why it exists |
 |---|---|
-| `window_frame` | A window's own edge: a one-pixel border, three pixels of frame on the left, right and bottom, and the title bar flush at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
-| `popup_frame` | A menu or modal's edge. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
+| `window_frame` | A window's own edge: a one-pixel border, rounded along the compositor's curve and drawn last as a `Node::Outline`, three pixels of frame on the left, right and bottom, and the title bar flush at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
+| `popup_frame` | A menu or modal's edge, rounded like a window's. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
 | `menu_item` | A dropdown row that highlights under the pointer, the way a selected list row does — they are the same thing seen twice |
 | `ListState::drag_to` | Converts a pointer's y on a scrollbar into an offset. On the state rather than in each caller, so a list's thumb and `nxterm`'s grid answer the same question the same way |
 
@@ -549,6 +549,16 @@ Two painting primitives arrived with them: `Node::Bevel`, a fill with the theme'
 *second* fill rather than a flag on the first, because a flat fill is correct from the clip alone
 and a gradient is only correct from the node's own rect — and `Node::Icon`, the three window
 controls drawn as shapes rather than typed as `_`, `[]` and `X`.
+
+**A third, `Node::Outline`, arrived with the desktop refresh's Part B**: the one-pixel border of
+a window or a popup, with rounded corners. It is painted *last*, over the content its corners
+curve into, because the compositor now cuts a floating window's corners to
+`libdraw::corner::WINDOW_RADIUS` and a square border painted first would lose its corners to the
+cut. It blends at `libdraw::corner::border_share` — the share of the covered part of a pixel that
+is border — because the compositor supplies the curve's own fade, so it is only for a surface the
+compositor cuts to the same curve. **It is never a hit-test target**: painted last and spanning the
+whole window, it would otherwise take every press in it and answer none of them, which is what the
+first version did until `dialog_buttons_land_where_the_constants_say` failed.
 
 **The waiting was the point, and it is worth saying what it bought.** This section's standing
 reason was that "building an editor's widget remains a guess at requirements no editor has yet

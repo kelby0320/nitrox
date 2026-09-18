@@ -229,6 +229,24 @@ pub enum Node<Msg> {
     /// repaints. Keeping them separate is what stops that distinction being a parameter somebody
     /// passes wrongly.
     Bevel(Rgb),
+    /// The one-pixel border of a window or a popup, with its corners rounded to `radius`
+    /// (desktop refresh, Part B).
+    ///
+    /// **Drawn last, over the surface's content**, because the corner curves inward over whatever
+    /// is in the window's corners — a title bar, a menu's first row — and a border painted first
+    /// would be painted over. It measures to nothing, like [`Fill`](Self::Fill), and draws along
+    /// its own rectangle's edge.
+    ///
+    /// **Only for a surface the compositor cuts to the same curve**: it blends the border at
+    /// `libdraw::corner::border_share`, which leaves the curve's own fade to the compositor. See
+    /// `Framebuffer::outline_rounded_rect`.
+    Outline {
+        /// The border's colour.
+        colour: Rgb,
+        /// The corner radius — `libdraw::corner::WINDOW_RADIUS` for everything that uses it
+        /// today, since it must be the radius the compositor cuts with.
+        radius: u32,
+    },
     /// One of the three window-control glyphs, drawn rather than typed.
     ///
     /// **Drawn, so there is no icon format yet** (M11 Part E, batch 2). A minimise is a bar, a
@@ -443,6 +461,7 @@ impl<Msg> Element<Msg> {
             Node::Text(_)
             | Node::Fill(_)
             | Node::Bevel(_)
+            | Node::Outline { .. }
             | Node::Icon(_)
             | Node::Custom { .. } => (&[], None, None),
             Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
@@ -509,6 +528,11 @@ pub fn sized<Msg>(size: Size, child: Element<Msg>) -> Element<Msg> {
 /// A rectangle of flat colour, filling whatever it is given.
 pub fn fill<Msg>(colour: Rgb) -> Element<Msg> {
     Element::new(Node::Fill(colour))
+}
+
+/// A rounded window border — see [`Node::Outline`].
+pub fn outline<Msg>(colour: Rgb, radius: u32) -> Element<Msg> {
+    Element::new(Node::Outline { colour, radius })
 }
 
 /// A face drawn with the theme's bevel — see [`Node::Bevel`].

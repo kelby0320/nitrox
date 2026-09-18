@@ -7314,7 +7314,8 @@ fn cmd_tune(args: &[String]) -> R<()> {
             },
         ],
     };
-    let corner = num("--corner", 0)?;
+    // What ships, like every other default here: floating windows are rounded since Part B.
+    let corner = num("--corner", libdraw::corner::WINDOW_RADIUS)?;
     let ground_alpha = num("--ground", 210)?.min(255) as u8;
     let side_alpha = num("--side", 150)?.min(255) as u8;
 
@@ -8133,22 +8134,6 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     }
     println!("  ok: cursor visible at ({cx},{cy}) — {cursor_px} body pixels");
 
-    let mut mismatches = 0usize;
-    let mut first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
-    for y in 0..sh {
-        for x in 0..sw {
-            let want = Framebuffer::get_pixel(&expected, x, y).unwrap_or_default();
-            let i = (y as usize * w as usize + x as usize) * 3;
-            let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
-            if got != (want.r, want.g, want.b) {
-                mismatches += 1;
-                if first.is_none() {
-                    first = Some((x, y, got, (want.r, want.g, want.b)));
-                }
-            }
-        }
-    }
-
     // The font both reference renders are drawn with here — the same file the image build
     // stages at `/system/fonts/`, against a guest render made from the bytes it read off the
     // disk. This is the only check anywhere that a font loads on the target at all.
@@ -8175,124 +8160,115 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         let g = libdraw::framebuffer::Framebuffer::geometry(&term);
         (g.width, g.height)
     };
-    // The stacking the exclusions below assume, stated rather than trusted: each window must sit
+    let ui = reference_frame(&faces, "ui")?;
+    // The stacking the composition below assumes, stated rather than trusted: each window must sit
     // wholly inside the one beneath it, or a region the gate believes it is comparing is covered
     // by something it is not comparing against — a hole that would be silent.
     if !(sw <= tw && sh <= th && tw <= uw && th <= uh) {
         return Err(format!(
             "the reference windows are no longer nested: scene {sw}x{sh}, terminal {tw}x{th}, \
              toolkit {uw}x{uh}. `ui-testclient` creates them largest-first because windows stack \
-             at the origin in creation order; fix the sizes or the order before the exclusions \
+             at the origin in creation order; fix the sizes or the order before the comparison \
              below can mean anything"
         )
         .into());
     }
-    // **And nested with room for a shadow**, which nesting alone does not give (M13 Part C, PR
-    // #276 review, finding 6). Each window's shadow is applied to the reference *below* it and
-    // then that window's rectangle is excluded from the comparison — so a shadow that reached
-    // past the window above it would land in a region the exclusion does not cover, and the gate
-    // would report unexplained pixel mismatches instead of the real cause. One font-size change
-    // to the terminal reference is all it takes.
-    // How far past a one-pixel window the shadow paints, rightward and downward — over every
-    // layer, since the refresh's shadow has two and the wider need not be the one dropped further.
-    // **The light scheme's**, because nothing in a self-test boot says otherwise: there is no
-    // session, so no shell sends `SetScheme`, and the compositor keeps the scheme it starts in.
-    let shadow = libdraw::theme::window_shadow(libdraw::theme::Scheme::Light);
-    let reach = shadow.around(libdraw::geom::Rect::new(0, 0, 1, 1));
-    let reach_x = (reach.right() - 1) as u32;
-    let reach_y = (reach.bottom() - 1) as u32;
-    if !(sw + reach_x <= tw && sh + reach_y <= th && tw + reach_x <= uw && th + reach_y <= uh) {
-        return Err(format!(
-            "a reference window's shadow would fall outside the window above it: scene \
-             {sw}x{sh}, terminal {tw}x{th}, toolkit {uw}x{uh}, and a shadow reaches {reach_x} \
-             sideways and {reach_y} down. Each window must clear the one below it by that much, \
-             or the exclusions below stop covering what the guest paints"
-        )
-        .into());
-    }
-    // **The window above casts a shadow onto this one** (M13 Part C), so the reference has to
-    // carry it or the gate would be comparing against a picture the compositor never draws. Applied
-    // through `libdraw`'s own `draw_shadow` with `libdraw`'s own constant — the gate computes its
-    // expected answer, and a shadow that stopped reaching the screen now fails here rather than
-    // going unnoticed.
-    let mut term = term;
-    libdraw::compose::draw_shadow(
-        &mut term,
-        libdraw::geom::Rect::new(0, 0, sw, sh),
-        // Square: the reference windows are not rounded until Part B rounds real ones.
-        0,
-        &shadow,
-        &libdraw::geom::Rect::new(0, 0, tw, th),
-    );
-    let term = term;
-
-    let mut term_mismatches = 0usize;
-    let mut term_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
-    let mut term_compared = 0usize;
-    if w >= tw && h >= th {
-        for y in 0..th {
-            for x in 0..tw {
-                if x < sw && y < sh {
-                    continue; // the scene's window is on top here
-                }
-                term_compared += 1;
-                let want = Framebuffer::get_pixel(&term, x, y).unwrap_or_default();
-                let i = (y as usize * w as usize + x as usize) * 3;
-                let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
-                if got != (want.r, want.g, want.b) {
-                    term_mismatches += 1;
-                    if term_first.is_none() {
-                        term_first = Some((x, y, got, (want.r, want.g, want.b)));
-                    }
-                }
-            }
-        }
-    }
-
-    // **The toolkit's window**, at the bottom of the three, and the only check that puts
-    // `libui` on a screen.
+    // **The expected screen is composed here, the way the guest composes it** (desktop refresh,
+    // Part B). The three windows are rounded now, so each one's corners show what is beneath —
+    // the scene's the terminal's, the terminal's the toolkit window's, and the toolkit window's
+    // the desktop — and each casts its shadow over what is below and into its own corners. This
+    // was built by hand until then: each render, the shadow of the window above painted onto it,
+    // and the window above excluded. Rounding would have meant three more exclusions and a
+    // hand-written blend per curve, so the pictures are stacked through `libdraw::compose`
+    // instead, with the guest's own radius and shadow.
     //
-    // Compared everywhere *except* the rectangles of the windows above it. That exclusion is
-    // not a weakening: a compositor that stacked them the other way would fail the comparisons
-    // above, so the ordering is still covered.
-    let ui = reference_frame(&faces, "ui")?;
-    // The terminal's window shadows the toolkit's, for the same reason and from the same source.
-    // The scene's shadow reaches at most `radius` past the terminal, which is inside the terminal's
-    // own rectangle and therefore inside the region excluded below — so one shadow, not two.
-    let mut ui = ui;
-    libdraw::compose::draw_shadow(
-        &mut ui,
-        libdraw::geom::Rect::new(0, 0, tw, th),
-        // Square: the reference windows are not rounded until Part B rounds real ones.
-        0,
-        &shadow,
-        &libdraw::geom::Rect::new(0, 0, uw, uh),
-    );
-    let ui = ui;
-    let mut ui_mismatches = 0usize;
-    let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
-    let mut ui_compared = 0usize;
+    // **What is still computed independently is the part that matters**: the three pictures come
+    // from `libdraw`'s scene, `libterm` and `libui`, and compose's rounding and shadowing are
+    // held by their own unit tests. What this gate adds is that the guest applies them — a
+    // compositor that forgot to round, or to shadow, fails here — and the binding: a wrong base,
+    // stride or channel order.
+    //
+    // **The light scheme's shadow**, because nothing in a self-test boot says otherwise: there is
+    // no session, so no shell sends `SetScheme`, and the compositor keeps the scheme it starts in.
+    let shadow = libdraw::theme::window_shadow(libdraw::theme::Scheme::Light);
+    let radius = libdraw::corner::WINDOW_RADIUS;
+    let composed = {
+        use libdraw::compose::SurfaceRef;
+        let origin = libdraw::geom::Point::new(0, 0);
+        // A function rather than a closure, so the borrow it returns can be named.
+        fn at<'a>(
+            fb: &'a libdraw::framebuffer::MemFramebuffer,
+            origin: libdraw::geom::Point,
+            shadow: libdraw::compose::Shadow,
+            radius: u32,
+        ) -> SurfaceRef<'a> {
+            SurfaceRef::new(Framebuffer::geometry(fb), origin, fb.bytes())
+                .with_shadow(shadow)
+                .with_corner(radius)
+        }
+        let mut out = libdraw::framebuffer::MemFramebuffer::new(libdraw::framebuffer::Geometry::packed(
+            uw,
+            uh,
+            libdraw::format::PixelFormat::XRGB8888,
+        ));
+        // Bottom first, as `ui-testclient` created them — the nesting above is what makes this
+        // the guest's order.
+        let stack = [
+            at(&ui, origin, shadow, radius),
+            at(&term, origin, shadow, radius),
+            at(&expected, origin, shadow, radius),
+        ];
+        libdraw::compose::compose_full(&mut out, libdraw::scene::BACKGROUND, &stack);
+        out
+    };
+    // **Except the bottom window's four corner squares**, and only those. The self-test image runs
+    // `nxterm` as a service, and with no manager its window sits at the origin *beneath* these
+    // three — invisible while they were square, because the toolkit window covered its rectangle
+    // whole. Rounded, the toolkit window's corners show `nxterm`'s pixels and its shadow, which
+    // this gate does not render. Everywhere else the toolkit window is opaque over whatever is
+    // under it, so nothing else can reach the comparison; the scene's and the terminal's corners
+    // show only windows this gate *does* render, and those are compared exactly — which is what
+    // proves the guest rounds at all. The first run of the rounded gate failed on exactly these
+    // pixels, first at the shared corner (0,0).
+    let unknown_beneath = move |x: u32, y: u32| {
+        (x < radius || x >= uw - radius) && (y < radius || y >= uh - radius)
+    };
+    // One pass, counted per window so a failure still says which picture it was in.
+    let region = |x: u32, y: u32| {
+        if x < sw && y < sh {
+            0
+        } else if x < tw && y < th {
+            1
+        } else {
+            2
+        }
+    };
+    let mut miss = [0usize; 3];
+    let mut compared = [0usize; 3];
+    let mut firsts: [Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))>; 3] = [None; 3];
     if w >= uw && h >= uh {
         for y in 0..uh {
             for x in 0..uw {
-                if x < tw && y < th {
-                    // The terminal's window is on top here, and the scene's above that. One
-                    // exclusion rather than two, because the nesting was asserted above.
+                if unknown_beneath(x, y) {
                     continue;
                 }
-                ui_compared += 1;
-                let want = Framebuffer::get_pixel(&ui, x, y).unwrap_or_default();
+                let k = region(x, y);
+                compared[k] += 1;
+                let want = Framebuffer::get_pixel(&composed, x, y).unwrap_or_default();
                 let i = (y as usize * w as usize + x as usize) * 3;
                 let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
                 if got != (want.r, want.g, want.b) {
-                    ui_mismatches += 1;
-                    if ui_first.is_none() {
-                        ui_first = Some((x, y, got, (want.r, want.g, want.b)));
+                    miss[k] += 1;
+                    if firsts[k].is_none() {
+                        firsts[k] = Some((x, y, got, (want.r, want.g, want.b)));
                     }
                 }
             }
         }
     }
+    let (mismatches, term_mismatches, ui_mismatches) = (miss[0], miss[1], miss[2]);
+    let (first, term_first, ui_first) = (firsts[0], firsts[1], firsts[2]);
+    let (term_compared, ui_compared) = (compared[1], compared[2]);
 
     // **M8 Part B: the screendump Part A could not take.** Part A's gate box asked for a
     // switched screen compared against a `libdraw` render, and could not have it: the guest had
@@ -8304,7 +8280,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // the unswitched one was wrong, and running it anyway would report the second failure while
     // hiding the first.
     if mismatches == 0 && term_mismatches == 0 && ui_mismatches == 0 {
-        if let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh) {
+        if let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh, &composed, radius) {
             let _ = session.child.kill();
             let _ = fs::remove_file(&qmp_sock);
             return Err(e);
@@ -8321,7 +8297,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
              first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
              the capture is at {} — a whole-image shift suggests a base-address or stride \
              error, and swapped components suggest a channel-order one",
-            sw as usize * sh as usize,
+            compared[0],
             shot.display()
         )
         .into());
@@ -8363,9 +8339,10 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         .into());
     }
     println!(
-        "\nxtask: display gate PASSED — the {sw}x{sh} scene, {term_compared} pixels of the \
-         {tw}x{th} terminal and {ui_compared} pixels of the {uw}x{uh} toolkit window match \
-         libdraw, libterm and libui pixel for pixel ✓"
+        "\nxtask: display gate PASSED — {} pixels of the {sw}x{sh} scene, {term_compared} of the \
+         {tw}x{th} terminal and {ui_compared} of the {uw}x{uh} toolkit window match libdraw, \
+         libterm and libui pixel for pixel, rounded corners and shadows composed ✓",
+        compared[0]
     );
     Ok(())
 }
@@ -8389,6 +8366,8 @@ fn desktop_round_trip(
     screen_w: u32,
     sw: u32,
     sh: u32,
+    composed: &libdraw::framebuffer::MemFramebuffer,
+    radius: u32,
 ) -> R<()> {
     let shot = work.join("screendump-desktop.ppm");
 
@@ -8456,12 +8435,20 @@ fn desktop_round_trip(
     let restored = settle_and_capture(qmp, &shot)?;
     let (w3, _, px3) = parse_ppm(&restored)?;
     use libdraw::framebuffer::Framebuffer;
-    let expected = libdraw::scene::render_reference();
+    // **The composed screen, not the scene's own render** (desktop refresh, Part B): the scene's
+    // window is rounded, so its corners show the terminal beneath it, and that is what coming
+    // back unchanged has to reproduce.
+    let expected: &libdraw::framebuffer::MemFramebuffer = composed;
     let mut bad = 0usize;
     let mut first_bad = None;
     for y in 0..sh {
         for x in 0..sw {
-            let want = Framebuffer::get_pixel(&expected, x, y).unwrap_or_default();
+            // The shared corner at the origin shows `nxterm` beneath, which the comparison above
+            // also leaves out — see `unknown_beneath` there.
+            if x < radius && y < radius {
+                continue;
+            }
+            let want = Framebuffer::get_pixel(expected, x, y).unwrap_or_default();
             let i = (y as usize * w3 as usize + x as usize) * 3;
             let got = (px3[i], px3[i + 1], px3[i + 2]);
             if got != (want.r, want.g, want.b) {
