@@ -5323,3 +5323,16 @@ navigate; a dialog that can go up and descend can reach anything.
       `menu_item`s), and nobody noticed until buttons grew an edge and the picture showed two
       boxed words where a menu bar should be. A reference picture that is not what applications
       draw is a polish pass judging the wrong thing.
+
+---
+
+## After this subproject
+
+**The display arm is complete at Milestone 15** and this document is its record. The next body
+of work on the desktop is **[the desktop refresh](desktop-refresh.md)** — adopting the polished
+design in [`docs/design/nitrox-shell/`](../design/nitrox-shell/) — which stands on everything
+here and is deliberately **not** numbered into this sequence: it sits between Phases 5 and 6,
+its source of truth is an artifact produced outside the codebase, and it is constrained by a
+real machine that did not exist while M1–M15 were written. It cites this document where the
+history matters: M11 for the theme, M13 for translucent surfaces and the overview, M15 for what
+makes a control read as one.

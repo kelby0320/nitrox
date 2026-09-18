@@ -30,7 +30,9 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
 | 3 — Service ecosystem | [phase-3-service-ecosystem.md](phase-3-service-ecosystem.md) | ✅ complete (2026-07-21) |
 | 4 — A usable windowed desktop | [phase-4-desktop.md](phase-4-desktop.md) | ✅ complete (2026-09-10) |
 | 5 — Bare metal | [phase-5-bare-metal.md](phase-5-bare-metal.md) | ✅ complete (2026-09-17) |
-| 6 — USB | [phase-6-usb.md](phase-6-usb.md) | 🚧 next |
+| — The desktop refresh | [desktop-refresh.md](desktop-refresh.md) | 🚧 next |
+| — Administration | [administration.md](administration.md) | planned, to be scoped |
+| 6 — USB | [phase-6-usb.md](phase-6-usb.md) | planned |
 | 7 — The portable runtime | [phase-7-portable-runtime.md](phase-7-portable-runtime.md) | planned |
 | 8 — Networking | [phase-8-networking.md](phase-8-networking.md) | planned |
 | 9 — The browser | [phase-9-browser.md](phase-9-browser.md) | planned |
@@ -41,13 +43,36 @@ open-ended list into a portable runtime, networking, and the browser. The 2026-0
 under an emulator and every later phase inherits that ambiguity — a `std::thread` bug and an
 interrupt-routing bug look identical from userspace. See the decision log for both.
 
-**Unscheduled, and written down so it is not lost**:
+**Two items sit between Phase 5 and Phase 6, and they are not renumbered** (2026-09-17). The
+phase numbers appear throughout the decision log, which is append-only, so shifting USB to 7
+would make every historical reference wrong to save a tidier table. The order is what matters and
+the table states it:
+
+1. **The desktop refresh.** A polished UI was designed outside the codebase
+   ([`docs/design/nitrox-shell/`](../design/nitrox-shell/)) and
+   [desktop-refresh.md](desktop-refresh.md) adopts it. **Its own document rather than a
+   milestone of the display arm**, which is complete at M15: appending live work to 5,300 lines
+   of ticked boxes buries the one thing still owed. **It comes first
+   because the administration tools are UI surfaces**, and building them against the old look to
+   restyle them afterwards is the thing this project's standing rule forbids — the admin phase
+   also contains an unanswered display question of its own (a prompt the compositor trusts).
+2. **Administration** — elevation, administrative policy, and the tools an installed system
+   needs. [`administration.md`](administration.md) is the stub; its closing slice should be the
+   installer becoming the broker's first client, because a broker with no consumer is the state
+   Part H.1 was fairly criticised for.
+
+Then Phase 6. The signal that would reorder this: if the admin work turns out to need frequent
+iteration on real hardware, USB is what makes that cheap — the laptop has no network and no USB,
+so today the only way to get anything onto it is a reinstall from a stick.
+
+**Written down so it is not lost** (the first of these is now scheduled; see the table):
 
 - [administration.md](administration.md) — elevation (the capability-system answer to `sudo`),
   administrative accounts as policy rather than identity, and the tools an installed system needs:
-  partitioning, formatting, mounting, accounts, passwords. A **stub**; its scope and its place in
-  the phase order are decided once Phase 5 completes. It exists because Phase 5 Part H's installer
-  is its first client, and an installer built without a destination is one that gets replaced.
+  partitioning, formatting, mounting, accounts, passwords. **Scheduled** as of 2026-09-17 — it is
+  in the table above, after the desktop refresh — but still a **stub**: its internal scope is
+  decided when it is taken up. It exists because Phase 5 Part H's installer is its first client,
+  and an installer built without a destination is one that gets replaced.
 
 **Subproject plans** (detailed breakdowns that hang off a phase):
 

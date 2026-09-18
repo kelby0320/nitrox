@@ -272,9 +272,10 @@ wrong about how something works:
   same change.
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
-  is what a subsystem *will* be. Today it holds exactly one document: `fault-survival.md`
+  is what a subsystem *will* be. Today it holds `fault-survival.md`
   (added 2026-08-19), which is not a display document at all — it is where the kernel's
-  fault-survival intent is written down. What is built has moved out —
+  fault-survival intent is written down — and `nitrox-shell/`, the designed-but-not-built
+  appearance of the desktop, which `docs/planning/desktop-refresh.md` adopts. What is built has moved out —
   `input-subsystem.md` and `widget-toolkit.md` graduated on 2026-08-12, `desktop-shell.md` and
   `graphical-session.md` on 2026-08-25 with Milestone 7, `ui-composition-model.md` on
   2026-08-26 with Milestone 8, and `display-substrate.md` on 2026-08-30 (owed by Milestone 9 and
@@ -363,4 +364,9 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phases 0–5 (foundation, kernel substrate, boot-to-userspace, service ecosystem, a usable windowed desktop, bare metal) are **complete** (Phase 5 closed 2026-09-17). The target laptop boots Nitrox from its own internal disk, installed by `nxinstall` from a live USB stick, to a greeter and a terminal — so "it has only ever run under an emulator" is no longer true of anything below the display arm. **Phase 6 — USB — is next**; 7–9 are the portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
+Phases 0–5 (foundation, kernel substrate, boot-to-userspace, service ecosystem, a usable windowed desktop, bare metal) are **complete** (Phase 5 closed 2026-09-17). The target laptop boots Nitrox from its own internal disk, installed by `nxinstall` from a live USB stick, to a greeter and a terminal — so "it has only ever run under an emulator" is no longer true of anything below the display arm. **Two things come before Phase 6** (2026-09-17): the **desktop refresh**
+(`docs/planning/desktop-refresh.md`), adopting a polished design, and then **administration**
+(`docs/planning/administration.md`) — elevation and the tools an installed system needs. The
+refresh is first because the admin tools are UI surfaces. Phases are **not renumbered**: the
+numbers appear throughout an append-only decision log. Then **Phase 6 — USB**; 7–9 are the
+portable runtime, networking, and the browser. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

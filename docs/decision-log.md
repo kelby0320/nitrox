@@ -26605,3 +26605,74 @@ unnoticed.
 Concluding a *capability does not exist* from a handful of failures is a claim about everything
 you did not try, and the cost here was a wrong deferral, a wrong answer to the maintainer, and a
 workaround thirteen lines long for something that fits on one.
+
+## 2026-09-17 — What comes after Phase 5, and why the design goes first
+
+Phase 5 closed this morning. The remaining plan said Phase 6 is USB; two things now sit in front
+of it, and the phases are **not renumbered** — the numbers appear throughout this log, which is
+append-only, and shifting USB to 7 would make every historical reference wrong to tidy a table.
+
+**The desktop refresh comes first.** The maintainer designed a polished shell
+with Claude Design and handed it over as a runnable page. It goes before the administration work
+for a reason that is the maintainer's own standing rule: the admin tools are UI surfaces, and
+building them against the current look to restyle them afterwards is building something that has
+to be replaced. `administration.md` also carries an unanswered display question — "the prompt must
+belong to the broker, which on this system means a window the compositor trusts" — so the two
+overlap whichever order they are taken in.
+
+**Then administration**, whose closing slice should be the installer becoming the broker's first
+client. The stub already frames it that way, and "first client" is only meaningful if something
+consumes the broker: a set of admin tools with no consumer is precisely the state PR #308's review
+criticised in Part H.1.
+
+**What the design asked for and did not get.** The page contains a notification centre, quick
+settings with volume and brightness, a System Settings application, desktop icons and a launcher.
+Notifications and quick settings have no infrastructure — no service, no audio, no backlight.
+Settings largely existed so the maintainer could try layouts. Desktop icons duplicate the Places
+menu. The launcher is deferred rather than rejected. **Categories are dropped**: the design files
+three programs under "Accessories" and a taxonomy invented for three entries is one we would have
+to live with.
+
+**One deliberate divergence, and it is a correction of the design rather than a compromise with
+it.** In the mock a focused window differs from an unfocused one by a thin outline in dark mode
+and almost nothing in light. We already carry `title_active` and `title_inactive`; they will
+differ visibly. A desktop where you cannot tell which window has the keyboard gets reported as a
+focus bug, and this one is meant to be used on a laptop with no pointer worth speaking of.
+
+**The structural rule this plan is written around.** A redesign is the change most able to
+turn `check-display` into a tautology: every visual assertion moves at once, and the tempting
+repair is to adjust the reference until it matches whatever the code now draws. So nothing — no
+colour — is written twice. Colours go in the theme; the toolkit reads the theme; the reference
+render reads the same theme. A gate then fails when the code disagrees with the design, which is
+the only disagreement worth gating. The design makes this easy by containing its own `theme.toml`.
+
+**The rule stops at colour, and the first draft did not say so.** M11 decision 2 is that chrome
+metrics are *not* themeable, and `xtask` copies each one with a comment giving the reason: "a gate
+that read the shell's layout to know where to aim could agree with a shell that had stopped
+drawing where it says". That is the same anti-tautology argument reaching the opposite conclusion,
+because a colour is compared against a computed render while a metric is where a gate aims a
+click. `radius_px` is a compiled constant for a second reason: after this work the corner is drawn
+by the compositor and the title bar by the client, and the compositor never reads a theme file
+(M11 decision 1), so a value reaching only one of them shows as a wedge at every corner.
+
+**Dark mode reverses M11 decision 4** — "One theme … Dark-and-light doubles both … nothing ships
+one" — which was decided before there was a design specifying two. Named here rather than
+quietly outgrown. It also needs a mechanism the plan owes: the compositor paints the shadow, the
+ground, the outline and the cursor from compiled `Theme::light()` values, and the design's two
+palettes differ in exactly those.
+
+**And the detail pass's headline finding was wrong, which is the most useful thing in this
+entry.** It claimed rounded corners were a `covers` change. `covers` decides only which background
+`compose_exposed` fills, and `compose_exposed` is *tested* to draw the same picture as `compose`,
+which has no `covers` at all — so no change to it can alter an output pixel. The corner is written
+by `blit_rows`, a `memcpy` of the whole rectangle. What rounds a corner is a **masked blit**, which
+the draft never mentioned; `covers`-minus-corners is the optimisation that accompanies the mask.
+The draft also priced the alpha alternative against M13 Part A's double-write measurement, which
+found removing half the pixel writes bought **6%** — "the writes were never the cost". The cost is
+losing the `memcpy` fast path that made compose 5× faster, which an alpha window would pay on
+every pixel.
+
+Three of the five errors a review found in that draft came from the same place: **reading a
+picture as a specification.** The switcher's rule, the overview's thumbnails and the page's own
+size were all taken off screenshots rather than out of the source, and all three were wrong. A
+design is evidence about appearance, and not about architecture.

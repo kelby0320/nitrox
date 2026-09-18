@@ -1,9 +1,12 @@
 # Administration: elevation, admin tools, and who is allowed to
 
-**Status: a stub, unscheduled.** Written 2026-09-16 while planning Phase 5 Part H (the installer),
+**Status: a stub, and scheduled** — after [the desktop refresh](desktop-refresh.md) and before
+Phase 6 (2026-09-17), because its tools are UI surfaces and the refresh decides what those look
+like. **Its internal scope is still open**; the questions at the end of this file are what a
+detail pass would answer. Written 2026-09-16 while planning Phase 5 Part H (the installer),
 because the installer is the first program that needs authority an ordinary session cannot have, and
 building it without a stated destination is how you build something that has to be removed later.
-**Its scope and its place in the plan are decided after Phase 5 completes** — this file exists so
+This file exists so
 that decision starts from a page rather than a blank one, and so today's installer can be shaped
 towards it.
 
