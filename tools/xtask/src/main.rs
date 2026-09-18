@@ -889,8 +889,9 @@ impl DisplaySize {
 
     /// The height of the shell's bars — `desktop_shell::BAR_H`, **written down a second time on
     /// purpose**: a gate that read the shell's layout to know where to aim could agree with a shell
-    /// that had stopped drawing where it says (M11 decision 2).
-    const BAR_H: i32 = 24;
+    /// that had stopped drawing where it says (M11 decision 2). 30 since the desktop refresh's
+    /// Part C, which took the design's bars; it was 24.
+    const BAR_H: i32 = 30;
     /// The desktop indicator's width at the bottom bar's right-hand end — `desktop_shell::INDICATOR_W`,
     /// for the same reason.
     const INDICATOR_W: i32 = 160;
@@ -2035,9 +2036,9 @@ fn taskbar_slot(list: &str, id: u32) -> Option<usize> {
         .position(|group| group.split_once(':').is_some_and(|(n, _)| n.trim() == id.to_string()))
 }
 
-/// Type `text` into the applications modal, one character at a time, waiting for each.
+/// Type `text` into the Applications menu's filter, one character at a time, waiting for each.
 ///
-/// **A receipt per character, because injection is relative and unacknowledged.** The modal's
+/// **A receipt per character, because injection is relative and unacknowledged.** The menu's
 /// filter had no line of its own until M12 Part A — the shell's source said the receipt was
 /// "limited to renaming so the launcher's typing stays quiet" — so a burst of six keys followed
 /// immediately by a click on a row was six chances to lose a keystroke and no way to tell.
@@ -2048,12 +2049,12 @@ fn taskbar_slot(list: &str, id: u32) -> Option<usize> {
 /// The count is read and not asserted: what `/bin` holds is the image's business, and a gate
 /// that pinned the number of matches would fail the day a program is added. What is asserted is
 /// that the keystroke arrived at all.
-fn type_into_modal(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
+fn type_into_menu(qmp: &mut Qmp, session: &mut Session, text: &str) -> R<()> {
     for c in text.chars() {
         let mut qcode = String::new();
         qcode.push(c);
         press(qmp, &qcode)?;
-        session.expect("desktop-shell: applications modal listing ")?;
+        session.expect("desktop-shell: applications menu listing ")?;
     }
     Ok(())
 }
@@ -2447,7 +2448,7 @@ const TARGET_MIB: u64 = 512;
 ///
 /// The first boot is the whole path a person takes on the laptop, driven the way they drive it:
 /// the live image's third menu entry, the **graphical** greeter (that machine has no serial port,
-/// so its greeter is the only way in), a terminal launched from the applications modal, and the
+/// so its greeter is the only way in), a terminal launched from the Applications menu, and the
 /// installer typed at the shell in it. Nothing here reads the terminal's grid — a release image
 /// deliberately does not narrate it — so what the gate asserts on is the kernel log: the module
 /// the install entry loads, the devices the session and then the shell hand on, and the
@@ -2820,7 +2821,7 @@ fn run_install_steps(
     println!("  ok: the installer session was handed the disks");
     session.expect("desktop-shell: up (graphical session leader)")?;
 
-    // 6. A terminal, from the applications modal — the path a person takes, keyboard only,
+    // 6. A terminal, from the Applications menu — the path a person takes, keyboard only,
     //    because that is the path the laptop has.
     //
     //    **Wait until the chord exists.** A hotkey is registered with the compositor by the
@@ -2833,8 +2834,8 @@ fn run_install_steps(
     qmp.send_key("a", true)?;
     qmp.send_key("a", false)?;
     qmp.send_key("meta_l", false)?;
-    session.expect("desktop-shell: applications modal open")?;
-    type_into_modal(qmp, session, "nxterm")?;
+    session.expect("desktop-shell: applications menu open")?;
+    type_into_menu(qmp, session, "nxterm")?;
     press(qmp, "ret")?;
 
     // **And the devices reach the program, not just the session.** This is the line PR #308's
@@ -3902,7 +3903,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(&format!("desktop-shell: bottom bar placed at 0,{}", size.bottom_bar_y()))?;
     // **The count, not just the prefix** (PR #279 review, finding 7). This is the one line that
     // distinguishes desktop entries from the `/bin` listing they replaced: a regression to
-    // listing every program would still open a modal, still match `nxterm`, and still launch it,
+    // listing every program would still open the menu, still match `nxterm`, and still launch it,
     // so every other expectation in this gate holds under both behaviours.
     session.expect(&format!(
         "desktop-shell: /applications lists {STAGED_APPLICATIONS} application(s)"
@@ -3913,25 +3914,28 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("Super+R names, Super+A opens applications")?;
     session.expect("desktop-shell: Super+H minimizes the focused window")?;
 
-    // 4. **The applications modal, by both of its triggers** — `desktop-shell.md` §4's button
-    //    and its chord. The chord is `Super+A` since Phase 5, because the button is on a
-    //    `panel` and a panel can only be clicked: on the laptop Phase 5 targets there is no
+    // 4. **The Applications menu, by both of its triggers** — `desktop-shell.md` §4's word on
+    //    the top bar and its chord. The chord is `Super+A` since Phase 5, because the word is on
+    //    a `panel` and a panel can only be clicked: on the laptop Phase 5 targets there is no
     //    pointing device until USB (Phase 6), so without a chord a session could be logged into
     //    and never used.
     //
-    //    The bar spans the screen at y=0 and the button is its left 120px, so a press at
-    //    (60, 12) lands inside it. Asserted through the compositor's own `press at` line
-    //    first, for the reason `check-terminal` gives: it separates "the pointer was not
-    //    there" from "the pointer was there and nothing happened".
+    //    The bar spans the screen at y=0 and `Applications` is its first word, 126 pixels wide
+    //    at the staged font size, so a press at (60, 12) lands inside it — which
+    //    `desktop_shell::panel`'s own test pins against this literal (desktop refresh, Part C).
+    //    Asserted through the compositor's own `press at` line first, for the reason
+    //    `check-terminal` gives: it separates "the pointer was not there" from "the pointer was
+    //    there and nothing happened".
     const APPS_CLICK: (i32, i32) = (60, 12);
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
-    session.expect("desktop-shell: applications modal open")?;
+    session.expect("desktop-shell: applications menu open")?;
 
-    //    **And the chord, closing what the button opened, then opening it again.** Closing
-    //    first is deliberate: it is the half the button cannot do — its handler is gated on no
-    //    modal being up — and it leaves the launch below driven entirely by the keyboard, which
-    //    is the path the laptop has. A chord that only ever opened would pass this gate while
-    //    leaving a person no way out of the modal but Escape.
+    //    **And the chord, closing what the word opened, then opening it again.** Closing first
+    //    is deliberate: it is the half the word cannot do — a press on it dismisses the open menu
+    //    and the click then reopens it, as on every window's menu bar — and it leaves the launch
+    //    below driven entirely by the keyboard, which is the path the laptop has. A chord that
+    //    only ever opened would pass this gate while leaving a person no way out of the menu but
+    //    Escape.
     // Every `Super`-chord this gate presses goes through here, so the four `send_key` calls a
     // chord is have one spelling rather than one per step.
     let chord = |qmp: &mut Qmp, shift: bool, code: &str| -> R<()> {
@@ -3948,36 +3952,36 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         Ok(())
     };
     chord(&mut qmp, false, "a")?;
-    session.expect("desktop-shell: applications modal closed")?;
+    session.expect("desktop-shell: applications menu closed")?;
     chord(&mut qmp, false, "a")?;
-    session.expect("desktop-shell: applications modal open")?;
+    session.expect("desktop-shell: applications menu open")?;
 
-    // 5. **Type to filter, then launch.** The modal is a `popup`, so it holds the keyboard —
+    // 5. **Type to filter, then launch.** The menu is a `popup`, so it holds the keyboard —
     //    the property `check-terminal` relies on when it says an open menu "is a topmost popup
     //    and takes the keyboard". The top bar could not receive these keys at all.
     //
     //    **`nxterm`, which is what makes the milestone visible**: a person types into the
-    //    applications modal and a terminal opens. Part E launched a coreutil because the
+    //    Applications menu and a terminal opens. Part E launched a coreutil because the
     //    mechanism was the deliverable; Part F is the thing launched being worth looking at.
-    type_into_modal(&mut qmp, &mut session, "nxterm")?;
+    type_into_menu(&mut qmp, &mut session, "nxterm")?;
     press(&mut qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
     session.expect("desktop-shell: application namespace grants new + /home, withholds manage")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     // **Only the shell's own lines are ordered here.** `nxterm` starts concurrently with the
-    // shell closing the modal, so an `expect` between the two is a race between processes —
+    // shell closing the menu, so an `expect` between the two is a race between processes —
     // the flake PR #227's review caught and PR #236's avoided. What `nxterm` did is checked
     // against the whole transcript below, where order does not matter.
-    session.expect("desktop-shell: applications modal closed")?;
+    session.expect("desktop-shell: applications menu closed")?;
     // **And the shell placed it**, which is the manager half actually doing something rather
     // than merely holding a channel. Every window created while a manager is attached is
     // announced to it, and a `normal` one's first `Configure` is *held* until the manager acts
     // — so a shell that received `WindowCreated` and did nothing would leave launched
     // applications invisible, a failure that looks like they never started.
     //
-    // **Asserted against the launched terminal, and after the close.** It sat after the modal
-    // *opened* until M8 Part C, where the shell stopped placing its own windows — a modal is a
+    // **Asserted against the launched terminal, and after the close.** It sat after the menu
+    // *opened* until M8 Part C, where the shell stopped placing its own windows — a menu is a
     // `popup`, placed by its creator and never held for anyone, so the line it matched was a
     // placement that could not have been load-bearing. The terminal's placement arrives one
     // loop iteration after the close, when its `WindowCreated` is drained.
@@ -4120,15 +4124,17 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // the cursor reacted. Everything after this step depends on the terminal, so a click that
     // silently does nothing fails the rest of the gate rather than passing quietly.
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
-    session.expect("desktop-shell: applications modal open")?;
+    session.expect("desktop-shell: applications menu open")?;
     // Filtered to one row first, so the row being clicked is known without the gate having to
     // work out where `nxterm` sorts in the contents of `/bin`.
-    type_into_modal(&mut qmp, &mut session, "nxterm")?;
-    // **The modal hangs from the button now**, at (0, `BAR_H`), rather than covering the bar it
-    // drops from — so the first row sits a field's height below the bar. `click_at` asserts the
-    // press position before anything downstream is checked, which is what separates "the pointer
-    // was not over the row" from "it was, and the click did nothing".
-    const ROW1: (i32, i32) = (60, 64);
+    type_into_menu(&mut qmp, &mut session, "nxterm")?;
+    // **The menu hangs 8 pixels in from its word and 2 below the bar**, at (8, 32), with the
+    // filter field above its rows (desktop refresh, Part C) — so the one row left sits a field's
+    // height below that, at y 73 to 101. `desktop_shell::panel`'s own test pins this literal
+    // against a layout of the menu with the staged font. `click_at` asserts the press position
+    // before anything downstream is checked, which is what separates "the pointer was not over
+    // the row" from "it was, and the click did nothing".
+    const ROW1: (i32, i32) = (60, 87);
     click_at(&mut qmp, &mut session, ROW1.0, ROW1.1)?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: placed window ")?;
@@ -4148,14 +4154,15 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    proxy for it (PR #237 review, finding 6).
     // **Escape first, so this step's precondition is stated rather than assumed.** `click_at`
     // retries a press that did not land where it was aimed, and an abandoned attempt still
-    // *pressed* somewhere — if that somewhere is the applications button (x < 120, and a
-    // mis-walked pointer parks at x=0) the modal is already open, the shell ignores the aimed
-    // click because it opens no second modal, and the assertion below waits for a line that
-    // will never come. Escape with no modal open reaches the focused terminal and does nothing.
+    // *pressed* somewhere — if that somewhere is the Applications word (a mis-walked pointer
+    // parks at x=0) the menu is already open, and the aimed click then dismisses it and opens it
+    // again: the line below matches either way, and would be asserting less than it says. Escape
+    // closes a menu left open, and with none open it reaches the focused terminal and does
+    // nothing.
     press(&mut qmp, "esc")?;
     session.skip_to_end()?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
-    session.expect("desktop-shell: applications modal open")?;
+    session.expect("desktop-shell: applications menu open")?;
 
     // 6b. **The window list, and the two things you can do to a window from it** (M8 Part C).
     //
@@ -4169,7 +4176,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     wide from the left — so `list_click`, x = 90 at half the bar's height, is inside the
     //     first one at any size.
 
-    // Close the modal first: it is a popup on top, and a press meant for the bar would land in
+    // Close the menu first: it is a popup on top, and a press meant for the bar would land in
     // it. **By clicking outside it rather than by pressing Escape** (M11 Part E batch 4) —
     // Escape is covered by the launch step above, and dismissal-on-outside-click is what did not
     // exist: this process never sees a press aimed at another window, so the modal stayed open
@@ -4189,7 +4196,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // bare desktop instead would depend on the terminal not being maximised at this point in the
     // gate, and it is.
     click_at(&mut qmp, &mut session, 600, size.bottom_bar_click_y())?;
-    session.expect("desktop-shell: applications modal closed")?;
+    session.expect("desktop-shell: applications menu closed")?;
     // **That the compositor *said* so is checked against the whole transcript below**, not here.
     // The dismissal is logged while the press is being routed and the `press at` line is logged
     // when the routed record is delivered — so the dismissal comes *first*, and `click_at`'s own
@@ -4316,13 +4323,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: thumbnail of window ")?;
     session.expect("desktop-shell: overview open, window ")?;
 
-    // The first thumbnail sits at (16, 40) and is 240x150 — see `thumb_rect`. Press inside it,
+    // The first thumbnail sits at (16, 46) and is 240x150 — see `thumb_rect`. Press inside it,
     // release over the second sidebar row, which is desktop 2.
     const THUMB: (i32, i32) = (100, 100);
     // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
-    // padding — and this is the second place that number lives. Half a row down, so the aim is
-    // clear of both edges.
-    let side_row = |i: i32| (size.sidebar_x(), 24 + i * 72 + 36);
+    // padding — and this is the second place that number lives. The rows start below the top
+    // bar, which is what `BAR_H` is doing here. Half a row down, so the aim is clear of both
+    // edges.
+    let side_row = |i: i32| (size.sidebar_x(), DisplaySize::BAR_H + i * 72 + 36);
     // **The drag starts from a position already verified — by the click that opened this.** A
     // drag cannot check its own start: there is no press receipt until the button goes down, and
     // by then it has begun. The indicator's `click_at` above asserted where it landed and left the
@@ -4490,9 +4498,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // Then the sidebar click, with no drag in flight. Row 1 is the second desktop — `cli`,
     // which is where the terminal is — so the refresh must find it again.
     // `SIDE_ROW_H` is 72 since M11 Part E batch 10 — a miniature of the desktop plus its
-    // padding — and this is the second place that number lives. Half a row down, so the aim is
-    // clear of both edges.
-    let side_row = |i: i32| (size.sidebar_x(), 24 + i * 72 + 36);
+    // padding — and this is the second place that number lives. The rows start below the top
+    // bar, which is what `BAR_H` is doing here. Half a row down, so the aim is clear of both
+    // edges.
+    let side_row = |i: i32| (size.sidebar_x(), DisplaySize::BAR_H + i * 72 + 36);
     let (sx, sy) = side_row(1);
     click_at(&mut qmp, &mut session, sx, sy)?;
     session.expect("desktop-shell: switched to cli")?;
@@ -4855,8 +4864,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("/home>")?;
 
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
-    session.expect("desktop-shell: applications modal open")?;
-    type_into_modal(&mut qmp, &mut session, "nxfiles")?;
+    session.expect("desktop-shell: applications menu open")?;
+    type_into_menu(&mut qmp, &mut session, "nxfiles")?;
     press(&mut qmp, "ret")?;
     // **The theme reached the application** (M11 Part C): a value that travelled from a file on
     // disk, through one reader in the shell, onto the setup record every launch already carries,
@@ -5624,11 +5633,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // closed long before the editor existed — and closed again at the end of this step, so the
     // windows steps 11 and 12 drive are the ones they expect to find.
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
-    session.expect("desktop-shell: applications modal open")?;
-    type_into_modal(&mut qmp, &mut session, "nxterm")?;
+    session.expect("desktop-shell: applications menu open")?;
+    type_into_menu(&mut qmp, &mut session, "nxterm")?;
     press(&mut qmp, "ret")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
-    session.expect("desktop-shell: applications modal closed")?;
+    session.expect("desktop-shell: applications menu closed")?;
 
     // Click into the new terminal's grid to give it the keyboard. **Its origin comes off the
     // shell's own placement line** — the cascade moves, and a gate that assumed an origin is
@@ -5858,15 +5867,15 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: and the shell found the new name, with the old contents");
 
     // 10. **An editor launched from the menu, which is a launch with no file** (M11 Part E
-    //     batch 7). `nxedit` required `argv[1]` and the applications modal passes none, so it
+    //     batch 7). `nxedit` required `argv[1]` and the Applications menu passes none, so it
     //     printed "no file to edit" and exited — reported as "nxedit doesn't launch from the
     //     menu", and true in the most literal way. It opens untitled now and asks for a name when
     //     there is something to save.
     press(&mut qmp, "esc")?;
     session.skip_to_end()?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
-    session.expect("desktop-shell: applications modal open")?;
-    type_into_modal(&mut qmp, &mut session, "nxedit")?;
+    session.expect("desktop-shell: applications menu open")?;
+    type_into_menu(&mut qmp, &mut session, "nxedit")?;
     // **Enter, not a click on the row.** Clicking a row is proved above, where the terminal every
     // later step depends on is launched that way; what this step is about is what happens *after*
     // a launch that carries no file, so it takes the shortest route to one.
@@ -6120,6 +6129,32 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(&format!("desktop-shell: window {edit_id} did not answer; closed it"))?;
     println!("  ok: a second middle-click destroyed the window the first one only asked about");
 
+    // 13. **The Places menu** (desktop refresh, Part C): the top bar's second word, and a place
+    //     opened from it is the file browser started *there* — the argument `nxfiles` learned
+    //     for this — rather than at its home.
+    //
+    //     **Last, because it leaves a browser on screen** that nothing after it has to account
+    //     for. Both aims are pinned against the bar's and the menu's layout by
+    //     `desktop_shell::panel`'s own test, as `APPS_CLICK` and `ROW1` are: the Places word is
+    //     x 126 to 190, and the menu hangs at (134, 32) with `Documents` its second row, y 66 to
+    //     94.
+    const PLACES_CLICK: (i32, i32) = (158, 12);
+    const PLACE_DOCUMENTS: (i32, i32) = (180, 80);
+    click_at(&mut qmp, &mut session, PLACES_CLICK.0, PLACES_CLICK.1)?;
+    session.expect("desktop-shell: places menu open")?;
+    click_at(&mut qmp, &mut session, PLACE_DOCUMENTS.0, PLACE_DOCUMENTS.1)?;
+    // **The shell's own lines, in the order it prints them**: the launch, then the menu going.
+    // What the browser did is another process's output and is checked against the whole
+    // transcript below — the rule 5 states for `nxterm`.
+    session.expect("desktop-shell: opening place Documents")?;
+    session.expect("desktop-shell: launched nxfiles into its own namespace")?;
+    session.expect("desktop-shell: places menu closed")?;
+    // And its window arrived — the receipt that the browser ran far enough to draw, which is
+    // what makes the transcript checks below about a browser that started rather than one that
+    // might yet.
+    session.expect("desktop-shell: placed window ")?;
+    println!("  ok: a place opened the file browser");
+
     let transcript = session.finish();
     let _ = fs::remove_file(&qmp_sock);
     // **Written on the way past, whichever way this ends.** The checks below each wrote it on
@@ -6226,7 +6261,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // the machinery was there (`libstream` documents `PeerClosed` as "stop producing, exit")
     // and the gate now says so out loud. Order-independent: the child notices its master go at
     // whatever moment the tty-server gets there.
-    // **The modal was dismissed by the compositor, not by a focus change** (M11 Part E batch 5).
+    // **The menu was dismissed by the compositor, not by a focus change** (M11 Part E batch 5).
     // The distinction is the whole of the fix: clicking another *window* raises it, and a raise
     // is a focus change the popup hears about — which is why the first version of this step
     // passed while the reported bug survived. A press on a panel raises nothing.
@@ -6234,7 +6269,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         let path = build_cache().join("guest-transcript-check-login.log");
         let _ = fs::write(&path, &transcript);
         return Err(format!(
-            "the applications modal closed, but the compositor never sent a dismissal — so it \
+            "the Applications menu closed, but the compositor never sent a dismissal — so it \
              closed on a focus change, which is the half of this that already worked. A press on \
              a panel raises no window and changes no focus, so nothing but `Surface::Dismissed` \
              can have closed it.\n\nthe transcript is at {}",
@@ -6265,6 +6300,24 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         )
         .into());
     }
+    // **The browser started in the place, and listed it** (step 13). Two lines, because each
+    // says something the other does not: the first that the argument reached the browser, the
+    // second that it read the directory it was sent to — a browser that logged its argument and
+    // then navigated home would pass the first alone. Neither can see the sidebar, which is why
+    // `nxfiles` keeps `HOME` as its home whatever it starts at, and says so where it decides.
+    for want in ["nxfiles: starting at /home/Documents", "nxfiles: listed /home/Documents - "] {
+        if !transcript.contains(want) {
+            let path = build_cache().join("guest-transcript-check-login.log");
+            let _ = fs::write(&path, &transcript);
+            return Err(format!(
+                "the Places menu launched the file browser, but the transcript has no \"{want}\": \
+                 `nxfiles` must start in the place it is given as `argv[1]`, not at its home.\n\n\
+                 the transcript is at {}",
+                path.display()
+            )
+            .into());
+        }
+    }
     if let Err(e) = check_two_sessions(&transcript) {
         let path = build_cache().join("guest-transcript-check-login.log");
         let saved = fs::write(&path, &transcript).is_ok();
@@ -6289,7 +6342,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
 /// that line appears is if the session came down.
 fn check_two_sessions(transcript: &str) -> R<()> {
     // **The terminal opened and hosted a shell**, which is what makes M7 visible: a person
-    // typed in the applications modal and got a terminal. It found a font, a terminal and
+    // typed in the Applications menu and got a terminal. It found a font, a terminal and
     // `/bin` in the namespace the shell built for it — none of which an application namespace
     // had before Part F.
     //
@@ -6334,7 +6387,7 @@ fn check_two_sessions(transcript: &str) -> R<()> {
             .into());
     }
     // **An empty applications list would satisfy every expect above.** "`/bin` lists " matches
-    // "lists 0 programs", and "modal open" says nothing about its contents — so a session
+    // "lists 0 programs", and "menu open" says nothing about its contents — so a session
     // whose `/bin` failed to open would pass the whole gate. Asserted as an absence for the
     // same reason the concurrency check is: `expect` cannot say "a number greater than zero".
     // **What the `desktop` command itself reported** — order-independent, because it is a
@@ -6373,9 +6426,9 @@ fn check_two_sessions(transcript: &str) -> R<()> {
             .into());
     }
     if transcript.contains("desktop-shell: /applications lists 0 application(s)") {
-        return Err("the applications modal is empty: no desktop entries reached the session \
+        return Err("the Applications menu is empty: no desktop entries reached the session \
              namespace. Either the `/applications` bind failed (the session log says so), the \
-             directory would not open, or every entry was malformed. The modal opening is not \
+             directory would not open, or every entry was malformed. The menu opening is not \
              evidence it has anything in it"
             .into());
     }
@@ -6592,7 +6645,7 @@ fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
     // **A bare Enter first, because this gate has pressed Escape at a terminal.** `ESC` is the
     // **meta prefix**: the discipline consumes the byte after a bare one, exactly as readline
     // does — `ESC d` is M-d, and an unbound pair is discarded rather than inserted. This gate
-    // presses Escape to dismiss the modal and the overview, and when no popup is open that
+    // presses Escape to dismiss the menu and the overview, and when no popup is open that
     // Escape reaches whatever holds the keyboard, which by then is the terminal. So the next
     // character typed is eaten: `desktop` becomes `esktop`.
     //
@@ -7419,7 +7472,12 @@ fn cmd_tune(args: &[String]) -> R<()> {
         let ug = Framebuffer::geometry(&ui);
         (ug.width, ug.height)
     };
-    let panel = MemFramebuffer::filled(Geometry::packed(sw, 24, PixelFormat::XRGB8888), Rgb::new(0xEC, 0xEC, 0xEC));
+    // The top bar, as a strip of its ground: 30 pixels of `panel` since the desktop refresh's
+    // Part C.
+    let panel = MemFramebuffer::filled(
+        Geometry::packed(sw, 30, PixelFormat::XRGB8888),
+        libdraw::theme::Theme::for_scheme(scheme).panel,
+    );
     let wall = SurfaceRef::new(wg, Point::new(0, 0), &wp);
     let bar = SurfaceRef::new(panel.geometry(), Point::new(0, 0), panel.bytes());
     let a = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120, 140), ui.bytes())
@@ -7568,7 +7626,7 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
 /// drives it to each moment worth looking at, and writes what QEMU says is on the display.
 ///
 /// **Several moments per boot**, because the boot is the cost. One run gives the greeter, the
-/// bare desktop, the applications modal, a screen with real windows on it, and the overview — a
+/// bare desktop, the Applications menu, a screen with real windows on it, and the overview — a
 /// polish list is written against all five. The overview is there because it is the one surface
 /// with no other way to be looked at: it covers the screen and closes when anything else is
 /// clicked.
@@ -7637,30 +7695,30 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(&format!("desktop-shell: bottom bar placed at 0,{}", size.bottom_bar_y()))?;
     capture!("desktop");
 
-    // 3. **The applications modal**, the one piece of chrome with no window of its own: a popup
+    // 3. **The Applications menu**, the one piece of chrome with no window of its own: a popup
     //    over the desktop, which is where the toolkit's list rows are seen at their real size.
     click_at(&mut qmp, &mut session, 60, 12)?;
-    session.expect("desktop-shell: applications modal open")?;
+    session.expect("desktop-shell: applications menu open")?;
     capture!("apps");
 
     // 4. **Real windows.** Two applications rather than one, because half of what a desktop
     //    looks like is how two windows sit next to each other — and one of each kind: a
     //    proportional-font application and the terminal, which is the only grid on the screen.
-    launch_from_modal(&mut qmp, &mut session, "nxfiles")?;
+    launch_from_menu(&mut qmp, &mut session, "nxfiles")?;
     // **Escape before aiming at the button again**, the precondition `check-login` states for
     // the same click: `click_at` retries a press that did not land, and an abandoned attempt
-    // still pressed *somewhere* — if that somewhere was the applications button the modal is
+    // still pressed *somewhere* — if that somewhere was the Applications word the menu is
     // already open, the aimed click opens no second one, and the wait below never ends.
     press(&mut qmp, "esc")?;
     session.skip_to_end()?;
     click_at(&mut qmp, &mut session, 60, 12)?;
-    session.expect("desktop-shell: applications modal open")?;
+    session.expect("desktop-shell: applications menu open")?;
     // And drawn, before a keystroke is aimed at it.
     let _ = settle_and_capture(&mut qmp, &dump)?;
-    launch_from_modal(&mut qmp, &mut session, "nxterm")?;
+    launch_from_menu(&mut qmp, &mut session, "nxterm")?;
     // The shell cascades what it places, so the two land offset rather than stacked.
     //
-    // **No wait here**: `launch_from_modal` already waited for the shell to place the window,
+    // **No wait here**: `launch_from_menu` already waited for the shell to place the window,
     // which is the stronger receipt — and the terminal's own startup lines come *before* that, so
     // an `expect` for one of them scans past output that was already there.
     move_pointer_to(&mut qmp, 900, 500)?;
@@ -7687,10 +7745,13 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     Ok(())
 }
 
-/// Type a program's name into the open applications modal and launch it.
+/// Type a program's name into the open Applications menu and launch it.
 ///
-/// The modal is a `popup`, so it holds the keyboard — the same property `check-login` relies on.
-fn launch_from_modal(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<()> {
+/// The menu is a `popup`, so it holds the keyboard — the same property `check-login` relies on.
+///
+/// **Enter launches the lit row**, and typing lights the top match: the menu points at what the
+/// filter narrowed to, so the name typed here is the row Enter chooses.
+fn launch_from_menu(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<()> {
     for c in program.chars() {
         let mut qcode = String::new();
         qcode.push(c);
@@ -7698,11 +7759,11 @@ fn launch_from_modal(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<(
     }
     press(qmp, "ret")?;
     session.expect(&format!("desktop-shell: launched {program} into its own namespace"))?;
-    session.expect("desktop-shell: applications modal closed")?;
+    session.expect("desktop-shell: applications menu closed")?;
     // **And wait until its window is on screen**, which is not the same claim and is the one the
     // next step needs. A launch returns when the *shell* has spawned the program; the program
-    // then starts, creates a window, and the compositor focuses it — after the modal for the
-    // *next* launch has already opened. Typing into that modal put the second program's name
+    // then starts, creates a window, and the compositor focuses it — after the menu for the
+    // *next* launch has already opened. Typing into that menu put the second program's name
     // into the first program, and in a file browser Enter means "open the selected row", so the
     // shot ended up with an editor on `theme.toml` instead of a terminal.
     session.expect("desktop-shell: placed window ")?;
@@ -10334,7 +10395,7 @@ fn cmd_test() -> R<()> {
         .arg(&host)
         .current_dir(&userspace_dir))?;
 
-    // `desktop-shell`'s library — the desktop-entry parser, the modal's filter, and since Phase 5
+    // `desktop-shell`'s library — the desktop-entry parser, the Applications menu's filter, and since Phase 5
     // Part E the layout arithmetic on the screen's size (entry capacity, the indicator, the window
     // list's placement). **Its own doc said this ran long before it did**: the three tests it had
     // were compiled by nothing, so a capacity bug that painted an entry under the indicator would
@@ -12628,17 +12689,17 @@ fn profile_programs() -> Vec<&'static str> {
     // The terminal is a program a person runs, not a service the system runs — the same class
     // as the shell beside it. Part C's `session-mgr` will spawn it from `/bin` like any other.
     v.push("nxterm");
-    // The file browser, likewise a program a person runs. In `/bin`, so the applications modal
+    // The file browser, likewise a program a person runs. In `/bin`, so the Applications menu
     // lists it without anything being told about it (M10 Part B).
     v.push("nxfiles");
-    // The editor (M10 Part D). In `/bin` for two reasons rather than one: the modal lists it,
+    // The editor (M10 Part D). In `/bin` for two reasons rather than one: the menu lists it,
     // *and* `desktop-shell` resolves `/bin/nxedit` when a client asks it to open a path — so a
     // build that packaged the browser and not the editor would present a file row that opens
     // nothing, which is the failure this list exists to make impossible.
     v.push("nxedit");
-    // The installer (Phase 5 Part H.1). In `/bin` and **not** in the applications modal: it is a
+    // The installer (Phase 5 Part H.1). In `/bin` and **not** in the Applications menu: it is a
     // command-line tool like the coreutils, run from a terminal in the installer session, and a
-    // modal entry would offer a person a window that does not exist. It ships in every image for
+    // menu entry would offer a person a window that does not exist. It ships in every image for
     // the reason `build_userspace_bin` gives — authority is the session's, not the program's.
     v.push("nxinstall");
     v
@@ -12646,14 +12707,14 @@ fn profile_programs() -> Vec<&'static str> {
 
 /// The applications a person launches, and what to call them.
 ///
-/// **The display name is the point as much as the filter is.** A modal listing `nxfiles` is
+/// **The display name is the point as much as the filter is.** A menu listing `nxfiles` is
 /// naming a binary; one listing "Files" is naming an application. Both come from the same entry,
 /// so they cannot disagree — and when an icon set exists, it goes here too rather than becoming a
 /// fourth place that has to be kept in step.
 ///
 /// **Every `exec` must be a program [`profile_programs`] ships**, asserted in `assemble_image`.
 /// This is a fourth list beside that one's three consumers, and without the check an entry can
-/// name a program the package does not contain — which builds clean, lists in the modal, logs a
+/// name a program the package does not contain — which builds clean, lists in the menu, logs a
 /// launch, and opens no window (PR #279 review, finding 5).
 const GRAPHICAL_APPLICATIONS: [(&str, &str); 3] =
     [("nxterm", "Terminal"), ("nxfiles", "Files"), ("nxedit", "Text Editor")];
@@ -13283,7 +13344,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
 
     // **The desktop entries** — one per graphical application, in the same package as the
     // binaries they name, projected at `/applications` the way `bin/` is projected at `/bin`
-    // (M14 Part H). This is what stops the applications modal listing every program on the
+    // (M14 Part H). This is what stops the Applications menu listing every program on the
     // system: `/bin` holds services, servers and CLI tools too, and *"is this graphical?"* is
     // not a property that can be read off a binary — it is a claim somebody has to make, and
     // this is where it is made.
@@ -13291,14 +13352,14 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // **Beside the binaries rather than in a file of their own**, so that a package carries its
     // own applications: adding one here is adding a file to a package, not editing a list that
     // has to be kept in step with three others.
-    // **An entry naming a program the package does not ship is a build error**, not a modal row
+    // **An entry naming a program the package does not ship is a build error**, not a menu row
     // that launches nothing (PR #279 review, finding 5). `profile_programs` makes the same
     // guarantee for its own three consumers; this is the fourth list, so it needs the same guard.
     for (exec, name) in GRAPHICAL_APPLICATIONS {
         if !programs.contains(&exec) {
             return Err(format!(
                 "the desktop entry for {name:?} names {exec:?}, which `profile_programs()` does \
-                 not ship — the modal would list it and launching it would open nothing"
+                 not ship — the menu would list it and launching it would open nothing"
             )
             .into());
         }
@@ -14032,17 +14093,21 @@ mod diag_tests {
     fn the_derived_click_points_at_the_old_size_are_the_literals_they_replaced() {
         // The gates aimed at these by hand at 1280x800; deriving them from the size must give the
         // same answer there, or the move to 1360x768 changed what a gate clicks and not just where.
+        //
+        // **Except by the bar's height**, which the desktop refresh's Part C changed on purpose:
+        // the bars are 30 pixels since, so every aim at the bottom bar is six higher than the
+        // literal it replaced (776 and 788 were 24-pixel answers).
         let old = DisplaySize::parse("1280x800").unwrap();
         assert_eq!(old.corner(), (1279, 799));
         assert_eq!(old.centre(), (640, 400));
-        assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (776, 788));
-        assert_eq!(old.indicator_click(), (1200, 788));
+        assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (770, 785));
+        assert_eq!(old.indicator_click(), (1200, 785));
         assert_eq!(old.sidebar_x(), 1180);
         assert_eq!(old.pin_motions(), 20, "the pin the gates always used at this size");
         let big = DisplaySize::parse("2560x1440").unwrap();
         assert!(big.pin_motions() * 100 > big.w as usize, "a pin that cannot cross the screen");
         let gate = DisplaySize::GATE;
-        assert_eq!((gate.bottom_bar_y(), gate.indicator_click(), gate.sidebar_x()), (744, (1280, 756), 1260));
+        assert_eq!((gate.bottom_bar_y(), gate.indicator_click(), gate.sidebar_x()), (738, (1280, 753), 1260));
     }
 
     #[test]

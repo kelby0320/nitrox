@@ -473,7 +473,7 @@ so they exist:
 
 | Widget | Why it exists |
 |---|---|
-| `text_field` | The greeter's password box and the applications modal's search box. Single-line, optionally masked |
+| `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked |
 | `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3 |
 
 **And the text area arrived in M10 Part C**, six milestones after this section first reserved a

@@ -95,7 +95,7 @@ absolute — a relative path would be relative to a working directory this serve
 application namespaces that do not gate, which disables launching outright.
 
 **Nothing bounds how often a client may ask.** This is the first op in the system a *program*
-can drive that causes a process to be spawned — the applications modal needs a person — and the
+can drive that causes a process to be spawned — the Applications menu needs a person — and the
 shell does not rate-limit it, cap live openers, or dedup paths. `MAX_DESKTOP_SESSIONS` is not the
 bound: a client may open and close a session per request, and `nxfiles` does. Filed as
 `TODO(open-amplification)` in

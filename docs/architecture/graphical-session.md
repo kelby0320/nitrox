@@ -4,14 +4,14 @@
 
 **Built, and checked 2026-09-04** — Milestone 7 (Parts A–F). Graduated from `design/` on
 2026-08-25, revision 2. One thing changed under it since: the session namespace also binds
-`/applications`, which is where the applications modal's entries come from (M14 Part H); §3 records
+`/applications`, which is where the Applications menu's entries come from (M14 Part H); §3 records
 why an *application's* namespace deliberately does not.
 
 What exists: [`auth-service`](../../userspace/auth-service) answers `Auth::Authenticate` at
 `/svc/auth`; [`desktop-session-mgr`](../../userspace/desktop-session-mgr) draws the greeter,
 authenticates through it, builds the session namespace and spawns the session leader;
-[`desktop-shell`](../../userspace/desktop-shell) is that leader — top bar, applications modal,
-a namespace constructed per application, window placement. The two supervisors share
+[`desktop-shell`](../../userspace/desktop-shell) is that leader — top bar, Applications and
+Places menus, a namespace constructed per application, window placement. The two supervisors share
 [`libsession`](../../userspace/libsession), so the serial and graphical columns authenticate
 and build namespaces through one implementation. `cargo xtask check-login` boots a **release**
 image, refuses a wrong password, logs in, launches a terminal, and proves a serial login runs
@@ -100,7 +100,7 @@ Everything below `desktop-session-mgr` already exists. Only the two right-hand r
 | **compositor** | Pixels, surfaces, windows, input routing, focus | the framebuffer, the input stream | built |
 | **session-mgr** | Serial session supervisor | `BIND_NAMESPACE`, fs/profile/tty endpoints, an auth channel | built |
 | **desktop-session-mgr** | **Graphical** session supervisor | the same, **plus** a `/dev/draw` connection | **new** |
-| **desktop-shell** | The graphical session's leader: bar, applications modal, window placement policy, application namespaces | its session namespace; `BIND_NAMESPACE` for the namespaces it builds | **new** |
+| **desktop-shell** | The graphical session's leader: bars, Applications and Places menus, window placement policy, application namespaces | its session namespace; `BIND_NAMESPACE` for the namespaces it builds | **new** |
 
 **`auth-service`'s protocol is untouched.** Both supervisors ask it the same question over the
 same protocol — `Authenticate { username, password } → { AUTHENTICATED, principal, home } |
@@ -279,7 +279,7 @@ second shape's mechanism confirmed, without the first clause: the name stays pre
 minting is what it is for.
 
 **What an application namespace deliberately lacks: `/applications`** (M14 Part H). The *session*
-namespace has it — it is where the applications modal's entries come from — and an application's
+namespace has it — it is where the Applications menu's entries come from — and an application's
 does not, so `nxsh` on the serial console can list the installed applications and the same `nxsh`
 inside `nxterm` cannot. That asymmetry is the design rather than an oversight: nothing in an
 application reads it, and an application holds no authority to spawn in the first place, which is

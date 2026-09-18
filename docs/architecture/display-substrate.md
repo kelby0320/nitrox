@@ -405,8 +405,8 @@ nothing.
   wrong in use.
 - ~~**What a `panel` does on a multi-desktop system** (§4a)~~ — **settled in M8**: panels are
   *sticky*, present on every desktop rather than belonging to one. So are the overview, the
-  applications modal and the rename prompt, for the same reason — a surface that is about the
-  session rather than about a desktop.
+  Applications and Places menus and the name prompt, for the same reason — a surface that is
+  about the session rather than about a desktop.
 - ~~**Reference-scene contents** (§8e)~~ — **settled**: a 64×32 scene, a 180×96 `libterm` render
   and a 320×260 `libui` render, each compared against a host render pixel for pixel by
   `check-display`.

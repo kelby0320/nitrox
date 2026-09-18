@@ -35,9 +35,9 @@ use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
 
-/// `EV_KEY` code for Escape — the modal's dismissal.
+/// `EV_KEY` code for Escape — the name prompt's and the overview's dismissal.
 const KEY_ESC: u16 = 1;
-/// `EV_KEY` code for Enter — the modal's launch.
+/// `EV_KEY` code for Enter — the name prompt's answer.
 const KEY_ENTER: u16 = 28;
 /// `EV_KEY` code for `h`, the minimize chord's key.
 ///
@@ -63,7 +63,7 @@ const KEY_R: u16 = 19;
 const HOTKEY_RENAME: u32 = 2;
 /// `EV_KEY` code for `a`, the applications chord's key.
 const KEY_A: u16 = 30;
-/// The shell's id for the chord that opens the applications modal.
+/// The shell's id for the chord that opens the Applications menu.
 const HOTKEY_APPS: u32 = 3;
 /// How many desktops the number chords reach.
 ///
@@ -87,15 +87,15 @@ use libsurface::ipc::ChannelTransport;
 use libui::element::{
     Element, Insets, bevel, column, custom, fill, offset, padding, row, sized, stack, text,
 };
-use libui::diff::Tree;
 use libui::layout::layout;
-use libui::route::Router;
 use desktop_shell::{
-    Application, BAR_H, ENTRY_W, INDICATOR_W, SIDE_W, Screen, THUMB_PAD, THUMB_W, matches_app,
-    parse_entry,
+    Application, BAR_H, ENTRY_W, INDICATOR_W, SIDE_W, Screen, THUMB_PAD, THUMB_W, parse_entry,
 };
+use desktop_shell::panel::{self, MenuMsg, TopMsg};
+use libui::menu::{Item, KeyOutcome, MenuState};
+use libui::window::Child;
 use libui::paint::{FontMetrics, Theme, paint, paint_over};
-use libui::widget::{ListRow, ListState, TextFieldState, WidgetState, list_view, popup_frame, text_field};
+use libui::widget::TextFieldState;
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
@@ -172,37 +172,6 @@ fn fail(msg: &[u8]) -> ! {
     loop {
         core::hint::spin_loop();
     }
-}
-
-/// How wide the applications button is, in pixels.
-///
-/// The modal's **only** trigger for now. `desktop-shell.md` §4 gives it two — this button and
-/// the Super key — but the Super key is a *global hotkey*, which §8 makes a capability rather
-/// than an ambient grab, and the compositor has none. A `panel` does not take keyboard focus,
-/// so a key would not reach this process at all; a click routes to the window under the
-/// pointer whatever holds focus, which is why the button is the half that can exist yet.
-const APPS_BUTTON_W: u32 = 120;
-
-/// The top bar's element tree.
-fn bar_view(clock: &str) -> Element<()> {
-    // **One thing, and it does something** (M11 Part E batch 4). There was a "nitrox" label
-    // beside the button — a word with no handler, which reads as a menu that does not open. A
-    // control that looks live and is not is the defect M8's overview shipped three of; a label
-    // that looks like a control is the same defect with less code behind it.
-    row(alloc::vec![
-        sized(
-            libdraw::geom::Size::new(APPS_BUTTON_W, 0),
-            padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text("Applications")),
-        ),
-        // **Centred on the screen, not on what is left of it.** Two equal flexible gaps put the
-        // clock in the middle of the space *between* them, so without the balancing slot on the
-        // right it would sit half the button's width off centre. The slot is empty; it exists to
-        // make the arithmetic symmetric (M11 Part E batch 9).
-        sized(libdraw::geom::Size::new(0, 0), text("")).flex(1),
-        padding(Insets { top: 4, right: 8, bottom: 4, left: 8 }, text(clock)),
-        sized(libdraw::geom::Size::new(0, 0), text("")).flex(1),
-        sized(libdraw::geom::Size::new(APPS_BUTTON_W, 0), text("")),
-    ])
 }
 
 /// One entry in the bottom bar's window list.
@@ -450,172 +419,21 @@ fn render_window_bar(
     let l = layout(&ui, bounds, &metrics);
     // The session's theme, read once in `_start` — the shell's own chrome follows the file
     // it hands to every application, or it themes the windows and not the bars around them.
-    //
-    // **On the panel face, not on a window's ground** (M11 Part E, batch 1). `paint` clears a
-    // damage rectangle to `background`, which since the theme turned light is the white an
-    // application draws on — and a bar is not paper: it is a face, the surface a button and a
-    // toolbar are made of. One substituted field rather than a new one; a panel wanting a colour
-    // of its own needs more evidence than one screenshot.
+    // **On the panel's ground, not on a window's** — see `panel`: `paint` clears a damaged
+    // rectangle to `background`, which is the white an application draws on.
     paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
     });
     fb
 }
 
-/// The applications modal's size.
-const MODAL_W: u32 = 320;
-/// See [`MODAL_W`].
-const MODAL_H: u32 = 240;
-/// Bytes per row in the modal.
-const MODAL_PITCH: usize = (MODAL_W as usize) * 4;
-/// How tall one entry is.
-const ROW_H: u32 = 20;
-
-/// What the applications modal can ask for.
-///
-/// **One variant, and it is still worth a type.** `Element<()>` was honest while nothing could be
-/// clicked; a message with a payload is what carries *which* row, and the unit type cannot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ModalMsg {
-    /// Launch the program keyed by this index into the unfiltered program list.
-    Launch(u64),
-    /// The scrollbar is being dragged.
-    ///
-    /// **Which is why the modal's list state had to stop being a throwaway.** It was built fresh
-    /// in `render_modal` on the argument that the launcher keeps no selection — true, and it also
-    /// meant an offset that reset to zero every frame, so `/bin` was 26 entries of which ten were
-    /// reachable and the rest only by typing a filter (M11 Part E batch 6).
-    Scroll(librsproto::surface::PointerEvent),
-}
-
-/// The height the modal's list is laid out at — the space left after the filter field.
-///
-/// **One place, because two things have to agree about it** (PR #265 review, optional 10): the
-/// view lays the list out at this height, and the `ScrollState` a drag is converted against is
-/// built from it. Open-coded at both, changing one would leave the thumb tracking a track that is
-/// not the one drawn — which is the failure `ListState::bar`'s own doc names. `nxfiles` routes
-/// both through `App::list_h`, and this is that shape.
-fn modal_list_h() -> u32 {
-    MODAL_H.saturating_sub(40)
-}
-
-/// The applications modal's element tree: a filter field over a list of `/bin` programs.
-///
-/// **The theme is passed in rather than built here**, and that is not tidiness. This function
-/// builds widgets while its caller *paints* them, and two themes in one frame is a thing the old
-/// `Theme`/`Palette` split made unwriteable and one type makes easy (PR #262 review, optional 5).
-///
-/// **The same mistake arrived a second time through the metrics**, which is worth stating here
-/// because this is where it was first argued: M11 Part C took the theme from a file and left
-/// every `layout()` measuring at a hardcoded 16, so text was laid out at one size and painted at
-/// another — clipped and overlapping for every size but the default. There is no size constant
-/// in this crate now; there is a theme, and both the measure and the paint come from it
-/// (PR #263 review, blocking 1).
-fn modal_view(
-    query: &TextFieldState,
-    rows: &[ListRow<'_>],
-    state: &mut ListState,
-    hovered: Option<u64>,
-    theme: &Theme,
-) -> Element<ModalMsg> {
-    let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme);
-    let list_h = modal_list_h();
-    // **Rows are clickable and they highlight** (M11 Part E batch 4). Until then this shell
-    // looked at pointer events for exactly three things — the overview's thumbnails, the
-    // applications button and the taskbar — and never at the modal's own window, so its rows
-    // could not be clicked at all and nothing under the cursor reacted. Both are the same gap:
-    // no router. The key is the row's index into the *unfiltered* list, which is what makes
-    // `ModalMsg::Launch` resolvable after a filter has reordered what is shown.
-    let list = list_view(
-        rows,
-        state,
-        list_h,
-        ROW_H,
-        ModalMsg::Launch,
-        None,
-        Some(ModalMsg::Scroll),
-        hovered,
-        None,
-        theme,
-    );
-    // **Framed, because a popup is the one surface with nothing behind it to define its edge**
-    // (M11 Part E, batch 2). On a light theme this modal's face and the window it covers are
-    // within a few units of each other, so without a line around it the two run together. Same
-    // helper `nxterm`'s menu uses — they are the same kind of thing seen twice.
-    popup_frame(
-        padding(
-            Insets::all(8),
-            column(alloc::vec![field, sized(libdraw::geom::Size::new(0, list_h), list)]),
-        ),
-        theme,
-    )
-}
-
-/// Render the modal.
-fn render_modal(
-    theme: &Theme,
-    font: &Font,
-    query: &TextFieldState,
-    rows: &[ListRow<'_>],
-    state: &mut ListState,
-    tree: &mut Tree,
-    hovered: Option<u64>,
-) -> MemFramebuffer {
-    let geometry = Geometry::with_pitch(MODAL_W, MODAL_H, MODAL_PITCH, PixelFormat::XRGB8888)
-        .expect("the modal pitch is wide enough for a row");
-    let mut fb = MemFramebuffer::new(geometry);
-    // **Built once and used for both**, which is the whole of optional 5: this function lays the
-    // tree out and paints it, and a tree built from one theme painted with another is two themes
-    // in one frame.
-    // The session's theme, read once in `_start` — the shell's own chrome follows the file
-    // it hands to every application, or it themes the windows and not the bars around them.
-    let ui = modal_view(query, rows, state, hovered, theme);
-    let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
-    let metrics = FontMetrics::new(font, theme.font_px);
-    let l = layout(&ui, bounds, &metrics);
-    // **The tree records what was painted**, which is what makes a click land on the row a
-    // person can see: the router hit-tests the retained tree, so a tree from a different frame
-    // is a hit test against a picture nobody is looking at. Updated here rather than at the
-    // call sites, so it cannot be forgotten at one of them.
-    let _ = tree.update(&ui, &l);
-    paint(&mut fb, font, theme, &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {});
-    fb
-}
-
-/// The entries matching `q`, in order. An empty query matches everything.
-///
-/// Substring rather than prefix: a launcher that only matched from the start would make
-/// "term" fail to find `nxterm`, which is the one thing anybody will type.
-fn filter<'a>(apps: &'a [Application], q: &str) -> alloc::vec::Vec<&'a Application> {
-    apps.iter().filter(|a| matches_app(a, q)).collect()
-}
-
-
-
-
-/// The modal's rows: what `q` matches, **keyed by index into the unfiltered list**.
-///
-/// **One builder, because two of them disagreed.** `open_modal` keyed by the unfiltered index —
-/// with a comment explaining that the filtered index would pair row 2's widget with row 3's
-/// element the moment a character is typed — and the repaint site keyed by the filtered one. The
-/// two produced different keys for the same row as soon as the query was non-empty, which
-/// nothing noticed while a key was only ever used for diffing a modal that is repainted whole.
-/// A click resolves a key back to a program, so it notices now (M11 Part E batch 4).
-fn modal_rows<'a>(apps: &'a [Application], q: &str) -> alloc::vec::Vec<ListRow<'a>> {
-    apps.iter()
-        .enumerate()
-        .filter(|(_, a)| matches_app(a, q))
-        .map(|(i, a)| ListRow { key: i as u64, label: a.name.as_str(), marked: false })
-        .collect()
-}
-
-/// Read the desktop entries `/applications` projects, as the modal's entries.
+/// Read the desktop entries `/applications` projects, as the Applications menu's entries.
 ///
 /// **`/applications` is a forwarded directory, not a set of bindings**, so `SYS_NS_ENUMERATE`
 /// does not see inside it — that walks the namespace's own bindings and this is one of them. The
 /// names come from a directory session, the same way `list /bin` gets `/bin`'s; each is then read
 /// and parsed.
 ///
-/// **An entry that will not parse is skipped and said so**, rather than failing the modal: one
+/// **An entry that will not parse is skipped and said so**, rather than failing the menu: one
 /// broken package should lose its own applications, not everybody's — the same rule the profile
 /// server applies to a package whose `bin/` will not open.
 fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
@@ -623,7 +441,7 @@ fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
     let mut names = alloc::vec::Vec::new();
     let mut buf = [0u8; 4096];
     let Ok(mut dir) = Dir::open(ns, b"/applications", &mut buf) else {
-        kprint(b"desktop-shell: /applications did not open; the modal will be empty\n");
+        kprint(b"desktop-shell: /applications did not open; the Applications menu will be empty\n");
         return alloc::vec::Vec::new();
     };
     let _ = dir.read_dir(|e| {
@@ -672,30 +490,23 @@ fn sidebar(theme: &Theme) -> Theme {
 /// `theme`, with a bar's ground in place of a window's.
 ///
 /// One place, so the two bars cannot disagree about what a panel is made of.
+///
+/// **`theme.panel`, since the desktop refresh's Part C.** It was `face` — "a bar is not paper: it
+/// is a face" (M11 Part E) — until the design gave the bars a colour of their own, which Part A
+/// added as a key and this is the first use of: lighter than a button's face in the light scheme
+/// and the darkest surface on the screen in the dark one.
 fn panel(theme: &Theme) -> Theme {
-    Theme { background: theme.face, ..*theme }
+    Theme { background: theme.panel, ..*theme }
 }
 
-/// Render the top bar.
-fn render_bar(theme: &Theme, font: &Font, clock: &str, screen: Screen) -> MemFramebuffer {
-    let geometry = Geometry::with_pitch(screen.width, BAR_H, screen.pitch(), PixelFormat::XRGB8888)
-        .expect("the bar pitch is wide enough for a row");
-    let mut fb = MemFramebuffer::new(geometry);
-    let ui = bar_view(clock);
-    let bounds = Rect::new(0, 0, screen.width, BAR_H);
-    let metrics = FontMetrics::new(font, theme.font_px);
-    let l = layout(&ui, bounds, &metrics);
-    // The session's theme, read once in `_start` — the shell's own chrome follows the file
-    // it hands to every application, or it themes the windows and not the bars around them.
-    //
-    // **On the panel face, not on a window's ground** (M11 Part E, batch 1). `paint` clears a
-    // damage rectangle to `background`, which since the theme turned light is the white an
-    // application draws on — and a bar is not paper: it is a face, the surface a button and a
-    // toolbar are made of. One substituted field rather than a new one; a panel wanting a colour
-    // of its own needs more evidence than one screenshot.
-    paint(&mut fb, font, &panel(theme), &ui, &l, bounds, &mut |_, _, _, _: &mut MemFramebuffer| {
-    });
-    fb
+/// A string field of an environment record, by name.
+fn env_str<'a>(env: &'a libstream::wire::Record, name: &str) -> Option<&'a str> {
+    env.schema
+        .fields
+        .iter()
+        .position(|f| f.name == name)
+        .and_then(|i| env.values.get(i))
+        .and_then(|v| v.as_str())
 }
 
 /// Unmap a buffer this process mapped with [`shared_buffer`], and forget the pointer.
@@ -704,9 +515,9 @@ fn render_bar(theme: &Theme, font: &Font, clock: &str, screen: Screen) -> MemFra
 /// outside the heap, so nothing reclaims it on drop: every overview open leaked two 4 MB
 /// mappings and up to six thumbnails, ~9 MB a cycle against a 256 MB guest — about
 /// twenty-eight opens to exhaust the machine, and the landing spot for that is a `create` that
-/// fails after the window exists (PR #244 review, finding 4). The modal has the same shape at
-/// 614 KB, which is why it had not bitten; it is fixed here too rather than left as the next
-/// instance of the same bug.
+/// fails after the window exists (PR #244 review, finding 4). The modal had the same shape at
+/// 614 KB, which is why it had not bitten; it was fixed there too rather than left as the next
+/// instance of the same bug. (The menus that replaced it are `Child`s, whose pool unmaps on drop.)
 fn release_buffer(addr: &mut *mut u8, len: usize) {
     if addr.is_null() {
         return;
@@ -1467,9 +1278,10 @@ fn open_wallpaper(
     // Returning `None` from the middle would leave the compositor holding a full-screen,
     // configured, hit-testable `panel` with nothing committed to it, for the life of the
     // process — no manager is attached this early, so its initial `Configure` goes out at once.
-    // `open_overview` and `open_modal` in this file both say this, each after a review found it
-    // (PR #244 blocking 3, PR #237 finding 7); this is the third (PR #272 review, worth
-    // fixing 3).
+    // `open_overview` in this file says this, and the modal it had before the Applications menu
+    // said it too, each after a review found it (PR #244 blocking 3, PR #237 finding 7); this is
+    // the third (PR #272 review, worth fixing 3). `Child::open`, which the menus use, says it in
+    // `libui`.
     let mut ok = true;
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
@@ -1755,17 +1567,25 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // `reserve` is stated separately from the height on purpose — the role's own doc explains
     // that deriving it would make a bar that reserves less than it occupies inexpressible.
     // A bar wants them equal.
-    let role = Role::Panel { dock: Edge::Top, reserve: BAR_H };
-    let window = match session.create(&CreateWindowRequest::new(screen.width, BAR_H, role), BUFFERS) {
-        Ok(id) => id,
-        Err(_) => fail(b"desktop-shell: top bar CreateWindow FAILED\n"),
-    };
-
-    // **Kept, because the top bar is repainted now** (M11 Part E batch 9). It was drawn once at
-    // startup and never again — true while it held one static label, and the clock on it changes
-    // every minute.
-    let mut top_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    // **The panel's ground and the design's bar** (desktop refresh, Part C): a `Child`, like
+    // every application's windows, so its words are routed and light under the pointer rather
+    // than hit-tested by hand against a width written down beside them.
+    let panel_theme = panel(&theme);
     let mut shown_clock = clock_text();
+    let mut top = match Child::open_sized(
+        &mut session,
+        Role::Panel { dock: Edge::Top, reserve: BAR_H },
+        (0, 0),
+        libdraw::geom::Size::new(screen.width, BAR_H),
+        &panel::top_bar(&shown_clock, None, None, &theme),
+        &font,
+        &panel_theme,
+        BUFFERS,
+    ) {
+        Some(c) => c,
+        None => fail(b"desktop-shell: top bar CreateWindow FAILED\n"),
+    };
+    let window = top.id();
     // **Said once, because an absent clock is otherwise indistinguishable from a broken bar.**
     // The kernel reports the wall clock as unsupported when the RTC could not be read at boot,
     // and the bar's answer to that is to show nothing — which looks identical to a clock that
@@ -1780,35 +1600,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
         l.end();
     }
-    let picture = render_bar(&theme, &font, &shown_clock, screen).into_bytes();
+    // The bottom bar's buffers are this size too; it is still drawn by hand.
     let len = screen.pitch() * BAR_H as usize;
-    if picture.len() != len {
-        fail(b"desktop-shell: top bar render is not the size it declares\n");
-    }
-    for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
-            fail(b"desktop-shell: top bar buffer alloc FAILED\n");
-        };
-        top_addrs[i] = addr;
-        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
-        // regions are distinct allocations, so they cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-        let Some(mut w) = session.window(window) else {
-            fail(b"desktop-shell: top bar window vanished\n");
-        };
-        if w.attach(i as u32, screen.width, BAR_H, screen.pitch() as u32, handle).is_err() {
-            fail(b"desktop-shell: top bar AttachBuffer FAILED\n");
-        }
-    }
-    let Some(mut w) = session.window(window) else {
-        fail(b"desktop-shell: top bar window vanished\n");
-    };
-    if w.commit(0, (0, 0, screen.width, BAR_H)).is_err() {
-        fail(b"desktop-shell: top bar Commit FAILED\n");
-    }
 
     // **Build one application namespace and check it**, before anything is launched into it.
-    // Part E's applications modal is what will call this per launch; doing it once here is
+    // Every launch builds one the same way; doing it once here is
     // what makes the narrow bind observable — and the shell refusing to launch when the check
     // fails is the behaviour, not the test.
     // **The startup check gates, rather than only reporting.** It used to `kprint` and let
@@ -2094,38 +1890,37 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     }
 
 
-    // The modal's entries, read once. `desktop-shell.md` §4: they are desktop entries, and
-    // that falls out of decisions already made — they are ordinary files in the namespace, so
-    // type-to-filter runs over them with no special mechanism.
+    // The Applications menu's entries, read once. `desktop-shell.md` §4: they are desktop
+    // entries, and that falls out of decisions already made — they are ordinary files in the
+    // namespace, so type-to-filter runs over them with no special mechanism.
     let programs = read_applications(session_ns);
     Line::new()
         .s(b"desktop-shell: /applications lists ")
         .u(programs.len() as u64)
         .s(b" application(s)")
         .end();
-    let mut modal: Option<u32> = None;
-    let mut modal_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    // **The modal's own routing state** (M11 Part E batch 4). Until now this shell read pointer
-    // events for three things it hit-tested by hand — the overview's thumbnails, the applications
-    // button, and the taskbar's entries — and never for the modal, whose contents are a widget
-    // tree rather than a fixed grid. Hand-testing a list that scrolls and filters would be the
-    // toolkit's layout re-derived in the shell; a router is what the toolkit already has.
-    let mut modal_tree = Tree::new();
-    // The hover the modal's retained tree was last built with — see where it is resampled.
-    let mut modal_hover: Option<u64> = None;
-    let mut modal_router = Router::new();
-    // **Persistent, since M11 Part E batch 6.** It was a throwaway in each render on the argument
-    // that the launcher keeps no selection — which was true and also meant the scroll offset
-    // reset every frame, so `/bin`'s 26 entries were ten reachable rows and a filter.
-    let mut modal_list = ListState::default();
-    // Where within the thumb the modal's scrollbar was taken hold of (M14 Part I), so that
-    // grabbing it does not move the list before the drag begins.
-    let mut modal_grab = libui::widget::ScrollGrab::new();
-    let mut query = TextFieldState::new();
-    // **The modal serves two purposes and has to know which.** It is the applications launcher
-    // by default, and the desktop-name prompt after `Super+R` — same popup, same text field,
-    // different thing to do with what was typed.
-    let mut rename = false;
+    // **The Places menu's, from the home an application sees** — the `HOME` this shell forwards,
+    // which is `/home` inside an application's namespace — because a place is launched *into*
+    // one. The session's own `argv[1]` spelling of the home is true only here.
+    let app_home = env_str(&env, "HOME").unwrap_or("/home");
+    let places = libfs::places(app_home);
+    // **The two menus the top bar opens, and the one popup showing whichever is open** (desktop
+    // refresh, Part C). The state is `libui`'s, the same value every window's menu bar keeps, so
+    // arrows, Enter, Escape and Left/Right between the two menus behave as they do everywhere
+    // else — and Left/Right is the only way to reach `Places` without a pointer.
+    let mut bar = BarMenus {
+        state: MenuState::new(2),
+        win: None,
+        query: TextFieldState::new(),
+        programs: &programs,
+        places: &places,
+        home: app_home,
+        anchors: menu_anchors(&shown_clock, &theme, &font, screen),
+    };
+    // **The desktop-name prompt, a popup of its own** since the menu stopped being a modal it
+    // could borrow.
+    let mut prompt: Option<Child> = None;
+    let mut name = TextFieldState::new();
     // The overview: its window, the thumbnails it is showing, and which one is being dragged.
     let mut overview: Option<u32> = None;
     let mut over_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
@@ -2236,10 +2031,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
         if let Some(m) = manager.as_mut() {
             // The shell's own windows are never listed: the bars and the wallpaper are
-            // `panel`s and the modal a `popup`, so the role filter already covers them, but
+            // `panel`s and the menus and the name prompt `popup`s, so the role filter already
+            // covers them, but
             // naming them is what keeps that true if a future shell window is `normal`.
-            let ours =
-                [window, bottom.unwrap_or(0), modal.unwrap_or(0), wallpaper_window];
+            let ours = [
+                window,
+                bottom.unwrap_or(0),
+                bar.id().unwrap_or(0),
+                prompt.as_ref().map_or(0, |c| c.id()),
+                wallpaper_window,
+            ];
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
                 alloc::vec::Vec::new();
@@ -2425,25 +2226,17 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     continue;
                 }
                 if id == HOTKEY_RENAME {
-                    // The rename prompt is a popup like the applications modal, and for the
-                    // same reason: a `panel` takes no keyboard focus, so the bar could never
-                    // read a typed name.
-                    if modal.is_none() {
-                        query.clear();
-                        modal = open_modal(
-                            &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query, &mut modal_tree, &mut modal_list,
-                        );
-                        if let Some(id) = modal {
-                            stick(m, id, b"the rename prompt");
-                        }
-                        // **Set from whether the prompt actually opened.** `open_modal` returns
-                        // `None` on three paths, and a `rename` left true with no modal sticks
-                        // for the session — the next launcher Enter would rename the desktop to
-                        // whatever was typed and never launch anything again
-                        // (PR #243 review, finding 4).
-                        rename = modal.is_some();
-                        if rename {
+                    // The prompt is a popup, and for the reason the menus are: a `panel` takes
+                    // no keyboard focus, so the bar could never read a typed name.
+                    //
+                    // **Only when nothing else is up.** A menu holds the keyboard, and a prompt
+                    // opened over it would leave two popups each believing the next keystroke
+                    // was its own.
+                    if prompt.is_none() && bar.win.is_none() {
+                        name.clear();
+                        prompt = open_prompt(&mut session, window, bottom, &name, &theme, &font, screen);
+                        if let Some(c) = prompt.as_ref() {
+                            stick(m, c.id(), b"the name prompt");
                             kprint(b"desktop-shell: naming this desktop\n");
                         }
                     }
@@ -2451,40 +2244,26 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
                 if id == HOTKEY_APPS {
                     // **The keyboard's way in, and the only way in on a machine with no
-                    // pointer** (Phase 5). The applications button lives on a `panel`, which
-                    // takes no keyboard focus, so it can only be *clicked* — and the laptop this
-                    // phase targets has no working pointing device until USB lands in Phase 6.
-                    // Everything past this point was already keyboard-driven: the modal is a
-                    // popup and takes the keyboard, typing filters, Enter launches the top hit.
+                    // pointer** (Phase 5). The Applications word lives on a `panel`, which takes
+                    // no keyboard focus, so it can only be *clicked* — and the laptop this phase
+                    // targets has no working pointing device until USB lands in Phase 6.
+                    // Everything past this point is keyboard-driven: the menu is a popup and
+                    // takes the keyboard, typing filters, Enter launches the lit row, and
+                    // Left/Right reach `Places`.
                     //
-                    // **A second press puts it away**, which the button itself cannot do — its
-                    // handler is gated on `modal.is_none()`, since a press aimed at the bar
-                    // while the modal is up is dismissed by the modal instead. A chord has no
-                    // such ambiguity, and a key that only opens is a key you cannot undo.
-                    if modal.is_some() {
-                        // **Named by what is actually up.** This chord closes whichever popup
-                        // the modal window is serving, and calling a dismissed name prompt an
-                        // "applications modal" is the line `close_modal`'s `what` exists to
-                        // prevent (PR #243 review, optional 8; PR #304 review, finding 1).
-                        let what = if rename { "name prompt" } else { "applications modal" };
-                        rename = false;
-                        // **And the hover goes with it.** A chord can close and reopen with the
-                        // pointer never moving, so nothing would resample it: the router would
-                        // route the next press against a hovered row while `open_modal` recorded
-                        // a quiet one, and a hovered row is a three-child stack where a quiet one
-                        // is two — the id mismatch this file's own note at the router describes,
-                        // where a press lands on a row and nothing happens.
-                        modal_hover = None;
-                        close_modal(
-                            &mut session, &mut modal, &mut query, what, &mut modal_addrs,
-                        );
+                    // **A second press puts it away — or whatever popup is up.** A key that only
+                    // opens is a key you cannot undo, and the name prompt is a popup this chord
+                    // has always closed; each says which it closed, because a dismissal read as
+                    // the wrong one sends a later gate looking for a line under the other name
+                    // (PR #243 review, optional 8; PR #304 review, finding 1).
+                    if prompt.is_some() {
+                        close_prompt(&mut session, &mut prompt, &mut name);
+                    } else if bar.win.is_some() {
+                        bar.close(&mut session);
                     } else {
-                        modal = open_modal(
-                            &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query, &mut modal_tree, &mut modal_list,
-                        );
-                        if let Some(id) = modal {
-                            stick(m, id, b"the applications modal");
+                        bar.state.toggle(panel::APPS);
+                        if let Some(id) = bar.sync(&mut session, window, &theme, &font) {
+                            stick(m, id, b"the applications menu");
                         }
                     }
                     continue;
@@ -2551,9 +2330,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                 }
             }
-            // Named `rename_hk` so it does not shadow the `rename` *bool* that decides what
-            // the modal's Enter does — nothing in this block reads that bool today, which is
-            // exactly the shape where a later edit silently reads the wrong one.
+            // Named `rename_hk` for the chord it is: the prompt it opens is `prompt`, and a
+            // name that could be read as either is the shape where a later edit silently reads
+            // the wrong one.
             let rename_hk = MgrHotkey { id: HOTKEY_RENAME, mods: MOD_META, code: KEY_R };
             let mut rb = [0u8; core::mem::size_of::<MgrHotkey>()];
             if rename_hk.write(&mut rb).is_some() {
@@ -2566,7 +2345,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
             // **`Super+A`, and not a tap of `Super`.** A bare modifier is what a full launcher
             // will want — one field that searches applications, files and settings — and this
-            // modal is the applications menu, so it takes a letter and leaves the tap unspent
+            // is the Applications menu, so it takes a letter and leaves the tap unspent
             // (maintainer, 2026-09-15). A tap would also have to be told from the start of
             // every chord here, all of which begin with `Super` going down.
             let apps_hk = MgrHotkey { id: HOTKEY_APPS, mods: MOD_META, code: KEY_A };
@@ -2604,230 +2383,176 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
 
-        let mut modal_dirty = false;
-        // The hover the *next* frame will be drawn with. Applied after the drain, so that every
-        // event in one batch is routed against the tree currently on screen.
-        let mut next_hover = modal_hover;
         while let Some((w, event)) = session.next_event() {
-            // A press on the applications button opens the modal. **A press, not a key**: a
-            // `panel` takes no keyboard focus, so a key never reaches this process — see
-            // `APPS_BUTTON_W`.
-            // **Keys go to the modal**, which is a popup and therefore takes the keyboard —
+            // **Keys go to the open menu**, which is a popup and therefore takes the keyboard —
             // the property `check-terminal` relies on when it says "an open menu is a topmost
             // popup and takes the keyboard". The top bar could never receive these.
-            if Some(w) == modal {
-                // **A click on a row launches it** (M11 Part E batch 4), routed through the
-                // toolkit rather than hit-tested here: the modal's contents are a widget tree
-                // that filters and scrolls, and re-deriving where its rows are would be the
-                // layout engine written twice. The tree is the one `render_modal` recorded when
-                // it painted, so a click lands on the row a person can see.
-                if let libsurface::WindowEvent::Pointer(p) = event {
-                    let rows = modal_rows(&programs, query.text());
-                    let hovered = modal_hover;
-                    let ui = modal_view(&query, &rows, &mut modal_list, hovered, &theme);
-                    let bounds = Rect::new(0, 0, MODAL_W, MODAL_H);
-                    let l = libui::layout::layout(&ui, bounds, &FontMetrics::new(&font, theme.font_px));
-                    let (msgs, _) = modal_router.pointer(&modal_tree, &ui, &l, p);
-                    // **Hover is a repaint even when nothing was clicked**, which is the whole
-                    // of the highlight: a pointer that merely moved produces no message and
-                    // still changes what the modal should look like.
-                    // **A repaint, and no receipt.** `nxterm` reports its menu hover because a
-                    // gate has no other way to see it; this shell must not, for a reason that
-                    // outranks the convenience: it has **no build-mode `cfg` sites at all**, and
-                    // `check-login` boots the *release* image, so a `test-harness` line here
-                    // would be both a reintroduction of what the test-path retrofit removed and
-                    // invisible to the gate that would want it. What proves this wiring is the
-                    // click below it: hover and clicking ride the same router, so a router that
-                    // hit-tests wrongly fails the launch.
-                    // **What a gesture sees is what the tree was built with** (M12 Part D). A
-                    // capture is a *tree id* of the deepest node under the cursor, and a hovered
-                    // row draws more layers than a quiet one — so repainting with a *different*
-                    // hover between a press and its release gives that node a new id,
-                    // `path_to_id` finds nothing, and the click is silently lost. It presents as
-                    // a launcher row that can be clicked and does nothing.
-                    //
-                    // **Not resampled while a button is held, and not mid-batch either.** M12
-                    // Part B froze it from the press onwards, which is too late: the motion that
-                    // brings the pointer onto a row is usually in the *same* drain as the press,
-                    // so the hover advanced before any frame was drawn and the next one stranded
-                    // the capture. Held until after the drain, every event in a batch routes
-                    // against the tree that is actually on screen.
-                    if !modal_router.grabbed() {
-                        next_hover = modal_router.hovered_key(&modal_tree);
-                    }
-                    for msg in msgs {
-                        // The drag converts through the widget's own arithmetic, which is what
-                        // keeps a list's thumb and a terminal's agreeing about where a y points —
-                        // and, since M14 Part I, about what taking hold of one means.
-                        let ModalMsg::Launch(key) = msg else {
-                            if let ModalMsg::Scroll(p) = msg {
-                                let h = modal_list_h();
-                                let bar = modal_list.bar(h, ROW_H, rows.len());
-                                if let Some(offset) = modal_grab.apply(bar, h, p) {
-                                    modal_list.offset = offset as usize;
-                                    modal_dirty = true;
-                                }
-                            }
-                            continue;
-                        };
-                        // The key is an index into the *unfiltered* list, which is what
-                        // `modal_rows` guarantees and what makes this resolvable at all.
-                        if let Some(name) = programs.get(key as usize) {
-                            if rename {
-                                // A rename prompt has rows for the same reason the launcher
-                                // does — it is the same widget — but choosing one is not
-                                // naming a desktop, so a click is ignored rather than
-                                // misinterpreted as one.
-                                kprint(b"desktop-shell: the name prompt takes typing, not clicks\n");
-                            } else {
-                                // **The entry's `exec`, not its display name.** "Text Editor" is what a person
-                                // reads; `nxedit` is what `/bin` resolves.
-                                launcher.launch(name.exec.as_str(), &[]);
-                                modal_hover = None;
-                                close_modal(
-                                    &mut session,
-                                    &mut modal,
-                                    &mut query,
-                                    "applications modal",
-                                    &mut modal_addrs,
-                                );
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // **A press outside it dismisses it, and losing the keyboard does too.**
+            if bar.id() == Some(w) {
+                // **A press elsewhere dismisses it, and losing the keyboard does too.**
                 //
                 // Two signals rather than one, because neither covers the other. `Focus(false)`
                 // arrives when something *raises* — clicking another window, or a chord that
-                // restacks — and it was all this had at first, which turned out to cover only
-                // half the case: focus here is a consequence of stacking, so a press on the
-                // desktop or on a panel raises nothing and changed no focus, and the modal
-                // stayed open over the click (reported by the maintainer; M11 Part E batch 5).
-                // `Dismissed` is the compositor saying the press landed elsewhere, which is the
-                // half a client cannot see for itself.
+                // restacks — and a press on the desktop or on a panel raises nothing and changes
+                // no focus (reported by the maintainer; M11 Part E batch 5). `Dismissed` is the
+                // compositor saying the press landed elsewhere, which is the half a client cannot
+                // see for itself.
                 //
-                // `InputLost` is neither of these — that is queue overflow, and reading it as
-                // one would close the modal on a burst of pointer motion.
+                // `InputLost` is neither of these — that is queue overflow, and reading it as one
+                // would close the menu on a burst of pointer motion.
                 if matches!(
                     event,
                     libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
                 ) {
-                    let what = if rename { "name prompt" } else { "applications modal" };
-                    rename = false;
-                    modal_hover = None;
-                    close_modal(&mut session, &mut modal, &mut query, what, &mut modal_addrs);
+                    bar.close(&mut session);
                     continue;
                 }
+                let mut chosen: Option<MenuMsg> = None;
+                // Closing waits until the choice has been acted on — see below.
+                let mut finished = false;
                 if let libsurface::WindowEvent::Key(k) = event {
-                    if k.pressed != 0 {
-                        if k.keycode == KEY_ESC {
-                            // Dismissed without launching. The field declines Escape for
-                            // exactly this — see `TextFieldState::apply`.
-                            let what =
-                                if rename { "name prompt" } else { "applications modal" };
-                            rename = false;
-                            modal_hover = None;
-                            close_modal(&mut session, &mut modal, &mut query, what, &mut modal_addrs);
-                        } else if k.keycode == KEY_ENTER && rename {
-                            // **Naming is what makes a desktop persist**, so this is the one
-                            // gesture that changes the lifecycle rather than the view.
-                            // **Capped at what the wire can carry.** `write_list` refuses a
-                            // whole `List` reply rather than truncating a name, which is right
-                            // — but the text field has no cap of its own, so a 33-character
-                            // label typed here made every later `List` fail for *all* desktops,
-                            // permanently, since the name persists. The `desktop name` path
-                            // already checked this bound; this one did not
-                            // (PR #245 review, finding 4).
-                            let full = query.text();
-                            let name = &full[..full
-                                .char_indices()
-                                .map(|(i, c)| i + c.len_utf8())
-                                .take_while(|&e| e <= librsproto::desktop::MAX_DESKTOP_NAME)
-                                .last()
-                                .unwrap_or(0)];
-                            if let Some(d) =
-                                desktops.iter_mut().find(|d| d.id == current_desktop)
+                    let table = bar.table(&theme);
+                    match bar.state.key(&k, &table) {
+                        // **From the outcome, not from `open()`** — choosing closes, so the open
+                        // menu is only named here (PR #280 review, blocking 1).
+                        KeyOutcome::Chose { menu, item } => {
+                            chosen = table.get(menu).and_then(|m| m.items.get(item)).and_then(|it| {
+                                match it {
+                                    Item::Action { msg, enabled: true, .. } => Some(*msg),
+                                    _ => None,
+                                }
+                            });
+                            finished = true;
+                        }
+                        KeyOutcome::Dismissed => finished = true,
+                        // Left and Right move to the other menu; Up and Down move the lit row.
+                        KeyOutcome::Changed => {
+                            if let (Some(id), Some(m)) = (bar.sync(&mut session, window, &theme, &font), manager.as_mut()) {
+                                stick(m, id, bar.what().as_bytes());
+                            }
+                        }
+                        // **Everything the menu does not claim is the filter's**, on the
+                        // Applications menu — a Places menu has nothing to type into.
+                        KeyOutcome::Ignored => {
+                            if bar.state.open() == Some(panel::APPS)
+                                && k.pressed != 0
+                                && bar.query.apply(k.keycode, k.modifiers)
                             {
-                                d.name.clear();
-                                d.name.push_str(name);
-                            }
-                            Line::new()
-                                .s(b"desktop-shell: named this desktop ")
-                                .untrusted(name.as_bytes())
-                                .end();
-                            rename = false;
-                            list_dirty = true;
-                            modal_hover = None;
-                            close_modal(&mut session, &mut modal, &mut query, "name prompt", &mut modal_addrs);
-                            // Naming changes which desktops survive, so the rule applies here
-                            // too — the one site that used to reach the next iteration by way
-                            // of the popup's own destroy event.
-                            normalize_desktops(
-                                &mut desktops,
-                                &entries,
-                                &mut current_desktop,
-                                &mut next_desktop_id,
-                            );
-                        } else if k.keycode == KEY_ENTER {
-                            // The filtered list's first entry is what Enter launches. A
-                            // selection the user moved would come from `ListState`; nothing
-                            // moves it yet, and "the top hit" is what a launcher does with an
-                            // untouched list anyway.
-                            let filtered = filter(&programs, query.text());
-                            if let Some(app) = filtered.first() {
-                                // The entry's `exec`, not the name on the row — "Terminal" is
-                                // what a person reads and `nxterm` is what `/bin` resolves.
-                                launcher.launch(app.exec.as_str(), &[]);
-                                // **Closed after launching, and this was the bug.** `modal`
-                                // was set once and never cleared, so the popup stayed on top
-                                // of whatever was launched and the top bar's click handler —
-                                // gated on `modal.is_none()` — was inert for the rest of the
-                                // session. There was no second launch and no way back, and
-                                // the gate clicks once so it passed (PR #237 review,
-                                // finding 6).
-                                modal_hover = None;
-                                close_modal(&mut session, &mut modal, &mut query, "applications modal", &mut modal_addrs);
-                            } else {
-                                kprint(b"desktop-shell: nothing matches; not launching\n");
-                            }
-                        } else if query.apply(k.keycode, k.modifiers) {
-                            modal_dirty = true;
-                            // **A receipt per character.** Injection is relative and
-                            // unacknowledged, so a dropped PS/2 batch silently eats a keystroke
-                            // — a desktop named `wok` instead of `work`, which is a gate failure
-                            // that looks like a logic bug. The greeter solved this by typing one
-                            // character at a time and waiting for each redraw; this is the same
-                            // receipt.
-                            //
-                            // **The launcher gets one too, and it is a count** (M12 Part A).
-                            // This said the receipt was "limited to renaming so the launcher's
-                            // typing stays quiet", and the quiet was the problem: `check-login`
-                            // types six characters into the filter and immediately clicks a row,
-                            // so a batch lost anywhere in that burst leaves the list showing
-                            // something else and the click lands on nothing — a launcher row
-                            // that can be clicked and does nothing, intermittently, with no line
-                            // anywhere saying which key went missing. The gate waits for one of
-                            // these per character now.
-                            //
-                            // A *count*, where naming logs the text: a desktop's name is a label
-                            // the person is choosing and can see, and what somebody types into a
-                            // launcher is a program they are about to run. The number is what
-                            // says the keystroke arrived, which is the whole job.
-                            if rename {
-                                Line::new()
-                                    .s(b"desktop-shell: name so far ")
-                                    .untrusted(query.text().as_bytes())
-                                    .end();
-                            } else {
-                                Line::new()
-                                    .s(b"desktop-shell: applications modal listing ")
-                                    .u(filter(&programs, query.text()).len() as u64)
-                                    .end();
+                                let table = bar.table(&theme);
+                                // **The top match is lit**, so Enter launches what the person can
+                                // see — the modal launched "the top hit" with nothing to say
+                                // which one that was.
+                                bar.state.select_first(&table);
+                                bar.redraw(&mut session, &theme, &font);
+                                // **A receipt per character, and it is a count** (M12 Part A).
+                                // `check-login` types into the filter and then clicks a row, so
+                                // a keystroke lost to a dropped PS/2 batch has to be visible —
+                                // and what somebody types into a launcher is a program they
+                                // are about to run, so the number is logged and not the text.
+                                let listed = table
+                                    .get(panel::APPS)
+                                    .map_or(0, |m| m.items.iter().filter(|it| matches!(it, Item::Action { enabled: true, .. })).count());
+                                Line::new().s(b"desktop-shell: applications menu listing ").u(listed as u64).end();
                             }
                         }
                     }
                 }
+                if let libsurface::WindowEvent::Pointer(_) = event {
+                    // **Routed through the toolkit, against the tree the popup last presented**
+                    // — `Child` keeps that, and the hover a gesture must see, which is the pair
+                    // of rules this loop used to keep by hand (M12 Part B and D).
+                    let msgs = bar.route(&font, &theme, &event);
+                    chosen = msgs.first().copied();
+                    if chosen.is_some() {
+                        finished = true;
+                    } else {
+                        bar.redraw(&mut session, &theme, &font);
+                    }
+                }
+                match chosen {
+                    // **The entry's `exec`, not its display name** — "Text Editor" is what a
+                    // person reads, `nxedit` is what `/bin` resolves.
+                    Some(MenuMsg::Launch(i)) => {
+                        if let Some(app) = programs.get(i) {
+                            launcher.launch(app.exec.as_str(), &[]);
+                        }
+                    }
+                    Some(MenuMsg::Place(i)) => {
+                        if let Some(p) = places.get(i) {
+                            Line::new().s(b"desktop-shell: opening place ").s(p.name.as_bytes()).end();
+                            launcher.launch(FOLDER_OPENER, &[p.path.as_str()]);
+                        }
+                    }
+                    Some(MenuMsg::Nothing) | None => {}
+                }
+                // **Launched, then closed** — the modal's order, and the one a reader of the log
+                // expects: the choice is what the menu was for, and its going away is the
+                // consequence. `check-login` and `shot` read the two lines in this order.
+                if finished {
+                    bar.close(&mut session);
+                }
+                continue;
+            }
+            // **The name prompt's own input.** Typing names; Enter keeps it; Escape, a press
+            // elsewhere, or losing the keyboard puts it away unnamed.
+            if prompt.as_ref().map(|c| c.id()) == Some(w) {
+                if matches!(
+                    event,
+                    libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
+                ) {
+                    close_prompt(&mut session, &mut prompt, &mut name);
+                    continue;
+                }
+                if let libsurface::WindowEvent::Key(k) = event
+                    && k.pressed != 0
+                {
+                    if k.keycode == KEY_ESC {
+                        close_prompt(&mut session, &mut prompt, &mut name);
+                    } else if k.keycode == KEY_ENTER {
+                        // **Naming is what makes a desktop persist**, so this is the one
+                        // gesture that changes the lifecycle rather than the view.
+                        // **Capped at what the wire can carry.** `write_list` refuses a whole
+                        // `List` reply rather than truncating a name, which is right — but the
+                        // text field has no cap of its own, so a 33-character label typed here
+                        // made every later `List` fail for *all* desktops, permanently, since
+                        // the name persists (PR #245 review, finding 4).
+                        let full = name.text();
+                        let cut = &full[..full
+                            .char_indices()
+                            .map(|(i, c)| i + c.len_utf8())
+                            .take_while(|&e| e <= librsproto::desktop::MAX_DESKTOP_NAME)
+                            .last()
+                            .unwrap_or(0)];
+                        let chosen = alloc::string::String::from(cut);
+                        if let Some(d) = desktops.iter_mut().find(|d| d.id == current_desktop) {
+                            d.name.clear();
+                            d.name.push_str(&chosen);
+                        }
+                        Line::new()
+                            .s(b"desktop-shell: named this desktop ")
+                            .untrusted(chosen.as_bytes())
+                            .end();
+                        list_dirty = true;
+                        close_prompt(&mut session, &mut prompt, &mut name);
+                        // Naming changes which desktops survive, so the rule applies here too.
+                        normalize_desktops(
+                            &mut desktops,
+                            &entries,
+                            &mut current_desktop,
+                            &mut next_desktop_id,
+                        );
+                    } else if name.apply(k.keycode, k.modifiers) {
+                        // **A receipt per character.** Injection is relative and unacknowledged,
+                        // so a dropped PS/2 batch silently eats a keystroke — a desktop named
+                        // `wok` instead of `work`, which is a gate failure that looks like a
+                        // logic bug. A desktop's name is a label the person is choosing and can
+                        // see, so it is logged as text.
+                        Line::new().s(b"desktop-shell: name so far ").untrusted(name.text().as_bytes()).end();
+                        if let Some(c) = prompt.as_mut() {
+                            c.present(&mut session, &panel::name_prompt(&name, &theme), &font, &theme);
+                        }
+                    }
+                }
+                continue;
             }
             // **The overview's own input**: Escape closes it, a press picks a thumbnail up, a
             // release over a sidebar row drops it there.
@@ -2998,23 +2723,23 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
                 continue;
             }
-            if w == window && modal.is_none() {
-                if let libsurface::WindowEvent::Pointer(p) = event {
-
-                    if p.kind == librsproto::surface::POINTER_BUTTON
-                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
-                        && p.x >= 0
-                        && (p.x as u32) < APPS_BUTTON_W
-                    {
-                        modal = open_modal(
-                            &mut session, window, &theme, &font, &programs, &mut modal_addrs,
-                            &query, &mut modal_tree, &mut modal_list,
-                        );
-                        if let Some((m, id)) = manager.as_mut().zip(modal) {
-                            stick(m, id, b"the applications modal");
-                        }
+            // **The top bar's two words**, routed through the toolkit rather than hit-tested
+            // against a width written down beside them: a click on one opens its menu, or closes
+            // it if it is the one open. The pointer lights them as it lights every other control.
+            //
+            // **A click on the open menu's own word reopens it**, as it does on every window's
+            // menu bar: the press dismisses the popup — the compositor tells it the press landed
+            // elsewhere — and the release is then a click on a word whose menu is shut.
+            if w == window {
+                let view = panel::top_bar(&shown_clock, bar.state.open(), top.hovered_key(), &theme);
+                for msg in top.route(&view, &font, &panel_theme, &event) {
+                    let TopMsg::Menu(i) = msg;
+                    bar.state.toggle(i);
+                    if let (Some(id), Some(m)) = (bar.sync(&mut session, window, &theme, &font), manager.as_mut()) {
+                        stick(m, id, bar.what().as_bytes());
                     }
                 }
+                continue;
             }
             // **A press on a window-list entry.** The entries are a fixed-width row, so the
             // index is the x coordinate divided by the width — the same arithmetic the layout
@@ -3129,26 +2854,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             let want = clock_text();
             if want != shown_clock {
                 shown_clock = want;
-                let picture = render_bar(&theme, &font, &shown_clock, screen).into_bytes();
-                let len = screen.pitch() * BAR_H as usize;
-                // `acquire`, for the reason the bottom bar's repaint gives: a buffer index this
-                // code kept itself would invert its phase on any iteration where the commit did
-                // not go out, and every repaint after that would write into what is on screen.
-                if picture.len() == len
-                    && let Some(mut w) = session.window(window)
-                    && let Ok(b) = w.acquire()
-                    && !top_addrs[b as usize].is_null()
-                {
-                    // SAFETY: the destination maps `len` writable bytes and `picture` holds
-                    // exactly `len`; the two are distinct allocations.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(picture.as_ptr(), top_addrs[b as usize], len)
-                    };
-                    if w.commit(b, (0, 0, screen.width, BAR_H)).is_err() {
-                        kprint(b"desktop-shell: top bar Commit failed\n");
-                    }
-                }
             }
+        }
+        // **The top bar, whenever anything it shows may have moved** — the minute, which word
+        // the pointer is over, which menu is open. Asked every pass and cheap when nothing did:
+        // `Child::present` diffs the tree and commits only what changed, so a pass that changed
+        // nothing costs a layout and no frame. A menu closed by a key, a choice or a dismissal is
+        // then un-lit on the same pass as it went, with no flag for each of those to remember.
+        let view = panel::top_bar(&shown_clock, bar.state.open(), top.hovered_key(), &theme);
+        if !top.present(&mut session, &view, &font, &panel_theme) {
+            kprint(b"desktop-shell: top bar Commit failed\n");
         }
 
         // **Redraw the bar when the list changed, and only then.** Every manager event would
@@ -3167,8 +2882,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // discarded — so any iteration where the commit did not go out inverted the phase,
             // and every repaint after that wrote into the buffer the compositor was displaying.
             // `acquire` blocks until one is genuinely free, which is the property being wanted,
-            // and it is already what `present_modal` twelve lines below does
-            // (PR #242 review, finding 4).
+            // and it is already what every `Child::present` does (PR #242 review, finding 4).
             if picture.len() == len
                 && let Some(mut w) = session.window(id)
                 && let Ok(b) = w.acquire()
@@ -3208,45 +2922,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     .s(b" on ")
                     .s(desktop_label(&desktops, current_desktop).as_bytes())
                     .end();
-            }
-        }
-
-        // The hover the drain settled on — applied only if **no gesture is still running**.
-        //
-        // **Deferring the sample was half the rule** (PR #270 review, blocking 1). It fixes the
-        // element-versus-tree mismatch *during* a batch, and then applies the new hover anyway:
-        // a batch of `[ENTER, MOTION, PRESS]` leaves `next_hover` on the row, because the motion
-        // sampled it before the press made `grabbed()` true. Repainting with it gives the row
-        // three children where it had two, the captured node a new id, and the release nothing
-        // to find — which is the whole bug, arriving one drain later than before.
-        //
-        // `Child` has no such hole because its `present` records `hovered_key()`, which under a
-        // grab is already the shown value and therefore a no-op. This is the same rule spelled
-        // out for a loop that owns its own tree.
-        if !modal_router.grabbed() && next_hover != modal_hover {
-            modal_hover = next_hover;
-            modal_dirty = true;
-        }
-        // Redraw the modal when the query changed, so the filter is visible. A filter you
-        // cannot see is not a filter.
-        if modal_dirty {
-            if let Some(id) = modal {
-                let rows = modal_rows(&programs, query.text());
-                // Read before the borrow: `present_modal` takes the tree mutably to record what
-                // it painted, and the hover it should paint *with* comes from the tree as it is.
-                let hovered = modal_hover;
-                present_modal(
-                    &mut session,
-                    id,
-                    &theme,
-                    &font,
-                    &query,
-                    &rows,
-                    &modal_addrs,
-                    &mut modal_tree,
-                    hovered,
-                    &mut modal_list,
-                );
             }
         }
     }
@@ -3791,7 +3466,7 @@ fn recapture(
 
 /// Create the overview window and present it. `None` if any step fails.
 ///
-/// **A `popup`, like the applications modal, and for two reasons.** A popup is placed by its
+/// **A `popup`, like the menus, and for two reasons.** A popup is placed by its
 /// creator and is *not* held for the manager — which is what a shell creating a window while
 /// holding its own manager channel needs, as Part C learned the hard way. And a popup takes
 /// keyboard focus, so Escape closes it; a `panel` never could.
@@ -3816,11 +3491,11 @@ fn open_overview(
             BUFFERS,
         )
         .ok()?;
-    // **Every failure past `create` destroys the window**, which `open_modal` below has said
-    // since PR #237 and this function did not. Returning `None` without it leaves the
+    // **Every failure past `create` destroys the window**, which the modal's `open_modal` said
+    // from PR #237 and this function did not. Returning `None` without it leaves the
     // compositor holding a popup whose id this process has forgotten — never closable, never
     // committable to — while `addrs` keeps a live mapping of an orphaned object that the next
-    // present would write through. Repeat past `MAX_WINDOWS_PER_CONNECTION` and the modal stops
+    // present would write through. Repeat past `MAX_WINDOWS_PER_CONNECTION` and the menus stop
     // opening too, because they share the connection (PR #244 review, blocking 3).
     let mut ok = true;
     for i in 0..BUFFERS {
@@ -4287,7 +3962,7 @@ fn serve_desktop_session(
                 return bad(KError::InvalidArgument);
             }
             // **And nothing bounds how many times this may be asked.** `Open` is the first
-            // spawn path a *program* can drive — the modal needs a person — and the handler
+            // spawn path a *program* can drive — the menus need a person — and the handler
             // checks the path's shape and launches. `MAX_DESKTOP_SESSIONS` is not the bound
             // (`nxfiles` opens a session per file, so a per-session counter resets every call),
             // and this shell does not reap what it launches, so it cannot count what is alive.
@@ -4806,8 +4481,8 @@ fn place_new_windows(
                 .end();
             continue;
         }
-        // **Only `normal` windows, and none of the shell's own.** A bar is a `panel` and the
-        // modal is a `popup`, so the role filter covers those — but an application's own popup
+        // **Only `normal` windows, and none of the shell's own.** A bar is a `panel` and a menu
+        // is a `popup`, so the role filter covers those — but an application's own popup
         // is a `popup` too, and listing one would put a menu in the taskbar. The id check is
         // belt and braces for anything the shell creates that is `normal` later.
         if created.role != ROLE_NORMAL || ours.contains(&created.window) {
@@ -4874,168 +4549,216 @@ fn place_new_windows(
     dirty
 }
 
-/// Render the modal into a free buffer and commit it.
-fn present_modal(
-    session: &mut Session<ChannelTransport>,
-    id: u32,
-    theme: &Theme,
-    font: &Font,
-    query: &TextFieldState,
-    rows: &[ListRow<'_>],
-    addrs: &[*mut u8; BUFFERS],
-    tree: &mut Tree,
-    hovered: Option<u64>,
-    list: &mut ListState,
-) {
-    let len = MODAL_PITCH * MODAL_H as usize;
-    let fb = render_modal(theme, font, query, rows, list, tree, hovered);
-    let bytes = fb.into_bytes();
-    if bytes.len() != len {
-        return;
-    }
-    let Some(mut w) = session.window(id) else {
-        return;
-    };
-    // A buffer the compositor is not displaying — writing into the committed one would tear
-    // the picture on screen.
-    let Ok(slot) = w.acquire() else {
-        return;
-    };
-    let addr = addrs[slot as usize % BUFFERS];
-    if addr.is_null() {
-        return;
-    }
-    // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
-    // allocations, so they cannot overlap.
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
-    let _ = w.commit(slot, (0, 0, MODAL_W, MODAL_H));
+/// The program a place opens in — the folder's counterpart of [`OPENER`].
+const FOLDER_OPENER: &str = "nxfiles";
+
+/// The top bar's two menus: which one is open, the popup showing it, and what the Applications
+/// menu is filtered by (desktop refresh, Part C).
+///
+/// **One popup at a time, whichever menu it is.** `MenuState` moves between the two with Left and
+/// Right; [`sync`](Self::sync) is what makes the popup follow, closing one menu's window and
+/// opening the other's. The popup is a `Child`, like every application's menus, so it keeps its
+/// own retained tree and router — the two things this shell used to keep beside the modal by hand.
+struct BarMenus<'a> {
+    /// Which menu is open and which row the keyboard is on.
+    state: MenuState,
+    /// The popup, and which menu it is showing.
+    win: Option<(usize, Child)>,
+    /// What the Applications menu is filtered by. Cleared when it closes: a launcher that reopened
+    /// still filtered by the last thing launched would be showing a stale answer to a question
+    /// nobody asked.
+    query: TextFieldState,
+    /// The desktop entries, in the order the rows' messages index.
+    programs: &'a [Application],
+    /// The places, in the order the rows' messages index.
+    places: &'a [libfs::Place],
+    /// The home an application sees, which the places are written from.
+    home: &'a str,
+    /// Where each menu hangs, by index — see [`menu_anchors`].
+    anchors: [(i32, i32); 2],
 }
 
-/// Destroy the modal and forget it, so the top bar accepts a click again.
-///
-/// The query is reset with it: a launcher that reopened still filtered by the last thing
-/// launched would be showing a stale answer to a question nobody asked.
-fn close_modal(
-    session: &mut Session<ChannelTransport>,
-    modal: &mut Option<u32>,
-    query: &mut TextFieldState,
-    what: &str,
-    modal_addrs: &mut [*mut u8; BUFFERS],
-) {
-    if let Some(id) = modal.take() {
-        if let Some(w) = session.window(id) {
-            let _ = w.destroy();
-        }
-        query.clear();
-        // The modal's buffers go the same way the overview's do — 614 KB a time rather than
-        // 8 MB, which is why this had not bitten, but it is the same bug.
-        for a in modal_addrs.iter_mut() {
-            release_buffer(a, MODAL_PITCH * MODAL_H as usize);
-        }
-        // **Named, because the same popup serves two purposes.** These gates read the serial
-        // log as the shell's only externally visible output, and a rename dismissal reading as
-        // a launcher dismissal is the kind of line a later gate would assert the wrong thing
-        // about (PR #243 review, optional 8).
-        Line::new()
-            .s(b"desktop-shell: ")
-            .s(what.as_bytes())
-            .s(b" closed, window ")
-            .u(id as u64)
-            .end();
+impl BarMenus<'_> {
+    /// The two menus as they are now.
+    fn table(&self, theme: &Theme) -> alloc::vec::Vec<libui::menu::Menu<MenuMsg>> {
+        panel::menus(self.programs, self.query.text(), self.places, self.home, theme)
     }
-}
 
-/// Open the applications modal as a popup parented to the top bar.
-///
-/// **A `popup`, which is what M6 Part C made it possible to be.** A menu was a `Stack` layer
-/// over its window until then, and worked only because it happened to fit inside one; a modal
-/// wider than the bar it hangs from could not have been drawn that way at all. It is
-/// positioned by its creator and clipped by the *screen*, not by its parent.
-fn open_modal(
-    session: &mut Session<ChannelTransport>,
-    parent: u32,
-    theme: &Theme,
-    font: &Font,
-    apps: &[Application],
-    addrs: &mut [*mut u8; BUFFERS],
-    query: &TextFieldState,
-    tree: &mut Tree,
-    list: &mut ListState,
-) -> Option<u32> {
-    let rows = modal_rows(apps, query.text());
-    // Nothing is hovered before the window exists.
-    let picture = render_modal(theme, font, query, &rows, list, tree, None);
-    let bytes = picture.into_bytes();
-    let len = MODAL_PITCH * MODAL_H as usize;
-    if bytes.len() != len {
-        kprint(b"desktop-shell: modal render is not the size it declares\n");
-        return None;
+    /// The popup's window, if one is up.
+    fn id(&self) -> Option<u32> {
+        self.win.as_ref().map(|(_, c)| c.id())
     }
-    let role = Role::Popup { parent };
-    // **Hanging from the applications button, not sitting on top of it** (M11 Part E batch 4).
-    // A popup created with `new` takes its parent's origin, and the parent here is the top bar —
-    // so the modal covered the bar it dropped from, including the button that opened it.
-    // `nxterm`'s menu has always used `at`; this is the same call, with the button's left edge
-    // and the bar's height. A popup is clipped by the *screen* rather than by its parent, which
-    // is what lets it hang below a 24-pixel bar.
-    let id = match session
-        .create(&CreateWindowRequest::at(MODAL_W, MODAL_H, role, 0, BAR_H as i32), BUFFERS)
-    {
-        Ok(id) => id,
-        Err(_) => {
-            kprint(b"desktop-shell: modal CreateWindow FAILED\n");
+
+    /// What the log calls the menu that is open — or was, for a line about closing it.
+    fn what(&self) -> &'static str {
+        let which = self.win.as_ref().map(|(w, _)| *w).or(self.state.open());
+        if which == Some(panel::PLACES) { "places menu" } else { "applications menu" }
+    }
+
+    /// Close whatever is open, choosing nothing.
+    fn close(&mut self, session: &mut Session<ChannelTransport>) {
+        self.state.close();
+        self.drop_popup(session);
+    }
+
+    /// Destroy the popup and say so, leaving `state` alone.
+    fn drop_popup(&mut self, session: &mut Session<ChannelTransport>) {
+        let what = self.what();
+        if let Some((which, c)) = self.win.take() {
+            let id = c.id();
+            c.close(session);
+            if which == panel::APPS {
+                self.query.clear();
+            }
+            // **Named, because two menus share this path.** These gates read the serial log as
+            // the shell's only externally visible output, and a Places dismissal reading as the
+            // Applications menu's is the line a later gate would assert the wrong thing about
+            // (PR #243 review, optional 8).
+            Line::new().s(b"desktop-shell: ").s(what.as_bytes()).s(b" closed, window ").u(id as u64).end();
+        }
+    }
+
+    /// Make the popup show what `state` says is open: open it, close it, switch it to the other
+    /// menu, or redraw it. Returns the id of a popup this opened, which the caller makes sticky.
+    fn sync(
+        &mut self,
+        session: &mut Session<ChannelTransport>,
+        parent: u32,
+        theme: &Theme,
+        font: &Font,
+    ) -> Option<u32> {
+        let want = self.state.open();
+        if want == self.win.as_ref().map(|(w, _)| *w) {
+            self.redraw(session, theme, font);
             return None;
         }
+        self.drop_popup(session);
+        let which = want?;
+        let table = self.table(theme);
+        let view = panel::menu_view(which, &table, &self.state, None, &self.query, theme);
+        let Some(mut c) =
+            Child::open(session, Role::Popup { parent }, self.anchors[which], &view, font, theme, BUFFERS)
+        else {
+            Line::new().s(b"desktop-shell: ").s(self.what().as_bytes()).s(b" CreateWindow FAILED").end();
+            self.state.close();
+            return None;
+        };
+        // **Drawn before it is announced**, so a line saying it is open is a line about a window
+        // that has committed a frame — an uncommitted popup is invisible and still takes the
+        // keyboard, which is the worst of both.
+        if !c.present(session, &view, font, theme) {
+            kprint(b"desktop-shell: a menu could not draw its first frame\n");
+            c.close(session);
+            self.state.close();
+            return None;
+        }
+        let id = c.id();
+        let mut l = Line::new();
+        l.s(b"desktop-shell: ");
+        if which == panel::APPS {
+            l.s(b"applications menu open, window ").u(id as u64).s(b" listing ").u(self.programs.len() as u64);
+        } else {
+            l.s(b"places menu open, window ").u(id as u64);
+        }
+        l.end();
+        self.win = Some((which, c));
+        Some(id)
+    }
+
+    /// Redraw the popup with the lit row and the filter as they are now — **at a new size** when
+    /// the filter has changed how many rows there are, since a menu is as tall as what is in it.
+    fn redraw(&mut self, session: &mut Session<ChannelTransport>, theme: &Theme, font: &Font) {
+        let table = panel::menus(self.programs, self.query.text(), self.places, self.home, theme);
+        let Some((which, c)) = self.win.as_mut() else { return };
+        let view = panel::menu_view(*which, &table, &self.state, c.hovered_key(), &self.query, theme);
+        let size = libui::layout::measure(
+            &view,
+            libui::layout::Constraints::loose(libdraw::geom::Size::new(u32::MAX / 4, u32::MAX / 4)),
+            &FontMetrics::new(font, theme.font_px),
+        );
+        if size.w > 0 && size.h > 0 && c.resize(size) == Some(false) {
+            kprint(b"desktop-shell: a menu could not be resized\n");
+        }
+        c.present(session, &view, font, theme);
+    }
+
+    /// Route a pointer event through the popup, returning the row it chose.
+    fn route(
+        &mut self,
+        font: &Font,
+        theme: &Theme,
+        event: &libsurface::WindowEvent,
+    ) -> alloc::vec::Vec<MenuMsg> {
+        let table = panel::menus(self.programs, self.query.text(), self.places, self.home, theme);
+        let Some((which, c)) = self.win.as_mut() else { return alloc::vec::Vec::new() };
+        let view = panel::menu_view(*which, &table, &self.state, c.hovered_key(), &self.query, theme);
+        c.route(&view, font, theme, event)
+    }
+}
+
+/// Where each menu hangs: under its word on the top bar, by [`panel::APPS`] and
+/// [`panel::PLACES`].
+///
+/// **Read off a layout of the bar**, not written down: a word's position is a fact about the bar,
+/// and the menu hanging from it is the one thing that has to agree.
+fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i32, i32); 2] {
+    let view = panel::top_bar(clock, None, None, theme);
+    let l = layout(&view, Rect::new(0, 0, screen.width, BAR_H), &FontMetrics::new(font, theme.font_px));
+    let at = |key| {
+        libui::layout::locate(&view, &l, key)
+            .map_or((panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP), panel::menu_anchor)
     };
-    // **Every failure past `create` destroys the window.** Returning `None` without it left
-    // the compositor holding a mapped popup whose id this process had forgotten — never
-    // closable, never committable to — while `addrs` kept a half-written new mapping that the
-    // next `present_modal` would write through (PR #237 review, finding 7).
-    let mut ok = true;
-    for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
-            kprint(b"desktop-shell: modal buffer alloc FAILED\n");
-            ok = false;
-            break;
-        };
-        addrs[i] = addr;
-        // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
-        // allocations, so they cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
-        let Some(mut w) = session.window(id) else {
-            ok = false;
-            break;
-        };
-        if w.attach(i as u32, MODAL_W, MODAL_H, MODAL_PITCH as u32, handle).is_err() {
-            kprint(b"desktop-shell: modal AttachBuffer FAILED\n");
-            ok = false;
-            break;
-        }
-    }
-    if ok {
-        match session.window(id) {
-            Some(mut w) => {
-                if w.commit(0, (0, 0, MODAL_W, MODAL_H)).is_err() {
-                    kprint(b"desktop-shell: modal Commit FAILED\n");
-                    ok = false;
-                }
-            }
-            None => ok = false,
-        }
-    }
-    if !ok {
-        if let Some(w) = session.window(id) {
-            let _ = w.destroy();
-        }
+    [at(panel::APPS_KEY), at(panel::PLACES_KEY)]
+}
+
+/// Open the desktop-name prompt: above the bottom bar's right-hand end, where the desktop's name
+/// is — or below the top bar's, on a session with no bottom bar.
+fn open_prompt(
+    session: &mut Session<ChannelTransport>,
+    top: u32,
+    bottom: Option<u32>,
+    name: &TextFieldState,
+    theme: &Theme,
+    font: &Font,
+    screen: Screen,
+) -> Option<Child> {
+    let view = panel::name_prompt(name, theme);
+    let h = libui::layout::measure(
+        &view,
+        libui::layout::Constraints::loose(libdraw::geom::Size::new(u32::MAX / 4, u32::MAX / 4)),
+        &FontMetrics::new(font, theme.font_px),
+    )
+    .h as i32;
+    let x = screen.width as i32 - panel::PROMPT_W as i32 - panel::MENU_INSET_X;
+    // A popup's offset is from its parent's origin, so above the bottom bar is a negative one.
+    let (parent, at) = match bottom {
+        Some(b) => (b, (x, -(h + panel::MENU_DROP))),
+        None => (top, (x, BAR_H as i32 + panel::MENU_DROP)),
+    };
+    let Some(mut c) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
+        kprint(b"desktop-shell: name prompt CreateWindow FAILED\n");
+        return None;
+    };
+    if !c.present(session, &view, font, theme) {
+        c.close(session);
         return None;
     }
-    Line::new()
-        .s(b"desktop-shell: applications modal open, window ")
-        .u(id as u64)
-        .s(b" listing ")
-        .u(apps.len() as u64)
-        .end();
-    Some(id)
+    Line::new().s(b"desktop-shell: name prompt open, window ").u(c.id() as u64).end();
+    Some(c)
+}
+
+/// Destroy the name prompt, forgetting what was typed into it.
+fn close_prompt(
+    session: &mut Session<ChannelTransport>,
+    prompt: &mut Option<Child>,
+    name: &mut TextFieldState,
+) {
+    if let Some(c) = prompt.take() {
+        let id = c.id();
+        c.close(session);
+        name.clear();
+        Line::new().s(b"desktop-shell: name prompt closed, window ").u(id as u64).end();
+    }
 }
 
 #[panic_handler]

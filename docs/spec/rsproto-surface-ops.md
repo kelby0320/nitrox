@@ -1022,7 +1022,7 @@ There is no unregister. A manager holds the channel for its whole life and the t
 it; adding one is additive if a manager ever needs to rebind at runtime.
 
 **Why this is a manager request and not a client one.** Any application able to register `Super`
-could impersonate the launcher — take the chord that opens the applications modal and show its
+could impersonate the launcher — take the chord that opens the Applications menu and show its
 own window instead. The capability is holding `/dev/draw/manage`, which is one holder at a time
 and which an application's namespace does not bind.
 

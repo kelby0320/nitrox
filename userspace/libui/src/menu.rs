@@ -122,7 +122,7 @@ pub enum Item<Msg> {
         ///
         /// **In the mark's column rather than beside it**, and the column widens for the whole
         /// menu when any row has one, so labels stay in one line down the menu whichever rows
-        /// carry a swatch — the argument [`MARK_W`] makes about marks.
+        /// carry a swatch — the argument the mark column makes about marks.
         swatch: Option<Rgb>,
         /// What choosing it means.
         msg: Msg,

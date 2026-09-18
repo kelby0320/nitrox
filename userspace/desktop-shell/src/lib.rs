@@ -13,12 +13,14 @@
 
 extern crate alloc;
 
+pub mod panel;
+
 /// One graphical application, from a desktop entry under `/applications`.
 ///
 /// **The display name and the program are different strings, and that is the point** (M14 Part
-/// H). The modal showed `/bin` — every service, server and CLI tool on the system, under the
-/// name of its binary. It shows what a package *declares* is an application now, under the name
-/// that package gives it.
+/// H). The launcher showed `/bin` — every service, server and CLI tool on the system, under the
+/// name of its binary. The Applications menu shows what a package *declares* is an application,
+/// under the name that package gives it.
 pub struct Application {
     /// What a person sees: "Files".
     pub name: alloc::string::String,
@@ -93,7 +95,12 @@ pub struct Screen {
 }
 
 /// Each bar's height: the top bar, and the window list at the foot of the screen.
-pub const BAR_H: u32 = 24;
+///
+/// **30, the design's**, since the desktop refresh's Part C; it was 24. Six pixels a bar is what
+/// the design's controls need: a 22-pixel task button and a 26-by-22 show-desktop button with
+/// room above and below, where 24 would leave them one pixel from each edge. Every gate that
+/// aims at a bar keeps its own copy, and moved with this.
+pub const BAR_H: u32 = 30;
 
 /// Width of one window-list entry, in pixels.
 pub const ENTRY_W: u32 = 180;
@@ -180,10 +187,10 @@ mod tests {
     #[test]
     fn the_layout_at_the_old_size_and_at_the_gate_size() {
         let old = Screen { width: 1280, height: 800 };
-        assert_eq!((old.indicator_x(), old.max_entries(), old.window_list_y()), (1120, 6, 776));
+        assert_eq!((old.indicator_x(), old.max_entries(), old.window_list_y()), (1120, 6, 770));
         assert_eq!((old.thumb_cols(), old.pitch()), (4, 5120));
         let gate = Screen { width: 1360, height: 768 };
-        assert_eq!((gate.indicator_x(), gate.max_entries(), gate.window_list_y()), (1200, 6, 744));
+        assert_eq!((gate.indicator_x(), gate.max_entries(), gate.window_list_y()), (1200, 6, 738));
         assert_eq!((gate.thumb_cols(), gate.pitch()), (4, 5440));
     }
 
@@ -217,7 +224,7 @@ mod tests {
 
     #[test]
     fn a_malformed_entry_is_refused_rather_than_half_read() {
-        // **Each of these would otherwise become a modal row that launches nothing.**
+        // **Each of these would otherwise become a menu row that launches nothing.**
         for bad in [
             "name = \"Files\"\n",                    // no exec
             "exec = \"nxfiles\"\n",                  // no name

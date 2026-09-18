@@ -83,8 +83,9 @@ const MEASURE_MAX: u32 = u32::MAX / 4;
 pub struct Child {
     /// The compositor's id for this window.
     id: u32,
-    /// Its size. Fixed at creation for a popup or a dialog, which never answer a `Configure`;
-    /// changed by [`resize`](Self::resize) for a top-level, which must.
+    /// Its size. Changed by [`resize`](Self::resize): for a top-level answering a `Configure`,
+    /// and for a popup its owner resizes to what it holds — the shell's Applications menu, which
+    /// narrows as you type. A dialog's is fixed at creation.
     size: Size,
     /// The retained tree this window's frames diff against.
     tree: Tree,
@@ -248,7 +249,8 @@ impl Child {
         me.present(session, content, font, theme).then_some(me)
     }
 
-    /// Take a new size from a `Configure`, reallocating what depends on it.
+    /// Take a new size — from a `Configure`, or from a popup's owner — reallocating what depends
+    /// on it.
     ///
     /// **`None` if nothing changed**, so a caller can skip the work for a `Configure` that repeats
     /// a size — which is every `Configure` that follows a move. `Some(false)` means the memory
@@ -281,8 +283,13 @@ impl Child {
         self.id
     }
 
-    /// Its size in pixels. Constant for a popup or a dialog; a top-level's changes with
-    /// every `Configure` it answers through [`resize`](Self::resize).
+    /// Its size in pixels. A top-level's changes with every `Configure` it answers through
+    /// [`resize`](Self::resize), and a popup's when its owner resizes it to its contents.
+    ///
+    /// **A popup can do that without asking anybody**: it is placed by its creator and never
+    /// configured, and a commit of a buffer of a new size is what sets a window's bounds —
+    /// `WindowStack::commit` says so. [`present`](Self::present) acquires a buffer of this size,
+    /// so the next frame after a `resize` is the new size on screen.
     pub fn size(&self) -> Size {
         self.size
     }
