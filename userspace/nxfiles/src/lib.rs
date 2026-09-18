@@ -137,13 +137,6 @@ pub const SIDEBAR_W: u32 = 148;
 /// separate it from the rest".
 pub const SIDEBAR_PAD: u32 = 6;
 
-/// The folders the sidebar offers beneath Home.
-///
-/// **Named here and made by the image build**, which is the arrangement M14 Part D chose while
-/// there is one staged home: first-login creation is the right answer once there are real users,
-/// and is `TODO(home-folders)` rather than built. A row whose directory is absent is not hidden —
-/// pressing it says so, which is the same answer a typed path gets.
-pub const DEFAULT_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
 /// The element key on the sidebar.
 pub const SIDEBAR_KEY: u64 = 26;
 /// Where the sidebar's rows are keyed from — clear of the listing's and of the chrome's, for the
@@ -1161,7 +1154,7 @@ impl App {
             }
             Msg::Place(key) => {
                 if let Some(p) = place_of(key).and_then(|i| self.places().into_iter().nth(i)) {
-                    self.goto = Some(p.1);
+                    self.goto = Some(p.path);
                 }
             }
             Msg::CutFiles | Msg::CopyFiles => {
@@ -1516,21 +1509,13 @@ impl App {
         p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone())
     }
 
-    /// The common locations the sidebar offers: a label and where it goes.
+    /// The common locations the sidebar offers — `libfs::places` for this window's home.
     ///
-    /// **Built rather than stored**, because every one of them is a function of `home` — and a
-    /// list held in a field would be a second answer to "where is home" that could go stale if
-    /// the session's ever moved.
-    ///
-    /// **Root is last and Home is first**, which is the order they are wanted in: the folders
-    /// between them are where a person's own files go, and `/` is the one you take deliberately.
-    pub fn places(&self) -> Vec<(String, String)> {
-        let mut out = alloc::vec![(String::from("Home"), self.home.clone())];
-        for name in DEFAULT_FOLDERS {
-            out.push((String::from(*name), join(&self.home, name)));
-        }
-        out.push((String::from("Root"), String::from("/")));
-        out
+    /// **The shell's Places menu asks the same function** (desktop refresh, Part C), which is
+    /// why the list is not here any more: two copies of it are two answers to what a person's
+    /// places are.
+    pub fn places(&self) -> Vec<libfs::Place> {
+        libfs::places(&self.home)
     }
 
     /// Paths the binary owes a clipboard push for. Clears the record.
@@ -2324,15 +2309,11 @@ impl App {
         // this tab is, recomputed each frame. A stored selection would be a second answer to
         // "where am I" and would disagree the moment anything else navigated.
         let places = self.places();
-        let here = places.iter().position(|(_, path)| *path == self.pane().path);
+        let here = places.iter().position(|p| p.path == self.pane().path);
         let side_rows: Vec<ListRow<'_>> = places
             .iter()
             .enumerate()
-            .map(|(i, (label, _))| ListRow {
-                key: SIDEBAR_ROW_KEY + i as u64,
-                label: label.as_str(),
-                marked: false,
-            })
+            .map(|(i, p)| ListRow { key: SIDEBAR_ROW_KEY + i as u64, label: p.name, marked: false })
             .collect();
         self.sidebar.selected = here;
         // **The panel is built for the height it will be drawn at**, which is the box minus the
@@ -3799,21 +3780,13 @@ mod tests {
 
     // --- the sidebar (M14 Part D) --------------------------------------------
 
-    /// The places are Home, the default folders under it, and Root — all relative to *this*
-    /// session's home rather than to `/home`.
+    /// The sidebar's places are this window's home's — `libfs::places` is pinned by its own
+    /// test, and this is the half that says the browser asks it about the right home.
     #[test]
     fn the_places_are_built_from_this_sessions_home() {
         let a = App::new("/home/someone-else");
-        let places = a.places();
-        assert_eq!(places[0], (String::from("Home"), String::from("/home/someone-else")));
-        assert_eq!(places.last().unwrap().1, "/", "Root is last");
-        for name in DEFAULT_FOLDERS {
-            let want = alloc::format!("/home/someone-else/{name}");
-            assert!(
-                places.iter().any(|(l, p)| l == name && *p == want),
-                "{name} should be under this home, not under /home: {places:?}"
-            );
-        }
+        assert_eq!(a.places(), libfs::places("/home/someone-else"));
+        assert_eq!(a.places()[1].path, "/home/someone-else/Documents");
     }
 
     /// One press on a sidebar row goes there — no second click.
@@ -3857,7 +3830,7 @@ mod tests {
 
         a.show("/home/Pictures", alloc::vec![]);
         let _ = a.view(&ui, None);
-        let want = a.places().iter().position(|(l, _)| l == "Pictures");
+        let want = a.places().iter().position(|p| p.name == "Pictures");
         assert_eq!(a.sidebar.selected, want, "and follows a navigation it did not cause");
 
         a.show("/home/papers", alloc::vec![]);
@@ -4335,7 +4308,7 @@ mod tests {
                 .items
                 .iter()
                 .filter_map(|it| match it {
-                    Item::Action { label, marked: true, .. } => Some(String::from(*label)),
+                    Item::Action { label, marked: true, .. } => Some(String::from(label.as_ref())),
                     _ => None,
                 })
                 .collect()

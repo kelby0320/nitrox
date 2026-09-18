@@ -13,12 +13,14 @@
 
 extern crate alloc;
 
+pub mod panel;
+
 /// One graphical application, from a desktop entry under `/applications`.
 ///
 /// **The display name and the program are different strings, and that is the point** (M14 Part
-/// H). The modal showed `/bin` — every service, server and CLI tool on the system, under the
-/// name of its binary. It shows what a package *declares* is an application now, under the name
-/// that package gives it.
+/// H). The launcher showed `/bin` — every service, server and CLI tool on the system, under the
+/// name of its binary. The Applications menu shows what a package *declares* is an application,
+/// under the name that package gives it.
 pub struct Application {
     /// What a person sees: "Files".
     pub name: alloc::string::String,
@@ -84,6 +86,10 @@ pub fn matches(name: &str, q: &str) -> bool {
 /// `SCREEN_H = 800`, and on the laptop's 1366×768 its window list was placed at `y = 776` — below
 /// the last row. Every size the shell derives from the screen is a method here, so the arithmetic
 /// is host-tested at every size rather than checked by a `const` assert at one.
+///
+/// **Except how many windows the bottom bar holds**, since the desktop refresh's Part C: that
+/// depends on the switcher beside them, which carries the desktop's name, so it is
+/// [`panel::task_capacity`] of a measured width rather than a method of the screen alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Screen {
     /// Width in pixels.
@@ -93,13 +99,12 @@ pub struct Screen {
 }
 
 /// Each bar's height: the top bar, and the window list at the foot of the screen.
-pub const BAR_H: u32 = 24;
-
-/// Width of one window-list entry, in pixels.
-pub const ENTRY_W: u32 = 180;
-
-/// Width of the desktop indicator at the window list's right-hand end.
-pub const INDICATOR_W: u32 = 160;
+///
+/// **30, the design's**, since the desktop refresh's Part C; it was 24. Six pixels a bar is what
+/// the design's controls need: a 22-pixel task button and a 26-by-22 show-desktop button with
+/// room above and below, where 24 would leave them one pixel from each edge. Every gate that
+/// aims at a bar keeps its own copy, and moved with this.
+pub const BAR_H: u32 = 30;
 
 /// The overview's sidebar width, at the right-hand edge.
 pub const SIDE_W: u32 = 200;
@@ -116,26 +121,6 @@ impl Screen {
         self.width as usize * 4
     }
 
-    /// Where the indicator starts, in bar-local x. Clicks at or past this belong to it.
-    ///
-    /// **Anchored to the screen's right edge.** The first version laid the indicator out after the
-    /// entries, so it was drawn at `n * ENTRY_W` and coincided with its hit region at exactly one
-    /// window count (PR #243 review, blocking 2); a flexible spacer between the entries and the
-    /// indicator is what puts it here, and [`max_entries`](Self::max_entries) reserves the width.
-    pub const fn indicator_x(self) -> u32 {
-        self.width.saturating_sub(INDICATOR_W)
-    }
-
-    /// How many entries the window list can show without one being painted under the indicator.
-    ///
-    /// **The invariant is the product**: `max_entries × ENTRY_W + INDICATOR_W ≤ width`. With the
-    /// capacity computed from the full width, a full bar painted an entry across the indicator's
-    /// hit region, and clicking the last window switched desktops (PR #243 review, blocking 2).
-    /// Entries past the limit are not shown; the window is still there.
-    pub const fn max_entries(self) -> usize {
-        (self.indicator_x() / ENTRY_W) as usize
-    }
-
     /// Where the window list is placed: its top edge, one bar above the bottom of the screen.
     pub const fn window_list_y(self) -> i32 {
         self.height.saturating_sub(BAR_H) as i32
@@ -150,9 +135,128 @@ impl Screen {
     }
 }
 
+/// One window, as show-desktop sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Window {
+    /// The compositor's id.
+    pub id: u32,
+    /// The desktop it is on.
+    pub desktop: u32,
+    /// Whether it is put away.
+    pub minimized: bool,
+    /// Whether it holds the keyboard.
+    pub focused: bool,
+}
+
+/// What show-desktop put away on one desktop, and what it could not reach (desktop refresh,
+/// Part C).
+///
+/// **Both halves are kept**, and the second is what the review of PR #314 found missing. A press
+/// puts away only the windows the bar has buttons for — `Super+H`'s bound, since a window past
+/// the bar's end minimised and then abandoned would have no way back — so on a desktop with more
+/// windows than buttons, some stay up. A check of "is anything on this desktop up again" then
+/// found those, in the same pass as the press, and dropped the set before the button could light:
+/// the second press brought nothing back.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShownDesktop {
+    /// The desktop it is on.
+    pub desktop: u32,
+    /// What the press put away, in the order it comes back: the window that had the keyboard last,
+    /// so it is on top and focused again.
+    pub put_away: alloc::vec::Vec<u32>,
+    /// What the press left up because the bar has no button for it — or because putting it away
+    /// was refused.
+    pub left_up: alloc::vec::Vec<u32>,
+}
+
+impl ShownDesktop {
+    /// What a press on `desktop` should put away, given every window in the bar's order and how
+    /// many buttons the bar has. `None` when nothing it could reach is up — a press with nothing
+    /// to bring back leaves the button unlit.
+    ///
+    /// **Only what is up is put away**, so a window already minimised before the press is not in
+    /// the set and stays put away after the second — which is what makes the pair undo each other.
+    pub fn plan(windows: &[Window], desktop: u32, capacity: usize) -> Option<Self> {
+        let (mut put_away, mut left_up, mut focused) = (alloc::vec::Vec::new(), alloc::vec::Vec::new(), None);
+        for (i, w) in windows.iter().filter(|w| w.desktop == desktop).enumerate() {
+            if w.minimized {
+                continue;
+            }
+            if i >= capacity {
+                left_up.push(w.id);
+            } else if w.focused {
+                focused = Some(w.id);
+            } else {
+                put_away.push(w.id);
+            }
+        }
+        put_away.extend(focused);
+        (!put_away.is_empty()).then_some(ShownDesktop { desktop, put_away, left_up })
+    }
+
+    /// Whether the desktop is still as the press left it: nothing on it is up but what the press
+    /// could not reach.
+    ///
+    /// **Anything else up means something came back another way** — a window restored from its
+    /// button, a new one, one moved here — and then "bring back what the first press put away" is
+    /// no longer a coherent request. The button's light is this answer.
+    pub fn holds(&self, windows: &[Window]) -> bool {
+        windows
+            .iter()
+            .all(|w| w.desktop != self.desktop || w.minimized || self.left_up.contains(&w.id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn win(id: u32, desktop: u32, minimized: bool, focused: bool) -> Window {
+        Window { id, desktop, minimized, focused }
+    }
+
+    /// Six windows and five buttons — the review's scenario at 1360×768 — and the press still
+    /// holds its set, because the sixth is the one it could not reach.
+    #[test]
+    fn show_desktop_holds_with_more_windows_than_buttons() {
+        let before: alloc::vec::Vec<Window> = (1..=6).map(|i| win(i, 1, false, i == 3)).collect();
+        let s = ShownDesktop::plan(&before, 1, 5).expect("five things to put away");
+        assert_eq!(s.put_away, [1, 2, 4, 5, 3], "the focused window comes back last");
+        assert_eq!(s.left_up, [6]);
+        // After the press: the five are down, the sixth is not.
+        let after: alloc::vec::Vec<Window> =
+            before.iter().map(|w| Window { minimized: w.id != 6, focused: false, ..*w }).collect();
+        assert!(s.holds(&after), "the window past the bar's end is not something coming back");
+    }
+
+    /// Anything on the desktop that is up and was not left up lets the set go — and nothing on
+    /// another desktop does.
+    #[test]
+    fn show_desktop_lets_go_when_something_comes_back_another_way() {
+        let s = ShownDesktop { desktop: 1, put_away: alloc::vec![1, 2], left_up: alloc::vec![3] };
+        let quiet = [win(1, 1, true, false), win(2, 1, true, false), win(3, 1, false, false)];
+        assert!(s.holds(&quiet));
+        let restored = [win(1, 1, false, true), win(2, 1, true, false), win(3, 1, false, false)];
+        assert!(!s.holds(&restored), "a window restored from its button");
+        let mut arrived = quiet.to_vec();
+        arrived.push(win(9, 1, false, true));
+        assert!(!s.holds(&arrived), "a new window, or one moved here");
+        let mut elsewhere = quiet.to_vec();
+        elsewhere.push(win(9, 2, false, true));
+        assert!(s.holds(&elsewhere), "another desktop's windows are not this press's business");
+    }
+
+    /// A window already put away before the press is not in the set, so the second press does not
+    /// bring it back — the pair undo each other. And a press with nothing up plans nothing.
+    #[test]
+    fn show_desktop_brings_back_exactly_what_it_put_away() {
+        let before = [win(1, 1, true, false), win(2, 1, false, true), win(3, 2, false, false)];
+        let s = ShownDesktop::plan(&before, 1, 5).unwrap();
+        assert_eq!(s.put_away, [2], "not the one already minimised, and not another desktop's");
+        assert!(ShownDesktop::plan(&[win(1, 1, true, false)], 1, 5).is_none());
+        // A window past the bar's end is never put away, even when it is the only one up.
+        assert!(ShownDesktop::plan(&[win(1, 1, true, false), win(2, 1, false, false)], 1, 1).is_none());
+    }
 
     /// Sizes the shell has been or will be run at, and the edges of the arithmetic.
     const SIZES: [(u32, u32); 9] = [
@@ -168,30 +272,25 @@ mod tests {
     ];
 
     #[test]
-    fn no_entry_is_ever_painted_under_the_indicator() {
+    fn the_window_list_sits_one_bar_above_the_foot_at_every_size() {
         for (width, height) in SIZES {
             let s = Screen { width, height };
-            let used = s.max_entries() as u32 * ENTRY_W;
-            assert!(used + INDICATOR_W.min(width) <= width, "{width}x{height}: {used} + indicator");
-            assert!(used <= s.indicator_x(), "{width}x{height}: an entry crosses the indicator");
+            assert_eq!(s.window_list_y() as u32, height.saturating_sub(BAR_H), "{width}x{height}");
+            assert!(s.thumb_cols() >= 1, "{width}x{height}");
         }
     }
 
     #[test]
     fn the_layout_at_the_old_size_and_at_the_gate_size() {
         let old = Screen { width: 1280, height: 800 };
-        assert_eq!((old.indicator_x(), old.max_entries(), old.window_list_y()), (1120, 6, 776));
-        assert_eq!((old.thumb_cols(), old.pitch()), (4, 5120));
+        assert_eq!((old.window_list_y(), old.thumb_cols(), old.pitch()), (770, 4, 5120));
         let gate = Screen { width: 1360, height: 768 };
-        assert_eq!((gate.indicator_x(), gate.max_entries(), gate.window_list_y()), (1200, 6, 744));
-        assert_eq!((gate.thumb_cols(), gate.pitch()), (4, 5440));
+        assert_eq!((gate.window_list_y(), gate.thumb_cols(), gate.pitch()), (738, 4, 5440));
     }
 
     #[test]
     fn a_screen_too_small_for_the_chrome_degrades_rather_than_wrapping() {
         let tiny = Screen { width: 100, height: 10 };
-        assert_eq!(tiny.indicator_x(), 0);
-        assert_eq!(tiny.max_entries(), 0);
         assert_eq!(tiny.window_list_y(), 0, "saturating, not a negative origin from a wrap");
         assert_eq!(tiny.thumb_cols(), 1);
     }
@@ -217,7 +316,7 @@ mod tests {
 
     #[test]
     fn a_malformed_entry_is_refused_rather_than_half_read() {
-        // **Each of these would otherwise become a modal row that launches nothing.**
+        // **Each of these would otherwise become a menu row that launches nothing.**
         for bad in [
             "name = \"Files\"\n",                    // no exec
             "exec = \"nxfiles\"\n",                  // no name

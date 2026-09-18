@@ -29,7 +29,7 @@ libkern = { path = "../libkern" }
 # `userspace/CLAUDE.md` puts a helper with two consumers below both of them. The shell takes no
 # other part of this crate — it is not a supervisor of sessions.
 libsession = { path = "../libsession" }
-# `io` for `session::Dir`: the modal reads /bin as a forwarded directory.
+# `io` for `session::Dir`: the Applications menu reads /applications as a forwarded directory.
 librsproto = { path = "../librsproto", features = ["io"] }
 libsurface = { path = "../libsurface" }
 libui = { path = "../libui" }
@@ -42,7 +42,8 @@ libstream = { path = "../libstream", features = ["io"] }
 # every application the result on the environment record it already forwards (M11 Part C).
 libfs = { path = "../libfs" }
 
-# The pure half — the desktop-entry parser and the modal's filter — so it can be host-tested.
+# The pure half — the desktop-entry parser, the Applications menu's filter, and the top bar and
+# its menus as element trees (`panel`) — so it can be host-tested.
 # Same split as `init`, `service-mgr`, `nxterm`, `nxfiles` and `nxedit`.
 [lib]
 name = "desktop_shell"

@@ -113,7 +113,7 @@ choosing two colours that do.
       and `libdraw` gains the three primitives they imply.
 - [x] **Part B — window chrome**: rounded corners, the new titlebar, focus that reads, and menus
       in the design's style.
-- [ ] **Part C — the panels**: the Applications and Places menus, and a bottom bar with a
+- [x] **Part C — the panels**: the Applications and Places menus, and a bottom bar with a
       show-desktop button and the new switcher.
 - [ ] **Part D — the greeter**, which the design does not cover and which has to match anyway.
 - [ ] **Part E — the overview**, whose layout changes.
@@ -278,41 +278,61 @@ for a different reason.
 
 ## Part C — the panels
 
-- [ ] **The Applications menu becomes a menu**, not a modal — sections, rows with icons, a
+- [x] **The Applications menu becomes a menu**, not a modal — sections, rows with icons, a
       separator. **No categories**: the design groups three programs under "Accessories" and a
       System section, and a taxonomy invented for three entries is one we would have to live
       with. A flat list until there are enough entries to need grouping (maintainer, 2026-09-17).
-- [ ] **…but typing still narrows it.** Today `Super+A` opens a modal and typing filters; on the
+      Built in C.2 (2026-09-18): `libui`'s `MenuState` and popup, hanging from the word, on the
+      window's ground with the design's rows. **No separator**, since with no sections and the
+      two System rows omitted there is nothing to separate.
+- [x] **…but typing still narrows it.** Today `Super+A` opens a modal and typing filters; on the
       laptop that is the fastest path to a program and the only one that does not need a pointer.
       Adopting the menu's *look* must not cost the menu's *behaviour* — this is the one place the
-      design would be a regression if followed literally.
-- [ ] **A Places menu**: `Home`, `Documents`, `Downloads`, `Pictures`, `Root`, with a swatch, a
-      label and a dim right-aligned path. **Trash is dropped**, because there is no trash.
-- [ ] **The list has one source, which means moving it.** `DEFAULT_FOLDERS` is only `Documents`,
+      design would be a regression if followed literally. A filter field above the rows
+      (`menu::popup_headed`); the menu resizes to what matches, the top match is lit
+      (`MenuState::select_first`) and Enter launches it. One change: Enter with nothing typed
+      closes rather than launching the first entry, the rule every chord-opened menu keeps.
+- [x] **A Places menu**: `Home`, `Documents`, `Downloads`, `Pictures`, `Root`, with a swatch, a
+      label and a dim right-aligned path. **Trash is dropped**, because there is no trash. A place
+      opens `nxfiles` at it — `argv[1]`, which the browser learned in C.1 — and `check-login`'s
+      step 13 opens `Documents` and reads the listing back.
+- [x] **The list has one source, which means moving it.** `DEFAULT_FOLDERS` is only `Documents`,
       `Downloads` and `Pictures`; `Home` first and `Root` last are added by `Browser::places()`, a
       method on the file browser that `desktop-shell` cannot call (review). Either that function
       moves somewhere both can reach, or the menu is a second copy of the list — and a second copy
-      is what the first draft claimed it was not.
-- [ ] **`Run Application…` and `End session` are omitted**, not disabled: the launcher is
+      is what the first draft claimed it was not. Moved: `libfs::places` and `HOME_FOLDERS` (C.1).
+- [x] **`Run Application…` and `End session` are omitted**, not disabled: the launcher is
       deferred and there is no logout. A menu item that does nothing is worse than an absent one.
-- [ ] **The bottom bar gains a show-desktop button** on the left: minimise everything, press
+- [ ] **Not built: icons on the Applications menu's rows.** The design's are three CSS boxes keyed
+      by program, and an icon is an asset question — a format, where the files live beside a
+      desktop entry, who draws them — rather than a drawing one. Three glyphs keyed by name would
+      be the thing that has to be removed when that is answered. Named here so it is not assumed
+      done; the Places menu's swatches are built, because a swatch *is* a colour.
+- [x] **The bottom bar gains a show-desktop button** on the left: minimise everything, press
       again to restore. **The restore set belongs to the shell**, which already tracks
       `WinEntry.minimized` — minimising is a manager operation, and the compositor's "whole part
       is to check the caller owns the window and hand the manager the question" (M9 Part B). The
       first draft put this state in the compositor, which is the process the architecture keeps
-      policy-free (review, finding 6).
-- [ ] **The switcher moves to the bottom right**: `‹`, up to three squares, `›`, the current
+      policy-free (review, finding 6). Built in C.3 (2026-09-18): the restore set is exactly what
+      the press minimised, bounded by the windows the bar shows, and it lets go when anything on
+      that desktop comes back another way — so the button's light is always true.
+- [x] **The switcher moves to the bottom right**: `‹`, up to three squares, `›`, the current
       desktop's name. The rule is `min(3, total)` — **not** "two when there is no previous
       desktop", which is what the first draft read off a screenshot with two desktops open
       (review, finding 7). On desktop 1 of three or more it shows three cells with the back
-      arrow disabled.
-- [ ] **`desktop-shell.md` §7 is updated in the same change.** It records a *compact indicator*
+      arrow disabled. `panel::switcher_cells`, host-tested at every position up to seven desktops.
+      **One divergence**: an empty desktop's cell has a faint border where the design dashes it —
+      the missing mark already says "empty", and a dashed rectangle would be a primitive for one
+      border.
+- [x] **`desktop-shell.md` §7 is updated in the same change.** It records a *compact indicator*
       as the decision and rejects "GNOME 2's full desktop switcher", on the grounds that a row of
       boxes churns as desktops come and go and "a name is also a better use of the space". The
       design answers the churn objection — three cells is bounded — and keeps the name beside
       them. That is a decision being revisited on new evidence, which is fine, and leaving §7
-      saying the opposite is not.
-- [ ] **The window list stays** and is restyled.
+      saying the opposite is not. §7a records the old decision and why it no longer holds.
+- [x] **The window list stays** and is restyled: 186-pixel buttons with the design's state dot,
+      the focused one a raised face, and how many fit measured against the switcher beside them
+      (`panel::task_capacity`), since the switcher carries the desktop's name.
 
 ## Part D — the greeter
 

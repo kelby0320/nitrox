@@ -208,9 +208,9 @@ screen from every caller, so a new boot cannot forget to say.
   guest's own `framebuffer:` line and the self-test verdict, which a wrong stride cannot fail, still
   read correct. `DisplaySize::parse` refuses such a width. 1360×768 is the laptop's 1366×768 as near
   as QEMU shows it.
-- **A gate aims at a size it derives, not one it reads.** The bottom bar's click height, the
-  indicator, the sidebar, the pointer's pin corner and the screen's centre are `DisplaySize`
-  methods over the chrome metrics the gate writes down a second time (M11 decision 2); the
+- **A gate aims at a size it derives, not one it reads.** The bottom bar's click height, its
+  task buttons, show-desktop and the desktop's name, the sidebar, the pointer's pin corner and the
+  screen's centre are `DisplaySize` methods over the chrome metrics the gate writes down a second time (M11 decision 2); the
   expected wallpaper line is `libdraw::scale::fill` at the size.
 - **Pointer travel is sized from the screen too.** A pin over-drives the longer side
   (`DisplaySize::pin_motions`), and a drag to an edge travels a screen's width, paced. Both were

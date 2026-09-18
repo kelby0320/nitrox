@@ -23,7 +23,7 @@ Resolving `/dev/desktop` with a **non-empty suffix** is `NotFound`: there is no 
 
 ## Positions, not ids
 
-Every op that names a desktop names a **position**, one-based, as the desktop indicator counts
+Every op that names a desktop names a **position**, one-based, as the bottom bar's switcher counts
 them. Ids are stable and never reused, so after a few desktops have come and gone they stop
 matching what anyone sees — and `Super+N` addresses positions for the same reason. `List` reports
 both, so a caller that wants to hold on to a desktop across a renumbering can.
@@ -95,7 +95,7 @@ absolute — a relative path would be relative to a working directory this serve
 application namespaces that do not gate, which disables launching outright.
 
 **Nothing bounds how often a client may ask.** This is the first op in the system a *program*
-can drive that causes a process to be spawned — the applications modal needs a person — and the
+can drive that causes a process to be spawned — the Applications menu needs a person — and the
 shell does not rate-limit it, cap live openers, or dedup paths. `MAX_DESKTOP_SESSIONS` is not the
 bound: a client may open and close a session per request, and `nxfiles` does. Filed as
 `TODO(open-amplification)` in
@@ -127,4 +127,4 @@ nothing that would go stale unnoticed.
 
 - [Wire format](rsproto-wire-format.md) — envelope, categories, reply rules
 - [`ui-composition-model.md`](../architecture/ui-composition-model.md) — what a desktop *is*, and §2a's namespace sketch
-- [`desktop-shell.md`](../architecture/desktop-shell.md) — the bar, the indicator and the overview that drive the same model
+- [`desktop-shell.md`](../architecture/desktop-shell.md) — the bar, its switcher and the overview that drive the same model

@@ -744,9 +744,67 @@ pub fn join(dir: &[u8], name: &[u8]) -> String {
     s
 }
 
+/// The folders a session's home holds for a person's own files — between Home and Root in every
+/// list of [`places`].
+///
+/// **Named here and made by the image build**, which is the arrangement M14 Part D chose while
+/// there is one staged home: first-login creation is the right answer once there are real users,
+/// and is `TODO(home-folders)` rather than built. A place whose directory is absent is still
+/// offered — opening it says so, which is the same answer a typed path gets.
+///
+/// It was `nxfiles::DEFAULT_FOLDERS` until the shell's Places menu needed the same list (desktop
+/// refresh, Part C): a helper with two consumers belongs below both, and a second copy is how the
+/// sidebar and the menu would come to disagree about what a person's places are.
+pub const HOME_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
+
+/// Somewhere a person goes often: what it is called, and the path it opens.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Place {
+    /// What a person reads — `Home`, `Documents`, `Root`.
+    pub name: &'static str,
+    /// Where it goes.
+    pub path: String,
+}
+
+/// The places for a session whose home is `home`: Home, the [`HOME_FOLDERS`] beneath it, and the
+/// root.
+///
+/// **Built rather than stored**, because every one of them is a function of `home` — a list held
+/// somewhere would be a second answer to "where is home" that could go stale.
+///
+/// **Home is first and Root is last**, which is the order they are wanted in: the folders between
+/// them are where a person's own files go, and `/` is the one you take deliberately.
+pub fn places(home: &str) -> Vec<Place> {
+    let mut out = alloc::vec![Place { name: "Home", path: String::from(home) }];
+    for name in HOME_FOLDERS {
+        out.push(Place { name, path: join(home.as_bytes(), name.as_bytes()) });
+    }
+    out.push(Place { name: "Root", path: String::from("/") });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The places are Home, the home folders under it, and Root — all relative to the home they
+    /// were asked about rather than to `/home`.
+    #[test]
+    fn the_places_are_built_from_the_home_they_are_given() {
+        let places = places("/home/someone-else");
+        assert_eq!(places[0], Place { name: "Home", path: String::from("/home/someone-else") });
+        assert_eq!(places.last().map(|p| (p.name, p.path.as_str())), Some(("Root", "/")));
+        assert_eq!(places.len(), HOME_FOLDERS.len() + 2);
+        for name in HOME_FOLDERS {
+            let want = alloc::format!("/home/someone-else/{name}");
+            assert!(
+                places.iter().any(|p| p.name == *name && p.path == want),
+                "{name} should be under this home, not under /home: {places:?}"
+            );
+        }
+        // A home given with its separator does not grow a second one.
+        assert_eq!(super::places("/home/")[1].path, "/home/Documents");
+    }
 
     #[test]
     fn basename_takes_the_final_component() {
