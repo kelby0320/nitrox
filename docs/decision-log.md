@@ -26854,7 +26854,9 @@ this closed the popup first, and `check-login`'s `expect` scanned past the close
 copy was what the plan's first draft had and claimed not to. A place launches `nxfiles` with the
 path as `argv[1]`, which the browser learned for this; its home stays `HOME`, since a browser that
 took the argument as its home would offer `Documents/Documents`. `Root`'s swatch is `deny`.
-`check-login`'s new step 13 opens `Documents` and reads the listing back.
+`check-login`'s new step 13 opens `Documents` and reads the listing back — **after** the browser
+says where it started, since the same gate lists `Documents` from the sidebar long before, and the
+first version's whole-transcript search could not fail (PR #314 review, blocking 2).
 
 **What the design has and this does not.** No categories (maintainer, 2026-09-17). No
 `Run Application…` or `End session`: the launcher is deferred, there is no logout, and a row that
@@ -26867,7 +26869,11 @@ that has to be removed when that is answered.
 which the architecture keeps free of policy. It holds exactly what the press minimised, is bounded
 by the windows the bar shows (a window past the bar's end, minimised and then left behind, would
 have no way back — the `Super+H` rule), and lets go the moment anything on that desktop returns by
-another route, so the button's light is always true.
+another route, so the button's light is always true. **The first version let go in the same pass
+as the press** whenever a desktop had more windows than buttons: the bound left some up, and "is
+anything up" found them (PR #314 review, blocking 1). `ShownDesktop` keeps what the press left up
+beside what it put away, and both halves — the plan and whether it still holds — are pure and
+host-tested, including that six-window desktop.
 
 **The switcher is back, bounded, and `desktop-shell.md` §7 says why.** §7 recorded a compact
 indicator as the decision because a row of boxes over dynamic desktops churns and "a name is a
@@ -26880,9 +26886,12 @@ in the shell and in `DisplaySize`; the overview sidebar aims, which had hardcode
 derivations at 1280×800, whose test says the six pixels are this part's. The bottom bar's aims are
 new: the first task at x 48–234 rather than 0–180, the desktop's name 30 pixels in from the right
 where the indicator's middle was 80. **Every one of them is pinned as a literal by
-`desktop_shell::panel`'s host tests** against a layout in the shipped face — the arrangement
-`dialog_buttons_land_where_the_constants_say` made for dialogs — so the gate's copies and the
-shell's layout cannot part without a host test failing first. The task capacity is tested at seven
+`desktop_shell::panel`'s host tests** against a layout in the shipped face, at both the staged
+14 px and the built-in 16 — the arrangement `dialog_buttons_land_where_the_constants_say` made for
+dialogs — so the gate's copies and the shell's layout cannot part without a host test failing
+first. **The first version pinned 16 alone**, while every gate boots the staged 14: the review
+moved two aims out of their rows in the guest and the tests stayed green, so the words "cannot
+part" were not yet true (PR #314 review, finding 4). The task capacity is tested at seven
 widths and four names never to put a button under the switcher, and to be tight; each new test
 has a negative control that fails it.
 

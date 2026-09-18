@@ -70,7 +70,7 @@ const HOTKEY_APPS: u32 = 3;
 /// **Four, not nine.** `MAX_HOTKEYS` is sixteen and each desktop costs two chords — one to
 /// switch, one to move — so nine would leave no room for the minimize and rename chords here,
 /// let alone Part E's overview. Desktops past the fourth exist and hold windows; they are
-/// reached by the indicator rather than by a chord.
+/// reached by the switcher and the overview rather than by a chord.
 const CHORD_DESKTOPS: u32 = 4;
 /// Ids `HOTKEY_SWITCH_BASE + n` switch to desktop `n`; `HOTKEY_MOVE_BASE + n` move to it.
 const HOTKEY_SWITCH_BASE: u32 = 10;
@@ -86,7 +86,9 @@ use libsurface::{Session, Transport};
 use libsurface::ipc::ChannelTransport;
 use libui::element::{Element, Insets, column, custom, fill, offset, padding, row, sized, stack, text};
 use libui::layout::layout;
-use desktop_shell::{Application, BAR_H, SIDE_W, Screen, THUMB_PAD, THUMB_W, parse_entry};
+use desktop_shell::{
+    Application, BAR_H, SIDE_W, Screen, ShownDesktop, THUMB_PAD, THUMB_W, parse_entry,
+};
 use desktop_shell::panel::{self, BottomMsg, MenuMsg, TopMsg};
 use libui::menu::{Item, KeyOutcome, MenuState};
 use libui::window::Child;
@@ -271,7 +273,7 @@ fn normalize_desktops(
     before != desktops.iter().map(|d| d.id).collect::<alloc::vec::Vec<u32>>()
 }
 
-/// What the indicator shows: the desktop's name, or its position when it has none.
+/// What the switcher shows beside its cells: the desktop's name, or its position when it has none.
 ///
 /// **Its position, not its id.** Ids are stable and never reused, so after a few desktops have
 /// come and gone they stop matching what a person sees — and `Super+N` addresses the Nth
@@ -1711,7 +1713,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // **What show-desktop put away, and on which desktop** — the restore set, which is the
     // shell's because minimising is a manager operation and the compositor keeps no policy (the
     // plan's review, finding 6). `None` when the desktop is not being shown.
-    let mut shown: Option<(u32, alloc::vec::Vec<u32>)> = None;
+    let mut shown: Option<ShownDesktop> = None;
 
     // **The manager channel, which makes this the compositor's first real manager.**
     //
@@ -2017,6 +2019,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             }
         }
         if let Some(m) = manager.as_mut() {
+            // **The compositor told of any move the desktop endpoint just made, before a window
+            // can be drained.** A `Name` there normalises, and can move the shell off an emptied
+            // desktop; a window drained after that is recorded on the shell's current desktop and
+            // must have been created on the same one (PR #314 review, optional 6).
+            sync_current(m, &desktops, current_desktop, &mut told_desktop);
             // The shell's own windows are never listed: the bars and the wallpaper are
             // `panel`s and the menus and the name prompt `popup`s, so the role filter already
             // covers them, but
@@ -2145,15 +2152,15 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut next_desktop_id,
             );
             for id in fired {
-                // **Bounded exactly as the click is**, and the reason is `Screen::max_entries`' own:
-                // an entry past it is neither drawn nor clickable, so minimizing one would take
+                // **Bounded exactly as the click is**, and the reason is the bar's capacity's own
+                // (`task_capacity`): an entry past it is neither drawn nor clickable, so minimizing one would take
                 // the window off screen with no way to bring it back — "a window you cannot get
                 // back rather than a cosmetic problem", which is what that bound exists to
                 // prevent. Unbounded, the chord invalidated its own justification
                 // (PR #242 review, finding 3).
                 // **`Super+N`: switch.** The chord names the *Nth* desktop, not desktop id N —
                 // ids are stable and never reused, so after a few have come and gone they stop
-                // matching what a person sees on the indicator.
+                // matching what a person sees on the switcher.
                 if (HOTKEY_SWITCH_BASE + 1..=HOTKEY_SWITCH_BASE + CHORD_DESKTOPS).contains(&id) {
                     let n = (id - HOTKEY_SWITCH_BASE) as usize;
                     if let Some(d) = desktops.get(n - 1) {
@@ -2256,7 +2263,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     continue;
                 }
                 // **Bounded by what the bar is *showing*, which since Part D is not the first
-                // `max_entries` of the global list but the first `max_entries` on the current
+                // `task_capacity` of the global list but the first `task_capacity` on the current
                 // desktop.** With seven windows on another desktop and one here, the one here
                 // is drawn, clickable and focused — and its index in `entries` is 7, so a bound
                 // over the global list never reached it and the chord silently did nothing for
@@ -2696,8 +2703,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             }
                             // **A click on the overview's own background dismisses it**, which
                             // is what clicking outside a menu does everywhere else. It also
-                            // makes the indicator a toggle for free: the overview covers the
-                            // bar, so a second click where the indicator is lands here.
+                            // makes the desktop's name a toggle for free: the overview covers
+                            // the bar, so a second click where the name is lands here.
                             (None, None) => {
                                 close_overview(
                                     &mut session,
@@ -2746,7 +2753,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             if Some(w) == bottom
                 && let Some(bb) = bottom_bar.as_mut()
             {
-                let lit = shown.as_ref().is_some_and(|(d, _)| *d == current_desktop);
+                let lit = shown.as_ref().is_some_and(|s| s.desktop == current_desktop);
                 let view = bottom_view(
                     &entries, &desktops, current_desktop, lit, bb.hovered_key(), &theme, &font, screen,
                 );
@@ -2892,12 +2899,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
 
         // **Show-desktop lets go the moment anything on that desktop is back** — a window
-        // restored from its button, a new one opened, one moved there. Its second press means
-        // "bring back what the first put away", which stops being a coherent request once the
-        // desktop is not what the first press left; and the button's light is what says whether
-        // there is anything to bring back.
-        if let Some((d, _)) = shown.as_ref()
-            && entries.iter().any(|e| e.desktop == *d && !e.minimized)
+        // restored from its button, a new one opened, one moved there — but not a window the press
+        // could not reach, which was never put away (`ShownDesktop::holds`; PR #314 review,
+        // blocking 1). Its second press means "bring back what the first put away", which stops
+        // being a coherent request once the desktop is not what the first press left; and the
+        // button's light is what says whether there is anything to bring back.
+        if let Some(s) = shown.as_ref()
+            && !s.holds(&windows_of(&entries))
         {
             shown = None;
             list_dirty = true;
@@ -4241,9 +4249,12 @@ fn tell_current(mgr: &mut ChannelTransport, to: u32) -> bool {
 /// found its terminal on a desktop the compositor was no longer compositing — listed, unfocused,
 /// and not on screen. The chords had the same hole.
 ///
-/// **Called after every stretch that can normalise**, rather than at each of the eight calls:
-/// what matters is that the compositor has been told before the next window it creates, and a
-/// window arrives only through the manager drain.
+/// **Called at three points a pass, rather than at each of the eight normalisations**: before the
+/// manager drain, after it, and after the event drain. What matters is that the compositor has
+/// been told before a window is drained, because a window arrives only through the manager drain
+/// and is recorded there on the shell's current desktop. The call *before* the drain is the one a
+/// first version lacked: the desktop endpoint runs ahead of it and can normalise too (PR #314
+/// review, optional 6).
 fn sync_current(mgr: &mut ChannelTransport, desktops: &[Desktop], current: u32, told: &mut u32) {
     if current == *told {
         return;
@@ -4564,7 +4575,10 @@ fn place_new_windows(
             origin: (0, 0),
             size: (created.width, created.height),
             // The compositor creates a window onto *its* current desktop, and the shell is what
-            // set that — so this is not a guess, it is the same number read from the other side.
+            // set that. **The same number only because `sync_current` runs before every drain** —
+            // it was not, until the desktop refresh's Part C: the shell moved its current desktop
+            // off a removed one without telling the compositor, and from then on this recorded the
+            // shell's number for windows the compositor had put on another.
             desktop: current,
         });
         dirty = true;
@@ -4618,29 +4632,40 @@ fn present_bottom(
     entries: &[WinEntry],
     desktops: &[Desktop],
     current: u32,
-    shown: &Option<(u32, alloc::vec::Vec<u32>)>,
+    shown: &Option<ShownDesktop>,
     theme: &Theme,
     panel_theme: &Theme,
     font: &Font,
     screen: Screen,
 ) {
     let Some(bar) = bar else { return };
-    let lit = shown.as_ref().is_some_and(|(d, _)| *d == current);
+    let lit = shown.as_ref().is_some_and(|s| s.desktop == current);
     let view = bottom_view(entries, desktops, current, lit, bar.hovered_key(), theme, font, screen);
     if !bar.present(session, &view, font, panel_theme) {
         kprint(b"desktop-shell: bottom bar Commit failed\n");
     }
 }
 
-/// Show-desktop: put away every window on `current`, or bring back what the last press put away.
+/// The windows as show-desktop sees them — see [`ShownDesktop`].
+fn windows_of(entries: &[WinEntry]) -> alloc::vec::Vec<desktop_shell::Window> {
+    entries
+        .iter()
+        .map(|e| desktop_shell::Window {
+            id: e.id,
+            desktop: e.desktop,
+            minimized: e.minimized,
+            focused: e.focused,
+        })
+        .collect()
+}
+
+/// Show-desktop: put away every window on `current` the bar has a button for, or bring back what
+/// the last press put away.
 ///
-/// **The restore set is exactly what this minimised**, not "everything minimised": a window put
-/// away before the press stays away after the second one, which is what makes the pair undo each
-/// other. **The window that had the keyboard is raised last**, so it is on top and focused again.
-///
-/// **Only the windows the bar shows** — the first `capacity` — for the reason `Super+H` is bounded
-/// the same way: a window past the bar's end has no button, so one minimised here and then left
-/// behind when the set is dropped would be a window with no way back.
+/// **What to put away, and whether the set still holds, is [`ShownDesktop`]'s** — host-tested,
+/// including the desktop with more windows than buttons, whose windows past the bar's end are left
+/// up and must not count as something coming back (PR #314 review, blocking 1). This is the half
+/// that talks to the compositor.
 ///
 /// **One set at a time.** Showing a second desktop forgets the first's, whose windows are still
 /// on that desktop's buttons — which is where any minimised window comes back from.
@@ -4649,12 +4674,12 @@ fn show_desktop(
     entries: &mut [WinEntry],
     current: u32,
     capacity: usize,
-    shown: &mut Option<(u32, alloc::vec::Vec<u32>)>,
+    shown: &mut Option<ShownDesktop>,
 ) {
     // Taken only if it is this desktop's: another desktop's set is still that desktop's to undo.
-    if let Some((_, ids)) = shown.take_if(|(d, _)| *d == current) {
+    if let Some(s) = shown.take_if(|s| s.desktop == current) {
         let mut back = 0u64;
-        for id in ids {
+        for id in s.put_away {
             if let Some(e) = entries.iter_mut().find(|e| e.id == id && e.minimized)
                 && raise_window(mgr, e)
             {
@@ -4664,29 +4689,29 @@ fn show_desktop(
         Line::new().s(b"desktop-shell: restored ").u(back).s(b" window(s)").end();
         return;
     }
-    let showing: alloc::vec::Vec<u32> =
-        visible_entries(entries, current, capacity).iter().filter(|e| !e.minimized).map(|e| e.id).collect();
-    let mut ids = alloc::vec::Vec::new();
-    let mut focused = None;
-    for e in entries.iter_mut().filter(|e| showing.contains(&e.id)) {
-        let (id, had_keyboard) = (e.id, e.focused);
-        if minimize_window(mgr, e) {
-            if had_keyboard {
-                focused = Some(id);
-            } else {
-                ids.push(id);
-            }
+    let Some(mut plan) = ShownDesktop::plan(&windows_of(entries), current, capacity) else {
+        kprint(b"desktop-shell: showing the desktop, minimised 0 window(s)\n");
+        return;
+    };
+    // **A refusal is a window left up**, like one past the bar's end: it was never put away, so
+    // its being up is not something coming back.
+    let mut refused = alloc::vec::Vec::new();
+    plan.put_away.retain(|id| {
+        let ok = entries.iter_mut().find(|e| e.id == *id).is_some_and(|e| minimize_window(mgr, e));
+        if !ok {
+            refused.push(*id);
         }
-    }
-    ids.extend(focused);
+        ok
+    });
+    plan.left_up.extend(refused);
     Line::new()
         .s(b"desktop-shell: showing the desktop, minimised ")
-        .u(ids.len() as u64)
+        .u(plan.put_away.len() as u64)
         .s(b" window(s)")
         .end();
     // **Nothing put away is nothing to bring back**, so the button stays unlit.
-    if !ids.is_empty() {
-        *shown = Some((current, ids));
+    if !plan.put_away.is_empty() {
+        *shown = Some(plan);
     }
 }
 

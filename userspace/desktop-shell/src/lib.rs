@@ -135,9 +135,128 @@ impl Screen {
     }
 }
 
+/// One window, as show-desktop sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Window {
+    /// The compositor's id.
+    pub id: u32,
+    /// The desktop it is on.
+    pub desktop: u32,
+    /// Whether it is put away.
+    pub minimized: bool,
+    /// Whether it holds the keyboard.
+    pub focused: bool,
+}
+
+/// What show-desktop put away on one desktop, and what it could not reach (desktop refresh,
+/// Part C).
+///
+/// **Both halves are kept**, and the second is what the review of PR #314 found missing. A press
+/// puts away only the windows the bar has buttons for — `Super+H`'s bound, since a window past
+/// the bar's end minimised and then abandoned would have no way back — so on a desktop with more
+/// windows than buttons, some stay up. A check of "is anything on this desktop up again" then
+/// found those, in the same pass as the press, and dropped the set before the button could light:
+/// the second press brought nothing back.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShownDesktop {
+    /// The desktop it is on.
+    pub desktop: u32,
+    /// What the press put away, in the order it comes back: the window that had the keyboard last,
+    /// so it is on top and focused again.
+    pub put_away: alloc::vec::Vec<u32>,
+    /// What the press left up because the bar has no button for it — or because putting it away
+    /// was refused.
+    pub left_up: alloc::vec::Vec<u32>,
+}
+
+impl ShownDesktop {
+    /// What a press on `desktop` should put away, given every window in the bar's order and how
+    /// many buttons the bar has. `None` when nothing it could reach is up — a press with nothing
+    /// to bring back leaves the button unlit.
+    ///
+    /// **Only what is up is put away**, so a window already minimised before the press is not in
+    /// the set and stays put away after the second — which is what makes the pair undo each other.
+    pub fn plan(windows: &[Window], desktop: u32, capacity: usize) -> Option<Self> {
+        let (mut put_away, mut left_up, mut focused) = (alloc::vec::Vec::new(), alloc::vec::Vec::new(), None);
+        for (i, w) in windows.iter().filter(|w| w.desktop == desktop).enumerate() {
+            if w.minimized {
+                continue;
+            }
+            if i >= capacity {
+                left_up.push(w.id);
+            } else if w.focused {
+                focused = Some(w.id);
+            } else {
+                put_away.push(w.id);
+            }
+        }
+        put_away.extend(focused);
+        (!put_away.is_empty()).then_some(ShownDesktop { desktop, put_away, left_up })
+    }
+
+    /// Whether the desktop is still as the press left it: nothing on it is up but what the press
+    /// could not reach.
+    ///
+    /// **Anything else up means something came back another way** — a window restored from its
+    /// button, a new one, one moved here — and then "bring back what the first press put away" is
+    /// no longer a coherent request. The button's light is this answer.
+    pub fn holds(&self, windows: &[Window]) -> bool {
+        windows
+            .iter()
+            .all(|w| w.desktop != self.desktop || w.minimized || self.left_up.contains(&w.id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn win(id: u32, desktop: u32, minimized: bool, focused: bool) -> Window {
+        Window { id, desktop, minimized, focused }
+    }
+
+    /// Six windows and five buttons — the review's scenario at 1360×768 — and the press still
+    /// holds its set, because the sixth is the one it could not reach.
+    #[test]
+    fn show_desktop_holds_with_more_windows_than_buttons() {
+        let before: alloc::vec::Vec<Window> = (1..=6).map(|i| win(i, 1, false, i == 3)).collect();
+        let s = ShownDesktop::plan(&before, 1, 5).expect("five things to put away");
+        assert_eq!(s.put_away, [1, 2, 4, 5, 3], "the focused window comes back last");
+        assert_eq!(s.left_up, [6]);
+        // After the press: the five are down, the sixth is not.
+        let after: alloc::vec::Vec<Window> =
+            before.iter().map(|w| Window { minimized: w.id != 6, focused: false, ..*w }).collect();
+        assert!(s.holds(&after), "the window past the bar's end is not something coming back");
+    }
+
+    /// Anything on the desktop that is up and was not left up lets the set go — and nothing on
+    /// another desktop does.
+    #[test]
+    fn show_desktop_lets_go_when_something_comes_back_another_way() {
+        let s = ShownDesktop { desktop: 1, put_away: alloc::vec![1, 2], left_up: alloc::vec![3] };
+        let quiet = [win(1, 1, true, false), win(2, 1, true, false), win(3, 1, false, false)];
+        assert!(s.holds(&quiet));
+        let restored = [win(1, 1, false, true), win(2, 1, true, false), win(3, 1, false, false)];
+        assert!(!s.holds(&restored), "a window restored from its button");
+        let mut arrived = quiet.to_vec();
+        arrived.push(win(9, 1, false, true));
+        assert!(!s.holds(&arrived), "a new window, or one moved here");
+        let mut elsewhere = quiet.to_vec();
+        elsewhere.push(win(9, 2, false, true));
+        assert!(s.holds(&elsewhere), "another desktop's windows are not this press's business");
+    }
+
+    /// A window already put away before the press is not in the set, so the second press does not
+    /// bring it back — the pair undo each other. And a press with nothing up plans nothing.
+    #[test]
+    fn show_desktop_brings_back_exactly_what_it_put_away() {
+        let before = [win(1, 1, true, false), win(2, 1, false, true), win(3, 2, false, false)];
+        let s = ShownDesktop::plan(&before, 1, 5).unwrap();
+        assert_eq!(s.put_away, [2], "not the one already minimised, and not another desktop's");
+        assert!(ShownDesktop::plan(&[win(1, 1, true, false)], 1, 5).is_none());
+        // A window past the bar's end is never put away, even when it is the only one up.
+        assert!(ShownDesktop::plan(&[win(1, 1, true, false), win(2, 1, false, false)], 1, 1).is_none());
+    }
 
     /// Sizes the shell has been or will be run at, and the edges of the arithmetic.
     const SIZES: [(u32, u32); 9] = [

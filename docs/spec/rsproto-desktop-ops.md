@@ -23,7 +23,7 @@ Resolving `/dev/desktop` with a **non-empty suffix** is `NotFound`: there is no 
 
 ## Positions, not ids
 
-Every op that names a desktop names a **position**, one-based, as the desktop indicator counts
+Every op that names a desktop names a **position**, one-based, as the bottom bar's switcher counts
 them. Ids are stable and never reused, so after a few desktops have come and gone they stop
 matching what anyone sees — and `Super+N` addresses positions for the same reason. `List` reports
 both, so a caller that wants to hold on to a desktop across a renumbering can.
@@ -127,4 +127,4 @@ nothing that would go stale unnoticed.
 
 - [Wire format](rsproto-wire-format.md) — envelope, categories, reply rules
 - [`ui-composition-model.md`](../architecture/ui-composition-model.md) — what a desktop *is*, and §2a's namespace sketch
-- [`desktop-shell.md`](../architecture/desktop-shell.md) — the bar, the indicator and the overview that drive the same model
+- [`desktop-shell.md`](../architecture/desktop-shell.md) — the bar, its switcher and the overview that drive the same model

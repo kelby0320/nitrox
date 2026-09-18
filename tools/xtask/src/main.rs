@@ -3951,9 +3951,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    pointing device until USB (Phase 6), so without a chord a session could be logged into
     //    and never used.
     //
-    //    The bar spans the screen at y=0 and `Applications` is its first word, 126 pixels wide
-    //    at the staged font size, so a press at (60, 12) lands inside it — which
-    //    `desktop_shell::panel`'s own test pins against this literal (desktop refresh, Part C).
+    //    The bar spans the screen at y=0 and `Applications` is its first word, 116 pixels wide
+    //    at the staged 14 px (126 at the built-in 16), so a press at (60, 12) lands inside it —
+    //    which `desktop_shell::panel`'s own test pins against this literal at both sizes
+    //    (desktop refresh, Part C).
     //    Asserted through the compositor's own `press at` line first, for the reason
     //    `check-terminal` gives: it separates "the pointer was not there" from "the pointer was
     //    there and nothing happened".
@@ -4164,8 +4165,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     type_into_menu(&mut qmp, &mut session, "nxterm")?;
     // **The menu hangs 8 pixels in from its word and 2 below the bar**, at (8, 32), with the
     // filter field above its rows (desktop refresh, Part C) — so the one row left sits a field's
-    // height below that, at y 73 to 101. `desktop_shell::panel`'s own test pins this literal
-    // against a layout of the menu with the staged font. `click_at` asserts the press position
+    // height below that, at y 71 to 97 in the staged 14 px (73 to 101 at the built-in 16).
+    // `desktop_shell::panel`'s own test pins this literal against a layout of the menu at both. `click_at` asserts the press position
     // before anything downstream is checked, which is what separates "the pointer was not over
     // the row" from "it was, and the click did nothing".
     const ROW1: (i32, i32) = (60, 87);
@@ -4260,8 +4261,11 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      window this desktop's bar shows and lights the button; the second brings back exactly
     //      what the first put away. The restore set is the shell's, because minimising is a
     //      manager operation — which the plan's first draft put in the compositor (its review,
-    //      finding 6). One window here, so the count is the claim: a press that put away nothing,
-    //      or brought back something it had not put away, says so.
+    //      finding 6). **One window here**, so the counts say the press put something away and
+    //      brought it back, and no more: that it brings back *exactly* what it put away — not a
+    //      window already minimised, not one past the bar's end — needs more windows than this
+    //      step has, and is `desktop_shell::ShownDesktop`'s host tests (PR #314 review, optional
+    //      5).
     let show = size.show_desktop_click();
     click_at(&mut qmp, &mut session, show.0, show.1)?;
     session.expect("desktop-shell: showing the desktop, minimised 1 window(s)")?;
@@ -6209,9 +6213,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //
     //     **Last, because it leaves a browser on screen** that nothing after it has to account
     //     for. Both aims are pinned against the bar's and the menu's layout by
-    //     `desktop_shell::panel`'s own test, as `APPS_CLICK` and `ROW1` are: the Places word is
-    //     x 126 to 190, and the menu hangs at (134, 32) with `Documents` its second row, y 66 to
-    //     94.
+    //     `desktop_shell::panel`'s own test at both text sizes, as `APPS_CLICK` and `ROW1` are.
+    //     In the staged 14 px the Places word is x 116 to 175 and the menu hangs at (124, 32)
+    //     with `Documents` its second row, y 64 to 90; at the built-in 16 they are 126 to 190,
+    //     (134, 32) and 66 to 94.
     const PLACES_CLICK: (i32, i32) = (158, 12);
     const PLACE_DOCUMENTS: (i32, i32) = (180, 80);
     click_at(&mut qmp, &mut session, PLACES_CLICK.0, PLACES_CLICK.1)?;
@@ -6374,23 +6379,20 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         )
         .into());
     }
-    // **The browser started in the place, and listed it** (step 13). Two lines, because each
-    // says something the other does not: the first that the argument reached the browser, the
-    // second that it read the directory it was sent to — a browser that logged its argument and
-    // then navigated home would pass the first alone. Neither can see the sidebar, which is why
-    // `nxfiles` keeps `HOME` as its home whatever it starts at, and says so where it decides.
-    for want in ["nxfiles: starting at /home/Documents", "nxfiles: listed /home/Documents - "] {
-        if !transcript.contains(want) {
-            let path = build_cache().join("guest-transcript-check-login.log");
-            let _ = fs::write(&path, &transcript);
-            return Err(format!(
-                "the Places menu launched the file browser, but the transcript has no \"{want}\": \
-                 `nxfiles` must start in the place it is given as `argv[1]`, not at its home.\n\n\
-                 the transcript is at {}",
-                path.display()
-            )
-            .into());
-        }
+    // **The browser started in the place, and listed it** (step 13) — the listing searched for
+    // only *after* the start, because this gate has the browser list `/home/Documents` from its
+    // sidebar long before, and a whole-transcript search passed a browser that logged its argument
+    // and then navigated home (PR #314 review, blocking 2). Neither line can see the sidebar, which
+    // is why `nxfiles` keeps `HOME` as its home whatever it starts at, and says so where it decides.
+    if let Err(why) = started_and_listed(&transcript, "/home/Documents") {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err(format!(
+            "the Places menu launched the file browser, but {why}: `nxfiles` must start in the \
+             place it is given as `argv[1]` and list it, not its home.\n\nthe transcript is at {}",
+            path.display()
+        )
+        .into());
     }
     if let Err(e) = check_two_sessions(&transcript) {
         let path = build_cache().join("guest-transcript-check-login.log");
@@ -6404,6 +6406,26 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         "\nxtask: graphical login gate PASSED — refused a wrong password, ran a session, and a \
          serial login ran beside it ✓"
     );
+    Ok(())
+}
+
+/// Whether the file browser started at `path` and **then** listed it.
+///
+/// **Line by line, and the listing only after the start.** One browser prints both, in that
+/// order, so the order is the claim; a listing of the same directory from before the start — which
+/// `check-login` has, from the sidebar step — says nothing about this browser. Exact on the start
+/// line, so `/home/Documents/sub` is not `/home/Documents`. Another browser listing the same
+/// directory in between would satisfy it; none is driven while step 13 runs.
+fn started_and_listed(transcript: &str, path: &str) -> Result<(), String> {
+    let start = format!("nxfiles: starting at {path}");
+    let listed = format!("nxfiles: listed {path} - ");
+    let mut lines = transcript.lines().map(|l| l.trim_end_matches('\r'));
+    if !lines.any(|l| l == start) {
+        return Err(format!("the transcript has no \"{start}\""));
+    }
+    if !lines.any(|l| l.starts_with(&listed)) {
+        return Err(format!("nothing after \"{start}\" says \"{listed}…\""));
+    }
     Ok(())
 }
 
@@ -14164,6 +14186,27 @@ LLVM version: 22.1.2
 #[cfg(test)]
 mod diag_tests {
     use super::*;
+
+    /// The listing counts only after the start — the check `check-login`'s step 13 makes, and the
+    /// one a whole-transcript search could not fail (PR #314 review, blocking 2).
+    #[test]
+    fn a_browser_started_at_a_place_must_list_it_afterwards() {
+        let p = "/home/Documents";
+        // The sidebar step's listing, then a browser that started there and went home.
+        let went_home = "nxfiles: listed /home/Documents - 2 entries\r\n\
+                         nxfiles: starting at /home/Documents\r\n\
+                         nxfiles: listed /home - 5 entries\r\n";
+        assert!(started_and_listed(went_home, p).is_err(), "the earlier listing must not count");
+        let honest = "nxfiles: listed /home/Documents - 2 entries\n\
+                      nxfiles: starting at /home/Documents\n\
+                      desktop-shell: placed window 20 at 24,54\n\
+                      nxfiles: listed /home/Documents - 2 entries\n";
+        assert_eq!(started_and_listed(honest, p), Ok(()));
+        // A deeper directory is not this one, at either end.
+        let deeper = "nxfiles: starting at /home/Documents/sub\nnxfiles: listed /home/Documents - 1 entries\n";
+        assert!(started_and_listed(deeper, p).is_err());
+        assert!(started_and_listed("nxfiles: listed /home/Documents - 1 entries\n", p).is_err());
+    }
 
     #[test]
     fn the_derived_click_points_at_the_old_size_are_the_literals_they_replaced() {

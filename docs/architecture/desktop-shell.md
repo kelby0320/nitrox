@@ -446,4 +446,5 @@ a role into a shipped protocol is the kind of change that touches every client.
 - **Does the launcher search beyond programs?** Files and open windows are the obvious
   extensions, and each adds an indexing problem.
 - **Live thumbnails** as an optimisation. Trigger: the frozen ones being visibly wrong in use.
-- **Indicator or switcher** (§7) — decidable empirically after living with the bar.
+- ~~**Indicator or switcher** (§7)~~ — **decided by the desktop refresh's Part C**: a switcher,
+  bounded to three cells, with the name beside it. §7a has the reasoning.

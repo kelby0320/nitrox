@@ -618,6 +618,18 @@ mod tests {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
     }
 
+    /// The text sizes every aim must hold at: **14, what the image stages** — `xtask`'s
+    /// `THEME_FONT_PX`, and so what every gate boots — and 16, the built-in theme's, for a session
+    /// with no theme file. The bars are laid out in the session's theme, so an aim pinned at one
+    /// size could drift out of its target at the other with nothing failing; the first version of
+    /// these tests pinned 16 alone while the guest drew 14 (PR #314 review, finding 4).
+    const FONT_SIZES: [f32; 2] = [14.0, 16.0];
+
+    /// The light theme at each of [`FONT_SIZES`].
+    fn themes() -> impl Iterator<Item = Theme> {
+        FONT_SIZES.into_iter().map(|px| Theme { font_px: px, ..Theme::light() })
+    }
+
     fn app(name: &str, exec: &str) -> Application {
         Application { name: String::from(name), exec: String::from(exec) }
     }
@@ -647,46 +659,52 @@ mod tests {
     /// moves a word under them fails a host test rather than a boot.
     #[test]
     fn the_gates_aims_land_on_the_words_they_name() {
-        let (f, theme) = (font(), Theme::light());
-        let m = FontMetrics::new(&f, theme.font_px);
-        for width in [1024u32, 1280, 1360, 1920] {
-            let bounds = Rect::new(0, 0, width, BAR_H);
-            let bar = top_bar("12:34", None, None, &theme);
-            assert_eq!(click(&bar, bounds, &m, 60, 12), [TopMsg::Menu(APPS)], "APPS_CLICK at {width}");
-            assert_eq!(click(&bar, bounds, &m, 158, 12), [TopMsg::Menu(PLACES)], "PLACES_CLICK at {width}");
-            // And the clock is not a control: a press on it is a press on the bar.
-            assert!(click(&bar, bounds, &m, width as i32 / 2, 12).is_empty(), "the clock at {width}");
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            for width in [1024u32, 1280, 1360, 1920] {
+                let bounds = Rect::new(0, 0, width, BAR_H);
+                let bar = top_bar("12:34", None, None, &theme);
+                assert_eq!(click(&bar, bounds, &m, 60, 12), [TopMsg::Menu(APPS)], "APPS_CLICK at {width}");
+                assert_eq!(click(&bar, bounds, &m, 158, 12), [TopMsg::Menu(PLACES)], "PLACES_CLICK at {width}");
+                // And the clock is not a control: a press on it is a press on the bar.
+                assert!(click(&bar, bounds, &m, width as i32 / 2, 12).is_empty(), "the clock at {width}");
+            }
         }
     }
 
     /// The clock is centred on the **screen**, which is what the old bar's balancing slot was for.
     #[test]
     fn the_clock_is_centred_on_the_bar_whatever_is_left_of_it() {
-        let (f, theme) = (font(), Theme::light());
-        let m = FontMetrics::new(&f, theme.font_px);
-        for width in [1024u32, 1360, 2560] {
-            let bar = top_bar("12:34", None, None, &theme);
-            let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
-            // The clock layer is the stack's second: padding → center → text.
-            let t = l.children[1].children[0].children[0].rect;
-            let mid = t.origin.x + t.size.w as i32 / 2;
-            assert!((mid - width as i32 / 2).abs() <= 1, "clock centred at {mid}, not {}", width / 2);
-            assert!(t.size.w > 0, "the clock drew nothing");
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            for width in [1024u32, 1360, 2560] {
+                let bar = top_bar("12:34", None, None, &theme);
+                let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
+                // The clock layer is the stack's second: padding → center → text.
+                let t = l.children[1].children[0].children[0].rect;
+                let mid = t.origin.x + t.size.w as i32 / 2;
+                assert!((mid - width as i32 / 2).abs() <= 1, "clock centred at {mid}, not {}", width / 2);
+                assert!(t.size.w > 0, "the clock drew nothing");
+            }
         }
     }
 
     /// A menu hangs 8 pixels in from its word and 2 below the bar — the design's positions.
     #[test]
     fn a_menu_hangs_from_the_word_that_opened_it() {
-        let (f, theme) = (font(), Theme::light());
-        let m = FontMetrics::new(&f, theme.font_px);
-        let bar = top_bar("", None, None, &theme);
-        let l = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
-        let apps = locate(&bar, &l, APPS_KEY).expect("the Applications word");
-        let places = locate(&bar, &l, PLACES_KEY).expect("the Places word");
-        assert_eq!(menu_anchor(apps), (8, 32));
-        assert_eq!(menu_anchor(places), (places.origin.x + 8, 32));
-        assert_eq!(places.origin.x, apps.right() as i32, "Places sits right after Applications");
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            let bar = top_bar("", None, None, &theme);
+            let l = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
+            let apps = locate(&bar, &l, APPS_KEY).expect("the Applications word");
+            let places = locate(&bar, &l, PLACES_KEY).expect("the Places word");
+            assert_eq!(menu_anchor(apps), (8, 32));
+            assert_eq!(menu_anchor(places), (places.origin.x + 8, 32));
+            assert_eq!(places.origin.x, apps.right() as i32, "Places sits right after Applications");
+        }
     }
 
     /// The bar keeps diffing as a word lights and its menu opens — a shape `diff` refuses is a bar
@@ -786,39 +804,41 @@ mod tests {
     /// clicks `Documents` at `PLACE_DOCUMENTS`. Both are screen coordinates.
     #[test]
     fn the_gates_row_aims_land_on_the_rows_they_name() {
-        let (f, theme) = (font(), Theme::light());
-        let m = FontMetrics::new(&f, theme.font_px);
-        let apps = staged();
-        let places = libfs::places("/home");
-        let bar = top_bar("", None, None, &theme);
-        let bl = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            let apps = staged();
+            let places = libfs::places("/home");
+            let bar = top_bar("", None, None, &theme);
+            let bl = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
 
-        // The popup's own coordinates are the screen's less its anchor.
-        let aim = |which: usize, query: &str, key: u64, (sx, sy): (i32, i32)| {
-            let word = locate(&bar, &bl, if which == APPS { APPS_KEY } else { PLACES_KEY }).unwrap();
-            let (ax, ay) = menu_anchor(word);
-            let table = menus(&apps, query, &places, "/home", &theme);
-            let mut q = TextFieldState::new();
-            for c in query.chars() {
-                q.insert(c);
-            }
-            let view = menu_view(which, &table, &MenuState::new(2), None, &q, &theme);
-            let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
-            let msgs = click(&view, Rect::new(0, 0, size.w, size.h), &m, sx - ax, sy - ay);
-            let want = table[which].items.iter().enumerate().find_map(|(i, it)| {
-                (ROW_KEY_BASE + i as u64 == key).then(|| match it {
-                    Item::Action { msg, .. } => *msg,
-                    Item::Separator => MenuMsg::Nothing,
-                })
-            });
-            (msgs, want)
-        };
-        let (got, want) = aim(APPS, "nxterm", ROW_KEY_BASE, (60, 87));
-        assert_eq!(got, [want.unwrap()], "ROW1 is the one row left after typing nxterm");
-        assert_eq!(got, [MenuMsg::Launch(1)]);
-        let (got, _) = aim(PLACES, "", ROW_KEY_BASE + 1, (180, 80));
-        assert_eq!(got, [MenuMsg::Place(1)], "PLACE_DOCUMENTS is the second row");
-        assert_eq!(places[1].name, "Documents");
+            // The popup's own coordinates are the screen's less its anchor.
+            let aim = |which: usize, query: &str, key: u64, (sx, sy): (i32, i32)| {
+                let word = locate(&bar, &bl, if which == APPS { APPS_KEY } else { PLACES_KEY }).unwrap();
+                let (ax, ay) = menu_anchor(word);
+                let table = menus(&apps, query, &places, "/home", &theme);
+                let mut q = TextFieldState::new();
+                for c in query.chars() {
+                    q.insert(c);
+                }
+                let view = menu_view(which, &table, &MenuState::new(2), None, &q, &theme);
+                let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
+                let msgs = click(&view, Rect::new(0, 0, size.w, size.h), &m, sx - ax, sy - ay);
+                let want = table[which].items.iter().enumerate().find_map(|(i, it)| {
+                    (ROW_KEY_BASE + i as u64 == key).then(|| match it {
+                        Item::Action { msg, .. } => *msg,
+                        Item::Separator => MenuMsg::Nothing,
+                    })
+                });
+                (msgs, want)
+            };
+            let (got, want) = aim(APPS, "nxterm", ROW_KEY_BASE, (60, 87));
+            assert_eq!(got, [want.unwrap()], "ROW1 is the one row left after typing nxterm");
+            assert_eq!(got, [MenuMsg::Launch(1)]);
+            let (got, _) = aim(PLACES, "", ROW_KEY_BASE + 1, (180, 80));
+            assert_eq!(got, [MenuMsg::Place(1)], "PLACE_DOCUMENTS is the second row");
+            assert_eq!(places[1].name, "Documents");
+        }
     }
 
     /// The name prompt measures to a size a popup can be created at — nothing, and everything,
@@ -866,34 +886,36 @@ mod tests {
     /// product the capacity exists for — and the capacity is tight: one more would not fit.
     #[test]
     fn no_task_is_ever_laid_out_under_the_switcher() {
-        let (f, theme) = (font(), Theme::light());
-        let m = FontMetrics::new(&f, theme.font_px);
-        let occupied = [true, false, true, true, false];
-        for width in [640u32, 1024, 1280, 1360, 1366, 1920, 2560] {
-            for label in ["Desktop 1", "cli", "work", "a desktop with a long name, 32b"] {
-                for total in [1usize, 2, 5] {
-                    let d = Desktops { occupied: &occupied[..total], current: total - 1, label };
-                    let n = task_capacity(width, switcher_width(&d, &theme, &m));
-                    let ts = tasks(n);
-                    let bar = bottom_bar(&ts, false, &d, None, &theme);
-                    let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
-                    // The whole group, from its rule — not the name, which starts further in.
-                    let sw = locate(&bar, &l, SWITCHER_KEY).expect("the switcher is laid out");
-                    assert_eq!(sw.size.w, switcher_width(&d, &theme, &m), "{width}/{label}: squeezed");
-                    for t in &ts {
-                        let r = locate(&bar, &l, TASK_KEY_BASE + t.id as u64).unwrap();
-                        assert!(
-                            r.right() <= sw.origin.x as i64 && r.size.w == TASK_W,
-                            "{width}/{label}/{total}: task {} at {r:?} meets the switcher at {sw:?}",
-                            t.id
-                        );
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            let occupied = [true, false, true, true, false];
+            for width in [640u32, 1024, 1280, 1360, 1366, 1920, 2560] {
+                for label in ["Desktop 1", "cli", "work", "a desktop with a long name, 32b"] {
+                    for total in [1usize, 2, 5] {
+                        let d = Desktops { occupied: &occupied[..total], current: total - 1, label };
+                        let n = task_capacity(width, switcher_width(&d, &theme, &m));
+                        let ts = tasks(n);
+                        let bar = bottom_bar(&ts, false, &d, None, &theme);
+                        let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
+                        // The whole group, from its rule — not the name, which starts further in.
+                        let sw = locate(&bar, &l, SWITCHER_KEY).expect("the switcher is laid out");
+                        assert_eq!(sw.size.w, switcher_width(&d, &theme, &m), "{width}/{label}: squeezed");
+                        for t in &ts {
+                            let r = locate(&bar, &l, TASK_KEY_BASE + t.id as u64).unwrap();
+                            assert!(
+                                r.right() <= sw.origin.x as i64 && r.size.w == TASK_W,
+                                "{width}/{label}/{total}: task {} at {r:?} meets the switcher at {sw:?}",
+                                t.id
+                            );
+                        }
+                        let name = locate(&bar, &l, NAME_KEY).expect("the name is laid out");
+                        assert!(name.right() <= width as i64, "{width}/{label}: the name runs off the bar");
+                        // Tight: the next button would not have fitted.
+                        let next_right = TASKS_X + n as u32 * TASK_PITCH + TASK_W;
+                        let switcher_x = width - BAR_PAD_X - switcher_width(&d, &theme, &m);
+                        assert!(next_right + BAR_GAP > switcher_x - BAR_GAP, "{width}/{label}: room for one more");
                     }
-                    let name = locate(&bar, &l, NAME_KEY).expect("the name is laid out");
-                    assert!(name.right() <= width as i64, "{width}/{label}: the name runs off the bar");
-                    // Tight: the next button would not have fitted.
-                    let next_right = TASKS_X + n as u32 * TASK_PITCH + TASK_W;
-                    let switcher_x = width - BAR_PAD_X - switcher_width(&d, &theme, &m);
-                    assert!(next_right + BAR_GAP > switcher_x - BAR_GAP, "{width}/{label}: room for one more");
                 }
             }
         }
@@ -905,37 +927,39 @@ mod tests {
     /// forward arrow and the first cell measured from the right edge too. All at half the bar.
     #[test]
     fn the_gates_bottom_bar_aims_land_on_what_they_name() {
-        let (f, theme) = (font(), Theme::light());
-        let m = FontMetrics::new(&f, theme.font_px);
-        let y = BAR_H as i32 / 2;
-        for width in [1024u32, 1280, 1360, 1920, 2560] {
-            let bounds = Rect::new(0, 0, width, BAR_H);
-            let w = width as i32;
-            for label in ["Desktop 1", "work", "cli", "Desktop 2"] {
+        let f = font();
+        for theme in themes() {
+            let m = FontMetrics::new(&f, theme.font_px);
+            let y = BAR_H as i32 / 2;
+            for width in [1024u32, 1280, 1360, 1920, 2560] {
+                let bounds = Rect::new(0, 0, width, BAR_H);
+                let w = width as i32;
+                for label in ["Desktop 1", "work", "cli", "Desktop 2"] {
+                    let occupied = [true, false];
+                    let d = Desktops { occupied: &occupied, current: 0, label };
+                    let ts = tasks(2);
+                    let bar = bottom_bar(&ts, false, &d, None, &theme);
+                    assert_eq!(click(&bar, bounds, &m, 20, y), [BottomMsg::ShowDesktop], "{width}");
+                    assert_eq!(click(&bar, bounds, &m, 141, y), [BottomMsg::Task(10)], "{width}");
+                    assert_eq!(click(&bar, bounds, &m, 331, y), [BottomMsg::Task(11)], "{width}");
+                    assert!(click(&bar, bounds, &m, 600, y).is_empty(), "{width}: 600 is not empty space");
+                    assert_eq!(click(&bar, bounds, &m, w - 30, y), [BottomMsg::Overview], "{width}/{label}");
+                }
+                // The two the switcher step aims at, with `work` current and the scratch desktop
+                // after it — the state `check-login` is in when it presses them.
                 let occupied = [true, false];
-                let d = Desktops { occupied: &occupied, current: 0, label };
-                let ts = tasks(2);
-                let bar = bottom_bar(&ts, false, &d, None, &theme);
-                assert_eq!(click(&bar, bounds, &m, 20, y), [BottomMsg::ShowDesktop], "{width}");
-                assert_eq!(click(&bar, bounds, &m, 141, y), [BottomMsg::Task(10)], "{width}");
-                assert_eq!(click(&bar, bounds, &m, 331, y), [BottomMsg::Task(11)], "{width}");
-                assert!(click(&bar, bounds, &m, 600, y).is_empty(), "{width}: 600 is not empty space");
-                assert_eq!(click(&bar, bounds, &m, w - 30, y), [BottomMsg::Overview], "{width}/{label}");
+                let d = Desktops { occupied: &occupied, current: 0, label: "work" };
+                let bar = bottom_bar(&tasks(1), false, &d, None, &theme);
+                assert_eq!(click(&bar, bounds, &m, w - NEXT_FROM_RIGHT, y), [BottomMsg::Next], "{width}");
+                // …and from the second desktop, named `Desktop 2`, the first cell and the back arrow.
+                let d = Desktops { occupied: &occupied, current: 1, label: "Desktop 2" };
+                let bar = bottom_bar(&[], false, &d, None, &theme);
+                assert_eq!(
+                    click(&bar, bounds, &m, w - FIRST_CELL_FROM_RIGHT, y),
+                    [BottomMsg::Desktop(0)],
+                    "{width}"
+                );
             }
-            // The two the switcher step aims at, with `work` current and the scratch desktop
-            // after it — the state `check-login` is in when it presses them.
-            let occupied = [true, false];
-            let d = Desktops { occupied: &occupied, current: 0, label: "work" };
-            let bar = bottom_bar(&tasks(1), false, &d, None, &theme);
-            assert_eq!(click(&bar, bounds, &m, w - NEXT_FROM_RIGHT, y), [BottomMsg::Next], "{width}");
-            // …and from the second desktop, named `Desktop 2`, the first cell and the back arrow.
-            let d = Desktops { occupied: &occupied, current: 1, label: "Desktop 2" };
-            let bar = bottom_bar(&[], false, &d, None, &theme);
-            assert_eq!(
-                click(&bar, bounds, &m, w - FIRST_CELL_FROM_RIGHT, y),
-                [BottomMsg::Desktop(0)],
-                "{width}"
-            );
         }
     }
 
@@ -974,12 +998,20 @@ mod tests {
                 fills(c, out);
             }
         }
+        // **The task's own element, found by its key** — not the whole bar, whose current desktop
+        // cell draws in the accent too and hid a focused dot of any colour (PR #314 review,
+        // blocking 3).
+        fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
+            if e.key == Some(key) {
+                return Some(e);
+            }
+            e.children().find_map(|c| keyed(c, key))
+        }
         let task = |t: Task<'static>| {
             let d = Desktops { occupied: &[true], current: 0, label: "x" };
             let mut out = Vec::new();
-            // The task's own subtree is the third item of the bar's row.
             let bar = bottom_bar(&[t], false, &d, None, &theme);
-            fills(&bar, &mut out);
+            fills(keyed(&bar, TASK_KEY_BASE + t.id as u64).expect("the task is keyed"), &mut out);
             out
         };
         let base = Task { id: 1, title: "t", focused: false, minimized: false };
