@@ -133,7 +133,7 @@ const WALLPAPER_W: u32 = 1920;
 /// See [`WALLPAPER_W`]. 16:10, which the gate's 1360x768 is not.
 const WALLPAPER_H: u32 = 1200;
 
-/// The folders staged under the demo home, which `nxfiles::DEFAULT_FOLDERS` names too.
+/// The folders staged under the demo home, which `libfs::HOME_FOLDERS` names too.
 ///
 /// Kept in step by `check-login` rather than by the compiler — see where they are staged.
 const HOME_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
@@ -5020,10 +5020,10 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // row has nothing to select and no second verb, so the listing's double click would be a rule
     // copied past its reason.
     //
-    // **This is also what keeps two spellings of the folder names in step.** `nxfiles` names them
-    // in `DEFAULT_FOLDERS` and the image build stages them from `HOME_FOLDERS`, and this crate
-    // cannot link the browser to compare them — so a folder staged under another name answers
-    // "no such directory" here rather than differing silently.
+    // **This is also what keeps two spellings of the folder names in step.** `libfs` names them
+    // in `HOME_FOLDERS` and the image build stages them from this crate's `HOME_FOLDERS`, and this
+    // crate does not link a guest library to compare them — so a folder staged under another name
+    // answers "no such directory" here rather than differing silently.
     //
     // Sidebar rows are Home, the three folders, then Root; they sit `SIDEBAR_PAD` below the
     // listing rows beside them, because the panel is inset from the content it shares an edge
@@ -13245,8 +13245,8 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // demo home; the right answer once there are real users is for the session to make them on
     // first login, which is `TODO(home-folders)` rather than built.
     //
-    // **Spelled twice, and checked by a boot rather than by the compiler.** `nxfiles` names the
-    // same three in `DEFAULT_FOLDERS` and this crate cannot link it — that is the same reason the
+    // **Spelled twice, and checked by a boot rather than by the compiler.** `libfs` names the
+    // same three in `HOME_FOLDERS` and this crate does not link it — that is the same reason the
     // gate spells a menu row as a number. What keeps them in step is `check-login`: it presses a
     // sidebar row and demands a *listing*, and a folder staged under another name would answer
     // "no such directory" instead.

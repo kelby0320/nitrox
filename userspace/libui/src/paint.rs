@@ -212,6 +212,9 @@ fn draw<F, Msg, C>(
         // drawn; passing the clip would make a one-row repaint paint a one-row gradient.
         Node::Bevel(colour) => fb.fill_rect_bevel(l.rect, clip, *colour, theme.bevel),
         Node::Outline { colour, radius } => fb.outline_rounded_rect(l.rect, clip, *colour, *radius),
+        // The node's own rect for the shape and the clip for how much of it this frame repaints,
+        // for `Bevel`'s reason: a curve taken from the clip would round a partial repaint's edges.
+        Node::RoundedFill { colour, radius } => fb.fill_rounded_rect(l.rect, clip, *colour, *radius),
         Node::Wash { colour, coverage } => fb.blend_rect(clip, *colour, *coverage),
         Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, ink),
         // **Not a container arm**, which is what would happen by default and is the whole bug
@@ -303,6 +306,38 @@ mod tests {
 
     fn fb_has_ink(b: &MemFramebuffer, t: &Theme, x: u32, y: u32) -> bool {
         b.get_pixel(x, y) != Some(t.background)
+    }
+
+    /// A rounded fill is rounded at its **own** corners — not at a partial repaint's.
+    ///
+    /// The second half is the one a shape taken from the clip would fail: repainting a band
+    /// through the middle of the shape must leave that band's ends square, since the shape has no
+    /// corner there.
+    #[test]
+    fn a_rounded_fill_is_rounded_at_its_own_corners_and_nowhere_else() {
+        use crate::element::rounded_fill;
+        let (f, t) = (font(), Theme::default());
+        let red = Rgb::new(200, 0, 0);
+        let e: Element<Msg> = sized(Size::new(40, 30), rounded_fill(red, 8));
+        let mut b = fb();
+        b.clear(t.background);
+        go(&mut b, &f, &t, &e, Rect::new(0, 0, W, H));
+        assert_eq!(b.get_pixel(0, 0), Some(t.background), "the corner is cut");
+        assert_eq!(b.get_pixel(39, 29), Some(t.background), "every corner is cut");
+        assert_eq!(b.get_pixel(20, 0), Some(red), "the straight top edge is solid");
+        assert_eq!(b.get_pixel(0, 15), Some(red), "the straight left edge is solid");
+        assert_eq!(b.get_pixel(20, 15), Some(red), "the middle is the colour");
+        // An edge pixel of the curve is a blend: neither the ground nor the colour.
+        let curve = (0..8).map(|i| b.get_pixel(i, 8 - 1 - i)).find(|p| *p != Some(red) && *p != Some(t.background));
+        assert!(curve.is_some(), "the curve is antialiased, not stepped");
+
+        // A band through the middle, repainted on its own over a clean ground.
+        let mut b = fb();
+        b.clear(t.background);
+        go(&mut b, &f, &t, &e, Rect::new(0, 10, W, 10));
+        assert_eq!(b.get_pixel(0, 10), Some(red), "the band's end is not a corner of the shape");
+        assert_eq!(b.get_pixel(39, 19), Some(red), "nor is its other end");
+        assert_eq!(b.get_pixel(0, 0), Some(t.background), "and nothing outside the band was drawn");
     }
 
     /// Every pixel drawn, as a set of colours.

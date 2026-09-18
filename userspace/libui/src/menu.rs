@@ -20,14 +20,18 @@
 //! it, and the application's key handler asks [`Accel::matches`] rather than re-deriving the
 //! chord. There is no second place to change.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use librsproto::surface::{KeyEvent, MOD_ALT, MOD_CTRL, MOD_SHIFT};
 
+use libdraw::format::Rgb;
 use libdraw::geom::{Rect, Size};
 
-use crate::element::{Element, Insets, column, fill, ink, padding, row, sized, stack, text, wash};
+use crate::element::{
+    Element, Insets, center_v, column, fill, ink, padding, rounded_fill, row, sized, stack, text, wash,
+};
 use crate::widget::{Theme, menu_bar, menu_item, popup_frame};
 
 /// A keyboard shortcut: the modifiers held, and the key pressed.
@@ -98,9 +102,28 @@ pub enum Item<Msg> {
     /// A row that does something. Disabled rows are drawn dimmed and do not answer a press.
     Action {
         /// What the row reads.
-        label: &'static str,
+        ///
+        /// **Borrowed or owned** (desktop refresh, Part C). Every window menu's rows are literals,
+        /// and the shell's are not: an application's name comes from its desktop entry and a
+        /// place's from the session's home. A `&'static str` made the second kind unwritable
+        /// short of leaking the strings, which `userspace/CLAUDE.md` forbids.
+        label: Cow<'static, str>,
         /// The chord shown on its right, if it has one.
         accel: Option<Accel>,
+        /// Dim text in the chord's column, for a row whose right-hand annotation is not a chord —
+        /// the path beside a place in the shell's Places menu.
+        ///
+        /// **Not an `Accel`**, because an accelerator is also a *match* ([`accel_match`]) and a
+        /// path is only something to read. A chord wins where a row has both, since it is the one
+        /// that does something.
+        hint: Option<Cow<'static, str>>,
+        /// A square of colour in the leading column, before the label — the swatch beside a place
+        /// (desktop refresh, Part C; the design's Places menu).
+        ///
+        /// **In the mark's column rather than beside it**, and the column widens for the whole
+        /// menu when any row has one, so labels stay in one line down the menu whichever rows
+        /// carry a swatch — the argument [`MARK_W`] makes about marks.
+        swatch: Option<Rgb>,
         /// What choosing it means.
         msg: Msg,
         /// Whether it can be chosen now.
@@ -124,43 +147,67 @@ pub enum Item<Msg> {
 
 impl<Msg> Item<Msg> {
     /// An enabled row with an accelerator.
-    pub fn new(label: &'static str, accel: Accel, msg: Msg) -> Self {
-        Item::Action { label, accel: Some(accel), msg, enabled: true, marked: false, destructive: false }
+    pub fn new(label: impl Into<Cow<'static, str>>, accel: Accel, msg: Msg) -> Self {
+        Self::row(label.into(), Some(accel), msg)
     }
 
     /// An enabled row with no chord.
-    pub fn plain(label: &'static str, msg: Msg) -> Self {
-        Item::Action { label, accel: None, msg, enabled: true, marked: false, destructive: false }
+    pub fn plain(label: impl Into<Cow<'static, str>>, msg: Msg) -> Self {
+        Self::row(label.into(), None, msg)
+    }
+
+    /// The one place every field of a row is named, so a field added later is added here.
+    fn row(label: Cow<'static, str>, accel: Option<Accel>, msg: Msg) -> Self {
+        Item::Action {
+            label,
+            accel,
+            hint: None,
+            swatch: None,
+            msg,
+            enabled: true,
+            marked: false,
+            destructive: false,
+        }
     }
 
     /// The same row, greyed and unpressable.
-    pub fn enabled(self, on: bool) -> Self {
-        match self {
-            Item::Action { label, accel, msg, marked, destructive, .. } => {
-                Item::Action { label, accel, msg, enabled: on, marked, destructive }
-            }
-            Item::Separator => Item::Separator,
+    pub fn enabled(mut self, on: bool) -> Self {
+        if let Item::Action { enabled, .. } = &mut self {
+            *enabled = on;
         }
+        self
     }
 
     /// The same row, marked or not — the state a *setting* row is in.
-    pub fn marked(self, on: bool) -> Self {
-        match self {
-            Item::Action { label, accel, msg, enabled, destructive, .. } => {
-                Item::Action { label, accel, msg, enabled, marked: on, destructive }
-            }
-            Item::Separator => Item::Separator,
+    pub fn marked(mut self, on: bool) -> Self {
+        if let Item::Action { marked, .. } = &mut self {
+            *marked = on;
         }
+        self
     }
 
     /// The same row, drawn as destroying something — in `deny`.
-    pub fn destructive(self, on: bool) -> Self {
-        match self {
-            Item::Action { label, accel, msg, enabled, marked, .. } => {
-                Item::Action { label, accel, msg, enabled, marked, destructive: on }
-            }
-            Item::Separator => Item::Separator,
+    pub fn destructive(mut self, on: bool) -> Self {
+        if let Item::Action { destructive, .. } = &mut self {
+            *destructive = on;
         }
+        self
+    }
+
+    /// The same row, with dim text on its right — see the `hint` field.
+    pub fn hint(mut self, text: impl Into<Cow<'static, str>>) -> Self {
+        if let Item::Action { hint, .. } = &mut self {
+            *hint = Some(text.into());
+        }
+        self
+    }
+
+    /// The same row, with a swatch of `colour` before its label — see the `swatch` field.
+    pub fn swatch(mut self, colour: Rgb) -> Self {
+        if let Item::Action { swatch, .. } = &mut self {
+            *swatch = Some(colour);
+        }
+        self
     }
 }
 
@@ -242,6 +289,18 @@ impl MenuState {
     pub fn close(&mut self) {
         self.open = None;
         self.cursor = None;
+    }
+
+    /// Put the keyboard's cursor on the open menu's first selectable row — or on none, if it has
+    /// none or nothing is open.
+    ///
+    /// **For a menu whose rows change under the keyboard**: the shell's Applications menu, which
+    /// narrows as you type (desktop refresh, Part C). Its top match is what Enter should launch,
+    /// and lighting it says so before the key is pressed. A cursor kept from the previous filter
+    /// could name a row that is no longer there, or a different program in the same place.
+    pub fn select_first<Msg>(&mut self, menus: &[Menu<Msg>]) {
+        let items = self.open.and_then(|i| menus.get(i)).map_or(&[][..], |m| m.items.as_slice());
+        self.cursor = step(items, None, 1);
     }
 
     /// Record where each bar word sits. Called every frame: a word's position is a fact about the
@@ -376,6 +435,56 @@ pub fn popup<Msg: Clone>(
     hovered: Option<u64>,
     theme: &Theme,
 ) -> Element<Msg> {
+    frame(rows(menu, state, key_base, hovered, theme), theme)
+}
+
+/// [`popup`], with `header` above the rows — the shell's Applications menu puts its filter field
+/// there (desktop refresh, Part C).
+///
+/// **The header is the caller's element and the caller keys it**, with a key outside
+/// `key_base..key_base + items.len()`: it shares a column with the rows, every one of which is
+/// keyed, and `diff` rejects a column whose children are partly keyed — the failure
+/// [`popup`]'s separator note describes, a menu that opens and never draws a frame.
+///
+/// It gets the row's side padding and the design's section-header spacing (`6px 12px 5px`), so a
+/// field in it lines up with the labels below.
+pub fn popup_headed<Msg: Clone>(
+    menu: &Menu<Msg>,
+    state: &MenuState,
+    key_base: u64,
+    hovered: Option<u64>,
+    header: Element<Msg>,
+    theme: &Theme,
+) -> Element<Msg> {
+    debug_assert!(header.key.is_some(), "a popup's header must be keyed; see popup_headed");
+    let key = header.key;
+    let mut header = padding(HEADER_PAD, header);
+    header.key = key;
+    let mut all = Vec::with_capacity(menu.items.len() + 1);
+    all.push(header);
+    all.extend(rows(menu, state, key_base, hovered, theme));
+    frame(all, theme)
+}
+
+/// The design's `padding: 5px 0` — room above the first row and below the last, and the rows
+/// themselves edge to edge so a hover runs the popup's width.
+fn frame<Msg>(rows: Vec<Element<Msg>>, theme: &Theme) -> Element<Msg> {
+    popup_frame(padding(POPUP_PAD, column(rows)), theme)
+}
+
+/// One element per item, keyed from `key_base`.
+fn rows<Msg: Clone>(
+    menu: &Menu<Msg>,
+    state: &MenuState,
+    key_base: u64,
+    hovered: Option<u64>,
+    theme: &Theme,
+) -> Vec<Element<Msg>> {
+    // **The leading column is as wide as the widest thing any row puts in it**, decided once for
+    // the menu: a swatch needs its gap to the label, a mark does not, and a column that changed
+    // width row by row would put the labels on different lines.
+    let swatches = menu.items.iter().any(|it| matches!(it, Item::Action { swatch: Some(_), .. }));
+    let lead_w = if swatches { SWATCH_W + SWATCH_GAP } else { MARK_W };
     let mut rows: Vec<Element<Msg>> = Vec::with_capacity(menu.items.len());
     for (i, it) in menu.items.iter().enumerate() {
         // **Every row is keyed, separators included**, and a rule has no more use for a key than
@@ -398,7 +507,7 @@ pub fn popup<Msg: Clone>(
                 )
                 .key(key),
             ),
-            Item::Action { label, accel, msg, enabled, marked, destructive } => {
+            Item::Action { label, accel, hint, swatch, msg, enabled, marked, destructive } => {
                 let lit = *enabled && (hovered == Some(key) || state.cursor() == Some(i));
                 // **The chord sits in the same row as its label, pushed right by a spacer.** A
                 // menu that only names its actions teaches nothing; the point of the column on
@@ -414,18 +523,27 @@ pub fn popup<Msg: Clone>(
                 // An unmarked row draws *nothing* here rather than a space: the `sized` is what
                 // holds the column open, and a space would put a stray glyph into every label a
                 // caller reads back.
-                let mark: Element<Msg> =
-                    sized(Size::new(MARK_W, 0), text(if *marked { MARK } else { "" }));
+                let lead: Element<Msg> = match swatch {
+                    // Centred down the row and left where it starts across it, so the gap to the
+                    // label is the rest of the column.
+                    Some(c) => sized(
+                        Size::new(lead_w, 0),
+                        center_v(sized(Size::new(SWATCH_W, SWATCH_H), rounded_fill(*c, SWATCH_RADIUS))),
+                    ),
+                    None => sized(Size::new(lead_w, 0), text(if *marked { MARK } else { "" })),
+                };
                 // **The chord in the dim ink**, the design's hint column: it is read second, after
-                // the label it annotates.
-                let body: Element<Msg> = match accel {
-                    Some(a) => row(alloc::vec![
-                        mark,
-                        text(*label),
+                // the label it annotates. A hint that is not a chord goes in the same column.
+                let right: Option<String> =
+                    accel.map(|a| a.label()).or_else(|| hint.as_ref().map(|h| String::from(h.as_ref())));
+                let body: Element<Msg> = match right {
+                    Some(r) => row(alloc::vec![
+                        lead,
+                        text(label.as_ref()),
                         text("").flex(1),
-                        padding(ACCEL_PAD, ink(theme.foreground_dim, text(a.label()))),
+                        padding(ACCEL_PAD, ink(theme.foreground_dim, text(r))),
                     ]),
-                    None => row(alloc::vec![mark, text(*label), text("").flex(1)]),
+                    None => row(alloc::vec![lead, text(label.as_ref()), text("").flex(1)]),
                 };
                 // **A disabled row is dim, and a destructive one is `deny`** — the first closes
                 // the gap this function's `menu_row` recorded ("a disabled row is not dimmed"),
@@ -446,9 +564,7 @@ pub fn popup<Msg: Clone>(
             }
         }
     }
-    // The design's `padding: 5px 0` — room above the first row and below the last, and the rows
-    // themselves edge to edge so a hover runs the popup's width.
-    popup_frame(padding(POPUP_PAD, column(rows)), theme)
+    rows
 }
 
 /// One popup row: its body, highlighted when the pointer or the keyboard is on it.
@@ -477,6 +593,18 @@ const ROW_PAD: Insets = Insets { top: 6, right: 12, bottom: 6, left: 12 };
 
 /// The space above and below a popup's rows: the design's `padding: 5px 0`.
 const POPUP_PAD: Insets = Insets { top: 5, right: 0, bottom: 5, left: 0 };
+
+/// The space around a popup's header: the design's section header, `padding: 6px 12px 5px`.
+const HEADER_PAD: Insets = Insets { top: 6, right: 12, bottom: 5, left: 12 };
+
+/// A swatch's size: the design's Places menu, `14px × 11px`.
+const SWATCH_W: u32 = 14;
+/// See [`SWATCH_W`].
+const SWATCH_H: u32 = 11;
+/// Its corners: the design's `border-radius: 2px`.
+const SWATCH_RADIUS: u32 = 2;
+/// The space between a swatch and its label: the design's `gap: 10px`.
+const SWATCH_GAP: u32 = 10;
 
 /// The gap around a separator rule: the design's `margin: 5px 0`, the rule running edge to edge.
 const SEPARATOR_PAD: Insets = Insets { top: 5, right: 0, bottom: 5, left: 0 };
@@ -785,5 +913,147 @@ mod tests {
         assert_eq!(s.open(), Some(1), "another word switches rather than closing");
         s.toggle(1);
         assert_eq!(s.open(), None);
+    }
+
+    /// Where each text in a laid-out tree was put, by its contents.
+    fn text_rects<M>(e: &Element<M>, l: &crate::layout::Layout, out: &mut Vec<(String, Rect)>) {
+        if let crate::element::Node::Text(t) = &e.node
+            && !t.is_empty()
+        {
+            out.push((t.clone(), l.rect));
+        }
+        for (c, cl) in e.children().zip(l.children.iter()) {
+            text_rects(c, cl, out);
+        }
+    }
+
+    /// The Places menu's two additions (desktop refresh, Part C): a hint in the chord's column,
+    /// dim, and a chord winning where a row has both — it is the one that does something.
+    #[test]
+    fn a_hint_sits_in_the_chord_column_and_a_chord_wins() {
+        let theme = Theme::default();
+        let m = Menu {
+            title: "Places",
+            items: alloc::vec![
+                Item::plain("Documents", 1u8).hint("~/Documents"),
+                Item::new("New Tab", Accel::ctrl_shift(20, "T"), 2).hint("never shown"),
+            ],
+        };
+        let (texts, _) = inks_and_washes(&popup(&m, &MenuState::new(1), 0, None, &theme));
+        let ink_of = |label: &str| texts.iter().find(|(t, _)| t == label).map(|(_, i)| *i);
+        assert_eq!(ink_of("~/Documents"), Some(Some(theme.foreground_dim)), "a hint is dim");
+        assert_eq!(ink_of("Ctrl+Shift+T"), Some(Some(theme.foreground_dim)));
+        assert_eq!(ink_of("never shown"), None, "a chord takes the column from a hint");
+
+        // **Right-aligned, which is what makes it a column**: the hint's right edge is the
+        // row's, less the row's own padding, however long the label beside it.
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let e = popup(&m, &MenuState::new(1), 0, None, &theme);
+        let l = crate::layout::layout(&e, Rect::new(0, 0, 300, 200), &cell);
+        let mut rects = Vec::new();
+        text_rects(&e, &l, &mut rects);
+        let at = |t: &str| rects.iter().find(|(s, _)| s == t).map(|(_, r)| *r).unwrap();
+        assert_eq!(at("~/Documents").right(), at("Ctrl+Shift+T").right(), "one column, ragged left");
+    }
+
+    /// A swatch is drawn in the leading column, and **the column widens for every row** so the
+    /// labels stay in one line — a column that changed width row by row would stagger them.
+    #[test]
+    fn a_swatch_widens_the_leading_column_for_the_whole_menu() {
+        let theme = Theme::default();
+        let red = Rgb::new(200, 0, 0);
+        let m = Menu {
+            title: "Places",
+            items: alloc::vec![Item::plain("Home", 1u8).swatch(red), Item::plain("Other", 2)],
+        };
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let e = popup(&m, &MenuState::new(1), 0, None, &theme);
+        let l = crate::layout::layout(&e, Rect::new(0, 0, 300, 200), &cell);
+        let mut rects = Vec::new();
+        text_rects(&e, &l, &mut rects);
+        let at = |t: &str| rects.iter().find(|(s, _)| s == t).map(|(_, r)| *r).unwrap();
+        assert_eq!(at("Home").origin.x, at("Other").origin.x, "the labels share a left edge");
+
+        // …further in than a menu with no swatch at all, whose column is the mark's.
+        let plain = Menu { title: "Places", items: alloc::vec![Item::plain("Other", 2u8)] };
+        let pe = popup(&plain, &MenuState::new(1), 0, None, &theme);
+        let pl = crate::layout::layout(&pe, Rect::new(0, 0, 300, 200), &cell);
+        let mut prects = Vec::new();
+        text_rects(&pe, &pl, &mut prects);
+        let plain_x = prects.iter().find(|(s, _)| s == "Other").unwrap().1.origin.x;
+        assert_eq!(at("Other").origin.x - plain_x, (SWATCH_W + SWATCH_GAP - MARK_W) as i32);
+
+        // And the swatch itself is there, in its colour, only on the row that asked for it.
+        fn fills<M>(e: &Element<M>, out: &mut Vec<Rgb>) {
+            if let crate::element::Node::RoundedFill { colour, .. } = &e.node {
+                out.push(*colour);
+            }
+            for c in e.children() {
+                fills(c, out);
+            }
+        }
+        let mut found = Vec::new();
+        fills(&e, &mut found);
+        assert_eq!(found, [red]);
+    }
+
+    /// A headed popup keeps diffing as its rows come and go under the header — the Applications
+    /// menu's filter removing rows on every keystroke.
+    ///
+    /// **This is what the header's key is for.** Unkeyed, it shares a column with keyed rows and
+    /// `diff` refuses the tree: the menu opens and never draws another frame.
+    #[test]
+    fn a_headed_popup_diffs_as_its_rows_are_filtered() {
+        use crate::diff::Tree;
+        use crate::layout::{FixedCell, layout};
+        let theme = Theme::default();
+        let cell = FixedCell { w: 8, h: 16 };
+        let bounds = Rect::new(0, 0, 200, 200);
+        let names = ["Files", "Terminal", "Text Editor"];
+        let mut tree = Tree::new();
+        for keep in [3usize, 2, 1, 0, 3] {
+            let m = Menu {
+                title: "Applications",
+                items: names[..keep].iter().enumerate().map(|(i, n)| Item::plain(*n, i as u8)).collect(),
+            };
+            let e = popup_headed(&m, &MenuState::new(1), 10, None, text("filter").key(1), &theme);
+            let l = layout(&e, bounds, &cell);
+            assert!(tree.update(&e, &l).is_ok(), "the popup stopped diffing at {keep} rows");
+            let mut rects = Vec::new();
+            text_rects(&e, &l, &mut rects);
+            let header = rects.iter().find(|(s, _)| s == "filter").unwrap().1;
+            for (s, r) in rects.iter().filter(|(s, _)| names.contains(&s.as_str())) {
+                assert!(r.origin.y >= header.bottom() as i32, "{s} is above the header");
+            }
+        }
+    }
+
+    /// `select_first` puts the cursor on the first row Enter can choose, and on nothing when
+    /// there is none — the Applications menu pointing at its top match as the filter narrows.
+    #[test]
+    fn select_first_points_at_the_first_choosable_row() {
+        let menus = alloc::vec![menu()];
+        let mut s = MenuState::new(1);
+        s.select_first(&menus);
+        assert_eq!(s.cursor(), None, "nothing is open, so nothing is pointed at");
+        s.toggle(0);
+        s.select_first(&menus);
+        assert_eq!(s.cursor(), Some(0));
+        assert_eq!(s.key(&ev(KEY_ENTER, 0), &menus), KeyOutcome::Chose { menu: 0, item: 0 });
+
+        // Past a separator and a disabled row, as arrowing is.
+        let menus = alloc::vec![Menu {
+            title: "Applications",
+            items: alloc::vec![Item::Separator, Item::plain("Gone", 1u8).enabled(false), Item::plain("Here", 2)],
+        }];
+        let mut s = MenuState::new(1);
+        s.toggle(0);
+        s.select_first(&menus);
+        assert_eq!(s.cursor(), Some(2));
+        // A filter that leaves nothing choosable leaves nothing pointed at, so Enter chooses
+        // nothing rather than a row that is no longer there.
+        let empty: Vec<Menu<u8>> = alloc::vec![Menu { title: "Applications", items: Vec::new() }];
+        s.select_first(&empty);
+        assert_eq!(s.cursor(), None);
     }
 }

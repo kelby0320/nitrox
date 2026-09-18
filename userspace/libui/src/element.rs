@@ -247,6 +247,23 @@ pub enum Node<Msg> {
         /// today, since it must be the radius the compositor cuts with.
         radius: u32,
     },
+    /// A rectangle of flat colour with its corners rounded to `radius`, antialiased against what
+    /// is painted beneath it (desktop refresh, Part C).
+    ///
+    /// **For a shape *inside* a surface** — a task button, a desktop cell, a swatch — which nothing
+    /// cuts afterwards. That is the difference from [`Outline`](Self::Outline), whose corners leave
+    /// the curve's fade to the compositor because a window's corners *are* cut: a rounded shape in
+    /// the middle of a bar has to fade itself. A bordered shape is two of these, the border colour
+    /// and then the ground inset by a pixel; see `Framebuffer::fill_rounded_rect`.
+    ///
+    /// **Its ground must be painted before it**, like a [`Wash`](Self::Wash)'s, since the corner
+    /// pixels are blended over whatever is there. It measures to nothing, like [`Fill`](Self::Fill).
+    RoundedFill {
+        /// The colour.
+        colour: Rgb,
+        /// The corner radius, clamped to half the shorter side.
+        radius: u32,
+    },
     /// A translucent wash of `colour` at `coverage` over whatever is painted beneath it — a
     /// selected row, a hovered menu item (desktop refresh, Part B).
     ///
@@ -480,6 +497,7 @@ impl<Msg> Element<Msg> {
             | Node::Fill(_)
             | Node::Bevel(_)
             | Node::Outline { .. }
+            | Node::RoundedFill { .. }
             | Node::Wash { .. }
             | Node::Icon(_)
             | Node::Custom { .. } => (&[], None, None),
@@ -552,6 +570,11 @@ pub fn fill<Msg>(colour: Rgb) -> Element<Msg> {
 /// A rounded window border — see [`Node::Outline`].
 pub fn outline<Msg>(colour: Rgb, radius: u32) -> Element<Msg> {
     Element::new(Node::Outline { colour, radius })
+}
+
+/// A rounded rectangle of flat colour, inside a surface — see [`Node::RoundedFill`].
+pub fn rounded_fill<Msg>(colour: Rgb, radius: u32) -> Element<Msg> {
+    Element::new(Node::RoundedFill { colour, radius })
 }
 
 /// A translucent wash — see [`Node::Wash`].

@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()` and Part B rounded the frames — `Node::Outline`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -509,11 +509,11 @@ the widget set that is a small type system rather than a function:
 | Piece | What it is |
 |---|---|
 | `Accel` | A chord and how it reads — `Ctrl+Shift+T`. **Exact on modifiers**, not a subset test, so `Ctrl+V` and `Ctrl+Shift+V` are different chords |
-| `Item` | An action — label, optional `Accel`, message, `enabled`, and `marked` — or a `Separator`. `marked` draws a bullet in a fixed-width column, so a menu that *sets* something says what it is set to (M14 Part D) |
+| `Item` | An action — label, optional `Accel`, message, `enabled`, and `marked` — or a `Separator`. `marked` draws a bullet in a fixed-width column, so a menu that *sets* something says what it is set to (M14 Part D). Since the desktop refresh's Part C a label may be owned as well as `'static` (a `Cow`), a row may carry a `hint` — dim text in the chord's column that is only read, never matched — and a `swatch`, a small rounded square of colour in the leading column, which widens for the whole menu when any row has one so labels stay in one line. All three are the shell's Places and Applications menus: names from desktop entries, paths beside places |
 | `Menu` | A title and its items |
-| `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key` |
+| `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key`, and `select_first` — the cursor on the first row Enter can choose, for a menu whose rows change under the keyboard (the Applications menu, narrowing as you type) |
 | `KeyOutcome::Chose` | **Names the menu as well as the row.** Choosing closes, so a caller that asked `open()` afterwards would get `None` and lose the message |
-| `bar` / `popup` | The two trees: one word per menu, and the open menu's rows |
+| `bar` / `popup` | The two trees: one word per menu, and the open menu's rows. `popup_headed` puts a caller's element above the rows — the Applications menu's filter field — and the caller keys it, since it shares a column with rows that are all keyed |
 | `accel_match` | The message whose item claims a key, from the same table the popup draws |
 
 **What it replaced.** `menu_bar` and `menu_item` already existed and every application used them;
@@ -570,6 +570,14 @@ is border — because the compositor supplies the curve's own fade, so it is onl
 compositor cuts to the same curve. **It is never a hit-test target**: painted last and spanning the
 whole window, it would otherwise take every press in it and answer none of them, which is what the
 first version did until `dialog_buttons_land_where_the_constants_say` failed.
+
+**A fourth, `Node::RoundedFill`, arrived with Part C**: a flat colour with rounded corners,
+antialiased against what is beneath it — `Framebuffer::fill_rounded_rect`. It is `Outline`'s
+opposite case: a shape *inside* a surface, which nothing cuts afterwards, so it fades its own
+curve. A task button or a desktop cell on the shell's bottom bar is two of them, the border colour
+and then the ground a pixel in. Its shape comes from the node's rect and only the extent of the
+repaint from the clip, for `Bevel`'s reason: a partial repaint through the middle of a rounded
+button must leave that band's ends square.
 
 **The waiting was the point, and it is worth saying what it bought.** This section's standing
 reason was that "building an editor's widget remains a guess at requirements no editor has yet

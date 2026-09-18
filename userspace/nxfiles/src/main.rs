@@ -6,11 +6,15 @@
 //!
 //! ## The one thing this file decides
 //!
-//! **Where the browser starts.** `HOME` from the Tier-1 environment record, which
+//! **Where the browser starts.** `argv[1]` when it is given one — the shell's Places menu does —
+//! and otherwise `HOME` from the Tier-1 environment record, which
 //! `desktop-shell::build_app_namespace` binds to the user's subtree — so `/home` here is the
 //! user's own directory and not the `/home` above it. An application launched with no setup
 //! message at all falls back to `/`, which is the honest answer for a process that was told
 //! nothing: it can still list what its namespace contains.
+//!
+//! **Home is `HOME` either way.** The argument chooses the first window's directory; the
+//! sidebar's places and every later window are still the session's home's.
 
 #![no_std]
 #![no_main]
@@ -327,11 +331,18 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxfiles: up\n");
 
-    let env = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
-        Some(Ok(s)) => s.env,
-        _ => libstream::wire::Record::default(),
+    let (argv, env) = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
+        Some(Ok(s)) => (s.argv, s.env),
+        _ => (Vec::new(), libstream::wire::Record::default()),
     };
-    let start = home_of(&env);
+    let home = home_of(&env);
+    // **`argv[1]` is where to start, and home is where a window belongs** (desktop refresh,
+    // Part C): the shell's Places menu launches this at `Documents` or `/`, and that is where the
+    // first window opens — but the sidebar's places, and every window opened after it, are still
+    // this session's home's. A browser that took the argument *as* its home would offer
+    // `Documents/Documents`.
+    let start = argv.get(1).cloned().unwrap_or_else(|| home.clone());
+    libkern::debug::Line::new().s(b"nxfiles: starting at ").untrusted(start.as_bytes()).end();
     // **From the environment, not from a default** (M11 Part C), and read *here* — beside the
     // other thing the session tells this program — rather than at the point it is first drawn
     // with. A value logged where it is learned appears in the order a reader expects it, which
@@ -352,7 +363,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
     };
 
-    let mut app = App::new(&start);
+    let mut app = App::new(&home);
     navigate(&mut app, root_ns, &start);
 
     let size = app.window_size();
@@ -901,7 +912,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // **A new window starts at home**, not at this window's directory: New Window is a
             // second browser, and one that opened where the first happens to be looking would be
             // a copy rather than a window.
-            match open_window(&mut win, App::new(&start), &font, &theme) {
+            match open_window(&mut win, App::new(&home), &font, &theme) {
                 Some(w) => {
                     kprint(b"nxfiles: opened another window\n");
                     wins.push(w);
