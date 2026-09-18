@@ -27,9 +27,8 @@ use librsproto::surface::{KeyEvent, MOD_ALT, MOD_CTRL, MOD_SHIFT};
 
 use libdraw::geom::{Rect, Size};
 
-use crate::element::{Element, Insets, column, fill, padding, row, sized, stack, text};
+use crate::element::{Element, Insets, column, fill, ink, padding, row, sized, stack, text, wash};
 use crate::widget::{Theme, menu_bar, menu_item, popup_frame};
-use crate::element::bevel;
 
 /// A keyboard shortcut: the modifiers held, and the key pressed.
 ///
@@ -114,6 +113,10 @@ pub enum Item<Msg> {
         /// got this treatment in Part A ("shown, not discovered on refusal"); this is the same
         /// argument for state.
         marked: bool,
+        /// Whether choosing it destroys something — drawn in the theme's `deny` (desktop
+        /// refresh, Part B, the design's destructive menu item). A colour, not a question: the
+        /// confirmation is still the application's to ask.
+        destructive: bool,
     },
     /// A horizontal rule between groups.
     Separator,
@@ -122,19 +125,19 @@ pub enum Item<Msg> {
 impl<Msg> Item<Msg> {
     /// An enabled row with an accelerator.
     pub fn new(label: &'static str, accel: Accel, msg: Msg) -> Self {
-        Item::Action { label, accel: Some(accel), msg, enabled: true, marked: false }
+        Item::Action { label, accel: Some(accel), msg, enabled: true, marked: false, destructive: false }
     }
 
     /// An enabled row with no chord.
     pub fn plain(label: &'static str, msg: Msg) -> Self {
-        Item::Action { label, accel: None, msg, enabled: true, marked: false }
+        Item::Action { label, accel: None, msg, enabled: true, marked: false, destructive: false }
     }
 
     /// The same row, greyed and unpressable.
     pub fn enabled(self, on: bool) -> Self {
         match self {
-            Item::Action { label, accel, msg, marked, .. } => {
-                Item::Action { label, accel, msg, enabled: on, marked }
+            Item::Action { label, accel, msg, marked, destructive, .. } => {
+                Item::Action { label, accel, msg, enabled: on, marked, destructive }
             }
             Item::Separator => Item::Separator,
         }
@@ -143,8 +146,18 @@ impl<Msg> Item<Msg> {
     /// The same row, marked or not — the state a *setting* row is in.
     pub fn marked(self, on: bool) -> Self {
         match self {
-            Item::Action { label, accel, msg, enabled, .. } => {
-                Item::Action { label, accel, msg, enabled, marked: on }
+            Item::Action { label, accel, msg, enabled, destructive, .. } => {
+                Item::Action { label, accel, msg, enabled, marked: on, destructive }
+            }
+            Item::Separator => Item::Separator,
+        }
+    }
+
+    /// The same row, drawn as destroying something — in `deny`.
+    pub fn destructive(self, on: bool) -> Self {
+        match self {
+            Item::Action { label, accel, msg, enabled, marked, .. } => {
+                Item::Action { label, accel, msg, enabled, marked, destructive: on }
             }
             Item::Separator => Item::Separator,
         }
@@ -376,10 +389,16 @@ pub fn popup<Msg: Clone>(
             // at the column's full width and its own measured *height*, so an element measuring
             // zero wide and one tall paints across the whole popup. `sized` cannot ask for "as
             // wide as you have", and it does not need to.
+            // **The design's `--lineSoft`**: `border` at half strength over the menu's ground,
+            // edge to edge — the derivation Part A measured in both palettes.
             Item::Separator => rows.push(
-                padding(SEPARATOR_PAD, sized(Size::new(0, 1), fill(theme.border))).key(key),
+                padding(
+                    SEPARATOR_PAD,
+                    sized(Size::new(0, 1), fill(theme.border.blend(theme.background, 128))),
+                )
+                .key(key),
             ),
-            Item::Action { label, accel, msg, enabled, marked } => {
+            Item::Action { label, accel, msg, enabled, marked, destructive } => {
                 let lit = *enabled && (hovered == Some(key) || state.cursor() == Some(i));
                 // **The chord sits in the same row as its label, pushed right by a spacer.** A
                 // menu that only names its actions teaches nothing; the point of the column on
@@ -397,14 +416,27 @@ pub fn popup<Msg: Clone>(
                 // caller reads back.
                 let mark: Element<Msg> =
                     sized(Size::new(MARK_W, 0), text(if *marked { MARK } else { "" }));
+                // **The chord in the dim ink**, the design's hint column: it is read second, after
+                // the label it annotates.
                 let body: Element<Msg> = match accel {
                     Some(a) => row(alloc::vec![
                         mark,
                         text(*label),
                         text("").flex(1),
-                        padding(ACCEL_PAD, text(a.label())),
+                        padding(ACCEL_PAD, ink(theme.foreground_dim, text(a.label()))),
                     ]),
                     None => row(alloc::vec![mark, text(*label), text("").flex(1)]),
+                };
+                // **A disabled row is dim, and a destructive one is `deny`** — the first closes
+                // the gap this function's `menu_row` recorded ("a disabled row is not dimmed"),
+                // now that ink exists; the second is the design's. Disabled wins: a greyed row
+                // that shouted red would be offering what it cannot do.
+                let body = if !*enabled {
+                    ink(theme.foreground_dim, body)
+                } else if *destructive {
+                    ink(theme.deny, body)
+                } else {
+                    body
                 };
                 let mut e = menu_row(body, lit, *enabled, theme);
                 if *enabled {
@@ -414,7 +446,9 @@ pub fn popup<Msg: Clone>(
             }
         }
     }
-    popup_frame(padding(Insets::all(2), column(rows)), theme)
+    // The design's `padding: 5px 0` — room above the first row and below the last, and the rows
+    // themselves edge to edge so a hover runs the popup's width.
+    popup_frame(padding(POPUP_PAD, column(rows)), theme)
 }
 
 /// One popup row: its body, highlighted when the pointer or the keyboard is on it.
@@ -423,27 +457,29 @@ pub fn popup<Msg: Clone>(
 /// column is two pieces of text with a gap between them, and giving `menu_item` a second shape
 /// would make the bar's words and the popup's rows the same function pretending to be one thing.
 ///
-/// **A disabled row is not dimmed, and that is a gap rather than a decision.** `paint` draws every
-/// `Text` in `theme.foreground` — there is no per-element ink — so "unavailable" shows only as a
-/// row that does not light under the pointer and that arrowing skips. The colour arrives with the
-/// ink wrapper M14 Part G adds for syntax highlighting; until then this is honest about being half
-/// of the affordance.
+/// **A disabled row is dimmed since the desktop refresh's Part B**, through the ink wrapper —
+/// see [`popup`]. This used to record the gap: "unavailable" showed only as a row that did not
+/// light under the pointer and that arrowing skipped.
+///
+/// **Lit is a wash of the accent over the popup's ground**, the design's `--soft`, rather than a
+/// ring round a bevelled fill; the ground is `popup_frame`'s, painted first.
 fn menu_row<Msg>(body: Element<Msg>, lit: bool, _enabled: bool, theme: &Theme) -> Element<Msg> {
-    let mut layers = Vec::with_capacity(3);
+    let mut layers = Vec::with_capacity(2);
     if lit {
-        layers.push(fill(theme.accent));
-        layers.push(padding(Insets::all(1), bevel(theme.selection())));
+        layers.push(wash(theme.accent, theme.scheme.hover_coverage()));
     }
     layers.push(padding(ROW_PAD, body));
     stack(layers)
 }
 
-/// The space around a popup row's contents. Matches `menu_item`'s, so the bar and the rows below
-/// it are spaced alike.
-const ROW_PAD: Insets = Insets { top: 3, right: 10, bottom: 3, left: 10 };
+/// The space around a popup row's contents: the design's `padding: 6px 12px`.
+const ROW_PAD: Insets = Insets { top: 6, right: 12, bottom: 6, left: 12 };
 
-/// The gap around a separator rule.
-const SEPARATOR_PAD: Insets = Insets { top: 3, right: 2, bottom: 3, left: 2 };
+/// The space above and below a popup's rows: the design's `padding: 5px 0`.
+const POPUP_PAD: Insets = Insets { top: 5, right: 0, bottom: 5, left: 0 };
+
+/// The gap around a separator rule: the design's `margin: 5px 0`, the rule running edge to edge.
+const SEPARATOR_PAD: Insets = Insets { top: 5, right: 0, bottom: 5, left: 0 };
 
 /// The gap before an accelerator's text, so it never touches its label.
 const ACCEL_PAD: Insets = Insets { top: 0, right: 0, bottom: 0, left: 24 };
@@ -499,6 +535,7 @@ mod tests {
     }
 
     use super::*;
+    use libdraw::format::Rgb;
     use libkern::abi::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
     fn ev(code: u16, mods: u16) -> KeyEvent {
@@ -515,6 +552,58 @@ mod tests {
                 Item::plain("Quit", 3),
             ],
         }
+    }
+
+    /// The inks and the wash a popup's rows are drawn with (desktop refresh, Part B).
+    ///
+    /// Each text in the popup, with the innermost ink wrapped round it — or `None` for the
+    /// theme's foreground — and the popup's washes.
+    fn inks_and_washes(e: &Element<u8>) -> (Vec<(String, Option<Rgb>)>, Vec<(Rgb, u8)>) {
+        fn walk(e: &Element<u8>, ink: Option<Rgb>, texts: &mut Vec<(String, Option<Rgb>)>, washes: &mut Vec<(Rgb, u8)>) {
+            let ink = match &e.node {
+                crate::element::Node::Ink { colour, .. } => Some(*colour),
+                _ => ink,
+            };
+            match &e.node {
+                crate::element::Node::Text(t) if !t.is_empty() => texts.push((t.clone(), ink)),
+                crate::element::Node::Wash { colour, coverage } => washes.push((*colour, *coverage)),
+                _ => {}
+            }
+            for c in e.children() {
+                walk(c, ink, texts, washes);
+            }
+        }
+        let (mut texts, mut washes) = (Vec::new(), Vec::new());
+        walk(e, None, &mut texts, &mut washes);
+        (texts, washes)
+    }
+
+    #[test]
+    fn a_popup_dims_its_chords_and_what_it_cannot_do_and_reddens_what_destroys() {
+        let theme = Theme::default();
+        let m = Menu {
+            title: "File",
+            items: alloc::vec![
+                Item::new("New Tab", Accel::ctrl_shift(20, "T"), 1u8),
+                Item::plain("Close Tab", 2).enabled(false),
+                Item::plain("Delete", 3).destructive(true),
+                Item::plain("Wipe", 4).destructive(true).enabled(false),
+            ],
+        };
+        let st = MenuState::new(1);
+        let (texts, washes) = inks_and_washes(&popup(&m, &st, 0, None, &theme));
+        let ink_of = |label: &str| texts.iter().find(|(t, _)| t == label).map(|(_, i)| *i);
+        assert_eq!(ink_of("New Tab"), Some(None), "an ordinary label is in the foreground");
+        assert_eq!(ink_of("Ctrl+Shift+T"), Some(Some(theme.foreground_dim)), "the chord is dim");
+        assert_eq!(ink_of("Close Tab"), Some(Some(theme.foreground_dim)), "a disabled row is dim");
+        assert_eq!(ink_of("Delete"), Some(Some(theme.deny)), "a destructive row is deny");
+        // A greyed row that shouted red would be offering what it cannot do.
+        assert_eq!(ink_of("Wipe"), Some(Some(theme.foreground_dim)), "disabled wins over destructive");
+        assert!(washes.is_empty(), "nothing is lit: {washes:?}");
+
+        // The row under the pointer is washed at the hover's coverage, and only that one.
+        let (_, washes) = inks_and_washes(&popup(&m, &st, 0, Some(0), &theme));
+        assert_eq!(washes, [(theme.accent, theme.scheme.hover_coverage())]);
     }
 
     #[test]

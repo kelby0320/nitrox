@@ -229,6 +229,42 @@ pub enum Node<Msg> {
     /// repaints. Keeping them separate is what stops that distinction being a parameter somebody
     /// passes wrongly.
     Bevel(Rgb),
+    /// The one-pixel border of a window or a popup, with its corners rounded to `radius`
+    /// (desktop refresh, Part B).
+    ///
+    /// **Drawn last, over the surface's content**, because the corner curves inward over whatever
+    /// is in the window's corners — a title bar, a menu's first row — and a border painted first
+    /// would be painted over. It measures to nothing, like [`Fill`](Self::Fill), and draws along
+    /// its own rectangle's edge.
+    ///
+    /// **Only for a surface the compositor cuts to the same curve**: it blends the border at
+    /// `libdraw::corner::border_share`, which leaves the curve's own fade to the compositor. See
+    /// `Framebuffer::outline_rounded_rect`.
+    Outline {
+        /// The border's colour.
+        colour: Rgb,
+        /// The corner radius — `libdraw::corner::WINDOW_RADIUS` for everything that uses it
+        /// today, since it must be the radius the compositor cuts with.
+        radius: u32,
+    },
+    /// A translucent wash of `colour` at `coverage` over whatever is painted beneath it — a
+    /// selected row, a hovered menu item (desktop refresh, Part B).
+    ///
+    /// **The design's model of emphasis**: its selection is the accent at 20% and its hover the
+    /// accent at 10% (18% dark), laid over the ground a row sits on — the list's paper, a
+    /// sidebar, a menu — so one colour is right on all of them, where a precomputed opaque colour
+    /// is right on one. It measures to nothing, like [`Fill`](Self::Fill).
+    ///
+    /// **Its ground must be painted before it in the same repaint**, because half its colour is
+    /// what is under it: a wash repainted over itself darkens a step per frame. Every caller puts
+    /// it in a `Stack` after that ground, and `paint` clears the damage and draws the tree in
+    /// order, which is what keeps that true.
+    Wash {
+        /// The colour washed over.
+        colour: Rgb,
+        /// How much of it: 0 is nothing, 255 is a fill.
+        coverage: u8,
+    },
     /// One of the three window-control glyphs, drawn rather than typed.
     ///
     /// **Drawn, so there is no icon format yet** (M11 Part E, batch 2). A minimise is a bar, a
@@ -443,6 +479,8 @@ impl<Msg> Element<Msg> {
             Node::Text(_)
             | Node::Fill(_)
             | Node::Bevel(_)
+            | Node::Outline { .. }
+            | Node::Wash { .. }
             | Node::Icon(_)
             | Node::Custom { .. } => (&[], None, None),
             Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
@@ -509,6 +547,16 @@ pub fn sized<Msg>(size: Size, child: Element<Msg>) -> Element<Msg> {
 /// A rectangle of flat colour, filling whatever it is given.
 pub fn fill<Msg>(colour: Rgb) -> Element<Msg> {
     Element::new(Node::Fill(colour))
+}
+
+/// A rounded window border — see [`Node::Outline`].
+pub fn outline<Msg>(colour: Rgb, radius: u32) -> Element<Msg> {
+    Element::new(Node::Outline { colour, radius })
+}
+
+/// A translucent wash — see [`Node::Wash`].
+pub fn wash<Msg>(colour: Rgb, coverage: u8) -> Element<Msg> {
+    Element::new(Node::Wash { colour, coverage })
 }
 
 /// A face drawn with the theme's bevel — see [`Node::Bevel`].

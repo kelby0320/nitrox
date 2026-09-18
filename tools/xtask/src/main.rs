@@ -70,6 +70,35 @@ const FAT32_MIN_MIB: u64 = 33;
 // login selftest (auth Part E) must use these same literals. A fixed salt keeps the
 // image build reproducible (a single demo user makes salt-uniqueness moot). See
 // `docs/architecture/session-and-auth.md`.
+/// **A framed window's chrome, as the gates aim at it** — `libui::widget`'s geometry, copied on
+/// purpose (M11 decision 2): a gate that read the toolkit to know where to click could agree with a
+/// toolkit that had stopped drawing where it says. `libui`'s own tests pin the other side, as
+/// literals pressed on built trees: `the_title_buttons_land_where_the_gates_aim` for the title bar
+/// and `dialog_buttons_land_where_the_constants_say` for a dialog. (This doc named
+/// `title_button_centre` as the pin; it is a helper that moves with the constants, and the literal
+/// test is the PR #313 review's optional 6.)
+///
+/// **One table since the desktop refresh's Part B**, which moved every one of these: the title bar
+/// grew from 26 to 31, its buttons went from contiguous 26-pixel slots to the design's 23 with 9
+/// between, and a window's content lost its 3-pixel frame. They were a dozen inline numbers —
+/// `+ 13`, `- 39`, `- 65`, `+ 4` — and a change to the chrome was a search for all of them.
+mod chrome {
+    /// A title bar's height, its bottom rule included (`libui::widget::TITLE_BAR_H`).
+    pub const TITLE_BAR_H: i32 = 31;
+    /// How far below a window's top edge its title bar is aimed at: the middle of the bar's face,
+    /// below the one-pixel border.
+    pub const TITLE_Y: i32 = 16;
+    /// How far left of a window's right edge the **close** button's centre is: the border, five
+    /// of padding, and half of a 23-pixel button.
+    pub const CLOSE_X: i32 = 18;
+    /// The **maximise** button's, one button and one 9-pixel gap further left.
+    pub const MAXIMISE_X: i32 = 50;
+    /// The **minimise** button's, one more further.
+    pub const MINIMISE_X: i32 = 82;
+    /// How far right of a window's left edge its content starts: the border, and no frame.
+    pub const CONTENT_X: i32 = 1;
+}
+
 const DEMO_USER: &str = "alice";
 const DEMO_PASSWORD: &str = "correct horse battery staple";
 const DEMO_HOME: &str = "/home/alice";
@@ -3984,15 +4013,15 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      `Surface::RequestState`, the compositor forwards it, and the shell decides.
     //
     // **The buttons are measured from the right edge in layout order** — minimise, maximise,
-    // close, each `TITLE_BUTTON_W` (26) wide. Part C added close, which moved the other two a
-    // slot left; the first run after that clicked *close* where it meant maximise, which is what
-    // a coordinate constant hides and a changing layout exposes.
-    let button_y = term_y + 13;
+    // close; see `chrome`. Part C added close, which moved the other two a slot left; the first
+    // run after that clicked *close* where it meant maximise, which is what a coordinate constant
+    // hides and a changing layout exposes.
+    let button_y = term_y + chrome::TITLE_Y;
     // Measured from the window's **right edge**, which is its origin plus its width — not from
     // its width, which is the same number only while windows are placed at x=0.
     let right = term_x + term_w as i32;
-    let maximise_at = (right - 39, button_y);
-    let minimise_at = (right - 65, button_y);
+    let maximise_at = (right - chrome::MAXIMISE_X, button_y);
+    let minimise_at = (right - chrome::MINIMISE_X, button_y);
 
     // **Maximise here is asserted as far as the shell's answer** — that the ask reached it and
     // that it answered with the *work area* rather than the screen. What the client does with
@@ -4022,7 +4051,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
         "desktop-shell: window {term_id} geometry {},{} {}x{}",
         work.0, work.1, work.2, work.3
     ))?;
-    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - 39, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
     session.expect("nxterm: asked the shell for window state 0")?;
     session.expect(&format!("desktop-shell: restore window {term_id} to "))?;
     // The size is pinned by the client's own line rather than by the shell's: the shell prints
@@ -4517,8 +4546,8 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     const DRAG_STEPS: i32 = 4;
     const DRAG_DX: i32 = 10;
     const DRAG_DY: i32 = 5;
-    // The title bar is the top 26 px of the window; x=100 is clear of the buttons at its right.
-    let press_at = (100, term_y + 13);
+    // The title bar is the top of the window; x=100 is clear of the buttons at its right.
+    let press_at = (100, term_y + chrome::TITLE_Y);
     move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
@@ -4566,7 +4595,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // was placed plus what the drag injected.
     let moved_x = term_x + DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
-    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - 39, moved_y + 13)?;
+    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - chrome::MAXIMISE_X, moved_y + chrome::TITLE_Y)?;
     session.expect("nxterm: asked the shell for window state 2")?;
     session.expect(&format!(
         "desktop-shell: maximize window {term_id} to {},{} {}x{}",
@@ -4663,14 +4692,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     line that says which of the two the shell used.
     //
     //     The window is `resized_w x resized_h` at the work area's origin after 6j, so its title
-    //     bar is at `work.1 + 13` and clear of the buttons at `x = 100`.
+    //     bar is at `work.1 + chrome::TITLE_Y` and clear of the buttons at `x = 100`.
     // **First the control, as a step of its own with a positive assertion**: a drag that passes
     // *through* a zone and is released outside it must snap nothing — and what it must do
     // instead is the ordinary move, so the assertion is the geometry that move produces. A
     // compositor that snapped on entry rather than on release would report the zone's target
     // here, and this line is what catches it. Asserting the absence of a snap would not: the
     // step after this one produces exactly that line, and an `expect` scans forward.
-    let press_at = (100, work.1 + 13);
+    let press_at = (100, work.1 + chrome::TITLE_Y);
     move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
@@ -4796,7 +4825,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //      6k then dropped it at the left edge, so its right edge is the work area's midpoint.
     chord(&mut qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
-    click_at(&mut qmp, &mut session, work.0 + (work.2 / 2) as i32 - 13, work.1 + 13)?;
+    click_at(&mut qmp, &mut session, work.0 + (work.2 / 2) as i32 - chrome::CLOSE_X, work.1 + chrome::TITLE_Y)?;
     session.expect("nxterm: closing")?;
     session.expect("desktop-shell: window list on ")?;
     println!("  ok: the close button closed the terminal with no request to the shell");
@@ -4971,7 +5000,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // **And the margin around it** (M15 Part E), which moved every sidebar row down by its height
     // without moving a listing row at all. `nxfiles::SIDEBAR_PAD` is the browser's own version.
     const SIDEBAR_PAD: i32 = 6;
-    const TITLE_BAR_H: i32 = 26;
+    const TITLE_BAR_H: i32 = chrome::TITLE_BAR_H;
     const PATH_H: i32 = 24;
     const ROW_H: i32 = 20;
     // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
@@ -5231,7 +5260,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //    a window at the screen's right edge is M9 Part F's own gesture, so the geometry the
     //    drag then uses is the work area's half rather than a number this gate invented.
     let (edit_id, ex, ey, ew, _eh) = edit_win;
-    let title_grab = (ex + ew as i32 / 2, ey + 13);
+    let title_grab = (ex + ew as i32 / 2, ey + chrome::TITLE_Y);
     move_pointer_to(&mut qmp, title_grab.0, title_grab.1)?;
     qmp.pointer = Some(title_grab);
     qmp.send_button("left", true)?;
@@ -5400,14 +5429,14 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     const TAB_STRIP_H: i32 = 24;
     // The editor is the work area's right half after the snap above.
     let ed = (work.0 + (work.2 / 2) as i32, work.1);
-    // Tab `i`'s label area: 4 is `WINDOW_CONTENT_X`, `TAB_W` per tab, and 40 into the label —
+    // Tab `i`'s label area: `chrome::CONTENT_X`, `TAB_W` per tab, and 40 into the label —
     // clear of the close box, whose centre is at `TAB_CLOSE_CX` (110).
     // **Below the editor's menu bar since M14 Part A**, which put one above the strip to match
     // the browser. The strip did not move relative to anything it contains; the whole of it moved
     // down by a bar, and a gate that aimed at the old y clicked the menus instead — which is how
     // this failed, silently, as a tab that never became current.
     let tab = |i: i32| {
-        (ed.0 + 4 + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H / 2)
+        (ed.0 + chrome::CONTENT_X + TAB_W * i + 40, ed.1 + 1 + TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H / 2)
     };
     let tab0 = tab(0);
     click_at(&mut qmp, &mut session, tab0.0, tab0.1)?;
@@ -5734,7 +5763,9 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // menu now holds a **separator**, which occupies height without being a row, so no division
     // names the right one. The client says which row the pointer is over, so the gate walks down
     // the popup and stops when the guest agrees it is over `Rename`.
-    const MENU_FRAME: i32 = 3;
+    // The popup's border and the space above its first row: one and five since the desktop
+    // refresh's Part B (the design's `padding: 5px 0`), one and two before.
+    const MENU_FRAME: i32 = 6;
     // `Rename` is `MENU_ROW_KEY + 8`: New Tab, Close Tab, a rule, New Window, Quit, a rule, New
     // File, New Folder, Rename. **It has moved twice** — once when the menu gained separators and
     // again when M14 Part B added the window rows — and each time the gate failed as a *prompt*
@@ -5752,12 +5783,16 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     while ry < py + ph as i32 - MENU_FRAME {
         move_pointer_to(&mut qmp, rx, ry)?;
         qmp.pointer = Some((rx, ry));
-        // A poll rather than a wait: the receipt lands on the frame after the motion, and a step
-        // that arrived on another row says so just as fast.
-        if session.expect_within(
-            &format!("nxfiles: menu hover {RENAME_ROW}"),
-            std::time::Duration::from_millis(300),
-        )? {
+        // **The row the pointer settled on, not the first one it crossed** — see
+        // `Session::settled_line`. The receipt lands on the frame after the motion; a step that
+        // arrived nowhere new says nothing, and the next step is taken.
+        let over = session.settled_line(
+            "nxfiles: menu hover ",
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(400),
+        )?;
+        if over.as_deref() == Some(RENAME_ROW.to_string().as_str()) {
+            println!("  ok: the pointer settled over row {RENAME_ROW}");
             rename_at = Some((rx, ry));
             break;
         }
@@ -5894,9 +5929,12 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     //     compiler cannot see.)
     const CONFIRM_W: i32 = 340;
     const CONFIRM_H: i32 = 132;
-    const CONFIRM_DISCARD_CX: i32 = 91;
-    const CONFIRM_KEEP_CX: i32 = 249;
-    const CONFIRM_BUTTON_CY: i32 = 103;
+    // **Moved by the desktop refresh's Part B** from (91, 249, 103): the dialog's content runs
+    // flush to its border now, three pixels wider each side and three lower. `libui`'s pin moved
+    // with them, in the same change.
+    const CONFIRM_DISCARD_CX: i32 = 89;
+    const CONFIRM_KEEP_CX: i32 = 250;
+    const CONFIRM_BUTTON_CY: i32 = 106;
     // **And the editor's own size, `nxedit::START_SIZE`, because the geometry line cannot be
     // read this late.** The shell logs at most `MAX_LOGGED_GEOMETRY` of them per session and
     // this run passed that long ago — a bound that exists because the event is client-driven,
@@ -5914,7 +5952,7 @@ fn cmd_check_login(accel: Accel, size: DisplaySize) -> R<()> {
     // three title-bar controls, measured from the window's right edge — the same arithmetic 6a2
     // uses, and the same one 6i used on `nxterm`, whose close button really does just exit.
     let untitled_right = untitled_x + EDITOR_W;
-    let close_at = (untitled_right - 13, untitled_y + 13);
+    let close_at = (untitled_right - chrome::CLOSE_X, untitled_y + chrome::TITLE_Y);
     click_at(&mut qmp, &mut session, close_at.0, close_at.1)?;
     // **The editor's line comes first, and it is ordered by construction rather than by luck.**
     // It is printed *before* the dialog is asked for, because a dialog's first `Configure` is
@@ -6961,12 +6999,18 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     while cy < py + ph as i32 - 3 {
         move_pointer_to(&mut qmp, cx, cy)?;
         qmp.pointer = Some((cx, cy));
-        // Short, because this is a poll rather than a wait: the receipt is emitted on the frame
-        // after the motion, and a step that landed on another row will say so just as fast.
-        if session.expect_within(
-            &format!("nxterm: menu hover {CLEAR_ROW}"),
-            std::time::Duration::from_millis(300),
-        )? {
+        // **The row the pointer settled on, not the first one it crossed.** The first step here
+        // comes from wherever the last click left the pointer, in 100-pixel packets, and the
+        // guest reports every row it passes: after the desktop refresh's Part B moved this popup
+        // four pixels, the approach's first packet landed on `Clear` itself, the walk took that
+        // for arrival, and clicked the disabled `Copy` at the top. See `Session::settled_line`.
+        let over = session.settled_line(
+            "nxterm: menu hover ",
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(400),
+        )?;
+        if over.as_deref() == Some(CLEAR_ROW.to_string().as_str()) {
+            println!("  ok: the pointer settled over row {CLEAR_ROW}");
             found = Some(cy);
             break;
         }
@@ -7012,6 +7056,15 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // a click chooses. Nothing had ever arrowed.
     //
     // The popup takes the keyboard while it is up, so these keys reach *it* and never the grid.
+    //
+    // **And the terminal has to have the keyboard back before F1 goes**, which is why this waits
+    // for `focus=1`. Choosing closes the popup, and the compositor announces the terminal's focus
+    // only once the popup has gone; F1 sent on `chose Clear` alone could arrive while the
+    // closing popup still held the keyboard, and open nothing. It did, twice: once in the desktop
+    // refresh's Part A under host load, and again in Part B without it, both transcripts ending
+    // `chose Clear`, `focus=1`, and silence. The key's destination cannot be logged — console lines
+    // never carry what was typed — so the evidence is the ordering: this is the transcript's own.
+    session.expect("nxterm: focus=1")?;
     qmp.send_key("f1", true)?;
     qmp.send_key("f1", false)?;
     session.expect("nxterm: menu popup ")?;
@@ -7314,7 +7367,8 @@ fn cmd_tune(args: &[String]) -> R<()> {
             },
         ],
     };
-    let corner = num("--corner", 0)?;
+    // What ships, like every other default here: floating windows are rounded since Part B.
+    let corner = num("--corner", libdraw::corner::WINDOW_RADIUS)?;
     let ground_alpha = num("--ground", 210)?.min(255) as u8;
     let side_alpha = num("--side", 150)?.min(255) as u8;
 
@@ -8133,22 +8187,6 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     }
     println!("  ok: cursor visible at ({cx},{cy}) — {cursor_px} body pixels");
 
-    let mut mismatches = 0usize;
-    let mut first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
-    for y in 0..sh {
-        for x in 0..sw {
-            let want = Framebuffer::get_pixel(&expected, x, y).unwrap_or_default();
-            let i = (y as usize * w as usize + x as usize) * 3;
-            let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
-            if got != (want.r, want.g, want.b) {
-                mismatches += 1;
-                if first.is_none() {
-                    first = Some((x, y, got, (want.r, want.g, want.b)));
-                }
-            }
-        }
-    }
-
     // The font both reference renders are drawn with here — the same file the image build
     // stages at `/system/fonts/`, against a guest render made from the bytes it read off the
     // disk. This is the only check anywhere that a font loads on the target at all.
@@ -8175,124 +8213,115 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         let g = libdraw::framebuffer::Framebuffer::geometry(&term);
         (g.width, g.height)
     };
-    // The stacking the exclusions below assume, stated rather than trusted: each window must sit
+    let ui = reference_frame(&faces, "ui")?;
+    // The stacking the composition below assumes, stated rather than trusted: each window must sit
     // wholly inside the one beneath it, or a region the gate believes it is comparing is covered
     // by something it is not comparing against — a hole that would be silent.
     if !(sw <= tw && sh <= th && tw <= uw && th <= uh) {
         return Err(format!(
             "the reference windows are no longer nested: scene {sw}x{sh}, terminal {tw}x{th}, \
              toolkit {uw}x{uh}. `ui-testclient` creates them largest-first because windows stack \
-             at the origin in creation order; fix the sizes or the order before the exclusions \
+             at the origin in creation order; fix the sizes or the order before the comparison \
              below can mean anything"
         )
         .into());
     }
-    // **And nested with room for a shadow**, which nesting alone does not give (M13 Part C, PR
-    // #276 review, finding 6). Each window's shadow is applied to the reference *below* it and
-    // then that window's rectangle is excluded from the comparison — so a shadow that reached
-    // past the window above it would land in a region the exclusion does not cover, and the gate
-    // would report unexplained pixel mismatches instead of the real cause. One font-size change
-    // to the terminal reference is all it takes.
-    // How far past a one-pixel window the shadow paints, rightward and downward — over every
-    // layer, since the refresh's shadow has two and the wider need not be the one dropped further.
-    // **The light scheme's**, because nothing in a self-test boot says otherwise: there is no
-    // session, so no shell sends `SetScheme`, and the compositor keeps the scheme it starts in.
-    let shadow = libdraw::theme::window_shadow(libdraw::theme::Scheme::Light);
-    let reach = shadow.around(libdraw::geom::Rect::new(0, 0, 1, 1));
-    let reach_x = (reach.right() - 1) as u32;
-    let reach_y = (reach.bottom() - 1) as u32;
-    if !(sw + reach_x <= tw && sh + reach_y <= th && tw + reach_x <= uw && th + reach_y <= uh) {
-        return Err(format!(
-            "a reference window's shadow would fall outside the window above it: scene \
-             {sw}x{sh}, terminal {tw}x{th}, toolkit {uw}x{uh}, and a shadow reaches {reach_x} \
-             sideways and {reach_y} down. Each window must clear the one below it by that much, \
-             or the exclusions below stop covering what the guest paints"
-        )
-        .into());
-    }
-    // **The window above casts a shadow onto this one** (M13 Part C), so the reference has to
-    // carry it or the gate would be comparing against a picture the compositor never draws. Applied
-    // through `libdraw`'s own `draw_shadow` with `libdraw`'s own constant — the gate computes its
-    // expected answer, and a shadow that stopped reaching the screen now fails here rather than
-    // going unnoticed.
-    let mut term = term;
-    libdraw::compose::draw_shadow(
-        &mut term,
-        libdraw::geom::Rect::new(0, 0, sw, sh),
-        // Square: the reference windows are not rounded until Part B rounds real ones.
-        0,
-        &shadow,
-        &libdraw::geom::Rect::new(0, 0, tw, th),
-    );
-    let term = term;
-
-    let mut term_mismatches = 0usize;
-    let mut term_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
-    let mut term_compared = 0usize;
-    if w >= tw && h >= th {
-        for y in 0..th {
-            for x in 0..tw {
-                if x < sw && y < sh {
-                    continue; // the scene's window is on top here
-                }
-                term_compared += 1;
-                let want = Framebuffer::get_pixel(&term, x, y).unwrap_or_default();
-                let i = (y as usize * w as usize + x as usize) * 3;
-                let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
-                if got != (want.r, want.g, want.b) {
-                    term_mismatches += 1;
-                    if term_first.is_none() {
-                        term_first = Some((x, y, got, (want.r, want.g, want.b)));
-                    }
-                }
-            }
-        }
-    }
-
-    // **The toolkit's window**, at the bottom of the three, and the only check that puts
-    // `libui` on a screen.
+    // **The expected screen is composed here, the way the guest composes it** (desktop refresh,
+    // Part B). The three windows are rounded now, so each one's corners show what is beneath —
+    // the scene's the terminal's, the terminal's the toolkit window's, and the toolkit window's
+    // the desktop — and each casts its shadow over what is below and into its own corners. This
+    // was built by hand until then: each render, the shadow of the window above painted onto it,
+    // and the window above excluded. Rounding would have meant three more exclusions and a
+    // hand-written blend per curve, so the pictures are stacked through `libdraw::compose`
+    // instead, with the guest's own radius and shadow.
     //
-    // Compared everywhere *except* the rectangles of the windows above it. That exclusion is
-    // not a weakening: a compositor that stacked them the other way would fail the comparisons
-    // above, so the ordering is still covered.
-    let ui = reference_frame(&faces, "ui")?;
-    // The terminal's window shadows the toolkit's, for the same reason and from the same source.
-    // The scene's shadow reaches at most `radius` past the terminal, which is inside the terminal's
-    // own rectangle and therefore inside the region excluded below — so one shadow, not two.
-    let mut ui = ui;
-    libdraw::compose::draw_shadow(
-        &mut ui,
-        libdraw::geom::Rect::new(0, 0, tw, th),
-        // Square: the reference windows are not rounded until Part B rounds real ones.
-        0,
-        &shadow,
-        &libdraw::geom::Rect::new(0, 0, uw, uh),
-    );
-    let ui = ui;
-    let mut ui_mismatches = 0usize;
-    let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
-    let mut ui_compared = 0usize;
+    // **What is still computed independently is the part that matters**: the three pictures come
+    // from `libdraw`'s scene, `libterm` and `libui`, and compose's rounding and shadowing are
+    // held by their own unit tests. What this gate adds is that the guest applies them — a
+    // compositor that forgot to round, or to shadow, fails here — and the binding: a wrong base,
+    // stride or channel order.
+    //
+    // **The light scheme's shadow**, because nothing in a self-test boot says otherwise: there is
+    // no session, so no shell sends `SetScheme`, and the compositor keeps the scheme it starts in.
+    let shadow = libdraw::theme::window_shadow(libdraw::theme::Scheme::Light);
+    let radius = libdraw::corner::WINDOW_RADIUS;
+    let composed = {
+        use libdraw::compose::SurfaceRef;
+        let origin = libdraw::geom::Point::new(0, 0);
+        // A function rather than a closure, so the borrow it returns can be named.
+        fn at<'a>(
+            fb: &'a libdraw::framebuffer::MemFramebuffer,
+            origin: libdraw::geom::Point,
+            shadow: libdraw::compose::Shadow,
+            radius: u32,
+        ) -> SurfaceRef<'a> {
+            SurfaceRef::new(Framebuffer::geometry(fb), origin, fb.bytes())
+                .with_shadow(shadow)
+                .with_corner(radius)
+        }
+        let mut out = libdraw::framebuffer::MemFramebuffer::new(libdraw::framebuffer::Geometry::packed(
+            uw,
+            uh,
+            libdraw::format::PixelFormat::XRGB8888,
+        ));
+        // Bottom first, as `ui-testclient` created them — the nesting above is what makes this
+        // the guest's order.
+        let stack = [
+            at(&ui, origin, shadow, radius),
+            at(&term, origin, shadow, radius),
+            at(&expected, origin, shadow, radius),
+        ];
+        libdraw::compose::compose_full(&mut out, libdraw::scene::BACKGROUND, &stack);
+        out
+    };
+    // **Except the bottom window's four corner squares**, and only those. The self-test image runs
+    // `nxterm` as a service, and with no manager its window sits at the origin *beneath* these
+    // three — invisible while they were square, because the toolkit window covered its rectangle
+    // whole. Rounded, the toolkit window's corners show `nxterm`'s pixels and its shadow, which
+    // this gate does not render. Everywhere else the toolkit window is opaque over whatever is
+    // under it, so nothing else can reach the comparison; the scene's and the terminal's corners
+    // show only windows this gate *does* render, and those are compared exactly — which is what
+    // proves the guest rounds at all. The first run of the rounded gate failed on exactly these
+    // pixels, first at the shared corner (0,0).
+    let unknown_beneath = move |x: u32, y: u32| {
+        (x < radius || x >= uw - radius) && (y < radius || y >= uh - radius)
+    };
+    // One pass, counted per window so a failure still says which picture it was in.
+    let region = |x: u32, y: u32| {
+        if x < sw && y < sh {
+            0
+        } else if x < tw && y < th {
+            1
+        } else {
+            2
+        }
+    };
+    let mut miss = [0usize; 3];
+    let mut compared = [0usize; 3];
+    let mut firsts: [Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))>; 3] = [None; 3];
     if w >= uw && h >= uh {
         for y in 0..uh {
             for x in 0..uw {
-                if x < tw && y < th {
-                    // The terminal's window is on top here, and the scene's above that. One
-                    // exclusion rather than two, because the nesting was asserted above.
+                if unknown_beneath(x, y) {
                     continue;
                 }
-                ui_compared += 1;
-                let want = Framebuffer::get_pixel(&ui, x, y).unwrap_or_default();
+                let k = region(x, y);
+                compared[k] += 1;
+                let want = Framebuffer::get_pixel(&composed, x, y).unwrap_or_default();
                 let i = (y as usize * w as usize + x as usize) * 3;
                 let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
                 if got != (want.r, want.g, want.b) {
-                    ui_mismatches += 1;
-                    if ui_first.is_none() {
-                        ui_first = Some((x, y, got, (want.r, want.g, want.b)));
+                    miss[k] += 1;
+                    if firsts[k].is_none() {
+                        firsts[k] = Some((x, y, got, (want.r, want.g, want.b)));
                     }
                 }
             }
         }
     }
+    let (mismatches, term_mismatches, ui_mismatches) = (miss[0], miss[1], miss[2]);
+    let (first, term_first, ui_first) = (firsts[0], firsts[1], firsts[2]);
+    let (term_compared, ui_compared) = (compared[1], compared[2]);
 
     // **M8 Part B: the screendump Part A could not take.** Part A's gate box asked for a
     // switched screen compared against a `libdraw` render, and could not have it: the guest had
@@ -8304,7 +8333,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // the unswitched one was wrong, and running it anyway would report the second failure while
     // hiding the first.
     if mismatches == 0 && term_mismatches == 0 && ui_mismatches == 0 {
-        if let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh) {
+        if let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh, &composed, radius) {
             let _ = session.child.kill();
             let _ = fs::remove_file(&qmp_sock);
             return Err(e);
@@ -8321,7 +8350,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
              first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
              the capture is at {} — a whole-image shift suggests a base-address or stride \
              error, and swapped components suggest a channel-order one",
-            sw as usize * sh as usize,
+            compared[0],
             shot.display()
         )
         .into());
@@ -8363,9 +8392,10 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         .into());
     }
     println!(
-        "\nxtask: display gate PASSED — the {sw}x{sh} scene, {term_compared} pixels of the \
-         {tw}x{th} terminal and {ui_compared} pixels of the {uw}x{uh} toolkit window match \
-         libdraw, libterm and libui pixel for pixel ✓"
+        "\nxtask: display gate PASSED — {} pixels of the {sw}x{sh} scene, {term_compared} of the \
+         {tw}x{th} terminal and {ui_compared} of the {uw}x{uh} toolkit window match libdraw, \
+         libterm and libui pixel for pixel, rounded corners and shadows composed ✓",
+        compared[0]
     );
     Ok(())
 }
@@ -8389,6 +8419,8 @@ fn desktop_round_trip(
     screen_w: u32,
     sw: u32,
     sh: u32,
+    composed: &libdraw::framebuffer::MemFramebuffer,
+    radius: u32,
 ) -> R<()> {
     let shot = work.join("screendump-desktop.ppm");
 
@@ -8456,12 +8488,20 @@ fn desktop_round_trip(
     let restored = settle_and_capture(qmp, &shot)?;
     let (w3, _, px3) = parse_ppm(&restored)?;
     use libdraw::framebuffer::Framebuffer;
-    let expected = libdraw::scene::render_reference();
+    // **The composed screen, not the scene's own render** (desktop refresh, Part B): the scene's
+    // window is rounded, so its corners show the terminal beneath it, and that is what coming
+    // back unchanged has to reproduce.
+    let expected: &libdraw::framebuffer::MemFramebuffer = composed;
     let mut bad = 0usize;
     let mut first_bad = None;
     for y in 0..sh {
         for x in 0..sw {
-            let want = Framebuffer::get_pixel(&expected, x, y).unwrap_or_default();
+            // The shared corner at the origin shows `nxterm` beneath, which the comparison above
+            // also leaves out — see `unknown_beneath` there.
+            if x < radius && y < radius {
+                continue;
+            }
+            let want = Framebuffer::get_pixel(expected, x, y).unwrap_or_default();
             let i = (y as usize * w3 as usize + x as usize) * 3;
             let got = (px3[i], px3[i + 1], px3[i + 2]);
             if got != (want.r, want.g, want.b) {
@@ -8485,6 +8525,18 @@ fn desktop_round_trip(
     }
     println!("  ok: switching back restored the scene pixel for pixel, with no client commit");
     Ok(())
+}
+
+/// The last **complete** line of `fresh` containing `prefix` — what follows `prefix` on it,
+/// trimmed — and how many bytes of `fresh` are whole lines. See [`Session::settled_line`].
+///
+/// **Whole lines only**: the reader appends as bytes arrive, and a half-written `hover 10` is not
+/// row 10. The count lets the caller stop at the last complete line and read the rest next time.
+fn last_receipt(fresh: &str, prefix: &str) -> (Option<String>, usize) {
+    let whole = fresh.rfind('\n').map_or(0, |i| i + 1);
+    let line = fresh[..whole].lines().filter(|l| l.contains(prefix)).last();
+    let rest = line.map(|l| l[l.find(prefix).map_or(0, |i| i + prefix.len())..].trim().to_string());
+    (rest, whole)
 }
 
 /// Parse a binary PPM (P6) into `(width, height, rgb_bytes)`.
@@ -9130,6 +9182,53 @@ impl Session {
             }
             if std::time::Instant::now() > deadline {
                 return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The **last** line starting `prefix` once such lines have stopped arriving for `quiet` —
+    /// the rest of it after `prefix` — or `None` if none arrived before `limit`. Consumes
+    /// everything read.
+    ///
+    /// **For a receipt that the path to a position can also produce.** An injected move is a run
+    /// of relative packets, and the guest reports every row the pointer crosses on the way, not
+    /// only the one it stops on. `expect_within` takes the *first* matching line, so a walk that
+    /// polled for "hover over row N" accepted a row the pointer merely passed through, and clicked
+    /// where it had stopped instead — which is what `check-terminal` did once the desktop
+    /// refresh's Part B moved a menu popup four pixels, putting the approach's first 100-pixel
+    /// step on the very row the walk was looking for. The row the pointer is *over* is the last
+    /// one it reported, and only once it has stopped reporting.
+    fn settled_line(
+        &mut self,
+        prefix: &str,
+        quiet: std::time::Duration,
+        limit: std::time::Duration,
+    ) -> R<Option<String>> {
+        let start = std::time::Instant::now();
+        let mut last: Option<String> = None;
+        let mut changed = start;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                // **Whole lines only**: the reader appends as bytes arrive, and a half-written
+                // `hover 10` is not row 10. The cursor stops at the last complete line, so the
+                // rest is read on the next poll.
+                let (receipt, whole) = last_receipt(&g[self.cursor..], prefix);
+                if let Some(r) = receipt {
+                    last = Some(r);
+                    // Only a receipt restarts the wait: other output — a heartbeat — says nothing
+                    // about whether the pointer is still moving.
+                    changed = std::time::Instant::now();
+                }
+                self.cursor += whole;
+            }
+            let now = std::time::Instant::now();
+            if last.is_some() && now.duration_since(changed) >= quiet {
+                return Ok(last);
+            }
+            if now.duration_since(start) >= limit {
+                return Ok(last);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -13470,6 +13569,22 @@ fn format_cmd(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settled_receipt_is_the_last_whole_one() {
+        // The approach crosses `Clear` and stops on `Copy`: the answer is where it stopped.
+        let text = "nxterm: menu hover 106\nheartbeat\nnxterm: menu hover 100\n";
+        assert_eq!(last_receipt(text, "nxterm: menu hover "), (Some("100".to_string()), text.len()));
+        // A line still being written is not read, and not consumed.
+        let partial = "nxterm: menu hover 100\nnxterm: menu hover 10";
+        assert_eq!(
+            last_receipt(partial, "nxterm: menu hover "),
+            (Some("100".to_string()), "nxterm: menu hover 100\n".len())
+        );
+        // Nothing complete, nothing read.
+        assert_eq!(last_receipt("nxterm: menu hov", "nxterm: menu hover "), (None, 0));
+        assert_eq!(last_receipt("heartbeat\n", "nxterm: menu hover "), (None, 10));
+    }
 
     #[test]
     fn the_staged_theme_reads_back_as_itself_and_only_its_overrides_are_live() {

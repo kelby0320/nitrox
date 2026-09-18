@@ -14,6 +14,19 @@
 //! floating point is the one thing in compositing that two targets could legitimately round
 //! differently.
 
+/// The radius a floating window's corners are rounded to: 8 pixels.
+///
+/// **A compiled constant, in the crate both sides link**, and that is the whole reason it is
+/// here (desktop refresh, "`radius_px` is a compiled constant"). The compositor cuts a window's
+/// corner to this curve and the window's own toolkit draws its border along it; the compositor
+/// never reads a theme file (M11 decision 1), so a value in the theme would reach one of the two
+/// and leave a wedge of mismatch at every corner.
+///
+/// **Eight is the design's own default**, and a physical size rather than a proportion: a CSS
+/// pixel is 1/96 inch and the laptop's panel is about 100 per inch, so the design's 8 px corner is
+/// 8 px here (desktop refresh, Part A's metrics decision).
+pub const WINDOW_RADIUS: u32 = 8;
+
 /// How much of the pixel at `(dx, dy)` a corner of `radius` covers, 0 to 255.
 ///
 /// `dx` and `dy` count from the corner itself — the pixel in the very corner of the rectangle is
@@ -38,6 +51,35 @@ pub fn coverage(radius: u32, dx: u32, dy: u32) -> u8 {
     // Coverage is how far inside the curve the centre is, plus the half pixel on its far side.
     let inside = (radius as i64 * 256 + 128 - d256).clamp(0, 256);
     ((inside * 255 + 128) / 256) as u8
+}
+
+/// How much of the pixel at `(dx, dy)` belongs to a one-pixel border drawn just inside a corner
+/// of `radius`, **as a share of the part of the pixel the shape covers** — 0 to 255.
+///
+/// **For a border on a surface the compositor will cut to the same curve**, and that is why it is
+/// a share rather than a coverage. The compositor blends each pixel on the curve at
+/// [`coverage`] over what is below; if the surface also blended its border at the ring's own
+/// coverage, the edge would be faded twice and every curve would draw lighter than the straight
+/// edges beside it. So the border is `outer − inner` of the pixel, and the surface is told what
+/// fraction of *its* part that is: a pixel the curve half covers, all of it border, is border
+/// here, and the compositor's half is the only fading it gets.
+///
+/// The border is the band between the shape's own curve and the curve of the shape inset by one
+/// pixel with radius `radius − 1` — the same centre, one pixel in. A pixel the shape does not
+/// cover at all answers 0: the compositor will not show it, so nothing drawn there matters.
+pub fn border_share(radius: u32, dx: u32, dy: u32) -> u8 {
+    let outer = coverage(radius, dx, dy) as u32;
+    if outer == 0 {
+        return 0;
+    }
+    // The inset shape starts one pixel in, so the outermost row and column are not in it at all.
+    let inner = if dx == 0 || dy == 0 || radius == 0 {
+        0
+    } else {
+        coverage(radius - 1, dx - 1, dy - 1) as u32
+    };
+    let ring = outer.saturating_sub(inner);
+    ((ring * 255 + outer / 2) / outer) as u8
 }
 
 /// The shape of one row of a rounded corner: how many pixels are wholly outside the curve, and
@@ -167,5 +209,42 @@ mod tests {
         assert_eq!(clamp(8, 10, 100), 5);
         assert_eq!(clamp(8, 100, 3), 1);
         assert_eq!(clamp(8, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_border_is_all_border_on_the_edge_and_none_inside() {
+        // The straight parts, which is most of any window's border: the outermost row and column
+        // are the line, the next one in is not.
+        for r in [2u32, 8] {
+            assert_eq!(border_share(r, 0, r + 3), 255, "the left edge at radius {r}");
+            assert_eq!(border_share(r, r + 3, 0), 255, "the top edge at radius {r}");
+            assert_eq!(border_share(r, 1, r + 3), 0, "one pixel in at radius {r}");
+            assert_eq!(border_share(r, r + 3, r + 3), 0, "the middle at radius {r}");
+        }
+        // Outside the curve the compositor shows nothing, so the answer is nothing.
+        assert_eq!(border_share(8, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_border_on_the_curve_is_a_share_of_what_the_shape_covers() {
+        // **The property the share exists for**: the compositor blends the surface's pixel at
+        // `coverage`, and the surface blends its border at `border_share` — so what reaches the
+        // screen as border is their product, and it must equal the real band's area in the pixel,
+        // `outer − inner`, to within rounding. Blending the border at the band's own coverage
+        // instead would square it and every curve would draw paler than the straight edge.
+        for r in [3u32, 8, 16] {
+            for dy in 0..r {
+                for dx in 0..r {
+                    let outer = coverage(r, dx, dy) as u32;
+                    if outer == 0 {
+                        continue;
+                    }
+                    let inner = if dx == 0 || dy == 0 { 0 } else { coverage(r - 1, dx - 1, dy - 1) as u32 };
+                    let band = outer.saturating_sub(inner);
+                    let shown = border_share(r, dx, dy) as u32 * outer / 255;
+                    assert!(shown.abs_diff(band) <= 1, "r {r} ({dx},{dy}): shown {shown}, band {band}");
+                }
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()` and the theming section was checked against it), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-18, when the desktop refresh's Part A added a real `Theme::dark()` and Part B rounded the frames — `Node::Outline`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -495,8 +495,9 @@ is:
 
 | Widget | Why it exists |
 |---|---|
-| `window_frame` | A window's own edge: a one-pixel border, three pixels of frame on the left, right and bottom, and the title bar flush at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
-| `popup_frame` | A menu or modal's edge. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
+| `window_frame` | A window's own edge: a one-pixel border, rounded along the compositor's curve and drawn last as a `Node::Outline`, with the content flush against it (`WINDOW_FRAME` is 0 since the desktop refresh's Part B, which took away a three-pixel margin the design does not have) and the title bar at the top. **Publishes what it costs** — `WINDOW_FRAME_W`, `WINDOW_FRAME_H`, `WINDOW_CONTENT_X`, `WINDOW_CONTENT_Y` — because all three windowed applications subtract it from their own content size, and a widget built for one height and laid out at another is the bug `list_view` above already warns about |
+| `window_frame_with_grip` | `window_frame` with a resize grip in its bottom-right corner, **inside the border and under it**: the grip is a layer before the border, so the border's curve is drawn over it. All three applications used to stack the grip over the finished frame, which covered that corner's border |
+| `popup_frame` | A menu or modal's edge, rounded like a window's. A popup is the one surface with nothing behind it to define one, and on a light theme its face and the window under it run together |
 | `menu_item` | A dropdown row that highlights under the pointer, the way a selected list row does — they are the same thing seen twice |
 | `ListState::drag_to` | Converts a pointer's y on a scrollbar into an offset. On the state rather than in each caller, so a list's thumb and `nxterm`'s grid answer the same question the same way |
 
@@ -540,15 +541,35 @@ wrong picture but as a menu that opens, reports its size, and never draws a fram
 `the_popup_diffs_from_one_highlight_to_the_next` is the host test that pins it, and each
 application has the same test for its own window.
 
-**What is still missing, and it is a gap rather than a decision.** A disabled row is not
-*dimmed*: `paint` draws every `Text` in `theme.foreground` and there is no per-element ink, so
-"unavailable" shows only as a row that does not light under the pointer and that arrowing skips.
-The colour arrives with the ink wrapper M14 Part G adds for syntax highlighting.
+**A disabled row is dimmed since the desktop refresh's Part B**, and this paragraph used to
+record that it was not: "unavailable" showed only as a row that did not light under the pointer
+and that arrowing skipped, waiting for the ink wrapper M14 Part G added. A popup now wraps a
+disabled row in `theme.foreground_dim`, its chord column in the same, and a row marked
+`Item::destructive` — the file browser's `Delete` — in `theme.deny`; disabled wins, so a greyed
+row never shouts.
+
+**Selection and hover are washes since the same part.** `Node::Wash` blends a colour at a
+coverage over whatever is painted beneath it, and a selected row is the accent at 20%
+(`SELECTION_COVERAGE`), a hovered row or menu item the accent at the scheme's hover coverage (10%,
+18% dark) — the design's `--sel` and `--soft`. It replaced a one-pixel accent border around a
+bevelled fill. A wash is half the colour under it, so every caller puts it in a `Stack` after the
+ground it sits on, and `paint` clears a damaged area and draws the tree in order, which keeps a
+repaint from washing over its own wash.
 
 Two painting primitives arrived with them: `Node::Bevel`, a fill with the theme's gradient — a
 *second* fill rather than a flag on the first, because a flat fill is correct from the clip alone
 and a gradient is only correct from the node's own rect — and `Node::Icon`, the three window
 controls drawn as shapes rather than typed as `_`, `[]` and `X`.
+
+**A third, `Node::Outline`, arrived with the desktop refresh's Part B**: the one-pixel border of
+a window or a popup, with rounded corners. It is painted *last*, over the content its corners
+curve into, because the compositor now cuts a floating window's corners to
+`libdraw::corner::WINDOW_RADIUS` and a square border painted first would lose its corners to the
+cut. It blends at `libdraw::corner::border_share` — the share of the covered part of a pixel that
+is border — because the compositor supplies the curve's own fade, so it is only for a surface the
+compositor cuts to the same curve. **It is never a hit-test target**: painted last and spanning the
+whole window, it would otherwise take every press in it and answer none of them, which is what the
+first version did until `dialog_buttons_land_where_the_constants_say` failed.
 
 **The waiting was the point, and it is worth saying what it bought.** This section's standing
 reason was that "building an editor's widget remains a guess at requirements no editor has yet
@@ -872,8 +893,8 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 
   **Metrics are still constants**, and that is a decision rather than a leftover: padding,
   title-bar height and the resize grip stay compiled in because the gates click title bars at
-  `+13` and close buttons at `-39`, and a gate that had to read a theme to know where to click
-  could disagree with the thing it is checking (M11 decision 2).
+  `+16` and close buttons at `-18` (the `chrome` table in `xtask`), and a gate that had to read a
+  theme to know where to click could disagree with the thing it is checking (M11 decision 2).
 
   **Where the values come from is a file**, since M11 Part C: `/home/theme.toml`, read once by
   the shell and handed to every application on the setup record

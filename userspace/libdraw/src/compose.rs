@@ -307,20 +307,6 @@ fn draw_layer<F: Framebuffer + ?Sized>(
     }
 }
 
-/// How much of the screen pixel `(x, y)` a surface at `bounds` with corners of `radius` covers.
-///
-/// `(x, y)` must be inside `bounds`; `radius` must already be clamped to it. Mirrors the pixel
-/// into the nearest corner and asks [`corner::coverage`](crate::corner::coverage), so all four
-/// corners are the one curve.
-fn covered(bounds: Rect, radius: u32, x: i32, y: i32) -> u8 {
-    if radius == 0 {
-        return 255;
-    }
-    let dx = (x - bounds.origin.x).min(bounds.right() as i32 - 1 - x) as u32;
-    let dy = (y - bounds.origin.y).min(bounds.bottom() as i32 - 1 - y) as u32;
-    crate::corner::coverage(radius, dx, dy)
-}
-
 /// Composite `surfaces` onto `fb` within `damage`.
 ///
 /// `surfaces` is in stacking order, **bottom first**; later entries paint over
@@ -754,6 +740,24 @@ fn blit_rows<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visi
 mod tests {
     use super::*;
     use crate::format::PixelFormat;
+
+    /// How much of the screen pixel `(x, y)` a surface at `bounds` with corners of `radius` covers.
+    ///
+    /// `(x, y)` must be inside `bounds`; `radius` must already be clamped to it. Mirrors the pixel
+    /// into the nearest corner and asks [`corner::coverage`](crate::corner::coverage), so all four
+    /// corners are the one curve.
+    ///
+    /// **Test-only since the span skip** (desktop refresh, Part A): `draw_layer` found its covered
+    /// span per row instead of asking this per pixel, and this stayed as the per-pixel definition
+    /// the tests and `draw_layer_reference` are written against.
+    fn covered(bounds: Rect, radius: u32, x: i32, y: i32) -> u8 {
+        if radius == 0 {
+            return 255;
+        }
+        let dx = (x - bounds.origin.x).min(bounds.right() as i32 - 1 - x) as u32;
+        let dy = (y - bounds.origin.y).min(bounds.bottom() as i32 - 1 - y) as u32;
+        crate::corner::coverage(radius, dx, dy)
+    }
 
     // ---- compose_exposed (M13 Part A) ----
 

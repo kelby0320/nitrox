@@ -2,8 +2,9 @@
 
 ## Status
 
-**Built, and checked 2026-09-03** — this document describes what exists. Two things changed under
-it since: a surface may name `ARGB8888` and be composited translucent (M13 Part B — §6's resolved
+**Built, and checked 2026-09-03; §4a checked 2026-09-18** — this document describes what exists.
+Since then the compositor rounds the corners of the roles that float (desktop refresh, Part B —
+§4a). Two things changed under it before that: a surface may name `ARGB8888` and be composited translucent (M13 Part B — §6's resolved
 note carries the extension), and the compositor no longer paints the aperture as it composes. `compositor::Screen` builds
 each frame in a shadow buffer and copies the finished damage rectangles across, so the display
 never holds a partly-composed frame (M13 Part A). Nothing about §2–§4's ownership, protocol or
@@ -165,6 +166,18 @@ each changes what the compositor does:
   its own parent (M12 Part A). What the role fixes is that the *compositor* holds its first
   `Configure` for a manager; what a manager then does with it is policy.
 - **`normal`** — everything else.
+
+**The roles that float cast a shadow and have rounded corners; a panel has neither.** A normal
+window, a popup and a dialog are shapes over the desktop, so the compositor draws a shadow under
+each (M13 Part C) and, since the desktop refresh's Part B, cuts each one's corners to an 8-pixel
+curve — `libdraw::corner::WINDOW_RADIUS`, compiled into both the compositor and the toolkit,
+because the client draws its border along the same curve. The cut writes nothing outside the curve
+and blends the pixels on it, so a window's corner shows whatever is beneath it. A bar is docked to
+the screen's edge, where a rounded corner would be a notch of wallpaper. **A window that covers the
+whole screen is not rounded either** (`compositor::corner_of`): its corners are the screen's, and a
+cut would show whatever is beneath it there. The overview is that window — a popup the size of the
+screen, created after the shell's bars and so above them — and while it was rounded, each cut
+corner showed a notch of undimmed bar through its dimmed overlay.
 
 **A panel reserves space.** A maximised window must not cover the bars, which X calls struts.
 The compositor subtracts reserved edges from the area it offers to `normal` windows.

@@ -111,7 +111,7 @@ choosing two colours that do.
 
 - [x] **Part A — the design as data**: the theme gains what the design needs, in two palettes,
       and `libdraw` gains the three primitives they imply.
-- [ ] **Part B — window chrome**: rounded corners, the new titlebar, focus that reads, and menus
+- [x] **Part B — window chrome**: rounded corners, the new titlebar, focus that reads, and menus
       in the design's style.
 - [ ] **Part C — the panels**: the Applications and Places menus, and a bottom bar with a
       show-desktop button and the new switcher.
@@ -208,15 +208,36 @@ ever paints whole surfaces.
 
 ## Part B — window chrome
 
-- [ ] **Rounded corners**, which need a new blit primitive — see below. They are neither a
-      paint change nor, as the first draft had it, a `covers` change.
-- [ ] **The titlebar**, restyled: the title left, the three controls right, `panel` behind.
-- [ ] **Focus reads at a glance** — `title_active` against `title_inactive`, diverging from the
-      design as argued above.
-- [ ] **Menus in the design's style**: dim small-caps section headers, a right-aligned hint
-      column (the shortcut in Applications, the path in Places), separators, and `deny` for a
-      destructive item. The design has no *window* menu open, so `File`/`Edit`/`View` take this
-      same style — inferred, and recorded here as inferred.
+- [x] **Rounded corners** (2026-09-18): the compositor cuts every role that floats — normal,
+      popup, dialog, the ones that already cast a shadow — to `WINDOW_RADIUS` (8); panels stay
+      square, and so does any window covering the whole screen — the overview, whose cut corners
+      showed the undimmed bars beneath it until the PR #313 review measured them. The window's own border is a `Node::Outline` along the same curve, painted last and
+      blended at `corner::border_share` so the curve is not faded twice. **It is never a hit-test
+      target** — painted last and full-size, the first version took every press in every framed
+      window. `check-display` composes its expectation through `libdraw::compose` and leaves out
+      only the bottom reference window's corner squares, where the self-test image's `nxterm`
+      shows through; a square expectation fails it at the scene's corner, so it sees the rounding.
+- [x] **The titlebar**, restyled to the design's source: 31 pixels with a rule along the bottom,
+      the title 11 in and centred down it, the controls borderless in `foreground_dim`, 23 wide,
+      9 apart, 5 from the border. **On `title_active`/`title_inactive`, not `panel`** — this line
+      said `panel`, which was read off a screenshot; the page's title bar is `--face`. A window's
+      content runs flush to its border (`WINDOW_FRAME` 3 → 0), which took away `nxterm`'s only
+      margin — its text touched the window's edge — so its pane has the design's own, 9 by 11, in
+      the terminal's ground. The menu bar takes `face_hover` and
+      a `--lineSoft` rule, **inside the 24 pixels** three applications carry — the design's is 25
+      with its rule, a pixel of divergence rather than a pixel of every aim moving.
+- [x] **Focus reads at a glance** — the accent-tinted `title_active` from Part A, drawn.
+- [x] **Menus in the design's style**, as far as window menus have the design's parts: on the
+      window's ground, rows padded 6/12 with 5 above and below, edge-to-edge `--lineSoft` rules, the
+      chord column and disabled rows in `foreground_dim` (closing a gap the toolkit doc recorded),
+      and `Item::destructive` in `deny` — the file browser's `Delete`. **Section headers are
+      Part C's**: no window menu has sections, and the Applications menu, which the design gives
+      them, is not a window menu. Selection and hover everywhere are `Node::Wash` — the accent at
+      20%, and at 10% (18% dark) — replacing a ring round a bevelled fill.
+- [ ] **Not built: a hover state on the title bar's controls.** The design lightens a control
+      under the pointer (`--faceLo`) and reddens close (`--deny`); `title_bar` takes no hover, and
+      giving it one means threading the router's hovered key through three applications' title
+      bars. A change of its own, and named here so it is not assumed done.
 
 **Rounded corners are a blit change, and the first draft of this section had the mechanism
 wrong.** It claimed the fix was to make `covers` a region rather than a predicate. `covers`
@@ -232,15 +253,19 @@ over. Nothing is rounded. (PR #311 review, finding 2.)
 blends them along an antialiased edge. That is the new primitive to cost, and it belongs beside
 `blend_rect` in Part A. The choice is then *how the corner pixels get their colour*:
 
-- [ ] **The mask, on the row path** — the primitive itself, and the only way any of this happens.
-- [ ] **Skip the corner pixels and let the stack fill them.** Surfaces are painted in stack order,
+- [x] **The mask, on the row path** — the primitive itself, and the only way any of this happens.
+- [x] **Skip the corner pixels and let the stack fill them.** Surfaces are painted in stack order,
       so a skipped pixel keeps whatever lower surface already painted there — the desktop where
       nothing is behind, the window below where something is. This is what the first draft's
       "option 2" should have said; it is wrong only if the compositor paints corners with the
       desktop colour, which is a mistake rather than a design.
-- [ ] **`covers` minus the corners**, as the optimisation that *accompanies* the mask rather than
+- [x] **`covers` minus the corners**, as the optimisation that *accompanies* the mask rather than
       an alternative to it: a masked surface no longer covers its full rectangle, so the
       background beneath the corners must be filled. The subtraction machinery (`cut`) exists.
+
+All three were built in Part A and switched on in Part B. **The third turned out to be required,
+not an optimisation**: a rounded window still counted as covering its whole rectangle leaves its
+corners holding whatever the framebuffer last held.
 
 **The option not to take, and its real cost.** Giving windows an alpha format with transparent
 corners would work, and the first draft priced it against M13 Part A's double-write measurement —

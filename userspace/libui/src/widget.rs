@@ -29,8 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, bevel, center, column, dock, docked, fill, icon, padding,
-    row, sized, stack, text,
+    Edge, Element, IconKind, Insets, bevel, center, center_v, column, dock, docked, fill, icon,
+    ink, outline, padding, row, sized, stack, text, wash,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -114,11 +114,18 @@ pub fn button<Msg>(
 ///
 /// One helper, so the applications modal and a menu cannot disagree about what a popup looks
 /// like — they are the same kind of thing seen twice.
+///
+/// **Rounded since the desktop refresh's Part B**, because the compositor cuts a popup's corners
+/// to [`WINDOW_RADIUS`](libdraw::corner::WINDOW_RADIUS): the border is an
+/// [`outline`](crate::element::outline) drawn last, along that curve, rather than a square
+/// fill the cut would have taken the corners off.
 pub fn popup_frame<Msg>(content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    // **On the window's own ground**, the design's `--bg`, rather than a button's face: a menu is
+    // a list of things to read, and it reads as one on paper (desktop refresh, Part B).
     stack(alloc::vec![
-        fill(theme.border),
-        padding(Insets::all(POPUP_BORDER), fill(theme.face)),
+        fill(theme.background),
         padding(Insets::all(POPUP_BORDER), content),
+        outline(theme.border, libdraw::corner::WINDOW_RADIUS),
     ])
 }
 
@@ -136,6 +143,16 @@ const POPUP_BORDER: u32 = 1;
 /// two are exactly the parts that are treated differently. An application that wants no frame
 /// simply does not call this; the greeter does not, having no title bar to be flush with.
 pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &Theme) -> Element<Msg> {
+    frame_layers(title, content, None, theme)
+}
+
+/// [`window_frame`]'s layers, with an optional corner layer drawn before the border.
+fn frame_layers<Msg>(
+    title: Element<Msg>,
+    content: Element<Msg>,
+    corner: Option<Element<Msg>>,
+    theme: &Theme,
+) -> Element<Msg> {
     // **Both children wrapped, and the zero-inset one is not decoration.** The diff requires a
     // container's children to be all keyed or all unkeyed, and every caller keys its title bar —
     // so docking the title directly beside an unkeyed content pane is a `MixedKeying` error at
@@ -149,18 +166,51 @@ pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, theme: &The
             content,
         ),
     );
-    stack(alloc::vec![
-        fill(theme.border),
-        padding(Insets::all(WINDOW_BORDER), fill(theme.face)),
-        padding(Insets::all(WINDOW_BORDER), inner),
-    ])
+    // **The border is drawn last, and round** (desktop refresh, Part B). It was a square fill
+    // under a face inset by a pixel; the compositor now cuts a window's corners to
+    // `WINDOW_RADIUS`, which would take a square border's corners off with them. So the edge is
+    // an outline along the same curve, painted over the content it curves into.
+    let mut layers = alloc::vec![fill(theme.face), padding(Insets::all(WINDOW_BORDER), inner)];
+    layers.extend(corner);
+    layers.push(outline(theme.border, libdraw::corner::WINDOW_RADIUS));
+    stack(layers)
+}
+
+/// [`window_frame`], with a resize grip in its bottom-right corner — **inside the border, and
+/// under it**.
+///
+/// **Why the frame places the grip rather than the application.** All three applications stacked
+/// their grip over the finished frame, which painted its face over the last sixteen pixels of the
+/// bottom and right border and over the whole bottom-right curve, so the one corner a person
+/// reaches for was the one corner whose border was missing (PR #313 review, optional 4). Placed
+/// here, the grip is a layer *before* the outline, so the border is drawn over it along the curve,
+/// and it sits inside the border rather than on it.
+///
+/// `window` is the window's own size, which is where the corner is; an `offset` sized to the grip
+/// is what keeps it from taking presses anywhere else — a full-size overlay would be the outline's
+/// bug again.
+pub fn window_frame_with_grip<Msg>(
+    title: Element<Msg>,
+    content: Element<Msg>,
+    grip: Element<Msg>,
+    window: Size,
+    theme: &Theme,
+) -> Element<Msg> {
+    let at = |len: u32| len.saturating_sub(WINDOW_BORDER + GRIP_W) as i32;
+    frame_layers(title, content, Some(crate::element::offset(at(window.w), at(window.h), grip)), theme)
 }
 
 /// How thick the line around a window is.
 pub const WINDOW_BORDER: u32 = 1;
 
 /// How much frame shows between a window's content and its edge.
-pub const WINDOW_FRAME: u32 = 3;
+///
+/// **None, since the desktop refresh's Part B**: the design's content runs flush to the border.
+/// It was 3, a margin of the button face around everything below the title bar — the reference
+/// desktop's, which the design does not have. Kept as a named zero because applications subtract
+/// the frame from their content size through `WINDOW_FRAME_W` and `WINDOW_FRAME_H`, and those
+/// still mean what they say.
+pub const WINDOW_FRAME: u32 = 0;
 
 /// What [`window_frame`] takes off a window's width before its content sees it.
 ///
@@ -393,10 +443,12 @@ pub fn menu_item<Msg: Clone>(
     hovered: bool,
     theme: &Theme,
 ) -> Element<Msg> {
-    let mut layers = alloc::vec::Vec::with_capacity(3);
+    // **A wash over the bar, not a ring round a fill** (desktop refresh, Part B) — the design's
+    // `--soft`. The bar's own face is painted beneath this by `menu_bar`, first, which is the
+    // ground a wash needs.
+    let mut layers = alloc::vec::Vec::with_capacity(2);
     if hovered {
-        layers.push(fill(theme.accent));
-        layers.push(padding(Insets::all(1), bevel(theme.selection())));
+        layers.push(wash(theme.accent, theme.scheme.hover_coverage()));
     }
     layers.push(padding(MENU_ITEM_PAD, text(label)));
     stack(layers).on_press(msg)
@@ -647,22 +699,59 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
 /// inside the window it drops from. This is the part the terminal's chrome needs; the anchor it
 /// is dropped from comes from [`layout::locate`](crate::layout::locate).
 pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, theme: &Theme) -> Element<Msg> {
+    // **The design's menu bar** (desktop refresh, Part B): `--faceHi` behind the words, which
+    // sets it apart from the title bar above in the same family of greys, and a `--lineSoft` rule
+    // under it. The rule is `border` at half strength over the bar's own face — the derivation
+    // Part A measured in both palettes — and is drawn *inside* `height` rather than below it:
+    // the design's bar is 25 with its rule, and three applications and their gates carry 24,
+    // which is a pixel of divergence rather than a pixel of every aim moving.
+    let rule = theme.border.blend(theme.face_hover, 128);
     sized(
         Size::new(0, height),
-        stack(alloc::vec![fill(theme.face), row(items)]),
+        dock(
+            alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(rule)))],
+            stack(alloc::vec![fill(theme.face_hover), row(items)]),
+        ),
     )
 }
 
 
-/// How tall a title bar is, in pixels.
+/// How tall a title bar is, in pixels — the rule along its bottom included.
 ///
 /// One number rather than a measurement of the font, because a client sizes its window around
 /// it: a bar that grew with the theme would change every window's content area when the theme
 /// changed, and M11 is where a theme becomes changeable.
-pub const TITLE_BAR_H: u32 = 26;
+///
+/// **31 since the desktop refresh's Part B**, the design's own (`height:31px` with a one-pixel
+/// `border-bottom`, box-sized). It was 26; the design's metrics are physical sizes on this
+/// machine and transfer as written (Part A's metrics decision). The gates carry their own copy,
+/// on purpose (M11 decision 2).
+pub const TITLE_BAR_H: u32 = 31;
 
-/// How wide each title-bar button is.
-pub const TITLE_BUTTON_W: u32 = 26;
+/// How wide each title-bar button is: the design's 23.
+pub const TITLE_BUTTON_W: u32 = 23;
+
+/// How tall the face of each is — 21, centred in the bar. The press lands anywhere in the
+/// button's column of the bar, which is the easier target and the one a gate aims at.
+pub const TITLE_BUTTON_H: u32 = 21;
+
+/// The gap between two title-bar buttons: the design's 9.
+pub const TITLE_BUTTON_GAP: u32 = 9;
+
+/// The space after the last button, before the window's border: the design's 5.
+pub const TITLE_BUTTON_PAD: u32 = 5;
+
+/// The centre of the `nth` title-bar button counting from the **right** — the close button is
+/// `0` — in a framed window `window_w` wide, in the window's own coordinates.
+///
+/// **For an application's tests, not for a gate**: a gate keeps its own copy of these numbers
+/// (M11 decision 2), and this exists so the three applications stop each re-deriving the
+/// arithmetic, which is how one of them came to aim a slot to the left.
+pub const fn title_button_centre(window_w: u32, nth: u32) -> (i32, i32) {
+    let right = window_w - WINDOW_BORDER - TITLE_BUTTON_PAD;
+    let x = right - nth * (TITLE_BUTTON_W + TITLE_BUTTON_GAP) - TITLE_BUTTON_W / 2 - 1;
+    (x as i32, (WINDOW_CONTENT_Y + (TITLE_BAR_H - 1) / 2) as i32)
+}
 
 /// A window's title bar: its name, and the three things you can do to a window.
 ///
@@ -693,38 +782,54 @@ pub fn title_bar<Msg: Clone>(
 ) -> Element<Msg> {
     let face = if focused { theme.title_active } else { theme.title_inactive };
     // **A glyph, not a letter** (M11 Part E, batch 2). These were `_`, `[]` and `X` — three
-    // characters standing in for three controls, which read as text on a bar full of text. They
-    // are drawn now, and the button keeps its size, so nothing a gate clicks has moved.
+    // characters standing in for three controls, which read as text on a bar full of text.
+    //
+    // **In the dim ink, on no face of their own** — the design's controls are borderless and
+    // `--fgdim`, and read as part of the bar rather than as three buttons on it. Each takes its
+    // whole column of the bar as a target and draws its glyph in the middle of the design's 23x21.
     let btn = |glyph: IconKind, msg: Msg| {
         sized(
-            Size::new(TITLE_BUTTON_W, TITLE_BAR_H),
-            stack(alloc::vec![icon(glyph)]).on_press(msg),
+            Size::new(TITLE_BUTTON_W, 0),
+            center(sized(Size::new(TITLE_BUTTON_W, TITLE_BUTTON_H), stack(alloc::vec![icon(glyph)]))),
         )
+        .on_press(msg)
     };
     // **A button a caller has no message for is not drawn.** The alternative is a button that
     // does nothing, and a control that looks live and is not is the defect this milestone's
     // predecessor shipped three of (M8's overview). The buttons arrive with the parts that give
     // them somewhere to go: minimise and maximise in Part B, close in Part C.
-    let mut controls = alloc::vec::Vec::with_capacity(4);
-    controls.push(padding(TITLE_PAD, text(title)).flex(1));
+    let mut glyphs = alloc::vec::Vec::with_capacity(3);
     if let Some(m) = buttons.minimise {
-        controls.push(btn(IconKind::Minimise, m));
+        glyphs.push(btn(IconKind::Minimise, m));
     }
     if let Some(m) = buttons.maximise {
-        controls.push(btn(IconKind::Maximise, m));
+        glyphs.push(btn(IconKind::Maximise, m));
     }
     if let Some(m) = buttons.close {
-        controls.push(btn(IconKind::Close, m));
+        glyphs.push(btn(IconKind::Close, m));
     }
+    let mut controls = alloc::vec::Vec::with_capacity(3);
+    controls.push(padding(TITLE_PAD, center_v(text(title))).flex(1));
+    controls.push(ink(
+        theme.foreground_dim,
+        crate::element::with_spacing(row(glyphs), TITLE_BUTTON_GAP),
+    ));
+    controls.push(sized(Size::new(TITLE_BUTTON_PAD, 0), text("")));
     // **The drag is on the bar itself, not on the face underneath the label.** Dispatch walks
     // *up* from whatever was hit to the nearest handler, and the label spans the bar — so a
     // handler on the face below it is never reached, and the first version of this widget
     // produced nothing at all for a press in the middle of its own title. On the bar, a press
     // that lands on the label or on empty space walks up to here, and one that lands on a button
     // stops at the button, because that is where the walk finds a handler first.
+    // **A rule along the bottom**, the design's `border-bottom: 1px solid var(--line)`: it is what
+    // separates a title bar from a menu bar the same colour as it, and it is inside `TITLE_BAR_H`.
     sized(
         Size::new(0, TITLE_BAR_H),
-        stack(alloc::vec![fill(face), row(controls)]).on_press_down(drag),
+        dock(
+            alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(theme.border)))],
+            stack(alloc::vec![fill(face), row(controls)]),
+        )
+        .on_press_down(drag),
     )
 }
 
@@ -793,8 +898,9 @@ impl<Msg> Default for TitleButtons<Msg> {
     }
 }
 
-/// Space between a title bar's text and its edge.
-const TITLE_PAD: Insets = Insets { top: 5, right: 6, bottom: 5, left: 8 };
+/// Space between a title bar's text and its edge: the design's 11 on the left, and the text
+/// centred down the bar.
+const TITLE_PAD: Insets = Insets { top: 0, right: 6, bottom: 0, left: 11 };
 
 /// Space between a text field's content and its edge.
 const FIELD_PAD: Insets = Insets { top: 4, right: 6, bottom: 4, left: 6 };
@@ -2277,24 +2383,25 @@ pub fn list_view<Msg>(
     let max_offset = rows.len().saturating_sub(visible);
     state.offset = state.offset.min(max_offset);
 
-    // **The surface the rows sit on, and what one looks like under the pointer.** A row used to
-    // fill `theme.track` whatever the list's ground was, so a panel with a ground of its own had
-    // list-coloured tiles painted over it and the panel showed only below the last row (M15
-    // Part F). A caller that names a ground gets its hover derived from it, because a hover is
-    // "this surface, lit" rather than a colour of its own — and the default path keeps
-    // `face_hover` exactly, so every other list in the system paints as it did.
-    let (ground, lit) = match ground {
-        Some(g) => (g, g.shade(HOVER_LIFT)),
-        None => (theme.track, theme.face_hover),
-    };
+    // **The surface the rows sit on.** A row used to fill `theme.track` whatever the list's
+    // ground was, so a panel with a ground of its own had list-coloured tiles painted over it and
+    // the panel showed only below the last row (M15 Part F).
+    //
+    // **And a highlight is a wash over it** (desktop refresh, Part B): the accent at the
+    // selection's 20%, or at the scheme's hover coverage. That is the design's model, and it is
+    // why the hover no longer has to be derived per ground — "this surface, lit" was what the
+    // derivation approximated, and a wash over whatever surface is under it is that exactly.
+    let ground = ground.unwrap_or(theme.track);
+    let hover = theme.scheme.hover_coverage();
     let last = (state.offset + visible).min(rows.len());
     let mut items = alloc::vec::Vec::with_capacity(last.saturating_sub(state.offset));
     for (i, r) in rows.iter().enumerate().take(last).skip(state.offset) {
         let selected = state.selected == Some(i) || r.marked;
-        // **A selection is blue with a darker edge**, not a lighter grey (M11 Part E, batch 2).
-        // The reference draws a one-pixel border in the same blue the focus ring uses and fills
-        // the inside with a gradient, and that border is what separates a selected row from the
-        // row above it — without it two adjacent selections would merge into one block.
+        // **A selection is the accent washed over the ground**, flat, since the desktop refresh's
+        // Part B. It was a one-pixel accent border around a bevelled fill (M11 Part E, batch 2),
+        // the reference desktop's, and the border was what kept two adjacent selections from
+        // merging into one block; the design lets them merge, as a block is what a run of
+        // selected rows is.
         //
         // **Hover is quieter than selection and loses to it** (batch 3) — *unless nothing is
         // selected*, in which case it is the answer and gets the blue (batch 5). The rule is
@@ -2303,16 +2410,14 @@ pub fn list_view<Msg>(
         // not competing. The applications modal is exactly that list — it keeps no selection at
         // all, so every hover landed on the quiet branch and the menu highlighted in grey.
         let primary = selected || (hovered == Some(r.key) && state.selected.is_none());
-        let row_el = if primary {
-            stack(alloc::vec![
-                fill(theme.accent),
-                padding(Insets::all(1), bevel(theme.selection())),
-                padding(ROW_PAD, text(r.label)),
-            ])
-        } else {
-            let face = if hovered == Some(r.key) { lit } else { ground };
-            stack(alloc::vec![fill(face), padding(ROW_PAD, text(r.label))])
-        };
+        let mut layers = alloc::vec![fill(ground)];
+        if primary {
+            layers.push(wash(theme.accent, libdraw::theme::SELECTION_COVERAGE));
+        } else if hovered == Some(r.key) {
+            layers.push(wash(theme.accent, hover));
+        }
+        layers.push(padding(ROW_PAD, text(r.label)));
+        let row_el = stack(layers);
         let mut item =
             sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
         // **A press *down* on a row, for the caller that needs the gesture rather than the
@@ -2352,13 +2457,6 @@ pub fn list_view<Msg>(
     };
     stack(alloc::vec![fill(ground), body]).focusable()
 }
-
-/// How far a row is lightened under the pointer, per channel.
-///
-/// **The step this palette already uses**: `face_hover` is `face` plus nine. Deriving it means a
-/// list on any ground gets a hover that belongs to the same desktop, rather than one that only
-/// suits the ground the toolkit shipped with.
-const HOVER_LIFT: i16 = 9;
 
 /// How wide a list's scrollbar is, in pixels.
 const SCROLLBAR_W: u32 = 12;
@@ -2407,52 +2505,55 @@ mod list_view_tests {
     ///
     /// **A row used to fill `theme.track` whatever the list's ground was** (M15 Part F), so a
     /// panel with a ground of its own had list-coloured tiles painted over it — the panel showed
-    /// only in the gap below the last row, which is not what a panel is. The hover is derived
-    /// from the ground for the same reason: a hover is "this surface, lit", not a colour of its
-    /// own, and one fixed near-white belongs to exactly one ground.
+    /// only in the gap below the last row, which is not what a panel is. The hover is a wash of
+    /// the accent over that ground since the desktop refresh's Part B — "this surface, lit",
+    /// which a hover derived by shading the ground only approximated.
     #[test]
-    fn a_rows_ground_is_the_lists_and_its_hover_is_derived_from_it() {
+    fn a_rows_ground_is_the_lists_and_its_hover_is_a_wash_over_it() {
+        use crate::element::Node;
         let p = Theme::default();
         let data = [(1u64, "alpha"), (2, "beta")];
         let panel = Rgb::new(0xDD, 0xDA, 0xD6);
         // **A selection is kept, and the hover is on a *different* row.** With nothing selected
-        // a hovered row is the primary highlight — the blue one — so a fixture without a
-        // selection never reaches the hover branch at all (M11 Part E, batch 5).
-        let fills_of = |ground: Option<Rgb>, hovered: Option<u64>| {
+        // a hovered row is the primary highlight, so a fixture without a selection never reaches
+        // the hover branch at all (M11 Part E, batch 5).
+        //
+        // Each row's fill and wash, in order.
+        let rows_of = |ground: Option<Rgb>, hovered: Option<u64>| {
             let mut st = ListState::at(Some(0), 0);
             let e: Element<u64> =
                 list_view(&rows(&data), &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
-            let mut out = Vec::new();
-            fn walk<M>(e: &Element<M>, out: &mut Vec<Rgb>) {
-                if let crate::element::Node::Fill(c) = &e.node {
-                    out.push(*c);
+            let mut out: Vec<(Option<Rgb>, Option<(Rgb, u8)>)> = Vec::new();
+            walk(&e, &mut |n| {
+                if n.key.is_none() {
+                    return;
                 }
-                for c in e.children() {
-                    walk(c, out);
-                }
-            }
-            walk(&e, &mut out);
+                let (mut f, mut w) = (None, None);
+                walk(n, &mut |c| match &c.node {
+                    Node::Fill(rgb) if f.is_none() => f = Some(*rgb),
+                    Node::Wash { colour, coverage } => w = Some((*colour, *coverage)),
+                    _ => {}
+                });
+                out.push((f, w));
+            });
             out
         };
+        let hover = p.scheme.hover_coverage();
+        let sel = libdraw::theme::SELECTION_COVERAGE;
 
-        // The default list is untouched: rows on `track`, lit with `face_hover`.
-        let plain = fills_of(None, Some(2));
-        assert!(plain.contains(&p.track), "the ordinary list stopped using the theme's ground");
-        assert!(plain.contains(&p.face_hover), "…or its hover");
-
-        // A list on a panel rests on the panel and lights from it.
-        let on_panel = fills_of(Some(panel), None);
-        assert!(on_panel.contains(&panel), "the rows are not on the ground they were given");
-        assert!(
-            !on_panel.contains(&p.track),
-            "a row painted the list's default ground over the panel: {on_panel:?}"
+        // The default list: rows on `track`; the selected row washed at 20%, the hovered one at
+        // the hover's coverage, both over their own ground.
+        assert_eq!(
+            rows_of(None, Some(2)),
+            [(Some(p.track), Some((p.accent, sel))), (Some(p.track), Some((p.accent, hover)))]
         );
-        let hovered = fills_of(Some(panel), Some(2));
-        assert!(
-            hovered.contains(&panel.shade(HOVER_LIFT)),
-            "the hover was not derived from the ground: {hovered:?}"
+        // A list on a panel rests on the panel, and the same washes land on it.
+        assert_eq!(
+            rows_of(Some(panel), Some(2)),
+            [(Some(panel), Some((p.accent, sel))), (Some(panel), Some((p.accent, hover)))]
         );
-        assert!(!hovered.contains(&p.face_hover), "…and it is not the default one either");
+        // And a row nobody is pointing at is its ground and nothing more.
+        assert_eq!(rows_of(Some(panel), None)[1], (Some(panel), None));
     }
 
     /// A **marked** row is drawn as a selected one, and an unmarked one is not.
@@ -2536,7 +2637,9 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_bevels(&e).iter().any(|f| *f == Some(Theme::default().selection())),
+            row_washes(&e)
+                .iter()
+                .any(|w| *w == Some((Theme::default().accent, libdraw::theme::SELECTION_COVERAGE))),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -2669,33 +2772,29 @@ mod list_view_tests {
         let hot: Element<u8> = menu_item("Clear", 1, true, &p);
         let cold: Element<u8> = menu_item("Clear", 1, false, &p);
 
-        let fills = |e: &Element<u8>| {
+        // Every painting node in the item, whatever its kind.
+        let paints = |e: &Element<u8>| {
             let mut out = alloc::vec::Vec::new();
-            walk(e, &mut |n| {
-                if let Node::Fill(c) = &n.node {
-                    out.push(*c);
-                }
-            });
-            out
-        };
-        let bevels = |e: &Element<u8>| {
-            let mut out = alloc::vec::Vec::new();
-            walk(e, &mut |n| {
-                if let Node::Bevel(c) = &n.node {
-                    out.push(*c);
-                }
+            walk(e, &mut |n| match &n.node {
+                Node::Fill(c) | Node::Bevel(c) => out.push((*c, 255)),
+                Node::Wash { colour, coverage } => out.push((*colour, *coverage)),
+                _ => {}
             });
             out
         };
 
-        // The same two layers a selected list row gets: a border in the focus blue, and the
-        // selection colour bevelled inside it.
-        assert_eq!(fills(&hot), alloc::vec![p.accent], "no border on the hovered item");
-        assert_eq!(bevels(&hot), alloc::vec![p.selection()], "no selection fill on the hovered item");
+        // **One layer: the accent washed over the bar at the hover's coverage** (desktop refresh,
+        // Part B) — the design's `--soft`. It was a border in the accent and the selection
+        // bevelled inside it.
+        assert_eq!(
+            paints(&hot),
+            alloc::vec![(p.accent, p.scheme.hover_coverage())],
+            "the hovered item is not the hover wash"
+        );
 
         // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
         // an item that paints a face when it is not hovered is a menu with every row lit.
-        assert!(fills(&cold).is_empty() && bevels(&cold).is_empty(), "an idle item drew a face");
+        assert!(paints(&cold).is_empty(), "an idle item drew a face");
     }
 
     #[test]
@@ -2900,9 +2999,11 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         let e: Element<u64> =
             list_view(&rows(&data), &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
-        assert_eq!(row_faces(&e)[1], p.accent, "the hovered row has no border");
-        assert_eq!(row_bevels(&e)[1], Some(p.selection()), "the hovered row is not the blue");
-        assert_eq!(row_faces(&e)[0], p.track, "an untouched row reacted");
+        // The primary highlight is the selection's wash, not the quieter hover's.
+        let sel = Some((p.accent, libdraw::theme::SELECTION_COVERAGE));
+        assert_eq!(row_washes(&e)[1], sel, "the hovered row is not the primary highlight");
+        assert_eq!(row_washes(&e)[0], None, "an untouched row reacted");
+        assert_eq!(row_faces(&e)[0], p.track, "and it is the list's ground");
     }
 
     #[test]
@@ -2923,10 +3024,12 @@ mod list_view_tests {
             None,
             &p,
         );
-        let faces = row_faces(&e);
-        assert_eq!(faces[0], p.face_hover, "the hovered row did not react");
-        assert_eq!(faces[1], p.accent, "the selected row lost its border");
-        assert_eq!(row_bevels(&e)[1], Some(p.selection()), "the selected row lost its fill");
+        // Quieter: the hover's coverage against the selection's — 10% against 20% in the light
+        // scheme, which is the whole difference in weight.
+        let washes = row_washes(&e);
+        assert_eq!(washes[0], Some((p.accent, p.scheme.hover_coverage())), "the hovered row did not react");
+        assert_eq!(washes[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "the selected row lost it");
+        assert!(p.scheme.hover_coverage() < libdraw::theme::SELECTION_COVERAGE, "the hover is not quieter");
 
         // And hovering the *selected* row leaves it selected rather than downgrading it.
         let e: Element<u64> = list_view(
@@ -2941,7 +3044,11 @@ mod list_view_tests {
             None,
             &p,
         );
-        assert_eq!(row_faces(&e)[1], p.accent, "selection lost to hover");
+        assert_eq!(
+            row_washes(&e)[1],
+            Some((p.accent, libdraw::theme::SELECTION_COVERAGE)),
+            "selection lost to hover"
+        );
     }
 
     /// The selected row paints differently, or selection is invisible.
@@ -2951,18 +3058,16 @@ mod list_view_tests {
         let p = Theme::default();
         let e: Element<u64> =
             list_view(&rows(&data), &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
+        // **The ground and a wash over it** (desktop refresh, Part B): both rows rest on the
+        // list's ground, and the selected one carries the accent at the selection's 20%. It was a
+        // one-pixel accent border and the selection bevelled inside it (M11 Part E, batch 2); the
+        // design is flat, so a gradient on either row is now the regression.
         let faces = row_faces(&e);
-        assert_eq!(faces.len(), 2);
-        assert_ne!(faces[0], faces[1], "the selected row looks like the others");
-        // **Two layers, and both are the claim** (M11 Part E, batch 2): a one-pixel border in
-        // the focus blue, and the selection colour bevelled inside it. Asserting only the fill
-        // would pass for a selection with no edge, which is the thing that makes two adjacent
-        // selected rows read as one block.
-        assert_eq!(faces[1], p.accent, "the selected row has no border");
-        assert_eq!(faces[0], p.track, "an unselected row is the list's own ground");
-        let bevels = row_bevels(&e);
-        assert_eq!(bevels[1], Some(p.selection()), "the selected row is not the selection colour");
-        assert_eq!(bevels[0], None, "an unselected row is a flat fill, not a gradient");
+        assert_eq!(faces, [p.track, p.track], "a row is not on the list's own ground");
+        let washes = row_washes(&e);
+        assert_eq!(washes[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "the selected row looks like the others");
+        assert_eq!(washes[0], None, "an unselected row is washed too");
+        assert_eq!(row_bevels(&e), [None, None], "a row is drawn with a gradient");
     }
 
     /// A scrollbar that is always there wastes width; one that never appears strands rows.
@@ -3024,8 +3129,29 @@ mod list_view_tests {
         out
     }
 
-    /// The bevelled fill each row carries, if any — the visible face of a selected row since
-    /// M11 Part E, where `row_faces` now reports the one-pixel border drawn behind it.
+    /// The wash each row carries, if any — `(colour, coverage)` — which is how a selected or a
+    /// hovered row is drawn since the desktop refresh's Part B.
+    fn row_washes<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<(Rgb, u8)>> {
+        let mut out = alloc::vec::Vec::new();
+        walk(e, &mut |n| {
+            if n.key.is_none() {
+                return;
+            }
+            let mut found = None;
+            walk(n, &mut |c| {
+                if found.is_none()
+                    && let Node::Wash { colour, coverage } = &c.node
+                {
+                    found = Some((*colour, *coverage));
+                }
+            });
+            out.push(found);
+        });
+        out
+    }
+
+    /// The bevelled fill each row carries, if any — the visible face of a selected row from M11
+    /// Part E until the desktop refresh's Part B, and the negative a flat design has to keep.
     fn row_bevels<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<Rgb>> {
         let mut out = alloc::vec::Vec::new();
         walk(e, &mut |n| {
@@ -3545,8 +3671,9 @@ mod tests {
         ];
         let e = menu_bar(items, 24, &p);
         let l = layout(&e, Rect::new(0, 0, 200, 100), &CELL);
-        // sized -> stack -> [face fill, row] ; row -> the two buttons
-        let row = &l.children[0].children[1];
+        // sized -> dock -> [the rule, stack] ; stack -> [face fill, row] ; row -> the buttons.
+        // (One level deeper since the desktop refresh's Part B put a rule under the bar.)
+        let row = &l.children[0].children[1].children[1];
         let (a, b) = (row.children[0].rect, row.children[1].rect);
         assert!(a.size.w > 0, "the first item measured to nothing");
         assert!(b.size.w > 0, "the second item got no width — the first one ate the row");
@@ -3604,23 +3731,42 @@ mod tests {
             &p,
         );
         let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
-        // sized -> stack -> [face, row] ; row -> [label, min, max, close]
-        let stack = &l.children[0];
-        let face = stack.children[0].rect;
-        let row = &stack.children[1];
-        assert_eq!(face.size.h, TITLE_BAR_H, "the draggable face is the bar");
-        assert_eq!(face.size.w, 400, "and it spans it");
-
-        let close = row.children[3].rect;
-        assert_eq!(close.right(), 400, "the close button is at the right edge");
-        assert_eq!(close.size.w, TITLE_BUTTON_W);
-        let label = row.children[0].rect;
-        assert_eq!(label.origin.x, 0, "the title starts at the left");
-        assert!(
-            label.right() <= row.children[1].rect.origin.x as i64,
-            "the title overlaps the buttons: {label:?} vs {:?}",
-            row.children[1].rect
-        );
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        // **Asked of the router, not read off the layout tree**, which this used to walk by child
+        // index and which changed shape when the bar gained a rule and its buttons an ink
+        // (desktop refresh, Part B). Where a press *lands* is the property; the tree's shape was
+        // only ever a way of guessing it.
+        let click = |x: i32, y: i32| {
+            let at = |pressed: bool| librsproto::surface::PointerEvent {
+                kind: librsproto::surface::POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { librsproto::surface::POINTER_PRESSED } else { 0 },
+                x,
+                y,
+                ..Default::default()
+            };
+            let mut r = crate::route::Router::new();
+            let mut got = r.pointer(&tree, &e, &l, at(true)).0;
+            got.extend(r.pointer(&tree, &e, &l, at(false)).0);
+            got
+        };
+        assert_eq!(l.rect.size.h, TITLE_BAR_H, "the bar is its height");
+        // The buttons sit at the right edge, `TITLE_BUTTON_PAD` in, each answering across its
+        // whole column and not a pixel beyond it.
+        let right = (400 - TITLE_BUTTON_PAD) as i32;
+        let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
+        for (nth, want) in [(0, M::Close), (1, M::Max), (2, M::Min)] {
+            let end = right - nth * step;
+            let start = end - TITLE_BUTTON_W as i32;
+            assert_eq!(click(start, 12), vec![want.clone()], "{want:?}'s first column");
+            assert_eq!(click(end - 1, 12), vec![want.clone()], "{want:?}'s last column");
+            assert_eq!(click(end, 12), vec![M::Drag], "just past {want:?} is the bar");
+        }
+        // And the face takes the rest: the title's end of the bar, the gaps, the padding.
+        assert_eq!(click(1, 12), vec![M::Drag], "the title starts at the left and drags");
+        assert_eq!(click(399, 12), vec![M::Drag], "the padding after close drags");
     }
 
     // ---- the text area (M10 Part C) ----
@@ -4664,22 +4810,30 @@ two");
         let down = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, true)).0;
         let up = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, false)).0;
 
+        // The buttons' centres in a bare 400-wide bar, from the constants — the close button ends
+        // `TITLE_BUTTON_PAD` in from the right, each is `TITLE_BUTTON_W` wide, `TITLE_BUTTON_GAP`
+        // apart. These were 390 and 364 in contiguous 26-pixel slots until the desktop refresh's
+        // Part B, and 364 now falls in a gap, which drags.
+        let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
+        let close_x = (400 - TITLE_BUTTON_PAD - TITLE_BUTTON_W / 2 - 1) as i32;
+        let max_x = close_x - step;
+
         let mut r = Router::new();
         assert_eq!(down(&mut r, 200), vec![M::Drag], "the bar moves the window on the press…");
         assert_eq!(up(&mut r, 200), vec![], "…and the release adds nothing");
 
         let mut r = Router::new();
         assert_eq!(
-            down(&mut r, 390),
+            down(&mut r, close_x),
             vec![],
             "a press on close must not also drag: the window would move under the pointer while \
              the user is aiming at a button"
         );
-        assert_eq!(up(&mut r, 390), vec![M::Close], "and the click is the close");
+        assert_eq!(up(&mut r, close_x), vec![M::Close], "and the click is the close");
 
         let mut r = Router::new();
-        assert_eq!(down(&mut r, 364), vec![], "the same for maximise");
-        assert_eq!(up(&mut r, 364), vec![M::Max]);
+        assert_eq!(down(&mut r, max_x), vec![], "the same for maximise");
+        assert_eq!(up(&mut r, max_x), vec![M::Max]);
 
         // **And a second button pressed mid-drag is not a second drag.** While a capture is held
         // the router routes to the *captured* widget, so every later press was reaching the bar
@@ -4801,6 +4955,115 @@ two");
     }
 
     #[test]
+    fn the_title_buttons_land_where_the_gates_aim() {
+        // **The literals the gates' `chrome` table types**, asserted against a framed window that
+        // is actually built — the same guard `dialog_buttons_land_where_the_constants_say` gives
+        // the dialog, and for its reason: `title_button_centre` moves with the constants, so a
+        // change to the padding moved it and this crate's own tests together and left the gates
+        // aiming four pixels off with nothing saying so (PR #313 review, optional 6). In a window
+        // 400 wide: close 18 in from the right, maximise 50, minimise 82, all 16 down.
+        assert_eq!(title_button_centre(400, 0), (382, 16));
+        assert_eq!(title_button_centre(400, 1), (350, 16));
+        assert_eq!(title_button_centre(400, 2), (318, 16));
+
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Drag,
+            Min,
+            Max,
+            Close,
+        }
+        let theme = Theme::default();
+        let bar = title_bar(
+            "a window",
+            true,
+            M::Drag,
+            TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
+            &theme,
+        )
+        .key(1);
+        let e: Element<M> = window_frame(bar, sized(Size::new(0, 0), text("")).key(2), &theme);
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let l = crate::layout::layout(&e, Rect::new(0, 0, 400, 200), &cell);
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        let click = |(x, y): (i32, i32)| {
+            let at = |pressed: bool| PointerEvent {
+                kind: POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { POINTER_PRESSED } else { 0 },
+                x,
+                y,
+                ..Default::default()
+            };
+            let mut r = crate::route::Router::new();
+            let _ = r.pointer(&tree, &e, &l, at(true));
+            r.pointer(&tree, &e, &l, at(false)).0
+        };
+        assert_eq!(click((382, 16)), vec![M::Close]);
+        assert_eq!(click((350, 16)), vec![M::Max]);
+        assert_eq!(click((318, 16)), vec![M::Min]);
+    }
+
+    #[test]
+    fn a_framed_windows_grip_is_inside_its_border_and_under_it() {
+        // **The one corner a person reaches for was the one whose border was missing**: all three
+        // applications stacked the grip over the finished frame (PR #313 review, optional 4). The
+        // frame places it now — inside the border, as a layer before the border — and takes no
+        // presses anywhere but the grip, which a full-size overlay would.
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        enum M {
+            Content,
+            Grip,
+        }
+        let theme = Theme::default();
+        let window = Size::new(200, 120);
+        let content: Element<M> = sized(Size::new(0, 0), crate::element::custom(1, Size::new(0, 0)))
+            .on_press(M::Content)
+            .key(2);
+        let e = window_frame_with_grip(
+            sized(Size::new(0, TITLE_BAR_H), fill(theme.face)).key(1),
+            content,
+            resize_grip(M::Grip, &theme).key(3),
+            window,
+            &theme,
+        );
+        let crate::element::Node::Stack(layers) = &e.node else { panic!("the frame is a stack") };
+        assert!(
+            matches!(layers.last().map(|l| &l.node), Some(crate::element::Node::Outline { .. })),
+            "the border is not the top layer, so the grip is painted over it"
+        );
+        let cell = crate::layout::FixedCell { w: 8, h: 16 };
+        let l = crate::layout::layout(&e, Rect::new(0, 0, window.w, window.h), &cell);
+        let grip = crate::layout::locate(&e, &l, 3).expect("the grip is keyed");
+        assert_eq!(
+            (grip.right(), grip.bottom()),
+            ((window.w - WINDOW_BORDER) as i64, (window.h - WINDOW_BORDER) as i64),
+            "the grip is not in the corner inside the border: {grip:?}"
+        );
+        let mut tree = crate::diff::Tree::new();
+        tree.update(&e, &l).expect("a clean frame");
+        let click = |x: i32, y: i32| {
+            let at = |pressed: bool| PointerEvent {
+                kind: POINTER_BUTTON,
+                button: 0x110,
+                buttons: u16::from(pressed),
+                flags: if pressed { POINTER_PRESSED } else { 0 },
+                x,
+                y,
+                ..Default::default()
+            };
+            let mut r = crate::route::Router::new();
+            let mut got = r.pointer(&tree, &e, &l, at(true)).0;
+            got.extend(r.pointer(&tree, &e, &l, at(false)).0);
+            got
+        };
+        assert_eq!(click(window.w as i32 - 8, window.h as i32 - 8), vec![M::Grip], "the grip's middle");
+        assert_eq!(click(window.w as i32 - 30, window.h as i32 - 8), vec![M::Content], "beside it is content");
+    }
+
+    #[test]
     fn dialog_buttons_land_where_the_constants_say() {
         // **The four numbers `check-login` types**, asserted against a tree that is actually
         // built. They were `nxedit`'s until `nxfiles` grew a second confirmation; deriving them
@@ -4810,8 +5073,12 @@ two");
         // The literals matter as much as the derivation. Comparing derived constants against a
         // tree built from the same constants pins nothing — both sides move together, and the
         // gate's own table is linked to neither (PR #267 review, finding 2).
+        //
+        // **Moved by the desktop refresh's Part B**, from (91, 249, 103): the window's content now
+        // runs flush to its border (`WINDOW_FRAME` 3 → 0), so the strip is three pixels wider on
+        // each side and three pixels lower. `check-login`'s `CONFIRM_*` moved in the same change.
         assert_eq!((DIALOG_W, DIALOG_H), (340, 132));
-        assert_eq!((DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), (91, 249, 103));
+        assert_eq!((DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), (89, 250, 106));
 
         #[derive(Clone, PartialEq, Eq, Debug)]
         enum M {

@@ -237,6 +237,44 @@ pub const fn shadow_for(role: Role, scheme: Scheme) -> Option<Shadow> {
     }
 }
 
+/// The radius a window of `role` at `bounds` is cut to, on a screen `screen`: [`corner_for`]'s,
+/// unless the window covers the whole screen, when it is square.
+///
+/// **Because a screen-sized window's corners are the screen's**, and there is nothing beside them
+/// for a curve to show. The overview is exactly that — a `Popup` the size of the screen — and the
+/// first version of this rounded it, on the claim that its corners sat under the shell's two bars
+/// and so showed nowhere. They sit *over* them: the overview is created after the bars and never
+/// lowered beneath them, and it dims the whole screen, bars included, so each cut corner showed a
+/// notch of undimmed bar — measured on a screendump by the PR #313 review. A rule about the
+/// screen's shape, rather than about the overview, is what stops the next full-screen surface
+/// from doing the same.
+pub fn corner_of(role: Role, bounds: Rect, screen: Rect) -> u32 {
+    let covers = bounds.origin.x <= screen.origin.x
+        && bounds.origin.y <= screen.origin.y
+        && bounds.right() >= screen.right()
+        && bounds.bottom() >= screen.bottom();
+    if covers { 0 } else { corner_for(role) }
+}
+
+/// The radius `role`'s corners are cut to (desktop refresh, Part B).
+///
+/// **The roles that float, as for the shadow, and for the same reason**: a window, a menu and a
+/// dialog are shapes over the desktop, and a bar is docked to the screen's edge, where a rounded
+/// corner is a notch of wallpaper beside it. The radius is `libdraw`'s compiled
+/// [`WINDOW_RADIUS`](libdraw::corner::WINDOW_RADIUS), because the window's own toolkit draws its
+/// border along the same curve and the two must not disagree by a crescent.
+///
+/// **A window that covers the whole screen is not rounded** — see [`corner_of`], which is what
+/// compositing asks. A maximised window *is* rounded: it fills the work area, not the screen, and
+/// the compositor does not know a window is maximised (the manager does), so a rule that needed
+/// to would be a second copy of that state.
+pub const fn corner_for(role: Role) -> u32 {
+    match role {
+        Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => libdraw::corner::WINDOW_RADIUS,
+        Role::Panel { .. } => 0,
+    }
+}
+
 impl Window {
     /// Everything this window puts on screen, **its shadow included** — what damage is computed
     /// from.
@@ -1350,6 +1388,7 @@ impl WindowStack {
         S: BufferSource + ?Sized,
     {
         let mut surfaces: Vec<SurfaceRef<'_>> = Vec::new();
+        let screen = fb.geometry().bounds();
         for w in &self.windows {
             // **Not composited unless it is on screen** — configured (M6 B4), not minimized,
             // and on the current desktop or sticky. A client that commits before its first
@@ -1367,7 +1406,9 @@ impl WindowStack {
             if px.len() < b.geometry.byte_len() {
                 continue;
             }
-            let surface = SurfaceRef::new(b.geometry, w.origin, px);
+            let bounds = Rect::new(w.origin.x, w.origin.y, b.geometry.width, b.geometry.height);
+            let surface =
+                SurfaceRef::new(b.geometry, w.origin, px).with_corner(corner_of(w.role, bounds, screen));
             surfaces.push(match w.shadow {
                 Some(sh) => surface.with_shadow(sh),
                 None => surface,
@@ -2360,11 +2401,15 @@ mod tests {
         // are where — and that claim survives a shadow as "recognisably the lower window's red,
         // and darker than the raw colour". The two inside `b` are exact, because a surface is
         // never darkened by its own shadow.
-        let lower = fb.get_pixel(0, 0).unwrap();
+        //
+        // **Sampled a pixel in from each window's corner** since the desktop refresh's Part B:
+        // both are rounded, and at 8x8 the radius clamps to 4, so a corner pixel is outside the
+        // curve and shows what is below. What is sampled is still whose pixels are where.
+        let lower = fb.get_pixel(2, 2).unwrap();
         assert!(lower.r > lower.g && lower.r > lower.b, "the lower window: {lower:?}");
         assert!(lower.r < red.r, "the lower window is darkened by the upper's shadow: {lower:?}");
         assert_eq!(fb.get_pixel(6, 6), Some(blue), "the upper window wins the overlap");
-        assert_eq!(fb.get_pixel(10, 10), Some(blue));
+        assert_eq!(fb.get_pixel(9, 9), Some(blue));
         let elsewhere = fb.get_pixel(20, 2).unwrap();
         assert_ne!(elsewhere, blue, "background elsewhere, not the window");
         assert_ne!(elsewhere, red, "background elsewhere, not the window");
@@ -2467,6 +2512,79 @@ mod tests {
     }
 
     // ---- shadows (M13 Part C) ----
+
+    #[test]
+    fn every_floating_role_is_rounded_and_a_panel_is_not() {
+        // Through `compose_into`, like the shadow's role test beside it, so this covers the wiring
+        // as well as the rule: the very corner pixel of a rounded window is outside its curve and
+        // shows the ground; a panel's is its own. **All four roles**, because a menu's border is
+        // drawn on the promise that the compositor cuts its corners — with only `Normal` here,
+        // popups and dialogs could stop being rounded and every test would still pass (PR #313
+        // review, finding 3).
+        for (make_role, rounded) in [
+            ((|_| Role::Normal) as fn(u32) -> Role, true),
+            ((|p| Role::Popup { parent: p }) as fn(u32) -> Role, true),
+            ((|p| Role::Dialog { parent: p }) as fn(u32) -> Role, true),
+            ((|_| Role::Panel { dock: Edge::Top, reserve: 0 }) as fn(u32) -> Role, false),
+        ] {
+            let mut s = WindowStack::new();
+            let mut src = MapSource::default();
+            // A parent for the two roles that need one, kept off the sample points below.
+            let parent = shown(&mut s, &CreateWindowRequest::new(2, 2, Role::Normal));
+            let _ = s.place(parent, Point::new(80, 80));
+            let role = make_role(parent);
+            let id = shown(&mut s, &CreateWindowRequest::new(24, 20, role));
+            s.attach(&attach(id, 0, 24, 20)).unwrap();
+            let ink = Rgb::new(200, 30, 30);
+            src.put(id, 0, geom(24, 20), ink);
+            s.commit(&commit(id, 0)).unwrap();
+            let _ = s.place(id, Point::new(8, 6));
+            let ground = Rgb::new(120, 120, 120);
+            let mut fb = big_screen();
+            let full = fb.geometry().bounds();
+            s.compose_into(&mut fb, ground, &src, &[full]);
+            let origin = s.window(id).unwrap().origin;
+            let corner = fb.get_pixel(origin.x as u32, origin.y as u32).unwrap();
+            let middle = fb.get_pixel(origin.x as u32 + 12, origin.y as u32 + 10).unwrap();
+            assert_eq!(middle, ink, "{role:?}: the middle is the window's own");
+            assert_eq!(corner != ink, rounded, "{role:?}: its corner pixel is {corner:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_that_covers_the_screen_is_not_rounded() {
+        // **The overview's shape**: a popup the size of the screen, over a panel. Rounded, each
+        // cut corner showed the panel beneath at full brightness through a dimmed overlay — the
+        // first version claimed the bars sat on top and hid it, and a screendump said otherwise
+        // (PR #313 review, finding 1). Its corners are the screen's; there is nothing to round.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let screen = big_screen().geometry().bounds();
+        let bar = shown(&mut s, &CreateWindowRequest::new(screen.size.w, 10, Role::Panel { dock: Edge::Top, reserve: 10 }));
+        s.attach(&attach(bar, 0, screen.size.w, 10)).unwrap();
+        let bar_ink = Rgb::new(215, 214, 212);
+        src.put(bar, 0, geom(screen.size.w, 10), bar_ink);
+        s.commit(&commit(bar, 0)).unwrap();
+        let cover = shown(
+            &mut s,
+            &CreateWindowRequest::new(screen.size.w, screen.size.h, Role::Popup { parent: bar }),
+        );
+        s.attach(&attach(cover, 0, screen.size.w, screen.size.h)).unwrap();
+        let cover_ink = Rgb::new(42, 42, 41);
+        src.put(cover, 0, geom(screen.size.w, screen.size.h), cover_ink);
+        s.commit(&commit(cover, 0)).unwrap();
+        let mut fb = big_screen();
+        s.compose_into(&mut fb, Rgb::BLACK, &src, &[screen]);
+        assert_eq!(s.window(cover).unwrap().origin, Point::new(0, 0), "precondition: at the origin");
+        for (x, y) in [(0, 0), (screen.size.w - 1, 0), (0, screen.size.h - 1)] {
+            assert_eq!(fb.get_pixel(x, y), Some(cover_ink), "({x},{y}) shows what is beneath the cover");
+        }
+        // The rule is about covering the screen, not about being a popup: the same popup a pixel
+        // short of the screen is rounded.
+        assert_eq!(corner_of(Role::Popup { parent: bar }, screen, screen), 0);
+        let short = Rect::new(0, 0, screen.size.w - 1, screen.size.h);
+        assert_eq!(corner_of(Role::Popup { parent: bar }, short, screen), libdraw::corner::WINDOW_RADIUS);
+    }
 
     #[test]
     fn a_scheme_change_re_derives_every_windows_shadow_and_darkens_the_picture() {
@@ -2606,8 +2724,10 @@ mod tests {
         let full = fb.geometry().bounds();
         stack.compose_into(&mut fb, bg, &src, &[full]);
 
-        assert_eq!(fb.get_pixel(1, 1), Some(ink.blend(bg, 128)));
-        assert_ne!(fb.get_pixel(1, 1), Some(ink), "the tag was ignored and it drew opaque");
+        // The window's middle rather than `(1, 1)`, which is on its rounded corner's curve since
+        // the desktop refresh's Part B and blends at the curve's coverage as well as its own.
+        assert_eq!(fb.get_pixel(4, 4), Some(ink.blend(bg, 128)));
+        assert_ne!(fb.get_pixel(4, 4), Some(ink), "the tag was ignored and it drew opaque");
     }
 
     // ---- Screen: the shadow buffer (M13 Part A) ----
@@ -2721,7 +2841,8 @@ mod tests {
         assert!(!sc.is_buffered());
         let full = screen().geometry().bounds();
         sc.present(&stack, Rgb::new(9, 9, 9), &src, &[full], Point::new(20, 12), None);
-        assert_eq!(sc.display().get_pixel(0, 0), Some(row_colour(0)));
+        // Inside the window's rounded corners (Part B), so the row is the window's own.
+        assert_eq!(sc.display().get_pixel(4, 3), Some(row_colour(3)));
     }
 
     #[test]
@@ -2778,12 +2899,14 @@ mod tests {
 
         let mut fb = screen();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
-        assert_eq!(fb.get_pixel(0, 0), Some(blue), "window 2 is on top");
+        // The middle of the overlap, not `(0, 0)`: both windows are rounded since Part B, and
+        // their shared corner pixel shows neither.
+        assert_eq!(fb.get_pixel(4, 4), Some(blue), "window 2 is on top");
 
         s.raise(1).unwrap();
         let mut fb = screen();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
-        assert_eq!(fb.get_pixel(0, 0), Some(red), "window 1 now is");
+        assert_eq!(fb.get_pixel(4, 4), Some(red), "window 1 now is");
     }
 
     #[test]
@@ -2895,7 +3018,8 @@ mod tests {
         );
         // And the window is still underneath it, rather than the cursor having replaced a
         // recompose that never happened.
-        assert_eq!(fb.get_pixel(0, 0), Some(window_colour), "the stack did not compose");
+        // `(10, 10)`: inside the window's rounded corner (Part B), and clear of the sprite at 20.
+        assert_eq!(fb.get_pixel(10, 10), Some(window_colour), "the stack did not compose");
     }
 
     /// Cursor body pixels inside the sprite's rectangle at `at`.
@@ -2981,8 +3105,14 @@ mod tests {
             Some(row_colour(5)),
             "the client's surface must reach the screen, row for row"
         );
-        assert_eq!(fb.get_pixel(63, 31), Some(row_colour(31)), "including its last pixel");
-        assert_eq!(fb.get_pixel(0, 0), Some(row_colour(0)), "and its first");
+        // **Its first and last pixels are outside its rounded corners** since the desktop
+        // refresh's Part B, so the ends of the copy are checked where the surface is still square:
+        // the last row up to the curve, and the right edge down to it — the same two boundaries a
+        // wrong stride or a short row would break — and the same at the start.
+        assert_eq!(fb.get_pixel(55, 31), Some(row_colour(31)), "the last row, to its curve");
+        assert_eq!(fb.get_pixel(63, 23), Some(row_colour(23)), "the last column, to its curve");
+        assert_eq!(fb.get_pixel(8, 0), Some(row_colour(0)), "and its first row");
+        assert_eq!(fb.get_pixel(0, 8), Some(row_colour(8)), "and its first column");
         // Past the right edge the surface stops — but its shadow does not, so this pixel is the
         // background darkened rather than the background exactly (M13 Part C). Asserted as "not
         // the surface's own row colour and no brighter than the ground", which is what "stops at
@@ -3083,6 +3213,8 @@ mod tests {
     /// and jumping when the manager places it.
     #[test]
     fn an_unconfigured_window_is_not_composited_however_much_it_commits() {
+        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
+        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3095,7 +3227,7 @@ mod tests {
 
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
         assert_eq!(
-            fb.get_pixel(0, 0),
+            fb.get_pixel(4, 4),
             Some(Rgb::new(0, 0, 0)),
             "committed, but never configured: the client jumped the handshake and is not on screen"
         );
@@ -3104,7 +3236,7 @@ mod tests {
         // does not care which — and the same pixels appear with no further commit.
         assert!(s.mark_configured(w), "this is the transition");
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
-        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "configured: now it composites");
+        assert_eq!(fb.get_pixel(4, 4), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "configured: now it composites");
 
         assert!(!s.mark_configured(w), "marking twice is not a second transition");
     }
@@ -3121,6 +3253,8 @@ mod tests {
 
     #[test]
     fn a_window_on_another_desktop_is_not_composited_and_comes_back_when_you_switch_to_it() {
+        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
+        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3130,22 +3264,24 @@ mod tests {
         let white = Rgb::new(0xFF, 0xFF, 0xFF);
 
         s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
-        assert_eq!(fb.get_pixel(0, 0), Some(white), "precondition: on the current desktop");
+        assert_eq!(fb.get_pixel(4, 4), Some(white), "precondition: on the current desktop");
 
         assert!(s.set_current_desktop(2).unwrap(), "the switch changed something");
         s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
-        assert_eq!(fb.get_pixel(0, 0), Some(black), "desktop 2 does not show desktop 1's window");
+        assert_eq!(fb.get_pixel(4, 4), Some(black), "desktop 2 does not show desktop 1's window");
 
         // **Nothing was destroyed, and no commit is needed to get it back** — the window kept
         // its buffer, so switching back is a filter changing its mind rather than a client
         // being asked to redraw. That is what makes a desktop switch cheap.
         s.set_current_desktop(1).unwrap();
         s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
-        assert_eq!(fb.get_pixel(0, 0), Some(white), "and back again, with no further commit");
+        assert_eq!(fb.get_pixel(4, 4), Some(white), "and back again, with no further commit");
     }
 
     #[test]
     fn a_sticky_window_composites_on_every_desktop() {
+        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
+        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3157,7 +3293,7 @@ mod tests {
             s.set_current_desktop(d).unwrap();
             s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
             assert_eq!(
-                fb.get_pixel(0, 0),
+                fb.get_pixel(4, 4),
                 Some(Rgb::new(0xFF, 0xFF, 0xFF)),
                 "a sticky window is on desktop {d} too"
             );
@@ -3166,6 +3302,8 @@ mod tests {
 
     #[test]
     fn a_minimized_window_is_not_composited_though_it_stays_on_its_desktop() {
+        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
+        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3174,7 +3312,7 @@ mod tests {
 
         assert!(s.set_minimized(w, true).unwrap(), "visibility changed");
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
-        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(0, 0, 0)), "minimized: off screen");
+        assert_eq!(fb.get_pixel(4, 4), Some(Rgb::new(0, 0, 0)), "minimized: off screen");
 
         // **Still on desktop 1**, which is the whole reason this is a separate attribute: a
         // window list is built per desktop, and a minimized window has to appear in the right
@@ -3182,7 +3320,7 @@ mod tests {
         assert_eq!(s.window(w).unwrap().desktop, 1, "minimizing did not move it");
         assert!(s.set_minimized(w, false).unwrap());
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
-        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "restored");
+        assert_eq!(fb.get_pixel(4, 4), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "restored");
     }
 
     #[test]
@@ -3389,27 +3527,31 @@ mod tests {
 
         let parent = shown(&mut s, &CreateWindowRequest::new(4, 4, Role::Normal));
         // Offset up and left, so the popup's origin is off-screen at (-8, -8).
+        //
+        // **32 across, not 16**, since the desktop refresh's Part B rounds a popup's corners: at
+        // 16 the radius clamps to 8, the popup is a circle, and the visible quarter is all curve.
+        // At 32 the clipped part keeps straight edges, which is what this test reads the rows off.
         let menu = s
-            .create(&CreateWindowRequest::at(16, 16, Role::Popup { parent }, -8, -8))
+            .create(&CreateWindowRequest::at(32, 32, Role::Popup { parent }, -8, -8))
             .unwrap();
         assert_eq!(s.window(menu).unwrap().origin, Point::new(-8, -8));
         s.mark_configured(menu);
-        s.attach(&attach(menu, 0, 16, 16)).unwrap();
+        s.attach(&attach(menu, 0, 32, 32)).unwrap();
         // Striped, so a row read from the wrong offset is visible rather than plausible.
-        src.put_striped(menu, 0, geom(16, 16));
+        src.put_striped(menu, 0, geom(32, 32));
         s.commit(&commit(menu, 0)).unwrap();
 
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
 
-        // The visible quarter is the popup's bottom-right: screen (0,0) is popup pixel (8,8).
+        // The visible part is the popup's bottom-right: screen (0,0) is popup pixel (8,8).
         assert_eq!(
             fb.get_pixel(0, 0),
             Some(row_colour(8)),
             "screen (0,0) shows the popup's row 8 — the clip moved the source, not just the size"
         );
-        assert_eq!(fb.get_pixel(0, 7), Some(row_colour(15)), "and the last row it has");
-        // Past the popup's extent (it ends at 8,8) the background shows through.
-        assert_eq!(fb.get_pixel(9, 9), Some(Rgb::new(0, 0, 0)), "nothing beyond it");
+        assert_eq!(fb.get_pixel(0, 23), Some(row_colour(31)), "and the last row it has");
+        // Past the popup's extent (it ends at 24,24) the background shows through.
+        assert_eq!(fb.get_pixel(25, 25), Some(Rgb::new(0, 0, 0)), "nothing beyond it");
     }
 
     #[test]
