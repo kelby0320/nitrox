@@ -18,9 +18,10 @@ opens, what the switcher shows when there is no previous desktop.
 | `nitrox-shell.html` | the design itself, self-contained — open it in a browser |
 | `light/`, `dark/` | the six states that need a click to reach, in both palettes |
 
-The screenshots exist because the page cannot be driven headlessly: `applications-menu`,
-`places-menu`, `desktop-switcher`, `bottom-bar`, `nxterm-focused`, `launcher`. The bottom bar is
-cut off in the others — the page is taller than the window it was captured in.
+The screenshots were taken by hand before there was a way to drive the page headlessly:
+`applications-menu`, `places-menu`, `desktop-switcher`, `bottom-bar`, `nxterm-focused`,
+`launcher`. The bottom bar is cut off in the others — the page is taller than the window they were
+captured in. `drive.mjs`, below, can now reach those states itself.
 
 ## Rendering it
 
@@ -39,6 +40,24 @@ capture lost the bottom bar off the end of the picture.
 That is about 24% more screen than the laptop's 1360×768, which every screen gate boots. **So the
 design's proportions are a starting point, not a specification**: a 30 px panel and a 548×404
 window were composed against a screen we do not have.
+
+### Driving it, and measuring it
+
+`drive.mjs` runs the page in headless Chrome over the DevTools protocol — `google-chrome` and Node
+22 or later, nothing from npm — so a state that needs a click can be reached, and **what the page
+drew can be read back as numbers** rather than estimated from a picture:
+
+```
+node docs/design/nitrox-shell/drive.mjs page   /tmp/design.png
+node docs/design/nitrox-shell/drive.mjs window Files /tmp/files    # files.png + files.json
+node docs/design/nitrox-shell/drive.mjs steps  my-steps.mjs        # click, eval, shot, …
+```
+
+`window` writes every element inside an application window with its rectangle, colours, font,
+padding, radius and borders as the browser computed them. Set beside `cargo xtask shot`, whose
+`terminal`, `files` and `editor` pictures show the same three windows in the same states, that is
+how the desktop refresh measures what is still missing (added 2026-09-18). **Its window menus are
+labels**: `Go`, `View` and `Terminal` open nothing, so the page says nothing about what they hold.
 
 The page's own stylesheet carries the token set (`--accent`, `--r`, `--sel`, …), and the mock
 text editor is displaying a `theme.toml` whose keys are nearly ours. **That is the useful part**:

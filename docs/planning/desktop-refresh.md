@@ -119,6 +119,16 @@ choosing two colours that do.
 - [ ] **Part E — the overview**, whose layout changes.
 - [ ] **Part F — a terminal with colour**, which is `nxsh` using a mechanism `libterm` already
       has.
+- [ ] **Part G — type**: the design's faces, weights and size scale.
+- [ ] **Part H — the parts of a window**: title and subtitle, the focus border, the tab strip, the
+      status bar, fields and buttons — shared by all three applications.
+- [ ] **Part I — the file browser**: toolbar, columns, sidebar, status bar.
+- [ ] **Part J — the editor**: monospace text, a gutter, Save on the tab strip, a status bar.
+- [ ] **Part K — the terminal's window**: line spacing, the scrollbar, the working directory.
+
+G–K were added on 2026-09-18, after measuring the applications against the page — see [How far
+the applications are from the design](#how-far-the-applications-are-from-the-design--measured-2026-09-18)
+and the revised [running order](#running-order-revised-2026-09-18).
 
 ## Part A — the design as data
 
@@ -375,6 +385,154 @@ reinvention per tool. `nxsh` knows which cell is a header because it built the t
 - [ ] **No truecolour.** Sixteen symbolic colours is what keeps scrollback re-themable, and
       adding a stored 24-bit colour would undo the argument `libterm` already makes.
 
+## How far the applications are from the design — measured 2026-09-18
+
+**Parts A–F restyle the chrome around the applications and almost nothing inside them**, and after
+Part C that is where the distance to the design is. The maintainer, comparing the two: *"we aren't
+close enough to the nitrox shell.html reference"*. The parts below are that distance, written
+down.
+
+**Measured, not read.** Until Part C this plan took its numbers from the page's markup, which
+worked for the bars and gets error-prone inside a window. `docs/design/nitrox-shell/drive.mjs` now
+runs the page in headless Chrome and writes every element of a window with the rectangle, colours,
+font, padding, radius and border the browser computed; `cargo xtask shot` gained `terminal`,
+`files` and `editor` pictures of our three windows in the same states the page draws them. Every
+number below comes from one or the other.
+
+**What the design has and we do not, per window** (the page's values, at its 1440×900):
+
+| | The design | Ours |
+|---|---|---|
+| **Every window** | a bold 12 px title with a dim subtitle (`Files  /home`, `nxterm  ~ /home`); the focused window's 1 px border in the accent | a regular-weight title; the border always `border` |
+| **Type** | IBM Plex Sans and Mono, 10–12.5 px, weights 400/500/600 | DejaVu Sans and Mono, one size (14 staged), one weight |
+| **Tab strip** (terminal, editor) | 30 px on `--faceHi`; rounded-top tabs, the active one on the window's ground and open to it, `×` in 10 px dim, a `+`; a slot on the right | a grey strip with square tabs; no `+` |
+| **Files: toolbar** | a 39 px row: a 24 px rounded `↑`, a breadcrumb path field (mono, `/` in `--line`), a 120 px Search field | `^` and the path as plain text |
+| **Files: listing** | a header row (Name / Size / Kind / Modified, 10.5 px dim on `--faceHi`); 25 px rows with an 11×9 swatch (folders accent, files `--line`), size, kind and time in dim, mono where numeric | names only |
+| **Files: sidebar** | 132 px on `--sidebar` against the window's edge, 5 px dots (`ok`; Root `deny`), selection the `--sel` wash; `disk0 · 18.4 GB free` at its foot | inset with a margin, no dots |
+| **Files: status bar** | `6 items │ Documents/ selected`, 25 px, mono 10.5 dim on `--faceHi` | none |
+| **Files: tabs** | none shown | a tab strip even with one tab |
+| **Editor** | monospace text on 20 px lines; a 36 px line-number gutter; the byte count and an accent **Save** pill on the tab strip; a status bar (`opened — 848 bytes` · `toml · ln 6, col 14`) | proportional text; no gutter; a bevelled `save` and the status on a separate row at the top |
+| **Terminal** | 12 px text on 19.5 px rows; no visible scrollbar | rows at the font's own line height; a scrollbar always drawn |
+| **Menus** | `Go` (Files), `View` (editor), `Terminal` (terminal) — **labels that open nothing** | none of the three |
+
+**Two things the page shows that we cannot honestly build yet.** The sidebar's free-space
+readout needs a filesystem operation that does not exist — no `statfs`-like request reaches a
+filesystem server today — and the Search field is a placeholder in the page, a `div` with a word
+in it. Neither is faked: the readout waits for the operation, and Search is built as a real filter
+or left out (Part I).
+
+**And one thing we can build that we did not know we could.** A directory entry already carries
+its size and modification time (`librsproto::file::OwnedEntry`), so the columns need no protocol
+change — only a renderer.
+
+## Part G — type
+
+**The single most visible difference in every window.** The design sets everything in IBM Plex
+Sans and Mono at 10–12.5 px, in three weights; we draw everything in DejaVu at one size and one
+weight. **The same words are 35% wider in ours** — `Documents` is 59 px in the page's Plex at
+11.5 and 80 in our DejaVu at the staged 14, and five names measured all fall at 1.32–1.35 — and the
+design's hierarchy (a semibold title, medium tab labels, dim 10.5 px metadata) is carried almost
+entirely by size and weight, where we have one of each.
+
+- [ ] **The faces.** IBM Plex Sans and Mono, which are under the SIL Open Font License, so they
+      ship beside their licence exactly as DejaVu's does. The theme's `font_ui` and `font_mono`
+      keys stay; what changes is what they name by default. **A decision for the maintainer**:
+      it is an asset in the image, and a look.
+- [ ] **Weights.** The toolkit has one UI face, so a 600 title and a 500 tab label have nowhere to
+      come from. A second face and a weight on the text node, or a synthetic weight — to be
+      decided by measuring both on a screendump, not by argument.
+- [ ] **A size scale instead of one size.** The design uses 12.5 (top bar), 12 (titles, the
+      terminal), 11.5 (menus, rows, fields), 10.5 (headers, status bars, byte counts) and 10
+      (hints). The theme keeps one number — `font_px`, the body size — and the toolkit derives
+      the others from it, so a theme still sets one value and the steps between them are ours.
+- [ ] **Every aim moves, and each is pinned first.** Part C's arrangement — the gates' literals
+      pinned by host tests at the staged size and the built-in one — is what makes this change
+      reviewable rather than a boot-by-boot hunt.
+- [ ] **Why it comes first**: every part after it measures against text. Doing type after them
+      would measure everything twice, the greeter included.
+
+## Part H — the parts of a window
+
+Toolkit pieces the three applications share, so each is built once and restyled once.
+
+- [ ] **Title and subtitle**: the title 12 px semibold, then a dim 11.5 px subtitle — the directory
+      for Files, the working directory for a terminal (which needs the shell to tell its terminal
+      where it is), and for the editor the design's single `theme.toml — Text Editor`.
+- [ ] **The focused window's border in the accent**, the design's own focus cue. We keep the
+      tinted title bar as well (the deliberate divergence above); this is additive and cheap,
+      since a client knows its own focus and draws its own `Outline`.
+- [ ] **The tab strip**: 30 px on `face_hover`, a `border` rule beneath, padding 5/6/0, tabs 24 px
+      with 8 px top corners, 9 px sides, 8 px from label to `×`, 1 px between tabs; the active tab
+      on the window's ground with its border open at the bottom, inactive tabs dim and flat; a
+      22×24 `+`; a right-hand slot for a window's own controls.
+- [ ] **The status bar**: 25 px on `face_hover`, a `--lineSoft` rule above, 10.5 px mono in
+      `foreground_dim`, 11 px sides, a left and a right slot, separators in `border`.
+- [ ] **Field, icon button and pill.** A field is 24 px with 8 px corners, a `border` line and 8 px
+      sides, on the window's ground or on `face_hover`; an icon button is a 24×24 of the same; a
+      primary action is an accent pill — accent ground, white 500-weight label, 12 px sides.
+
+## Part I — the file browser
+
+- [ ] **The toolbar row** (39 px with its rule; padding 7/9; gap 6): the `↑` icon button, the path
+      field as breadcrumb segments — mono, dim segments, `/` in `border` — and the Search field.
+- [ ] **Search filters or is absent.** The page's is a placeholder. The honest version filters the
+      current listing as you type, by the rule the Applications menu already uses — and a field
+      that looked like search and did nothing would be the defect every earlier part has named.
+- [ ] **Columns**: a 25 px header row (Name flexible, Size 70 right-aligned, Kind 60, Modified 96;
+      10.5 px medium dim on `face_hover`, a `--lineSoft` rule); rows of 25 px, padding 5/11, gap 8.
+      Size human-readable (`848`, `11K`, `2.8M`), Kind `dir` or the extension, Modified `HH:MM`
+      today and a date otherwise — `libtime`, which already formats the clock. Whether a header
+      click sorts is decided here: the View menu already holds the orders.
+- [ ] **The row swatch**: 11×9, 1 px corners — the accent for a folder, `border` for a file.
+- [ ] **The sidebar**: 132 px on `sidebar` against the window's edge rather than inset, rows of 25
+      px with a 5 px dot (`ok`; Root `deny`) and the selection wash.
+- [ ] **The status bar**: `N items`, and the selection.
+- [ ] **The tab strip only when there are two tabs.** The design shows none; tabs are ours, and a
+      strip holding one tab is chrome with nothing to switch between.
+- [ ] **Not built: the free-space readout**, until a filesystem operation reports free space.
+      Trigger: that operation, which the administration phase's disk tools will want anyway.
+
+## Part J — the editor
+
+- [ ] **Monospace text** in `font_mono`, on 20 px lines at the body size. Code in a proportional
+      face is the largest single difference in this window.
+- [ ] **A line-number gutter**: 36 px on `face_hover` with a `--lineSoft` rule, numbers right-aligned
+      8 px from it in dim mono, text starting 12 px after.
+- [ ] **The tab strip carries the file's controls**: the byte count in dim mono and an accent
+      **Save** pill in its right-hand slot, replacing the separate `save` row.
+- [ ] **A status bar at the foot**: the message on the left, `language · ln N, col M` on the right.
+- [ ] **Syntax colours, decided rather than copied.** The page colours TOML's keys in the accent —
+      a kind this scanner does not have (Part A recorded it) — strings in a red and numbers in
+      `ok`. Adding a key kind is a scanner change; whether the six colours move to the design's
+      is a palette decision.
+
+## Part K — the terminal's window
+
+Beside Part F, which owns the terminal's colours.
+
+- [ ] **The tab strip**, from Part H.
+- [ ] **Line spacing**: the design's 12 px text sits on 19.5 px rows, 1.6 times its size. Our row
+      is the font's own line height (`libterm::render`'s `cell_h`), so a terminal reads cramped
+      beside everything else. A leading on the cell, with the grid's reflow unchanged.
+- [ ] **The scrollbar**: the page shows none; ours is always drawn. Hidden until scrolled, or
+      restyled — decided by looking at both on a screendump.
+- [ ] **The working directory in the title** — the subtitle from Part H, which needs the shell to
+      tell its terminal where it is.
+
+## Menus the design names and does not fill
+
+`Go`, `View` and `Terminal` are words on the page's menu bars that open nothing. **A menu is added
+only with things in it** — the rule Part C applied to `Run Application…`: an empty menu is worse
+than none. Each application's part decides whether it has the items (`Go`: up, home, the places;
+`View`: the gutter, wrapping; `Terminal`: new tab, clear) and adds the word only then.
+
+## Running order, revised 2026-09-18
+
+**Proposed** — the maintainer decides. **G first**, because type moves every metric the others
+measure; then **D** (the greeter), then **H** before **I**, **J** and **K**, which are built from
+it; then **F** beside **K**, and **E** (the overview) last, since it is the one surface a person
+visits rather than works in.
+
 ## Deferred, and named so they are choices
 
 - **The launcher** (`Run Application…`, `super+space`) — wanted, its own surface.
@@ -395,6 +553,8 @@ reinvention per tool. `nxsh` knows which cell is a header because it built the t
   near-duplicates in Part A. A new key that is nearly an old key is how a theme grows thirty of
   them.
 - **Whether six parts is the right cut.** F is independent of A–E and could land separately.
+  **Answered 2026-09-18 by measuring**: six parts restyled the chrome and left the applications'
+  interiors as they were, so G–K were added and the running order revised.
 - **What "adapting the proportions" means concretely** — the design is 1440×900 and the machine
   is 1360×768, and the answer is probably not a uniform scale.
 

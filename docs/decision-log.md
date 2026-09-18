@@ -26922,3 +26922,33 @@ back into focus. A probe logging what the compositor was asked for said otherwis
 asked for desktop 2 and the terminal was on 1. `told_desktop` is what the compositor was last told,
 `switch_desktop` keeps it, and `sync_current` re-tells the compositor after each stretch that can
 normalise; the step asserts focus on return again, and 6a3 asserts the sync.
+
+## 2026-09-18 — Desktop refresh: the applications, measured against the design, and five parts added
+
+**Parts A–F restyled the chrome around the applications and almost nothing inside them.** With
+Part C merged the maintainer compared the desktop with the page and found it not close enough;
+the plan's remaining parts (the greeter, the overview, terminal colour) would not have closed
+the gap, because the gap is inside the three windows.
+
+**The comparison is measured now, not read.** Until this point the plan took its numbers from the
+page's markup. `docs/design/nitrox-shell/drive.mjs` runs the page in headless Chrome over the
+DevTools protocol — `google-chrome` and Node's built-in WebSocket, nothing from npm — reaches
+states that need a click, and writes each window's elements with the geometry and colours the
+browser computed. `cargo xtask shot` gained `terminal`, `files` and `editor` pictures in the states
+the page draws them in, and `move_pointer_to` now records where it leaves the pointer (a caller
+had to, and two in `shot` did not). The design README's "cannot be driven headlessly" was true of
+the tools to hand, not of the page.
+
+**Five parts, G–K, in `desktop-refresh.md`**: type (the design's faces, weights and a size scale),
+the parts of a window shared by all three applications (title and subtitle, the focus border, the
+tab strip, the status bar, fields and buttons), then the file browser, the editor and the
+terminal's window. **Type is proposed first**: our text is 35% wider than the page's for the same
+words — measured on five names, 1.32–1.35 — and every other part measures against text, so doing
+it later measures everything twice.
+
+**What was not planned as buildable, and why.** The sidebar's free-space readout needs a filesystem
+operation that does not exist; the Search field is a placeholder in the page and is planned as a
+real filter or not at all; and the page's `Go`, `View` and `Terminal` menus are labels that open
+nothing, so a menu word is added only with items behind it — Part C's rule for `Run Application…`.
+One thing turned out cheaper than it looked: a directory entry already carries size and mtime, so
+the file browser's columns need a renderer and no protocol.

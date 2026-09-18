@@ -7732,7 +7732,8 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be
 /// mistaken for a design opinion.
 fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
-    const MOMENTS: [&str; 5] = ["greeter", "desktop", "apps", "windows", "overview"];
+    const MOMENTS: [&str; 8] =
+        ["greeter", "desktop", "apps", "windows", "terminal", "files", "editor", "overview"];
     if what != "all" && !MOMENTS.contains(&what) {
         return Err(format!(
             "no shot called {what:?} — try `all` or one of: {}",
@@ -7801,7 +7802,7 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     // 4. **Real windows.** Two applications rather than one, because half of what a desktop
     //    looks like is how two windows sit next to each other — and one of each kind: a
     //    proportional-font application and the terminal, which is the only grid on the screen.
-    launch_from_menu(&mut qmp, &mut session, "nxfiles")?;
+    let files = launch_from_menu(&mut qmp, &mut session, "nxfiles")?;
     // **Escape before aiming at the button again**, the precondition `check-login` states for
     // the same click: `click_at` retries a press that did not land, and an abandoned attempt
     // still pressed *somewhere* — if that somewhere was the Applications word the menu is
@@ -7821,7 +7822,40 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
     move_pointer_to(&mut qmp, 900, 500)?;
     capture!("windows");
 
-    // 5. **The overview**, which is the one surface with no other way to be looked at: it is
+    // 5. **Each application on its own, in the state the design shows it** (desktop refresh,
+    //    Part C's comparison pass): the terminal after a `list`, the browser at `/home`, and the
+    //    editor on `theme.toml`. These are what `docs/design/nitrox-shell/nitrox-shell.html` draws
+    //    its three windows doing, so a picture of each can be set beside the design's.
+    //
+    //    The terminal holds the keyboard — it was launched last.
+    type_at_terminal(&mut qmp, "list")?;
+    capture!("terminal");
+
+    //    The browser, raised by its title bar — which the terminal, placed a cascade step lower,
+    //    leaves showing.
+    click_at(&mut qmp, &mut session, files.0 + 160, files.1 + 16)?;
+    capture!("files");
+
+    //    **The editor, opened the way a person opens a file**: the browser's selection moved down
+    //    its listing to `theme.toml`, and Enter. A fresh listing selects its first row, and the
+    //    browser reports each change of selection, so each press is acknowledged before the next.
+    let mut on_theme = false;
+    for _ in 0..12 {
+        press(&mut qmp, "down")?;
+        if session.expect_within("nxfiles: selected theme.toml", std::time::Duration::from_secs(2))? {
+            on_theme = true;
+            break;
+        }
+    }
+    if !on_theme {
+        return Err("the browser's selection never reached theme.toml in /home".into());
+    }
+    press(&mut qmp, "ret")?;
+    session.expect("desktop-shell: launched nxedit into its own namespace")?;
+    placed_window(&mut session)?;
+    capture!("editor");
+
+    // 6. **The overview**, which is the one surface with no other way to be looked at: it is
     //    opened from the desktop's name, it covers the screen, and it is where the sidebar's
     //    desktop miniatures live (M11 Part E batch 10).
     //    **Pressed by hand rather than through `click_at`**, because the shell logs the open
@@ -7848,7 +7882,7 @@ fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
 ///
 /// **Enter launches the lit row**, and typing lights the top match: the menu points at what the
 /// filter narrowed to, so the name typed here is the row Enter chooses.
-fn launch_from_menu(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<()> {
+fn launch_from_menu(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<(i32, i32, u32, u32)> {
     for c in program.chars() {
         let mut qcode = String::new();
         qcode.push(c);
@@ -7863,8 +7897,24 @@ fn launch_from_menu(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<()
     // *next* launch has already opened. Typing into that menu put the second program's name
     // into the first program, and in a file browser Enter means "open the selected row", so the
     // shot ended up with an editor on `theme.toml` instead of a terminal.
+    placed_window(session)
+}
+
+/// Wait for the shell to place the next window, and read where it went and how big it is.
+///
+/// **Its own geometry line, by id** — not the next `desktop-shell: window …` line, which can be the
+/// window list. Returns `(x, y, w, h)`.
+fn placed_window(session: &mut Session) -> R<(i32, i32, u32, u32)> {
     session.expect("desktop-shell: placed window ")?;
-    Ok(())
+    let placed = session.rest_of_line()?;
+    let (id, _, _) = parse_placement(&placed)
+        .ok_or_else(|| format!("could not read a placement from {placed:?}"))?;
+    session.expect(&format!("desktop-shell: window {id} geometry "))?;
+    let rest = session.rest_of_line()?;
+    let line = format!("{id} geometry {rest}");
+    let (_, x, y, w, h) = parse_geometry_line(&line)
+        .ok_or_else(|| format!("could not read window {id}'s geometry from {rest:?}"))?;
+    Ok((x, y, w, h))
 }
 
 /// Boot the **release** image headless with a QMP socket and the serial on stdio.
